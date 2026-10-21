@@ -102,9 +102,17 @@ pub fn run(args: &[String]) -> NuResult<()> {
                 match args[i].as_str() {
                     "--filter" => {
                         i += 1;
-                        if i < args.len() {
-                            filter = Some(args[i].as_str());
+                        let value = args.get(i).ok_or_else(|| NuError::PackageError {
+                            msg: "--filter requires a value".to_string(),
+                            span: Span::default(),
+                        })?;
+                        if value.starts_with("--") {
+                            return Err(NuError::PackageError {
+                                msg: "--filter requires a value".to_string(),
+                                span: Span::default(),
+                            });
                         }
+                        filter = Some(value.as_str());
                     }
                     "--verbose" | "-v" => verbose = true,
                     "--watch" | "-w" => watch = true,
@@ -1702,7 +1710,8 @@ fn guess_content_type(path: &Path) -> &'static str {
 }
 
 /// `nula test [--filter <substr>] [--verbose|-v]`: discover and run `.nula`
-/// test files under the package's `tests/` directory, reporting pass/fail.
+/// test files or `fn test_*` cases under `tests/`, reporting pass/fail.
+/// Filters match either a filename, qualified case name, or function name.
 ///
 /// Each test file is executed via the `nulang` exe in the current package
 /// (same process as `nula run`). A test PASSes if it runs to completion
@@ -1720,13 +1729,6 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
         Ok(entries) => entries
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().is_some_and(|ext| ext == "nula"))
-            .filter(|p| {
-                filter.map_or(true, |f| {
-                    p.file_stem()
-                        .and_then(|s| s.to_str())
-                        .map_or(false, |s| s.contains(f))
-                })
-            })
             .collect(),
         Err(_) => Vec::new(),
     };
@@ -1750,46 +1752,72 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
     }
 
     let mut tests: Vec<TestCase> = Vec::new();
-    let temp_dir = std::env::temp_dir().join("nula_test");
-    let _ = std::fs::create_dir_all(&temp_dir);
+    // Unique to this invocation, preventing concurrent packages from sharing
+    // wrappers. File names below also distinguish duplicate function names.
+    let temp_dir = std::env::temp_dir().join(format!(
+        "nula_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir(&temp_dir).map_err(|err| NuError::PackageError {
+        msg: format!("cannot create test wrapper directory: {err}"),
+        span: Span::default(),
+    })?;
 
     for file in &test_files {
-        let content = match std::fs::read_to_string(file) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+        let content = std::fs::read_to_string(file).map_err(|err| NuError::PackageError {
+            msg: format!("cannot read test file {}: {err}", file.display()),
+            span: Span::default(),
+        })?;
         let test_fns = discover_test_functions(&content);
         let relative = file
             .strip_prefix(&tests_dir.parent().unwrap_or(&tests_dir))
             .unwrap_or(file);
+        let matches_file = filter.is_none_or(|needle| {
+            file.file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem.contains(needle))
+        });
 
         if test_fns.is_empty() {
-            // No test_* functions: run whole file as one test
-            tests.push(TestCase {
-                display: relative.display().to_string(),
-                file_to_run: file.clone(),
-                is_temp: false,
-            });
+            // No test_* functions: run whole file as one test.
+            if matches_file {
+                tests.push(TestCase {
+                    display: relative.display().to_string(),
+                    file_to_run: file.clone(),
+                    is_temp: false,
+                });
+            }
         } else {
             if verbose {
                 println!("--- {} ---", relative.display());
                 println!("  discovered: {}", test_fns.join(", "));
             }
-            // Strip fn main() for per-function wrappers
-            let stripped = strip_main_function(&content);
+            // Rename the original main so the wrapper owns the entry point.
+            let stripped = rename_main_for_test(&content);
             for fn_name in &test_fns {
+                let display = format!("{}::{}", relative.display(), fn_name);
+                if !filter.is_none_or(|needle| {
+                    matches_file || fn_name.contains(needle) || display.contains(needle)
+                }) {
+                    continue;
+                }
                 let wrapper = format!(
                     "{}{}\nfn main() {{ {}() }}\n",
                     stripped,
                     if stripped.ends_with('\n') { "" } else { "\n" },
                     fn_name
                 );
-                let temp_path = temp_dir.join(format!("test_{}.nula", fn_name));
-                if std::fs::write(&temp_path, &wrapper).is_err() {
-                    continue;
-                }
+                let temp_path = temp_dir.join(format!("case_{:06}.nula", tests.len()));
+                std::fs::write(&temp_path, &wrapper).map_err(|err| NuError::PackageError {
+                    msg: format!("cannot write test wrapper {}: {err}", temp_path.display()),
+                    span: Span::default(),
+                })?;
                 tests.push(TestCase {
-                    display: fn_name.clone(),
+                    display,
                     file_to_run: temp_path,
                     is_temp: true,
                 });
@@ -1916,54 +1944,76 @@ fn cmd_test_watch(filter: Option<&str>, verbose: bool) -> NuResult<()> {
     }
 }
 
-/// Find all `fn test_*` function names in a source string.
+/// Find top-level `fn test_*` declarations, never matching comments, strings,
+/// or nested lambdas. Invalid source stays a whole-file test so the compiler
+/// reports the real lexical/parse error instead of silently skipping the file.
 fn discover_test_functions(source: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut rest = source;
-    while let Some(pos) = rest.find("fn test_") {
-        let start = pos + 3; // skip "fn "
-        let after_fn = &rest[start..];
-        // Find end of identifier: whitespace or '('
-        let end = after_fn
-            .find(|c: char| c.is_whitespace() || c == '(')
-            .unwrap_or(after_fn.len());
-        let name = after_fn[..end].trim().to_string();
-        if !name.is_empty() {
-            names.push(name);
-        }
-        rest = &after_fn[end..];
-    }
-    names
+    let tokens = match crate::lexer::Lexer::new(source).lex() {
+        Ok(tokens) => tokens,
+        Err(_) => return Vec::new(),
+    };
+    let module = match crate::parser::Parser::new(tokens).parse_module() {
+        Ok(module) => module,
+        Err(_) => return Vec::new(),
+    };
+    module
+        .decls
+        .into_iter()
+        .filter_map(|decl| match decl {
+            crate::ast::Decl::Function { name, .. } if name.starts_with("test_") => Some(name),
+            _ => None,
+        })
+        .collect()
 }
 
-/// Strip the `fn main() { ... }` block from source, keeping everything else.
-fn strip_main_function(source: &str) -> String {
-    if let Some(pos) = source.find("fn main") {
-        // Find the opening brace after "fn main"
-        if let Some(brace_start) = source[pos..].find('{') {
-            let abs_brace = pos + brace_start;
-            // Count braces to find matching close
-            let mut depth = 0;
-            let mut end = abs_brace;
-            for (i, ch) in source[abs_brace..].char_indices() {
-                match ch {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = abs_brace + i + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let before = &source[..pos];
-            let after = &source[end..];
-            return format!("{}{}", before, after);
+/// Move the source's original entry point out of the way when synthesizing
+/// a test-case main. Only rename an actual top-level declaration, using
+/// source spans from the lexer and parser: string/comment contents and braces
+/// inside string literals are never mistaken for function boundaries.
+///
+/// The old substring-and-brace scanner could delete arbitrary source or
+/// consume later functions when main had an expression body. Keeping the
+/// original body under an inert name avoids guessing where it ends. It is
+/// still typechecked, but never invoked by the generated test entry point.
+fn rename_main_for_test(source: &str) -> String {
+    let tokens = match crate::lexer::Lexer::new(source).lex() {
+        Ok(tokens) => tokens,
+        Err(_) => return source.to_string(),
+    };
+    let module = match crate::parser::Parser::new(tokens.clone()).parse_module() {
+        Ok(module) => module,
+        Err(_) => return source.to_string(),
+    };
+    let Some(start) = module.decls.iter().find_map(|decl| match decl {
+        crate::ast::Decl::Function { name, span, .. } if name == "main" => {
+            Some(span.start)
         }
+        _ => None,
+    }) else {
+        return source.to_string();
+    };
+    let Some(fn_index) = tokens.iter().position(|token| {
+        token.span.start == start && matches!(token.kind, crate::lexer::TokenKind::Fn)
+    }) else {
+        return source.to_string();
+    };
+    let Some(name) = tokens[fn_index + 1..].iter().find(|token| {
+        !matches!(
+            token.kind,
+            crate::lexer::TokenKind::Newline | crate::lexer::TokenKind::Semicolon
+        )
+    }) else {
+        return source.to_string();
+    };
+    if !matches!(&name.kind, crate::lexer::TokenKind::Ident(value) if value == "main") {
+        return source.to_string();
     }
-    source.to_string()
+    let mut rewritten = source.to_string();
+    rewritten.replace_range(
+        name.span.start as usize..name.span.end as usize,
+        "__nula_test_original_main",
+    );
+    rewritten
 }
 /// Run a test file via `nulang`, capturing stderr so error messages appear
 /// after the test name (avoiding interleaved output).
