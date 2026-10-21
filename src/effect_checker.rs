@@ -1175,7 +1175,7 @@ impl EffectChecker {
                     if !grants.contains(category) {
                         return Err(NuError::EffectError {
                             msg: format!(
-                                "function '{name}' performs effect '{eff}' which requires resource capability '{category}' (not granted; grant it with --with={category})"
+                                "function '{name}' performs effect '{eff}' which requires resource capability '{category}' (not granted; grant it with --with {category})"
                             ),
                             span: Span::default(),
                             missing_effects: None,
@@ -4719,6 +4719,20 @@ mod tests {
         assert!(
             full.check_module(&ast.decls).is_ok(),
             "all resource categories granted must pass"
+        );
+    }
+
+    #[test]
+    fn test_network_grant_error_suggests_supported_cli_syntax() {
+        let ast = parse_module("fn fetch_url() -> Unit ! {Net} { unit }");
+        let mut checker = EffectChecker::new();
+        checker.set_resource_grants(&[]);
+        let err = checker
+            .check_module(&ast.decls)
+            .expect_err("missing net grant must be rejected");
+        assert!(
+            format!("{err}").contains("grant it with --with net"),
+            "suggest space-separated --with net, as the CLI parses it: {err}"
         );
     }
 
