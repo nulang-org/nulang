@@ -1,7 +1,7 @@
 //! Shared, language-neutral Rust/Kotlin v1 wire compatibility fixtures.
 //! These assert acceptance/rejection and full-width semantics, not JSON byte formatting.
 
-use nulang_ui_protocol::{Revision, RuntimeToHostMessage, WireValue};
+use nulang_ui_protocol::{decode_runtime_message, Revision, RuntimeToHostMessage, WireValue};
 
 fn read(name: &str) -> &'static str {
     match name {
@@ -24,6 +24,9 @@ fn read(name: &str) -> &'static str {
         "snapshot_duplicate_key" => {
             include_str!("../../../tests/fixtures/ui_protocol/v1/snapshot_duplicate_key.json")
         }
+        "snapshot_duplicate_nested_object" => include_str!(
+            "../../../tests/fixtures/ui_protocol/v1/snapshot_duplicate_nested_object.json"
+        ),
         "snapshot_invalid_float" => {
             include_str!("../../../tests/fixtures/ui_protocol/v1/snapshot_invalid_float.json")
         }
@@ -31,13 +34,10 @@ fn read(name: &str) -> &'static str {
     }
 }
 
-// Rust's externally validated decode is deliberately explicit here: this
-// standalone PR can be compiled before the stacked canonical decoder #2102.
+// Parity must exercise the real public Rust ingress API, not a test-only
+// validator that can mask discrepancies against Kotlin's public decoder.
 fn validated(message: &str) -> Result<RuntimeToHostMessage, String> {
-    let decoded: RuntimeToHostMessage =
-        serde_json::from_str(message).map_err(|error| error.to_string())?;
-    decoded.validate().map_err(|error| error.to_string())?;
-    Ok(decoded)
+    decode_runtime_message(message).map_err(|error| error.to_string())
 }
 
 #[test]
@@ -116,6 +116,7 @@ fn test_shared_invalid_wire_cases_fail_closed() {
         "snapshot_negative_zero",
         "patch_nonincreasing",
         "snapshot_duplicate_key",
+        "snapshot_duplicate_nested_object",
         "snapshot_invalid_float",
     ] {
         assert!(

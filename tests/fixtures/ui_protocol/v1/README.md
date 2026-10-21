@@ -11,7 +11,8 @@ These JSON documents are a shared acceptance/rejection contract for the **Rust**
 | `snapshot_null_actions.json` | Reject | Explicit null does not equal omitted actions |
 | `snapshot_negative_zero.json` | Reject | Negative-zero unsigned revision spelling |
 | `patch_nonincreasing.json` | Reject | Revision must strictly increase |
-| `snapshot_duplicate_key.json` | Reject | Duplicate JSON envelope discriminator |
+| `snapshot_duplicate_key.json` | Reject | Duplicate key inside map-valued node properties, even when the JSON envelope is otherwise valid |
+| `snapshot_duplicate_nested_object.json` | Reject | Duplicate key inside a nested tagged object `WireValue` map |
 | `snapshot_invalid_float.json` | Reject | `f64` must have exactly sixteen hexadecimal digits |
 
 Both languages must consume these **unchanged files**, not independent inline

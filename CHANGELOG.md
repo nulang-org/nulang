@@ -1,4 +1,10 @@
 # Nulang Changelog
+
+### Rust/Kotlin UI wire ingress parity — 2026-10-21
+- Rust's public UI message decoders now validate protocol semantics before admitting host/runtime JSON, instead of relying on test-only validators.
+- Reject duplicate JSON map keys in node properties and nested tagged objects rather than silently overwriting the first value; shared Rust/Kotlin fixtures exercise both cases.
+- Golden-wire conformance now calls Rust's actual public decoder. This change does not establish full platform parity for size limits, Swift native hosts, or runtime action authorization.
+
 ### Rust/Kotlin mobile UI golden-wire conformance — 2026-10-21
 - **Both protocol hosts consume the same eight checked-in `nulang-ui/1` JSON fixtures**, covering full-width revisions, signed integer extrema, bit-precise floats, Unicode and nested tagged values, ordered patches, duplicate action events, malformed collections, and rejected revisions.
 - **The Kotlin Gradle check and Rust crate test both assert acceptance/rejection and atomic patch semantics.** This locks down the snapshot/patch subset without claiming byte-for-byte JSON encoding parity, native packaging, or host-action authorization.

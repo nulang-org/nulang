@@ -56,6 +56,7 @@ private fun test_shared_invalid_fixtures_are_rejected() {
         "snapshot_negative_zero",
         "patch_nonincreasing",
         "snapshot_duplicate_key",
+        "snapshot_duplicate_nested_object",
         "snapshot_invalid_float",
     )) {
         val state = UiRuntimeState()
@@ -73,5 +74,5 @@ fun main() {
     test_shared_valid_snapshot_preserves_lossless_values()
     test_shared_valid_patch_and_replay_atomicity()
     test_shared_invalid_fixtures_are_rejected()
-    println("Nulang Rust/Kotlin shared wire v1: 8/8 fixtures passed")
+    println("Nulang Rust/Kotlin shared wire v1: 9/9 fixtures passed")
 }
