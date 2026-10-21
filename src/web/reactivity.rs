@@ -812,7 +812,8 @@ pub fn generate_client_runtime() -> String {
   }
 
   function wireFormPayload(body) {
-    const fields = {};
+    // Form field names are untrusted, including '__proto__' and inherited keys.
+    const fields = Object.create(null);
     body.forEach(function (value, key) {
       if (typeof value === 'string') {
         fields[key] = { type: 'string', value: value };
