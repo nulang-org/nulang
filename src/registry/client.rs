@@ -18,13 +18,38 @@ pub(crate) fn verified_https_agent(target_url: &str) -> Result<ureq::Agent, Stri
     let (scheme, authority) = target_url
         .split_once("://")
         .ok_or_else(|| "registry/deploy URL must specify http:// or https://".to_string())?;
-    if authority.is_empty() {
-        return Err("registry/deploy URL must include a host".to_string());
+    // Keep the authority bounded to the host portion, not the URL path.
+    let authority = authority
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return Err("registry/deploy URL must have a host without userinfo".to_string());
     }
     let https_only = if scheme.eq_ignore_ascii_case("https") {
         true
     } else if scheme.eq_ignore_ascii_case("http") {
-        false // Preserve explicitly configured local/development HTTP endpoints.
+        // Plaintext is permitted only for exact loopback development hosts.
+        // Never let a registry/deploy bearer token reach an arbitrary origin.
+        let loopback = if let Some(ipv6) = authority.strip_prefix('[') {
+            let (literal, suffix) = ipv6
+                .split_once(']')
+                .ok_or_else(|| "malformed bracketed loopback host".to_string())?;
+            (suffix.is_empty() || suffix.starts_with(':'))
+                && literal
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        } else {
+            let (host, _) = authority.split_once(':').unwrap_or((authority, ""));
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        };
+        if !loopback {
+            return Err("plaintext registry/deploy URLs require an exact loopback host".to_string());
+        }
+        false
     } else {
         return Err("registry/deploy URL must specify http:// or https://".to_string());
     };
@@ -33,6 +58,9 @@ pub(crate) fn verified_https_agent(target_url: &str) -> Result<ureq::Agent, Stri
         .map_err(|e| format!("system TLS initialization failed: {}", e))?;
     Ok(ureq::AgentBuilder::new()
         .https_only(https_only)
+        // Local HTTP must not redirect bearer-bearing requests off loopback.
+        // HTTPS requests retain normal HTTPS-only redirect behavior.
+        .redirects(if https_only { 5 } else { 0 })
         .tls_connector(std::sync::Arc::new(connector))
         .build())
 }
