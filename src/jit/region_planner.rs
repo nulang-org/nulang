@@ -456,16 +456,22 @@ pub(crate) fn find_compilable_region(
     }
 }
 
-/// The code offset of the function containing `pc` (largest
-/// `function_table[i] <= pc`), bounding `direct_call_target`'s backward walk.
+/// Return the last function start at or before `pc`. MIR codegen emits
+/// functions in table order, so offsets are nondecreasing; `partition_point`
+/// avoids scanning the full table for each candidate native direct call.
+fn containing_function_start(offsets: &[usize], pc: usize) -> usize {
+    let end = offsets.partition_point(|&start| start <= pc);
+    if end == 0 {
+        0
+    } else {
+        offsets[end - 1]
+    }
+}
+
+/// Bound `direct_call_target`'s backward walk to the calling function.
+/// Keep the legacy zero fallback for top-level code before the first function.
 pub(crate) fn func_start_for(module: &crate::bytecode::CodeModule, pc: usize) -> usize {
-    module
-        .function_table
-        .iter()
-        .copied()
-        .filter(|&o| o <= pc)
-        .next_back()
-        .unwrap_or(0)
+    containing_function_start(&module.function_table, pc)
 }
 
 /// If the instruction at `pc` is a `Call` of a provably-non-suspending direct
@@ -731,6 +737,51 @@ mod planner_tests {
             plan.type_metadata().is_some(),
             "planner should preserve type facts for the backend"
         );
+    }
+
+    #[test]
+    fn test_containing_function_start_matches_linear_oracle_at_boundaries() {
+        // Function offsets are nondecreasing, as emitted by mir_codegen.
+        // Preserve the previous scan's behavior on empty tables, gaps and
+        // duplicate offsets (the latest matching function wins).
+        let offsets = [3usize, 8, 8, 25, 70];
+        for pc in [0, 2, 3, 7, 8, 9, 24, 25, 69, 70, 100] {
+            let expected = offsets
+                .iter()
+                .copied()
+                .filter(|&start| start <= pc)
+                .next_back()
+                .unwrap_or(0);
+            assert_eq!(containing_function_start(&offsets, pc), expected, "pc={pc}");
+        }
+        assert_eq!(containing_function_start(&[], 99), 0);
+    }
+
+    #[test]
+    fn test_containing_function_start_matches_large_function_table() {
+        let offsets: Vec<usize> = (0..16_384).map(|i| i * 3 + 2).collect();
+        for pc in [0, 1, 2, 3, 4, 5, 12_345, 49_150, 49_151, 65_535] {
+            let expected = offsets
+                .iter()
+                .copied()
+                .filter(|&start| start <= pc)
+                .next_back()
+                .unwrap_or(0);
+            assert_eq!(containing_function_start(&offsets, pc), expected, "pc={pc}");
+        }
+    }
+
+    #[test]
+    fn test_native_direct_call_cannot_look_into_previous_function() {
+        let mut module = CodeModule::new("function_boundary");
+        module.function_table.extend([0, 2]);
+        module.emit(Instruction::new1(OpCode::Const0, 254));
+        module.emit(Instruction::new0(OpCode::Ret));
+        module.emit(Instruction::new1(OpCode::Const0, 0));
+        module.emit(Instruction::new0(OpCode::Call));
+
+        assert_eq!(func_start_for(&module, 3), 2);
+        assert_eq!(native_direct_call(&module, 3, None, None), None);
     }
 
     #[test]
