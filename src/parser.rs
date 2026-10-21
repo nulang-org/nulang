@@ -2844,6 +2844,7 @@ impl Parser {
 
         // Handle infix operators
         loop {
+            let separated_by_newline = self.peek_kind() == &TokenKind::Newline;
             self.skip_newlines();
             let op = self.peek_kind().clone();
             if op == TokenKind::Eof {
@@ -3154,6 +3155,23 @@ impl Parser {
                 continue;
             }
 
+            // Contextual low-precedence contract check. Retain the inferred
+            // type instead of replacing it with the annotated contract.
+            if matches!(&op, TokenKind::Ident(name) if name == "satisfies") {
+                if separated_by_newline || PREC_PIPE < min_prec {
+                    break;
+                }
+                self.advance();
+                let ty = self.parse_type()?;
+                left = Expr::TypeAnnotate {
+                    expr: Box::new(left),
+                    ty,
+                    preserve_inferred: true,
+                    span: self.current_span(),
+                };
+                continue;
+            }
+
             if self.consume_if(&TokenKind::Colon) {
                 let span = self.current_span();
                 let is_cap = if let TokenKind::Ident(ref s) = self.peek_kind() {
@@ -3174,6 +3192,7 @@ impl Parser {
                     left = Expr::TypeAnnotate {
                         expr: Box::new(left),
                         ty,
+                        preserve_inferred: false,
                         span,
                     };
                 }
@@ -3356,13 +3375,23 @@ impl Parser {
                         // `let _ = expr [in body]` — wildcard binding, desugar to discard
                         if self.peek_kind() == &TokenKind::Ident("_".to_string()) {
                             self.advance(); // consume '_'
-                            let _ty = if self.consume_if(&TokenKind::Colon) {
+                            let ty = if self.consume_if(&TokenKind::Colon) {
                                 Some(self.parse_type()?)
                             } else {
                                 None
                             };
                             self.expect(TokenKind::Assign)?;
                             let value = self.parse_expr()?;
+                            // A discarded binding still has to honor its annotation.
+                            let value = match ty {
+                                Some(ty) => Expr::TypeAnnotate {
+                                    expr: Box::new(value),
+                                    ty,
+                                    preserve_inferred: false,
+                                    span,
+                                },
+                                None => value,
+                            };
                             if self.consume_if(&TokenKind::In) {
                                 let body = self.parse_expr()?;
                                 Ok(Expr::Block {
@@ -7938,6 +7967,60 @@ mod tests {
                 other => panic!("Expected perform for {}, got {:?}", source, other),
             }
         }
+    }
+
+    #[test]
+    fn test_satisfies_checks_whole_binary_expression() {
+        // 'satisfies' is a low-precedence type check, not a cast on the RHS.
+        let expr = parse_expr("1 + 2 satisfies Int").unwrap();
+        match expr {
+            Expr::TypeAnnotate { expr, ty, .. } => {
+                assert!(matches!(expr.as_ref(), Expr::Binary { op: BinOp::Add, .. }));
+                assert_eq!(ty, Type::int());
+            }
+            other => panic!("expected a checked binary expression, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_satisfies_type_mismatch_is_rejected() {
+        let expr = parse_expr("42 satisfies Bool").unwrap();
+        let mut checker = crate::typechecker::TypeChecker::new();
+        let ctx = crate::types::TypeContext::new();
+        assert!(checker.infer_expr(&ctx, &expr).is_err());
+    }
+
+    #[test]
+    fn test_satisfies_identifier_on_next_line_is_not_a_postfix_check() {
+        // A new statement named 'satisfies' must not be mistaken for
+        // the type-check operator following the previous expression.
+        let source = "fn main() {\n  let satisfies = 0\n  let n = 1\n  satisfies = 2\n  n\n}";
+        let tokens = Lexer::new(source).lex().unwrap();
+        let module = Parser::new(tokens).parse_module();
+        assert!(module.is_ok(), "satisfies after newline should be a variable: {:?}", module.err());
+    }
+
+    #[test]
+    fn test_satisfies_preserves_contextual_identifier() {
+        let expr = parse_expr("let satisfies = 7 in satisfies").unwrap();
+        assert!(matches!(expr, Expr::Let { name, .. } if name == "satisfies"));
+    }
+
+    #[test]
+    fn test_typed_discarded_binding_validates_annotation() {
+        let expr = parse_expr("let _: Bool = 42 in 7").unwrap();
+        let mut checker = crate::typechecker::TypeChecker::new();
+        let ctx = crate::types::TypeContext::new();
+        assert!(checker.infer_expr(&ctx, &expr).is_err());
+    }
+
+    #[test]
+    fn test_typed_discarded_binding_allows_compatible_value() {
+        let expr = parse_expr("let _: Int = 42 in 7").unwrap();
+        let mut checker = crate::typechecker::TypeChecker::new();
+        let ctx = crate::types::TypeContext::new();
+        let (_, ty) = checker.infer_expr(&ctx, &expr).unwrap();
+        assert_eq!(ty, Type::int());
     }
 
     #[test]

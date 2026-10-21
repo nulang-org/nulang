@@ -1062,10 +1062,19 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
             fmt_expr(out, expr, indent, had_unhandled);
             out.push_str(&format!(" :cap {:?})", cap));
         }
-        Expr::TypeAnnotate { expr, ty, .. } => {
+        Expr::TypeAnnotate {
+            expr,
+            ty,
+            preserve_inferred,
+            ..
+        } => {
             out.push_str("(");
             fmt_expr(out, expr, indent, had_unhandled);
-            out.push_str(&format!(": {})", fmt_type(ty)));
+            if *preserve_inferred {
+                out.push_str(&format!(" satisfies {})", fmt_type(ty)));
+            } else {
+                out.push_str(&format!(": {})", fmt_type(ty)));
+            }
         }
         Expr::Defer {
             expr, error_only, ..
@@ -1225,6 +1234,14 @@ mod tests {
             once, twice,
             "formatting must be idempotent\n--- once ---\n{once}\n--- twice ---\n{twice}"
         );
+    }
+
+    #[test]
+    fn test_fmt_satisfies_roundtrips() {
+        let src = "fn main() { let value = (1 + 2) satisfies Int; value }";
+        let out = format_source(src).expect("satisfies expression formats");
+        assert!(out.contains("satisfies Int"), "contract syntax lost: {out}");
+        assert_idempotent(src);
     }
 
     #[test]

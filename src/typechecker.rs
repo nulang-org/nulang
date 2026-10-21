@@ -2101,13 +2101,17 @@ impl TypeChecker {
             // Recover expression: recover { body } — isolated scope
             Expr::Recover { body, .. } => self.infer_expr(ctx, body),
             // Type annotation
-            Expr::TypeAnnotate { expr, ty, span } => {
+            Expr::TypeAnnotate {
+                expr,
+                ty,
+                preserve_inferred,
+                span,
+            } => {
                 let (s1, inferred) = self.infer_expr(ctx, expr)?;
                 let s2 = mgu_assignable(&apply_subst(&inferred, &s1), ty, *span)?;
-                Ok((
-                    compose_subst(&s2, &s1),
-                    apply_subst(ty, &compose_subst(&s2, &s1)),
-                ))
+                let subst = compose_subst(&s2, &s1);
+                let checked_ty = if *preserve_inferred { &inferred } else { ty };
+                Ok((subst.clone(), apply_subst(checked_ty, &subst)))
             }
 
             // Pipe operator: x |> f  ===  f(x), and x |> f(a, b) === f(x, a, b)
@@ -4910,6 +4914,7 @@ mod tests {
         let expr = Expr::TypeAnnotate {
             expr: Box::new(int_lit(42)),
             ty: Type::int(),
+            preserve_inferred: false,
             span: sp(),
         };
         let (s, ty) = tc.infer_expr(&ctx, &expr).unwrap();
@@ -4924,10 +4929,67 @@ mod tests {
         let expr = Expr::TypeAnnotate {
             expr: Box::new(int_lit(42)),
             ty: Type::bool(),
+            preserve_inferred: false,
             span: sp(),
         };
         let result = tc.infer_expr(&ctx, &expr);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_satisfies_retains_inferred_record_type() {
+        let mut checker = TypeChecker::new();
+        let ctx = TypeContext::new();
+        let expr = Expr::TypeAnnotate {
+            expr: Box::new(record(vec![("id", int_lit(42)), ("active", bool_lit(true))])),
+            ty: Type::Record(vec![
+                ("id".to_string(), Type::int()),
+                ("active".to_string(), Type::bool()),
+            ]),
+            preserve_inferred: true,
+            span: sp(),
+        };
+        let (subst, inferred) = checker.infer_expr(&ctx, &expr).unwrap();
+        assert_eq!(
+            apply_subst(&inferred, &subst),
+            Type::Record(vec![
+                ("id".to_string(), Type::int()),
+                ("active".to_string(), Type::bool()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_satisfies_retains_concrete_actor_protocol_type() {
+        // A contract check against ActorRef[P] must not attenuate the value
+        // into ActorRef[P]: the concrete actor type remains available.
+        let concrete = Type::Actor {
+            state: Box::new(Type::unit()),
+            behavior: Box::new(Type::Record(vec![])),
+        };
+        let ctx = ctx_with("worker", concrete.clone());
+        let expr = Expr::TypeAnnotate {
+            expr: Box::new(var("worker")),
+            ty: Type::actor_ref(Type::Record(vec![])),
+            preserve_inferred: true,
+            span: sp(),
+        };
+        let mut checker = TypeChecker::new();
+        let (subst, inferred) = checker.infer_expr(&ctx, &expr).unwrap();
+        assert_eq!(apply_subst(&inferred, &subst), concrete);
+    }
+
+    #[test]
+    fn test_satisfies_rejects_non_assignable_contract() {
+        let mut checker = TypeChecker::new();
+        let ctx = TypeContext::new();
+        let expr = Expr::TypeAnnotate {
+            expr: Box::new(int_lit(42)),
+            ty: Type::bool(),
+            preserve_inferred: true,
+            span: sp(),
+        };
+        assert!(checker.infer_expr(&ctx, &expr).is_err());
     }
 
     // -----------------------------------------------------------------------

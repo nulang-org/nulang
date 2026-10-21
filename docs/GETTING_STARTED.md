@@ -114,6 +114,28 @@ perform String.length("\u{41}")     // 1  ('A')
 let pi: Int = 3
 ```
 
+### Inferred-Type-Preserving Contract Checks (Experimental)
+
+Use `satisfies` to verify that an expression is assignable to a declared
+type **without replacing its inferred result type**:
+
+```nula
+let port = (8000 + 80) satisfies Int
+let checked = { id: 42, active: true } satisfies { id: Int, active: Bool }
+```
+
+A failing check is a compile-time error. The check performs no runtime cast,
+does not suppress effect or reference-capability checks, and uses Nulang's
+existing assignability rules (which require exact field sets for closed
+record types, unlike TypeScript's excess-property behavior).
+
+A discarded binding with an annotation is also checked:
+
+```nula
+let _: Int = 42  // valid
+// let _: Bool = 42  // compile-time type error
+```
+
 ## 5. Functions, Closures & Recursion
 
 Functions are values. Use `fn(params) { body }` for closures. Multi-argument

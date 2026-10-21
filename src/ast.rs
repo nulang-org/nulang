@@ -275,10 +275,13 @@ pub enum Expr {
         cap: Capability,
         span: Span,
     },
-    /// Type annotation: expr : Type
+    /// Type annotation (`expr : Type`) or an inferred-type-preserving
+    /// contract check (`expr satisfies Type`). Both erase during lowering.
     TypeAnnotate {
         expr: Box<Expr>,
         ty: Type,
+        /// Validate the contract while preserving the expression's inferred type.
+        preserve_inferred: bool,
         span: Span,
     },
     /// Pipe: x |> f
