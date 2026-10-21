@@ -14,10 +14,25 @@ use std::io::Read;
 /// Construct a shared, explicitly verified HTTP transport for registry/deploy.
 /// ureq 2 native TLS uses OS trust, not obsolete bundled root certificates.
 #[cfg(feature = "ureq")]
-pub(crate) fn verified_https_agent() -> Result<ureq::Agent, String> {
+pub(crate) fn verified_https_agent(target_url: &str) -> Result<ureq::Agent, String> {
+    let (scheme, authority) = target_url
+        .split_once("://")
+        .ok_or_else(|| "registry/deploy URL must specify http:// or https://".to_string())?;
+    if authority.is_empty() {
+        return Err("registry/deploy URL must include a host".to_string());
+    }
+    let https_only = if scheme.eq_ignore_ascii_case("https") {
+        true
+    } else if scheme.eq_ignore_ascii_case("http") {
+        false // Preserve explicitly configured local/development HTTP endpoints.
+    } else {
+        return Err("registry/deploy URL must specify http:// or https://".to_string());
+    };
+
     let connector = native_tls::TlsConnector::new()
         .map_err(|e| format!("system TLS initialization failed: {}", e))?;
     Ok(ureq::AgentBuilder::new()
+        .https_only(https_only)
         .tls_connector(std::sync::Arc::new(connector))
         .build())
 }
@@ -47,7 +62,7 @@ impl RegistryClient {
         #[cfg(feature = "ureq")]
         {
             let url = format!("{}/api/v1/packages/{}/{}", self.base_url(), name, version);
-            let agent = verified_https_agent()?;
+            let agent = verified_https_agent(&url)?;
             let request = match &self.token {
                 Some(token) => agent
                     .put(&url)
@@ -71,7 +86,7 @@ impl RegistryClient {
         #[cfg(feature = "ureq")]
         {
             let url = format!("{}/api/v1/packages/{}/{}", self.base_url(), name, version);
-            match verified_https_agent()?.get(&url).call() {
+            match verified_https_agent(&url)?.get(&url).call() {
                 Ok(response) => {
                     let mut bytes = Vec::new();
                     response
@@ -95,7 +110,7 @@ impl RegistryClient {
         #[cfg(feature = "ureq")]
         {
             let url = format!("{}/api/v1/packages/{}", self.base_url(), name);
-            match verified_https_agent()?.get(&url).call() {
+            match verified_https_agent(&url)?.get(&url).call() {
                 Ok(response) => {
                     let text = response.into_string().map_err(|e| e.to_string())?;
                     Self::parse_versions(&text)
