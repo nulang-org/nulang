@@ -263,10 +263,20 @@ impl UiDocument {
             if node.kind.trim().is_empty() {
                 return Err(ProtocolError::EmptyNodeKind(node.id.clone()));
             }
+            // A renderer must never have to guess which action handles one event.
+            // Different events on the same node and the same event on different
+            // nodes are permitted.
+            let mut action_events = BTreeSet::new();
             for binding in &node.actions {
                 require_id("action_id", binding.action_id.as_str())?;
                 if binding.event.trim().is_empty() {
                     return Err(ProtocolError::EmptyActionEvent(node.id.clone()));
+                }
+                if !action_events.insert(binding.event.as_str()) {
+                    return Err(ProtocolError::DuplicateActionEvent {
+                        node: node.id.clone(),
+                        event: binding.event.clone(),
+                    });
                 }
             }
             if nodes.insert(node.id.clone(), node).is_some() {
@@ -567,6 +577,10 @@ pub enum ProtocolError {
     EmptyIdentifier(&'static str),
     EmptyNodeKind(NodeId),
     EmptyActionEvent(NodeId),
+    DuplicateActionEvent {
+        node: NodeId,
+        event: String,
+    },
     DuplicateNode(NodeId),
     MissingNode(NodeId),
     DanglingChild {
@@ -603,6 +617,9 @@ impl fmt::Display for ProtocolError {
             Self::EmptyIdentifier(field) => write!(f, "{field} must not be empty"),
             Self::EmptyNodeKind(node) => write!(f, "node {node} has an empty kind"),
             Self::EmptyActionEvent(node) => write!(f, "node {node} has an empty action event"),
+            Self::DuplicateActionEvent { node, event } => {
+                write!(f, "node {node} has duplicate action event {event:?}")
+            }
             Self::DuplicateNode(node) => write!(f, "duplicate node id {node}"),
             Self::MissingNode(node) => write!(f, "node {node} does not exist"),
             Self::DanglingChild { parent, child } => {

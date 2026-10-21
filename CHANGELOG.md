@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Renderer-neutral UI action event uniqueness — 2026-10-21
+- **A semantic UI node can no longer bind the same event to multiple action handlers.** The shared `nulang-ui/1` validator rejects ambiguous per-node events, avoiding divergent handler selection between DOM, SwiftUI, and future Compose hosts. Different events on one node and the same event on different nodes remain valid.
+- **Atomic UI patches preserve the last valid document and revision** when a `ReplaceActions` operation would introduce a duplicate binding. Public protocol regressions cover rejection, unchanged state, and accepted disjoint events. The wire format and protocol version remain unchanged.
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
