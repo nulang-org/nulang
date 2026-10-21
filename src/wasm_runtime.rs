@@ -633,6 +633,21 @@ fn read_wasm_string(mut caller: &mut Caller<'_, HostState>, v: i64) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// Permit only return values whose representation has meaning in a WASM
+/// guest without borrowing a host address. Native pointers require a separate
+/// copy-to-guest-memory or opaque-handle contract, neither of which this ABI
+/// currently provides. Rejection must occur before symbol resolution/invocation,
+/// otherwise a C string result could leak its temporary host-side CString.
+fn wasm_ffi_return_supported(ret: crate::ffi::marshal::CType) -> Result<(), &'static str> {
+    use crate::ffi::marshal::CType;
+    match ret {
+        CType::CStr | CType::VoidPtr => {
+            Err("WASM FFI cannot return native host pointers without a guest-memory ownership contract")
+        }
+        CType::I64 | CType::F64 | CType::Bool | CType::Unit | CType::Value => Ok(()),
+    }
+}
+
 /// `env.ffi_call_N(lib, sym, sig, arg0..argN-1) -> i64`
 ///
 /// Invoke a foreign C function from WASM. `lib`/`sym` are TAG_STRING constants
@@ -656,6 +671,10 @@ fn host_ffi_call_impl(
         params.push(crate::jit::runtime::aot_ctype_from_tag(tag));
     }
     let ret = crate::jit::runtime::aot_ctype_from_tag(ret_tag);
+    // Host addresses are not offsets into guest linear memory. Fail before
+    // resolving or invoking native code, rather than returning unusable tagged
+    // pointers (and leaking C-string temporaries) to the guest.
+    wasm_ffi_return_supported(ret).map_err(Error::msg)?;
     let signature = crate::ffi::marshal::Signature::new(params.clone(), ret);
     let func = {
         let registry = crate::ffi::native::FFI_REGISTRY
@@ -1079,6 +1098,28 @@ pub fn load_precompiled(cwasm_bytes: &[u8]) -> NuResult<WasmRuntime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wasm_ffi_rejects_return_types_with_host_pointer_provenance() {
+        use crate::ffi::marshal::CType;
+        for kind in [CType::CStr, CType::VoidPtr] {
+            assert!(
+                wasm_ffi_return_supported(kind).is_err(),
+                "WASM guest cannot safely receive a host pointer from {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wasm_ffi_keeps_scalar_return_types_supported() {
+        use crate::ffi::marshal::CType;
+        for kind in [CType::I64, CType::F64, CType::Bool, CType::Unit, CType::Value] {
+            assert!(
+                wasm_ffi_return_supported(kind).is_ok(),
+                "{kind:?} has no inherent pointer result"
+            );
+        }
+    }
 
     #[test]
     fn guest_non_pointer_value_rejects_host_pointer_tag() {
