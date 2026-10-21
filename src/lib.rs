@@ -36,6 +36,7 @@ pub mod core_vm;
 pub mod cranelift_utils;
 pub mod crdt_peer_sync;
 pub mod dap;
+pub mod dataflow;
 pub mod database;
 pub mod diagnostic;
 #[cfg(feature = "native-codegen")]
