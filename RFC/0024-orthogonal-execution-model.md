@@ -28,7 +28,7 @@ Durability and identity are orthogonal to those domains. They are not actor spec
       +-- reference capabilities
       +-- external authority
       |
-      +-- persistence: ephemeral | durable | event-sourced | replicated
+      +-- state: durability x history x replication
       +-- identity: anonymous | scoped | runtime | stable
       +-- placement/activation policy
 
@@ -96,14 +96,17 @@ An actor provides:
 
 Actors coordinate independently evolving state. They are not required merely to achieve parallelism.
 
-### 4. Persistence is orthogonal
+### 4. State policies are orthogonal
 
-Persistence semantics are a separate axis:
+State semantics compose three independent dimensions:
 
-- ephemeral;
-- durable;
-- event-sourced;
-- replicated, for explicit convergence models such as CRDT-backed state.
+- **Durability:** ephemeral or durable;
+- **History:** current state or event-sourced history;
+- **Replication:** local or explicitly replicated.
+
+For example, an entity may be both durable, event-sourced, and replicated.
+Replication by itself does not establish consistency or convergence guarantees:
+those depend on an explicitly chosen runtime/backend policy.
 
 Examples:
 
@@ -222,15 +225,17 @@ No claim of parallel execution should be made until that phase lands.
 
 ## Runtime semantic vocabulary
 
-Phase 1 introduces representation-independent enums in src/primitives.rs:
+Phase 1 provides representation-independent semantic types in src/primitives.rs:
 
 - ExecutionDomain;
-- PersistenceSemantics;
+- Durability, HistorySemantics, and ReplicationSemantics;
+- PersistenceSemantics (their composable, non-serialized policy);
 - IdentitySemantics;
 - ActorActivation;
 - ExecutionSemantics.
 
-They are intentionally not serialized yet.
+These are intentionally not serialized yet. The decomposition does not change
+source-level entity defaults, persisted metadata, or runtime guarantees.
 
 The pre-existing RuntimePrimitive enum remains as the RFC 0017 actor-runtime subsystem vocabulary. It no longer defines the complete language ontology.
 

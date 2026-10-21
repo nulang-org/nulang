@@ -33,6 +33,12 @@ The compiler implements Hindley-Milner inference, row-polymorphic algebraic
 effects, variants/records, and Pony-inspired reference capabilities
 (`iso`, `lineariso`, `trn`, `ref`, `val`, `box`, `tag`).
 
+The non-serialized semantic vocabulary in `src/primitives.rs` represents
+state durability, current-state versus event-sourced history, and replication
+as independent properties. This is representation-level groundwork only:
+existing entities/workflows are not reinterpreted, and runtime/persistence
+guarantees are unchanged.
+
 ## Compiler and execution backends
 
 | Backend | Current role | Status boundary |
