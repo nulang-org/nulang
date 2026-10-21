@@ -707,7 +707,11 @@ impl MirCodegen {
             }
         }
 
-        // Build handler tables: offsets become module-absolute.
+        // Build handler tables: offsets become module-absolute. The MIR
+        // HandlerRef indices used by PerformDirect are function-local, while
+        // Handle installs the module-global table index assigned here. Keep
+        // the mapping so both opcodes address the same handler table.
+        let mut global_handler_tables = vec![None; func.handler_tables.len()];
         for (instr_idx, table_idx) in handle_patches {
             let def = &func.handler_tables[table_idx];
             let mut bindings = Vec::with_capacity(def.bindings.len());
@@ -742,6 +746,27 @@ impl MirCodegen {
                 ));
             }
             self.module.instructions[instr_idx].op1 = global_idx as u8;
+            global_handler_tables[table_idx] = Some(global_idx as u8);
+        }
+
+        // PerformDirect was emitted before the module-global handler table
+        // indices were assigned. Patch its local index now, just as Handle
+        // is patched above. Never silently dispatch to another function's
+        // table when a local index has no installed handler.
+        for instr in &mut self.module.instructions {
+            if instr.opcode == OpCode::PerformDirect {
+                let local_table_idx = instr.op1 as usize;
+                instr.op1 = global_handler_tables
+                    .get(local_table_idx)
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| {
+                        compile_err(
+                            "internal: PerformDirect references an uninstalled handler table",
+                            Span::default(),
+                        )
+                    })?;
+            }
         }
 
         let mut function_code = Vec::new();
@@ -1104,11 +1129,26 @@ impl MirCodegen {
                 self.record_effect_site(effect_pc, effect_site, &effect_operation)?;
                 if let Some(href) = resolved_handler {
                     // Statically-resolved handler — emit PerformDirect with
-                    // table and binding indices, skipping the string lookup.
+                    // function-local table and binding indices. The table
+                    // index is remapped to its module-global index after
+                    // handler tables are built. Reject values that cannot
+                    // fit the bytecode operands instead of truncating them.
+                    let local_table_idx = u8::try_from(href.table_index).map_err(|_| {
+                        compile_err(
+                            "too many function-local effect handler tables for PerformDirect",
+                            Span::default(),
+                        )
+                    })?;
+                    let binding_idx = u8::try_from(href.binding_index).map_err(|_| {
+                        compile_err(
+                            "too many effect handler bindings for PerformDirect",
+                            Span::default(),
+                        )
+                    })?;
                     self.emit(Instruction::new3(
                         OpCode::PerformDirect,
-                        href.table_index as u8,
-                        href.binding_index as u8,
+                        local_table_idx,
+                        binding_idx,
                         dst,
                     ));
                 } else {

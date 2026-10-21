@@ -2324,9 +2324,10 @@ pub struct HandlerFrame {
 ///
 /// A single-shot handler resumes the continuation at most once.
 /// Instead of deep-cloning every frame into a heap-allocated
-/// `Continuation`, we snapshot only the current frame's registers
-/// and restore them on `Resume`.  This avoids a `Vec<Frame>`
-/// allocation (~few hundred bytes + per-frame metadata).
+/// `Continuation`, we snapshot the current frame's registers and spill
+/// slots and restore them on `Resume`. Register-only frames allocate
+/// nothing; frames with spills must clone their spill storage to preserve
+/// continuation semantics.
 #[derive(Debug, Clone)]
 pub struct SingleShotState {
     /// PC after the `PerformDirect` instruction (the continuation point).
@@ -2337,6 +2338,10 @@ pub struct SingleShotState {
     pub step_count: usize,
     /// Snapshot of the current frame's registers at the perform site.
     pub regs: [Value; 256],
+    /// Spill slots belong to the captured frame too. Handler code can write
+    /// to these slots before resuming; they must not leak into the resumed
+    /// computation.
+    pub spilled: Vec<Value>,
 }
 
 impl HandlerFrame {
@@ -4230,17 +4235,15 @@ impl VM {
         self.handler_stack[hf_idx].resume_dst = binding.result_reg;
 
         if binding.single_shot {
-            // Fast path: snapshot registers inline — no heap allocation.
+            // Fast path: register-only frames snapshot inline without allocation.
+            // Spill slots are cloned only when the function actually has them.
             let frame = &self.frames[frame_idx];
-            let mut regs = [Value::nil(); 256];
-            for (i, r) in frame.regs.iter().enumerate() {
-                regs[i] = *r;
-            }
             self.handler_stack[hf_idx].single_shot_state = Some(SingleShotState {
                 resume_pc: frame.pc,
                 resume_dst: dst_reg,
                 step_count: self.step_count,
-                regs,
+                regs: frame.regs,
+                spilled: frame.spilled.clone(),
             });
         } else {
             let cont = Continuation::capture(self, dst_reg).ok_or_else(|| NuError::VMError {
@@ -5780,31 +5783,23 @@ impl VM {
             }
             OpCode::Resume => {
                 let val = frame.regs[instr.op1 as usize];
-                // The continuation lives on the innermost *matching* handler
-                // frame (Perform uses rposition), which is not necessarily the
-                // top of the stack when nested handlers bind different effects.
-                // Check single-shot state first — no heap allocation needed.
-                if let Some(hf) = self
-                    .handler_stack
-                    .iter_mut()
-                    .rev()
-                    .find(|hf| hf.single_shot_state.is_some())
-                {
-                    if let Some(state) = hf.single_shot_state.take() {
+                // Resume the innermost outstanding continuation, regardless
+                // of its representation. Checking every single-shot state
+                // before every general capture can incorrectly resume an
+                // outer effect while an inner general handler is active.
+                let handler_idx = self.handler_stack.iter().rposition(|hf| {
+                    hf.single_shot_state.is_some() || hf.captured_continuation.is_some()
+                });
+                if let Some(idx) = handler_idx {
+                    if let Some(state) = self.handler_stack[idx].single_shot_state.take() {
                         frame.regs = state.regs;
+                        frame.spilled = state.spilled;
                         frame.regs[state.resume_dst as usize] = val;
                         frame.pc = state.resume_pc;
                         self.step_count = state.step_count;
                         return Ok(());
                     }
-                }
-                if let Some(hf) = self
-                    .handler_stack
-                    .iter_mut()
-                    .rev()
-                    .find(|hf| hf.captured_continuation.is_some())
-                {
-                    if let Some(cont) = hf.captured_continuation.take() {
+                    if let Some(cont) = self.handler_stack[idx].captured_continuation.take() {
                         cont.restore(self, val);
                         return Ok(());
                     }
