@@ -87,6 +87,9 @@ pub use trace::TraceContext;
 mod cluster_dst;
 
 #[cfg(test)]
+mod cluster_dst_trace_tests;
+
+#[cfg(test)]
 mod cluster_sim;
 
 #[cfg(test)]
@@ -385,9 +388,8 @@ pub struct Runtime {
     pub cluster_config: ClusterConfig,
     // Acknowledged packet sequence numbers (transport-level reliability).
     pub acked_packets: HashSet<u64>,
-    /// Acknowledged packet sequences keyed by the peer that sent the ACK.
-    /// This prevents a sequence collision from another node from satisfying
-    /// a readiness probe for the wrong peer.
+    /// Peer-bound transport acknowledgements prevent unrelated ACKs from
+    /// satisfying a post-recovery readiness probe.
     pub(crate) acked_packets_by_peer: HashSet<(u64, u64)>,
 
     // Cross-node supervision (RFC 0012)
@@ -7400,7 +7402,7 @@ impl Runtime {
     pub fn is_acked(&self, seq: u64) -> bool {
         distribution::is_acked(self, seq)
     }
-    /// Check whether a specific peer acknowledged a packet sequence.
+    /// Require the acknowledgment to originate from the intended peer.
     pub(crate) fn is_acked_from(&self, peer: NodeId, seq: u64) -> bool {
         distribution::is_acked_from(self, peer, seq)
     }
