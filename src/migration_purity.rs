@@ -18,6 +18,7 @@ struct FunctionInfo<'a> {
 
 struct MigrationPurityChecker<'a> {
     functions: HashMap<String, FunctionInfo<'a>>,
+    ambiguous_functions: HashSet<String>,
     externs: HashSet<String>,
     visiting: Vec<String>,
 }
@@ -26,6 +27,7 @@ impl<'a> MigrationPurityChecker<'a> {
     fn new(decls: &'a [Decl]) -> Self {
         let mut checker = Self {
             functions: HashMap::new(),
+            ambiguous_functions: HashSet::new(),
             externs: HashSet::new(),
             visiting: Vec::new(),
         };
@@ -40,6 +42,11 @@ impl<'a> MigrationPurityChecker<'a> {
                 Decl::Function {
                     name, params, body, ..
                 } => {
+                    // Unqualified lookup cannot safely identify which module
+                    // helper executes when names collide.
+                    if self.functions.contains_key(name) {
+                        self.ambiguous_functions.insert(name.clone());
+                    }
                     self.functions.insert(
                         name.clone(),
                         FunctionInfo {
@@ -91,7 +98,14 @@ impl<'a> MigrationPurityChecker<'a> {
         )
     }
 
-    fn expand_function(&mut self, scope: &str, name: &str) -> NuResult<()> {
+    fn expand_function(&mut self, scope: &str, name: &str, span: Span) -> NuResult<()> {
+        if self.ambiguous_functions.contains(name) {
+            return Err(self.forbidden(
+                scope,
+                &format!("ambiguous migration helper '{name}'"),
+                span,
+            ));
+        }
         if self.visiting.iter().any(|n| n == name) {
             return Ok(());
         }
@@ -127,8 +141,17 @@ impl<'a> MigrationPurityChecker<'a> {
                 for arg in args {
                     self.walk(scope, arg, bound)?;
                 }
-                if let Expr::Var(name, _) = func.as_ref() {
-                    if !bound.iter().any(|b| b == name) {
+                match func.as_ref() {
+                    Expr::Var(name, _) => {
+                        // A bound function variable can conceal an effectful
+                        // callback; only statically named functions are expanded.
+                        if bound.iter().any(|b| b == name) {
+                            return Err(self.forbidden(
+                                scope,
+                                &format!("indirect call through '{name}'"),
+                                *span,
+                            ));
+                        }
                         if self.externs.contains(name) {
                             return Err(self.forbidden(
                                 scope,
@@ -136,7 +159,13 @@ impl<'a> MigrationPurityChecker<'a> {
                                 *span,
                             ));
                         }
-                        self.expand_function(scope, name)?;
+                        self.expand_function(scope, name, *span)?;
+                    }
+                    Expr::Lambda { .. } => {
+                        // The inline lambda body was recursively checked above.
+                    }
+                    _ => {
+                        return Err(self.forbidden(scope, "unresolved callable expression", *span));
                     }
                 }
                 Ok(())
@@ -234,9 +263,41 @@ impl<'a> MigrationPurityChecker<'a> {
                 self.walk(scope, arr, bound)?;
                 self.walk(scope, idx, bound)
             }
-            Expr::Binary { left, right, .. } | Expr::Pipe { left, right, .. } => {
+            Expr::Binary { left, right, .. } => {
                 self.walk(scope, left, bound)?;
                 self.walk(scope, right, bound)
+            }
+            Expr::Pipe { left, right, span } => {
+                self.walk(scope, left, bound)?;
+                self.walk(scope, right, bound)?;
+                // A pipe invokes its right-hand function; merely walking the
+                // callee expression does not inspect its function body.
+                match right.as_ref() {
+                    Expr::Var(name, _) => {
+                        if bound.iter().any(|b| b == name) {
+                            return Err(self.forbidden(
+                                scope,
+                                &format!("indirect pipe call through '{name}'"),
+                                *span,
+                            ));
+                        }
+                        if self.externs.contains(name) {
+                            return Err(self.forbidden(
+                                scope,
+                                &format!("external/FFI pipe call '{name}'"),
+                                *span,
+                            ));
+                        }
+                        self.expand_function(scope, name, *span)?;
+                    }
+                    Expr::Lambda { .. } => {
+                        // The inline lambda body was recursively checked above.
+                    }
+                    _ => {
+                        return Err(self.forbidden(scope, "unresolved callable expression", *span));
+                    }
+                }
+                Ok(())
             }
             Expr::Assign { target, value, .. } => {
                 self.walk(scope, target, bound)?;
@@ -365,6 +426,146 @@ mod tests {
             "#,
         );
         assert!(check_module(&ast.decls).is_err());
+    }
+
+    #[test]
+    fn rejects_effectful_callback_hidden_behind_helper_parameter() {
+        let ast = parse(
+            r#"
+            fn call_callback(callback) { callback() }
+            fn noisy() { perform IO.print("side effect") }
+            entity Account {
+                version: 2
+                state balance: Int = 0
+                events | Changed(value: Int)
+                migration from 1 to 2 {
+                    state => { call_callback(noisy) }
+                }
+            }
+            "#,
+        );
+        let err = check_module(&ast.decls).unwrap_err().to_string();
+        assert!(err.contains("migration 1 -> 2"));
+        assert!(err.contains("indirect call through 'callback'"));
+    }
+
+    #[test]
+    fn permits_direct_pure_named_helper() {
+        let ast = parse(
+            r#"
+            fn twice(x: Int) { x + x }
+            entity Account {
+                version: 2
+                state balance: Int = 0
+                events | Changed(value: Int)
+                migration from 1 to 2 {
+                    state => { twice(2) }
+                }
+            }
+            "#,
+        );
+        assert!(check_module(&ast.decls).is_ok());
+    }
+
+    #[test]
+    fn rejects_effect_hidden_behind_pipe_to_named_helper() {
+        let ast = parse(
+            r#"
+            fn noisy(x: Int) { perform IO.print("effect"); x }
+            entity Account {
+                version: 2
+                state balance: Int = 0
+                events | Changed(value: Int)
+                migration from 1 to 2 {
+                    state => { 1 |> noisy }
+                }
+            }
+            "#,
+        );
+        let err = check_module(&ast.decls).unwrap_err().to_string();
+        assert!(err.contains("perform IO.print"));
+    }
+
+    #[test]
+    fn permits_pipe_to_pure_named_helper() {
+        let ast = parse(
+            r#"
+            fn twice(x: Int) { x + x }
+            entity Account {
+                version: 2
+                state balance: Int = 0
+                events | Changed(value: Int)
+                migration from 1 to 2 {
+                    state => { 2 |> twice }
+                }
+            }
+            "#,
+        );
+        assert!(check_module(&ast.decls).is_ok());
+    }
+
+    #[test]
+    fn rejects_unknown_method_callback_during_migration() {
+        let ast = parse(
+            r#"
+            fn call_member(holder) { holder.run() }
+            fn noisy() { perform IO.print("side effect") }
+            entity Account {
+                version: 2
+                state balance: Int = 0
+                events | Changed(value: Int)
+                migration from 1 to 2 {
+                    state => { call_member({ run: noisy }) }
+                }
+            }
+            "#,
+        );
+        let err = check_module(&ast.decls).unwrap_err().to_string();
+        assert!(err.contains("unresolved callable expression"));
+    }
+
+    #[test]
+    fn rejects_unknown_pipe_target_during_migration() {
+        let ast = parse(
+            r#"
+            fn call_member(holder) { 1 |> holder.run }
+            fn noisy(x: Int) { perform IO.print("side effect"); x }
+            entity Account {
+                version: 2
+                state balance: Int = 0
+                events | Changed(value: Int)
+                migration from 1 to 2 {
+                    state => { call_member({ run: noisy }) }
+                }
+            }
+            "#,
+        );
+        let err = check_module(&ast.decls).unwrap_err().to_string();
+        assert!(err.contains("unresolved callable expression"));
+    }
+
+    #[test]
+    fn rejects_ambiguous_same_named_helpers_across_modules() {
+        let ast = parse(
+            r#"
+            module Alpha {
+                fn helper() { perform IO.print("unsafe") }
+                entity Account {
+                    version: 2
+                    state balance: Int = 0
+                    events | Changed(value: Int)
+                    migration from 1 to 2 {
+                        state => { helper() }
+                    }
+                }
+            }
+            module Beta {
+                fn helper() { 1 }
+            }
+            "#,
+        );
+        let err = check_module(&ast.decls).unwrap_err().to_string();
+        assert!(err.contains("ambiguous migration helper 'helper'"));
     }
 
     #[test]
