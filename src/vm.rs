@@ -8509,8 +8509,7 @@ mod vm_tests {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
 
-        let identity =
-            rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let identity = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
         let key: PrivateKeyDer<'static> =
             PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der()).into();
         let config = Arc::new(
@@ -8529,8 +8528,12 @@ mod vm_tests {
             loop {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-                        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        stream
+                            .set_write_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
                         let mut tls = rustls::ServerConnection::new(config.clone()).unwrap();
                         return tls.complete_io(&mut stream).is_err();
                     }
