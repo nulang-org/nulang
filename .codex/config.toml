@@ -1,0 +1,7 @@
+# Optional local-first graph for Rust/Cargo navigation. Requires the separately installed
+# MIT-licensed codebase-memory-mcp binary on PATH; no installer runs in CI.
+# rust-analyzer and the native Nulang LSP remain authoritative semantic tools.
+[mcp_servers.codebase-memory-mcp]
+command = "codebase-memory-mcp"
+args = []
+enabled = true
