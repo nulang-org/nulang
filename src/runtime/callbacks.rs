@@ -421,14 +421,16 @@ pub(crate) fn perform_web_builtin(
             let url = resolve(constants, *regs.first()?);
             if crate::runtime::http_server::register_explicit_http_redirect(&url) {
                 Some(callbacks.alloc_string(""))
-            } else {
-                // Preserve the non-HTTP fallback, but never interpolate a raw
-                // URL into an HTML attribute.
+            } else if crate::runtime::http_server::valid_explicit_redirect_target(&url) {
+                // Non-HTTP rendering keeps a safe, escaped local fallback.
                 let out = format!(
                     "<html><head><meta http-equiv=\"refresh\" content=\"0;url={}\"></head></html>",
                     html_escape(&url)
                 );
                 Some(callbacks.alloc_string(&out))
+            } else {
+                // Do not generate scriptable meta refreshes outside HTTP.
+                Some(callbacks.alloc_string(""))
             }
         }
         Some("respond_json") | Some("respond_text") => {
