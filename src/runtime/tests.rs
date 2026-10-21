@@ -5132,10 +5132,32 @@ fn pump_until_addresses_converge(
         if converged {
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "cluster addresses did not converge to real listen addresses within the timeout"
-        );
+        if Instant::now() >= deadline {
+            // Failure-only snapshot: report every unresolved observer/peer
+            // address pair. Membership can be Healthy while its advertised
+            // address still points at an ephemeral heartbeat source port.
+            let mut unresolved = Vec::new();
+            for rt in nodes.iter() {
+                let observer = rt.distributed.node_id.unwrap();
+                let cluster = rt.distributed.cluster.as_ref().unwrap();
+                for &(peer_id, expected) in listen {
+                    if peer_id == observer {
+                        continue;
+                    }
+                    let observed = cluster.get_node(peer_id).map(|peer| (peer.address, peer.status));
+                    if observed.map(|(address, _)| address) != Some(expected) {
+                        unresolved.push(format!(
+                            "observer={:?} peer={:?} expected={} observed={:?}",
+                            observer, peer_id, expected, observed
+                        ));
+                    }
+                }
+            }
+            panic!(
+                "cluster addresses did not converge to real listen addresses within the timeout: {}",
+                unresolved.join("; ")
+            );
+        }
         sleep(Duration::from_millis(50));
     }
 }
