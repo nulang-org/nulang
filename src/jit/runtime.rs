@@ -368,20 +368,32 @@ pub extern "C" fn nulang_ineg_nil0(a: u64) -> u64 {
 
 #[no_mangle]
 pub extern "C" fn nulang_fdiv(a: u64, b: u64) -> u64 {
-    let bv = f64::from_bits(b);
+    // Mirror VM::run_from FDiv: tagged/nil numerators coerce to 0.0,
+    // while tagged/nil divisors coerce to 1.0. An actual float zero
+    // divisor still produces nil.
+    let bv = if is_float_raw(b) {
+        f64::from_bits(b)
+    } else {
+        1.0
+    };
     if bv == 0.0 {
         return Value::nil().as_raw();
     }
-    Value::float(f64::from_bits(a) / bv).as_raw()
+    Value::float(fval(a) / bv).as_raw()
 }
 
 #[no_mangle]
 pub extern "C" fn nulang_fmod(a: u64, b: u64) -> u64 {
-    let bv = f64::from_bits(b);
+    // Keep FMod consistent with the interpreter's asymmetric defaults.
+    let bv = if is_float_raw(b) {
+        f64::from_bits(b)
+    } else {
+        1.0
+    };
     if bv == 0.0 {
         return Value::nil().as_raw();
     }
-    Value::float(f64::from_bits(a) % bv).as_raw()
+    Value::float(fval(a) % bv).as_raw()
 }
 
 #[no_mangle]
@@ -2117,6 +2129,45 @@ pub unsafe extern "C" fn nulang_aot_receive_pop() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_native_float_division_coerces_nil_like_interpreter() {
+        use crate::vm::Value;
+
+        let nil = Value::nil().as_raw();
+        let zero = Value::float(0.0).as_raw();
+        let negative_zero = Value::float(-0.0).as_raw();
+        let four = Value::float(4.0).as_raw();
+        let hundred_one = Value::float(101.0).as_raw();
+
+        // Regression from the October 15 differential fuzz campaign:
+        // 101.0 / 0.00 / 4.0 must yield Float(0), not nil.
+        let first = super::nulang_fdiv(hundred_one, zero);
+        assert_eq!(first, nil);
+        let second = super::nulang_fdiv(first, four);
+        assert_eq!(unsafe { Value::from_raw(second) }.as_float(), Some(0.0));
+
+        // FDiv defaults a non-float numerator to 0.0 and a non-float
+        // divisor to 1.0, but an actual zero float divisor yields nil.
+        assert_eq!(super::nulang_fdiv(four, nil), four);
+        assert_eq!(super::nulang_fdiv(four, negative_zero), nil);
+        assert_eq!(super::nulang_fdiv(nil, nil), zero);
+    }
+
+    #[test]
+    fn test_native_float_modulo_coerces_nil_like_interpreter() {
+        use crate::vm::Value;
+
+        let nil = Value::nil().as_raw();
+        let zero = Value::float(0.0).as_raw();
+        let two = Value::float(2.0).as_raw();
+        let seven = Value::float(7.0).as_raw();
+
+        assert_eq!(super::nulang_fmod(seven, zero), nil);
+        assert_eq!(super::nulang_fmod(seven, nil), zero);
+        assert_eq!(super::nulang_fmod(nil, two), zero);
+        assert_eq!(super::nulang_fmod(nil, nil), zero);
+    }
 
     #[test]
     fn test_jit_status_slots_are_thread_local() {

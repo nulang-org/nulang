@@ -2,6 +2,13 @@
 ### Renderer-neutral UI action event uniqueness — 2026-10-21
 - **A semantic UI node can no longer bind the same event to multiple action handlers.** The shared `nulang-ui/1` validator rejects ambiguous per-node events, avoiding divergent handler selection between DOM, SwiftUI, and future Compose hosts. Different events on one node and the same event on different nodes remain valid.
 - **Atomic UI patches preserve the last valid document and revision** when a `ReplaceActions` operation would introduce a duplicate binding. Public protocol regressions cover rejection, unchanged state, and accepted disjoint events. The wire format and protocol version remain unchanged.
+### Native float division/modulo nil parity — 2026-10-19
+- **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
+- **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
+
+### Fabric on-demand mailbox scoring — 2026-10-18
+- **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
+- **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
 
 ### Bounded Nulang Web development-server connections — 2026-10-16
 - **The experimental Web development listener caps active connections at 64**, including SSE, and returns `503` with `Retry-After: 1` when full.
