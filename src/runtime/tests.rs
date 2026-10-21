@@ -5144,7 +5144,9 @@ fn pump_until_addresses_converge(
                     if peer_id == observer {
                         continue;
                     }
-                    let observed = cluster.get_node(peer_id).map(|peer| (peer.address, peer.status));
+                    let observed = cluster
+                        .get_node(peer_id)
+                        .map(|peer| (peer.address, peer.status));
                     if observed.map(|(address, _)| address) != Some(expected) {
                         unresolved.push(format!(
                             "observer={:?} peer={:?} expected={} observed={:?}",
