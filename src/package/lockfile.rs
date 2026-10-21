@@ -278,6 +278,20 @@ impl Lockfile {
     }
 
     fn validate_identities(&self) -> NuResult<()> {
+        // Duplicate exact pins make identity lookup and dependency reproducibility
+        // ambiguous even when the optional identity sidecar is absent.
+        let mut seen_packages = BTreeSet::new();
+        for package in &self.package {
+            if !seen_packages.insert((&package.name, &package.version, &package.source)) {
+                return Err(NuError::PackageError {
+                    msg: format!(
+                        "duplicate locked package '{}' {} from {}",
+                        package.name, package.version, package.source
+                    ),
+                    span: Span::default(),
+                });
+            }
+        }
         let mut seen = BTreeSet::new();
         for identity in &self.identity {
             let key = (
@@ -545,6 +559,41 @@ source_id = "not-a-source-id"
         let err = Lockfile::parse(source).expect_err("invalid identity must fail closed");
         match err {
             NuError::PackageError { msg, .. } => assert!(msg.contains("invalid source_id")),
+            other => panic!("expected PackageError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_lockfile_parse_rejects_duplicate_exact_package_pins() {
+        let source = r#"
+version = 1
+
+[[package]]
+name = "util"
+version = "0.1.0"
+source = "path+/tmp/util"
+
+[[package]]
+name = "util"
+version = "0.1.0"
+source = "path+/tmp/util"
+"#;
+        let error = Lockfile::parse(source).expect_err("duplicate exact pins must be rejected");
+        match error {
+            NuError::PackageError { msg, .. } => assert!(msg.contains("duplicate locked package")),
+            other => panic!("expected PackageError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_lockfile_serialization_rejects_duplicate_exact_package_pins() {
+        let mut lockfile = sample_lockfile();
+        lockfile.package.push(lockfile.package[0].clone());
+        let error = lockfile
+            .to_toml()
+            .expect_err("serialization must reject duplicate exact pins");
+        match error {
+            NuError::PackageError { msg, .. } => assert!(msg.contains("duplicate locked package")),
             other => panic!("expected PackageError, got {other:?}"),
         }
     }
