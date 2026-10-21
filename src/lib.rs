@@ -9,6 +9,7 @@
 
 mod actor_protocol;
 pub mod agent;
+pub mod agent_release;
 #[cfg(feature = "native-codegen")]
 pub mod aot;
 pub mod artifact_identity;
