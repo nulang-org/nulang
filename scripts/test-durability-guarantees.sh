@@ -2,6 +2,7 @@
 set -euo pipefail
 
 cargo test --locked --no-default-features --test effect_site_artifact_metadata
+cargo test --locked --no-default-features vm_tests::perform_async
 cargo test --locked --no-default-features --test compiled_durable_dispatch
 cargo test --locked --no-default-features --test authorized_compiled_durable_dispatch
 cargo test --locked --no-default-features --test durable_effect_recovery_store

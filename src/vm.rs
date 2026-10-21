@@ -355,6 +355,27 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
         PerformAsyncResult::Ready(None)
     }
 
+    /// Execute a generic async effect with its exact compiled source-site
+    /// context. `pc` is the current instruction's index in `module`; the
+    /// module contains compiler-owned `effect_sites` metadata. A durable host
+    /// adapter can use this context to validate and derive an effect identity.
+    ///
+    /// This does NOT supply replay-stable dynamic execution identity, durable
+    /// storage, or authority by itself. Adapters must fail closed when those
+    /// inputs are missing before making an external call.
+    ///
+    /// Existing callbacks retain their behavior through the default
+    /// implementation, which delegates to `perform_async`.
+    fn perform_async_in_module(
+        &mut self,
+        module: &CodeModule,
+        _pc: usize,
+        effect_op: &str,
+        args: &[Value],
+    ) -> PerformAsyncResult {
+        self.perform_async(effect_op, &module.constants, args)
+    }
+
     /// Try to receive a message from the current actor's mailbox.
     /// Returns `Some((behavior_id, value))` if a message is available,
     /// or `None` if the mailbox is empty. Default returns `None`.
@@ -4381,7 +4402,8 @@ impl VM {
     /// Generic async effect dispatch (`PerformAsync` opcode).
     ///
     /// Reads the effect_op string from the constant pool, collects arguments
-    /// from registers r0..rN, and calls `ActorVmCallbacks::perform_async`.
+    /// from registers r0..rN, and calls
+    /// `ActorVmCallbacks::perform_async_in_module` with the exact effect PC.
     /// On `Ready(value)` the result is written to the destination register
     /// and execution continues. On `Pending` the PC is decremented so the
     /// instruction re-executes on resume, and the VM returns a
@@ -4396,17 +4418,37 @@ impl VM {
         let effect_op_idx = instr.imm16() as usize;
         let dst_reg = instr.op3 as usize;
         let effect_op = self.module_const_string(module_idx, effect_op_idx);
-        // Pass the full frame register slice and the module's constant pool
-        // so the callback can resolve string-id arguments from registers.
-        let args = &self.frames[frame_idx].regs;
-        let constants = self
+        // The execution loop has already advanced the frame PC past this
+        // instruction. On Pending it rewinds, so a resumed execution obtains
+        // the same exact bytecode PC and compiler-owned semantic site.
+        let pc = self.frames[frame_idx]
+            .pc
+            .checked_sub(1)
+            .ok_or_else(|| NuError::VMError {
+                msg: "PerformAsync requires an already-fetched bytecode PC".into(),
+                span: Span::default(),
+            })?;
+        let module = self
             .modules
             .get(module_idx)
-            .map(|m| &m.constants[..])
-            .unwrap_or(&[]);
+            .ok_or_else(|| NuError::VMError {
+                msg: "PerformAsync references a missing bytecode module".into(),
+                span: Span::default(),
+            })?;
+        // Do not hand a forged/stale instruction identity to any host callback:
+        // the PC must refer to the exact instruction the VM is executing.
+        if instr.opcode != OpCode::PerformAsync || module.instructions.get(pc) != Some(&instr) {
+            return Err(NuError::VMError {
+                msg: "PerformAsync site does not match executing bytecode".into(),
+                span: Span::default(),
+            });
+        }
+        // Pass the full frame register slice so legacy callbacks can still
+        // resolve string-id arguments from the executing module's constants.
+        let args = &self.frames[frame_idx].regs;
         match self
             .actor_callbacks
-            .perform_async(&effect_op, constants, args)
+            .perform_async_in_module(module, pc, &effect_op, args)
         {
             PerformAsyncResult::Ready(result) => {
                 let value = match result {
@@ -6357,6 +6399,13 @@ mod vm_tests {
         let mut vm = VM::new_without_jit();
         let mut module = CodeModule::new("perform_async_ready_value");
         let effect_idx = module.add_string_constant("Test.value");
+        let instr = Instruction::new3(
+            OpCode::PerformAsync,
+            ((effect_idx >> 8) & 0xff) as u8,
+            (effect_idx & 0xff) as u8,
+            7,
+        );
+        module.emit(instr);
         vm.load_module(module);
         vm.set_actor_callbacks(Box::new(ReadyValueCallbacks::new()));
 
@@ -6365,17 +6414,273 @@ mod vm_tests {
         vm.frames.push(frame);
         vm.current_frame_idx = Some(0);
 
-        let instr = Instruction::new3(
-            OpCode::PerformAsync,
-            ((effect_idx >> 8) & 0xff) as u8,
-            (effect_idx & 0xff) as u8,
-            7,
-        );
         vm.step_perform_async(0, 0, instr)
             .expect("ReadyValue should complete without suspension");
 
         assert_eq!(vm.frames[0].regs[7].as_int(), Some(73));
         assert_eq!(vm.frames[0].pc, 1, "ReadyValue must not rewind the PC");
+    }
+
+    /// An opted-in runtime callback must see the executing bytecode site,
+    /// not a source location or a guessed ordinal. Suspension replays the
+    /// same site after the VM rewinds the PC.
+    #[derive(Debug)]
+    struct SiteAwareEffectCallbacks {
+        heap_callbacks: ReadyValueCallbacks,
+        sites: std::rc::Rc<std::cell::RefCell<Vec<(usize, [u8; 32], String)>>>,
+        pending_once: bool,
+    }
+
+    impl ActorVmCallbacks for SiteAwareEffectCallbacks {
+        fn alloc(&mut self, size: usize, tag: HeapTypeTag) -> Option<*mut u8> {
+            self.heap_callbacks.alloc(size, tag)
+        }
+
+        fn drop_ref(&mut self, ptr: *mut u8) {
+            self.heap_callbacks.drop_ref(ptr);
+        }
+
+        fn retain_ref(&mut self, ptr: *mut u8) {
+            self.heap_callbacks.retain_ref(ptr);
+        }
+
+        fn array_len(&self, ptr: *mut u8) -> Option<usize> {
+            self.heap_callbacks.array_len(ptr)
+        }
+
+        fn spawn_actor(
+            &mut self,
+            _module: &CodeModule,
+            _spawn_pc: usize,
+            _behavior_idx: usize,
+            _init: Vec<(String, Value)>,
+        ) -> Value {
+            Value::actor_ref(0)
+        }
+
+        fn send_message(&mut self, _target: Value, _behavior_id: u16, _args: &[Value]) {}
+
+        fn perform_async_in_module(
+            &mut self,
+            module: &CodeModule,
+            pc: usize,
+            effect_op: &str,
+            _args: &[Value],
+        ) -> PerformAsyncResult {
+            let site = module.effect_site_at(pc).expect("exact compiler site");
+            assert_eq!(site.effect_operation, effect_op);
+            self.sites
+                .borrow_mut()
+                .push((pc, site.id, effect_op.to_string()));
+            if self.pending_once {
+                self.pending_once = false;
+                PerformAsyncResult::Pending
+            } else {
+                PerformAsyncResult::ReadyValue(Value::int(74))
+            }
+        }
+    }
+
+    #[test]
+    fn perform_async_passes_exact_compiled_site_across_pending_and_resume() {
+        use crate::bytecode::EffectSiteMetadata;
+
+        let sites = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut vm = VM::new_without_jit();
+        let mut module = CodeModule::new("async_site_resume");
+        let constant = module.add_string_constant("Inference.ask");
+        let instr = Instruction::new3(
+            OpCode::PerformAsync,
+            (constant >> 8) as u8,
+            constant as u8,
+            7,
+        );
+        module.emit(instr);
+        module.effect_sites.push(EffectSiteMetadata {
+            pc: 0,
+            id: [7; 32],
+            effect_operation: "Inference.ask".to_string(),
+        });
+        vm.load_module(module);
+        vm.set_actor_callbacks(Box::new(SiteAwareEffectCallbacks {
+            heap_callbacks: ReadyValueCallbacks::new(),
+            sites: sites.clone(),
+            pending_once: true,
+        }));
+
+        let mut frame = Frame::new(None, 0);
+        frame.pc = 1; // The fetch loop has advanced beyond opcode 0.
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+
+        assert!(matches!(
+            vm.step_perform_async(0, 0, instr),
+            Err(NuError::Suspended(VmSuspension::PerformAsync))
+        ));
+        assert_eq!(vm.frames[0].pc, 0);
+        vm.frames[0].pc = 1; // Simulate the next fetch of the same opcode.
+        vm.step_perform_async(0, 0, instr).unwrap();
+        assert_eq!(vm.frames[0].regs[7].as_int(), Some(74));
+        assert_eq!(
+            sites.borrow().as_slice(),
+            &[
+                (0, [7; 32], "Inference.ask".to_string()),
+                (0, [7; 32], "Inference.ask".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn perform_async_preserves_distinct_site_ids_for_identical_operations() {
+        use crate::bytecode::EffectSiteMetadata;
+
+        let sites = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut vm = VM::new_without_jit();
+        let mut module = CodeModule::new("async_distinct_sites");
+        let constant = module.add_string_constant("Inference.ask");
+        let instr = Instruction::new3(
+            OpCode::PerformAsync,
+            (constant >> 8) as u8,
+            constant as u8,
+            7,
+        );
+        module.emit(instr);
+        module.emit(instr);
+        for (pc, id) in [(0, [11; 32]), (1, [22; 32])] {
+            module.effect_sites.push(EffectSiteMetadata {
+                pc,
+                id,
+                effect_operation: "Inference.ask".to_string(),
+            });
+        }
+        vm.load_module(module);
+        vm.set_actor_callbacks(Box::new(SiteAwareEffectCallbacks {
+            heap_callbacks: ReadyValueCallbacks::new(),
+            sites: sites.clone(),
+            pending_once: false,
+        }));
+
+        let mut frame = Frame::new(None, 0);
+        frame.pc = 1;
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+        vm.step_perform_async(0, 0, instr).unwrap();
+        vm.frames[0].pc = 2;
+        vm.step_perform_async(0, 0, instr).unwrap();
+        assert_eq!(
+            sites.borrow().as_slice(),
+            &[
+                (0, [11; 32], "Inference.ask".to_string()),
+                (1, [22; 32], "Inference.ask".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn perform_async_rejects_out_of_bounds_instruction_site_before_dispatch() {
+        let sites = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut vm = VM::new_without_jit();
+        let mut module = CodeModule::new("async_out_of_bounds");
+        let constant = module.add_string_constant("Inference.ask");
+        let instr = Instruction::new3(
+            OpCode::PerformAsync,
+            (constant >> 8) as u8,
+            constant as u8,
+            7,
+        );
+        module.emit(instr);
+        vm.load_module(module);
+        vm.set_actor_callbacks(Box::new(SiteAwareEffectCallbacks {
+            heap_callbacks: ReadyValueCallbacks::new(),
+            sites: sites.clone(),
+            pending_once: false,
+        }));
+
+        let mut frame = Frame::new(None, 0);
+        frame.pc = 2; // No instruction at PC 1.
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+
+        assert!(matches!(
+            vm.step_perform_async(0, 0, instr),
+            Err(NuError::VMError { .. })
+        ));
+        assert!(sites.borrow().is_empty(), "invalid PC reached the host");
+    }
+
+    #[test]
+    fn perform_async_rejects_instruction_mismatch_before_dispatch() {
+        let sites = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut vm = VM::new_without_jit();
+        let mut module = CodeModule::new("async_mismatched_instruction");
+        let constant = module.add_string_constant("Inference.ask");
+        let instr = Instruction::new3(
+            OpCode::PerformAsync,
+            (constant >> 8) as u8,
+            constant as u8,
+            7,
+        );
+        module.emit(instr);
+        vm.load_module(module);
+        vm.set_actor_callbacks(Box::new(SiteAwareEffectCallbacks {
+            heap_callbacks: ReadyValueCallbacks::new(),
+            sites: sites.clone(),
+            pending_once: false,
+        }));
+
+        let mut frame = Frame::new(None, 0);
+        frame.pc = 1;
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+
+        let wrong_instruction = Instruction::new3(
+            OpCode::PerformAsync,
+            (constant >> 8) as u8,
+            constant as u8,
+            8,
+        );
+        assert!(matches!(
+            vm.step_perform_async(0, 0, wrong_instruction),
+            Err(NuError::VMError { .. })
+        ));
+        assert!(
+            sites.borrow().is_empty(),
+            "mismatched opcode reached the host"
+        );
+    }
+
+    #[test]
+    fn perform_async_rejects_missing_fetched_pc_before_host_dispatch() {
+        let sites = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut vm = VM::new_without_jit();
+        let mut module = CodeModule::new("invalid_async_pc");
+        let constant = module.add_string_constant("Inference.ask");
+        let instr = Instruction::new3(
+            OpCode::PerformAsync,
+            (constant >> 8) as u8,
+            constant as u8,
+            7,
+        );
+        module.emit(instr);
+        vm.load_module(module);
+        vm.set_actor_callbacks(Box::new(SiteAwareEffectCallbacks {
+            heap_callbacks: ReadyValueCallbacks::new(),
+            sites: sites.clone(),
+            pending_once: false,
+        }));
+
+        let mut frame = Frame::new(None, 0);
+        frame.pc = 0; // No opcode fetch has taken place.
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+        assert!(matches!(
+            vm.step_perform_async(0, 0, instr),
+            Err(NuError::VMError { .. })
+        ));
+        assert!(
+            sites.borrow().is_empty(),
+            "invalid executing PC must fail before invoking the host"
+        );
     }
 
     /// A NULL C string return (nil from cstr_to_value) must pass through
