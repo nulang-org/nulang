@@ -52,6 +52,7 @@ export default defineConfig({
           items: [
             { label: 'Installation', link: 'getting-started/installation/' },
             { label: 'Quick Start', link: 'getting-started/quick-start/' },
+            { label: 'For AI Coding Agents', link: 'getting-started/ai-coding-agents/' },
             { label: 'Tutorial', link: 'tutorial/' },
             { label: 'Editor Setup', link: 'getting-started/editor-setup/' },
           ],
