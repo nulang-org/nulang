@@ -73,6 +73,7 @@ mod metrics;
 mod persistence;
 mod process_groups;
 mod registry;
+pub mod resumable_session;
 pub mod resp;
 pub mod resp_cache;
 mod spawn;
