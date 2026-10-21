@@ -15,19 +15,27 @@ first Android integration slice tracked by [universal app issue #146](https://gi
 - iterative validation of deeply nested trees without JVM recursion;
 - typed values retaining integer, float-bit and byte identity.
 
-**Not yet implemented:** an untrusted JSON codec, exact cross-language wire
-fixture roundtrips, the Android AAR, native Nulang `.nbc` artifact loading,
+**Implemented in the stacked JSON-codec slice:** bounded, duplicate-key-rejecting
+runtime-to-host `nulang-ui-msg/1` JSON snapshot and patch decoding. Tagged
+`i64`, raw `f64` bits, unsigned revisions, and byte arrays are decoded
+without floating-point coercion. The decoded document/patch is validated before
+publication through `UiRuntimeState.applyJson`. JSON is limited to 8 MiB, with
+a 64-level nested-value limit and a 1 MiB individual string limit.
+
+**Not yet implemented:** cross-language Rust/Kotlin fixture roundtrips,
+host-to-runtime action encoding, the Android AAR, native Nulang `.nbc` artifact loading,
 client action authorization, Compose rendering, navigation, offline storage,
-or app background execution. Do not expose incoming network or native messages
-through this model until a strict JSON codec and canonical Rust/Kotlin fixture
-parity are integrated. Kotlin object models are not transport-level authority.
+or app background execution. The strict decoder handles only inbound
+runtime-to-host snapshots and patches; it does not authenticate the sender,
+authorize actions or negotiate capabilities. Do not treat parsed objects as
+transport-level authority. Cross-language fixture parity remains a release gate.
 
 ## Verification
 
 Run the dedicated executable conformance task:
 
 ```sh
-gradle -p platforms/android/NulangUIProtocol protocolConformance
+gradle -p platforms/android/NulangUIProtocol check
 ```
 
 To execute without Gradle using an installed Kotlin/JVM compiler:
@@ -40,6 +48,6 @@ kotlinc \
 java -jar /tmp/nulang-ui-protocol-tests.jar
 ```
 
-Passing this suite proves the Kotlin reference state machine only.
+Passing both suites proves the Kotlin reference state machine and validated JSON ingress only.
 It does **not** certify Android devices, Java/Kotlin packaging, Nulang bytecode,
 or SwiftUI/Compose rendering parity.

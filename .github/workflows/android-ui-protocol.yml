@@ -29,4 +29,4 @@ jobs:
         with:
           gradle-version: '8.10.2'
       - name: Compile and execute protocol conformance
-        run: gradle -p platforms/android/NulangUIProtocol protocolConformance --no-daemon --stacktrace
+        run: gradle -p platforms/android/NulangUIProtocol check --no-daemon --stacktrace
