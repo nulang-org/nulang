@@ -19,10 +19,7 @@ pub(crate) fn verified_https_agent(target_url: &str) -> Result<ureq::Agent, Stri
         .split_once("://")
         .ok_or_else(|| "registry/deploy URL must specify http:// or https://".to_string())?;
     // Keep the authority bounded to the host portion, not the URL path.
-    let authority = authority
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or_default();
     if authority.is_empty() || authority.contains('@') {
         return Err("registry/deploy URL must have a host without userinfo".to_string());
     }
@@ -47,7 +44,9 @@ pub(crate) fn verified_https_agent(target_url: &str) -> Result<ureq::Agent, Stri
                     .is_ok_and(|ip| ip.is_loopback())
         };
         if !loopback {
-            return Err("plaintext registry/deploy URLs require an exact loopback host".to_string());
+            return Err(
+                "plaintext registry/deploy URLs require an exact loopback host".to_string(),
+            );
         }
         false
     } else {
@@ -281,8 +280,16 @@ mod tls_transport_tests {
                 )
                 .unwrap();
         });
-        let response = verified_https_agent(&url).unwrap().get(&url).call().unwrap();
-        assert_eq!(response.status(), 302, "local redirect must not be followed");
+        let response = verified_https_agent(&url)
+            .unwrap()
+            .get(&url)
+            .call()
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            302,
+            "local redirect must not be followed"
+        );
         server.join().unwrap();
     }
 
