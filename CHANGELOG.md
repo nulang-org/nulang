@@ -259,6 +259,8 @@ version + migration.*
 
 ## Stable tier
 
+### Local owned-payload actor benchmark — 2026-09-24
+- **The actor A/B harness now includes a source-level fresh heap-payload send workload** (`bench_ab_local_owned_payload_send`), where a producer allocates an array and uses it exactly once in a behavior-internal send to a sink. This provides an identical baseline/candidate signal for compiler/runtime ownership-handoff work without benchmarking private runtime helpers.
 ### Preserve observable MIR panic through DCE — 2026-09-24
 - **MIR dead-store elimination now treats `RValue::Panic` as observable/divergent** (`src/mir_codegen.rs`), so an unused panic result cannot cause a reachable contract/precondition failure to be optimized away. A focused optimizer regression pins the behavior.
 ### Zero-copy non-reentrant JIT register entry — 2026-09-24
@@ -276,7 +278,6 @@ version + migration.*
 - **Tier-2 promotion now replaces the installed machine-code entry instead of returning the already-cached lower-tier function.** Compiled regions carry an explicit `Baseline` / `Typed` / `Simd` tier plus a `Fast` / `Optimized` codegen policy, and promotion uses fresh Cranelift symbols while preserving the same cache slot.
 - **First-tier native code now uses a low-latency Cranelift module with `opt_level=none` and `regalloc_algorithm=single_pass`; hot replacement uses a separate `opt_level=speed` + backtracking-register-allocation module.** Baseline code can retain folded direct calls while being recompiled at the optimized level; typed code preserves type-directed guard stripping across promotion and can subsequently promote to SIMD when the loop analyzer accepts it.
 - **Each installed compiled region records compiler wall time in nanoseconds.** Regression coverage pins pointer replacement, optimization-level transition, SIMD promotion, per-session counters, and stable compiled-region cardinality across replacement.
-
 
 ### CI playground dependency and formatting repair — 2026-09-24
 - **Browser-playground compilation now includes the shared content-identity module and its pure-Rust `hex` dependency** (`crates/nulang-playground`), matching `semantic_identity.rs`'s current dependency graph. Runtime worker-pool files were also normalized to the repository's rustfmt output so the format gate reflects semantics rather than stale layout.
