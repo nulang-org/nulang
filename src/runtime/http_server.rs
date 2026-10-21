@@ -577,10 +577,9 @@ pub(crate) fn safe_local_redirect_target(target: &str) -> bool {
         && bytes.len() <= 8192
         && bytes[0] == b'/'
         && bytes.get(1) != Some(&b'/')
-        && bytes.iter().all(|b| {
-            (0x21..=0x7e).contains(b)
-                && !matches!(*b, b'\\' | b'"' | b'<' | b'>')
-        })
+        && bytes
+            .iter()
+            .all(|b| (0x21..=0x7e).contains(b) && !matches!(*b, b'\\' | b'"' | b'<' | b'>'))
 }
 
 /// Look up a captured route parameter for the current request.
@@ -1093,7 +1092,11 @@ impl WebDevServer {
                     Ok(Some(html)) => match redirect {
                         Some(location) if safe_local_redirect_target(&location) => HttpResponse {
                             // POST/redirect/GET avoids inadvertently replaying form submission.
-                            status: if request.method == HttpMethod::Post { 303 } else { 302 },
+                            status: if request.method == HttpMethod::Post {
+                                303
+                            } else {
+                                302
+                            },
                             headers: vec![
                                 ("Location".into(), location),
                                 ("Cache-Control".into(), "no-store".into()),
