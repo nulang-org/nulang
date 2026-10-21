@@ -19,10 +19,10 @@ type FxHashSet<T> = rustc_hash::FxHashSet<T>;
 
 /// Check whether every effect in `sub` is present in `sup`.
 ///
-/// For closed rows this is simple set inclusion.  For open rows we are
-/// conservative: an open row on the *sup* side may contain additional effects
-/// via its row variable, while an open row on the *sub* side is assumed to
-/// possibly contain any effect not explicitly listed.
+/// For closed rows this is simple set inclusion. For open rows the comparison
+/// is conservative: an open row can have further effects through its unresolved
+/// tail. In particular, an open `sub` cannot prove a closed `sup` contract,
+/// including the empty effect row used by pure functions.
 pub fn effect_row_subset(sub: &EffectRow, sup: &EffectRow) -> bool {
     match (sub, sup) {
         // Closed sub, closed sup: straightforward subset check.
@@ -34,13 +34,9 @@ pub fn effect_row_subset(sub: &EffectRow, sup: &EffectRow) -> bool {
         (EffectRow::Closed(sub_effs), EffectRow::Open(sup_effs, _)) => {
             sub_effs.iter().all(|e| sup_effs.contains(e))
         }
-        // Open sub, closed sup: the open row *might* contain effects beyond
-        // its concrete list, so it is only a subset if the concrete list
-        // itself is already a subset and the open row is empty except for the
-        // variable that could introduce new effects.
-        (EffectRow::Open(sub_effs, _), EffectRow::Closed(sup_effs)) => {
-            sub_effs.iter().all(|e| sup_effs.contains(e))
-        }
+        // Open sub, closed sup: unresolved tail effects may exceed any
+        // closed allowlist, even when all known effects are permitted.
+        (EffectRow::Open(_, _), EffectRow::Closed(_)) => false,
         // Open sub, open sup: both row variables could introduce arbitrary
         // effects.  We only require that the concrete effects of sub are
         // contained in the concrete effects of sup.
@@ -2950,6 +2946,23 @@ mod tests {
     }
 
     #[test]
+    fn test_effect_row_subset_open_tail_cannot_satisfy_pure_contract() {
+        // An unresolved row variable could include IO or other effects even
+        // though its known effect list is empty.
+        let unknown = EffectRow::Open(vec![], Region::fresh());
+        assert!(!effect_row_subset(&unknown, &EffectRow::empty()));
+    }
+
+    #[test]
+    fn test_effect_row_subset_open_tail_cannot_satisfy_closed_allowlist() {
+        // Matching all known effects is insufficient when the tail can
+        // contain additional effects absent from the closed contract.
+        let unknown = EffectRow::Open(vec![Effect::IO], Region::fresh());
+        let allowed = EffectRow::Closed(vec![Effect::IO, Effect::FS]);
+        assert!(!effect_row_subset(&unknown, &allowed));
+    }
+
+    #[test]
     fn test_effect_row_union() {
         let a = EffectRow::Closed(vec![Effect::IO]);
         let b = EffectRow::Closed(vec![Effect::FS]);
@@ -3210,6 +3223,44 @@ mod tests {
         let row = checker.infer_effects(&ctx, &handle_expr).unwrap();
         // The IO effect should be handled (removed from the body row).
         assert!(!row.contains(&Effect::IO));
+    }
+
+    #[test]
+    fn test_array_perform_is_not_silently_reclassified_as_pure() {
+        // Array.length currently uses effect dispatch; an enclosing handler
+        // may intercept it, so it is not yet an unconditional pure intrinsic.
+        let mut checker = EffectChecker::new();
+        let ctx = EffectContext::empty();
+        let expr = Expr::Perform {
+            effect: "Array".to_string(),
+            op: "length".to_string(),
+            args: vec![Expr::Array(vec![], s())],
+            span: s(),
+        };
+        let row = checker.infer_effects(&ctx, &expr).unwrap();
+        assert!(row.contains(&Effect::Array));
+    }
+
+    #[test]
+    fn test_check_effects_rejects_open_callee_from_pure_function() {
+        // A callee with an unresolved effect tail cannot be assumed pure.
+        // This checks the actual call-site gate, not only row comparison.
+        let mut checker = EffectChecker::new();
+        checker.fn_rows.insert(
+            "maybe_effectful".to_string(),
+            EffectRow::Open(vec![], Region::fresh()),
+        );
+        let ctx = EffectContext::with_allowed(EffectRow::empty());
+        let expr = Expr::App {
+            func: Box::new(Expr::Var("maybe_effectful".to_string(), s())),
+            args: vec![],
+            span: s(),
+        };
+        let result = checker.check_effects(&ctx, &expr, &ctx.allowed_effects);
+        assert!(
+            result.is_err(),
+            "unresolved callee effects cannot satisfy ! {{}}"
+        );
     }
 
     #[test]
