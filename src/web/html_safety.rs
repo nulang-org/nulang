@@ -199,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn URL_attributes_fail_closed_on_script_and_entity_obfuscation() {
+    fn url_attributes_fail_closed_on_script_and_entity_obfuscation() {
         for url in [
             "javascript:alert(1)",
             "JaVaScRiPt:alert(1)",
@@ -220,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn safe_URLs_and_document_metadata_are_preserved() {
+    fn safe_urls_and_document_metadata_are_preserved() {
         for url in [
             "/docs?q=a&amp;b=2",
             "https://example.com/a",
