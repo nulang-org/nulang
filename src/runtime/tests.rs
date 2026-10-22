@@ -6073,10 +6073,36 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
             break;
         }
     }
-    assert!(
-        converged,
-        "5-node cluster did not converge to fully-armed failure detection (active views)"
-    );
+    if !converged {
+        // Failure-only, read-only evidence: separate a missing/Failed member
+        // from a Healthy passive/probationary peer that never armed its
+        // reciprocal heartbeat. Do not extend the virtual clock budget.
+        let states: Vec<_> = nodes
+            .iter()
+            .map(|rt| {
+                let local = rt.distributed.node_id.unwrap();
+                let c = rt.distributed.cluster.as_ref().unwrap();
+                let peers: Vec<_> = ids
+                    .iter()
+                    .filter(|&&peer| peer != local)
+                    .map(|&peer| {
+                        let info = c.get_node(peer);
+                        (
+                            peer,
+                            info.map(|x| (x.status, x.address)),
+                            c.active_view().contains(&peer),
+                            c.passive_view().contains(&peer),
+                            c.probationary().iter().any(|&(id, _)| id == peer),
+                        )
+                    })
+                    .collect();
+                (local, c.healthy_node_count(), peers)
+            })
+            .collect();
+        panic!(
+            "5-node cluster did not converge to fully-armed failure detection (active views): states={states:?}"
+        );
+    }
 
     // Split {A,B} | {C,D,E}.
     let ab_side: HashSet<NodeId> = HashSet::from([ids[2], ids[3], ids[4]]);
