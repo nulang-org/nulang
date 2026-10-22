@@ -226,7 +226,9 @@ Handlers that only perform `Web`/`Render` operations are **statically renderable
 nulang nula build --web
 ```
 
-It runs the route registrations, renders every route to `dist/<path>/index.html`, copies `static_dir` into `dist/`, and emits a deployment IR file (`nulang-app.ir.json`). The result is plain HTML + JS you can host on any static file server. Dynamic operations (`Web.param`, form parsing, the kv store, `Realtime.broadcast`) work under `nula dev` but render at their pattern path in a static build — e.g. `/hello/:name` becomes a literal `dist/hello/:name/index.html`.
+It runs route registration, emits HTML files only for safe, literal static `GET` routes, copies `static_dir` into `dist/`, and writes the deployment IR (`nulang-app.ir.json`). Server-only routes (including dynamic `/hello/:name` and `POST` routes) remain in the IR with no static artifact; they are **not** rendered into fake literal directories. Explicitly static routes that require request-time parameters or produce unsafe output paths fail the build rather than writing outside `dist/`.
+
+The emitted HTML and client script can be served by a static host. **Dynamic routes still require a compatible running host** and cannot function on a static-only deployment. `Web.param`, form parsing, the in-memory store, and `Realtime.broadcast` are available in the experimental `nula dev` host, but this is not evidence that these effects are supported by the WASM/Cloud web host.
 
 For a pure static response without the `app` machinery, `Web.text`/`Web.raw` are enough on their own — any `fn() -> Html` can be rendered by the same pipeline.
 
