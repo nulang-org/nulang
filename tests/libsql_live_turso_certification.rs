@@ -127,10 +127,10 @@ fn certification_configuration_accepts_explicit_disposable_turso_target() {
 /// NULANG_TURSO_TEST_IS_DISPOSABLE=I_CONFIRM_THIS_DB_MAY_BE_MODIFIED
 /// NULANG_TURSO_TEST_URL=libsql://<disposable-instance>.turso.io
 /// NULANG_TURSO_TEST_TOKEN=(secret, never log)
-/// cargo test --locked --features sqlite --test libsql_live_turso_certification -- --ignored
-#[test]
-#[ignore = "requires explicitly confirmed disposable Turso DB and an auth token"]
-fn authenticated_turso_sql_round_trip() {
+/// cargo run --locked --features sqlite --example libsql_live_turso_certification
+// The manual operation is not a test: neither ordinary nor --all-features CI
+// is allowed to execute credential-bearing SQL against an external database.
+pub fn authenticated_turso_sql_round_trip() {
     let ack = std::env::var("NULANG_TURSO_TEST_IS_DISPOSABLE").unwrap_or_default();
     let endpoint = std::env::var("NULANG_TURSO_TEST_URL").unwrap_or_default();
     let token = std::env::var("NULANG_TURSO_TEST_TOKEN").unwrap_or_default();

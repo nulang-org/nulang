@@ -253,6 +253,13 @@ codegen-units = 16
 criterion = "0.5"
 rcgen = "0.14"
 
+# Manual cloud SQL certification is a runnable example, not an ignored test.
+# Cargo builds but never executes examples as part of standard test suites.
+[[example]]
+name = "libsql_live_turso_certification"
+path = "examples/libsql_live_turso_certification.rs"
+required-features = ["sqlite"]
+
 [[bench]]
 name = "bench_main"
 harness = false

@@ -55,8 +55,13 @@ pub(crate) fn verified_https_agent(target_url: &str) -> Result<ureq::Agent, Stri
 
     let connector = native_tls::TlsConnector::new()
         .map_err(|e| format!("system TLS initialization failed: {}", e))?;
-    Ok(ureq::AgentBuilder::new()
-        .https_only(https_only)
+    let mut builder = ureq::AgentBuilder::new().https_only(https_only);
+    if !https_only {
+        // Even if another dependency enables ureq/proxy-from-env, plaintext
+        // bearer traffic addressed to loopback must never reach a proxy.
+        builder = builder.try_proxy_from_env(false);
+    }
+    Ok(builder
         // Local HTTP must not redirect bearer-bearing requests off loopback.
         // HTTPS requests retain normal HTTPS-only redirect behavior.
         .redirects(if https_only { 5 } else { 0 })
@@ -291,6 +296,83 @@ mod tls_transport_tests {
             "local redirect must not be followed"
         );
         server.join().unwrap();
+    }
+
+    // Regression: when another crate activates ureq/proxy-from-env, a locally
+    // addressed bearer request must still bypass a configured remote proxy.
+    #[test]
+    fn loopback_http_never_uses_environment_proxy() {
+        const CHILD: &str = "NULANG_LOOPBACK_PROXY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            use std::time::{Duration, Instant};
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(4);
+                loop {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(2)))
+                                .unwrap();
+                            let mut input = [0_u8; 2048];
+                            let count = stream.read(&mut input).unwrap();
+                            assert!(String::from_utf8_lossy(&input[..count])
+                                .contains("Authorization: Bearer loopback-proxy-test"));
+                            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK").unwrap();
+                            return;
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "direct loopback request was never received"
+                            );
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(err) => panic!("loopback accept failed: {err}"),
+                    }
+                }
+            });
+            let response = verified_https_agent(&url)
+                .unwrap()
+                .get(&url)
+                .set("Authorization", "Bearer loopback-proxy-test")
+                .call();
+            assert!(
+                response.is_ok(),
+                "loopback request was rerouted: {response:?}"
+            );
+            assert_eq!(response.unwrap().status(), 200);
+            server.join().unwrap();
+            return;
+        }
+
+        // Use a child process so proxy variables never pollute parallel tests.
+        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+        drop(proxy);
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "registry::client::tls_transport_tests::loopback_http_never_uses_environment_proxy",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("HTTP_PROXY", &proxy_url)
+            .env("http_proxy", &proxy_url)
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .env_remove("ALL_PROXY")
+            .env_remove("all_proxy")
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "proxy regression child failed:\n{}\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
     }
 
     #[test]
