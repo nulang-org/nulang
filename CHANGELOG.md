@@ -1,4 +1,9 @@
 # Nulang Changelog
+
+### Loopback HTTP proxy isolation and explicit Turso certification — 2026-10-22
+- Registry/deploy plaintext development requests to literal loopback IPs explicitly disable ureq environment proxy discovery; TLS-backed HTTPS requests retain their existing policy. A subprocess-isolated regression exercises the otherwise opt-in `ureq/proxy-from-env` feature and verifies bearer headers arrive at the local origin rather than an HTTP proxy.
+- Move authenticated disposable-Turso SQL certification to an operator-invoked Cargo example with explicit endpoint, scoped token and disposable-database acknowledgement. Ordinary integration tests validate configuration only, with no ignored tests or remote SQL side effects.
+
 ### Registry and deployment bearer-token plaintext safeguard — 2026-10-21
 - **Registry and deployment clients reject non-loopback plaintext HTTP destinations before sending requests.** Only literal loopback addresses such as `127.0.0.1` or `[::1]` remain available for plaintext development; hostname-based `localhost` is refused to prevent resolver redirection; authority userinfo is rejected.
 - **Local HTTP requests do not follow redirects**, preventing a loopback 302 from forwarding a request to a remote plaintext origin. HTTPS requests remain restricted to HTTPS and use the verified native TLS connector.

@@ -35,6 +35,11 @@ autobenches = false
 # is the human-readable mirror.
 language-version = "1.0.0-frozen"
 
+[[example]]
+name = "libsql_live_turso_certification"
+path = "examples/libsql_live_turso_certification.rs"
+required-features = ["sqlite"]
+
 [features]
 # Keep the historical batteries-included default during the stabilization
 # window, but give it an explicit name so release/CI consumers can pin the

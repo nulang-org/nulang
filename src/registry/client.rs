@@ -57,6 +57,10 @@ pub(crate) fn verified_https_agent(target_url: &str) -> Result<ureq::Agent, Stri
         .map_err(|e| format!("system TLS initialization failed: {}", e))?;
     Ok(ureq::AgentBuilder::new()
         .https_only(https_only)
+        // Even an exact loopback URL can be redirected to an environment HTTP
+        // proxy. Disable proxy discovery for credential-bearing plaintext.
+        // Preserve configured HTTPS proxy discovery for verified TLS traffic.
+        .try_proxy_from_env(https_only)
         // Local HTTP must not redirect bearer-bearing requests off loopback.
         // HTTPS requests retain normal HTTPS-only redirect behavior.
         .redirects(if https_only { 5 } else { 0 })
@@ -261,6 +265,64 @@ mod tls_transport_tests {
                 "explicit loopback dev transport must remain supported: {url}"
             );
         }
+    }
+
+    #[test]
+    fn test_loopback_plaintext_never_uses_environment_proxy() {
+        // A child process isolates HTTP_PROXY from concurrently running Rust tests.
+        // Enable ureq/proxy-from-env when running this regression to exercise
+        // the dependency's optional proxy-discovery implementation.
+        const CHILD: &str = "NULANG_LOOPBACK_PROXY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = [0_u8; 2048];
+                let count = stream.read(&mut bytes).unwrap();
+                assert!(count > 0);
+                assert!(
+                    String::from_utf8_lossy(&bytes[..count])
+                        .contains("Authorization: Bearer local-test-only"),
+                    "origin must receive bearer directly"
+                );
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+                    )
+                    .unwrap();
+            });
+            let response = verified_https_agent(&url)
+                .unwrap()
+                .get(&url)
+                .set("Authorization", "Bearer local-test-only")
+                .call()
+                .expect("local request must bypass proxy even when HTTP_PROXY is set");
+            assert_eq!(response.status(), 200);
+            server.join().unwrap();
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("registry::client::tls_transport_tests::test_loopback_plaintext_never_uses_environment_proxy")
+            .env(CHILD, "1")
+            .env("HTTP_PROXY", "http://127.0.0.1:9")
+            .env("http_proxy", "http://127.0.0.1:9")
+            .env("ALL_PROXY", "http://127.0.0.1:9")
+            .env("all_proxy", "http://127.0.0.1:9")
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "loopback transport was redirected to an environment proxy: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
