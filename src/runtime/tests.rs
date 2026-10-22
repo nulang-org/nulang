@@ -5231,8 +5231,12 @@ fn post_heal_roundtrip_ready(
     };
     healthy(sender, peer_id)
         && healthy(peer, sender_id)
-        && forward_sequences.iter().any(|seq| sender.is_acked(*seq))
-        && reverse_sequences.iter().any(|seq| peer.is_acked(*seq))
+        && forward_sequences
+            .iter()
+            .any(|seq| sender.is_acked_from(peer_id, *seq))
+        && reverse_sequences
+            .iter()
+            .any(|seq| peer.is_acked_from(sender_id, *seq))
 }
 
 /// A single forward ACK must never qualify a Failed membership entry as
@@ -5259,8 +5263,10 @@ fn test_post_heal_roundtrip_requires_healthy_bidirectional_evidence() {
         .handle_heartbeat(sender_id, sender_addr);
 
     sender.acked_packets.insert(41);
+    sender.acked_packets_by_peer.insert((peer_id.0, 41));
     assert!(!post_heal_roundtrip_ready(&sender, &peer, &[41], &[42]));
     peer.acked_packets.insert(42);
+    peer.acked_packets_by_peer.insert((sender_id.0, 42));
     assert!(post_heal_roundtrip_ready(&sender, &peer, &[41], &[42]));
 
     sender
@@ -5286,6 +5292,56 @@ fn test_post_heal_roundtrip_requires_healthy_bidirectional_evidence() {
         .unwrap()
         .handle_heartbeat(peer_id, peer_addr);
     assert!(post_heal_roundtrip_ready(&sender, &peer, &[41], &[42]));
+    shutdown_nodes(&mut [&mut sender, &mut peer]);
+}
+
+/// A sequence from an unrelated connection must not authenticate the peer
+/// whose membership has healed: tracked packet IDs are transport-local.
+#[cfg(feature = "tcp")]
+#[test]
+fn test_post_heal_roundtrip_rejects_wrong_peer_ack_sequence() {
+    let mut sender = start_distributed_node();
+    let mut peer = start_distributed_node();
+    let sender_id = sender.distributed.node_id.unwrap();
+    let peer_id = peer.distributed.node_id.unwrap();
+    let sender_addr = sender.distributed.transport.as_ref().unwrap().listen_addr();
+    let peer_addr = peer.distributed.transport.as_ref().unwrap().listen_addr();
+    sender
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(peer_id, peer_addr);
+    peer.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(sender_id, sender_addr);
+
+    let unrelated = NodeId(0xf00d_cafe);
+    let forward_seq = 101;
+    let reverse_seq = 102;
+    sender.acked_packets.insert(forward_seq);
+    sender
+        .acked_packets_by_peer
+        .insert((unrelated.0, forward_seq));
+    peer.acked_packets.insert(reverse_seq);
+    peer.acked_packets_by_peer
+        .insert((sender_id.0, reverse_seq));
+
+    assert!(
+        !post_heal_roundtrip_ready(&sender, &peer, &[forward_seq], &[reverse_seq]),
+        "an unrelated peer's ACK must never prove the intended peer is ready"
+    );
+    sender
+        .acked_packets_by_peer
+        .insert((peer_id.0, forward_seq));
+    assert!(post_heal_roundtrip_ready(
+        &sender,
+        &peer,
+        &[forward_seq],
+        &[reverse_seq]
+    ));
     shutdown_nodes(&mut [&mut sender, &mut peer]);
 }
 
