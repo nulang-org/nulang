@@ -3,6 +3,10 @@
 - **Docs Sync no longer force-pushes or opens pull requests from GitHub Actions.** It uses read-only repository permissions, builds the standard-library/API docs and browser playground, then archives generated files for reviewed import under organization-wide branch protections.
 - **A 30-day `nulang-generated-docs` artifact and drift warning preserve generated output without deployment claims.** The branch-specific GitHub Actions validation completed successfully, including the actual artifact upload; publication into `main` still requires an independently reviewed PR.
 
+### Native float division/modulo nil parity — 2026-10-19
+- **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
+- **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
+
 ### Fabric on-demand mailbox scoring — 2026-10-18
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
 - **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
