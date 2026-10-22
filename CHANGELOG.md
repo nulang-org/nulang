@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Authoritative cluster gossip preserves monotonic corrected addresses — 2026-10-21
+- **Self-authored gossip that corrects a peer's status and/or listen address now advertises an incarnation strictly beyond the highest locally observed version.** This prevents simultaneous Joining-to-Healthy recovery and stale TCP source-port correction from being dropped as equal/older-version gossip at downstream nodes. Repeated unchanged authoritative reports do not spuriously bump versions. Newer relayed address-only corrections now correctly report a changed membership entry.
+- **Two fail-first cluster regressions** cover simultaneous status/address correction and authoritative correction from an older incoming incarnation. No wire-protocol changes, loosened failure-detection timeouts, retries, or CI gate exemptions. Distributed five-node stress and full exact-head CI remain required before merge.
+
 ### Five-node post-heal actor-delivery readiness — 2026-10-21
 - **Test-only readiness contract:** require healthy membership at both peers and tracked heartbeat acknowledgements in both directions before the existing one-shot post-heal actor delivery. A forward ACK alone can succeed while the sender still marks the receiver Failed, which prevents its address resolver from routing actor messages.
 - **Deterministic guard and failure evidence:** tests pin the bidirectional ACK and membership predicate; initial active-view convergence failures now report each peer’s health, address and active/passive/probationary state; address-convergence timeouts report mismatched authoritative and observed peer addresses/statuses. No production runtime change, actor-message retry, timeout extension, CI skip, or audit bypass. Stress certification and independent security gates remain outstanding.
