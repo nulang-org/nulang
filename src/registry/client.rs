@@ -219,6 +219,56 @@ mod tls_transport_tests {
     }
 
     #[test]
+    fn remote_plaintext_registry_and_deploy_origins_are_rejected() {
+        for url in [
+            "http://registry.example.test/api/v1/packages",
+            "http://198.51.100.7:8080/api/v1/deploy",
+            "http://localhost.evil.test/api/v1/packages",
+            "http://user:pass@127.0.0.1:8080/api/v1/deploy",
+        ] {
+            assert!(
+                verified_https_agent(url).is_err(),
+                "non-loopback or userinfo HTTP URL must fail closed: {url}"
+            );
+        }
+        for url in [
+            "http://localhost:8080",
+            "http://127.0.0.2:8080",
+            "http://[::1]:8080",
+        ] {
+            assert!(
+                verified_https_agent(url).is_ok(),
+                "explicit loopback HTTP may remain supported: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_http_never_follows_redirect_with_bearer_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = [0_u8; 1024];
+            assert!(stream.read(&mut bytes).unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/credential-sink\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let response = verified_https_agent(&url)
+            .unwrap()
+            .get(&url)
+            .set("Authorization", "Bearer loopback-test")
+            .call()
+            .expect("redirect must be returned, not followed");
+        assert_eq!(response.status(), 302);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn registry_https_never_downgrades_to_plain_http() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback TLS sentinel");
         let port = listener.local_addr().unwrap().port();
