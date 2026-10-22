@@ -1,4 +1,12 @@
 # Nulang Changelog
+### Registry and deployment bearer-token plaintext safeguard — 2026-10-21
+- **Registry and deployment clients reject non-loopback plaintext HTTP destinations before sending requests.** Only literal loopback addresses such as `127.0.0.1` or `[::1]` remain available for plaintext development; hostname-based `localhost` is refused to prevent resolver redirection; authority userinfo is rejected.
+- **Local HTTP requests do not follow redirects**, preventing a loopback 302 from forwarding a request to a remote plaintext origin. HTTPS requests remain restricted to HTTPS and use the verified native TLS connector.
+- Focused regressions verify disallowed remote/userinfo hosts, permitted loopback URLs, and disabled loopback redirects; the branch depends on the audited transport baseline in #2097.
+
+
+### Remote libSQL bearer transport admission — 2026-10-21
+- Remote libSQL connections now reject non-loopback HTTP and even a plaintext `localhost` hostname before any I/O; plaintext development URLs require numeric loopback addresses to prevent resolver redirection. HTTPS and `libsql://` semantics remain unchanged.
 
 ### Five-node post-heal actor-delivery readiness — 2026-10-21
 - **Test-only readiness contract:** require healthy membership at both peers and tracked heartbeat acknowledgements in both directions before the existing one-shot post-heal actor delivery. A forward ACK alone can succeed while the sender still marks the receiver Failed, which prevents its address resolver from routing actor messages.
