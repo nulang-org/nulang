@@ -108,6 +108,11 @@ jobs:
         # the default-feature test selection.
         run: cargo nextest run --locked
 
+      - name: Test loopback proxy isolation with opt-in environment proxies
+        # The pinned ureq dependency currently disables proxy-from-env; this
+        # deliberately enables it to pin the plaintext bearer isolation guard.
+        run: cargo test --locked --no-default-features --features 'ureq ureq/proxy-from-env' --lib test_loopback_plaintext_never_uses_environment_proxy
+
       - name: Test doctests
         # nextest intentionally does not execute rustdoc tests.
         run: cargo test --locked --doc
