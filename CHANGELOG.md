@@ -4,6 +4,10 @@
 - **Test-only readiness contract:** require healthy membership at both peers and tracked heartbeat acknowledgements in both directions before the existing one-shot post-heal actor delivery. A forward ACK alone can succeed while the sender still marks the receiver Failed, which prevents its address resolver from routing actor messages.
 - **Deterministic guard and failure evidence:** tests pin the bidirectional ACK and membership predicate; initial active-view convergence failures now report each peer’s health, address and active/passive/probationary state; address-convergence timeouts report mismatched authoritative and observed peer addresses/statuses. No production runtime change, actor-message retry, timeout extension, CI skip, or audit bypass. Stress certification and independent security gates remain outstanding.
 
+### TCP failed-writer generation fencing — 2026-10-21
+- Retire a failed TCP writer's connection only if its generation still matches; a replaced socket must survive stale writer cleanup. Keep at-most-once send semantics unchanged.
+- Track readiness acknowledgements by peer, preventing unrelated packet ACKs from satisfying the post-heal probe. Test the replacement's framed-packet delivery; this narrows one connection race but does not certify five-node healing.
+
 ### October 2026 dependency-security remediation candidate
 - Use verified system TLS for legacy libSQL remote connections (#1900) and explicitly configure ureq registry/deploy HTTPS rather than using obsolete bundled root certificates.
 - Update Wasmtime to 48.0.7, rustls-webpki to 0.103.16 and webpki-roots to 1.0.10 with a Cargo-generated lockfile; preserve blocking cargo-audit and restore trustworthy certificate chains.
