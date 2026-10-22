@@ -86,21 +86,22 @@ Windows x86_64; other platform/architecture combinations are not release-tested.
 
 ## Quick Start
 
-A pre-built release binary needs no Rust toolchain. To build from source, use
-Rust 1.95.0:
+A pre-built release binary on your `PATH` can be invoked as `nulang`.
+For a source checkout, use Rust 1.95.0 and run the existing hello example
+through Cargo (which respects this repo's configured build directory):
 
 ```bash
 git clone https://github.com/nulang-org/nulang.git
 cd nulang
-cargo build --release
+cargo run --release --bin nulang -- examples/01_hello.nula
+cargo run --release --bin nulang -- --check examples/01_hello.nula
+cargo run --release --bin nulang -- --eval '40 + 2'
 ```
 
-```bash
-nulang hello.nula              # compile + run
-nulang --check hello.nula      # type-check only
-nulang --eval '40 + 2'         # evaluate inline code
-nulang --repl                  # interactive REPL
-```
+The first `cargo run` builds the source executable if necessary. After
+installing a release binary on your `PATH`, you can instead run
+`nulang examples/01_hello.nula`. For the interactive REPL from source, run
+`cargo run --release --bin nulang -- --repl`.
 
 A Nulang program:
 
