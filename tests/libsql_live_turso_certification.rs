@@ -31,6 +31,7 @@ fn validate_target(ack: &str, raw_url: &str, token: &str) -> Result<(), &'static
         || endpoint.fragment().is_some()
         || endpoint.port().is_some()
         || authority.contains(':')
+        || authority.contains('@')
         || !matches!(endpoint.path(), "" | "/")
         || !endpoint
             .host_str()

@@ -1341,6 +1341,15 @@ fn validate_libsql_remote_url(raw: &str) -> io::Result<()> {
         // Keep libSQL's existing bare-hostname interpretation (HTTPS).
         format!("https://{raw}")
     };
+    // Reject even empty userinfo (https://@host): Url::username() is empty
+    // for this explicit authority delimiter, so checking it alone is insufficient.
+    let authority = candidate
+        .split_once("://")
+        .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or_default())
+        .unwrap_or_default();
+    if authority.contains('@') {
+        return Err(invalid());
+    }
     let parsed = url::Url::parse(&candidate).map_err(|_| invalid())?;
     let Some(host) = parsed.host() else {
         return Err(invalid());
