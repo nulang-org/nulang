@@ -1,5 +1,8 @@
 # Nulang Changelog
 
+### Remote libSQL bearer transport admission — 2026-10-21
+- Remote libSQL connections now reject non-loopback HTTP and even a plaintext `localhost` hostname before any I/O; plaintext development URLs require numeric loopback addresses to prevent resolver redirection. HTTPS and `libsql://` semantics remain unchanged.
+
 ### Five-node post-heal actor-delivery readiness — 2026-10-21
 - **Test-only readiness contract:** require healthy membership at both peers and tracked heartbeat acknowledgements in both directions before the existing one-shot post-heal actor delivery. A forward ACK alone can succeed while the sender still marks the receiver Failed, which prevents its address resolver from routing actor messages.
 - **Deterministic guard and failure evidence:** tests pin the bidirectional ACK and membership predicate; initial active-view convergence failures now report each peer’s health, address and active/passive/probationary state; address-convergence timeouts report mismatched authoritative and observed peer addresses/statuses. No production runtime change, actor-message retry, timeout extension, CI skip, or audit bypass. Stress certification and independent security gates remain outstanding.
