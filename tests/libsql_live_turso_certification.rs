@@ -45,8 +45,16 @@ fn validate_target(ack: &str, raw_url: &str, token: &str) -> Result<(), &'static
 #[test]
 fn certification_configuration_rejects_unsafe_inputs_before_network_io() {
     for (ack, url, token) in [
-        (ACKNOWLEDGEMENT, "https://@sandbox.example.turso.io", "test-token"),
-        (ACKNOWLEDGEMENT, "libsql://@sandbox.example.turso.io", "test-token"),
+        (
+            ACKNOWLEDGEMENT,
+            "https://@sandbox.example.turso.io",
+            "test-token",
+        ),
+        (
+            ACKNOWLEDGEMENT,
+            "libsql://@sandbox.example.turso.io",
+            "test-token",
+        ),
         ("", "libsql://sandbox.example.turso.io", "test-token"),
         ("yes", "libsql://sandbox.example.turso.io", "test-token"),
         (
