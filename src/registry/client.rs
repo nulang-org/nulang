@@ -18,13 +18,37 @@ pub(crate) fn verified_https_agent(target_url: &str) -> Result<ureq::Agent, Stri
     let (scheme, authority) = target_url
         .split_once("://")
         .ok_or_else(|| "registry/deploy URL must specify http:// or https://".to_string())?;
-    if authority.is_empty() {
-        return Err("registry/deploy URL must include a host".to_string());
+    // Keep the authority bounded to the host portion, not the URL path.
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return Err("registry/deploy URL must have a host without userinfo".to_string());
     }
     let https_only = if scheme.eq_ignore_ascii_case("https") {
         true
     } else if scheme.eq_ignore_ascii_case("http") {
-        false // Preserve explicitly configured local/development HTTP endpoints.
+        // Plaintext is permitted only for exact loopback development hosts.
+        // Never let a registry/deploy bearer token reach an arbitrary origin.
+        let loopback = if let Some(ipv6) = authority.strip_prefix('[') {
+            let (literal, suffix) = ipv6
+                .split_once(']')
+                .ok_or_else(|| "malformed bracketed loopback host".to_string())?;
+            (suffix.is_empty() || suffix.starts_with(':'))
+                && literal
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        } else {
+            let (host, _) = authority.split_once(':').unwrap_or((authority, ""));
+            // A hostname is not proof of loopback: local DNS/NSS rules may
+            // resolve "localhost" to an external address. Require an IP literal.
+            host.parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+        };
+        if !loopback {
+            return Err(
+                "plaintext registry/deploy URLs require an exact loopback host".to_string(),
+            );
+        }
+        false
     } else {
         return Err("registry/deploy URL must specify http:// or https://".to_string());
     };
@@ -33,6 +57,9 @@ pub(crate) fn verified_https_agent(target_url: &str) -> Result<ureq::Agent, Stri
         .map_err(|e| format!("system TLS initialization failed: {}", e))?;
     Ok(ureq::AgentBuilder::new()
         .https_only(https_only)
+        // Local HTTP must not redirect bearer-bearing requests off loopback.
+        // HTTPS requests retain normal HTTPS-only redirect behavior.
+        .redirects(if https_only { 5 } else { 0 })
         .tls_connector(std::sync::Arc::new(connector))
         .build())
 }
@@ -205,6 +232,64 @@ mod tls_transport_tests {
             .call()
             .expect("explicit local HTTP should work");
         assert_eq!(result.status(), 200);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn test_registry_and_deploy_reject_remote_plaintext_and_userinfo() {
+        // A configured package/deploy endpoint can send bearer tokens.
+        // Only exact loopback authorities may use plaintext for local dev.
+        for url in [
+            "http://registry.example.test/api/v1/packages",
+            "http://203.0.113.2:8080/api/v1/deploy",
+            "http://localhost.evil.test/api/v1/deploy",
+            "http://localhost:8080/api/v1/packages",
+            "http://user@localhost:8080/api/v1/deploy",
+            "http://localhost@evil.test/api/v1/deploy",
+        ] {
+            assert!(
+                verified_https_agent(url).is_err(),
+                "must reject plaintext remote or userinfo destination: {url}"
+            );
+        }
+        for url in [
+            "http://127.0.0.1:8080/api/v1/packages",
+            "http://[::1]:8080/api/v1/packages",
+        ] {
+            assert!(
+                verified_https_agent(url).is_ok(),
+                "explicit loopback dev transport must remain supported: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_loopback_http_does_not_follow_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut buf = [0u8; 2048];
+            assert!(stream.read(&mut buf).unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://example.test/not-loopback\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+        });
+        let response = verified_https_agent(&url)
+            .unwrap()
+            .get(&url)
+            .call()
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            302,
+            "local redirect must not be followed"
+        );
         server.join().unwrap();
     }
 
