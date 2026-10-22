@@ -39,6 +39,8 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 				</div>
 			)}
 
+			<p class="hero-scope">Browser playground runs Nulang Core. Actor supervision and durable recovery require the local runtime.</p>
+
 			<div class="hero-proof-grid" aria-label="Core Nulang capabilities">
 				<div>
 					<span>Type system</span>
@@ -297,6 +299,13 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 			margin-top: 2.25rem;
 			border-top: 1px solid var(--nu-border);
 			border-bottom: 1px solid var(--nu-border);
+		}
+
+		.hero-scope {
+			margin: 0.85rem 0 0;
+			color: var(--nu-text-tertiary);
+			font-size: 0.8rem;
+			line-height: 1.5;
 		}
 
 		.hero-proof-grid > div {
