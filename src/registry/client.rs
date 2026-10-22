@@ -14,6 +14,35 @@ use std::io::Read;
 /// Construct a shared, explicitly verified HTTP transport for registry/deploy.
 /// ureq 2 native TLS uses OS trust, not obsolete bundled root certificates.
 #[cfg(feature = "ureq")]
+fn is_explicit_loopback_origin(target: &str) -> bool {
+    // Validate the literal authority, not a DNS lookup or a prefix such as
+    // "localhost.evil.test". Never accept URL userinfo in plaintext.
+    let authority = target.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some((host, suffix)) = bracketed.split_once(']') else {
+            return false;
+        };
+        if !suffix.is_empty() && !suffix.starts_with(':') {
+            return false;
+        }
+        host
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|address| address.is_loopback())
+            .unwrap_or(false)
+}
+
+/// Construct a shared, explicitly verified HTTP transport for registry/deploy.
+/// HTTPS requires system-trusted TLS. Plain HTTP is permitted only for an
+/// explicit loopback URL, and cannot redirect bearer tokens elsewhere.
+#[cfg(feature = "ureq")]
 pub(crate) fn verified_https_agent(target_url: &str) -> Result<ureq::Agent, String> {
     let (scheme, authority) = target_url
         .split_once("://")
@@ -24,17 +53,25 @@ pub(crate) fn verified_https_agent(target_url: &str) -> Result<ureq::Agent, Stri
     let https_only = if scheme.eq_ignore_ascii_case("https") {
         true
     } else if scheme.eq_ignore_ascii_case("http") {
-        false // Preserve explicitly configured local/development HTTP endpoints.
+        if !is_explicit_loopback_origin(authority) {
+            return Err("plaintext registry/deploy HTTP is allowed only for loopback hosts".into());
+        }
+        false
     } else {
         return Err("registry/deploy URL must specify http:// or https://".to_string());
     };
 
     let connector = native_tls::TlsConnector::new()
         .map_err(|e| format!("system TLS initialization failed: {}", e))?;
-    Ok(ureq::AgentBuilder::new()
+    let mut builder = ureq::AgentBuilder::new()
         .https_only(https_only)
-        .tls_connector(std::sync::Arc::new(connector))
-        .build())
+        .tls_connector(std::sync::Arc::new(connector));
+    if !https_only {
+        // Even a localhost origin cannot redirect an Authorization header
+        // to an attacker-controlled HTTP destination.
+        builder = builder.redirects(0);
+    }
+    Ok(builder.build())
 }
 
 /// Client for a package registry server.
