@@ -36,7 +36,9 @@ pub fn raw(s: String) -> Html ! {Web, Render} {
     perform Web.raw(s)
 }
 
-/// Produce a redirect response to the given URL.
+/// Redirect to a same-origin, root-relative URL (e.g. "/dashboard").
+/// Routed HTTP requests return 302 (GET) or 303 (POST) with Location.
+/// Outside an HTTP request, safe local targets retain the HTML fallback.
 pub fn redirect(url: String) -> Html ! {Web, Respond} {
     perform Web.redirect(url)
 }
