@@ -272,6 +272,48 @@ fn test_mailbox_push_pop() {
 }
 
 #[test]
+fn test_state_field_update_accepts_borrowed_key_and_marks_dirty_once() {
+    // This key can be borrowed but cannot be converted into an owned String.
+    // Repeated updates should only allocate a key for genuinely new fields.
+    struct BorrowedName<'a>(&'a str);
+    impl AsRef<str> for BorrowedName<'_> {
+        fn as_ref(&self) -> &str {
+            self.0
+        }
+    }
+
+    let mut actor = Actor::new(42, "StateTest", 0);
+    actor.state_data.insert("total".to_string(), Value::int(0));
+    actor.dirty_fields.clear();
+
+    actor.set_state_field(BorrowedName("total"), Value::int(1));
+    actor.set_state_field(BorrowedName("total"), Value::int(2));
+    assert_eq!(actor.get_state_field("total"), Some(Value::int(2)));
+    assert_eq!(actor.dirty_fields.len(), 1);
+    assert!(actor.dirty_fields.contains("total"));
+
+    actor.dirty_fields.clear();
+    actor.set_state_field(BorrowedName("new_field"), Value::int(7));
+    assert_eq!(actor.get_state_field("new_field"), Some(Value::int(7)));
+    assert!(actor.dirty_fields.contains("new_field"));
+    assert_eq!(actor.dirty_fields.len(), 1);
+
+    actor.state_models.insert(
+        "crdt_counter".to_string(),
+        StateModel::Crdt(crate::ast::CrdtType::GCounter),
+    );
+    actor.dirty_fields.clear();
+    actor.set_state_field(BorrowedName("crdt_counter"), Value::int(10));
+    actor.set_state_field(BorrowedName("crdt_counter"), Value::int(11));
+    assert_eq!(actor.get_state_field("crdt_counter"), Some(Value::int(11)));
+    assert_eq!(actor.dirty_fields.len(), 1);
+    assert!(
+        actor.dirty_fields.contains("crdt_counter"),
+        "CRDT mutations must still be tracked for synchronization"
+    );
+}
+
+#[test]
 fn test_send_carries_current_trace_span() {
     let mut rt = Runtime::new();
     let b = rt.spawn_actor(Box::new(|| vec![]));

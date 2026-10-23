@@ -1,4 +1,9 @@
 # Nulang Changelog
+
+### Borrowed actor-state field updates — 2026-10-23
+- **Existing actor state and dirty-marker keys now use borrowed string lookups rather than cloning an owned field name on every update.** Field names are allocated only when first inserted into the state or dirty set, reducing allocations in repeated native-handler state mutations.
+- **New regression covers existing fields, newly inserted fields, and CRDT dirty tracking.** The actor-dispatch A/B harness measures the actual throughput effect; no unmeasured overall speedup is claimed.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
