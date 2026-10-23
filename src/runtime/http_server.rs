@@ -942,6 +942,17 @@ pub fn render_route_handler(
     }
 }
 
+fn invalid_request_input_response(captured: &HttpRequestBindingInputs) -> Option<HttpResponse> {
+    captured.input_error.as_ref().map(|error| {
+        let problem = request_decode_problem_response(error);
+        HttpResponse {
+            status: problem.status,
+            headers: problem.headers,
+            body: problem.body,
+        }
+    })
+}
+
 fn invalid_ui_action_response(captured: &HttpRequestBindingInputs) -> Option<HttpResponse> {
     captured
         .ui_message_error
@@ -1164,7 +1175,9 @@ impl WebDevServer {
         {
             let captured =
                 HttpRequestBindingInputs::capture(&request.path, &request.headers, &request.body);
-            if let Some(response) = invalid_ui_action_response(&captured) {
+            if let Some(response) = invalid_request_input_response(&captured)
+                .or_else(|| invalid_ui_action_response(&captured))
+            {
                 response
             } else {
                 let values = captured.values(&params, &request.headers);
@@ -1696,6 +1709,37 @@ mod tests {
                 assert_eq!(form_value("missing"), None);
             },
         );
+    }
+
+    #[test]
+    fn malformed_request_sources_return_problem_before_handler_dispatch() {
+        for (target, headers, body, expected_code) in [
+            (
+                "/?limit=1&limit=2",
+                Vec::new(),
+                &b""[..],
+                "duplicate_request_input",
+            ),
+            (
+                "/",
+                vec![(
+                    "Content-Type".to_string(),
+                    "application/x-www-form-urlencoded".to_string(),
+                )],
+                &b"title=%FF"[..],
+                "invalid_request_encoding",
+            ),
+        ] {
+            let captured = HttpRequestBindingInputs::capture(target, &headers, body);
+            let response = invalid_request_input_response(&captured)
+                .expect("invalid inputs must fail before route dispatch");
+            assert_eq!(response.status, 400);
+            assert!(response.headers.iter().any(|(name, value)| {
+                name == "Content-Type" && value == "application/problem+json"
+            }));
+            let problem: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(problem["code"], expected_code);
+        }
     }
 
     #[test]
