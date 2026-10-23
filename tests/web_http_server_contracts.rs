@@ -125,6 +125,22 @@ fn compiler_bound_query_executes_over_real_http() {
 }
 
 #[test]
+fn absolute_form_routes_a_typed_query_over_real_http() {
+    let server = WebDevServer::bind_runtime(0, None, None, vec![typed_query_route()])
+        .expect("bind typed WebDevServer");
+
+    // The absolute request-target's authority overrides the mismatched Host,
+    // and the normalized path/query must reach compiler-backed dispatch.
+    let response = send_raw_request(
+        server.port,
+        "GET http://example.test/users?limit=31 HTTP/1.1\r\nHost: misleading.test\r\nConnection: close\r\n\r\n",
+    );
+
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(response_body(&response).starts_with("31"), "{response}");
+}
+
+#[test]
 fn invalid_typed_query_is_problem_json_over_real_http() {
     let server = WebDevServer::bind_runtime(0, None, None, vec![typed_query_route()])
         .expect("bind typed WebDevServer");
@@ -164,4 +180,92 @@ fn legacy_route_still_falls_back_over_real_http() {
 
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
     assert!(response_body(&response).starts_with("legacy"), "{response}");
+}
+
+#[test]
+fn head_responses_for_registered_routes_retain_headers_but_omit_body() {
+    let (module, function_index) = compile_handler("fn head() -> String { \"legacy\" }", "head");
+    let server = WebDevServer::bind(
+        0,
+        None,
+        None,
+        vec![WebRoute {
+            method: HttpMethod::Head,
+            path: "/head".to_string(),
+            handler_module: module,
+            handler_func_idx: function_index,
+        }],
+    )
+    .expect("bind HEAD route");
+
+    let response = send_raw_request(
+        server.port,
+        "HEAD /head HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(response.contains("Content-Length: 6\r\n"), "{response}");
+    assert_eq!(response_body(&response), "", "HEAD must not send a body");
+}
+
+#[test]
+fn head_responses_for_static_assets_retain_length_but_omit_body() {
+    struct TempDir(std::path::PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let directory =
+        TempDir(std::env::temp_dir().join(format!("nulang-head-{}-{nonce}", std::process::id())));
+    std::fs::create_dir_all(&directory.0).expect("create public directory");
+    std::fs::write(directory.0.join("head.txt"), b"static-content").expect("write test asset");
+    let server = WebDevServer::bind(0, Some(directory.0.clone()), None, Vec::new())
+        .expect("bind static server");
+
+    let get = send_raw_request(
+        server.port,
+        "GET /head.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    let head = send_raw_request(
+        server.port,
+        "HEAD /head.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+    assert!(head.contains("Content-Length: 14\r\n"), "{head}");
+    assert_eq!(response_body(&get), "static-content");
+    assert_eq!(response_body(&head), "", "HEAD must not send a body");
+}
+
+#[test]
+fn head_requests_do_not_open_sse_streams() {
+    let server = WebDevServer::bind(0, None, None, Vec::new()).expect("bind SSE server");
+    let response = send_raw_request(
+        server.port,
+        "HEAD /__nulang/sse/room HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+        "{response}"
+    );
+    assert!(response.contains("Allow: GET\r\n"), "{response}");
+    assert_eq!(response_body(&response), "");
+}
+
+#[test]
+fn post_requests_do_not_open_sse_streams() {
+    let server = WebDevServer::bind(0, None, None, Vec::new()).expect("bind SSE server");
+    let response = send_raw_request(
+        server.port,
+        "POST /__nulang/sse/room HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+        "{response}"
+    );
+    assert!(response.contains("Allow: GET\r\n"), "{response}");
+    assert_eq!(response_body(&response), "Method not allowed");
 }

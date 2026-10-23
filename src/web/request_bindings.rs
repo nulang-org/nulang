@@ -21,6 +21,8 @@ pub struct RequestBindingValues<'a> {
 pub enum RequestDecodeErrorKind {
     Missing,
     InvalidType,
+    DuplicateInput,
+    InvalidEncoding,
     DuplicateHandlerSlot,
     InvalidHandlerSlot,
     IncompleteBindingPlan,
@@ -43,7 +45,10 @@ impl RequestDecodeError {
     pub fn is_client_error(&self) -> bool {
         matches!(
             self.kind,
-            RequestDecodeErrorKind::Missing | RequestDecodeErrorKind::InvalidType
+            RequestDecodeErrorKind::Missing
+                | RequestDecodeErrorKind::InvalidType
+                | RequestDecodeErrorKind::DuplicateInput
+                | RequestDecodeErrorKind::InvalidEncoding
         )
     }
 
@@ -66,6 +71,8 @@ impl RequestDecodeError {
         match self.kind {
             RequestDecodeErrorKind::Missing => "missing_request_input",
             RequestDecodeErrorKind::InvalidType => "invalid_request_input",
+            RequestDecodeErrorKind::DuplicateInput => "duplicate_request_input",
+            RequestDecodeErrorKind::InvalidEncoding => "invalid_request_encoding",
             RequestDecodeErrorKind::DuplicateHandlerSlot => "duplicate_handler_slot",
             RequestDecodeErrorKind::InvalidHandlerSlot => "invalid_handler_slot",
             RequestDecodeErrorKind::IncompleteBindingPlan => "incomplete_binding_plan",
@@ -309,6 +316,84 @@ pub fn parse_urlencoded(input: &[u8]) -> HashMap<String, String> {
     out
 }
 
+/// Strict transport admission for scalar query/form parameters.
+///
+/// Unlike the legacy helper, this fails closed on duplicate decoded names,
+/// malformed percent escapes, or invalid UTF-8. Repeated names require an
+/// explicit future multi-value contract; a single-valued handler must never
+/// silently select the first or last attacker-supplied value.
+pub fn parse_urlencoded_strict(
+    input: &[u8],
+    source: RouteBindingSource,
+) -> Result<HashMap<String, String>, RequestDecodeError> {
+    let raw = std::str::from_utf8(input).map_err(|_| {
+        urlencoded_decode_error(source, None, RequestDecodeErrorKind::InvalidEncoding)
+    })?;
+    let mut values = HashMap::new();
+    for part in raw.split('&').filter(|part| !part.is_empty()) {
+        let (raw_key, raw_value) = part.split_once('=').unwrap_or((part, ""));
+        let key = strict_percent_decode_form(raw_key).ok_or_else(|| {
+            urlencoded_decode_error(source, None, RequestDecodeErrorKind::InvalidEncoding)
+        })?;
+        let value = strict_percent_decode_form(raw_value).ok_or_else(|| {
+            urlencoded_decode_error(
+                source,
+                Some(key.clone()),
+                RequestDecodeErrorKind::InvalidEncoding,
+            )
+        })?;
+        if values.contains_key(&key) {
+            return Err(urlencoded_decode_error(
+                source,
+                Some(key),
+                RequestDecodeErrorKind::DuplicateInput,
+            ));
+        }
+        values.insert(key, value);
+    }
+    Ok(values)
+}
+
+fn urlencoded_decode_error(
+    source: RouteBindingSource,
+    name: Option<String>,
+    kind: RequestDecodeErrorKind,
+) -> RequestDecodeError {
+    let message = match kind {
+        RequestDecodeErrorKind::DuplicateInput => "duplicate URL-encoded field",
+        _ => "invalid URL-encoded request input",
+    };
+    RequestDecodeError {
+        kind,
+        source: Some(source),
+        source_name: name,
+        handler_param: None,
+        handler_index: None,
+        expected_type: None,
+        message: message.to_string(),
+    }
+}
+
+fn strict_percent_decode_form(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => decoded.push(b' '),
+            b'%' => {
+                let high = hex(*bytes.get(i + 1)?)?;
+                let low = hex(*bytes.get(i + 2)?)?;
+                decoded.push((high << 4) | low);
+                i += 2;
+            }
+            byte => decoded.push(byte),
+        }
+        i += 1;
+    }
+    String::from_utf8(decoded).ok()
+}
+
 pub fn parse_cookie_header(header: &str) -> HashMap<String, String> {
     header
         .split(';')
@@ -511,6 +596,49 @@ mod tests {
                 .map(String::as_str),
             Some("dark mode")
         );
+    }
+
+    #[test]
+    fn strict_urlencoded_rejects_duplicate_fields_even_with_encoded_keys() {
+        for raw in [
+            &b"role=user&role=admin"[..],
+            &b"r%6fle=user&role=admin"[..],
+            &b"role=user&role=user"[..],
+        ] {
+            let error = parse_urlencoded_strict(raw, RouteBindingSource::Query).unwrap_err();
+            assert_eq!(error.kind, RequestDecodeErrorKind::DuplicateInput);
+            assert_eq!(error.http_status(), 400);
+            assert_eq!(error.problem_details()["source"], "query");
+            assert_eq!(error.problem_details()["source_name"], "role");
+            assert_eq!(error.problem_details()["code"], "duplicate_request_input");
+        }
+    }
+
+    #[test]
+    fn strict_urlencoded_rejects_malformed_escaping_and_utf8() {
+        for raw in [
+            &b"title=bad%XX"[..],
+            &b"title=bad%"[..],
+            &b"title=%FF"[..],
+            &b"title=\xFF"[..],
+        ] {
+            let error = parse_urlencoded_strict(raw, RouteBindingSource::Form).unwrap_err();
+            assert_eq!(error.kind, RequestDecodeErrorKind::InvalidEncoding);
+            assert_eq!(error.http_status(), 400);
+            assert_eq!(error.problem_details()["source"], "form");
+            assert_eq!(error.problem_details()["code"], "invalid_request_encoding");
+        }
+    }
+
+    #[test]
+    fn strict_urlencoded_accepts_valid_utf8_and_encoded_separators() {
+        let values = parse_urlencoded_strict(
+            b"name=Jos%C3%A9+M%C3%BCller&path=a%2Fb",
+            RouteBindingSource::Query,
+        )
+        .unwrap();
+        assert_eq!(values.get("name").map(String::as_str), Some("José Müller"));
+        assert_eq!(values.get("path").map(String::as_str), Some("a/b"));
     }
 
     #[test]

@@ -17,6 +17,7 @@ use std::time::Duration;
 use crate::bytecode::CodeModule;
 use crate::value_layout::PAYLOAD_MASK;
 use crate::vm::{resolve_value_string, Value, CLOSURE_ENV_FLAG, VM};
+use crate::web::csrf::validate_mutation_origin;
 use crate::web::dispatch::{render_direct_request, DirectRequestRenderError};
 use crate::web::http_problem::request_decode_problem_response;
 use crate::web::http_request::HttpRequestBindingInputs;
@@ -110,6 +111,99 @@ impl HttpReadError {
 const MAX_HTTP_HEADERS_SIZE: usize = 16 * 1024;
 const MAX_HTTP_BODY_SIZE: usize = 1_048_576;
 
+/// Convert absolute-form targets to origin-form and retain the URI authority.
+fn normalize_http_request_target(
+    raw: &str,
+    method: HttpMethod,
+) -> Result<(String, Option<String>), HttpReadError> {
+    if raw.contains('#') || raw.bytes().any(|byte| byte <= 0x20 || byte == 0x7f) {
+        return Err(HttpReadError::BadRequest);
+    }
+    if raw.starts_with('/') {
+        return Ok((raw.to_string(), None));
+    }
+    if raw == "*" && method == HttpMethod::Options {
+        return Ok((raw.to_string(), None));
+    }
+    let remainder = if raw
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+    {
+        &raw[7..]
+    } else if raw
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        &raw[8..]
+    } else {
+        return Err(HttpReadError::BadRequest);
+    };
+    let authority_end = remainder
+        .find(|ch: char| ch == '/' || ch == '?')
+        .unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    if !valid_http_authority(authority) {
+        return Err(HttpReadError::BadRequest);
+    }
+    let suffix = &remainder[authority_end..];
+    let path = if suffix.is_empty() {
+        "/".to_string()
+    } else if suffix.starts_with('?') {
+        format!("/{suffix}")
+    } else {
+        suffix.to_string()
+    };
+    Ok((path, Some(authority.to_string())))
+}
+
+/// Validate request authorities conservatively before routing. A blank Host
+/// for a URI without authority is permitted separately at the call site.
+fn valid_http_authority(value: &str) -> bool {
+    if value.is_empty()
+        || value.bytes().any(|byte| {
+            byte <= 0x20 || byte >= 0x7f || matches!(byte, b',' | b'/' | b'\\' | b'@' | b'#' | b'?')
+        })
+    {
+        return false;
+    }
+    if let Some(rest) = value.strip_prefix('[') {
+        let Some((host, suffix)) = rest.split_once(']') else {
+            return false;
+        };
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        return suffix.is_empty()
+            || suffix
+                .strip_prefix(':')
+                .is_some_and(|port| port.bytes().all(|byte| byte.is_ascii_digit()));
+    }
+    let (host, port) = value.split_once(':').unwrap_or((value, ""));
+    !host.is_empty()
+        && !host.contains(':')
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && host.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'-' | b'.'
+                        | b'_'
+                        | b'~'
+                        | b'%'
+                        | b'!'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b'='
+                        | b';'
+                )
+        })
+}
+
 /// Reads exactly one HTTP/1.x request. Both HTTP listeners use this same
 /// bounded framing boundary, rather than assuming one read contains a request.
 ///
@@ -166,12 +260,18 @@ fn read_http_request<R: Read>(reader: &mut R) -> Result<Option<HttpRequest>, Htt
         return Err(HttpReadError::BadRequest);
     }
 
+    let version = parsed.version.ok_or(HttpReadError::BadRequest)?;
+    if version != 0 && version != 1 {
+        return Err(HttpReadError::BadRequest);
+    }
+
     let method = parsed
         .method
         .and_then(HttpMethod::from_str)
         .ok_or(HttpReadError::NotImplemented)?;
-    let path = parsed.path.ok_or(HttpReadError::BadRequest)?.to_string();
-    let headers: Vec<(String, String)> = parsed
+    let raw_target = parsed.path.ok_or(HttpReadError::BadRequest)?;
+    let (path, absolute_authority) = normalize_http_request_target(raw_target, method)?;
+    let mut headers: Vec<(String, String)> = parsed
         .headers
         .iter()
         .map(|header| {
@@ -185,8 +285,20 @@ fn read_http_request<R: Read>(reader: &mut R) -> Result<Option<HttpRequest>, Htt
     let mut content_length = None;
     let mut has_transfer_encoding = false;
     let mut has_expectation = false;
+    let mut has_host = false;
     for (name, value) in &headers {
-        if name.eq_ignore_ascii_case("content-length") {
+        if name.eq_ignore_ascii_case("host") {
+            // Duplicate or ambiguous authority can cause front-end/backend
+            // routing disagreement, even when both Host values are equal.
+            if has_host {
+                return Err(HttpReadError::BadRequest);
+            }
+            has_host = true;
+            let host = value.trim();
+            if !host.is_empty() && !valid_http_authority(host) {
+                return Err(HttpReadError::BadRequest);
+            }
+        } else if name.eq_ignore_ascii_case("content-length") {
             // Reject even identical duplicates: this is a one-request server,
             // and accepting ambiguous lengths enables request desynchronization.
             let value = value.trim();
@@ -213,6 +325,22 @@ fn read_http_request<R: Read>(reader: &mut R) -> Result<Option<HttpRequest>, Htt
     }
     if has_transfer_encoding {
         return Err(HttpReadError::NotImplemented);
+    }
+    // RFC 9112 requires exactly one Host field line for HTTP/1.1.
+    // HTTP/1.0 remains supported for legacy clients without Host.
+    if version == 1 && !has_host {
+        return Err(HttpReadError::BadRequest);
+    }
+    if let Some(authority) = absolute_authority {
+        // RFC 9112: an absolute request-target overrides a conflicting Host.
+        if let Some((_, host)) = headers
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+        {
+            *host = authority;
+        } else {
+            headers.push(("Host".into(), authority));
+        }
     }
 
     let content_length = content_length.unwrap_or(0);
@@ -347,15 +475,15 @@ impl HttpServerState {
             Ok(Some(request)) => request,
             Ok(None) => return,
             Err(error) => {
-                Self::write_response(&mut stream, &error.response());
+                Self::write_response(&mut stream, &error.response(), false);
                 return;
             }
         };
         let response = Self::dispatch(handler_module, handler_func_idx, &request);
-        Self::write_response(&mut stream, &response);
+        Self::write_response(&mut stream, &response, request.method == HttpMethod::Head);
     }
 
-    fn write_response(stream: &mut TcpStream, response: &HttpResponse) {
+    fn write_response(stream: &mut TcpStream, response: &HttpResponse, suppress_body: bool) {
         let status_text = match response.status {
             200 => "OK",
             201 => "Created",
@@ -394,7 +522,9 @@ impl HttpServerState {
         out.push_str(&format!("Content-Length: {}\r\n", response.body.len()));
         out.push_str("\r\n");
         let _ = stream.write_all(out.as_bytes());
-        let _ = stream.write_all(&response.body);
+        if !suppress_body {
+            let _ = stream.write_all(&response.body);
+        }
         let _ = stream.flush();
     }
 
@@ -815,6 +945,42 @@ pub fn render_route_handler(
     }
 }
 
+fn invalid_request_input_response(captured: &HttpRequestBindingInputs) -> Option<HttpResponse> {
+    captured.input_error.as_ref().map(|error| {
+        let problem = request_decode_problem_response(error);
+        HttpResponse {
+            status: problem.status,
+            headers: problem.headers,
+            body: problem.body,
+        }
+    })
+}
+
+/// Experimental Web rejects ambiguous or cross-origin browser mutations before
+/// handler dispatch. This does not replace authentication or authorization.
+fn unsafe_origin_response(
+    request: &HttpRequest,
+    local_addr: Option<std::net::SocketAddr>,
+    public_origin: Option<&str>,
+) -> Option<HttpResponse> {
+    let failure = validate_mutation_origin(
+        request.method.as_str(),
+        &request.headers,
+        local_addr,
+        public_origin,
+    )
+    .err()?;
+    eprintln!("Nulang Web denied state-changing request: {failure:?}");
+    Some(HttpResponse {
+        status: 403,
+        headers: vec![
+            ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+            ("Cache-Control".into(), "no-store".into()),
+        ],
+        body: b"Forbidden: invalid request origin".to_vec(),
+    })
+}
+
 fn invalid_ui_action_response(captured: &HttpRequestBindingInputs) -> Option<HttpResponse> {
     captured
         .ui_message_error
@@ -978,6 +1144,7 @@ impl WebDevServer {
                                 ],
                                 body: b"Server at connection capacity".to_vec(),
                             },
+                            false,
                         );
                         continue;
                     };
@@ -1018,16 +1185,34 @@ impl WebDevServer {
             Ok(Some(request)) => request,
             Ok(None) => return,
             Err(error) => {
-                HttpServerState::write_response(&mut stream, &error.response());
+                HttpServerState::write_response(&mut stream, &error.response(), false);
                 return;
             }
         };
         let path = request.path.clone();
 
+        // Apply origin admission to every state-changing route. SSE has no
+        // mutation handler: reject non-GET methods with 405 before this guard.
+        let public_origin = std::env::var("NULANG_WEB_PUBLIC_ORIGIN").ok();
         let mut response = if path.starts_with(Self::SSE_PATH_PREFIX) {
-            let room = &path[Self::SSE_PATH_PREFIX.len()..];
-            Self::serve_sse(room, &mut stream, shutdown.clone());
-            return;
+            if request.method != HttpMethod::Get {
+                HttpResponse {
+                    status: 405,
+                    headers: vec![
+                        ("Allow".into(), "GET".into()),
+                        ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+                    ],
+                    body: b"Method not allowed".to_vec(),
+                }
+            } else {
+                let room = &path[Self::SSE_PATH_PREFIX.len()..];
+                Self::serve_sse(room, &mut stream, shutdown.clone());
+                return;
+            }
+        } else if let Some(forbidden) =
+            unsafe_origin_response(&request, stream.local_addr().ok(), public_origin.as_deref())
+        {
+            forbidden
         } else if let Some((route, params)) = routes
             .iter()
             .filter(|r| r.route.method == request.method)
@@ -1037,7 +1222,9 @@ impl WebDevServer {
         {
             let captured =
                 HttpRequestBindingInputs::capture(&request.path, &request.headers, &request.body);
-            if let Some(response) = invalid_ui_action_response(&captured) {
+            if let Some(response) = invalid_request_input_response(&captured)
+                .or_else(|| invalid_ui_action_response(&captured))
+            {
                 response
             } else {
                 let values = captured.values(&params, &request.headers);
@@ -1094,7 +1281,7 @@ impl WebDevServer {
         for m in &middlewares {
             m.apply(&request, &mut response);
         }
-        HttpServerState::write_response(&mut stream, &response);
+        HttpServerState::write_response(&mut stream, &response, request.method == HttpMethod::Head);
     }
 
     fn serve_sse(room: &str, stream: &mut TcpStream, shutdown: Arc<AtomicBool>) {
@@ -1278,6 +1465,153 @@ mod tests {
     }
 
     #[test]
+    fn web_dev_server_fences_cross_origin_mutations_before_dispatch() {
+        fn send(port: u16, raw: &str) -> String {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream.write_all(raw.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        }
+
+        let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
+        let host = format!("localhost:{}", server.port);
+        let foreign = format!(
+            "POST /mutation HTTP/1.1\r\nHost: {host}\r\nOrigin: https://attacker.example\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(send(server.port, &foreign).starts_with("HTTP/1.1 403 Forbidden"));
+
+        let missing =
+            format!("POST /mutation HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\n\r\n");
+        assert!(send(server.port, &missing).starts_with("HTTP/1.1 403 Forbidden"));
+
+        let trusted = format!(
+            "POST /mutation HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(
+            send(server.port, &trusted).starts_with("HTTP/1.1 404 Not Found"),
+            "same-origin requests must reach normal routing"
+        );
+
+        let duplicate = format!(
+            "POST /mutation HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nOrigin: https://attacker.example\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(send(server.port, &duplicate).starts_with("HTTP/1.1 403 Forbidden"));
+
+        let unknown = format!("TRACE / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        assert!(send(server.port, &unknown).starts_with("HTTP/1.1 501 Not Implemented"));
+    }
+
+    #[test]
+    fn http_request_requires_single_host_for_http_11() {
+        for raw in [
+            &b"GET /resource HTTP/1.1\r\n\r\n"[..],
+            &b"GET /resource HTTP/1.1\r\nHost: first.example\r\nhost: second.example\r\n\r\n"[..],
+            &b"GET /resource HTTP/1.1\r\nHost: first.example, second.example\r\n\r\n"[..],
+            &b"GET /resource HTTP/1.1\r\nHost: bad host\r\n\r\n"[..],
+            &b"GET /resource HTTP/1.1\r\nHost: \xff\r\n\r\n"[..],
+        ] {
+            assert_eq!(
+                read_http_request(&mut chunks(raw, 3)).unwrap_err(),
+                HttpReadError::BadRequest,
+                "invalid or ambiguous HTTP/1.1 Host must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn http_request_accepts_single_host_and_legacy_http_10() {
+        let http11 = read_http_request(&mut chunks(
+            b"GET /resource?limit=1 HTTP/1.1\r\nHost: api.example:8080\r\n\r\n",
+            2,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(http11.path, "/resource?limit=1");
+
+        // HTTP/1.0 did not require Host; keep compatibility with legacy clients.
+        let http10 = read_http_request(&mut chunks(b"GET /legacy HTTP/1.0\r\n\r\n", 2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(http10.path, "/legacy");
+    }
+
+    #[test]
+    fn http_request_rejects_invalid_versions_and_fragments() {
+        for raw in [
+            &b"GET / HTTP/2.0\r\nHost: localhost\r\n\r\n"[..],
+            &b"GET /resource#fragment HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+            &b"GET http://example.test/a#fragment HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+        ] {
+            assert_eq!(
+                read_http_request(&mut chunks(raw, 4)).unwrap_err(),
+                HttpReadError::BadRequest,
+                "invalid request lines must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn http_request_preserves_absolute_form_and_empty_host_for_routing() {
+        // RFC 9112: an origin host accepts absolute-form, routes its path,
+        // and uses request-target authority instead of a conflicting Host.
+        let absolute = read_http_request(&mut chunks(
+            b"GET http://example.test/resource?x=1 HTTP/1.1\r\nHost: mismatch.test\r\n\r\n",
+            4,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(absolute.path, "/resource?x=1");
+        let effective_host = absolute
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("host"))
+            .map(|(_, value)| value.as_str());
+        assert_eq!(effective_host, Some("example.test"));
+
+        // A URI with no explicit path still routes to '/'.
+        let no_path = read_http_request(&mut chunks(
+            b"GET HTTP://example.test?x=1 HTTP/1.1\r\nHost: ignored.test\r\n\r\n",
+            4,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(no_path.path, "/?x=1");
+        let effective_host = no_path
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("host"))
+            .map(|(_, value)| value.as_str());
+        assert_eq!(effective_host, Some("example.test"));
+
+        // Empty Host is permitted when the target has no URI authority.
+        let empty_host =
+            read_http_request(&mut chunks(b"GET /resource HTTP/1.1\r\nHost: \r\n\r\n", 4))
+                .unwrap()
+                .unwrap();
+        assert_eq!(empty_host.path, "/resource");
+    }
+
+    #[test]
+    fn http_request_rejects_ambiguous_absolute_form_authorities() {
+        for raw in [
+            &b"GET http:///missing HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+            &b"GET http://user@host.example/private HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+            &b"GET http://bad\\host.example/private HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+            &b"GET unknown://host.example/private HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+        ] {
+            assert_eq!(
+                read_http_request(&mut chunks(raw, 4)).unwrap_err(),
+                HttpReadError::BadRequest,
+            );
+        }
+    }
+
+    #[test]
     fn http_request_reassembles_fragmented_headers_and_exact_body() {
         let raw = b"POST /submit HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
         let request = read_http_request(&mut chunks(raw, 3)).unwrap().unwrap();
@@ -1328,7 +1662,7 @@ mod tests {
 
     #[test]
     fn http_request_rejects_oversized_payload_from_declared_length() {
-        let raw = b"POST / HTTP/1.1\r\nContent-Length: 1048577\r\n\r\n";
+        let raw = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1048577\r\n\r\n";
         assert_eq!(
             read_http_request(&mut chunks(raw, 32)).unwrap_err(),
             HttpReadError::PayloadTooLarge
@@ -1356,7 +1690,8 @@ mod tests {
 
     #[test]
     fn http_request_does_not_consume_pipelined_bytes_as_body() {
-        let raw = b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nokGET / HTTP/1.1\r\n\r\n";
+        let raw =
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\nokGET / HTTP/1.1\r\n\r\n";
         let request = read_http_request(&mut chunks(raw, 128)).unwrap().unwrap();
         assert_eq!(request.body, b"ok");
     }
@@ -1463,6 +1798,37 @@ mod tests {
                 assert_eq!(form_value("missing"), None);
             },
         );
+    }
+
+    #[test]
+    fn malformed_request_sources_return_problem_before_handler_dispatch() {
+        for (target, headers, body, expected_code) in [
+            (
+                "/?limit=1&limit=2",
+                Vec::new(),
+                &b""[..],
+                "duplicate_request_input",
+            ),
+            (
+                "/",
+                vec![(
+                    "Content-Type".to_string(),
+                    "application/x-www-form-urlencoded".to_string(),
+                )],
+                &b"title=%FF"[..],
+                "invalid_request_encoding",
+            ),
+        ] {
+            let captured = HttpRequestBindingInputs::capture(target, &headers, body);
+            let response = invalid_request_input_response(&captured)
+                .expect("invalid inputs must fail before route dispatch");
+            assert_eq!(response.status, 400);
+            assert!(response.headers.iter().any(|(name, value)| {
+                name == "Content-Type" && value == "application/problem+json"
+            }));
+            let problem: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(problem["code"], expected_code);
+        }
     }
 
     #[test]
