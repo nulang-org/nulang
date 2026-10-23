@@ -1693,9 +1693,31 @@ impl PersistenceStore for LibsqlStore {
                     let sequence: i64 = row.get(1).map_err(|error| {
                         io::Error::new(io::ErrorKind::InvalidData, error.to_string())
                     })?;
+                    // SQLite stores signed 64-bit integers. Negative and zero
+                    // epochs/sequences are never valid durable tail positions;
+                    // unchecked casts would turn corrupt negative values into
+                    // enormous positive fencing counters.
+                    let activation_epoch = u64::try_from(activation_epoch)
+                        .ok()
+                        .filter(|epoch| *epoch > 0)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "persisted durable activation epoch is not positive",
+                            )
+                        })?;
+                    let sequence = u64::try_from(sequence)
+                        .ok()
+                        .filter(|sequence| *sequence > 0)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "persisted durable tail sequence is not positive",
+                            )
+                        })?;
                     Ok(Some(DurableTailPosition {
-                        activation_epoch: activation_epoch as u64,
-                        sequence: sequence as u64,
+                        activation_epoch,
+                        sequence,
                     }))
                 }
                 None => Ok(None),
@@ -1740,6 +1762,35 @@ impl PersistenceStore for LibsqlStore {
 
     fn commit_transition(&mut self, transition: DurableTransition) -> io::Result<DurableCommit> {
         transition.validate_structure()?;
+
+        // libSQL persists these identifiers as signed SQLite INTEGERs. A raw
+        // u64->i64 cast wraps values above i64::MAX into negative rows, which
+        // can later be misread as valid actor/fencing history.
+        for (field, value) in [
+            ("actor_id", transition.actor_id),
+            ("activation_epoch", transition.activation_epoch),
+            ("sequence", transition.sequence),
+            (
+                "expected_previous_sequence",
+                transition.expected_previous_sequence,
+            ),
+        ] {
+            if i64::try_from(value).is_err() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{field} exceeds the libSQL signed integer range"),
+                ));
+            }
+        }
+        for message in &transition.outbox {
+            if i64::try_from(message.destination_actor_id).is_err() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "outbox destination_actor_id exceeds the libSQL signed integer range",
+                ));
+            }
+        }
+
         let digest = transition.digest()?;
         let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
 
@@ -1837,7 +1888,27 @@ impl PersistenceStore for LibsqlStore {
                         let stored_digest: String = row
                             .get(2)
                             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                        Some((epoch as u64, sequence as u64, stored_digest))
+                        // Reject corrupt fencing metadata before checking epochs,
+                        // retries, or mutating the transition ledger.
+                        let epoch = u64::try_from(epoch)
+                            .ok()
+                            .filter(|value| *value > 0)
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "persisted durable activation epoch is not positive",
+                                )
+                            })?;
+                        let sequence = u64::try_from(sequence)
+                            .ok()
+                            .filter(|value| *value > 0)
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "persisted durable tail sequence is not positive",
+                                )
+                            })?;
+                        Some((epoch, sequence, stored_digest))
                     }
                     None => None,
                 }
@@ -4404,5 +4475,234 @@ mod libsql_atomic_transition_tests {
 
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(store.latest_sequence(42), 1);
+    }
+
+    #[test]
+    fn libsql_reopens_effect_and_outbox_ledger_without_duplicate_receipts() {
+        use crate::durable_effect::{DurableEffectId, DurableEffectRecord, DurableEffectSpec};
+        use crate::primitives::{DeliverySemantics, EffectBoundary};
+
+        let path = std::env::temp_dir().join(format!(
+            "nulang_effect_outbox_contract_{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+
+        let id = DurableEffectId::derive(42, "step:charge", 0, "Payment.charge");
+        let spec = DurableEffectSpec::new(
+            id,
+            "Payment.charge",
+            EffectBoundary::External,
+            DeliverySemantics::EffectivelyOnceWithDeduplication,
+        );
+        let prepared = DurableEffectPersistenceRecord::from_effect(DurableEffectRecord::prepare(
+            spec.clone(),
+            b"order=42&amount=10",
+        ));
+        let completed = DurableEffectPersistenceRecord::from_effect(
+            DurableEffectRecord::prepare(spec, b"order=42&amount=10").complete(b"charged".to_vec()),
+        );
+
+        let mut step_one = transition(42, 1, 1);
+        step_one.durable_effects.push(prepared);
+        let mut step_two = transition(42, 2, 2);
+        step_two.durable_effects.push(completed.clone());
+        step_two.outbox.push(DurableOutboxMessage {
+            destination_actor_id: 44,
+            ordinal: 1,
+            behavior_id: 5,
+            payload: vec![PersistedValue::String("receipt".to_string())],
+        });
+
+        {
+            let mut store = LibsqlStore::new(&path).unwrap();
+            store.commit_transition(step_one).unwrap();
+            let receipt = store.commit_transition(step_two.clone()).unwrap();
+            assert_eq!(store.commit_transition(step_two.clone()).unwrap(), receipt);
+            store.commit_transition(transition(55, 1, 1)).unwrap();
+        }
+
+        {
+            let mut store = LibsqlStore::new(&path).unwrap();
+            assert_eq!(store.latest_sequence(42), 2);
+            assert_eq!(store.latest_sequence(55), 1);
+            assert_eq!(
+                store.load_durable_tail_position(42).unwrap(),
+                Some(DurableTailPosition {
+                    activation_epoch: 2,
+                    sequence: 2,
+                })
+            );
+            let restored = store.load_durable_effect(42, id).unwrap().unwrap();
+            assert_eq!(restored, completed);
+            assert_eq!(store.read_workflow_events(42).len(), 4);
+            assert_eq!(store.read_events(42).len(), 4);
+            assert_eq!(store.read_journal(42).len(), 2);
+            assert_eq!(
+                store
+                    .query(
+                        "SELECT sequence, ordinal, destination_actor_id
+                     FROM durable_outbox WHERE actor_id = 42
+                     ORDER BY sequence, ordinal",
+                        &[],
+                    )
+                    .unwrap(),
+                vec![
+                    "[1,0,43]".to_string(),
+                    "[2,0,43]".to_string(),
+                    "[2,1,44]".to_string(),
+                ],
+            );
+            assert_eq!(
+                store
+                    .query(
+                        "SELECT COUNT(*) FROM durable_effect_records WHERE actor_id = 42",
+                        &[],
+                    )
+                    .unwrap(),
+                vec!["[2]".to_string()]
+            );
+            let conflict = {
+                let mut altered = step_two;
+                altered.outbox[0].behavior_id = 777;
+                altered
+            };
+            assert_eq!(
+                store.commit_transition(conflict).unwrap_err().kind(),
+                io::ErrorKind::AlreadyExists,
+            );
+            assert_eq!(
+                store
+                    .query(
+                        "SELECT COUNT(*) FROM durable_outbox WHERE actor_id = 42",
+                        &[],
+                    )
+                    .unwrap(),
+                vec!["[3]".to_string()]
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn libsql_rejects_unsigned_ids_and_counters_outside_signed_sql_range() {
+        let mut store = LibsqlStore::in_memory().unwrap();
+        let too_large = i64::MAX as u64 + 1;
+        let mut oversized_actor = transition(too_large, 1, 1);
+        // The snapshot and workflow activation must agree with the actor ID.
+        oversized_actor.snapshot.as_mut().unwrap().actor_id = too_large;
+        oversized_actor.workflow_events[0] = WorkflowEvent::StepCompleted {
+            sequence: 1,
+            activation: Some(WorkflowActivationId::new(too_large, 1)),
+            step_name: "persist".to_string(),
+        };
+        assert_eq!(
+            store.commit_transition(oversized_actor).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput,
+        );
+
+        let mut oversized_epoch = transition(42, too_large, 1);
+        oversized_epoch.snapshot.as_mut().unwrap().activation_epoch = too_large;
+        assert_eq!(
+            store.commit_transition(oversized_epoch).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput,
+        );
+
+        let oversized_sequence = transition(42, 1, too_large);
+        assert_eq!(
+            store
+                .commit_transition(oversized_sequence)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput,
+        );
+
+        let mut oversized_destination = transition(42, 1, 1);
+        oversized_destination.outbox[0].destination_actor_id = too_large;
+        assert_eq!(
+            store
+                .commit_transition(oversized_destination)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput,
+        );
+        assert_eq!(store.latest_sequence(42), 0);
+    }
+
+    #[test]
+    fn libsql_commit_rejects_corrupt_existing_tail_before_writing() {
+        let mut store = LibsqlStore::in_memory().unwrap();
+        for (epoch, sequence) in [(-1_i64, 1_i64), (1, -1), (0, 1), (1, 0)] {
+            let conn = store.conn();
+            store
+                .rt
+                .block_on(async {
+                    conn.execute(
+                        "INSERT INTO durable_tails (actor_id, activation_epoch, sequence, digest)
+                         VALUES (42, ?1, ?2, 'invalid')
+                         ON CONFLICT(actor_id) DO UPDATE SET
+                           activation_epoch=excluded.activation_epoch,
+                           sequence=excluded.sequence",
+                        libsql::params![epoch, sequence],
+                    )
+                    .await
+                })
+                .unwrap();
+            drop(conn);
+            let error = store.commit_transition(transition(42, 2, 2)).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "corrupted persisted tail epoch={epoch} sequence={sequence} must fail closed"
+            );
+            assert!(
+                error.to_string().contains("persisted durable"),
+                "must identify corrupt persisted metadata, not report a normal writer conflict: {error}"
+            );
+            assert_eq!(
+                store
+                    .query(
+                        "SELECT COUNT(*) FROM durable_transitions WHERE actor_id = 42",
+                        &[]
+                    )
+                    .unwrap(),
+                vec!["[0]".to_string()]
+            );
+            assert!(store.load_snapshot(42).is_none());
+        }
+    }
+
+    #[test]
+    fn libsql_corrupt_tail_fails_closed_on_negative_epoch_or_sequence() {
+        let store = LibsqlStore::in_memory().unwrap();
+        for (epoch, sequence) in [(-1_i64, 1_i64), (1, -1), (0, 1), (1, 0)] {
+            let conn = store.conn();
+            store
+                .rt
+                .block_on(async {
+                    conn.execute(
+                        "INSERT INTO durable_tails (actor_id, activation_epoch, sequence, digest)
+                     VALUES (42, ?1, ?2, 'invalid')
+                     ON CONFLICT(actor_id) DO UPDATE SET
+                         activation_epoch=excluded.activation_epoch,
+                         sequence=excluded.sequence",
+                        libsql::params![epoch, sequence],
+                    )
+                    .await
+                })
+                .unwrap();
+            drop(conn);
+            let err = store.load_durable_tail_position(42).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::InvalidData,
+                "invalid epoch={epoch} sequence={sequence} must not be interpreted as valid",
+            );
+        }
     }
 }
