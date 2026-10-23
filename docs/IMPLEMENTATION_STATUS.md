@@ -60,6 +60,14 @@ source
 Do not claim backend parity unless the relevant conformance and differential
 tests establish it. Bytecode remains the semantic reference.
 
+The CLI's `nulang --check <FILE>` defaults to frontend-only checking for the
+bytecode backend. With `--backend native|wasm|wasm-run|wasm-aot|wasmfx|wasmfx-run`,
+it also invokes the selected backend compiler in memory (when compiled in),
+without running code or writing artifacts. An unknown/unavailable backend is an
+error; CoreVM backend-specific checking is not yet supported. Passing this check
+proves compilation for that backend, **not** runtime semantic parity or durable
+recovery guarantees.
+
 ## Actor runtime
 
 The live runtime is sharded and cooperatively scheduled.
