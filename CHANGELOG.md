@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Registry and deployment bearer-token plaintext safeguard — 2026-10-21
+- **Registry and deployment clients reject non-loopback plaintext HTTP destinations before sending requests.** Only literal loopback addresses such as `127.0.0.1` or `[::1]` remain available for plaintext development; hostname-based `localhost` is refused to prevent resolver redirection; authority userinfo is rejected.
+- **Local HTTP requests do not follow redirects**, preventing a loopback 302 from forwarding a request to a remote plaintext origin. HTTPS requests remain restricted to HTTPS and use the verified native TLS connector.
+- Focused regressions verify disallowed remote/userinfo hosts, permitted loopback URLs, and disabled loopback redirects; the branch depends on the audited transport baseline in #2097.
+
 
 ### October 2026 dependency-security remediation candidate
 - Use verified system TLS for legacy libSQL remote connections (#1900) and explicitly configure ureq registry/deploy HTTPS rather than using obsolete bundled root certificates.
