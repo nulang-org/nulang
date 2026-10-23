@@ -474,15 +474,15 @@ impl HttpServerState {
             Ok(Some(request)) => request,
             Ok(None) => return,
             Err(error) => {
-                Self::write_response(&mut stream, &error.response());
+                Self::write_response(&mut stream, &error.response(), false);
                 return;
             }
         };
         let response = Self::dispatch(handler_module, handler_func_idx, &request);
-        Self::write_response(&mut stream, &response);
+        Self::write_response(&mut stream, &response, request.method == HttpMethod::Head);
     }
 
-    fn write_response(stream: &mut TcpStream, response: &HttpResponse) {
+    fn write_response(stream: &mut TcpStream, response: &HttpResponse, suppress_body: bool) {
         let status_text = match response.status {
             200 => "OK",
             201 => "Created",
@@ -521,7 +521,9 @@ impl HttpServerState {
         out.push_str(&format!("Content-Length: {}\r\n", response.body.len()));
         out.push_str("\r\n");
         let _ = stream.write_all(out.as_bytes());
-        let _ = stream.write_all(&response.body);
+        if !suppress_body {
+            let _ = stream.write_all(&response.body);
+        }
         let _ = stream.flush();
     }
 
@@ -1116,6 +1118,7 @@ impl WebDevServer {
                                 ],
                                 body: b"Server at connection capacity".to_vec(),
                             },
+                            false,
                         );
                         continue;
                     };
@@ -1156,16 +1159,27 @@ impl WebDevServer {
             Ok(Some(request)) => request,
             Ok(None) => return,
             Err(error) => {
-                HttpServerState::write_response(&mut stream, &error.response());
+                HttpServerState::write_response(&mut stream, &error.response(), false);
                 return;
             }
         };
         let path = request.path.clone();
 
         let mut response = if path.starts_with(Self::SSE_PATH_PREFIX) {
-            let room = &path[Self::SSE_PATH_PREFIX.len()..];
-            Self::serve_sse(room, &mut stream, shutdown.clone());
-            return;
+            if request.method != HttpMethod::Get {
+                HttpResponse {
+                    status: 405,
+                    headers: vec![
+                        ("Allow".into(), "GET".into()),
+                        ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+                    ],
+                    body: b"Method not allowed".to_vec(),
+                }
+            } else {
+                let room = &path[Self::SSE_PATH_PREFIX.len()..];
+                Self::serve_sse(room, &mut stream, shutdown.clone());
+                return;
+            }
         } else if let Some((route, params)) = routes
             .iter()
             .filter(|r| r.route.method == request.method)
@@ -1234,7 +1248,7 @@ impl WebDevServer {
         for m in &middlewares {
             m.apply(&request, &mut response);
         }
-        HttpServerState::write_response(&mut stream, &response);
+        HttpServerState::write_response(&mut stream, &response, request.method == HttpMethod::Head);
     }
 
     fn serve_sse(room: &str, stream: &mut TcpStream, shutdown: Arc<AtomicBool>) {
