@@ -692,14 +692,19 @@ impl Actor {
     /// Set or update a named state field.  Marks the field dirty for
     /// incremental persistence (only dirty fields are re-serialized on
     /// the next checkpoint).
-    pub fn set_state_field(&mut self, name: impl Into<String>, value: Value) {
-        let name_str = name.into();
-        self.dirty_fields.insert(name_str.clone());
-        self.state_data.insert(name_str.clone(), value);
-
-        // Auto-sync CRDT fields on mutation
-        if let Some(StateModel::Crdt(_crdt_type)) = self.state_models.get(&name_str) {
-            self.dirty_fields.insert(name_str.clone());
+    pub fn set_state_field(&mut self, name: impl AsRef<str>, value: Value) {
+        let name = name.as_ref();
+        // Hot actor behaviors repeatedly mutate the same fields. Borrow the
+        // existing keys instead of allocating an owned String on every write.
+        // CRDT fields use this same dirty marker; the previous second insert
+        // of their marker was redundant.
+        if !self.dirty_fields.contains(name) {
+            self.dirty_fields.insert(name.to_owned());
+        }
+        if let Some(current) = self.state_data.get_mut(name) {
+            *current = value;
+        } else {
+            self.state_data.insert(name.to_owned(), value);
         }
     }
 
