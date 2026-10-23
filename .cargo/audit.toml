@@ -17,6 +17,11 @@ ignore = [
     "RUSTSEC-2026-0349",
     # The rustls-webpki advisories below are transitive through libsql
     # 0.10.0-pre.4 -> hyper-rustls 0.25 -> rustls 0.22.4 -> rustls-webpki 0.102.8.
+    # RUSTSEC-2026-0382 (Oct 20, 2026) additionally affects rustls-webpki
+    # 0.102.8. It has NO patched 0.102.x release and is intentionally NOT
+    # ignored; cargo audit must keep failing until the libsql remote/TLS
+    # dependency is removed or the upstream dependency chain is upgraded.
+    # Do not add a blanket ignore to unblock unrelated PRs.
     # No patched libsql release is available, and the vulnerable code path
     # (TLS certificate validation with CRLs / name constraints) is only reachable
     # when connecting to a remote Turso database. Nulang's LibsqlStore also
