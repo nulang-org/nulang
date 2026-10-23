@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Protected-branch-safe generated documentation archival — 2026-10-22
+- **Docs Sync no longer force-pushes or opens pull requests from GitHub Actions.** It uses read-only repository permissions, builds the standard-library/API docs and browser playground, then archives generated files for reviewed import under organization-wide branch protections.
+- **A 30-day `nulang-generated-docs` artifact and drift warning preserve generated output without deployment claims.** The branch-specific GitHub Actions validation completed successfully, including the actual artifact upload; publication into `main` still requires an independently reviewed PR.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
