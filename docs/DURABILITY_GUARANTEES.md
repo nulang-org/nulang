@@ -139,6 +139,16 @@ the VM's ordinary `.nula` `PerformAsync` host callback uses the helper
 or that process restarts, multi-owner race conditions, all resource-scoped
 external authority, and transactional actor-turn completion have been validated.
 
+`tests/durable_compiled_store_restart.rs` extends the trusted Rust adapter
+checks to file-backed SQLite: it compiles and round-trips an NBC artifact,
+commits and reopens a terminal receipt, checks request drift and revoked
+authority after reopen, and verifies that a `Prepared` timeout preserves a
+stable provider idempotency key across a fresh store instance. The gate
+explicitly runs this regression with the `sqlite` feature. It does **not**
+execute the VM's live `PerformAsync` callback, kill a process, verify provider
+side-effect deduplication, or prove atomic actor-turn completion. Those require
+separate integration and crash tests.
+
 ## What is not yet a production-wide guarantee
 
 Passing this gate does **not** prove that every `perform`, workflow activity,
