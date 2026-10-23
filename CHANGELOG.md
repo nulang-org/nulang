@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Post-removal packet admission is fail-closed — 2026-10-23
+- Drop all packets from an already confirmed-removed peer before dispatch, so delayed gossip cannot overwrite durable-actor ownership epochs and replayed goodbye manifests cannot poison the actor directory. A deterministic RED/GREEN transport regression also verifies that a different live peer can still advance the directory.
+- This does not implement stable-identity reincarnation or cryptographically authenticate the explicitly insecure plaintext transport; removed identities require a separately certified rejoin and actor-epoch fencing protocol.
+
 ### Confirmed-removed nodes are fenced from membership liveness — 2026-10-23
 - A confirmed `NodeGoodbye` or quorum-gated removal tombstone now blocks heartbeat and gossip resurrection, excludes the removed identity from healthy counts and advertised membership, and releases active/passive/probationary view slots. Focused regressions cover stale Healthy records, forged higher-incarnation gossip, timeout-confirmed removal, and fresh **different** node identities.
 - A stable `NodeId` may rejoin only after a separately verified incarnation and durable-actor epoch-fencing protocol is implemented; this change intentionally does **not** clear tombstones on heartbeat or self-gossip.
