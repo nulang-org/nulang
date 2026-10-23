@@ -5164,6 +5164,16 @@ mod lsp_tests {
     }
 
     #[test]
+    fn test_match_cases_skip_using_parameter_shadowing() {
+        let source = "type Color = Red | Blue\ntype Shape = Circle | Square\nfn f(c: Color) using (c: Shape) -> Int { match c { Circle => 1 } }";
+        let match_column = source.lines().nth(2).unwrap().find("match c").unwrap() as u32 + 5;
+        assert!(
+            match_case_test_edits(source, 2, match_column).is_empty(),
+            "using parameter overrides ordinary parameter; never generate wrong enum cases"
+        );
+    }
+
+    #[test]
     fn test_match_cases_never_resolve_existing_todo_identifier() {
         let source = "type Color = Red | Blue\nfn pick(c: Color, todo_Blue: Int) -> Int { match c { Red => 1 } }";
         let edits = match_case_test_edits(source, 1, 60);

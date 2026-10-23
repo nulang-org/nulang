@@ -1554,7 +1554,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         .unwrap_or_default();
                     #[cfg(feature = "ureq")]
                     {
-                        let agent = match crate::registry::client::verified_https_agent(&url) {
+                        let agent = match crate::registry::client::vm_effect_http_agent(&url) {
                             Ok(agent) => agent,
                             Err(_) => return Some(Value::nil()),
                         };
@@ -1617,7 +1617,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         .unwrap_or_default();
                     #[cfg(feature = "ureq")]
                     {
-                        let agent = match crate::registry::client::verified_https_agent(&url) {
+                        let agent = match crate::registry::client::vm_effect_http_agent(&url) {
                             Ok(agent) => agent,
                             Err(_) => return Some(Value::nil()),
                         };
@@ -8496,6 +8496,104 @@ mod vm_tests {
             result.unwrap().is_nil(),
             "Http.post on non-connectable port should return nil"
         );
+    }
+
+    /// A generic VM HTTP effect has no registry/deploy bearer credential:
+    /// the registry credential admission policy must not reject localhost.
+    #[cfg(feature = "ureq")]
+    fn assert_generic_http_effect_accepts_localhost(post: bool) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://localhost:{}/status",
+            listener.local_addr().unwrap().port()
+        );
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(3)))
+                            .unwrap();
+                        let mut buf = [0u8; 2048];
+                        let n = stream.read(&mut buf).unwrap();
+                        let expected = if post { b"POST " } else { b"GET  " };
+                        let verb = if post { &expected[..4] } else { &expected[..3] };
+                        let matched = buf[..n].starts_with(verb);
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK").unwrap();
+                        return matched;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return false;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("localhost HTTP accept failed: {e}"),
+                }
+            }
+        });
+
+        let mut module = CodeModule::new("generic_http_effect_hostname");
+        let url_idx = module.add_constant(Constant::String(url));
+        let eff_idx = module.add_constant(Constant::String(
+            (if post { "Http.post" } else { "Http.get" }).to_owned(),
+        ));
+        module.emit(Instruction::new3(
+            OpCode::ConstU,
+            ((url_idx >> 8) & 0xff) as u8,
+            (url_idx & 0xff) as u8,
+            0,
+        ));
+        if post {
+            let body_idx = module.add_constant(Constant::String("{}".to_string()));
+            module.emit(Instruction::new3(
+                OpCode::ConstU,
+                ((body_idx >> 8) & 0xff) as u8,
+                (body_idx & 0xff) as u8,
+                1,
+            ));
+        }
+        let result_reg = if post { 2 } else { 1 };
+        module.emit(Instruction::new3(
+            OpCode::Perform,
+            ((eff_idx >> 8) & 0xff) as u8,
+            (eff_idx & 0xff) as u8,
+            result_reg,
+        ));
+        module.emit(Instruction::new2(OpCode::Move, result_reg, 0));
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
+        let mut vm = VM::new();
+        vm.load_module(module);
+        vm.set_actor_callbacks(Box::new(StandaloneVmCallbacks::new()));
+        let result = vm.run().expect("generic HTTP effect must dispatch");
+        let did_contact = server.join().expect("localhost server");
+        assert!(
+            did_contact,
+            "generic HTTP should reach localhost by hostname"
+        );
+        assert!(
+            !result.is_nil(),
+            "generic HTTP must return its response body"
+        );
+    }
+
+    #[cfg(feature = "ureq")]
+    #[test]
+    fn test_vm_generic_http_get_allows_hostname() {
+        assert_generic_http_effect_accepts_localhost(false);
+    }
+
+    #[cfg(feature = "ureq")]
+    #[test]
+    fn test_vm_generic_http_post_allows_hostname() {
+        assert_generic_http_effect_accepts_localhost(true);
     }
 
     /// Run the real standalone VM Http effect against a self-signed loopback

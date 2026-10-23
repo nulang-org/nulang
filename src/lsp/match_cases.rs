@@ -157,10 +157,23 @@ pub(super) fn actions(
         return Vec::new();
     };
     for decl in &ast.decls {
-        let Decl::Function { params, body, .. } = decl else {
+        let Decl::Function {
+            params,
+            using_params,
+            body,
+            ..
+        } = decl
+        else {
             continue;
         };
         for Param { name, ty, .. } in params {
+            // The typechecker binds using parameters after ordinary
+            // parameters. A matching name therefore changes the effective
+            // type of the scrutinee. Until we resolve that binding, withhold
+            // the edit instead of generating arms for the wrong variant.
+            if using_params.iter().any(|param| param.name == *name) {
+                continue;
+            }
             let Some(Type::Variant(variants)) = ty else {
                 continue;
             };
