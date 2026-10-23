@@ -1,5 +1,10 @@
 # Nulang Changelog
 
+### Backend-aware CLI check validation — 2026-10-23
+- **An explicit `nulang --check --backend` now verifies compiler acceptance by the selected native or WASM backend**, rather than reporting success after frontend validation alone. The default bytecode check remains frontend-only.
+- **Unknown, unavailable, and currently unverified CoreVM backends fail closed with structured diagnostics.** Checks compile in memory without executing the program or writing output artifacts. WASM AOT checking verifies WASM emission, not host AOT precompilation or runtime semantic equivalence.
+- **Focused CLI regressions cover backend acceptance, unsupported durable workflows, JSON diagnostics, and artifact-free checks.** Backend-specific behavior still requires independent runtime conformance tests.
+
 ### October 2026 dependency-security remediation candidate
 - Use verified system TLS for legacy libSQL remote connections (#1900) and explicitly configure ureq registry/deploy HTTPS rather than using obsolete bundled root certificates.
 - Update Wasmtime to 48.0.7, rustls-webpki to 0.103.16 and webpki-roots to 1.0.10 with a Cargo-generated lockfile; preserve blocking cargo-audit and restore trustworthy certificate chains.
