@@ -20,6 +20,8 @@
 //! | `textDocument/completion` | Keyword/effect/capability/function completion |
 //! | `textDocument/codeLens` | Reference counts on top-level declarations |
 //! | `textDocument/documentLink` | Clickable import paths to stdlib/files |
+mod match_cases;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -666,14 +668,19 @@ impl LanguageServer for NulangLanguageServer {
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()));
         let import_index = self.import_index(doc_dir.as_deref());
-        Ok(Self::code_actions(
+        let mut actions = Self::code_actions(
             &source,
             range,
             &uri,
             &import_index,
             ast.as_ref(),
             inferred_types.as_ref(),
-        ))
+        )
+        .unwrap_or_default();
+        if let (Some(ast), Some(selection)) = (ast.as_ref(), range.as_ref()) {
+            actions.extend(Self::match_case_actions(&source, selection, &uri, ast));
+        }
+        Ok((!actions.is_empty()).then_some(actions))
     }
 
     async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
@@ -1835,6 +1842,15 @@ impl NulangLanguageServer {
         let line = prefix.bytes().filter(|&b| b == b'\n').count() as u32;
         let last_line = prefix.rsplit('\n').next().unwrap_or("");
         Some(Position::new(line, last_line.encode_utf16().count() as u32))
+    }
+
+    fn match_case_actions(
+        source: &str,
+        selection: &Range,
+        uri: &Url,
+        ast: &crate::ast::AstModule,
+    ) -> Vec<CodeActionOrCommand> {
+        match_cases::actions(source, selection, uri, ast)
     }
 
     /// Offer "Extract to variable" for a selected expression.
@@ -4935,6 +4951,89 @@ mod lsp_tests {
                 expected
             );
         }
+    }
+
+    // OCaml/Merlin-style exhaustiveness quick fix: targeted, AST-backed,
+    // and deliberately non-compiling until generated TODOs are replaced.
+    fn match_case_test_edits(source: &str, line: u32, character: u32) -> Vec<TextEdit> {
+        let tokens = Lexer::new(source).lex().expect("valid lexer input");
+        let ast = Parser::new(tokens)
+            .parse_module()
+            .expect("valid match syntax");
+        let uri = Url::parse("file:///match.nula").unwrap();
+        let actions = NulangLanguageServer::match_case_actions(
+            source,
+            &Range::new(
+                Position::new(line, character),
+                Position::new(line, character),
+            ),
+            &uri,
+            &ast,
+        );
+        actions
+            .into_iter()
+            .flat_map(|action| match action {
+                CodeActionOrCommand::CodeAction(action) => action
+                    .edit
+                    .and_then(|edit| edit.changes)
+                    .and_then(|changes| changes.get(&uri).cloned())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_match_cases_generates_only_missing_variants() {
+        let source = "type Color = Red | Green | Blue\nfn color(c: Color) -> Int {\n    match c {\n        | Red => 1\n    }\n}";
+        let edits = match_case_test_edits(source, 3, 10);
+        assert_eq!(edits.len(), 1);
+        assert!(edits[0].new_text.contains("| Green => todo_Green"));
+        assert!(edits[0].new_text.contains("| Blue => todo_Blue"));
+        assert!(!edits[0].new_text.contains("todo_Red"));
+        assert_eq!(edits[0].range.start.line, 4);
+        let pos =
+            NulangLanguageServer::position_to_byte_offset(source, &edits[0].range.start).unwrap();
+        let completed = format!("{}{}{}", &source[..pos], edits[0].new_text, &source[pos..]);
+        assert!(Parser::new(Lexer::new(&completed).lex().unwrap())
+            .parse_module()
+            .is_ok());
+    }
+
+    #[test]
+    fn test_match_cases_payload_and_guard_do_not_imply_coverage() {
+        let source = "type Option[T] = Some(T) | None\nfn unwrap(x: Option[Int]) -> Int {\n    match x {\n        | Some(1) => 1\n        | None if false => 0\n    }\n}";
+        let edits = match_case_test_edits(source, 3, 9);
+        assert_eq!(edits.len(), 1);
+        assert!(edits[0].new_text.contains("| Some(_) => todo_Some"));
+        assert!(edits[0].new_text.contains("| None => todo_None"));
+    }
+
+    #[test]
+    fn test_match_cases_irrefutable_payload_and_wildcard_skip_completion() {
+        let source = "type Option[T] = Some(T) | None\nfn unwrap(x: Option[Int]) -> Int {\n    match x {\n        | Some(v) => v\n        | None => 0\n    }\n}";
+        assert!(match_case_test_edits(source, 3, 11).is_empty());
+        let source = "type Color = Red | Blue\nfn f(c: Color) -> Int { match c { _ => 0 } }";
+        assert!(match_case_test_edits(source, 1, 39).is_empty());
+    }
+
+    #[test]
+    fn test_match_cases_rejects_untyped_and_unrelated_selection() {
+        let untyped = "fn f(c) { match c { Red => 1 } }";
+        assert!(match_case_test_edits(untyped, 0, 16).is_empty());
+        let source = "type Color = Red | Blue\nfn f(c: Color) { match c { Red => 1 } }";
+        assert!(match_case_test_edits(source, 0, 10).is_empty());
+    }
+
+    #[test]
+    fn test_match_cases_utf16_range_and_inline_source() {
+        let source = "// 🦉\ntype Color = Red | Blue\nfn f(c: Color) { match c { Red => 1 } }";
+        let edits = match_case_test_edits(source, 2, 25);
+        assert_eq!(edits.len(), 1);
+        let pos =
+            NulangLanguageServer::position_to_byte_offset(source, &edits[0].range.start).unwrap();
+        assert_eq!(&source[pos..pos + 1], "}");
+        assert!(edits[0].new_text.contains("todo_Blue"));
     }
 
     #[test]
