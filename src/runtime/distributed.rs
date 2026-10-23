@@ -1320,6 +1320,9 @@ pub fn process_network_packets(
             }
             Packet::Ack { packet_seq } => {
                 runtime.acked_packets.insert(packet_seq);
+                runtime
+                    .acked_packets_by_peer
+                    .insert((incoming.from_node.0, packet_seq));
                 if let Some((peer_id, batch_id)) =
                     runtime.pending_crdt_sync_acks.get(&packet_seq).copied()
                 {
@@ -4075,6 +4078,11 @@ mod tests {
         let drained = rt.drain_acked();
         assert!(drained.contains(&42));
         assert!(!rt.is_acked(42));
+        rt.acked_packets_by_peer.insert((7, 42));
+        assert!(rt.is_acked_from(NodeId(7), 42));
+        assert!(!rt.is_acked_from(NodeId(8), 42));
+        rt.drain_acked();
+        assert!(!rt.is_acked_from(NodeId(7), 42));
     }
 
     #[test]
