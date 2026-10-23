@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Confirmed-removed nodes are fenced from membership liveness — 2026-10-23
+- A confirmed `NodeGoodbye` or quorum-gated removal tombstone now blocks heartbeat and gossip resurrection, excludes the removed identity from healthy counts and advertised membership, and releases active/passive/probationary view slots. Focused regressions cover stale Healthy records, forged higher-incarnation gossip, timeout-confirmed removal, and fresh **different** node identities.
+- A stable `NodeId` may rejoin only after a separately verified incarnation and durable-actor epoch-fencing protocol is implemented; this change intentionally does **not** clear tombstones on heartbeat or self-gossip.
+
 ### Sender-bound heartbeat admission — 2026-10-23
 - Reject heartbeat payloads whose claimed node ID differs from the transport-reported sender before refreshing cluster liveness or reviving a failed peer. A deterministic transport regression proves forged third-party revival fails closed and legitimate same-sender recovery remains available.
 - This protects the heartbeat handler's sender/payload consistency; it does not authenticate plaintext transports or solve reincarnation fencing.
