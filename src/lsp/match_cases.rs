@@ -91,14 +91,30 @@ fn find_selected_match<'a>(
             .find_map(|part| find_selected_match(part, param_name, start, end, tokens)),
         Expr::Let {
             name, value, body, ..
-        }
-        | Expr::LetRec {
-            name, value, body, ..
         } => find_selected_match(value, param_name, start, end, tokens).or_else(|| {
             (name != param_name)
                 .then(|| find_selected_match(body, param_name, start, end, tokens))
                 .flatten()
         }),
+        Expr::LetRec {
+            name,
+            params,
+            value,
+            body,
+            ..
+        } => {
+            // Recursive binding and its parameters are scoped over the value.
+            // Only the recursive name remains bound in the body.
+            let value_match = (name != param_name
+                && params.iter().all(|param| param.name != param_name))
+            .then(|| find_selected_match(value, param_name, start, end, tokens))
+            .flatten();
+            value_match.or_else(|| {
+                (name != param_name)
+                    .then(|| find_selected_match(body, param_name, start, end, tokens))
+                    .flatten()
+            })
+        }
         Expr::If {
             cond,
             then_branch,
@@ -199,7 +215,7 @@ pub(super) fn actions(
             let Some(position) = lsp_position(source, insert_at) else {
                 return Vec::new();
             };
-            let lines = missing
+            let lines: Option<Vec<String>> = missing
                 .iter()
                 .map(|(name, payload)| {
                     let pat = if payload.is_some() {
@@ -207,12 +223,28 @@ pub(super) fn actions(
                     } else {
                         name.to_string()
                     };
-                    // An unresolved identifier intentionally fails compilation
-                    // until the developer provides case-specific behavior.
-                    format!("{arm_indent}| {pat} => todo_{name}")
+                    // Avoid every user identifier in the source. Fail closed
+                    // if no fresh placeholder can be found.
+                    let todo = (0..1024)
+                        .map(|i| {
+                            if i == 0 {
+                                format!("todo_{name}")
+                            } else {
+                                format!("todo_{name}_{i}")
+                            }
+                        })
+                        .find(|candidate| {
+                            !tokens.iter().any(|token| {
+                            matches!(&token.kind, TokenKind::Ident(s) if s == candidate)
+                        })
+                        })?;
+                    Some(format!("{arm_indent}| {pat} => {todo}"))
                 })
-                .collect::<Vec<_>>()
-                .join("\n");
+                .collect();
+            let Some(lines) = lines else {
+                return Vec::new();
+            };
+            let lines = lines.join("\n");
             let insertion = if multiline_close {
                 format!("{lines}\n")
             } else {

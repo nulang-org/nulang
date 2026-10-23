@@ -1690,7 +1690,9 @@ impl NulangLanguageServer {
             match ty {
                 Type::Primitive(PrimitiveType::Never) => false,
                 Type::Primitive(_) | Type::Nominal { .. } => true,
-                Type::Tuple(ts) => ts.iter().all(concrete),
+                // The annotation printer renders (Int,) as (Int), which
+                // the parser reads as Int, not a one-element tuple.
+                Type::Tuple(ts) => ts.len() != 1 && ts.iter().all(concrete),
                 Type::Array(t) => concrete(t),
                 Type::App { constructor, args } => {
                     concrete(constructor) && args.iter().all(concrete)
@@ -1759,7 +1761,12 @@ impl NulangLanguageServer {
         };
         let mut checker = TypeChecker::new();
         checker.collect_errors = true;
-        let _ = checker.check_module(&module);
+        // Do not continue with partial inference: a failed reconstructed
+        // declaration may leave an earlier, shadowed function in scope and
+        // produce a confidently wrong type for subsequent bindings.
+        if checker.check_module(&module).is_err() || !checker.collected_errors.is_empty() {
+            return Vec::new();
+        }
 
         // Look up actual top-level token spans. The synthetic AST lets have
         // default spans, so their original source locations are unavailable.
@@ -4136,6 +4143,25 @@ mod lsp_tests {
     }
 
     #[test]
+    fn test_type_annotation_rejects_recursive_lambda_shadowing_failure() {
+        let source = "fn f(n: Int) -> Bool { true }\nlet f = fn(n) if n == 0 then 0 else f(n - 1)\nlet result = f(3)";
+        assert!(
+            type_annotation_edits(source, None).is_empty(),
+            "failed reconstructed inference must not leak old function types to later lets"
+        );
+    }
+
+    #[test]
+    fn test_type_annotation_rejects_singleton_tuples_including_nested() {
+        for source in ["let item = (1,)", "let items = [(1,)]"] {
+            assert!(
+                type_annotation_edits(source, None).is_empty(),
+                "tuple formatting must preserve arity before offering an action: {source}"
+            );
+        }
+    }
+
+    #[test]
     fn test_type_annotation_ignores_function_local_lets() {
         assert!(
             type_annotation_edits("fn main() { let local = 7\n local }", None).is_empty(),
@@ -4819,8 +4845,13 @@ mod lsp_tests {
 
     /// Exercise both code actions through the actual editor-facing JSON-RPC
     /// service and the cached diagnostic AST/type inference.
-    #[tokio::test]
-    async fn test_protocol_code_actions_serve_both_lsp_features() {
+    #[test]
+    fn test_protocol_code_actions_serve_both_lsp_features() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        runtime.block_on(async {
         let (mut service, mut socket) = LspService::new(|client| NulangLanguageServer::new(client));
         init(&mut service).await;
 
@@ -4921,6 +4952,7 @@ mod lsp_tests {
             result.is_null() || result.as_array().is_some_and(|a| a.is_empty()),
             "must not return actions from stale AST: {result}"
         );
+        });
     }
 
     /// documentSymbol returns the top-level declaration outline through the
@@ -5129,6 +5161,26 @@ mod lsp_tests {
         assert!(match_case_test_edits(untyped, 0, 16).is_empty());
         let source = "type Color = Red | Blue\nfn f(c: Color) { match c { Red => 1 } }";
         assert!(match_case_test_edits(source, 0, 10).is_empty());
+    }
+
+    #[test]
+    fn test_match_cases_never_resolve_existing_todo_identifier() {
+        let source = "type Color = Red | Blue\nfn pick(c: Color, todo_Blue: Int) -> Int { match c { Red => 1 } }";
+        let edits = match_case_test_edits(source, 1, 60);
+        assert_eq!(edits.len(), 1);
+        assert!(
+            edits[0].new_text.contains("Blue => todo_Blue_1"),
+            "generated TODO must not resolve to an existing parameter: {edits:?}"
+        );
+    }
+
+    #[test]
+    fn test_match_cases_skip_shadowed_recursive_function_parameter() {
+        let source = "type Color = Red | Blue\ntype Shape = Circle | Square\nfn f(c: Color) { let rec g(c: Shape) = match c { Circle => 1 } in g(Circle) }";
+        assert!(
+            match_case_test_edits(source, 2, 52).is_empty(),
+            "local recursive function parameter shadows outer typed variant"
+        );
     }
 
     #[test]
