@@ -102,30 +102,24 @@ impl TraceContext {
     /// obtain this side's own span under it. Returns `None` on malformed
     /// input, non-zero-length version, or a zero trace/span id.
     pub fn from_traceparent(s: &str) -> Option<Self> {
-        let mut parts = s.split('-');
-        let version = parts.next()?;
-        let trace = parts.next()?;
-        let span = parts.next()?;
-        let flags = parts.next()?;
-        if parts.next().is_some() {
-            return None; // too many fields
-        }
-        if version.len() != 2 || trace.len() != 32 || span.len() != 16 || flags.len() != 2 {
+        // Version 00 has a fixed 55-byte wire layout. Validate its byte
+        // offsets before slicing; str::get rejects multibyte UTF-8 boundaries
+        // instead of panicking on malformed incoming network data.
+        let bytes = s.as_bytes();
+        if bytes.len() != 55 || &bytes[..3] != b"00-" || bytes[35] != b'-' || bytes[52] != b'-' {
             return None;
         }
-        let mut version_buf = [0u8; 1];
-        hex::decode_to_slice(version, &mut version_buf).ok()?;
-        if version_buf[0] != 0 {
-            return None; // only version 00 is understood
+        let trace = s.get(3..35)?;
+        let span = s.get(36..52)?;
+        let flags = s.get(53..55)?;
+        // Numeric radix parsers permit a leading '+', but the W3C wire
+        // format allows only hexadecimal digits in each fixed-width field.
+        if trace.starts_with('+') || span.starts_with('+') || flags.starts_with('+') {
+            return None;
         }
-        let mut trace_buf = [0u8; 16];
-        hex::decode_to_slice(trace, &mut trace_buf).ok()?;
-        let mut span_buf = [0u8; 8];
-        hex::decode_to_slice(span, &mut span_buf).ok()?;
-        let mut flags_buf = [0u8; 1];
-        hex::decode_to_slice(flags, &mut flags_buf).ok()?;
-        let trace_id = u128::from_be_bytes(trace_buf);
-        let span_id = u64::from_be_bytes(span_buf);
+        let trace_id = u128::from_str_radix(trace, 16).ok()?;
+        let span_id = u64::from_str_radix(span, 16).ok()?;
+        let trace_flags = u8::from_str_radix(flags, 16).ok()?;
         if trace_id == 0 || span_id == 0 {
             return None;
         }
@@ -133,7 +127,7 @@ impl TraceContext {
             trace_id,
             span_id,
             parent_span_id: 0,
-            sampled: flags_buf[0] & 0x01 != 0,
+            sampled: trace_flags & 0x01 != 0,
         })
     }
 
@@ -252,6 +246,55 @@ mod tests {
             )
             .is_none() // zero trace id
         );
+    }
+
+    #[test]
+    fn test_traceparent_fixed_width_parser_preserves_w3c_validation() {
+        const VALID: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let reference = TraceContext::from_traceparent(VALID).expect("W3C spec context");
+        let uppercase = VALID.to_ascii_uppercase();
+        let upper = TraceContext::from_traceparent(&uppercase).expect("hex may be uppercase");
+        assert_eq!(upper, reference);
+
+        // Every character is significant, including the fixed separators.
+        for i in 0..VALID.len() {
+            let mut altered = VALID.as_bytes().to_vec();
+            altered[i] = b'Z';
+            let altered = std::str::from_utf8(&altered).expect("ASCII candidate");
+            assert!(
+                TraceContext::from_traceparent(altered).is_none(),
+                "invalid byte at offset {i} must be rejected"
+            );
+        }
+
+        // UTF-8 with the same number of bytes must never panic on fixed offsets.
+        let mut nonascii = VALID.to_string();
+        nonascii.replace_range(3..5, "é");
+        assert!(TraceContext::from_traceparent(&nonascii).is_none());
+
+        // Rust numeric parsing accepts an optional plus sign; W3C hex does not.
+        let mut signed = VALID.to_string();
+        signed.replace_range(3..4, "+");
+        assert!(TraceContext::from_traceparent(&signed).is_none());
+
+        // The version, trace ID, parent span ID, and flags must still validate.
+        assert!(TraceContext::from_traceparent(
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01"
+        )
+        .is_none());
+        assert!(TraceContext::from_traceparent(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01"
+        )
+        .is_none());
+        assert!(TraceContext::from_traceparent(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-zz"
+        )
+        .is_none());
+        assert!(!TraceContext::from_traceparent(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00"
+        )
+        .expect("unsampled trace")
+        .sampled());
     }
 
     #[test]
