@@ -141,3 +141,42 @@ fn remote_https_rejects_untrusted_certificates() {
     );
     server.join().unwrap();
 }
+
+#[test]
+fn remote_url_rejects_non_loopback_plaintext_and_credential_authorities() {
+    // Invalid-input classification proves rejection happened before a DNS lookup
+    // or attempted TCP connection; a network failure is not sufficient.
+    let cases = [
+        "http://0.0.0.0:0",
+        "http://192.0.2.10:0",
+        "http://localhost:0",
+        "http://localhost.evil.invalid:0",
+        "http://127.0.0.1.evil.invalid:0",
+        "http://127.0.0.1@192.0.2.10:0",
+        "https://alice:password@remote.example",
+        "ftp://remote.example",
+        "https://",
+        "javascript:alert(1)",
+    ];
+
+    let secret = "secret-that-must-not-leak-to-errors";
+    for url in cases {
+        let error = match LibsqlStore::new_remote(url, secret) {
+            Ok(_) => panic!("unsafe remote URL {url:?} unexpectedly accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "{url:?} must be rejected before any network I/O: {error}"
+        );
+        assert!(
+            !error.to_string().contains(secret),
+            "{url:?} exposed the bearer token in a validation error"
+        );
+        assert!(
+            !error.to_string().contains("password"),
+            "{url:?} exposed embedded URL credentials in a validation error"
+        );
+    }
+}

@@ -1,5 +1,8 @@
 # Nulang Changelog
 
+### Remote libSQL bearer transport admission — 2026-10-21
+- Remote libSQL connections now reject non-loopback HTTP and even a plaintext `localhost` hostname before any I/O; plaintext development URLs require numeric loopback addresses to prevent resolver redirection. HTTPS and `libsql://` semantics remain unchanged.
+
 ### October 2026 dependency-security remediation candidate
 - Use verified system TLS for legacy libSQL remote connections (#1900) and explicitly configure ureq registry/deploy HTTPS rather than using obsolete bundled root certificates.
 - Update Wasmtime to 48.0.7, rustls-webpki to 0.103.16 and webpki-roots to 1.0.10 with a Cargo-generated lockfile; preserve blocking cargo-audit and restore trustworthy certificate chains.
