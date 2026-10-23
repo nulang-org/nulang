@@ -384,7 +384,14 @@ impl Mailbox {
         if !self.reserve_slot(system) {
             return Err(msg);
         }
-        self.local_queue.push_back(msg);
+        // Supervisor signals must preempt normal traffic even when produced
+        // on the owning scheduler thread. The local VecDeque is FIFO and
+        // cannot provide priority ordering if both classes share it.
+        if system {
+            self.system_queue.push(msg);
+        } else {
+            self.local_queue.push_back(msg);
+        }
         Ok(())
     }
 
@@ -689,6 +696,21 @@ mod tests {
         let accepted: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
         assert_eq!(accepted, 100);
         assert_eq!(mb.len(), 100);
+    }
+
+    #[test]
+    fn scheduler_local_system_message_preempts_queued_normal_messages() {
+        // System messages bypass the normal-message capacity limit too.
+        let mut mailbox = Mailbox::new(1);
+        mailbox.push_local(make_msg(1, 1)).unwrap();
+        let mut supervisor_signal = make_msg(99, 2);
+        supervisor_signal.priority = MessagePriority::System;
+        mailbox.push_local(supervisor_signal).unwrap();
+
+        assert_eq!(mailbox.len(), 2);
+        assert_eq!(mailbox.pop().unwrap().priority, MessagePriority::System);
+        assert_eq!(mailbox.pop().unwrap().priority, MessagePriority::Normal);
+        assert!(mailbox.is_empty());
     }
 
     #[test]
