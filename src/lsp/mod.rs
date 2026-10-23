@@ -20,6 +20,8 @@
 //! | `textDocument/completion` | Keyword/effect/capability/function completion |
 //! | `textDocument/codeLens` | Reference counts on top-level declarations |
 //! | `textDocument/documentLink` | Clickable import paths to stdlib/files |
+mod match_cases;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -666,14 +668,19 @@ impl LanguageServer for NulangLanguageServer {
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()));
         let import_index = self.import_index(doc_dir.as_deref());
-        Ok(Self::code_actions(
+        let mut actions = Self::code_actions(
             &source,
             range,
             &uri,
             &import_index,
             ast.as_ref(),
             inferred_types.as_ref(),
-        ))
+        )
+        .unwrap_or_default();
+        if let (Some(ast), Some(selection)) = (ast.as_ref(), range.as_ref()) {
+            actions.extend(Self::match_case_actions(&source, selection, &uri, ast));
+        }
+        Ok((!actions.is_empty()).then_some(actions))
     }
 
     async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
@@ -1842,6 +1849,15 @@ impl NulangLanguageServer {
         let line = prefix.bytes().filter(|&b| b == b'\n').count() as u32;
         let last_line = prefix.rsplit('\n').next().unwrap_or("");
         Some(Position::new(line, last_line.encode_utf16().count() as u32))
+    }
+
+    fn match_case_actions(
+        source: &str,
+        selection: &Range,
+        uri: &Url,
+        ast: &crate::ast::AstModule,
+    ) -> Vec<CodeActionOrCommand> {
+        match_cases::actions(source, selection, uri, ast)
     }
 
     /// Offer "Extract to variable" for a selected expression.
@@ -4827,6 +4843,118 @@ mod lsp_tests {
         );
     }
 
+    /// Exercise both code actions through the actual editor-facing JSON-RPC
+    /// service and the cached diagnostic AST/type inference.
+    #[test]
+    fn test_protocol_code_actions_serve_both_lsp_features() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        runtime.block_on(async {
+        let (mut service, mut socket) = LspService::new(|client| NulangLanguageServer::new(client));
+        init(&mut service).await;
+
+        let code_action_req = |line: u32, character: u32| {
+            Request::build("textDocument/codeAction")
+                .params(serde_json::json!({
+                    "textDocument": { "uri": DOC_URL },
+                    "range": {
+                        "start": { "line": line, "character": character },
+                        "end": { "line": line, "character": character }
+                    },
+                    "context": { "diagnostics": [] }
+                }))
+                .id(Id::Number(11.into()))
+                .finish()
+        };
+
+        call(&mut service, did_open_req(
+            DOC_URL, 1,
+            "type Color = Red | Blue\nfn pick(c: Color) -> Int {\n    match c {\n        | Red => 1\n    }\n}",
+        )).await;
+        socket.next().await.expect("match document diagnostics");
+        let response = call(&mut service, code_action_req(3, 10))
+            .await
+            .expect("code action response");
+        let (_, result) = response.into_parts();
+        let actions = result.expect("match code action must succeed");
+        let actions = actions
+            .as_array()
+            .expect("JSON-RPC codeAction result array");
+        assert!(
+            actions.iter().any(|a| {
+                a["title"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("missing variant case")
+                    && a["edit"]["changes"][DOC_URL][0]["newText"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("| Blue => todo_Blue")
+            }),
+            "editor must receive missing variant arm, got {actions:?}"
+        );
+
+        // A real LSP didChange invalidates the old AST immediately. During
+        // the debounce window no stale code actions may be offered.
+        let did_change_req = |version: i32, source: &str| {
+            Request::build("textDocument/didChange")
+                .params(serde_json::json!({
+                    "textDocument": { "uri": DOC_URL, "version": version },
+                    "contentChanges": [ { "text": source } ]
+                }))
+                .finish()
+        };
+        call(&mut service, did_change_req(2, "let answer = 42\n")).await;
+        let pending = call(&mut service, code_action_req(0, 5))
+            .await
+            .expect("pending document code action response");
+        let (_, pending) = pending.into_parts();
+        let pending = pending.expect("pending code action must not crash");
+        assert!(
+            pending.is_null() || pending.as_array().is_some_and(|a| a.is_empty()),
+            "pending diagnostics must not expose old AST actions: {pending}"
+        );
+
+        socket
+            .next()
+            .await
+            .expect("annotation document diagnostics");
+        let response = call(&mut service, code_action_req(0, 5))
+            .await
+            .expect("annotation code action response");
+        let (_, result) = response.into_parts();
+        let actions = result.expect("annotation code action must succeed");
+        let actions = actions
+            .as_array()
+            .expect("annotation JSON-RPC result array");
+        assert!(
+            actions.iter().any(|a| {
+                a["title"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("Add type annotation ': Int'")
+                    && a["edit"]["changes"][DOC_URL][0]["newText"] == ": Int"
+            }),
+            "editor must receive inferred annotation after document replacement, got {actions:?}"
+        );
+
+        // A malformed didChange likewise must not reuse stale inferred data.
+        call(&mut service, did_change_req(3, "fn broken( ")).await;
+        socket.next().await.expect("broken document diagnostics");
+        let response = call(&mut service, code_action_req(0, 4))
+            .await
+            .expect("malformed-document code action response");
+        let (_, result) = response.into_parts();
+        let result = result.expect("malformed-document request must not crash");
+        assert!(
+            result.is_null() || result.as_array().is_some_and(|a| a.is_empty()),
+            "must not return actions from stale AST: {result}"
+        );
+        });
+    }
+
     /// documentSymbol returns the top-level declaration outline through the
     /// full JSON-RPC round-trip.
     #[tokio::test]
@@ -4961,6 +5089,119 @@ mod lsp_tests {
                 expected
             );
         }
+    }
+
+    // OCaml/Merlin-style exhaustiveness quick fix: targeted, AST-backed,
+    // and deliberately non-compiling until generated TODOs are replaced.
+    fn match_case_test_edits(source: &str, line: u32, character: u32) -> Vec<TextEdit> {
+        let tokens = Lexer::new(source).lex().expect("valid lexer input");
+        let ast = Parser::new(tokens)
+            .parse_module()
+            .expect("valid match syntax");
+        let uri = Url::parse("file:///match.nula").unwrap();
+        let actions = NulangLanguageServer::match_case_actions(
+            source,
+            &Range::new(
+                Position::new(line, character),
+                Position::new(line, character),
+            ),
+            &uri,
+            &ast,
+        );
+        actions
+            .into_iter()
+            .flat_map(|action| match action {
+                CodeActionOrCommand::CodeAction(action) => action
+                    .edit
+                    .and_then(|edit| edit.changes)
+                    .and_then(|changes| changes.get(&uri).cloned())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_match_cases_generates_only_missing_variants() {
+        let source = "type Color = Red | Green | Blue\nfn color(c: Color) -> Int {\n    match c {\n        | Red => 1\n    }\n}";
+        let edits = match_case_test_edits(source, 3, 10);
+        assert_eq!(edits.len(), 1);
+        assert!(edits[0].new_text.contains("| Green => todo_Green"));
+        assert!(edits[0].new_text.contains("| Blue => todo_Blue"));
+        assert!(!edits[0].new_text.contains("todo_Red"));
+        assert_eq!(edits[0].range.start.line, 4);
+        let pos =
+            NulangLanguageServer::position_to_byte_offset(source, &edits[0].range.start).unwrap();
+        let completed = format!("{}{}{}", &source[..pos], edits[0].new_text, &source[pos..]);
+        assert!(Parser::new(Lexer::new(&completed).lex().unwrap())
+            .parse_module()
+            .is_ok());
+    }
+
+    #[test]
+    fn test_match_cases_payload_and_guard_do_not_imply_coverage() {
+        let source = "type Option[T] = Some(T) | None\nfn unwrap(x: Option[Int]) -> Int {\n    match x {\n        | Some(1) => 1\n        | None if false => 0\n    }\n}";
+        let edits = match_case_test_edits(source, 3, 9);
+        assert_eq!(edits.len(), 1);
+        assert!(edits[0].new_text.contains("| Some(_) => todo_Some"));
+        assert!(edits[0].new_text.contains("| None => todo_None"));
+    }
+
+    #[test]
+    fn test_match_cases_irrefutable_payload_and_wildcard_skip_completion() {
+        let source = "type Option[T] = Some(T) | None\nfn unwrap(x: Option[Int]) -> Int {\n    match x {\n        | Some(v) => v\n        | None => 0\n    }\n}";
+        assert!(match_case_test_edits(source, 3, 11).is_empty());
+        let source = "type Color = Red | Blue\nfn f(c: Color) -> Int { match c { _ => 0 } }";
+        assert!(match_case_test_edits(source, 1, 39).is_empty());
+    }
+
+    #[test]
+    fn test_match_cases_rejects_untyped_and_unrelated_selection() {
+        let untyped = "fn f(c) { match c { Red => 1 } }";
+        assert!(match_case_test_edits(untyped, 0, 16).is_empty());
+        let source = "type Color = Red | Blue\nfn f(c: Color) { match c { Red => 1 } }";
+        assert!(match_case_test_edits(source, 0, 10).is_empty());
+    }
+
+    #[test]
+    fn test_match_cases_skip_using_parameter_shadowing() {
+        let source = "type Color = Red | Blue\ntype Shape = Circle | Square\nfn f(c: Color) using (c: Shape) -> Int { match c { Circle => 1 } }";
+        let match_column = source.lines().nth(2).unwrap().find("match c").unwrap() as u32 + 5;
+        assert!(
+            match_case_test_edits(source, 2, match_column).is_empty(),
+            "using parameter overrides ordinary parameter; never generate wrong enum cases"
+        );
+    }
+
+    #[test]
+    fn test_match_cases_never_resolve_existing_todo_identifier() {
+        let source = "type Color = Red | Blue\nfn pick(c: Color, todo_Blue: Int) -> Int { match c { Red => 1 } }";
+        let edits = match_case_test_edits(source, 1, 60);
+        assert_eq!(edits.len(), 1);
+        assert!(
+            edits[0].new_text.contains("Blue => todo_Blue_1"),
+            "generated TODO must not resolve to an existing parameter: {edits:?}"
+        );
+    }
+
+    #[test]
+    fn test_match_cases_skip_shadowed_recursive_function_parameter() {
+        let source = "type Color = Red | Blue\ntype Shape = Circle | Square\nfn f(c: Color) { let rec g(c: Shape) = match c { Circle => 1 } in g(Circle) }";
+        assert!(
+            match_case_test_edits(source, 2, 52).is_empty(),
+            "local recursive function parameter shadows outer typed variant"
+        );
+    }
+
+    #[test]
+    fn test_match_cases_utf16_range_and_inline_source() {
+        let source = "// 🦉\ntype Color = Red | Blue\nfn f(c: Color) { match c { Red => 1 } }";
+        let edits = match_case_test_edits(source, 2, 25);
+        assert_eq!(edits.len(), 1);
+        let pos =
+            NulangLanguageServer::position_to_byte_offset(source, &edits[0].range.start).unwrap();
+        assert_eq!(&source[pos..pos + 1], "}");
+        assert!(edits[0].new_text.contains("todo_Blue"));
     }
 
     #[test]
