@@ -4817,6 +4817,93 @@ mod lsp_tests {
         );
     }
 
+    /// Exercise both code actions through the actual editor-facing JSON-RPC
+    /// service and the cached diagnostic AST/type inference.
+    #[tokio::test]
+    async fn test_protocol_code_actions_serve_both_lsp_features() {
+        let (mut service, mut socket) = LspService::new(|client| NulangLanguageServer::new(client));
+        init(&mut service).await;
+
+        let code_action_req = |line: u32, character: u32| {
+            Request::build("textDocument/codeAction")
+                .params(serde_json::json!({
+                    "textDocument": { "uri": DOC_URL },
+                    "range": {
+                        "start": { "line": line, "character": character },
+                        "end": { "line": line, "character": character }
+                    },
+                    "context": { "diagnostics": [] }
+                }))
+                .id(Id::Number(11.into()))
+                .finish()
+        };
+
+        call(&mut service, did_open_req(
+            DOC_URL, 1,
+            "type Color = Red | Blue\nfn pick(c: Color) -> Int {\n    match c {\n        | Red => 1\n    }\n}",
+        )).await;
+        socket.next().await.expect("match document diagnostics");
+        let response = call(&mut service, code_action_req(3, 10))
+            .await
+            .expect("code action response");
+        let (_, result) = response.into_parts();
+        let actions = result.expect("match code action must succeed");
+        let actions = actions
+            .as_array()
+            .expect("JSON-RPC codeAction result array");
+        assert!(
+            actions.iter().any(|a| {
+                a["title"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("missing variant case")
+                    && a["edit"]["changes"][DOC_URL][0]["newText"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("| Blue => todo_Blue")
+            }),
+            "editor must receive missing variant arm, got {actions:?}"
+        );
+
+        // Reopen a newer version: the next action must use its inferred types.
+        call(&mut service, did_open_req(DOC_URL, 2, "let answer = 42\n")).await;
+        socket
+            .next()
+            .await
+            .expect("annotation document diagnostics");
+        let response = call(&mut service, code_action_req(0, 5))
+            .await
+            .expect("annotation code action response");
+        let (_, result) = response.into_parts();
+        let actions = result.expect("annotation code action must succeed");
+        let actions = actions
+            .as_array()
+            .expect("annotation JSON-RPC result array");
+        assert!(
+            actions.iter().any(|a| {
+                a["title"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("Add type annotation ': Int'")
+                    && a["edit"]["changes"][DOC_URL][0]["newText"] == ": Int"
+            }),
+            "editor must receive inferred annotation after document replacement, got {actions:?}"
+        );
+
+        // An invalid replacement must never reuse stale inferred data or spans.
+        call(&mut service, did_open_req(DOC_URL, 3, "fn broken( ")).await;
+        socket.next().await.expect("broken document diagnostics");
+        let response = call(&mut service, code_action_req(0, 4))
+            .await
+            .expect("malformed-document code action response");
+        let (_, result) = response.into_parts();
+        let result = result.expect("malformed-document request must not crash");
+        assert!(
+            result.is_null() || result.as_array().is_some_and(|a| a.is_empty()),
+            "must not return actions from stale AST: {result}"
+        );
+    }
+
     /// documentSymbol returns the top-level declaration outline through the
     /// full JSON-RPC round-trip.
     #[tokio::test]
