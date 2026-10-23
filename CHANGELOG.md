@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Authoritative cluster gossip preserves monotonic corrected addresses — 2026-10-21
+- **Self-authored gossip that corrects a peer's status and/or listen address now advertises an incarnation strictly beyond the highest locally observed version.** This prevents simultaneous Joining-to-Healthy recovery and stale TCP source-port correction from being dropped as equal/older-version gossip at downstream nodes. Repeated unchanged authoritative reports do not spuriously bump versions. Newer relayed address-only corrections now correctly report a changed membership entry.
+- **Two fail-first cluster regressions** cover simultaneous status/address correction and authoritative correction from an older incoming incarnation. No wire-protocol changes, loosened failure-detection timeouts, retries, or CI gate exemptions. Distributed five-node stress and full exact-head CI remain required before merge.
+
 ### October 2026 dependency-security remediation candidate
 - Use verified system TLS for legacy libSQL remote connections (#1900) and explicitly configure ureq registry/deploy HTTPS rather than using obsolete bundled root certificates.
 - Update Wasmtime to 48.0.7, rustls-webpki to 0.103.16 and webpki-roots to 1.0.10 with a Cargo-generated lockfile; preserve blocking cargo-audit and restore trustworthy certificate chains.
