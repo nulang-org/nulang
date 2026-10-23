@@ -171,6 +171,71 @@ fn bench_ab_enqueue_payload_sweep() {
     }
 }
 
+/// Isolate native actor dispatch from mailbox admission and bytecode execution.
+///
+/// This shares the 50k primitive Add workload shape used by the bytecode/AOT
+/// drain probe. Both variants enqueue outside the timed region; one carries a
+/// real W3C traceparent so receive-side parsing/child-span cost is observable.
+/// The relative cost is diagnostic, not a cross-runtime comparison.
+#[test]
+fn bench_ab_native_actor_drain_trace_profile() {
+    const N: usize = 50_000;
+
+    fn add(actor: &mut crate::runtime::Actor, args: &[Value]) {
+        let n = actor
+            .get_state_field("total")
+            .and_then(|value| value.as_int())
+            .expect("native benchmark state must be Int");
+        let delta = args
+            .first()
+            .and_then(|value| value.as_int())
+            .expect("native benchmark payload must be Int");
+        actor.set_state_field("total", Value::int(n + delta));
+    }
+
+    for traced in [false, true] {
+        let mut rt = Runtime::new();
+        let actor_id = rt.spawn_actor(Box::new(|| vec![("total".to_string(), Value::int(0))]));
+        rt.actors
+            .get_mut(&actor_id)
+            .expect("benchmark actor exists")
+            .register_behavior("Add", add);
+        rt.run_scheduler();
+
+        if traced {
+            rt.current_trace = Some(crate::runtime::TraceContext::root());
+        }
+        for _ in 0..N {
+            rt.send_message_by_id(actor_id, 0, &[Value::int(1)]);
+        }
+        // The timed drain must establish trace state from incoming messages,
+        // rather than accidentally inheriting the sender's saved context.
+        rt.current_trace = None;
+        assert_eq!(rt.actors[&actor_id].mailbox.len(), N);
+
+        let start = Instant::now();
+        rt.run_scheduler();
+        let elapsed = start.elapsed();
+
+        let actor = rt.actors.get(&actor_id).expect("benchmark actor alive");
+        assert_eq!(
+            actor
+                .get_state_field("total")
+                .and_then(|value| value.as_int()),
+            Some(N as i64),
+            "native handler must process every queued message"
+        );
+        assert!(actor.mailbox.is_empty(), "native drain leaves no messages");
+
+        let label = if traced {
+            "native_actor_drain_traced"
+        } else {
+            "native_actor_drain_untraced"
+        };
+        report_ab(label, N as u64, elapsed);
+    }
+}
+
 #[cfg(feature = "native-codegen")]
 fn run_ab_jit_warm_execution_probe() {
     const REPEATS: usize = 10;
