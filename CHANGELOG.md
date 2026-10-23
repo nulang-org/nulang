@@ -1,7 +1,7 @@
 # Nulang Changelog
 ### Web compiler route-conflict validation integration — 2026-10-23
 - **Fail closed on duplicate package route registration and ambiguous compiled path shapes.** Reuse the authoritative Web Contract compilation/validation boundary and runtime segment parser, without introducing a parallel router.
-- **Test-first regressions cover duplicate direct/helper routes and capture-shape collisions**, plus a cross-module package-to-validation integration case. Different methods and distinct static routes remain supported.
+- **Test-first regressions cover duplicate direct/helper routes and capture-shape collisions**, plus cross-module package validation, public runtime-attachment admission, and real TCP happy-path HTTP coverage. Different methods and distinct static routes remain supported.
 - This is compile-time admission hardening, not HTTP authorization, deployment certification, or a complete overlapping-pattern policy. Exact-head Rust and CI validation remain required.
 
 ### Native float division/modulo nil parity — 2026-10-19

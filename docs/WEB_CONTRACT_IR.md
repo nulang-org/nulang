@@ -92,7 +92,7 @@ Extraction is intentionally best effort so IDE/compiler tooling can inspect part
 web::validation::compile_validated_contracts_from_tree(...)
 ```
 
-It aggregates extraction and binding diagnostics, sorts/deduplicates them deterministically, and returns the original `ContractCompilation` only when the contract is valid. Package build/dev paths enter this boundary through `web::dispatch::compile_runtime_routes(...)`; downstream consumers should reuse the validated compilation rather than reparsing source independently.
+It aggregates extraction and binding diagnostics, sorts/deduplicates them deterministically, and returns the original `ContractCompilation` only when the contract is valid. Package build/dev paths enter this boundary through `web::dispatch::compile_runtime_routes(...)`; downstream consumers should reuse the validated compilation rather than reparsing source independently. The public `compile_runtime_routes_from_contracts(...)` entry point also rechecks validation diagnostics before runtime attachment so an unvalidated caller cannot bypass this boundary.
 
 The intended flow is:
 
