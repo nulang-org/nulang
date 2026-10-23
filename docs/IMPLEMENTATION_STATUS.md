@@ -65,8 +65,9 @@ bytecode backend. With `--backend native|wasm|wasm-run|wasm-aot|wasmfx|wasmfx-ru
 it also invokes the selected backend compiler in memory (when compiled in),
 without running code or writing artifacts. An unknown/unavailable backend is an
 error; CoreVM backend-specific checking is not yet supported. Passing this check
-proves compilation for that backend, **not** runtime semantic parity or durable
-recovery guarantees.
+proves the checked code-generation stage, **not** runtime semantic parity or durable
+recovery guarantees. In particular, `wasm-aot` checking validates WASM emission,
+not Wasmtime host AOT precompilation.
 
 ## Actor runtime
 
