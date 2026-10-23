@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Sender-bound heartbeat admission — 2026-10-23
+- Reject heartbeat payloads whose claimed node ID differs from the transport-reported sender before refreshing cluster liveness or reviving a failed peer. A deterministic transport regression proves forged third-party revival fails closed and legitimate same-sender recovery remains available.
+- This protects the heartbeat handler's sender/payload consistency; it does not authenticate plaintext transports or solve reincarnation fencing.
+
 ### Sender-bound confirmed node removal — 2026-10-23
 - Reject `NodeGoodbye` payloads claiming a `NodeId` different from the transport-reported sender before applying durable directory entries or the confirmed-removal tombstone. A deterministic network regression reproduces third-party removal and directory poisoning before the guard, then verifies rejection and legitimate self-goodbye admission after the guard.
 - This is an identity-consistency safeguard, not a substitute for cryptographic transport authentication or rejoin-incarnation fencing.

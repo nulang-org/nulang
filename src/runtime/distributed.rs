@@ -1116,6 +1116,15 @@ pub fn process_network_packets(
     for incoming in packets {
         match incoming.packet {
             Packet::Heartbeat { node_id, .. } => {
+                // A peer must not revive another member by claiming its id in
+                // a heartbeat. Admit only the identity bound to this transport.
+                if node_id != incoming.from_node {
+                    warn!(
+                        "nulang-net: reject Heartbeat for {:?} from different peer {:?}",
+                        node_id, incoming.from_node
+                    );
+                    continue;
+                }
                 let cluster_node_id = NodeId(node_id.0);
                 // A Failed -> Healthy transition may be the same NodeId coming
                 // back as a fresh process. Receiver-specific CRDT knowledge
@@ -2967,6 +2976,71 @@ mod tests {
             .expect("legitimate durable manifest applied");
         assert_eq!(entry.node_id, victim_id);
         assert_eq!(entry.epoch, 7);
+    }
+
+    // A heartbeat's claimed node ID cannot rehabilitate a different peer.
+    // Only the transport-reported sender may refresh its own liveness.
+    #[test]
+    fn test_heartbeat_rejects_peer_identity_mismatch_without_reviving_failed_node() {
+        use crate::runtime::network::DeterministicNetworkTransport;
+
+        let bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let mut receiver =
+            DeterministicNetworkTransport::bind_with_bus(addr(9000), bus.clone()).unwrap();
+        let mut attacker =
+            DeterministicNetworkTransport::bind_with_bus(addr(9001), bus.clone()).unwrap();
+        let mut victim = DeterministicNetworkTransport::bind_with_bus(addr(9002), bus).unwrap();
+        receiver.register_on_bus();
+        let mut cluster = make_cluster(9000);
+        let attacker_id = add_peer(&mut cluster, 9001);
+        let victim_id = add_peer(&mut cluster, 9002);
+        cluster.merge_membership(vec![crate::runtime::cluster::NodeGossip {
+            node_id: victim_id,
+            address: addr(9002),
+            status: NodeStatus::Failed,
+            incarnation: 1_000_000,
+        }]);
+        assert_eq!(
+            cluster.get_node(victim_id).unwrap().status,
+            NodeStatus::Failed
+        );
+        let mut resolver = AddressResolver::new(NodeId::new(&addr(9000)));
+        let mut runtime = Runtime::new();
+
+        attacker.send(
+            NodeId::new(&addr(9000)),
+            addr(9000),
+            Packet::Heartbeat {
+                node_id: victim_id,
+                timestamp: 1,
+            },
+        );
+        process_network_packets(&mut runtime, &mut receiver, &mut cluster, &mut resolver);
+        assert_eq!(
+            cluster.get_node(victim_id).unwrap().status,
+            NodeStatus::Failed,
+            "forged heartbeat revived another peer"
+        );
+        assert_eq!(cluster.get_node(victim_id).unwrap().address, addr(9002));
+        assert_eq!(
+            cluster.get_node(attacker_id).unwrap().status,
+            NodeStatus::Healthy
+        );
+
+        // Genuine same-sender recovery must still be admitted.
+        victim.send(
+            NodeId::new(&addr(9000)),
+            addr(9000),
+            Packet::Heartbeat {
+                node_id: victim_id,
+                timestamp: 2,
+            },
+        );
+        process_network_packets(&mut runtime, &mut receiver, &mut cluster, &mut resolver);
+        assert_eq!(
+            cluster.get_node(victim_id).unwrap().status,
+            NodeStatus::Healthy
+        );
     }
 
     // -- 1. Local ActorAddress ----------------------------------------------
