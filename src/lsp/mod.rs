@@ -1683,7 +1683,9 @@ impl NulangLanguageServer {
             match ty {
                 Type::Primitive(PrimitiveType::Never) => false,
                 Type::Primitive(_) | Type::Nominal { .. } => true,
-                Type::Tuple(ts) => ts.iter().all(concrete),
+                // The annotation printer renders (Int,) as (Int), which
+                // the parser reads as Int, not a one-element tuple.
+                Type::Tuple(ts) => ts.len() != 1 && ts.iter().all(concrete),
                 Type::Array(t) => concrete(t),
                 Type::App { constructor, args } => {
                     concrete(constructor) && args.iter().all(concrete)
@@ -1752,7 +1754,12 @@ impl NulangLanguageServer {
         };
         let mut checker = TypeChecker::new();
         checker.collect_errors = true;
-        let _ = checker.check_module(&module);
+        // Do not continue with partial inference: a failed reconstructed
+        // declaration may leave an earlier, shadowed function in scope and
+        // produce a confidently wrong type for subsequent bindings.
+        if checker.check_module(&module).is_err() || !checker.collected_errors.is_empty() {
+            return Vec::new();
+        }
 
         // Look up actual top-level token spans. The synthetic AST lets have
         // default spans, so their original source locations are unavailable.
@@ -4117,6 +4124,25 @@ mod lsp_tests {
             type_annotation_edits("let already: Int = 3", None).is_empty(),
             "existing annotations must not be duplicated"
         );
+    }
+
+    #[test]
+    fn test_type_annotation_rejects_recursive_lambda_shadowing_failure() {
+        let source = "fn f(n: Int) -> Bool { true }\nlet f = fn(n) if n == 0 then 0 else f(n - 1)\nlet result = f(3)";
+        assert!(
+            type_annotation_edits(source, None).is_empty(),
+            "failed reconstructed inference must not leak old function types to later lets"
+        );
+    }
+
+    #[test]
+    fn test_type_annotation_rejects_singleton_tuples_including_nested() {
+        for source in ["let item = (1,)", "let items = [(1,)]"] {
+            assert!(
+                type_annotation_edits(source, None).is_empty(),
+                "tuple formatting must preserve arity before offering an action: {source}"
+            );
+        }
     }
 
     #[test]
