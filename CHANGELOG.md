@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Mutual-TLS peer identity admission fails closed — 2026-10-23
+- Reject absent peer certificates and mismatched certificate-derived NodeIds on all inbound and outbound TLS connection paths, while leaving explicitly configured plaintext mode unchanged.
+- Verify outbound peer certificate identity after TLS/NUL0 handshake I/O but before registering a connection; lazy rustls streams may not expose the certificate before handshake progress. A RED/GREEN regression covers missing, mismatched, and matching peer certificates; existing real mutual-TLS integration tests exercise authenticated connection and failure cases.
+
 ### Post-removal packet admission is fail-closed — 2026-10-23
 - Drop all packets from an already confirmed-removed peer before dispatch, so delayed gossip cannot overwrite durable-actor ownership epochs and replayed goodbye manifests cannot poison the actor directory. A deterministic RED/GREEN transport regression also verifies that a different live peer can still advance the directory.
 - This does not implement stable-identity reincarnation or cryptographically authenticate the explicitly insecure plaintext transport; removed identities require a separately certified rejoin and actor-epoch fencing protocol.

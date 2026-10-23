@@ -353,6 +353,28 @@ impl TransportStream {
     }
 }
 
+/// Validate the certificate-derived peer identity, not only the NUL0 claim.
+/// Called exclusively for MutualTls; plaintext mode is explicitly unauthenticated.
+#[cfg(feature = "tcp")]
+fn verify_tls_peer_identity(expected: NodeId, observed: Option<NodeId>) -> io::Result<()> {
+    let actual = observed.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "mutual TLS peer certificate missing after NUL0 handshake",
+        )
+    })?;
+    if actual != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "TLS peer identity mismatch: expected {:?}, observed {:?}",
+                expected, actual
+            ),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(feature = "tcp")]
 impl Read for TransportStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -2236,22 +2258,7 @@ impl TcpTransport {
             tls_wrap_client(tcp, &self.tls_config)?
         };
 
-        // When TLS is active, verify the peer's certificate matches the
-        // expected node identity *before* accepting the NUL0 handshake.
-        if !self.tls_config.is_plaintext() {
-            if let Some(cert_id) = stream.peer_cert_node_id() {
-                if cert_id != node_id {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "TLS cert identity mismatch: expected {:?}, cert fingerprint {:?}",
-                            node_id, cert_id
-                        ),
-                    ));
-                }
-            }
-        }
-
+        // Complete TLS handshake I/O before inspecting the peer certificate.
         write_handshake(&mut stream, self.node_id)?;
         let peer_id = read_handshake(&mut stream)?;
 
@@ -2263,6 +2270,10 @@ impl TcpTransport {
                     node_id, peer_id
                 ),
             ));
+        }
+
+        if !self.tls_config.is_plaintext() {
+            verify_tls_peer_identity(node_id, stream.peer_cert_node_id())?;
         }
 
         let generation = next_connection_generation();
@@ -2544,17 +2555,11 @@ fn connection_reader(
         Err(_) => return,
     };
 
-    // When TLS is active, verify the peer's certificate fingerprint
-    // matches the node_id claimed in the NUL0 handshake.
+    // Verify that the NUL0 claim matches the TLS certificate identity.
     if !tls_config.is_plaintext() {
-        if let Some(cert_id) = stream.peer_cert_node_id() {
-            if cert_id != peer_id {
-                warn!(
-                    "TLS cert identity mismatch for {}: handshake claims {:?}, cert fingerprint {:?}",
-                    addr, peer_id, cert_id
-                );
-                return;
-            }
+        if let Err(error) = verify_tls_peer_identity(peer_id, stream.peer_cert_node_id()) {
+            warn!("TLS peer identity rejected for {}: {}", addr, error);
+            return;
         }
     }
 
@@ -2819,19 +2824,7 @@ fn connect_in_sender(
         tls_wrap_client(tcp, tls_config)?
     };
 
-    // When TLS is active, verify the peer's certificate matches the
-    // expected node identity.
-    if !tls_config.is_plaintext() {
-        if let Some(cert_id) = stream.peer_cert_node_id() {
-            if cert_id != node_id {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "TLS cert identity mismatch in sender connect",
-                ));
-            }
-        }
-    }
-
+    // TLS streams are lazy: complete handshake I/O before checking certs.
     write_handshake(&mut stream, local_node_id)?;
     let peer_id = read_handshake(&mut stream)?;
 
@@ -2840,6 +2833,10 @@ fn connect_in_sender(
             io::ErrorKind::InvalidData,
             "node id handshake mismatch in sender connect",
         ));
+    }
+
+    if !tls_config.is_plaintext() {
+        verify_tls_peer_identity(node_id, stream.peer_cert_node_id())?;
     }
 
     let read_stream = stream.try_clone()?;
@@ -2877,6 +2874,18 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     #[cfg(feature = "tcp")]
     use std::thread::sleep;
+
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_tls_peer_identity_rejects_absent_cert_and_mismatch() {
+        let expected = NodeId(101);
+        assert!(
+            verify_tls_peer_identity(expected, None).is_err(),
+            "mTLS identity admission must fail closed when the peer cert is absent"
+        );
+        assert!(verify_tls_peer_identity(expected, Some(NodeId(102))).is_err());
+        assert!(verify_tls_peer_identity(expected, Some(expected)).is_ok());
+    }
 
     // ------------------------------------------------------------------
     // 1. NodeId hashing
