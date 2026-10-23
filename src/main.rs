@@ -14,7 +14,7 @@
 //! Options:
 //!   -r, --repl               Start interactive REPL
 //!   -e, --eval <CODE>        Evaluate a code string
-//!   -c, --check <FILE>       Type-check a file (don't run)
+//!   -c, --check <FILE>       Check frontend and selected backend (don't run)
 //!   --doc                    Generate Markdown API docs (docs/api.md)
 //!   --emit-stdlib-docs <dir> Generate per-effect stdlib docs into <dir>
 //!   --lsp                    Start Language Server (stdio)
@@ -815,6 +815,8 @@ fn main() {
             opts.all_errors,
             &opts.with_capabilities,
             opts.deny_warnings,
+            &opts.backend,
+            &opts.target,
         ) {
             let code = exit_code(&e);
             if opts.json {
@@ -853,8 +855,10 @@ fn main() {
             let report =
                 nulang::json_diagnostics::JsonReport::new("check", Some(path.clone()), Vec::new());
             print!("{}", report.to_json_string());
-        } else {
+        } else if opts.backend == "bytecode" {
             println!("Type check passed.");
+        } else {
+            println!("Backend check passed ({}).", opts.backend);
         }
         return;
     }
@@ -1132,7 +1136,7 @@ fn print_help() {
     println!("Options:");
     println!("  -r, --repl       Start interactive REPL");
     println!("  -e, --eval       Evaluate a code string");
-    println!("  -c, --check      Type-check a file (don't run)");
+    println!("  -c, --check      Check frontend and selected backend (no execution or artifacts)");
     println!("  --doc            Generate Markdown API docs (docs/api.md)");
     println!("  --emit-stdlib-docs <dir>  Generate per-effect stdlib Markdown docs into <dir>");
     println!("  --lsp            Start Language Server (stdio)");
@@ -2353,8 +2357,72 @@ fn check_source(
     _all_errors: bool,
     with_capabilities: &[String],
     deny_warnings: bool,
+    backend: &str,
+    target: &str,
 ) -> NuResult<()> {
-    let (_ast, _tc) = run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
+    let (ast, tc) = run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
+
+    // `--check` must not claim that a target can run source it cannot compile.
+    // Use the SAME HIR/MIR and backend implementations as `run_source`, but
+    // never execute the module or emit a build artifact.
+    match backend {
+        "bytecode" => {}
+        #[cfg(feature = "wasm-backend")]
+        "wasm" | "wasm-run" | "wasm-aot" => {
+            use nulang::backends::WasmBackend;
+            let hir = nulang::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
+            let mir = nulang::mir_lower::lower_module(&hir)?;
+            let mut compiler = nulang::backends::DefaultWasmBackend;
+            let _ = compiler.compile(&mir, "main")?;
+        }
+        #[cfg(not(feature = "wasm-backend"))]
+        "wasm" | "wasm-run" | "wasm-aot" => {
+            return Err(NuError::VMError {
+                msg: "wasm backend not compiled in (enable 'wasm-backend' feature)".into(),
+                span: Span::default(),
+            });
+        }
+        #[cfg(feature = "wasmfx-backend")]
+        "wasmfx" | "wasmfx-run" => {
+            let hir = nulang::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
+            let mir = nulang::mir_lower::lower_module(&hir)?;
+            let mut compiler = nulang::wasmfx_backend::WasmFxBackend::new();
+            let _ = compiler.compile(&mir, "main")?;
+        }
+        #[cfg(not(feature = "wasmfx-backend"))]
+        "wasmfx" | "wasmfx-run" => {
+            return Err(NuError::VMError {
+                msg: "wasmfx backend not compiled in. Rebuild with --features wasmfx-backend"
+                    .into(),
+                span: Span::default(),
+            });
+        }
+        #[cfg(feature = "native-codegen")]
+        "native" => {
+            let hir = nulang::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
+            let mir = nulang::mir_lower::lower_module(&hir)?;
+            let _ = nulang::aot::AotModule::compile_for_target(&mir, target)?;
+        }
+        #[cfg(not(feature = "native-codegen"))]
+        "native" => {
+            return Err(NuError::VMError {
+                msg: "native backend not compiled in (enable 'native-codegen' feature)".into(),
+                span: Span::default(),
+            });
+        }
+        "core-vm" => {
+            return Err(NuError::VMError {
+                msg: "backend-aware checking is not yet supported for core-vm; use --backend bytecode or run the CoreVM conformance suite".into(),
+                span: Span::default(),
+            });
+        }
+        _ => {
+            return Err(NuError::VMError {
+                msg: format!("unknown backend '{backend}'"),
+                span: Span::default(),
+            });
+        }
+    }
 
     if verbose {
         println!("Effect check passed.");
