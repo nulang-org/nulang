@@ -160,9 +160,7 @@ fn normalize_http_request_target(
 fn valid_http_authority(value: &str) -> bool {
     if value.is_empty()
         || value.bytes().any(|byte| {
-            byte <= 0x20
-                || byte >= 0x7f
-                || matches!(byte, b',' | b'/' | b'\\' | b'@' | b'#' | b'?')
+            byte <= 0x20 || byte >= 0x7f || matches!(byte, b',' | b'/' | b'\\' | b'@' | b'#' | b'?')
         })
     {
         return false;
@@ -187,8 +185,20 @@ fn valid_http_authority(value: &str) -> bool {
             byte.is_ascii_alphanumeric()
                 || matches!(
                     byte,
-                    b'-' | b'.' | b'_' | b'~' | b'%' | b'!' | b'$' | b'&'
-                        | b'\'' | b'(' | b')' | b'*' | b'+' | b'=' | b';'
+                    b'-' | b'.'
+                        | b'_'
+                        | b'~'
+                        | b'%'
+                        | b'!'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b'='
+                        | b';'
                 )
         })
 }
@@ -1422,10 +1432,9 @@ mod tests {
         assert_eq!(http11.path, "/resource?limit=1");
 
         // HTTP/1.0 did not require Host; keep compatibility with legacy clients.
-        let http10 =
-            read_http_request(&mut chunks(b"GET /legacy HTTP/1.0\r\n\r\n", 2))
-                .unwrap()
-                .unwrap();
+        let http10 = read_http_request(&mut chunks(b"GET /legacy HTTP/1.0\r\n\r\n", 2))
+            .unwrap()
+            .unwrap();
         assert_eq!(http10.path, "/legacy");
     }
 
@@ -1478,12 +1487,10 @@ mod tests {
         assert_eq!(effective_host, Some("example.test"));
 
         // Empty Host is permitted when the target has no URI authority.
-        let empty_host = read_http_request(&mut chunks(
-            b"GET /resource HTTP/1.1\r\nHost: \r\n\r\n",
-            4,
-        ))
-        .unwrap()
-        .unwrap();
+        let empty_host =
+            read_http_request(&mut chunks(b"GET /resource HTTP/1.1\r\nHost: \r\n\r\n", 4))
+                .unwrap()
+                .unwrap();
         assert_eq!(empty_host.path, "/resource");
     }
 
@@ -1553,7 +1560,7 @@ mod tests {
 
     #[test]
     fn http_request_rejects_oversized_payload_from_declared_length() {
-        let raw = b"POST / HTTP/1.1\r\nContent-Length: 1048577\r\n\r\n";
+        let raw = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1048577\r\n\r\n";
         assert_eq!(
             read_http_request(&mut chunks(raw, 32)).unwrap_err(),
             HttpReadError::PayloadTooLarge
