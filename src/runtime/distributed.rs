@@ -431,8 +431,19 @@ impl AddressResolver {
             self.remote_cache.evict_stale();
         }
 
+        // A confirmed NodeGoodbye takes precedence over a stale Healthy
+        // membership view, for both cached and uncached remote actor routes.
+        if cluster.is_removed(node_id) {
+            self.remote_cache.remove_node(node_id);
+            self.stats.cache_misses += 1;
+            self.stats.failed_resolves += 1;
+            return ResolveResult::Unresolvable {
+                reason: format!("node {:?} is confirmed removed", node_id),
+            };
+        }
+
         // A cached actor route is not proof of live cluster membership. A
-        // Failed/removed peer must not become routable through a cache hit.
+        // Failed/unknown peer must not become routable through a cache hit.
         if cluster
             .get_node(node_id)
             .is_none_or(|info| info.status != NodeStatus::Healthy)
@@ -3077,6 +3088,43 @@ mod tests {
                 node_id: peer_id,
                 actor_id: 55,
             }
+        );
+    }
+
+    // A confirmed NodeGoodbye tombstone must override a stale Healthy view.
+    // Otherwise a cached route can address an actor that already shut down.
+    #[test]
+    fn test_resolver_rejects_confirmed_removed_peer_with_stale_healthy_view() {
+        let mut cluster = make_cluster(9000);
+        let peer_id = add_peer(&mut cluster, 9001);
+        let mut resolver = AddressResolver::new(NodeId::new(&addr(9000)));
+        let target = ActorAddress::remote(peer_id, 55);
+
+        assert!(matches!(
+            resolver.resolve(&cluster, target),
+            ResolveResult::Remote { .. }
+        ));
+        assert!(cluster.mark_removed(peer_id));
+        assert_eq!(
+            cluster.get_node(peer_id).unwrap().status,
+            NodeStatus::Healthy
+        );
+        assert!(cluster.is_removed(peer_id));
+
+        assert!(
+            matches!(
+                resolver.resolve(&cluster, target),
+                ResolveResult::Unresolvable { .. }
+            ),
+            "confirmed removed peer must not be routable via cached Healthy membership"
+        );
+        assert!(resolver.cache_mut().get(peer_id, 55).is_none());
+        assert!(
+            matches!(
+                resolver.resolve_remote(&cluster, peer_id, 56),
+                ResolveResult::Unresolvable { .. }
+            ),
+            "confirmed removed peer must reject a new uncached actor route"
         );
     }
 

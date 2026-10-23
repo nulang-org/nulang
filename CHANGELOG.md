@@ -2,6 +2,7 @@
 ### Cached remote actor routes reject unhealthy membership — 2026-10-23
 - **Distributed actor route-cache hits now honor current cluster health.** A Failed or removed peer invalidates its cached actor addresses before resolution, so previously healthy routes cannot bypass fail-closed admission.
 - **A regression exercises cache fill, peer failure, cache invalidation, and recovery.** Existing healthy actor-route caching and other resolver behavior remain unchanged.
+- Confirmed `NodeGoodbye` removal now blocks cached and uncached actor routes even while an old membership record remains `Healthy`; a RED/GREEN regression pins fail-closed resolution against the removal tombstone.
 
 ### Loopback HTTP proxy isolation and explicit Turso certification — 2026-10-22
 - Registry/deploy plaintext development requests to literal loopback IPs explicitly disable ureq environment proxy discovery; TLS-backed HTTPS requests retain their existing policy. A subprocess-isolated regression exercises the otherwise opt-in `ureq/proxy-from-env` feature and verifies bearer headers arrive at the local origin rather than an HTTP proxy.
