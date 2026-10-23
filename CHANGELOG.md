@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Superseded TCP connection readers retire promptly — 2026-10-23
+- Fence TCP readers against the active local connection generation before accepting a frame, after a frame read, and during read-timeout retries. A replaced reader must not forward new packets or refresh the newer connection's activity, and an idle old reader must exit even when its peer leaves the obsolete socket open.
+- Existing queued packets from earlier sessions, authenticated boot-generation admission, and durable actor epoch fencing remain separate requirements; connection-generation checks alone do not implement safe stable-NodeId reincarnation.
+
 ### Mutual-TLS peer identity admission fails closed — 2026-10-23
 - Reject absent peer certificates and mismatched certificate-derived NodeIds on all inbound and outbound TLS connection paths, while leaving explicitly configured plaintext mode unchanged.
 - Verify outbound peer certificate identity after TLS/NUL0 handshake I/O but before registering a connection; lazy rustls streams may not expose the certificate before handshake progress. A RED/GREEN regression covers missing, mismatched, and matching peer certificates; existing real mutual-TLS integration tests exercise authenticated connection and failure cases.

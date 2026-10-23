@@ -2612,14 +2612,30 @@ fn connection_read_loop(
             break;
         }
 
+        // Connection replacement invalidates the old reader's authority.
+        // An old socket may remain readable after a newer connection for
+        // the same NodeId has been registered.
+        if !lock_ignore_poison(&connections)
+            .get(&peer_id)
+            .is_some_and(|conn| conn.generation == generation)
+        {
+            break;
+        }
+
         // Read 4-byte length prefix.
         let len = loop {
             let mut len_buf = [0u8; 4];
             match stream.read_exact(&mut len_buf) {
                 Ok(()) => break u32::from_be_bytes(len_buf),
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    // TLS read timeout: release lock briefly so the
-                    // sender thread can acquire it.
+                    // This connection may have been superseded while idle.
+                    if !lock_ignore_poison(&connections)
+                        .get(&peer_id)
+                        .is_some_and(|conn| conn.generation == generation)
+                    {
+                        break 'read_loop;
+                    }
+                    // Release the TLS lock so a writer can interleave.
                     std::thread::sleep(Duration::from_millis(1));
                     continue;
                 }
@@ -2636,6 +2652,12 @@ fn connection_read_loop(
             match stream.read_exact(&mut payload) {
                 Ok(()) => break,
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if !lock_ignore_poison(&connections)
+                        .get(&peer_id)
+                        .is_some_and(|conn| conn.generation == generation)
+                    {
+                        break 'read_loop;
+                    }
                     std::thread::sleep(Duration::from_millis(1));
                     continue;
                 }
@@ -2643,11 +2665,16 @@ fn connection_read_loop(
             }
         }
 
-        // Update last-activity timestamp.
+        // A new connection may have superseded this reader while read_exact
+        // waited on a frame. Do not update its activity or enqueue stale
+        // packets under the replacement's identity.
         {
             let mut conns = lock_ignore_poison(&connections);
-            if let Some(conn) = conns.get_mut(&peer_id) {
-                conn.last_activity = Instant::now();
+            match conns.get_mut(&peer_id) {
+                Some(conn) if conn.generation == generation => {
+                    conn.last_activity = Instant::now();
+                }
+                _ => break 'read_loop,
             }
         }
 
@@ -3585,7 +3612,7 @@ mod tests {
         let old_client = TcpStream::connect(listen_addr).unwrap();
         let (old_server, old_peer_addr) = listener.accept().unwrap();
         old_server
-            .set_read_timeout(Some(Duration::from_secs(1)))
+            .set_read_timeout(Some(Duration::from_millis(50)))
             .unwrap();
 
         let peer_id = NodeId(0xBEEF);
@@ -3633,8 +3660,19 @@ mod tests {
             },
         );
 
+        // The replacement must retire the old *idle* reader promptly,
+        // even if the former TCP peer keeps its socket open.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let exited_before_peer_closed = handle.is_finished();
         drop(old_client);
         handle.join().unwrap();
+        assert!(
+            exited_before_peer_closed,
+            "superseded idle reader kept running on an obsolete connection"
+        );
 
         assert_eq!(
             lock_ignore_poison(&connections)
@@ -3644,6 +3682,101 @@ mod tests {
             "an old reader must not evict a replacement connection"
         );
 
+        drop(new_client);
+    }
+
+    /// Old readers must not inject packets through a connection superseded
+    /// for the same stable NodeId, even while the old socket remains live.
+    #[test]
+    #[cfg(feature = "tcp")]
+    fn test_replaced_tcp_reader_cannot_deliver_stale_packet() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let mut old_client = TcpStream::connect(listen_addr).unwrap();
+        let (old_server, old_addr) = listener.accept().unwrap();
+        old_server
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+
+        let peer_id = NodeId(0xBEEF);
+        let old_reader = TransportStream::Raw(old_server);
+        let old_writer = old_reader.try_clone().unwrap();
+        let old_generation = next_connection_generation();
+        let connections = Arc::new(Mutex::new(HashMap::new()));
+        lock_ignore_poison(&connections).insert(
+            peer_id,
+            TcpConnection {
+                node_id: peer_id,
+                generation: old_generation,
+                addr: old_addr,
+                stream: old_writer,
+                last_activity: Instant::now(),
+            },
+        );
+        let (incoming_tx, incoming_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let reader_connections = Arc::clone(&connections);
+        let reader_shutdown = Arc::clone(&shutdown_flag);
+        let handle = thread::spawn(move || {
+            connection_read_loop(
+                old_reader,
+                peer_id,
+                old_generation,
+                incoming_tx,
+                reader_connections,
+                reader_shutdown,
+            );
+        });
+
+        let new_client = TcpStream::connect(listen_addr).unwrap();
+        let (new_server, new_addr) = listener.accept().unwrap();
+        let new_generation = next_connection_generation();
+        let new_activity = Instant::now();
+        lock_ignore_poison(&connections).insert(
+            peer_id,
+            TcpConnection {
+                node_id: peer_id,
+                generation: new_generation,
+                addr: new_addr,
+                stream: TransportStream::Raw(new_server),
+                last_activity: new_activity,
+            },
+        );
+
+        let packet = Packet::Heartbeat {
+            node_id: peer_id,
+            timestamp: 321,
+        }
+        .to_bytes(19);
+        old_client
+            .write_all(&(packet.len() as u32).to_be_bytes())
+            .unwrap();
+        old_client.write_all(&packet).unwrap();
+        old_client.flush().unwrap();
+
+        assert!(
+            incoming_rx
+                .recv_timeout(Duration::from_millis(600))
+                .is_err(),
+            "superseded TCP reader delivered a packet from the old session"
+        );
+        assert_eq!(
+            lock_ignore_poison(&connections)
+                .get(&peer_id)
+                .unwrap()
+                .last_activity,
+            new_activity,
+            "superseded reader refreshed activity of the new connection"
+        );
+        drop(old_client);
+        handle.join().unwrap();
+        assert_eq!(
+            lock_ignore_poison(&connections)
+                .get(&peer_id)
+                .unwrap()
+                .generation,
+            new_generation
+        );
         drop(new_client);
     }
 
