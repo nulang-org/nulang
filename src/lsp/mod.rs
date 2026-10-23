@@ -20,6 +20,8 @@
 //! | `textDocument/completion` | Keyword/effect/capability/function completion |
 //! | `textDocument/codeLens` | Reference counts on top-level declarations |
 //! | `textDocument/documentLink` | Clickable import paths to stdlib/files |
+mod match_cases;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -651,8 +653,12 @@ impl LanguageServer for NulangLanguageServer {
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = params.text_document.uri.clone();
         let docs = self.documents.lock().unwrap();
-        let source = match docs.get(&uri) {
-            Some(doc) => doc.source.clone(),
+        let (source, ast, inferred_types) = match docs.get(&uri) {
+            Some(doc) => (
+                doc.source.clone(),
+                doc.ast.clone(),
+                doc.inferred_decl_types.clone(),
+            ),
             None => return Ok(None),
         };
         drop(docs);
@@ -662,7 +668,19 @@ impl LanguageServer for NulangLanguageServer {
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()));
         let import_index = self.import_index(doc_dir.as_deref());
-        Ok(Self::code_actions(&source, range, &uri, &import_index))
+        let mut actions = Self::code_actions(
+            &source,
+            range,
+            &uri,
+            &import_index,
+            ast.as_ref(),
+            inferred_types.as_ref(),
+        )
+        .unwrap_or_default();
+        if let (Some(ast), Some(selection)) = (ast.as_ref(), range.as_ref()) {
+            actions.extend(Self::match_case_actions(&source, selection, &uri, ast));
+        }
+        Ok((!actions.is_empty()).then_some(actions))
     }
 
     async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
@@ -1576,6 +1594,8 @@ impl NulangLanguageServer {
         range: Option<Range>,
         uri: &Url,
         import_index: &[Importable],
+        ast: Option<&crate::ast::AstModule>,
+        inferred_types: Option<&FxHashMap<String, crate::types::Type>>,
     ) -> Option<CodeActionResponse> {
         let mut actions = Vec::new();
 
@@ -1629,58 +1649,208 @@ impl NulangLanguageServer {
             }
         }
 
-        // Existing: add type annotations for `let` bindings without explicit types.
-        for (li, line) in source.lines().enumerate() {
-            let t = line.trim();
-            let ln = li as u32;
-            if let Some(pos) = t.find("let ") {
-                if !t[pos..].contains(':') {
-                    let after = pos + 4;
-                    let rest = &t[after..];
-                    if let Some(end) = rest.find(|c: char| c == ' ' || c == '=') {
-                        let vname = &rest[..end];
-                        let Some(eq) = t.find('=') else { continue };
-                        let rhs = t[eq + 1..].trim();
-                        let ty = if rhs.parse::<i64>().is_ok() {
-                            "Int"
-                        } else if rhs.starts_with('"') {
-                            "String"
-                        } else if rhs == "true" || rhs == "false" {
-                            "Bool"
-                        } else {
-                            "a"
-                        };
-                        let edit = TextEdit {
-                            range: Range {
-                                start: Position::new(ln, (pos + eq) as u32),
-                                end: Position::new(ln, (pos + eq) as u32),
-                            },
-                            new_text: format!(" : {}", ty),
-                        };
-                        let mut changes = std::collections::HashMap::new();
-                        changes.insert(uri.clone(), vec![edit]);
-                        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                            title: format!("Add type annotation ': {}' for '{}'", ty, vname),
-                            kind: Some(CodeActionKind::QUICKFIX),
-                            diagnostics: None,
-                            edit: Some(WorkspaceEdit {
-                                changes: Some(changes),
-                                ..WorkspaceEdit::default()
-                            }),
-                            command: None,
-                            is_preferred: Some(false),
-                            disabled: None,
-                            data: None,
-                        }));
-                    }
-                }
-            }
+        // Only offer annotations proved by the current compiler pass.
+        // Never inspect source strings, comments, or guess polymorphic types.
+        if let (Some(ast), Some(inferred)) = (ast, inferred_types) {
+            actions.extend(Self::inferred_type_annotation_actions(
+                source,
+                range.as_ref(),
+                uri,
+                ast,
+                inferred,
+            ));
         }
         if actions.is_empty() {
             None
         } else {
             Some(actions)
         }
+    }
+
+    /// Offer annotations from actual type inference, never source-string guesses.
+    ///
+    /// The parser folds module-level lets into a synthetic main function.
+    /// Reconstruct just those declarations for an independent compiler pass:
+    /// the cached inferred_decl_types map otherwise only contains "__main".
+    fn inferred_type_annotation_actions(
+        source: &str,
+        range: Option<&Range>,
+        uri: &Url,
+        ast: &crate::ast::AstModule,
+        _inferred: &FxHashMap<String, crate::types::Type>,
+    ) -> Vec<CodeActionOrCommand> {
+        use crate::ast::{AstModule, Decl, Expr};
+        use crate::lexer::TokenKind;
+        use crate::types::{PrimitiveType, Span, Type};
+        use std::collections::HashSet;
+
+        // Printing arbitrary inference variables or function effect rows does
+        // not necessarily yield parseable type syntax. Remain conservative.
+        fn concrete(ty: &Type) -> bool {
+            match ty {
+                Type::Primitive(PrimitiveType::Never) => false,
+                Type::Primitive(_) | Type::Nominal { .. } => true,
+                Type::Tuple(ts) => ts.iter().all(concrete),
+                Type::Array(t) => concrete(t),
+                Type::App { constructor, args } => {
+                    concrete(constructor) && args.iter().all(concrete)
+                }
+                Type::Record(fields) => fields.iter().all(|(_, ty)| concrete(ty)),
+                _ => false,
+            }
+        }
+
+        let Ok(tokens) = Lexer::new(source).lex() else {
+            return Vec::new();
+        };
+
+        // Only synthetic statement lets at the beginning of a main body are
+        // module-level bindings. Ordinary local lets are intentionally excluded.
+        let mut bindings = Vec::new();
+        let mut declarations = Vec::new();
+        for decl in &ast.decls {
+            if let Decl::Function { name, body, .. } = decl {
+                if name == "__main" || name == "main" {
+                    let mut expr = body;
+                    while let Expr::Let {
+                        name,
+                        ty,
+                        value,
+                        body,
+                        mutable,
+                        let_in: false,
+                        span,
+                    } = expr
+                    {
+                        if *span != Span::default() {
+                            break;
+                        }
+                        bindings.push((name.clone(), ty.clone(), (**value).clone(), *mutable));
+                        expr = body;
+                    }
+                    continue;
+                }
+            }
+            declarations.push(decl.clone());
+        }
+        if bindings.is_empty() {
+            return Vec::new();
+        }
+
+        let mut names = HashSet::new();
+        let mut ambiguous = HashSet::new();
+        for (name, ..) in &bindings {
+            if !names.insert(name.as_str()) {
+                ambiguous.insert(name.as_str());
+            }
+        }
+        for (name, annotation, value, mutable) in &bindings {
+            declarations.push(Decl::LetBinding {
+                name: name.clone(),
+                type_ann: annotation.clone(),
+                value: value.clone(),
+                mutable: *mutable,
+                span: Span::default(),
+            });
+        }
+        let module = AstModule {
+            name: ast.name.clone(),
+            decls: declarations,
+        };
+        let mut checker = TypeChecker::new();
+        checker.collect_errors = true;
+        let _ = checker.check_module(&module);
+
+        // Look up actual top-level token spans. The synthetic AST lets have
+        // default spans, so their original source locations are unavailable.
+        // Brace depth distinguishes top-level lets from inner function lets.
+        let mut depth = 0usize;
+        let mut positions = HashMap::<String, Position>::new();
+        let mut source_name_counts = HashMap::<String, usize>::new();
+        for (idx, token) in tokens.iter().enumerate() {
+            match &token.kind {
+                TokenKind::LBrace => depth += 1,
+                TokenKind::RBrace => depth = depth.saturating_sub(1),
+                TokenKind::Let if depth == 0 => {
+                    let ident = tokens[idx + 1..].iter()
+                        .take_while(|t| !matches!(t.kind, TokenKind::Assign | TokenKind::Colon))
+                        .find(|t| matches!(&t.kind, TokenKind::Ident(s) if names.contains(s.as_str())));
+                    if let Some(ident) = ident {
+                        if let TokenKind::Ident(name) = &ident.kind {
+                            if let Some(pos) =
+                                Self::byte_offset_to_position(source, ident.span.end as usize)
+                            {
+                                positions.insert(name.clone(), pos);
+                                *source_name_counts.entry(name.clone()).or_default() += 1;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut actions = Vec::new();
+        for (name, annotation, _, _) in &bindings {
+            if annotation.is_some()
+                || ambiguous.contains(name.as_str())
+                || source_name_counts.get(name) != Some(&1)
+            {
+                continue;
+            }
+            let Some(ty) = checker
+                .inferred_decl_types
+                .get(name)
+                .filter(|ty| concrete(ty))
+            else {
+                continue;
+            };
+            let Some(position) = positions.get(name).copied() else {
+                continue;
+            };
+            if let Some(sel) = range {
+                if sel.start.line != position.line || sel.end.line != position.line {
+                    continue;
+                }
+            }
+            let ty_string = type_to_string(ty);
+            let mut changes = HashMap::new();
+            changes.insert(
+                uri.clone(),
+                vec![TextEdit {
+                    range: Range::new(position, position),
+                    new_text: format!(": {ty_string}"),
+                }],
+            );
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title: format!("Add type annotation ': {ty_string}' for '{name}'"),
+                kind: Some(CodeActionKind::QUICKFIX),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(changes),
+                    ..WorkspaceEdit::default()
+                }),
+                is_preferred: Some(false),
+                ..CodeAction::default()
+            }));
+        }
+        actions
+    }
+
+    /// Convert a source byte offset to the UTF-16 coordinates required by LSP.
+    fn byte_offset_to_position(source: &str, offset: usize) -> Option<Position> {
+        let prefix = source.get(..offset)?;
+        let line = prefix.bytes().filter(|&b| b == b'\n').count() as u32;
+        let last_line = prefix.rsplit('\n').next().unwrap_or("");
+        Some(Position::new(line, last_line.encode_utf16().count() as u32))
+    }
+
+    fn match_case_actions(
+        source: &str,
+        selection: &Range,
+        uri: &Url,
+        ast: &crate::ast::AstModule,
+    ) -> Vec<CodeActionOrCommand> {
+        match_cases::actions(source, selection, uri, ast)
     }
 
     /// Offer "Extract to variable" for a selected expression.
@@ -3860,6 +4030,132 @@ mod lsp_tests {
 
     // -- Crash-safety regression tests --
 
+    // OCaml/Merlin-inspired code actions must use types from the compiler,
+    // never guess annotations by scanning strings or comments.
+    fn type_annotation_edits(source: &str, range: Option<Range>) -> Vec<TextEdit> {
+        let uri = Url::parse("file:///test.nula").unwrap();
+        let result = NulangLanguageServer::compute_diagnostics(source);
+        let actions = NulangLanguageServer::code_actions(
+            source,
+            range,
+            &uri,
+            &[],
+            result.ast.as_ref(),
+            Some(&result.inferred_decl_types),
+        )
+        .unwrap_or_default();
+        let mut edits = Vec::new();
+        for action in actions {
+            if let CodeActionOrCommand::CodeAction(action) = action {
+                if !action.title.starts_with("Add type annotation") {
+                    continue;
+                }
+                if let Some(edit) = action.edit {
+                    if let Some(changes) = edit.changes {
+                        edits.extend(changes.get(&uri).cloned().unwrap_or_default());
+                    }
+                }
+            }
+        }
+        edits
+    }
+
+    #[test]
+    fn test_type_annotation_uses_inference_not_literal_guess() {
+        let edits = type_annotation_edits("let total = 2 + 3", None);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, ": Int");
+        let source = "let total = 2 + 3";
+        let offset =
+            NulangLanguageServer::position_to_byte_offset(source, &edits[0].range.start).unwrap();
+        let fixed = format!(
+            "{}{}{}",
+            &source[..offset],
+            edits[0].new_text,
+            &source[offset..]
+        );
+        assert!(
+            NulangLanguageServer::compute_diagnostics(&fixed)
+                .diagnostics
+                .is_empty(),
+            "type-directed quick fix must produce valid code: {fixed}"
+        );
+    }
+
+    #[test]
+    fn test_type_annotation_ignores_comments_and_failed_inference() {
+        let edits = type_annotation_edits("// let fake = 4\nlet result = 9", None);
+        assert_eq!(edits.len(), 1, "comments must never generate code actions");
+        assert_eq!(edits[0].range.start.line, 1);
+        assert!(
+            type_annotation_edits("let missing = nonexistent_symbol", None).is_empty(),
+            "unresolved expressions cannot have a guessed type"
+        );
+    }
+
+    #[test]
+    fn test_type_annotation_string_with_colon_and_selection() {
+        let source = "let headline = \"key:value\"\nlet enabled = true";
+        let range = Range::new(Position::new(0, 5), Position::new(0, 5));
+        let edits = type_annotation_edits(source, Some(range));
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, ": String");
+        assert_eq!(edits[0].range.start.line, 0);
+    }
+
+    #[test]
+    fn test_type_annotation_action_only_for_selected_binding() {
+        let source = "let first = 3\nlet second = true";
+        let range = Range::new(Position::new(1, 5), Position::new(1, 5));
+        let edits = type_annotation_edits(source, Some(range));
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, ": Bool");
+        assert_eq!(edits[0].range.start.line, 1);
+    }
+
+    #[test]
+    fn test_type_annotation_handles_prior_binding_types_and_explicit_main() {
+        let source = "let base = 40\nlet total = base + 2\nfn main() { total }";
+        let range = Range::new(Position::new(1, 6), Position::new(1, 6));
+        let edits = type_annotation_edits(source, Some(range));
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, ": Int");
+        assert_eq!(edits[0].range.start, Position::new(1, 9));
+    }
+
+    #[test]
+    fn test_type_annotation_skips_shadowed_and_explicit_bindings() {
+        assert!(
+            type_annotation_edits("let x = 1\nlet x = true", None).is_empty(),
+            "a name-based inferred type must not be applied to shadowed bindings"
+        );
+        assert!(
+            type_annotation_edits("let already: Int = 3", None).is_empty(),
+            "existing annotations must not be duplicated"
+        );
+    }
+
+    #[test]
+    fn test_type_annotation_ignores_function_local_lets() {
+        assert!(
+            type_annotation_edits("fn main() { let local = 7\n local }", None).is_empty(),
+            "local lets are not available in the independent module-level inference pass"
+        );
+    }
+
+    #[test]
+    fn test_utf16_position_after_non_ascii_source() {
+        let source = "🦉abc\nlet total = 42";
+        let pos = NulangLanguageServer::byte_offset_to_position(source, "🦉abc\nlet total".len())
+            .unwrap();
+        assert_eq!(pos, Position::new(1, 9));
+        assert_eq!(
+            NulangLanguageServer::byte_offset_to_position(source, "🦉".len()).unwrap(),
+            Position::new(0, 2),
+        );
+        assert!(NulangLanguageServer::byte_offset_to_position(source, 1).is_none());
+    }
+
     #[test]
     fn test_code_action_let_binding_without_rhs() {
         // A half-typed `let` line with no `=` (e.g. `let x y`) must not
@@ -3870,14 +4166,19 @@ mod lsp_tests {
             None,
             &Url::parse("file:///test.nula").unwrap(),
             &[],
+            None,
+            None,
         )
         .is_none());
         // A well-formed binding still produces a quick fix.
+        let result = NulangLanguageServer::compute_diagnostics("let x = 42");
         assert!(NulangLanguageServer::code_actions(
             "let x = 42",
             None,
             &Url::parse("file:///test.nula").unwrap(),
             &[],
+            result.ast.as_ref(),
+            Some(&result.inferred_decl_types),
         )
         .is_some());
     }
@@ -4652,6 +4953,89 @@ mod lsp_tests {
         }
     }
 
+    // OCaml/Merlin-style exhaustiveness quick fix: targeted, AST-backed,
+    // and deliberately non-compiling until generated TODOs are replaced.
+    fn match_case_test_edits(source: &str, line: u32, character: u32) -> Vec<TextEdit> {
+        let tokens = Lexer::new(source).lex().expect("valid lexer input");
+        let ast = Parser::new(tokens)
+            .parse_module()
+            .expect("valid match syntax");
+        let uri = Url::parse("file:///match.nula").unwrap();
+        let actions = NulangLanguageServer::match_case_actions(
+            source,
+            &Range::new(
+                Position::new(line, character),
+                Position::new(line, character),
+            ),
+            &uri,
+            &ast,
+        );
+        actions
+            .into_iter()
+            .flat_map(|action| match action {
+                CodeActionOrCommand::CodeAction(action) => action
+                    .edit
+                    .and_then(|edit| edit.changes)
+                    .and_then(|changes| changes.get(&uri).cloned())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_match_cases_generates_only_missing_variants() {
+        let source = "type Color = Red | Green | Blue\nfn color(c: Color) -> Int {\n    match c {\n        | Red => 1\n    }\n}";
+        let edits = match_case_test_edits(source, 3, 10);
+        assert_eq!(edits.len(), 1);
+        assert!(edits[0].new_text.contains("| Green => todo_Green"));
+        assert!(edits[0].new_text.contains("| Blue => todo_Blue"));
+        assert!(!edits[0].new_text.contains("todo_Red"));
+        assert_eq!(edits[0].range.start.line, 4);
+        let pos =
+            NulangLanguageServer::position_to_byte_offset(source, &edits[0].range.start).unwrap();
+        let completed = format!("{}{}{}", &source[..pos], edits[0].new_text, &source[pos..]);
+        assert!(Parser::new(Lexer::new(&completed).lex().unwrap())
+            .parse_module()
+            .is_ok());
+    }
+
+    #[test]
+    fn test_match_cases_payload_and_guard_do_not_imply_coverage() {
+        let source = "type Option[T] = Some(T) | None\nfn unwrap(x: Option[Int]) -> Int {\n    match x {\n        | Some(1) => 1\n        | None if false => 0\n    }\n}";
+        let edits = match_case_test_edits(source, 3, 9);
+        assert_eq!(edits.len(), 1);
+        assert!(edits[0].new_text.contains("| Some(_) => todo_Some"));
+        assert!(edits[0].new_text.contains("| None => todo_None"));
+    }
+
+    #[test]
+    fn test_match_cases_irrefutable_payload_and_wildcard_skip_completion() {
+        let source = "type Option[T] = Some(T) | None\nfn unwrap(x: Option[Int]) -> Int {\n    match x {\n        | Some(v) => v\n        | None => 0\n    }\n}";
+        assert!(match_case_test_edits(source, 3, 11).is_empty());
+        let source = "type Color = Red | Blue\nfn f(c: Color) -> Int { match c { _ => 0 } }";
+        assert!(match_case_test_edits(source, 1, 39).is_empty());
+    }
+
+    #[test]
+    fn test_match_cases_rejects_untyped_and_unrelated_selection() {
+        let untyped = "fn f(c) { match c { Red => 1 } }";
+        assert!(match_case_test_edits(untyped, 0, 16).is_empty());
+        let source = "type Color = Red | Blue\nfn f(c: Color) { match c { Red => 1 } }";
+        assert!(match_case_test_edits(source, 0, 10).is_empty());
+    }
+
+    #[test]
+    fn test_match_cases_utf16_range_and_inline_source() {
+        let source = "// 🦉\ntype Color = Red | Blue\nfn f(c: Color) { match c { Red => 1 } }";
+        let edits = match_case_test_edits(source, 2, 25);
+        assert_eq!(edits.len(), 1);
+        let pos =
+            NulangLanguageServer::position_to_byte_offset(source, &edits[0].range.start).unwrap();
+        assert_eq!(&source[pos..pos + 1], "}");
+        assert!(edits[0].new_text.contains("todo_Blue"));
+    }
+
     #[test]
     fn test_code_action_add_import() {
         let import_index = vec![Importable {
@@ -4667,6 +5051,8 @@ mod lsp_tests {
             }),
             &Url::parse("file:///test.nula").unwrap(),
             &import_index,
+            None,
+            None,
         );
         let actions = actions.expect("expected code actions");
         assert!(
