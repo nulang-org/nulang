@@ -4865,8 +4865,27 @@ mod lsp_tests {
             "editor must receive missing variant arm, got {actions:?}"
         );
 
-        // Reopen a newer version: the next action must use its inferred types.
-        call(&mut service, did_open_req(DOC_URL, 2, "let answer = 42\n")).await;
+        // A real LSP didChange invalidates the old AST immediately. During
+        // the debounce window no stale code actions may be offered.
+        let did_change_req = |version: i32, source: &str| {
+            Request::build("textDocument/didChange")
+                .params(serde_json::json!({
+                    "textDocument": { "uri": DOC_URL, "version": version },
+                    "contentChanges": [ { "text": source } ]
+                }))
+                .finish()
+        };
+        call(&mut service, did_change_req(2, "let answer = 42\n")).await;
+        let pending = call(&mut service, code_action_req(0, 5))
+            .await
+            .expect("pending document code action response");
+        let (_, pending) = pending.into_parts();
+        let pending = pending.expect("pending code action must not crash");
+        assert!(
+            pending.is_null() || pending.as_array().is_some_and(|a| a.is_empty()),
+            "pending diagnostics must not expose old AST actions: {pending}"
+        );
+
         socket
             .next()
             .await
@@ -4890,8 +4909,8 @@ mod lsp_tests {
             "editor must receive inferred annotation after document replacement, got {actions:?}"
         );
 
-        // An invalid replacement must never reuse stale inferred data or spans.
-        call(&mut service, did_open_req(DOC_URL, 3, "fn broken( ")).await;
+        // A malformed didChange likewise must not reuse stale inferred data.
+        call(&mut service, did_change_req(3, "fn broken( ")).await;
         socket.next().await.expect("broken document diagnostics");
         let response = call(&mut service, code_action_req(0, 4))
             .await
