@@ -17,6 +17,7 @@ use std::time::Duration;
 use crate::bytecode::CodeModule;
 use crate::value_layout::PAYLOAD_MASK;
 use crate::vm::{resolve_value_string, Value, CLOSURE_ENV_FLAG, VM};
+use crate::web::csrf::validate_mutation_origin;
 use crate::web::dispatch::{render_direct_request, DirectRequestRenderError};
 use crate::web::http_problem::request_decode_problem_response;
 use crate::web::http_request::HttpRequestBindingInputs;
@@ -955,6 +956,31 @@ fn invalid_request_input_response(captured: &HttpRequestBindingInputs) -> Option
     })
 }
 
+/// Experimental Web rejects ambiguous or cross-origin browser mutations before
+/// handler dispatch. This does not replace authentication or authorization.
+fn unsafe_origin_response(
+    request: &HttpRequest,
+    local_addr: Option<std::net::SocketAddr>,
+    public_origin: Option<&str>,
+) -> Option<HttpResponse> {
+    let failure = validate_mutation_origin(
+        request.method.as_str(),
+        &request.headers,
+        local_addr,
+        public_origin,
+    )
+    .err()?;
+    eprintln!("Nulang Web denied state-changing request: {failure:?}");
+    Some(HttpResponse {
+        status: 403,
+        headers: vec![
+            ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+            ("Cache-Control".into(), "no-store".into()),
+        ],
+        body: b"Forbidden: invalid request origin".to_vec(),
+    })
+}
+
 fn invalid_ui_action_response(captured: &HttpRequestBindingInputs) -> Option<HttpResponse> {
     captured
         .ui_message_error
@@ -1165,6 +1191,9 @@ impl WebDevServer {
         };
         let path = request.path.clone();
 
+        // Apply origin admission to every state-changing route. SSE has no
+        // mutation handler: reject non-GET methods with 405 before this guard.
+        let public_origin = std::env::var("NULANG_WEB_PUBLIC_ORIGIN").ok();
         let mut response = if path.starts_with(Self::SSE_PATH_PREFIX) {
             if request.method != HttpMethod::Get {
                 HttpResponse {
@@ -1180,6 +1209,10 @@ impl WebDevServer {
                 Self::serve_sse(room, &mut stream, shutdown.clone());
                 return;
             }
+        } else if let Some(forbidden) =
+            unsafe_origin_response(&request, stream.local_addr().ok(), public_origin.as_deref())
+        {
+            forbidden
         } else if let Some((route, params)) = routes
             .iter()
             .filter(|r| r.route.method == request.method)
@@ -1429,6 +1462,48 @@ mod tests {
                 name == "Content-Type" && value == "application/javascript; charset=utf-8"
             }));
         }
+    }
+
+    #[test]
+    fn web_dev_server_fences_cross_origin_mutations_before_dispatch() {
+        fn send(port: u16, raw: &str) -> String {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream.write_all(raw.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        }
+
+        let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
+        let host = format!("localhost:{}", server.port);
+        let foreign = format!(
+            "POST /mutation HTTP/1.1\r\nHost: {host}\r\nOrigin: https://attacker.example\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(send(server.port, &foreign).starts_with("HTTP/1.1 403 Forbidden"));
+
+        let missing =
+            format!("POST /mutation HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\n\r\n");
+        assert!(send(server.port, &missing).starts_with("HTTP/1.1 403 Forbidden"));
+
+        let trusted = format!(
+            "POST /mutation HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(
+            send(server.port, &trusted).starts_with("HTTP/1.1 404 Not Found"),
+            "same-origin requests must reach normal routing"
+        );
+
+        let duplicate = format!(
+            "POST /mutation HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nOrigin: https://attacker.example\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(send(server.port, &duplicate).starts_with("HTTP/1.1 403 Forbidden"));
+
+        let unknown = format!("TRACE / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        assert!(send(server.port, &unknown).starts_with("HTTP/1.1 501 Not Implemented"));
     }
 
     #[test]
