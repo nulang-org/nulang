@@ -1,4 +1,9 @@
 # Nulang Changelog
+
+### Sender-bound confirmed node removal — 2026-10-23
+- Reject `NodeGoodbye` payloads claiming a `NodeId` different from the transport-reported sender before applying durable directory entries or the confirmed-removal tombstone. A deterministic network regression reproduces third-party removal and directory poisoning before the guard, then verifies rejection and legitimate self-goodbye admission after the guard.
+- This is an identity-consistency safeguard, not a substitute for cryptographic transport authentication or rejoin-incarnation fencing.
+
 ### Cached remote actor routes reject unhealthy membership — 2026-10-23
 - **Distributed actor route-cache hits now honor current cluster health.** A Failed or removed peer invalidates its cached actor addresses before resolution, so previously healthy routes cannot bypass fail-closed admission.
 - **A regression exercises cache fill, peer failure, cache invalidation, and recovery.** Existing healthy actor-route caching and other resolver behavior remain unchanged.
