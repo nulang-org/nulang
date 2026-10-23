@@ -92,7 +92,7 @@ Extraction is intentionally best effort so IDE/compiler tooling can inspect part
 web::validation::compile_validated_contracts_from_tree(...)
 ```
 
-It aggregates extraction and binding diagnostics, sorts/deduplicates them deterministically, and returns the original `ContractCompilation` only when the contract is valid. Package build/dev paths enter this boundary through `web::dispatch::compile_runtime_routes(...)`; downstream consumers should reuse the validated compilation rather than reparsing source independently.
+It aggregates extraction and binding diagnostics, sorts/deduplicates them deterministically, and returns the original `ContractCompilation` only when the contract is valid. Package build/dev paths enter this boundary through `web::dispatch::compile_runtime_routes(...)`; downstream consumers should reuse the validated compilation rather than reparsing source independently. The public `compile_runtime_routes_from_contracts(...)` entry point also rechecks validation diagnostics before runtime attachment so an unvalidated caller cannot bypass this boundary.
 
 The intended flow is:
 
@@ -106,6 +106,24 @@ source tree
        -> OpenAPI / client generation
        -> tests / tooling
 ```
+
+## Route registration conflicts
+
+The validated package contract rejects duplicate `(method, path)` registrations,
+including duplicate calls through public `route(...)` helpers. Best-effort
+extraction retains one representative route and emits a diagnostic naming both
+handlers; serving and artifact generation fail at the validation boundary.
+
+Validation also rejects paths with equivalent compiled runtime matching shapes
+for the same HTTP method, even when capture names or capture syntax differ
+(e.g. `/users/:id` and `/users/{user_id: Int}`). Percent-encoded literal
+aliases are normalized through the existing runtime path parser. Different
+methods remain independent, and a static path such as `/users/me` can
+coexist with a parameter path; matching precedence is unchanged.
+
+This deliberately does not claim a general overlapping-pattern analyzer or
+support for wildcard precedence. The validator reuses the runtime's route
+segment compiler instead of maintaining an independent URL-pattern grammar.
 
 ## Runtime binding and dispatch
 
