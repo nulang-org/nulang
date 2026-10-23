@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Fixed-width W3C traceparent parsing — 2026-10-23
+- **Receive-side W3C version-00 traceparent parsing uses validated fixed offsets and standard integer parsing rather than splitting and decoding four separate hex fields.** Malformed separators, invalid hex, UTF-8 boundaries, zero IDs, and non-version-00 values still fail closed.
+- **Regression covers valid upper- and lowercase hex and malformed-by-position, Unicode, signed, unsampled, and zero-ID cases.** Release-profile paired A/B is required before claiming end-to-end throughput impact.
+
 ### Borrowed actor-state field updates — 2026-10-23
 - **Existing actor state and dirty-marker keys now use borrowed string lookups rather than cloning an owned field name on every update.** Field names are allocated only when first inserted into the state or dirty set, reducing allocations in repeated native-handler state mutations.
 - **New regression covers existing fields, newly inserted fields, and CRDT dirty tracking.** The actor-dispatch A/B harness measures the actual throughput effect; no unmeasured overall speedup is claimed.
