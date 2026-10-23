@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Fixed-width W3C traceparent parsing — 2026-10-23
+- **Receive-side W3C version-00 traceparent parsing uses validated fixed offsets and standard integer parsing rather than splitting and decoding four separate hex fields.** Malformed separators, invalid hex, UTF-8 boundaries, zero IDs, and non-version-00 values still fail closed.
+- **Regression covers valid upper- and lowercase hex and malformed-by-position, Unicode, signed, unsampled, and zero-ID cases.** Release-profile paired A/B is required before claiming end-to-end throughput impact.
+
 ### October 2026 dependency-security remediation candidate
 - Use verified system TLS for legacy libSQL remote connections (#1900) and explicitly configure ureq registry/deploy HTTPS rather than using obsolete bundled root certificates.
 - Update Wasmtime to 48.0.7, rustls-webpki to 0.103.16 and webpki-roots to 1.0.10 with a Cargo-generated lockfile; preserve blocking cargo-audit and restore trustworthy certificate chains.
