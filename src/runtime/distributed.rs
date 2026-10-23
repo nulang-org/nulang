@@ -1114,6 +1114,18 @@ pub fn process_network_packets(
 
     let packets = transport.receive();
     for incoming in packets {
+        // A confirmed-removed identity no longer has packet authority. An old
+        // connection can still deliver queued gossip, goodbye, or shadow
+        // packets after removal; none may mutate the durable actor directory
+        // or runtime state until a separately authenticated rejoin protocol
+        // has fenced the former activation.
+        if cluster.is_removed(incoming.from_node) {
+            warn!(
+                "nulang-net: reject packet from confirmed-removed peer {:?}",
+                incoming.from_node
+            );
+            continue;
+        }
         match incoming.packet {
             Packet::Heartbeat { node_id, .. } => {
                 // A peer must not revive another member by claiming its id in
@@ -2920,6 +2932,85 @@ mod tests {
         let peer_id = NodeId::new(&peer_addr);
         cluster.handle_heartbeat(peer_id, peer_addr);
         peer_id
+    }
+
+    // An old connection cannot grant control-plane authority to a removed peer.
+    #[test]
+    fn test_removed_sender_cannot_rewrite_directory_or_replay_goodbye() {
+        use crate::runtime::cluster::DurableDirectoryEntry;
+        use crate::runtime::network::DeterministicNetworkTransport;
+
+        let bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let mut receiver =
+            DeterministicNetworkTransport::bind_with_bus(addr(9000), bus.clone()).unwrap();
+        let mut removed_sender =
+            DeterministicNetworkTransport::bind_with_bus(addr(9001), bus.clone()).unwrap();
+        let mut live_sender =
+            DeterministicNetworkTransport::bind_with_bus(addr(9002), bus).unwrap();
+        receiver.register_on_bus();
+        let mut cluster = make_cluster(9000);
+        let removed_id = add_peer(&mut cluster, 9001);
+        let live_id = add_peer(&mut cluster, 9002);
+        let owned = DurableDirectoryEntry {
+            actor_id: 42,
+            node_id: live_id,
+            epoch: 10,
+        };
+        cluster.announce_directory(owned);
+        assert!(cluster.mark_removed(removed_id));
+        let mut resolver = AddressResolver::new(NodeId::new(&addr(9000)));
+        let mut runtime = Runtime::new();
+
+        removed_sender.send(
+            NodeId::new(&addr(9000)),
+            addr(9000),
+            Packet::Gossip {
+                members: Vec::new(),
+                directory: vec![DurableDirectoryEntry {
+                    actor_id: 42,
+                    node_id: removed_id,
+                    epoch: 1000,
+                }],
+                fabric: None,
+            },
+        );
+        process_network_packets(&mut runtime, &mut receiver, &mut cluster, &mut resolver);
+        assert_eq!(
+            cluster.directory_entry(42),
+            Some(owned),
+            "removed identity changed the durable actor ownership epoch"
+        );
+
+        removed_sender.send(
+            NodeId::new(&addr(9000)),
+            addr(9000),
+            Packet::NodeGoodbye {
+                node_id: removed_id,
+                durable: vec![(43, 1000)],
+            },
+        );
+        process_network_packets(&mut runtime, &mut receiver, &mut cluster, &mut resolver);
+        assert!(
+            cluster.directory_entry(43).is_none(),
+            "replayed goodbye polluted directory"
+        );
+
+        // Another live identity still advances the durable owner epoch.
+        live_sender.send(
+            NodeId::new(&addr(9000)),
+            addr(9000),
+            Packet::Gossip {
+                members: Vec::new(),
+                directory: vec![DurableDirectoryEntry {
+                    actor_id: 42,
+                    node_id: live_id,
+                    epoch: 11,
+                }],
+                fabric: None,
+            },
+        );
+        process_network_packets(&mut runtime, &mut receiver, &mut cluster, &mut resolver);
+        assert_eq!(cluster.directory_epoch(42), Some(11));
     }
 
     // A peer cannot declare another peer removed by forging the payload id.
