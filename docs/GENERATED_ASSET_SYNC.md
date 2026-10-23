@@ -14,7 +14,7 @@ have been merged or deployed.**
 
 1. Open the latest successful **Docs Sync** run on GitHub. Download its
    `nulang-generated-docs` artifact, or use GitHub CLI:
-   
+
    ```sh
    gh run download RUN_ID --repo nulang-org/nulang \
      --name nulang-generated-docs --dir docs
