@@ -1554,7 +1554,11 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         .unwrap_or_default();
                     #[cfg(feature = "ureq")]
                     {
-                        match ureq::get(&url).call() {
+                        let agent = match crate::registry::client::verified_https_agent(&url) {
+                            Ok(agent) => agent,
+                            Err(_) => return Some(Value::nil()),
+                        };
+                        match agent.get(&url).call() {
                             Ok(response) => match response.into_string() {
                                 Ok(body) => {
                                     let bytes = body.into_bytes();
@@ -1613,7 +1617,11 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         .unwrap_or_default();
                     #[cfg(feature = "ureq")]
                     {
-                        match ureq::post(&url).send_string(&body) {
+                        let agent = match crate::registry::client::verified_https_agent(&url) {
+                            Ok(agent) => agent,
+                            Err(_) => return Some(Value::nil()),
+                        };
+                        match agent.post(&url).send_string(&body) {
                             Ok(response) => match response.into_string() {
                                 Ok(body) => {
                                     let bytes = body.into_bytes();
@@ -8488,6 +8496,111 @@ mod vm_tests {
             result.unwrap().is_nil(),
             "Http.post on non-connectable port should return nil"
         );
+    }
+
+    /// Run the real standalone VM Http effect against a self-signed loopback
+    /// TLS endpoint. A valid TLS handshake cannot be completed because the
+    /// ephemeral certificate is not in the OS root store; the VM must return
+    /// nil rather than accept the endpoint or downgrade to plaintext.
+    #[cfg(feature = "ureq")]
+    fn assert_vm_http_rejects_untrusted_certificate(post: bool) {
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        use std::net::TcpListener;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let identity = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let key: PrivateKeyDer<'static> =
+            PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der()).into();
+        let config = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![identity.cert.der().clone()], key)
+                .unwrap(),
+        );
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        stream
+                            .set_write_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let mut tls = rustls::ServerConnection::new(config.clone()).unwrap();
+                        return tls.complete_io(&mut stream).is_err();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "VM HTTPS client never connected");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("loopback TLS accept failed: {error}"),
+                }
+            }
+        });
+
+        let mut module = CodeModule::new("vm_https_certificate_rejection");
+        let url = format!("https://127.0.0.1:{port}/");
+        let url_idx = module.add_constant(Constant::String(url));
+        let effect = if post { "Http.post" } else { "Http.get" };
+        let effect_idx = module.add_constant(Constant::String(effect.to_string()));
+        module.emit(Instruction::new3(
+            OpCode::ConstU,
+            ((url_idx >> 8) & 0xFF) as u8,
+            (url_idx & 0xFF) as u8,
+            0,
+        ));
+        if post {
+            let body_idx = module.add_constant(Constant::String("{}".to_string()));
+            module.emit(Instruction::new3(
+                OpCode::ConstU,
+                ((body_idx >> 8) & 0xFF) as u8,
+                (body_idx & 0xFF) as u8,
+                1,
+            ));
+        }
+        let result_reg = if post { 2 } else { 1 };
+        module.emit(Instruction::new3(
+            OpCode::Perform,
+            ((effect_idx >> 8) & 0xFF) as u8,
+            (effect_idx & 0xFF) as u8,
+            result_reg,
+        ));
+        module.emit(Instruction::new2(OpCode::Move, result_reg, 0));
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
+
+        let mut vm = VM::new();
+        vm.load_module(module);
+        vm.set_actor_callbacks(Box::new(StandaloneVmCallbacks::new()));
+        let response = vm.run().expect("VM must dispatch the HTTPS effect");
+        assert!(
+            response.is_nil(),
+            "{effect} must fail closed when the certificate is untrusted"
+        );
+        assert!(
+            server.join().expect("TLS loopback server thread"),
+            "the self-signed TLS handshake must be rejected"
+        );
+    }
+
+    #[cfg(feature = "ureq")]
+    #[test]
+    fn vm_http_get_rejects_untrusted_certificate() {
+        assert_vm_http_rejects_untrusted_certificate(false);
+    }
+
+    #[cfg(feature = "ureq")]
+    #[test]
+    fn vm_http_post_rejects_untrusted_certificate() {
+        assert_vm_http_rejects_untrusted_certificate(true);
     }
 
     /// Regression: effect dispatch must match on the (effect, op) pair —
