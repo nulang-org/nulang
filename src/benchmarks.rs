@@ -236,6 +236,79 @@ fn bench_ab_native_actor_drain_trace_profile() {
     }
 }
 
+/// Compare two independently warmed JIT instances for the same arithmetic
+/// loop. This is a diagnostic for #2135, not a pass/fail speed assertion.
+///
+/// A/B runners execute this test for both exact refs when present; on an
+/// older base the additional records are explicitly candidate-only.
+#[cfg(feature = "native-codegen")]
+#[test]
+fn bench_ab_jit_hot_loop_two_instance_control() {
+    const TRIPS: usize = 100_000;
+    const REPEATS: usize = 8;
+    let source = format!(
+        "var sum = 0; var i = 0; while i < {TRIPS} {{ sum = sum + i * 3 - i / 7; i = i + 1; }}; sum"
+    );
+    let module = compile_ab_module(&source, "jit-hotloop-two-instance");
+
+    let mut oracle = VM::new_without_jit();
+    oracle.load_module(module.clone());
+    let expected = oracle
+        .run()
+        .expect("interpreter must run the control")
+        .as_int()
+        .expect("arithmetic control returns Int");
+
+    let mut vms = [VM::new(), VM::new()];
+    let mut compiled_at_warm = [0usize; 2];
+    for (i, vm) in vms.iter_mut().enumerate() {
+        vm.load_module(module.clone());
+        let result = vm
+            .run()
+            .expect("JIT warm-up must succeed")
+            .as_int()
+            .expect("arithmetic control returns Int");
+        assert_eq!(result, expected, "JIT warm-up must match interpreter");
+        compiled_at_warm[i] = vm.jit_compiled_count();
+        assert!(compiled_at_warm[i] > 0, "both VMs must compile JIT regions");
+    }
+
+    let mut elapsed = [std::time::Duration::ZERO; 2];
+    for _ in 0..REPEATS {
+        for (i, vm) in vms.iter_mut().enumerate() {
+            let start = Instant::now();
+            let result = vm
+                .run()
+                .expect("warmed JIT control must succeed")
+                .as_int()
+                .expect("arithmetic control returns Int");
+            elapsed[i] += start.elapsed();
+            assert_eq!(result, expected, "JIT result must stay stable");
+        }
+    }
+    for (i, vm) in vms.iter().enumerate() {
+        assert_eq!(
+            vm.jit_compiled_count(),
+            compiled_at_warm[i],
+            "a warmed VM must not compile extra JIT regions during the timed phase"
+        );
+        report_ab(
+            if i == 0 {
+                "jit_hotloop_vm_a"
+            } else {
+                "jit_hotloop_vm_b"
+            },
+            REPEATS as u64,
+            elapsed[i],
+        );
+        println!(
+            "[ab-jit-detail] vm={} jit_regions={} expected={expected}",
+            if i == 0 { "a" } else { "b" },
+            compiled_at_warm[i]
+        );
+    }
+}
+
 #[cfg(feature = "native-codegen")]
 fn run_ab_jit_warm_execution_probe() {
     const REPEATS: usize = 10;
