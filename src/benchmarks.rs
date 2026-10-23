@@ -88,6 +88,50 @@ fn compile_ab_module(source: &str, name: &str) -> crate::bytecode::CodeModule {
     crate::mir_codegen::compile_mir(&mut mir, name).expect("bench: codegen failed")
 }
 
+/// Diagnostic decomposition of receive-side W3C trace context cost.
+///
+/// The native actor-drain probe excludes sender-side trace serialization and
+/// message admission from its timed section. These controls isolate the
+/// receive-side parse+child path, fresh-root creation, and TRACE span guard.
+/// They do not measure a complete actor dispatch or real OTLP export.
+#[test]
+fn bench_ab_trace_receive_cost_decomposition() {
+    const N: usize = 100_000;
+    let incoming = crate::runtime::TraceContext::root();
+    let traceparent = incoming.to_traceparent();
+
+    let start = Instant::now();
+    let mut last = None;
+    for _ in 0..N {
+        let received = crate::runtime::TraceContext::from_traceparent(std::hint::black_box(
+            traceparent.as_str(),
+        ))
+        .expect("valid W3C traceparent");
+        last = Some(std::hint::black_box(received.child()));
+    }
+    let parse_elapsed = start.elapsed();
+    let last = last.expect("at least one received trace");
+    assert_eq!(last.trace_id(), incoming.trace_id());
+    assert_eq!(last.parent_span_id(), incoming.span_id());
+    report_ab("trace_receive_parse_child", N as u64, parse_elapsed);
+
+    let start = Instant::now();
+    let mut last = None;
+    for _ in 0..N {
+        last = Some(std::hint::black_box(crate::runtime::TraceContext::root()));
+    }
+    let root_elapsed = start.elapsed();
+    assert_ne!(last.expect("at least one root").trace_id(), 0);
+    report_ab("trace_receive_new_root", N as u64, root_elapsed);
+
+    let start = Instant::now();
+    for _ in 0..N {
+        let guard = std::hint::black_box(incoming).enter_dispatch_span(1, 0);
+        std::hint::black_box(guard);
+    }
+    report_ab("trace_dispatch_span_guard", N as u64, start.elapsed());
+}
+
 /// Lower-bound local mailbox admission probe for one inline primitive value.
 ///
 /// This intentionally bypasses actor lookup, routing/grain checks, ORCA

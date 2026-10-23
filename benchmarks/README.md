@@ -130,8 +130,10 @@ core VM/JIT/AOT/actor runtime from unrelated optional integrations. Longer
 manual runs can use the default feature set when production-profile validation
 is needed.
 
-Nulang-only A/B probes include a mailbox-only one-value admission lower bound,
-a 0/1/4/5/16-value runtime enqueue sweep around the small-message inline
+Nulang-only A/B probes include a W3C receive-side trace microprobe
+(parse and child creation, fresh root, and subscriber-gated dispatch span guard),
+a mailbox-only one-value admission lower bound, a 0/1/4/5/16-value runtime
+enqueue sweep around the small-message inline
 boundary, a matched warmed-bytecode/JIT vs AOT actor-drain comparison over the
 same actor source, a native-handler drain control over 50k increment messages
 with and without an incoming W3C traceparent, first-run JIT-vs-interpreter
