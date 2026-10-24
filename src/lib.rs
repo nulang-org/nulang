@@ -3,6 +3,10 @@
     clippy::too_many_arguments,
     clippy::missing_transmute_annotations
 )]
+// Test fixtures intentionally exercise source-level decimal spellings such as 3.14;
+// replacing those values with mathematical constants would change test semantics.
+#![cfg_attr(test, allow(clippy::approx_constant))]
+
 // Keep the hosted bytecode runner incapable of compiling host-integrating
 // subsystems. Cloud must select --no-default-features --features untrusted-runner.
 #[cfg(all(
@@ -25,9 +29,6 @@
 ))]
 compile_error!("untrusted-runner forbids host-integrating features; use --no-default-features --features untrusted-runner");
 
-// Test fixtures intentionally exercise source-level decimal spellings such as 3.14;
-// replacing those values with mathematical constants would change test semantics.
-#![cfg_attr(test, allow(clippy::approx_constant))]
 
 mod actor_protocol;
 pub mod agent;
