@@ -58,6 +58,10 @@ native-codegen = [
 # Marker profile for embedded mobile runtimes. Intentionally empty: the
 # bytecode interpreter and pre-registered host callbacks need no JIT.
 mobile-runtime = []
+# Untrusted bytecode-only runner: policy enforced by a compile-time guard in
+# src/lib.rs. MUST be built with --no-default-features. No FFI, network
+# sockets, Python, JIT/native codegen, persistence or external effect clients.
+untrusted-runner = []
 # Enables the standalone Savina-style actor benchmark runner without pulling optional subsystems.
 savina-bench = []
 python = ["dep:pyo3"]
