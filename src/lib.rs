@@ -24,7 +24,19 @@
         feature = "postgres",
         feature = "cache-server",
         feature = "lsp",
-        feature = "otel"
+        feature = "otel",
+        // Explicitly fence every public Cargo feature, including features
+        // that currently imply a forbidden one. A new feature must be
+        // classified here before the hosted-runner profile can ship.
+        feature = "default",
+        feature = "full",
+        feature = "release-cli",
+        feature = "wasm-backend",
+        feature = "wasmfx-backend",
+        feature = "difffuzz",
+        feature = "mobile-runtime",
+        feature = "savina-bench",
+        feature = "tls"
     )
 ))]
 compile_error!("untrusted-runner forbids host-integrating features; use --no-default-features --features untrusted-runner");
