@@ -76,6 +76,9 @@ pub fn run(args: &[String]) -> NuResult<()> {
             cmd_new(path_arg, template)
         }
         Some("init") => cmd_init(),
+        Some("generate") => {
+            crate::package::resource_generator::run(&args[1..], &package_root()?).map(|_| ())
+        },
         Some("build") => {
             let web = args.get(1).map(String::as_str) == Some("--web");
             if web {
@@ -266,7 +269,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
 
         Some(other) => Err(NuError::PackageError {
             msg: format!(
-                "unknown nula subcommand '{}' (expected new, init, build, build-wasm, test, run, add, remove, publish, deploy, watch, doc, list, or clean)",
+                "unknown nula subcommand '{}' (expected new, init, generate, build, build-wasm, test, run, add, remove, publish, deploy, watch, doc, list, or clean)",
                 other
             ),
             span: Span::default(),
@@ -288,6 +291,8 @@ fn print_usage() {
     println!("                Scaffold a new package directory");
     println!("                Templates: default, cli, lib, full");
     println!("  init          Scaffold a new package in the current directory");
+    println!("  generate resource <Name> --field name:String [--field rate:Float ...]");
+    println!("                Generate typed resource and deny-all authorization hooks");
     println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
     println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
     println!("  test [--filter <substr>] [--verbose|-v] [--watch|-w]  Run .nula test files");
@@ -2377,7 +2382,14 @@ fn cmd_deploy(
     eprintln!("Deploying {} to {} ...", name, cloud_url);
 
     let url = format!("{}/api/v1/deploy", cloud_url.trim_end_matches('/'));
-    let response: ureq::Response = ureq::post(&url)
+    let agent = crate::registry::client::verified_https_agent(&url).map_err(|message| {
+        NuError::PackageError {
+            msg: format!("system TLS initialization failed: {}", message),
+            span: Span::default(),
+        }
+    })?;
+    let response: ureq::Response = agent
+        .post(&url)
         .set("Authorization", &format!("Bearer {}", token))
         .set("Content-Type", "application/gzip")
         .send_bytes(&tarball)
@@ -2751,6 +2763,43 @@ mod tests {
         let err = cmd_init().expect_err("second init should fail");
         assert!(matches!(err, NuError::PackageError { msg: _, span: _ }));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_generate_resource_cli_dispatch_and_no_overwrite() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_generate_resource_cli_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test package directory");
+        let _guard = ChangeDir::new(&dir);
+        scaffold_package(&dir, "resource-pkg", "web").expect("scaffold web package");
+
+        let args = [
+            "generate",
+            "resource",
+            "Billboard",
+            "--field",
+            "name:String",
+            "--field",
+            "daily_rate:Float",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+
+        run(&args).expect("generator is reachable from nula command dispatcher");
+        let generated = dir.join("src/resources/billboard.nula");
+        assert!(generated.is_file());
+        let original = std::fs::read_to_string(&generated).expect("read resource source");
+        assert!(original.contains("pub type Billboard = {"));
+        assert!(original.contains("can_write_billboard"));
+
+        let duplicate = run(&args).expect_err("rerunning must never overwrite source");
+        assert!(duplicate.to_string().contains("without overwriting"));
+        assert_eq!(std::fs::read_to_string(&generated).unwrap(), original);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
