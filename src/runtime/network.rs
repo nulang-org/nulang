@@ -1956,6 +1956,14 @@ pub struct IncomingPacket {
     pub packet: Packet,
 }
 
+// Transport-local admission evidence. Not serialized on NUL0 and not a
+// distributed node-incarnation/actor-ownership epoch.
+#[cfg(feature = "tcp")]
+struct TcpQueuedPacket {
+    generation: u64,
+    incoming: IncomingPacket,
+}
+
 /// A packet to be sent to another node.
 #[derive(Debug, Clone)]
 pub struct OutgoingPacket {
@@ -2119,10 +2127,10 @@ pub struct TcpTransport {
     /// Active connections to other nodes.
     connections: Arc<Mutex<HashMap<NodeId, TcpConnection>>>,
     /// Channel endpoint used to receive packets from other nodes.
-    incoming_rx: mpsc::Receiver<IncomingPacket>,
+    incoming_rx: mpsc::Receiver<TcpQueuedPacket>,
     /// Cloneable send side of the incoming channel, handed to reader
     /// threads spawned for dialled outbound connections.
-    incoming_tx: mpsc::SyncSender<IncomingPacket>,
+    incoming_tx: mpsc::SyncSender<TcpQueuedPacket>,
     /// Channel endpoint used to enqueue packets for transmission.
     outgoing_tx: mpsc::SyncSender<OutgoingPacket>,
     /// Transport-local failure queue. The sender thread reports connect/write
@@ -2389,7 +2397,20 @@ impl TcpTransport {
         let mut packets = Vec::new();
         loop {
             match self.incoming_rx.try_recv() {
-                Ok(p) => packets.push(p),
+                Ok(queued) => {
+                    // A prior socket may have queued frames before a newer
+                    // generation for the same stable NodeId was installed.
+                    // Preserve queued EOF/Goodbye frames if no connection is
+                    // currently registered; connection replacement is the
+                    // only authority revoked by this local generation fence.
+                    let active = lock_ignore_poison(&self.connections);
+                    if active
+                        .get(&queued.incoming.from_node)
+                        .is_none_or(|conn| conn.generation == queued.generation)
+                    {
+                        packets.push(queued.incoming);
+                    }
+                }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => break,
             }
@@ -2477,7 +2498,7 @@ impl TcpTransport {
 #[cfg(feature = "tcp")]
 fn listener_thread(
     listener: TcpListener,
-    incoming_tx: mpsc::SyncSender<IncomingPacket>,
+    incoming_tx: mpsc::SyncSender<TcpQueuedPacket>,
     connections: Arc<Mutex<HashMap<NodeId, TcpConnection>>>,
     shutdown_flag: Arc<AtomicBool>,
     local_node_id: NodeId,
@@ -2524,7 +2545,7 @@ fn listener_thread(
 fn connection_reader(
     tcp: TcpStream,
     addr: SocketAddr,
-    incoming_tx: mpsc::SyncSender<IncomingPacket>,
+    incoming_tx: mpsc::SyncSender<TcpQueuedPacket>,
     connections: Arc<Mutex<HashMap<NodeId, TcpConnection>>>,
     shutdown_flag: Arc<AtomicBool>,
     local_node_id: NodeId,
@@ -2603,7 +2624,7 @@ fn connection_read_loop(
     mut stream: TransportStream,
     peer_id: NodeId,
     generation: u64,
-    incoming_tx: mpsc::SyncSender<IncomingPacket>,
+    incoming_tx: mpsc::SyncSender<TcpQueuedPacket>,
     connections: Arc<Mutex<HashMap<NodeId, TcpConnection>>>,
     shutdown_flag: Arc<AtomicBool>,
 ) {
@@ -2684,7 +2705,13 @@ fn connection_read_loop(
                 seq,
                 packet,
             };
-            if incoming_tx.send(incoming).is_err() {
+            if incoming_tx
+                .send(TcpQueuedPacket {
+                    generation,
+                    incoming,
+                })
+                .is_err()
+            {
                 break;
             }
         }
@@ -2733,7 +2760,7 @@ fn sender_thread(
     connections: Arc<Mutex<HashMap<NodeId, TcpConnection>>>,
     shutdown_flag: Arc<AtomicBool>,
     local_node_id: NodeId,
-    incoming_tx: mpsc::SyncSender<IncomingPacket>,
+    incoming_tx: mpsc::SyncSender<TcpQueuedPacket>,
     send_failure_tx: mpsc::Sender<TransportSendFailure>,
     tls_config: TlsConfig,
 ) {
@@ -2833,7 +2860,7 @@ fn sender_thread(
 #[cfg(feature = "tcp")]
 fn connect_in_sender(
     connections: &Arc<Mutex<HashMap<NodeId, TcpConnection>>>,
-    incoming_tx: &mpsc::SyncSender<IncomingPacket>,
+    incoming_tx: &mpsc::SyncSender<TcpQueuedPacket>,
     shutdown_flag: &Arc<AtomicBool>,
     local_node_id: NodeId,
     node_id: NodeId,
@@ -3778,6 +3805,92 @@ mod tests {
             new_generation
         );
         drop(new_client);
+    }
+
+    /// Queued frames from a replaced TCP session must not cross into the
+    /// newer session with the same stable NodeId.
+    #[test]
+    #[cfg(feature = "tcp")]
+    fn test_tcp_receive_fences_queued_old_connection_generation() {
+        let mut transport = TcpTransport::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            TlsConfig::PlaintextInsecure,
+        )
+        .unwrap();
+        let peer_id = NodeId(0xCAFE);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, addr) = listener.accept().unwrap();
+        let old_generation = next_connection_generation();
+        let new_generation = next_connection_generation();
+
+        transport
+            .incoming_tx
+            .send(TcpQueuedPacket {
+                generation: old_generation,
+                incoming: IncomingPacket {
+                    from_node: peer_id,
+                    seq: 1,
+                    packet: Packet::Heartbeat {
+                        node_id: peer_id,
+                        timestamp: 1,
+                    },
+                },
+            })
+            .unwrap();
+
+        lock_ignore_poison(&transport.connections).insert(
+            peer_id,
+            TcpConnection {
+                node_id: peer_id,
+                generation: new_generation,
+                addr,
+                stream: TransportStream::Raw(server),
+                last_activity: Instant::now(),
+            },
+        );
+
+        transport
+            .incoming_tx
+            .send(TcpQueuedPacket {
+                generation: new_generation,
+                incoming: IncomingPacket {
+                    from_node: peer_id,
+                    seq: 2,
+                    packet: Packet::Heartbeat {
+                        node_id: peer_id,
+                        timestamp: 2,
+                    },
+                },
+            })
+            .unwrap();
+
+        // A frame queued before a peer disconnects is still admissible when
+        // there has been no replacement for that peer (e.g. final Goodbye).
+        let disconnected = NodeId(0xBABA);
+        transport
+            .incoming_tx
+            .send(TcpQueuedPacket {
+                generation: next_connection_generation(),
+                incoming: IncomingPacket {
+                    from_node: disconnected,
+                    seq: 3,
+                    packet: Packet::Heartbeat {
+                        node_id: disconnected,
+                        timestamp: 3,
+                    },
+                },
+            })
+            .unwrap();
+
+        let received = transport.receive();
+        assert_eq!(
+            received.iter().map(|p| p.seq).collect::<Vec<_>>(),
+            vec![2, 3],
+            "replacement must fence old frames without dropping unrelated queued packets"
+        );
+        assert_ne!(old_generation, new_generation);
+        transport.shutdown();
     }
 
     /// A stale writer failure must not evict a replacement connection or
