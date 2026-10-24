@@ -29,7 +29,6 @@
 ))]
 compile_error!("untrusted-runner forbids host-integrating features; use --no-default-features --features untrusted-runner");
 
-
 mod actor_protocol;
 pub mod agent;
 #[cfg(feature = "native-codegen")]
