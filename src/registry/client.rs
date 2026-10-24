@@ -68,6 +68,33 @@ pub(crate) fn verified_https_agent(target_url: &str) -> Result<ureq::Agent, Stri
         .build())
 }
 
+/// HTTP transport for VM effects, which do not carry registry/deploy tokens.
+/// Ordinary HTTP may reach private or DNS-named services; unlike the
+/// credential-bearing registry agent, it does not require loopback plaintext.
+/// An HTTPS request still cannot redirect down to HTTP and native OS trust
+/// validates remote HTTPS certificates.
+#[cfg(feature = "ureq")]
+pub(crate) fn vm_effect_http_agent(target_url: &str) -> Result<ureq::Agent, String> {
+    let (scheme, _) = target_url
+        .split_once("://")
+        .ok_or_else(|| "HTTP effect requires an http:// or https:// URL".to_string())?;
+    let https_only = if scheme.eq_ignore_ascii_case("https") {
+        true
+    } else if scheme.eq_ignore_ascii_case("http") {
+        false
+    } else {
+        return Err("HTTP effect requires an http:// or https:// URL".to_string());
+    };
+    let connector = native_tls::TlsConnector::new()
+        .map_err(|e| format!("system TLS initialization failed: {}", e))?;
+    Ok(ureq::AgentBuilder::new()
+        .https_only(https_only)
+        .try_proxy_from_env(https_only)
+        .redirects(5)
+        .tls_connector(std::sync::Arc::new(connector))
+        .build())
+}
+
 /// Client for a package registry server.
 pub struct RegistryClient {
     registry_url: String,
@@ -237,6 +264,18 @@ mod tls_transport_tests {
             .expect("explicit local HTTP should work");
         assert_eq!(result.status(), 200);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn vm_generic_http_transport_isolated_from_bearer_admission() {
+        let local = "http://localhost:12345/status";
+        assert!(super::vm_effect_http_agent(local).is_ok());
+        assert!(super::verified_https_agent(local).is_err());
+        let secure = super::vm_effect_http_agent("https://example.test/").unwrap();
+        assert!(
+            secure.get(local).call().is_err(),
+            "TLS request must not downgrade to HTTP"
+        );
     }
 
     #[test]
