@@ -80,6 +80,12 @@ mod spawn;
 pub(crate) use spawn::spawn_from_module_with_authority;
 mod timer;
 mod trace;
+#[cfg(feature = "sqlite")]
+mod web_sqlite;
+#[cfg(feature = "sqlite")]
+mod web_sqlite_auth_gate;
+#[cfg(feature = "sqlite")]
+mod web_sqlite_http;
 mod workflow;
 pub use trace::TraceContext;
 
@@ -116,7 +122,10 @@ pub use foreign_executor::*;
 pub use gc::{ForeignRefOp, GcStats, OrcaCoordinator, OrcaGc, OrcaHeap};
 pub use grain::*;
 pub use heap::*;
-pub use http_server::{render_route_handler, HttpMethod, HttpServerState, WebDevServer, WebRoute};
+pub use http_server::{
+    render_route_handler, HttpMethod, HttpRequest, HttpResponse, HttpServerState, WebDevServer,
+    WebRoute,
+};
 pub use mailbox::*;
 pub use network::NetworkTransport;
 pub use network::*;
@@ -129,6 +138,12 @@ pub use resp_cache::*;
 pub use scheduler::*;
 pub use supervisor::*;
 pub use timer::*;
+#[cfg(feature = "sqlite")]
+pub use web_sqlite::WebSqliteStore;
+#[cfg(feature = "sqlite")]
+pub use web_sqlite_auth_gate::{AuthorizedWebSqlite, WebSqliteAuthGate, WebTenantTokenVerifier};
+#[cfg(feature = "sqlite")]
+pub use web_sqlite_http::{WebSqliteHttpMount, WebSqliteNativeHandler, WEB_SQLITE_HTTP_PREFIX};
 
 use crate::crdt_peer_sync::PeerCrdtFrontiers;
 use crate::types::{ExitReason, NuError, Span, VmSuspension};
