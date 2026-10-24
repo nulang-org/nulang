@@ -419,11 +419,19 @@ pub(crate) fn perform_web_builtin(
         Some("route") => Some(crate::vm::Value::unit()),
         Some("redirect") => {
             let url = resolve(constants, *regs.first()?);
-            let out = format!(
-                "<html><head><meta http-equiv=\"refresh\" content=\"0;url={}\"></head></html>",
-                url
-            );
-            Some(callbacks.alloc_string(&out))
+            if crate::runtime::http_server::register_explicit_http_redirect(&url) {
+                Some(callbacks.alloc_string(""))
+            } else if crate::runtime::http_server::valid_explicit_redirect_target(&url) {
+                // Non-HTTP rendering keeps a safe, escaped local fallback.
+                let out = format!(
+                    "<html><head><meta http-equiv=\"refresh\" content=\"0;url={}\"></head></html>",
+                    html_escape(&url)
+                );
+                Some(callbacks.alloc_string(&out))
+            } else {
+                // Do not generate scriptable meta refreshes outside HTTP.
+                Some(callbacks.alloc_string(""))
+            }
         }
         Some("respond_json") | Some("respond_text") => {
             let status = regs
