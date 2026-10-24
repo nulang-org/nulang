@@ -102,6 +102,9 @@ jobs:
       - name: Build
         run: cargo build --locked --all-targets
 
+      - name: Check untrusted runner feature boundary
+        run: bash scripts/ci/check-untrusted-runner-profile.sh
+
       - name: Test
         # nextest isolates individual tests in their own processes and schedules
         # test binaries concurrently, reducing wall-clock time without changing
