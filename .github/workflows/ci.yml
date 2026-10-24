@@ -124,7 +124,7 @@ jobs:
 
       - name: Generate coverage report
         if: env.CODECOV_TOKEN != ''
-        run: cargo llvm-cov --locked --all-features --lcov --output-path lcov.info
+        run: cargo llvm-cov --locked --no-default-features --features "$(python3 scripts/ci/compatible-cargo-features.py)" --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
         if: env.CODECOV_TOKEN != ''
@@ -310,7 +310,7 @@ jobs:
 
       # Clippy with all features — catches wasm-backend code paths.
       - name: Clippy (all features)
-        run: cargo clippy --locked --all-targets --all-features -- -D clippy::correctness
+        run: cargo clippy --locked --all-targets --no-default-features --features "$(python3 scripts/ci/compatible-cargo-features.py)" -- -D clippy::correctness
 
       # Clippy with no default features — catches minimal-build code paths.
       - name: Clippy (no default features)
@@ -333,7 +333,7 @@ jobs:
 
       # All-features compilation check.
       - name: Check all features
-        run: cargo check --locked --all-features
+        run: cargo check --locked --no-default-features --features "$(python3 scripts/ci/compatible-cargo-features.py)"
 
       # Documentation builds without errors.
       - name: Check docs

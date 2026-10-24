@@ -6,6 +6,7 @@ cd "$(dirname "$0")/../.."
 # Fail closed when a new Cargo feature is added without being explicitly
 # classified by the untrusted-runner compile-time guard.
 python3 scripts/ci/test-untrusted-runner-feature-coverage.py
+python3 scripts/ci/test-compatible-cargo-features.py
 
 cargo check --locked -p nulang --lib --no-default-features --features untrusted-runner
 
