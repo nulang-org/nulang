@@ -3,6 +3,28 @@
     clippy::too_many_arguments,
     clippy::missing_transmute_annotations
 )]
+// Keep the hosted bytecode runner incapable of compiling host-integrating
+// subsystems. Cloud must select --no-default-features --features untrusted-runner.
+#[cfg(all(
+    feature = "untrusted-runner",
+    any(
+        feature = "ffi",
+        feature = "tcp",
+        feature = "ureq",
+        feature = "python",
+        feature = "native-codegen",
+        feature = "ai-runtime",
+        feature = "http-client",
+        feature = "sqlite",
+        feature = "rocksdb",
+        feature = "postgres",
+        feature = "cache-server",
+        feature = "lsp",
+        feature = "otel"
+    )
+))]
+compile_error!("untrusted-runner forbids host-integrating features; use --no-default-features --features untrusted-runner");
+
 // Test fixtures intentionally exercise source-level decimal spellings such as 3.14;
 // replacing those values with mathematical constants would change test semantics.
 #![cfg_attr(test, allow(clippy::approx_constant))]
