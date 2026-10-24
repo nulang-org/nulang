@@ -38,18 +38,24 @@ fn valid_resource_name(name: &str) -> bool {
 }
 
 fn valid_field_name(name: &str) -> bool {
-    !name.is_empty()
+    let valid_shape = !name.is_empty()
         && name.len() <= 64
         && name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
-        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-        && !matches!(
-            name,
-            "id" | "tenant_id" | "fn" | "let" | "var" | "type" | "pub"
-                | "import" | "if" | "then" | "else" | "match" | "perform"
-                | "return" | "for" | "while" | "actor" | "app" | "route"
-                | "signal" | "effect" | "handle" | "spawn" | "self" | "nil"
-                | "unit" | "true" | "false" | "const" | "workflow"
-        )
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    if !valid_shape || matches!(name, "id" | "tenant_id") {
+        return false;
+    }
+
+    // Use the language's authoritative lexer rather than a hand-maintained
+    // keyword list. New syntax keywords must not silently become bad scaffolds.
+    let Ok(tokens) = crate::lexer::Lexer::new(name).lex() else {
+        return false;
+    };
+    tokens.len() == 2
+        && matches!(&tokens[0].kind, crate::lexer::TokenKind::Ident(identifier) if identifier == name)
+        && matches!(&tokens[1].kind, crate::lexer::TokenKind::Eof)
 }
 
 impl Resource {
@@ -59,7 +65,9 @@ impl Resource {
                 "usage: nula generate resource <PascalCase> --field name:String [--field rate:Float ...]",
             ));
         }
-        let name = args.get(1).ok_or_else(|| invalid("resource name is required"))?;
+        let name = args
+            .get(1)
+            .ok_or_else(|| invalid("resource name is required"))?;
         if !valid_resource_name(name) {
             return Err(invalid(format!(
                 "invalid resource name '{name}' (expected PascalCase ASCII identifier, up to 64 characters)"
@@ -76,7 +84,9 @@ impl Resource {
                     args[index]
                 )));
             }
-            let spec = args.get(index + 1).ok_or_else(|| invalid("--field requires name:Type"))?;
+            let spec = args
+                .get(index + 1)
+                .ok_or_else(|| invalid("--field requires name:Type"))?;
             let (field, ty) = spec
                 .split_once(':')
                 .ok_or_else(|| invalid(format!("invalid field '{spec}' (expected name:Type)")))?;
@@ -221,12 +231,20 @@ pub fn run(args: &[String], root: &Path) -> NuResult<PathBuf> {
         .write(true)
         .create_new(true)
         .open(&output)
-        .map_err(|error| invalid(format!("cannot create {} without overwriting: {error}", output.display())))?;
+        .map_err(|error| {
+            invalid(format!(
+                "cannot create {} without overwriting: {error}",
+                output.display()
+            ))
+        })?;
 
     if let Err(error) = file.write_all(resource.render().as_bytes()) {
         drop(file);
         let _ = fs::remove_file(&output);
-        return Err(invalid(format!("cannot write {}: {error}", output.display())));
+        return Err(invalid(format!(
+            "cannot write {}: {error}",
+            output.display()
+        )));
     }
     println!("Created resource scaffold at {}", output.display());
     Ok(output)
@@ -240,7 +258,9 @@ mod tests {
     use crate::typechecker::TypeChecker;
 
     fn argv(args: &[&str]) -> Vec<String> {
-        args.iter().map(|argument| (*argument).to_string()).collect()
+        args.iter()
+            .map(|argument| (*argument).to_string())
+            .collect()
     }
 
     fn test_package(label: &str) -> PathBuf {
@@ -290,14 +310,47 @@ mod tests {
     #[test]
     fn canonical_field_order_is_independent_of_flag_order() {
         let a = Resource::parse(&argv(&[
-            "resource", "Billboard", "--field", "name:String", "--field", "rate:Float",
+            "resource",
+            "Billboard",
+            "--field",
+            "name:String",
+            "--field",
+            "rate:Float",
         ]))
         .unwrap();
         let b = Resource::parse(&argv(&[
-            "resource", "Billboard", "--field", "rate:Float", "--field", "name:String",
+            "resource",
+            "Billboard",
+            "--field",
+            "rate:Float",
+            "--field",
+            "name:String",
         ]))
         .unwrap();
         assert_eq!(a.render(), b.render());
+    }
+
+    #[test]
+    fn lexer_keywords_cannot_be_generated_as_resource_fields() {
+        for name in [
+            "in",
+            "with",
+            "as",
+            "module",
+            "entity",
+            "behavior",
+            "await",
+            "using",
+            "organization",
+            "defer",
+        ] {
+            let specification = format!("{name}:String");
+            assert!(
+                Resource::parse(&argv(&["resource", "Billboard", "--field", &specification]))
+                    .is_err(),
+                "reserved lexer keyword {name:?} must not become a field",
+            );
+        }
     }
 
     #[test]
@@ -316,11 +369,19 @@ mod tests {
             );
         }
         assert!(Resource::parse(&argv(&[
-            "resource", "Billboard", "--field", "name:String", "--field", "name:Int",
+            "resource",
+            "Billboard",
+            "--field",
+            "name:String",
+            "--field",
+            "name:Int",
         ]))
         .is_err());
         assert!(Resource::parse(&argv(&[
-            "resource", "../../Escape", "--field", "name:String",
+            "resource",
+            "../../Escape",
+            "--field",
+            "name:String",
         ]))
         .is_err());
         assert!(Resource::parse(&argv(&["resource", "Billboard", "--unknown"])).is_err());
@@ -341,7 +402,14 @@ mod tests {
     fn validation_failure_does_not_create_any_resource_files() {
         let root = test_package("no_partial");
         let result = run(
-            &argv(&["resource", "Billboard", "--field", "name:String", "--field", "id:Int"]),
+            &argv(&[
+                "resource",
+                "Billboard",
+                "--field",
+                "name:String",
+                "--field",
+                "id:Int",
+            ]),
             &root,
         );
         assert!(result.is_err());
@@ -378,7 +446,10 @@ mod tests {
             &argv(&["resource", "Billboard", "--field", "name:String"]),
             &root,
         );
-        assert!(result.is_err(), "generator must reject a symlinked output directory");
+        assert!(
+            result.is_err(),
+            "generator must reject a symlinked output directory"
+        );
         assert!(!outside.join("billboard.nula").exists());
 
         let _ = fs::remove_dir_all(&root);
@@ -398,11 +469,13 @@ mod tests {
             &argv(&["resource", "Billboard", "--field", "name:String"]),
             &root,
         );
-        assert!(result.is_err(), "generator must reject a symlinked source directory");
+        assert!(
+            result.is_err(),
+            "generator must reject a symlinked source directory"
+        );
         assert!(!outside.join("resources").exists());
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&outside);
     }
-
 }
