@@ -444,8 +444,14 @@ fn explicit_redirect_and_json_share_one_request_scoped_response_slot() {
         server.port,
         "GET /redirect HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
     );
-    assert!(redirected.starts_with("HTTP/1.1 302 Found\r\n"), "{redirected}");
-    assert!(redirected.contains("\r\nLocation: /next?tab=1\r\n"), "{redirected}");
+    assert!(
+        redirected.starts_with("HTTP/1.1 302 Found\r\n"),
+        "{redirected}"
+    );
+    assert!(
+        redirected.contains("\r\nLocation: /next?tab=1\r\n"),
+        "{redirected}"
+    );
     assert_eq!(response_body(&redirected), "");
 
     let json = send_raw_request(
@@ -453,7 +459,10 @@ fn explicit_redirect_and_json_share_one_request_scoped_response_slot() {
         "GET /json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
     );
     assert!(json.starts_with("HTTP/1.1 201 Created\r\n"), "{json}");
-    assert!(json.contains("\r\nContent-Type: application/json\r\n"), "{json}");
+    assert!(
+        json.contains("\r\nContent-Type: application/json\r\n"),
+        "{json}"
+    );
     assert_eq!(response_body(&json), "{\"ok\":true}");
     assert!(!json.contains("\r\nLocation:"), "{json}");
 
@@ -475,19 +484,31 @@ fn explicit_redirect_and_json_share_one_request_scoped_response_slot() {
 
 #[test]
 fn invalid_redirect_targets_fail_closed_without_location_or_cookies() {
-    for target in ["//external.example", "https://external.example/", "/safe\r\nX-Evil: yes", "javascript:alert(1)"] {
+    for target in [
+        "//external.example",
+        "https://external.example/",
+        "/safe\r\nX-Evil: yes",
+        "javascript:alert(1)",
+    ] {
         let server = WebDevServer::bind(
             0,
             None,
             None,
-            vec![redirect_response_route(HttpMethod::Get, "/redirect", target)],
+            vec![redirect_response_route(
+                HttpMethod::Get,
+                "/redirect",
+                target,
+            )],
         )
         .expect("bind unsafe redirect route");
         let response = send_raw_request(
             server.port,
             "GET /redirect HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         );
-        assert!(response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"), "{response}");
+        assert!(
+            response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+            "{response}"
+        );
         assert!(!response.contains("\r\nLocation:"), "{response}");
         assert!(!response.contains("\r\nSet-Cookie:"), "{response}");
         assert!(!response.contains("\r\nX-Evil:"), "{response}");
@@ -520,10 +541,16 @@ fn response_endpoint() {
         server.port,
         "GET /duplicate HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
     );
-    assert!(response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"), "{response}");
+    assert!(
+        response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+        "{response}"
+    );
     assert!(!response.contains("\r\nLocation:"), "{response}");
     assert!(!response.contains("\r\nSet-Cookie:"), "{response}");
-    assert!(!response_body(&response).contains("not-committed"), "{response}");
+    assert!(
+        !response_body(&response).contains("not-committed"),
+        "{response}"
+    );
 }
 
 #[test]
