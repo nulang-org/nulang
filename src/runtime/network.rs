@@ -2669,6 +2669,28 @@ fn connection_read_loop(
     let _ = stream.shutdown();
 }
 
+/// Retire only the connection on which the failed write occurred.
+///
+/// The listener or a reader can install a newer generation while the sender
+/// is between its write lock and cleanup lock. A failed sender must not evict
+/// that replacement.
+#[cfg(feature = "tcp")]
+fn retire_failed_sender_generation(
+    connections: &mut HashMap<NodeId, TcpConnection>,
+    node_id: NodeId,
+    failed_generation: Option<u64>,
+) -> Option<TcpConnection> {
+    let generation = failed_generation?;
+    if connections
+        .get(&node_id)
+        .is_some_and(|conn| conn.generation == generation)
+    {
+        connections.remove(&node_id)
+    } else {
+        None
+    }
+}
+
 /// Sender thread entry point.
 ///
 /// Drains the outgoing queue, looks up (or creates) the TCP connection
@@ -2732,21 +2754,25 @@ fn sender_thread(
         // correlated with the logical operation that produced this packet.
         let bytes = outgoing.packet.to_bytes(outgoing.seq);
 
-        let result = {
+        let (result, attempted_generation) = {
             let mut conns = lock_ignore_poison(&connections);
             if let Some(conn) = conns.get_mut(&outgoing.to_node) {
-                conn.send_packet(&bytes)
+                let generation = conn.generation;
+                (conn.send_packet(&bytes), Some(generation))
             } else {
-                Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "connection disappeared",
-                ))
+                (
+                    Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "connection disappeared",
+                    )),
+                    None,
+                )
             }
         };
 
         if let Err(e) = result {
             warn!(
-                "[nulang-net] Send to {:?} failed: {}; removing connection",
+                "[nulang-net] Send to {:?} failed: {}; retiring failed connection",
                 outgoing.to_node, e
             );
             let _ = send_failure_tx.send(TransportSendFailure {
@@ -2756,7 +2782,9 @@ fn sender_thread(
                 reason: TransportSendFailureReason::Write,
             });
             let mut conns = lock_ignore_poison(&connections);
-            if let Some(conn) = conns.remove(&outgoing.to_node) {
+            if let Some(conn) =
+                retire_failed_sender_generation(&mut conns, outgoing.to_node, attempted_generation)
+            {
                 let _ = conn.stream.shutdown();
             }
         }
@@ -3608,6 +3636,75 @@ mod tests {
         );
 
         drop(new_client);
+    }
+
+    /// A stale writer failure must not evict a replacement connection or
+    /// prevent the replacement from delivering the next framed packet.
+    #[test]
+    #[cfg(feature = "tcp")]
+    fn test_failed_sender_generation_preserves_replacement_delivery() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+
+        let stale_client = TcpStream::connect(listen_addr).unwrap();
+        let stale_server = listener.accept().unwrap().0;
+        drop(stale_client);
+        drop(stale_server);
+
+        let replacement_client = TcpStream::connect(listen_addr).unwrap();
+        let (mut replacement_server, replacement_addr) = listener.accept().unwrap();
+        replacement_server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+
+        let peer_id = NodeId(0x9001);
+        let stale_generation = next_connection_generation();
+        let replacement_generation = next_connection_generation();
+        let mut connections = HashMap::new();
+        connections.insert(
+            peer_id,
+            TcpConnection {
+                node_id: peer_id,
+                generation: replacement_generation,
+                addr: replacement_addr,
+                stream: TransportStream::Raw(replacement_client),
+                last_activity: Instant::now(),
+            },
+        );
+
+        assert!(
+            retire_failed_sender_generation(&mut connections, peer_id, Some(stale_generation))
+                .is_none(),
+            "a stale writer failure must not remove the replacement"
+        );
+
+        let packet = Packet::Heartbeat {
+            node_id: NodeId(7),
+            timestamp: 42,
+        };
+        let packet_bytes = packet.to_bytes(1);
+        connections
+            .get_mut(&peer_id)
+            .expect("replacement connection must remain cached")
+            .send_packet(&packet_bytes)
+            .unwrap();
+
+        let mut length = [0u8; 4];
+        replacement_server.read_exact(&mut length).unwrap();
+        let mut frame = vec![0u8; u32::from_be_bytes(length) as usize];
+        replacement_server.read_exact(&mut frame).unwrap();
+        let (seq, delivered) = Packet::from_bytes(&frame).expect("replacement frame");
+        assert_eq!(seq, 1);
+        assert_eq!(delivered, packet);
+
+        let retired = retire_failed_sender_generation(
+            &mut connections,
+            peer_id,
+            Some(replacement_generation),
+        )
+        .expect("matching failed generation must be retired");
+        let _ = retired.stream.shutdown();
+        assert!(connections.is_empty());
     }
 
     // ------------------------------------------------------------------
