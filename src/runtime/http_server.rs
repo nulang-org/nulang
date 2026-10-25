@@ -556,7 +556,10 @@ pub fn set_cookie(name: &str, value: &str) {
 
 /// Add a `Set-Cookie` header that clears the named cookie.
 pub fn clear_cookie(name: &str) {
-    let cookie = format!("{}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax", name);
+    let cookie = format!(
+        "{}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax",
+        name
+    );
     RESPONSE_COOKIES.with(|c| c.borrow_mut().push(cookie));
 }
 
