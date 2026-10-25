@@ -718,8 +718,18 @@ impl FileWal {
         for (_, frame) in &staged {
             self.file.write_all(frame)?;
             offsets.push(self.file.stream_position()?);
+            #[cfg(test)]
+            if offsets.len() == 1 {
+                super::interruption::hit(
+                    super::interruption::StorageInterruptionPoint::WalGroupAfterFirstFrame,
+                )?;
+            }
         }
         self.file.sync_data()?;
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::WalGroupAfterSync,
+        )?;
 
         self.records.extend(staged.into_iter().map(|(record, _)| record));
         self.record_end_offsets.extend(offsets);
