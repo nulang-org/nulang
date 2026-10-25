@@ -146,3 +146,74 @@ fn {plural}_new() -> Html {{
     );
     Ok(())
 }
+
+#[cfg(all(test, unix))]
+mod symlink_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fixture() -> (Cleanup, std::path::PathBuf, std::path::PathBuf, String) {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "nulang_resource_symlink_guard_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        let root = base.join("package");
+        let outside = base.join("external");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(root.join("Nulang.toml"), "[web]\n").unwrap();
+        let original = "// nula:resources:handlers-start\n// nula:resources:handlers-end\napp \"x\" {\n// nula:resources:routes-start\n    // nula:resources:routes-end\n}\n".to_string();
+        fs::write(outside.join("main.nula"), &original).unwrap();
+        (Cleanup(base), root, outside, original)
+    }
+
+    #[test]
+    fn symlinked_src_is_rejected_before_touching_external_main() {
+        let (_cleanup, root, outside, original) = fixture();
+        symlink(&outside, root.join("src")).unwrap();
+        let result = generate_resource(&root, "Billboard");
+        assert!(
+            result.is_err(),
+            "must not follow package src/ outside the project"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.join("main.nula")).unwrap(),
+            original
+        );
+        assert!(!outside
+            .join(format!(
+                "main.nula.nula-generate-{}.tmp",
+                std::process::id()
+            ))
+            .exists());
+    }
+
+    #[test]
+    fn symlinked_main_is_rejected_without_replacing_user_link() {
+        let (_cleanup, root, outside, original) = fixture();
+        fs::create_dir_all(root.join("src")).unwrap();
+        symlink(outside.join("main.nula"), root.join("src/main.nula")).unwrap();
+        let result = generate_resource(&root, "Billboard");
+        assert!(result.is_err(), "must not replace a symlinked main.nula");
+        assert!(fs::symlink_metadata(root.join("src/main.nula"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read_to_string(outside.join("main.nula")).unwrap(),
+            original
+        );
+    }
+}
