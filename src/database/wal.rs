@@ -31,6 +31,9 @@ const WAL_RECORD_VERSION: u16 = 1;
 const WAL_FRAME_PREFIX_BYTES: usize = 4 + 2 + 4;
 const WAL_FRAME_HEADER_BYTES: usize = WAL_FRAME_PREFIX_BYTES + 32;
 const MAX_WAL_RECORD_BYTES: usize = 64 * 1024 * 1024;
+// Hard ceilings on the direct group-commit API, independent of owner scheduling.
+const MAX_WAL_BATCH_RECORDS: usize = 4096;
+const MAX_WAL_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -549,6 +552,10 @@ impl FileWal {
         if writes.is_empty() {
             return Ok(());
         }
+        // Preflight count before cloning, serializing, or writing anything.
+        if writes.len() > MAX_WAL_BATCH_RECORDS {
+            return Err(WalError::BatchTooManyRecords(writes.len()));
+        }
 
         let start_offset = self.file.seek(SeekFrom::End(0))?;
         let mut next_offset = start_offset;
@@ -556,6 +563,7 @@ impl FileWal {
         let mut latest_epoch = self.latest_ownership_epoch;
         let mut last_sequence = self.last_sequence();
         let mut prepared = Vec::with_capacity(writes.len());
+        let mut total_frame_bytes = 0_usize;
 
         for write in writes {
             let record = WalRecord::from_write(write);
@@ -592,6 +600,15 @@ impl FileWal {
                     offset: next_offset,
                     reason: "encoded WAL frame length overflow".to_string(),
                 })?;
+            // Bound aggregate staged frames even for direct append_batch callers.
+            // This runs before the first mutation of the file; failures remain
+            // retryable and do not poison the live handle.
+            total_frame_bytes = total_frame_bytes
+                .checked_add(frame_len)
+                .ok_or(WalError::BatchTooLarge(usize::MAX))?;
+            if total_frame_bytes > MAX_WAL_BATCH_BYTES {
+                return Err(WalError::BatchTooLarge(total_frame_bytes));
+            }
             let end_offset = next_offset.checked_add(frame_len as u64).ok_or_else(|| {
                 WalError::InvalidRecord {
                     offset: next_offset,
@@ -875,6 +892,8 @@ pub enum WalError {
         offset: u64,
         length: usize,
     },
+    BatchTooManyRecords(usize),
+    BatchTooLarge(usize),
     ChecksumMismatch {
         offset: u64,
     },
@@ -958,6 +977,12 @@ impl fmt::Display for WalError {
                 f,
                 "WAL record at byte offset {offset} is too large ({length} bytes)"
             ),
+            Self::BatchTooManyRecords(count) => {
+                write!(f, "WAL group commit has too many records ({count})")
+            }
+            Self::BatchTooLarge(bytes) => {
+                write!(f, "WAL group commit exceeds staged byte limit ({bytes} bytes)")
+            }
             Self::ChecksumMismatch { offset } => {
                 write!(f, "WAL checksum mismatch at byte offset {offset}")
             }
