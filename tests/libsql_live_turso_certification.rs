@@ -41,6 +41,48 @@ fn validate_target(ack: &str, raw_url: &str, token: &str) -> Result<(), &'static
     Ok(())
 }
 
+// This table exists only on the explicitly acknowledged disposable target.
+// Use a fixed, idempotent key so rerunning after a partial failure is safe.
+const PROBE_CREATE: &str = "CREATE TABLE IF NOT EXISTS nulang_turso_tls_certification_probe (id INTEGER PRIMARY KEY, marker INTEGER NOT NULL)";
+const PROBE_WRITE: &str =
+    "INSERT OR REPLACE INTO nulang_turso_tls_certification_probe (id, marker) VALUES (1, 739101)";
+const PROBE_READ: &str = "SELECT marker FROM nulang_turso_tls_certification_probe WHERE id = 1";
+const PROBE_DROP: &str = "DROP TABLE IF EXISTS nulang_turso_tls_certification_probe";
+
+fn query_without_leaking_credentials(store: &LibsqlStore, sql: &str, stage: &str) -> Vec<String> {
+    store
+        .query(sql, &[])
+        .unwrap_or_else(|_| panic!("disposable Turso certification {stage} failed"))
+}
+
+fn write_probe(store: &LibsqlStore) {
+    query_without_leaking_credentials(store, PROBE_CREATE, "table creation");
+    query_without_leaking_credentials(store, PROBE_WRITE, "SQL write");
+}
+
+fn verify_and_remove_probe(store: &LibsqlStore) {
+    assert_eq!(
+        query_without_leaking_credentials(store, PROBE_READ, "SQL read"),
+        vec!["[739101]"],
+        "disposable SQL write was not visible to the verifying connection",
+    );
+    query_without_leaking_credentials(store, PROBE_DROP, "table cleanup");
+}
+
+/// Validate SQL DDL/DML and the LibsqlStore query interface without a remote
+/// database, a credential, or changing the host machine's trust store.
+#[test]
+fn certification_probe_supports_real_sql_write_and_read_locally() {
+    let store = LibsqlStore::in_memory().expect("isolated in-memory SQL store");
+    write_probe(&store);
+    verify_and_remove_probe(&store);
+    assert_eq!(
+        store.query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'nulang_turso_tls_certification_probe'", &[])
+            .expect("in-memory probe cleanup check"),
+        vec!["[0]"],
+    );
+}
+
 #[test]
 fn certification_configuration_rejects_unsafe_inputs_before_network_io() {
     for (ack, url, token) in [
@@ -143,4 +185,12 @@ fn authenticated_turso_sql_round_trip() {
         )
         .unwrap_or_else(|_| panic!("schema verification query failed"));
     assert_eq!(rows, vec!["[1]"]);
+
+    // A new remote connection must see an actual committed write. SELECT 1 and
+    // schema creation alone are insufficient to prove remote durability.
+    write_probe(&store);
+    drop(store);
+    let verifier = LibsqlStore::new_remote(&endpoint, &token)
+        .unwrap_or_else(|_| panic!("authenticated verifying connection failed"));
+    verify_and_remove_probe(&verifier);
 }
