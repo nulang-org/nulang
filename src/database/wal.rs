@@ -34,7 +34,7 @@ const WAL_RECORD_VERSION: u16 = 1;
 const WAL_FRAME_PREFIX_BYTES: usize = 4 + 2 + 4;
 const WAL_FRAME_HEADER_BYTES: usize = WAL_FRAME_PREFIX_BYTES + 32;
 const MAX_WAL_RECORD_BYTES: usize = 64 * 1024 * 1024;
-const MAX_GROUP_COMMIT_RECORDS: usize = 64;
+pub(crate) const MAX_GROUP_COMMIT_RECORDS: usize = 64;
 const MAX_GROUP_COMMIT_BYTES: usize = 8 * 1024 * 1024;
 
 #[cfg(test)]
