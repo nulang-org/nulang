@@ -74,21 +74,20 @@ fn direct_host_allowed(host: &str, local: SocketAddr) -> bool {
     false
 }
 
-/// Verify provenance before invoking any state-changing Web route.
+/// Validate the Host for every Web request before dispatch, then require
+/// same-origin provenance for state-changing requests.
 ///
-/// Configure public_origin for a trusted HTTPS reverse proxy. Without it,
-/// only the local listening IP or localhost are admitted to prevent malicious
-/// DNS-rebinding Host spoofing. Referer is fallback when Origin is absent.
+/// This also protects read-only routes and SSE subscriptions from DNS
+/// rebinding. Configure public_origin for a trusted reverse proxy. Without it,
+/// only the local listening IP or localhost are accepted. The Origin/Referer
+/// checks are required for unsafe methods only. This is not authentication.
 pub fn validate_mutation_origin(
     method: &str,
     headers: &[(String, String)],
     local_addr: Option<SocketAddr>,
     public_origin: Option<&str>,
 ) -> Result<(), OriginCheckError> {
-    if matches!(method, "GET" | "HEAD" | "OPTIONS") {
-        return Ok(());
-    }
-
+    let safe_method = matches!(method, "GET" | "HEAD" | "OPTIONS");
     let host = single_header(headers, "Host")?.ok_or(OriginCheckError::MissingHost)?;
     let expected = if let Some(origin) = public_origin {
         let trusted_authority = configured_authority(origin)?;
@@ -98,11 +97,25 @@ pub fn validate_mutation_origin(
         origin.to_string()
     } else {
         let local = local_addr.ok_or(OriginCheckError::UntrustedHost)?;
-        if !direct_host_allowed(host, local) {
+        // Legacy read-only HTTP fixtures send Host: localhost without a port.
+        // This name cannot be DNS-rebound by an attacker-controlled hostname.
+        // Unsafe requests retain the strict authority-with-port policy.
+        let legacy_loopback_read = safe_method
+            && local.ip().is_loopback()
+            && (host.eq_ignore_ascii_case("localhost")
+                || host.eq_ignore_ascii_case(&local.ip().to_string()));
+        if !direct_host_allowed(host, local) && !legacy_loopback_read {
             return Err(OriginCheckError::UntrustedHost);
         }
         format!("http://{host}")
     };
+
+    // Safe reads need neither Origin nor Referer, but must have passed Host
+    // admission above. Otherwise an attacker-controlled DNS name resolving to
+    // localhost can read sensitive GET pages using its own browser origin.
+    if safe_method {
+        return Ok(());
+    }
 
     if let Some(site) = single_header(headers, "Sec-Fetch-Site")? {
         if site != "same-origin" && site != "none" {
