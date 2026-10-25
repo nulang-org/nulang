@@ -40,6 +40,11 @@ fn admin_page() -> Html {
         layout("Admin", el("div", [], [
             el("p", [], [text("Logged in as: " + user)]),
             el("form", [("method", "POST"), ("action", "/logout")], [
+                el("input", [
+                    ("type", "hidden"),
+                    ("name", "_csrf"),
+                    ("value", csrf_token())
+                ], []),
                 el("button", [("type", "submit")], [text("Sign out")])
             ])
         ]))
