@@ -129,9 +129,7 @@ fn a_retry_only_request_larger_than_the_group_limit_is_rejected_up_front() {
     let mut tablet = fixture.open();
     // Duplicate identifiers let us detect whether the input count is checked
     // *before* allocating a large seen-ID set and processing every item.
-    let entries = (0..65)
-        .map(|_| (id(1), put(b"same".to_vec())))
-        .collect();
+    let entries = (0..65).map(|_| (id(1), put(b"same".to_vec()))).collect();
     assert_eq!(
         tablet.commit_batch_idempotent(entries).unwrap_err(),
         WalBackedError::Wal(WalError::BatchTooLarge {
@@ -142,7 +140,10 @@ fn a_retry_only_request_larger_than_the_group_limit_is_rejected_up_front() {
     assert_eq!(tablet.current_sequence(), 0);
 
     assert_eq!(
-        tablet.commit_idempotent(id(2), put(b"safe".to_vec())).unwrap().sequence(),
+        tablet
+            .commit_idempotent(id(2), put(b"safe".to_vec()))
+            .unwrap()
+            .sequence(),
         1
     );
 }
