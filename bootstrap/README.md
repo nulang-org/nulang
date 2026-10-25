@@ -34,27 +34,22 @@ nulang out.nbc                          # VM runs the compiled program → 7
 The Rust host (`nulang`) runs `compile_hex.nula`; the hex output is converted
 to `.nbc` binary (RFC 0001) by `fixup_hex.py` + `hex2nbc.py`.
 
-### Stage 2 (In Progress — Self-compiling)
-A full Nulang Core parser + type-checker + code generator, written in Nulang
-Core, that compiles itself. `verify.sh` checks 1–6 are passing: single
-expressions, recursion (fib), and multi-fn programs compile and run through
-`compile_hex.nula`.
+### Stage 2 (Restricted Core self-compile oracle passes; full self-hosting pending)
+The Core compiler source in compile_hex.nula can be translated by prep_core.py,
+compiled into .nbc, then used to compile test expressions. Bootstrap check 7
+compares the generated hex against the Rust-hosted execution of the same Nulang
+compiler on six reference programs, including recursion and closures.
 
-**Known blocker:** the self-compile oracle (check 7) is disabled. The host
-compiler can build `bootstrap/self_compile.nbc` from `prep_core.py` output,
-but running the self-hosted compiler on any input returns a closure value
-(e.g. `#Value(7ff7000000000068)`) instead of hex bytecode. The closure is
-created while the program builds its top-level function table; the final
-`main()` call does not execute or does not return unit. The root cause is
-still under investigation — it is **not** the previously suspected host
-register-spill bug (simple deep let-chains and effect calls inside functions
-compile correctly in isolation). See `bootstrap/diagnose_self_host.py` for
-an automated dump of each pipeline stage.
+The latest verified check runs all seven bootstrap phases successfully. This
+is a restricted Core **self-compilation proof**, not full-language self-hosting:
+the compiler still needs Python preprocessing and fixup tools, and the VM is
+built with Rust. See verify.sh and RFC 0003 for the exact proof boundary.
 
-### Stage 3 (Planned — Independence)
-The Stage 2 `.nbc` is run on a minimal Core VM (pure interpreter, no JIT, no
-WASM, no AI, no Python — just the frozen Core opcodes). That VM can be ported
-to new hardware without the Rust toolchain, achieving full host independence.
+### Stage 3 (Core VM implemented in Rust; independent host planned)
+The --backend core-vm interpreter exists as an isolated frozen-Core execution
+path. It is still implemented in Rust; bootstrapping an independent VM on
+other architectures and removing Python and Rust build requirements remains
+future work. Do not equate the existence of core-vm with full independence.
 
 ## Directory Structure
 
@@ -79,9 +74,9 @@ bootstrap/
 ## Build & Test
 
 ```bash
-# Run the self-hosted pipeline end-to-end. Checks 1–6 pass; check 7 (the
-# Stage 2 self-compile oracle) is currently disabled.
-bash bootstrap/verify.sh
+# Run all seven bootstrap phases, including six self-compile oracle cases.
+# stdin is closed explicitly for the non-interactive verification.
+bash bootstrap/verify.sh </dev/null
 
 # Single expression through the self-hosting pipeline:
 echo '1 + 2 * 3' | nulang bootstrap/compile_hex.nula |

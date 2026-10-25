@@ -1,0 +1,42 @@
+name: Core self-host bootstrap
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/bootstrap-selfhost.yml'
+      - 'bootstrap/**'
+      - 'src/bytecode.rs'
+      - 'src/core_vm.rs'
+      - 'src/mir_codegen.rs'
+      - 'src/parser.rs'
+      - 'src/vm.rs'
+      - 'src/format/**'
+  workflow_dispatch:
+
+concurrency:
+  group: bootstrap-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  self-host-oracle:
+    name: Core self-compile oracle
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_TARGET_DIR: target
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+      - uses: Swatinem/rust-cache@v2
+      - name: Build minimal Rust host for frozen Core
+        run: cargo build --locked --no-default-features --bin nulang
+      - name: Verify all bootstrap phases and self-compile oracle
+        env:
+          NULANG_BIN: ${{ github.workspace }}/target/debug/nulang
+        shell: bash
+        run: bash bootstrap/verify.sh </dev/null

@@ -14,7 +14,7 @@ fi
 echo "PASS: self_test.nula = 42"
 
 # 2. compiler_core.nula: parses 4 expressions, last is 'let x = 42 in x + 1' = 43
-result=$($NULANG bootstrap/compiler_core.nula 2>&1 | tail -1)
+result=$($NULANG bootstrap/compiler_core.nula </dev/null 2>&1 | tail -1)
 if [ "$result" != "43" ]; then
     echo "FAIL: compiler_core.nula expected 43, got '$result'"
     exit 1
