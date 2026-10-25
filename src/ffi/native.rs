@@ -10,6 +10,28 @@ use std::sync::{Mutex, OnceLock};
 
 use super::marshal::Signature;
 
+/// Resolve a package-local Cargo adapter alias without allowing path traversal.
+/// The original alias remains the registry and FFI allowlist identity.
+#[cfg(any(feature = "ffi", test))]
+fn resolved_library_path(library: &str) -> Result<std::path::PathBuf, String> {
+    let Some(target) = library.strip_prefix("nula-native:") else {
+        return Ok(library.into());
+    };
+    if target.is_empty()
+        || !target
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+    {
+        return Err("FFI: invalid nula-native target name".into());
+    }
+    Ok(std::path::PathBuf::from(".nula/native").join(format!(
+        "{}{}{}",
+        std::env::consts::DLL_PREFIX,
+        target,
+        std::env::consts::DLL_SUFFIX
+    )))
+}
+
 /// A loaded dynamic library.
 ///
 /// When the `ffi` feature is disabled, the library handle is absent and
@@ -28,7 +50,8 @@ impl NativeLibrary {
     /// The caller must ensure the path points to a valid shared library.
     #[cfg(feature = "ffi")]
     pub unsafe fn open(path: &str) -> Result<Self, String> {
-        let inner = unsafe { libloading::Library::new(path) }.map_err(|e| e.to_string())?;
+        let inner = unsafe { libloading::Library::new(resolved_library_path(path)?) }
+            .map_err(|e| e.to_string())?;
         Ok(Self {
             inner,
             name: path.to_string(),
@@ -376,5 +399,30 @@ mod tests {
         let found = registry.resolve(None, "dup");
         assert!(found.is_some());
         assert_eq!(found.unwrap().symbol, "dup");
+    }
+}
+
+#[cfg(test)]
+mod native_alias_tests {
+    use super::resolved_library_path;
+
+    #[test]
+    fn native_alias_uses_platform_library_filename() {
+        let value = resolved_library_path("nula-native:crc_bridge").unwrap();
+        assert_eq!(
+            value,
+            std::path::PathBuf::from(".nula/native").join(format!(
+                "{}crc_bridge{}",
+                std::env::consts::DLL_PREFIX,
+                std::env::consts::DLL_SUFFIX
+            ))
+        );
+    }
+
+    #[test]
+    fn native_alias_rejects_path_traversal() {
+        for alias in ["nula-native:", "nula-native:../foo", "nula-native:a/b"] {
+            assert!(resolved_library_path(alias).is_err(), "{alias}");
+        }
     }
 }

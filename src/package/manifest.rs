@@ -32,6 +32,9 @@ pub struct Manifest {
     pub package: PackageSection,
     #[serde(default)]
     pub dependencies: BTreeMap<String, Dependency>,
+    /// Explicitly opted-in Cargo native adapter.
+    #[serde(default)]
+    pub rust: Option<RustSection>,
     #[serde(default)]
     pub web: WebSection,
     #[serde(default)]
@@ -46,6 +49,13 @@ impl Default for WebSection {
             output_dir: default_output_dir(),
         }
     }
+}
+
+/// Cargo manifest for a native C ABI adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RustSection {
+    pub manifest: String,
 }
 
 /// The `[package]` section.
@@ -210,6 +220,27 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_manifest_parse_rust_native_bridge() {
+        let source = r#"
+            [package]
+            name = "bridge-demo"
+            version = "0.1.0"
+
+            [rust]
+            manifest = "native/Cargo.toml"
+        "#;
+        let manifest = Manifest::parse(source).unwrap();
+        assert_eq!(
+            manifest.rust.as_ref().unwrap().manifest,
+            "native/Cargo.toml"
+        );
+        assert!(Manifest::parse(&manifest.to_toml().unwrap())
+            .unwrap()
+            .rust
+            .is_some());
+    }
 
     #[test]
     fn test_manifest_parse_minimal() {

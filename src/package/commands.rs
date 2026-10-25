@@ -840,6 +840,10 @@ fn prepare_package() -> NuResult<PathBuf> {
             span: Span::default(),
         })?;
 
+    if let Some(native) = &manifest.rust {
+        super::cargo::build_native(&root, native)?;
+    }
+
     let entry = root.join(&manifest.package.entry);
     if !entry.exists() {
         return Err(NuError::PackageError {
@@ -1246,6 +1250,12 @@ fn cmd_build_wasm() -> NuResult<()> {
         span: Span::default(),
     })?;
     let name = manifest.package.name.clone();
+    if manifest.rust.is_some() {
+        return Err(NuError::PackageError {
+            msg: "native Cargo adapters are not supported by nula build-wasm".into(),
+            span: Span::default(),
+        });
+    }
 
     let entry = prepare_package()?;
     let entry_str = entry.to_string_lossy().into_owned();
@@ -2044,17 +2054,28 @@ fn cmd_list() -> NuResult<()> {
 /// `nula clean`: remove build artifacts (.nula/dist/ directory).
 fn cmd_clean() -> NuResult<()> {
     let root = package_root()?;
-    let dist_dir = root.join(".nula").join("dist");
-    if dist_dir.exists() {
-        eprintln!("Cleaning build artifacts...");
-        std::fs::remove_dir_all(&dist_dir).map_err(|e| NuError::PackageError {
-            msg: format!("cannot remove {}: {}", dist_dir.display(), e),
-            span: Span::default(),
-        })?;
-        println!("Removed build artifacts.");
-    } else {
-        println!("No build artifacts found.");
+    let mut removed = false;
+    for dir in [
+        root.join(".nula").join("native"),
+        root.join(".nula").join("dist"),
+    ] {
+        if dir.exists() {
+            eprintln!("Cleaning build artifacts from {}...", dir.display());
+            std::fs::remove_dir_all(&dir).map_err(|e| NuError::PackageError {
+                msg: format!("cannot remove {}: {}", dir.display(), e),
+                span: Span::default(),
+            })?;
+            removed = true;
+        }
     }
+    println!(
+        "{}",
+        if removed {
+            "Removed build artifacts."
+        } else {
+            "No build artifacts found."
+        }
+    );
     Ok(())
 }
 
@@ -2190,8 +2211,19 @@ struct DeployResponse {
     status: String,
 }
 
-/// `nula deploy [--wasm] [--url <url>] [--token <token>] [--adapter <kind>] [--dry-run]`
-/// — build and deploy the current package to Nulang Cloud or another adapter.
+/// Reject deployments whose archive would silently omit a required native adapter.
+#[cfg(any(feature = "ureq", test))]
+fn reject_unsupported_native_deployment(manifest: &Manifest) -> NuResult<()> {
+    if manifest.rust.is_some() {
+        return Err(NuError::PackageError {
+            msg: "native Cargo adapters cannot be deployed until deployment archives and runtimes support native libraries".into(),
+            span: Span::default(),
+        });
+    }
+    Ok(())
+}
+
+/// `nula deploy` builds and deploys the current package to Nulang Cloud.
 #[cfg(feature = "ureq")]
 fn cmd_deploy(
     wasm: bool,
@@ -2212,6 +2244,7 @@ fn cmd_deploy(
         msg: format!("failed to load {}: {}", manifest_path.display(), e),
         span: Span::default(),
     })?;
+    reject_unsupported_native_deployment(&manifest)?;
     let name = manifest.package.name.clone();
     let version = manifest.package.version.clone();
 
@@ -3000,6 +3033,27 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn test_native_cargo_deploy_fails_closed() {
+        let manifest = Manifest::parse(
+            r#"
+            [package]
+            name = "native-deploy"
+            version = "0.1.0"
+
+            [rust]
+            manifest = "native/Cargo.toml"
+        "#,
+        )
+        .unwrap();
+        let err = reject_unsupported_native_deployment(&manifest)
+            .expect_err("deploy must reject native libraries until packaging supports them");
+        assert!(
+            format!("{err}").contains("native Cargo adapters cannot be deployed"),
+            "{err}"
+        );
+    }
+
     #[cfg(feature = "ureq")]
     #[test]
     fn test_cmd_deploy_missing_token() {

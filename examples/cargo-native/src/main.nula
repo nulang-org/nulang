@@ -1,0 +1,4 @@
+extern "nula-native:crc_bridge" {
+    fn crc32_i64(value: Int) -> Int
+}
+perform IO.print(perform Int.to_string(crc32_i64(42)))
