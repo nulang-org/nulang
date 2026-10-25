@@ -47,6 +47,7 @@ jobs:
           cargo test --locked --no-default-features --lib database::receipt_tests
           cargo test --locked --no-default-features --test nudb_idempotent_group_receipts
           cargo test --locked --no-default-features --test nudb_idempotent_group_limits
+          cargo test --locked --no-default-features --test nudb_receipt_digest_integrity
       - name: Tablet owner admission and coalescing
         run: |
           cargo test --locked --no-default-features --lib database::owner::tests
