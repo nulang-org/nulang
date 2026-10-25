@@ -1328,6 +1328,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_disconnect_drains_late_exit_and_terminated_events() {
+        let (event_tx, event_rx) = crossbeam::channel::unbounded();
+        let (ready_tx, ready_rx) = crossbeam::channel::bounded(1);
+        let debuggee = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            // Run after the old 250 ms quiet-window timeout. EOF must not
+            // cancel a debuggee that is still running and about to exit.
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            event_tx.send(DebugEvent::Exited { exit_code: 0 }).unwrap();
+            event_tx.send(DebugEvent::Terminated).unwrap();
+        });
+        ready_rx.recv().unwrap();
+        let mut output = Vec::new();
+        let mut seq = 0;
+        drain_debuggee_after_disconnect(&event_rx, &mut output, &mut seq, Some(&debuggee));
+        debuggee.join().unwrap();
+        let msgs = parse_output(&output);
+        assert!(msgs.iter().any(|m| m["event"] == "exited"), "{msgs:#?}");
+        assert!(msgs.iter().any(|m| m["event"] == "terminated"), "{msgs:#?}");
+    }
+
+    #[test]
     fn test_continue_reaches_exit() {
         let source = "let a = 1 in a + 1";
         let script = vec![
