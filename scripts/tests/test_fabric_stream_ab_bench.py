@@ -37,6 +37,24 @@ class FixtureTests(unittest.TestCase):
         base, candidate = fixtures()
         self.assertEqual(mod.matched_fixture(base, candidate), candidate)
 
+    def test_fixture_detection_runs_only_on_newly_added_benchmark(self):
+        base, candidate = fixtures()
+        self.assertEqual(mod.select_fixture_mode(base, candidate), "new")
+        self.assertIsNone(mod.select_fixture_mode(base, base))
+        self.assertIsNone(mod.select_fixture_mode(candidate, candidate))
+
+    def test_existing_fixture_is_skipped_for_source_only_changes(self):
+        _, candidate = fixtures()
+        # Source-only changes do not add a second copy of the benchmark.
+        self.assertIsNone(mod.select_fixture_mode(candidate, candidate))
+
+    def test_new_fixture_still_rejects_unrelated_benchmark_mutations(self):
+        base, candidate = fixtures()
+        tampered = candidate.replace("fn unrelated()", "fn mutated()")
+        self.assertEqual(mod.select_fixture_mode(base, tampered), "new")
+        with self.assertRaisesRegex(ValueError, "unrelated"):
+            mod.matched_fixture(base, tampered)
+
     def test_unrelated_changes_fail_closed(self):
         base, candidate = fixtures()
         with self.assertRaisesRegex(ValueError, "unrelated"):
