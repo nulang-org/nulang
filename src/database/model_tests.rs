@@ -137,8 +137,7 @@ fn assert_matches_reference(
                 .map(|value| value.to_vec());
             let expected = reference.read_at(&[key], sequence);
             assert_eq!(
-                actual,
-                expected,
+                actual, expected,
                 "seed={seed:#x}, step={step}, key={}, snapshot={sequence}",
                 key as char
             );
@@ -273,10 +272,12 @@ fn failed_write_requires_reconciliation_before_retry() {
 
     // A complete WAL frame exists, but the caller got an error rather than
     // a commit receipt. Reopen to determine whether its sequence committed.
-    assert!(with_interruption(StorageInterruptionPoint::WalAfterSync, || {
-        tablet.commit(write)
-    })
-    .is_err());
+    assert!(
+        with_interruption(StorageInterruptionPoint::WalAfterSync, || {
+            tablet.commit(write)
+        })
+        .is_err()
+    );
     drop(tablet);
 
     let mut recovered = WalBackedTablet::open(descriptor(), &path).unwrap();

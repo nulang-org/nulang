@@ -54,7 +54,10 @@ fn repeated_transaction_returns_original_receipt_after_restart() {
     assert_eq!(receipt.sequence(), 1);
 
     // A retry must not append another version even on the same live handle.
-    assert_eq!(tablet.commit_idempotent(id, mutation.clone()).unwrap(), receipt);
+    assert_eq!(
+        tablet.commit_idempotent(id, mutation.clone()).unwrap(),
+        receipt
+    );
     assert_eq!(tablet.current_sequence(), 1);
     drop(tablet);
 
@@ -106,8 +109,14 @@ fn checkpoint_reclamation_preserves_all_commit_receipts() {
     drop(tablet);
 
     let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
-    assert_eq!(tablet.commit_idempotent(first, put(b"f", b"one")).unwrap(), one);
-    assert_eq!(tablet.commit_idempotent(second, put(b"g", b"two")).unwrap(), two);
+    assert_eq!(
+        tablet.commit_idempotent(first, put(b"f", b"one")).unwrap(),
+        one
+    );
+    assert_eq!(
+        tablet.commit_idempotent(second, put(b"g", b"two")).unwrap(),
+        two
+    );
     assert_eq!(tablet.current_sequence(), 2);
 
     let three = tablet
@@ -117,8 +126,14 @@ fn checkpoint_reclamation_preserves_all_commit_receipts() {
     drop(tablet);
 
     let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
-    assert_eq!(tablet.commit_idempotent(first, put(b"f", b"one")).unwrap(), one);
-    assert_eq!(tablet.commit_idempotent(second, put(b"g", b"two")).unwrap(), two);
+    assert_eq!(
+        tablet.commit_idempotent(first, put(b"f", b"one")).unwrap(),
+        one
+    );
+    assert_eq!(
+        tablet.commit_idempotent(second, put(b"g", b"two")).unwrap(),
+        two
+    );
     assert_eq!(tablet.current_sequence(), 3);
     drop(tablet);
     cleanup(&path);
@@ -164,7 +179,10 @@ fn legacy_unidentified_writes_still_recover_alongside_idempotent_commits() {
 
     let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
     assert_eq!(tablet.read_latest(b"b"), Some(&b"legacy"[..]));
-    assert_eq!(tablet.commit_idempotent(id, put(b"c", b"new")).unwrap(), receipt);
+    assert_eq!(
+        tablet.commit_idempotent(id, put(b"c", b"new")).unwrap(),
+        receipt
+    );
     assert_eq!(tablet.current_sequence(), 2);
     drop(tablet);
     cleanup(&path);
@@ -178,10 +196,12 @@ fn torn_wal_frame_does_not_claim_transaction_id() {
     let mutation = put(b"k", b"retry-after-torn-frame");
     let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
 
-    assert!(with_interruption(StorageInterruptionPoint::WalAfterPayload, || {
-        tablet.commit_idempotent(id, mutation.clone())
-    })
-    .is_err());
+    assert!(
+        with_interruption(StorageInterruptionPoint::WalAfterPayload, || {
+            tablet.commit_idempotent(id, mutation.clone())
+        })
+        .is_err()
+    );
     drop(tablet);
 
     // Reopen discards the incomplete frame; the same logical transaction can
@@ -207,10 +227,12 @@ fn published_checkpoint_preserves_receipt_after_interrupted_publication() {
 
     // The checkpoint rename completed before the injected error. Both the
     // checkpoint and original WAL must remain individually safe to reopen.
-    assert!(with_interruption(StorageInterruptionPoint::CheckpointAfterRename, || {
-        tablet.publish_checkpoint()
-    })
-    .is_err());
+    assert!(
+        with_interruption(StorageInterruptionPoint::CheckpointAfterRename, || {
+            tablet.publish_checkpoint()
+        })
+        .is_err()
+    );
     drop(tablet);
 
     let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();

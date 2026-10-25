@@ -94,7 +94,10 @@ fn checkpoint_reclamation_keeps_the_same_writer_lock() {
         FileWal::open(&path),
         Err(WalError::WriterAlreadyActive { .. })
     ));
-    assert_eq!(tablet.commit_idempotent(id, mutations.clone()).unwrap(), receipt);
+    assert_eq!(
+        tablet.commit_idempotent(id, mutations.clone()).unwrap(),
+        receipt
+    );
     assert_eq!(tablet.current_sequence(), 1);
     drop(tablet);
 
