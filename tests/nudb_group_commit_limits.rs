@@ -94,11 +94,12 @@ fn exactly_sixty_four_transactions_commit_and_survive_checkpoint_recovery() {
 fn oversized_encoded_group_is_rejected_before_writing_and_writer_remains_usable() {
     let fixture = Fixture::new();
     let mut tablet = fixture.open();
-    // The encoded WAL group exceeds 8 MiB, but each transaction is below
-    // the per-record cap. This specifically exercises group-byte preflight.
+    // Each zero-filled value serializes to roughly 6 MiB of JSON bytes,
+    // under the 8 MiB group cap individually. Together the two encoded
+    // frames exceed 8 MiB, exercising the *aggregate* byte limit.
     let oversized = vec![
-        (id(1), put(vec![b'a'; 5 * 1024 * 1024])),
-        (id(2), put(vec![b'b'; 5 * 1024 * 1024])),
+        (id(1), put(vec![0; 3 * 1024 * 1024])),
+        (id(2), put(vec![0; 3 * 1024 * 1024])),
     ];
     assert!(matches!(
         tablet.commit_batch_idempotent(oversized),
