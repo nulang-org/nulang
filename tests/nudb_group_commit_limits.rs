@@ -66,14 +66,15 @@ fn id(i: u8) -> TransactionId {
 fn exactly_sixty_four_transactions_commit_and_survive_checkpoint_recovery() {
     let fixture = Fixture::new();
     let mut tablet = fixture.open();
-    let entries: Vec<_> = (1..=64_u8)
-        .map(|i| (id(i), put(vec![i])))
-        .collect();
+    let entries: Vec<_> = (1..=64_u8).map(|i| (id(i), put(vec![i]))).collect();
 
     let receipts = tablet.commit_batch_idempotent(entries.clone()).unwrap();
     assert_eq!(receipts.len(), 64);
     assert_eq!(
-        receipts.iter().map(|receipt| receipt.sequence()).collect::<Vec<_>>(),
+        receipts
+            .iter()
+            .map(|receipt| receipt.sequence())
+            .collect::<Vec<_>>(),
         (1..=64).collect::<Vec<_>>()
     );
     assert_eq!(tablet.current_sequence(), 64);
