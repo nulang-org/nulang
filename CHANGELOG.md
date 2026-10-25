@@ -1,4 +1,14 @@
 # Nulang Changelog
+### NuDB legacy checkpoint duplicate-version recovery — 2026-10-25
+- **Valid v1 checkpoints with repeated consecutive sequence numbers for the same key now recover with last-mutation-wins semantics**, matching the historical write path; canonical rewrites contain only one version per key and sequence.
+- **Checksum, descriptor, sequence ordering, and sequence-bound guards remain fail-closed.** This is a narrow compatibility repair, not a generic corrupt-checkpoint salvage mode.
+- **Deterministic on-disk fixture tests** cover legacy replay, canonical re-checkpoint, malformed version histories, and checksum tampering.
+
+### NuDB single-node WAL ownership and duplicate-key recovery — 2026-10-25
+- **NuDB now rejects competing writable WAL handles before file initialization or recovery**, using an exclusive persistent sidecar lock that remains held across checkpoint/WAL replacement. Path aliases are rejected; this is single-host local-filesystem safety, not a distributed lease.
+- **A transaction with repeated mutations to the same key records one MVCC version per committed sequence**, preserving last-write-wins behavior through checkpoint publication and restart.
+- **Dedicated red-to-green regressions and deterministic recovery-model tests** cover duplicate keys, writer contention across processes, owner termination, alias paths, crash interruption, and checkpoint replay. Older checkpoints already written with duplicate-sequence histories still require a separate compatibility/migration policy.
+
 
 ### Loopback HTTP proxy isolation and explicit Turso certification — 2026-10-22
 - Registry/deploy plaintext development requests to literal loopback IPs explicitly disable ureq environment proxy discovery; TLS-backed HTTPS requests retain their existing policy. A subprocess-isolated regression exercises the otherwise opt-in `ureq/proxy-from-env` feature and verifies bearer headers arrive at the local origin rather than an HTTP proxy.
