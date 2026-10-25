@@ -85,3 +85,44 @@ It must not be exposed to untrusted clients or deployed as an API. Introduce
 verified identity, request-wide origin/CSRF validation, typed response status,
 transactional tenant-scoped SQL and negative RLS tests before generating or
 exposing production CRUD routes.
+
+## Disposable PostgreSQL tenant-isolation proof
+
+`sql/001_tenant_rls.sql` contains a **reference PostgreSQL schema** for the two
+resources. It uses composite `(tenant_id, id)` primary keys, a same-tenant
+campaign-to-face foreign key, and enabled **FORCE ROW LEVEL SECURITY** on
+both tables. An isolated private mapping binds the PostgreSQL **login role**
+(`session_user`) to a tenant. A locked-down `SECURITY DEFINER` function reads
+that mapping; a client-set `app.tenant_id` session variable is deliberately
+ignored. Login roles cannot read or change this mapping, nor assume each
+other's role.
+
+To run on a **throwaway local PostgreSQL cluster only**, on a machine with
+PostgreSQL and Debian/Ubuntu `pg_virtualenv` installed:
+
+```bash
+pg_virtualenv env NULANG_TEST_POSTGRES_DISPOSABLE=1 \
+  bash tests/tenant_resource_postgres_rls.sh
+```
+
+Run this from the Nulang repository root. The shell test refuses to connect
+unless the host, port, configuration file, and temporary-cluster environment
+match the disposable `pg_virtualenv` instance. It creates sample login roles
+and data inside that cluster, which `pg_virtualenv` destroys on exit. **Never
+run this migration against a production or existing database.** The test
+asserts that distinct tenant roles cannot SELECT/INSERT/UPDATE/DELETE each
+other's data, cannot spoof a tenant using a custom GUC, cannot access the
+protected mapping, and cannot attach a campaign to a face from another tenant.
+It also verifies a two-record transaction, failure rollback, and committed
+state visibility from a separate database session.
+
+**This is not wired to the HTTP example or verified OIDC credentials.** Its
+role-per-tenant database authentication is a bounded illustration, not a
+chosen production connection-pooling design. Before using this with real
+users, design an identity-verified server adapter, tenant membership and role
+lifecycle, connection/role isolation (especially for pools), audited grants,
+TLS, revocation, migration ownership and production-grade failure handling.
+
+The existing HTTP example still uses ephemeral Web KV and pre-seeded test
+sessions. Passing PostgreSQL tests does **not** magically make its handlers
+durable or prove production end-to-end identity, authorization, or RLS.

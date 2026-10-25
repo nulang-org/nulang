@@ -93,3 +93,16 @@ authenticated authorization failure, with no-store text responses. The regressio
 persistence, verified external authentication, or SQL-level RLS**. Do not
 connect these example handlers to public routes before those independent
 boundaries and the strict origin/CSRF admission stack are completed.
+
+
+### Database RLS proof (disposable-only)
+
+The reference under
+[`examples/tenant-resources/sql/001_tenant_rls.sql`](../examples/tenant-resources/sql/001_tenant_rls.sql)
+adds a **separate PostgreSQL fixture** with role-bound tenants, forced RLS,
+composite keys, tenant-preserving campaign-to-face foreign keys, and a
+transactional negative-access regression. Run with
+`pg_virtualenv env NULANG_TEST_POSTGRES_DISPOSABLE=1 bash tests/tenant_resource_postgres_rls.sh`
+from the repository root. It refuses non-disposable databases. It does **not**
+change the Web dev server's in-memory KV persistence or provide verified user
+identity and must not be treated as production CRUD wiring.
