@@ -1096,6 +1096,13 @@ pub fn process_network_packets(
     for incoming in packets {
         match incoming.packet {
             Packet::Heartbeat { node_id, .. } => {
+                if node_id != incoming.from_node {
+                    warn!(
+                        "nulang-net: rejecting heartbeat claiming {:?} from transport peer {:?}",
+                        node_id, incoming.from_node
+                    );
+                    continue;
+                }
                 let cluster_node_id = NodeId(node_id.0);
                 // A Failed -> Healthy transition may be the same NodeId coming
                 // back as a fresh process. Receiver-specific CRDT knowledge
@@ -1580,6 +1587,13 @@ pub fn process_network_packets(
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
             Packet::NodeGoodbye { node_id, durable } => {
+                if node_id != incoming.from_node {
+                    warn!(
+                        "nulang-net: rejecting goodbye claiming {:?} from transport peer {:?}",
+                        node_id, incoming.from_node
+                    );
+                    continue;
+                }
                 // RFC 0014 §1 path 1: the sender declares its durable actors
                 // checkpointed and terminated. Fold its manifest into the
                 // directory (highest-epoch-wins) and confirm-gone it, then
@@ -2880,6 +2894,114 @@ mod tests {
         let peer_id = NodeId::new(&peer_addr);
         cluster.handle_heartbeat(peer_id, peer_addr);
         peer_id
+    }
+
+    // Transport-origin identity is distinct from a control packet's claimed identity.
+    // This fixture proves the admission boundary; TLS authentication of transport
+    // sender identity must be reviewed separately.
+    #[test]
+    fn test_control_packets_reject_claimed_peer_other_than_transport_sender() {
+        use crate::runtime::cluster::NodeGossip;
+        use crate::runtime::network::DeterministicNetworkTransport;
+        use parking_lot::Mutex;
+
+        let bus = Arc::new(Mutex::new(HashMap::new()));
+        let receiver_addr = addr(27101);
+        let attacker_addr = addr(27102);
+        let victim_addr = addr(27103);
+        let mut receiver =
+            DeterministicNetworkTransport::bind_with_bus(receiver_addr, bus.clone()).unwrap();
+        let mut attacker =
+            DeterministicNetworkTransport::bind_with_bus(attacker_addr, bus.clone()).unwrap();
+        let mut victim = DeterministicNetworkTransport::bind_with_bus(victim_addr, bus).unwrap();
+        receiver.register_on_bus();
+        attacker.register_on_bus();
+        victim.register_on_bus();
+
+        let receiver_id = receiver.node_id();
+        let attacker_id = attacker.node_id();
+        let victim_id = victim.node_id();
+        let mut cluster = ClusterState::new(receiver_id, receiver_addr);
+        cluster.handle_heartbeat(attacker_id, attacker_addr);
+        cluster.handle_heartbeat(victim_id, victim_addr);
+        assert!(cluster.merge_membership(vec![NodeGossip {
+            node_id: victim_id,
+            address: victim_addr,
+            status: NodeStatus::Failed,
+            incarnation: 50,
+        }]));
+        assert_eq!(
+            cluster.get_node(victim_id).unwrap().status,
+            NodeStatus::Failed
+        );
+
+        let mut runtime = Runtime::new();
+        let mut resolver = AddressResolver::new(receiver_id);
+        attacker.send(
+            receiver_id,
+            receiver_addr,
+            Packet::Heartbeat {
+                node_id: victim_id,
+                timestamp: 1,
+            },
+        );
+        process_network_packets(&mut runtime, &mut receiver, &mut cluster, &mut resolver);
+        assert_eq!(
+            cluster.get_node(victim_id).unwrap().status,
+            NodeStatus::Failed,
+            "forged heartbeat must not revive another peer"
+        );
+
+        // A genuine heartbeat from the claimed peer still restores liveness.
+        victim.send(
+            receiver_id,
+            receiver_addr,
+            Packet::Heartbeat {
+                node_id: victim_id,
+                timestamp: 2,
+            },
+        );
+        process_network_packets(&mut runtime, &mut receiver, &mut cluster, &mut resolver);
+        assert_eq!(
+            cluster.get_node(victim_id).unwrap().status,
+            NodeStatus::Healthy,
+            "matching sender and claimed peer should restore liveness"
+        );
+
+        attacker.send(
+            receiver_id,
+            receiver_addr,
+            Packet::NodeGoodbye {
+                node_id: victim_id,
+                durable: vec![(99101, 4)],
+            },
+        );
+        process_network_packets(&mut runtime, &mut receiver, &mut cluster, &mut resolver);
+        assert!(
+            !cluster.is_removed(victim_id),
+            "forged goodbye must not remove an unrelated peer"
+        );
+        assert_eq!(
+            cluster.directory_epoch(99101),
+            None,
+            "forged goodbye must not inject durable actor ownership"
+        );
+
+        // Legitimate same-sender goodbye retains its original removal contract.
+        victim.send(
+            receiver_id,
+            receiver_addr,
+            Packet::NodeGoodbye {
+                node_id: victim_id,
+                durable: Vec::new(),
+            },
+        );
+        process_network_packets(&mut runtime, &mut receiver, &mut cluster, &mut resolver);
+        assert!(cluster.is_removed(victim_id));
+
+        receiver.shutdown();
+        attacker.shutdown();
+        victim.shutdown();
     }
 
     // -- 1. Local ActorAddress ----------------------------------------------
