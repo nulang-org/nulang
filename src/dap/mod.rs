@@ -1121,6 +1121,47 @@ where
     run_dap_server_io_with_store(reader, writer, rewind::resolve_store_dir())
 }
 
+/// Flush terminal events after the client stream closes. A short gap
+/// between events is not proof that a running debuggee finished; in a busy CI
+/// runner, the debuggee can take longer than 250 ms to start or resume.
+///
+/// Stop waiting on a paused debuggee (it cannot finish without a new client
+/// command), a completed debuggee, or the bounded shutdown deadline.
+fn drain_debuggee_after_disconnect<W: Write>(
+    event_rx: &Receiver<DebugEvent>,
+    writer: &mut W,
+    seq: &mut i64,
+    debuggee: Option<&std::thread::JoinHandle<()>>,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut paused = false;
+    loop {
+        // Drain queued events before checking whether the thread finished.
+        // Exited and Terminated may both be queued after is_finished() = true.
+        while let Ok(ev) = event_rx.try_recv() {
+            paused |= matches!(ev, DebugEvent::Stopped { .. });
+            write_event(writer, seq, ev);
+        }
+        if paused || debuggee.map(|h| h.is_finished()).unwrap_or(true) {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match event_rx.recv_timeout(remaining.min(std::time::Duration::from_millis(250))) {
+            Ok(ev) => {
+                paused |= matches!(ev, DebugEvent::Stopped { .. });
+                write_event(writer, seq, ev);
+            }
+            Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                // A running debuggee may simply not have emitted anything yet.
+            }
+            Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
 /// Like [`run_dap_server_io`] but with an explicit durable store directory
 /// override (`Some` enables time-travel rewind against that store; `None`
 /// disables rewind regardless of the environment).
@@ -1178,26 +1219,14 @@ pub fn run_dap_server_io_with_store<R, W>(
                         handle_request(&mut writer, &mut seq, request_seq, &command, &args, &control, &mut debuggee, &mut module, &cmd_tx, &cmd_rx, &event_tx, &mut rewind);
                     }
                     Err(_) => {
-                        // Client disconnected. Drain debuggee events until it
-                        // settles (finishes, or pauses with no further output
-                        // for the quiescence window), then shut down.
-                        loop {
-                            // Drain everything already queued first: the
-                            // debuggee may have sent a burst (e.g. Exited +
-                            // Terminated) and finished, so a naive
-                            // `is_finished()` short-circuit would drop the
-                            // trailing events still in the queue.
-                            while let Ok(ev) = event_rx.try_recv() {
-                                write_event(&mut writer, &mut seq, ev);
-                            }
-                            if debuggee.as_ref().map(|h| h.is_finished()).unwrap_or(true) {
-                                break;
-                            }
-                            match event_rx.recv_timeout(std::time::Duration::from_millis(250)) {
-                                Ok(ev) => write_event(&mut writer, &mut seq, ev),
-                                Err(_) => break,
-                            }
-                        }
+                        // Client disconnected. Let the debuggee flush its
+                        // terminal events, or stop waiting if it is paused.
+                        drain_debuggee_after_disconnect(
+                            &event_rx,
+                            &mut writer,
+                            &mut seq,
+                            debuggee.as_ref(),
+                        );
                         break;
                     }
                 }
