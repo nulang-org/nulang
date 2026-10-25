@@ -1352,6 +1352,69 @@ mod tests {
         assert!(send(server.port, &unknown).starts_with("HTTP/1.1 501 Not Implemented"));
     }
 
+    // Regression for untrusted response metadata crossing the HTTP/1.1 wire.
+    fn write_test_response(response: HttpResponse) -> String {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local test listener");
+        let address = listener.local_addr().expect("local listener address");
+        let server = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().expect("accept test connection");
+            HttpServerState::write_response(&mut connection, &response);
+        });
+        let mut connection = TcpStream::connect(address).expect("connect test client");
+        let mut output = Vec::new();
+        connection
+            .read_to_end(&mut output)
+            .expect("read HTTP response");
+        server.join().expect("response writer did not panic");
+        String::from_utf8(output).expect("HTTP output is UTF-8")
+    }
+
+    #[test]
+    fn test_response_writer_rejects_crlf_and_framing_headers() {
+        for (name, value) in [
+            ("X-Test\r\nX-Injected", "safe"),
+            ("X-Test", "safe\r\nX-Injected: yes"),
+            ("X-Test", "safe\nX-Injected: yes"),
+            ("X-Test", "safe\0trailing"),
+            ("Content-Length", "1"),
+            ("Transfer-Encoding", "chunked"),
+        ] {
+            let result = write_test_response(HttpResponse {
+                status: 200,
+                headers: vec![(name.into(), value.into())],
+                body: b"trusted".to_vec(),
+            });
+            assert!(
+                result.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+                "{result}"
+            );
+            assert!(!result.contains("X-Injected"), "{result}");
+            assert!(!result.contains("trusted"), "{result}");
+            assert_eq!(result.matches("Content-Length:").count(), 1, "{result}");
+        }
+    }
+
+    #[test]
+    fn test_cookie_helpers_reject_header_and_attribute_injection() {
+        let _ = take_response_cookies();
+        set_cookie("session\r\nX-Injected: yes", "token");
+        set_cookie("session", "token\r\nX-Injected: yes");
+        set_cookie("session", "token; SameSite=None");
+        set_cookie("session", "token\"; Secure");
+        clear_cookie("session\r\nX-Injected: yes");
+        assert!(take_response_cookies().is_empty());
+
+        set_cookie("session", "safe_token-123");
+        clear_cookie("session");
+        let cookies = take_response_cookies();
+        assert_eq!(cookies.len(), 2);
+        assert_eq!(
+            cookies[0],
+            "session=safe_token-123; Path=/; HttpOnly; SameSite=Lax"
+        );
+        assert_eq!(cookies[1], "session=; Path=/; Max-Age=0; SameSite=Lax");
+    }
+
     #[test]
     fn http_request_reassembles_fragmented_headers_and_exact_body() {
         let raw = b"POST /submit HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
