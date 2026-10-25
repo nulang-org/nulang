@@ -252,7 +252,11 @@ fn explicit_json_response_uses_201_and_canonical_json_over_http() {
     .expect("bind explicit JSON WebDevServer");
     let response = send_raw_request(
         server.port,
-        "POST /created HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        &format!(
+            "POST /created HTTP/1.1\r\nHost: localhost:{}\r\nOrigin: http://localhost:{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            server.port,
+            server.port,
+        ),
     );
     assert!(
         response.starts_with("HTTP/1.1 201 Created\r\n"),
@@ -468,7 +472,11 @@ fn explicit_redirect_and_json_share_one_request_scoped_response_slot() {
 
     let post = send_raw_request(
         server.port,
-        "POST /after-post HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        &format!(
+            "POST /after-post HTTP/1.1\r\nHost: localhost:{}\r\nOrigin: http://localhost:{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            server.port,
+            server.port,
+        ),
     );
     assert!(post.starts_with("HTTP/1.1 303 See Other\r\n"), "{post}");
     assert!(post.contains("\r\nLocation: /receipt\r\n"), "{post}");
