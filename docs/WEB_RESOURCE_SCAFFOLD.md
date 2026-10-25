@@ -79,3 +79,16 @@ The focused tests cover generated source parsing/typechecking, default-deny
 policies, canonical output, invalid/duplicate inputs, manifest requirements,
 non-destructive reruns, and symlinked output rejection on Unix. An additional
 CLI dispatch regression test verifies end-to-end command wiring.
+
+### HTTP contract exercise (test-only)
+
+The two-resource reference also contains source-level GET/POST Web handlers,
+validated through the native `WebDevServer` real TCP integration test. This
+shows policy-denied requests cannot observe or mutate test-owned Web KV keys.
+The reference stores test records under server-derived tenant-qualified keys
+and checks positive existence markers rather than treating `nil` as empty text.
+The Web KV backend is **ephemeral**, and denied handlers currently render
+HTTP 200 with `DENIED` bodies. The regression **does not prove durable tenant
+persistence, verified external authentication, or SQL-level RLS**. Do not
+connect these example handlers to public routes before those independent
+boundaries and the strict origin/CSRF admission stack are completed.

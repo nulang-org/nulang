@@ -1,0 +1,109 @@
+// Experimental HTTP contract exercised via the actual WebDevServer.
+// NOT a production auth provider, durable store, or security boundary for
+// requests without the independently reviewed Origin/CSRF admission guard.
+// Session/CSRF records are server-seeded test fixtures in ephemeral Web KV.
+
+fn session_role() -> String {
+    let token = perform Web.cookie("demo_session")
+    if token == "" then { "" }
+    else { perform Web.kv_get("tenant-demo:session:" + token) }
+}
+
+fn current_tenant() -> String {
+    let role = session_role()
+    if role == "tenant-a:editor" || role == "tenant-a:viewer" then { "tenant-a" }
+    else if role == "tenant-b:editor" || role == "tenant-b:viewer" then { "tenant-b" }
+    else { "" }
+}
+
+// Always derive tenant from trusted, server-seeded session state.
+// Never use a client-provided tenant in storage keys.
+fn face_key(tenant: String, id: String) -> String {
+    "tenant-demo:face:" + tenant + ":" + id
+}
+fn campaign_key(tenant: String, id: String) -> String {
+    "tenant-demo:campaign:" + tenant + ":" + id
+}
+fn campaign_face_key(tenant: String, id: String) -> String {
+    "tenant-demo:campaign-face:" + tenant + ":" + id
+}
+fn can_read_face_id(id: String) -> Bool {
+    let tenant = current_tenant()
+    // Web.kv_get returns nil for absent keys; `nil != ""` is NOT an existence
+    // check. Positive equality to a server-seeded marker fails closed.
+    let exists = perform Web.kv_get("tenant-demo:face-live:" + tenant + ":" + id)
+    tenant != "" && exists == "active"
+}
+
+fn can_write_face_id(id: String) -> Bool {
+    let role = session_role()
+    can_read_face_id(id) && (role == "tenant-a:editor" || role == "tenant-b:editor")
+}
+
+fn read_face() -> String {
+    let id = perform Web.param("id")
+    if can_read_face_id(id) then { perform Web.kv_get(face_key(current_tenant(), id)) }
+    else { "DENIED" }
+}
+
+// Web.form_value returns nil when absent, so `value != ""` is not a sound
+// presence check. Web.form returns concrete string pairs: count matching
+// names and reject duplicates or empty values before mutation.
+fn exactly_one_nonempty_form_field(name: String) -> Bool {
+    let fields = perform Web.form()
+    var count = 0
+    var valid = false
+    for field in fields {
+        if field.0 == name then {
+            count = count + 1
+            valid = field.1 != ""
+        } else {}
+    }
+    count == 1 && valid
+}
+
+fn write_face() -> String {
+    let id = perform Web.param("id")
+    let token = perform Web.cookie("demo_session")
+    let expected_csrf = perform Web.kv_get("tenant-demo:csrf:" + token)
+    let csrf_active = perform Web.kv_get("tenant-demo:csrf-live:" + token)
+    let submitted_csrf = perform Web.header("X-CSRF-Token")
+    let proposed_name = perform Web.form_value("name")
+    if can_write_face_id(id) && token != "" && csrf_active == "active"
+        && expected_csrf == submitted_csrf && exactly_one_nonempty_form_field("name") then {
+        perform Web.kv_set(face_key(current_tenant(), id), proposed_name)
+        "UPDATED"
+    } else { "DENIED" }
+}
+
+fn can_read_campaign_id(id: String) -> Bool {
+    let tenant = current_tenant()
+    let exists = perform Web.kv_get("tenant-demo:campaign-live:" + tenant + ":" + id)
+    let face_id = perform Web.kv_get(campaign_face_key(tenant, id))
+    tenant != "" && exists == "active" && can_read_face_id(face_id)
+}
+
+fn can_write_campaign_id(id: String) -> Bool {
+    let role = session_role()
+    can_read_campaign_id(id) && (role == "tenant-a:editor" || role == "tenant-b:editor")
+}
+
+fn read_campaign() -> String {
+    let id = perform Web.param("id")
+    if can_read_campaign_id(id) then { perform Web.kv_get(campaign_key(current_tenant(), id)) }
+    else { "DENIED" }
+}
+
+fn write_campaign() -> String {
+    let id = perform Web.param("id")
+    let token = perform Web.cookie("demo_session")
+    let expected_csrf = perform Web.kv_get("tenant-demo:csrf:" + token)
+    let csrf_active = perform Web.kv_get("tenant-demo:csrf-live:" + token)
+    let submitted_csrf = perform Web.header("X-CSRF-Token")
+    let proposed_title = perform Web.form_value("title")
+    if can_write_campaign_id(id) && token != "" && csrf_active == "active"
+        && expected_csrf == submitted_csrf && exactly_one_nonempty_form_field("title") then {
+        perform Web.kv_set(campaign_key(current_tenant(), id), proposed_title)
+        "UPDATED"
+    } else { "DENIED" }
+}
