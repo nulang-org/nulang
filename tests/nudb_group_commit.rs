@@ -121,3 +121,60 @@ fn empty_group_commit_is_a_noop() {
 
     let _ = fs::remove_file(path);
 }
+
+#[test]
+fn batch_append_preserves_the_exact_single_record_wal_format() {
+    let serial_path = temp_wal("serial_format");
+    let batch_path = temp_wal("batch_format");
+    let _ = fs::remove_file(&serial_path);
+    let _ = fs::remove_file(&batch_path);
+
+    // Multiple frames and multiple mutation shapes must have identical
+    // framing, JSON payload bytes, and checksums whether appended singly
+    // or durably as one group. This protects borrowed WAL serialization.
+    let first = TabletWrite::prepare(
+        &descriptor(),
+        3,
+        0,
+        0,
+        vec![
+            TabletMutation::Put {
+                key: b"a".to_vec(),
+                value: b"before".to_vec(),
+            },
+            TabletMutation::Delete { key: b"a".to_vec() },
+            TabletMutation::Put {
+                key: b"a".to_vec(),
+                value: b"after".to_vec(),
+            },
+        ],
+    )
+    .unwrap();
+    let second = write(1, b"b", b"second");
+    let writes = [first, second];
+
+    {
+        let mut serial = FileWal::open(&serial_path).unwrap();
+        for item in &writes {
+            serial.append_write(item).unwrap();
+        }
+    }
+    {
+        let mut batched = FileWal::open(&batch_path).unwrap();
+        batched.append_batch(&writes).unwrap();
+    }
+
+    assert_eq!(
+        fs::read(&serial_path).unwrap(),
+        fs::read(&batch_path).unwrap(),
+        "one-sync batch encoding must match individually persisted WAL frames"
+    );
+
+    let recovered = FileWal::open(&batch_path).unwrap();
+    assert_eq!(recovered.last_sequence(), 2);
+    assert_eq!(recovered.records().len(), 2);
+    drop(recovered);
+
+    let _ = fs::remove_file(serial_path);
+    let _ = fs::remove_file(batch_path);
+}
