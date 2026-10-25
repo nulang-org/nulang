@@ -3,7 +3,7 @@
 
 use std::io;
 
-use nulang::runtime::persistence::LibsqlStore;
+use nulang::runtime::LibsqlStore;
 
 #[test]
 fn remote_urls_reject_unsafe_destinations_before_network_access() {
