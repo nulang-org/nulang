@@ -61,6 +61,9 @@ fn group_commit_publishes_consecutive_writes_after_one_durable_batch() {
     assert_eq!(reopened.current_sequence(), 2);
     assert_eq!(reopened.read_at(b"a", 1).unwrap(), Some(&b"one"[..]));
     assert_eq!(reopened.read_at(b"b", 2).unwrap(), Some(&b"two"[..]));
+    // An independent writable WAL inspector must not overlap the tablet owner.
+    // This also permits a future exclusive single-writer lock on FileWal.
+    drop(reopened);
 
     let wal = FileWal::open(&path).unwrap();
     assert_eq!(wal.records().len(), 2);
