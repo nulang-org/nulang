@@ -72,7 +72,10 @@ fn group_commit_retains_distinct_receipts_and_mvcc_snapshots_after_reopen() {
     {
         let mut tablet = fixture.open();
         let receipts = tablet.commit_batch_idempotent(entries.clone()).unwrap();
-        assert_eq!(receipts.iter().map(|r| r.sequence()).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(
+            receipts.iter().map(|r| r.sequence()).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
         assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"first"[..]));
         assert_eq!(tablet.read_at(b"k", 2).unwrap(), Some(&b"second"[..]));
         assert_eq!(tablet.read_at(b"k", 3).unwrap(), None);
@@ -81,8 +84,15 @@ fn group_commit_retains_distinct_receipts_and_mvcc_snapshots_after_reopen() {
     let mut tablet = fixture.open();
     assert_eq!(tablet.current_sequence(), 3);
     let retry = tablet.commit_batch_idempotent(entries).unwrap();
-    assert_eq!(retry.iter().map(|r| r.sequence()).collect::<Vec<_>>(), vec![1, 2, 3]);
-    assert_eq!(tablet.current_sequence(), 3, "retries must not duplicate writes");
+    assert_eq!(
+        retry.iter().map(|r| r.sequence()).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        tablet.current_sequence(),
+        3,
+        "retries must not duplicate writes"
+    );
     assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"first"[..]));
     assert_eq!(tablet.read_at(b"k", 2).unwrap(), Some(&b"second"[..]));
 }
@@ -92,27 +102,36 @@ fn preflight_rejects_duplicate_ids_conflicts_and_out_of_range_keys() {
     let fixture = TestWal::new();
     let mut tablet = fixture.open();
     assert_eq!(
-        tablet.commit_batch_idempotent(vec![
-            (id(1), vec![put(b"k", b"a")]),
-            (id(1), vec![put(b"m", b"b")]),
-        ]).unwrap_err(),
+        tablet
+            .commit_batch_idempotent(vec![
+                (id(1), vec![put(b"k", b"a")]),
+                (id(1), vec![put(b"m", b"b")]),
+            ])
+            .unwrap_err(),
         WalBackedError::DuplicateBatchId(id(1))
     );
     assert_eq!(tablet.current_sequence(), 0);
 
-    assert!(tablet.commit_batch_idempotent(vec![
-        (id(2), vec![put(b"k", b"good")]),
-        (id(3), vec![put(b"z", b"out of range")]),
-    ]).is_err());
+    assert!(tablet
+        .commit_batch_idempotent(vec![
+            (id(2), vec![put(b"k", b"good")]),
+            (id(3), vec![put(b"z", b"out of range")]),
+        ])
+        .is_err());
     assert_eq!(tablet.current_sequence(), 0);
     assert_eq!(tablet.read_latest(b"k"), None);
 
     assert_eq!(
-        tablet.commit_batch_idempotent(vec![(id(2), vec![put(b"k", b"good")])]).unwrap()[0].sequence(),
+        tablet
+            .commit_batch_idempotent(vec![(id(2), vec![put(b"k", b"good")])])
+            .unwrap()[0]
+            .sequence(),
         1
     );
     assert_eq!(
-        tablet.commit_batch_idempotent(vec![(id(2), vec![put(b"k", b"conflict")])]).unwrap_err(),
+        tablet
+            .commit_batch_idempotent(vec![(id(2), vec![put(b"k", b"conflict")])])
+            .unwrap_err(),
         WalBackedError::IdempotencyConflict(id(2))
     );
     assert_eq!(tablet.current_sequence(), 1);
@@ -122,13 +141,24 @@ fn preflight_rejects_duplicate_ids_conflicts_and_out_of_range_keys() {
 fn mixed_retry_and_new_writes_preserve_input_receipt_order() {
     let fixture = TestWal::new();
     let mut tablet = fixture.open();
-    assert_eq!(tablet.commit_idempotent(id(1), vec![put(b"k", b"a")]).unwrap().sequence(), 1);
-    let receipts = tablet.commit_batch_idempotent(vec![
-        (id(2), vec![put(b"k", b"b")]),
-        (id(1), vec![put(b"k", b"a")]),
-        (id(3), vec![put(b"m", b"c")]),
-    ]).unwrap();
-    assert_eq!(receipts.iter().map(|r| r.sequence()).collect::<Vec<_>>(), vec![2, 1, 3]);
+    assert_eq!(
+        tablet
+            .commit_idempotent(id(1), vec![put(b"k", b"a")])
+            .unwrap()
+            .sequence(),
+        1
+    );
+    let receipts = tablet
+        .commit_batch_idempotent(vec![
+            (id(2), vec![put(b"k", b"b")]),
+            (id(1), vec![put(b"k", b"a")]),
+            (id(3), vec![put(b"m", b"c")]),
+        ])
+        .unwrap();
+    assert_eq!(
+        receipts.iter().map(|r| r.sequence()).collect::<Vec<_>>(),
+        vec![2, 1, 3]
+    );
     assert_eq!(tablet.current_sequence(), 3);
 }
 
