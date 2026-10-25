@@ -65,3 +65,7 @@ dependencies are available.
 
 Self-hosting Nulang's full compiler is independent of this bridge and remains
 a separate bootstrap milestone.
+
+Deployment: nula deploy (including dry-run and WASM modes) rejects native
+Cargo adapters until deployment archives and target runtimes explicitly
+support shipping and loading native shared libraries. Local build/run remain supported.

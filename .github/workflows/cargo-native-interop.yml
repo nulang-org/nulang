@@ -1,0 +1,71 @@
+name: Cargo native interop
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/cargo-native-interop.yml'
+      - 'src/package/cargo.rs'
+      - 'src/package/manifest.rs'
+      - 'src/package/commands.rs'
+      - 'src/ffi/native.rs'
+      - 'examples/cargo-native/**'
+  workflow_dispatch:
+
+concurrency:
+  group: cargo-native-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cross-platform:
+    name: Native Cargo bridge (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    env:
+      CARGO_TARGET_DIR: target
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+      - uses: Swatinem/rust-cache@v2
+      - name: Build FFI-enabled Nulang CLI
+        run: cargo build --locked --no-default-features --features ffi --bin nulang
+      - name: Verify Cargo adapter build/run/clean and WASM fail-closed
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            workspace="$(cygpath -u "$GITHUB_WORKSPACE")"
+            bin="$workspace/target/debug/nulang.exe"
+            library="crc_bridge.dll"
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            workspace="$GITHUB_WORKSPACE"
+            bin="$workspace/target/debug/nulang"
+            library="libcrc_bridge.dylib"
+          else
+            workspace="$GITHUB_WORKSPACE"
+            bin="$workspace/target/debug/nulang"
+            library="libcrc_bridge.so"
+          fi
+          export NULANG_STDLIB="$workspace/src/stdlib"
+          cd examples/cargo-native
+          output="$("$bin" nula run)"
+          test "$output" = "227844599"
+          test -s ".nula/native/$library"
+          "$bin" nula build
+          test -s ".nula/dist/cargo-native-demo.nbc"
+          "$bin" nula clean
+          test ! -e ".nula/native/$library"
+          test ! -e ".nula/dist/cargo-native-demo.nbc"
+          if "$bin" nula build-wasm > wasm-error.log 2>&1; then
+            echo 'ERROR: native Cargo adapter incorrectly accepted for WASM'
+            exit 1
+          fi
+          grep -q 'native Cargo adapters are not supported' wasm-error.log

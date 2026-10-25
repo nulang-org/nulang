@@ -2211,8 +2211,19 @@ struct DeployResponse {
     status: String,
 }
 
-/// `nula deploy [--wasm] [--url <url>] [--token <token>] [--adapter <kind>] [--dry-run]`
-/// — build and deploy the current package to Nulang Cloud or another adapter.
+/// Reject deployments whose archive would silently omit a required native adapter.
+#[cfg(any(feature = "ureq", test))]
+fn reject_unsupported_native_deployment(manifest: &Manifest) -> NuResult<()> {
+    if manifest.rust.is_some() {
+        return Err(NuError::PackageError {
+            msg: "native Cargo adapters cannot be deployed until deployment archives and runtimes support native libraries".into(),
+            span: Span::default(),
+        });
+    }
+    Ok(())
+}
+
+/// `nula deploy` builds and deploys the current package to Nulang Cloud.
 #[cfg(feature = "ureq")]
 fn cmd_deploy(
     wasm: bool,
@@ -2233,6 +2244,7 @@ fn cmd_deploy(
         msg: format!("failed to load {}: {}", manifest_path.display(), e),
         span: Span::default(),
     })?;
+    reject_unsupported_native_deployment(&manifest)?;
     let name = manifest.package.name.clone();
     let version = manifest.package.version.clone();
 
@@ -3021,6 +3033,27 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn test_native_cargo_deploy_fails_closed() {
+        let manifest = Manifest::parse(
+            r#"
+            [package]
+            name = "native-deploy"
+            version = "0.1.0"
+
+            [rust]
+            manifest = "native/Cargo.toml"
+        "#,
+        )
+        .unwrap();
+        let err = reject_unsupported_native_deployment(&manifest)
+            .expect_err("deploy must reject native libraries until packaging supports them");
+        assert!(
+            format!("{err}").contains("native Cargo adapters cannot be deployed"),
+            "{err}"
+        );
+    }
+
     #[cfg(feature = "ureq")]
     #[test]
     fn test_cmd_deploy_missing_token() {
