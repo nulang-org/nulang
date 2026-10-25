@@ -10,12 +10,18 @@
 //!
 //! No fallible validation is performed after the WAL acknowledges durability.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::checkpoint::{self, CheckpointError};
-use super::tablet::{MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite};
+use super::tablet::{
+    transaction_digest, MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite,
+    TransactionId, TransactionIdentity, TransactionReceipt,
+};
 use super::wal::{FileWal, WalError};
+
+const MAX_RECEIPT_GROUP_TRANSACTIONS: usize = 64;
 
 #[derive(Debug)]
 pub struct WalBackedTablet {
@@ -61,6 +67,113 @@ impl WalBackedTablet {
     ) -> Result<TabletWrite, TabletError> {
         self.tablet
             .prepare_write(presented_epoch, expected_previous_sequence, mutations)
+    }
+
+    /// Commit an identified transaction, or return its original receipt if
+    /// the same ordered mutations already committed on this tablet.
+    ///
+    /// A conflicting reuse of the ID is rejected without appending to the WAL.
+    /// The receipt is part of the same WAL record and checkpoint as the data,
+    /// so it survives restart and log reclamation. A failed append may have
+    /// committed; reopen the tablet and retry with the exact same ID/payload.
+    ///
+    /// FileWal excludes concurrent local writers to the same canonical WAL.
+    /// This is not distributed lease fencing. IDs are scoped to one tablet.
+    pub fn commit_idempotent(
+        &mut self,
+        id: TransactionId,
+        mutations: Vec<TabletMutation>,
+    ) -> Result<TransactionReceipt, WalBackedError> {
+        let digest = transaction_digest(&mutations);
+        if let Some(receipt) = self.tablet.transaction_receipt(id) {
+            if receipt.digest() != digest {
+                return Err(WalBackedError::IdempotencyConflict(id));
+            }
+            return Ok(receipt);
+        }
+
+        let write = self.tablet.prepare_write(
+            self.tablet.descriptor().ownership_epoch(),
+            self.tablet.current_sequence(),
+            mutations,
+        )?;
+        let write = write.with_identity(TransactionIdentity { id, digest });
+        let sequence = self.commit(write)?;
+        // This lookup is infallible after a successful durable commit.
+        let receipt = self
+            .tablet
+            .transaction_receipt(id)
+            .expect("committed transaction identity must be recorded atomically");
+        debug_assert_eq!(receipt.sequence(), sequence);
+        Ok(receipt)
+    }
+
+    /// Commit distinct identified transactions with one bounded WAL fsync.
+    ///
+    /// Existing matching receipts are returned without reappending. The whole
+    /// request is prevalidated before any file mutation; new records are
+    /// published to MVCC only after the shared durability barrier succeeds.
+    ///
+    /// A failed WAL write can leave a recoverable prefix, so the caller must
+    /// reopen and retry with these *same* IDs and mutations. This is not an
+    /// atomic all-or-nothing multi-transaction operation after a crash.
+    pub fn commit_batch_idempotent(
+        &mut self,
+        entries: Vec<(TransactionId, Vec<TabletMutation>)>,
+    ) -> Result<Vec<TransactionReceipt>, WalBackedError> {
+        // Bound the *request*, not just new WAL records. A replay-only batch
+        // must not bypass admission limits and allocate an unbounded dedup set.
+        if entries.len() > MAX_RECEIPT_GROUP_TRANSACTIONS {
+            return Err(WalBackedError::TooManyReceiptTransactions {
+                requested: entries.len(),
+                limit: MAX_RECEIPT_GROUP_TRANSACTIONS,
+            });
+        }
+        let mut seen = HashSet::with_capacity(entries.len());
+        let mut ids = Vec::with_capacity(entries.len());
+        let mut pending = Vec::new();
+        let descriptor = self.tablet.descriptor().clone();
+        let mut next_sequence = self.tablet.current_sequence();
+
+        for (id, mutations) in entries {
+            if !seen.insert(id) {
+                return Err(WalBackedError::DuplicateBatchId(id));
+            }
+            ids.push(id);
+            let digest = transaction_digest(&mutations);
+            if let Some(receipt) = self.tablet.transaction_receipt(id) {
+                if receipt.digest() != digest {
+                    return Err(WalBackedError::IdempotencyConflict(id));
+                }
+                continue;
+            }
+            let write = TabletWrite::prepare(
+                &descriptor,
+                descriptor.ownership_epoch(),
+                next_sequence,
+                next_sequence,
+                mutations,
+            )?
+            .with_identity(TransactionIdentity { id, digest });
+            next_sequence = write.sequence();
+            pending.push(write);
+        }
+
+        if !pending.is_empty() {
+            self.wal.append_batch(&pending)?;
+            for write in pending {
+                self.tablet.publish_validated(write);
+            }
+        }
+
+        Ok(ids
+            .into_iter()
+            .map(|id| {
+                self.tablet
+                    .transaction_receipt(id)
+                    .expect("durable group commit must publish every identified receipt")
+            })
+            .collect())
     }
 
     /// Durably commit one write before making it visible to readers.
@@ -129,6 +242,9 @@ pub enum WalBackedError {
     Tablet(TabletError),
     Wal(WalError),
     Checkpoint(CheckpointError),
+    IdempotencyConflict(TransactionId),
+    DuplicateBatchId(TransactionId),
+    TooManyReceiptTransactions { requested: usize, limit: usize },
 }
 
 impl From<TabletError> for WalBackedError {
@@ -155,6 +271,18 @@ impl fmt::Display for WalBackedError {
             Self::Tablet(error) => write!(f, "tablet commit rejected: {error}"),
             Self::Wal(error) => write!(f, "tablet WAL failure: {error}"),
             Self::Checkpoint(error) => write!(f, "tablet checkpoint failure: {error}"),
+            Self::TooManyReceiptTransactions { requested, limit } => {
+                write!(
+                    f,
+                    "receipt batch has {requested} transactions (limit {limit})"
+                )
+            }
+            Self::DuplicateBatchId(id) => {
+                write!(f, "transaction ID {id:?} appears twice in one group commit")
+            }
+            Self::IdempotencyConflict(id) => {
+                write!(f, "transaction ID {id:?} reused with different mutations")
+            }
         }
     }
 }
