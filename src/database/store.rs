@@ -70,6 +70,32 @@ impl WalBackedTablet {
         Ok(self.tablet.publish_validated(write))
     }
 
+    /// Durably commit a consecutive group of independent writes with one WAL
+    /// synchronization boundary, then publish them to MVCC state in order.
+    ///
+    /// The complete group is validated before any WAL bytes are emitted. Once
+    /// the WAL acknowledges durability, publication is infallible. An I/O
+    /// error during the append can leave an ambiguous durable prefix, so the
+    /// poisoned WAL contract requires reopen/recovery before retrying.
+    pub fn commit_batch(&mut self, writes: Vec<TabletWrite>) -> Result<u64, WalBackedError> {
+        if writes.is_empty() {
+            return Ok(self.tablet.current_sequence());
+        }
+
+        let mut projected_sequence = self.tablet.current_sequence();
+        for write in &writes {
+            self.tablet
+                .validate_write_at_sequence(write, projected_sequence)?;
+            projected_sequence = write.sequence();
+        }
+
+        self.wal.append_batch(&writes)?;
+        for write in writes {
+            self.tablet.publish_validated(write);
+        }
+        Ok(projected_sequence)
+    }
+
     pub fn read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, TabletError> {
         self.tablet.read_at(key, snapshot)
     }
