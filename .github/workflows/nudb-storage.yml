@@ -40,8 +40,10 @@ jobs:
           cargo test --locked --no-default-features --test nudb_wal_batch_recovery
           cargo test --locked --no-default-features --test nudb_wal_batch_decoder_hardening
           cargo test --locked --no-default-features --test nudb_batch_safety
-      - name: Read-only WAL integrity audit
-        run: cargo test --locked --no-default-features --test nudb_wal_read_only_audit
+      - name: Read-only WAL and checkpoint consistency
+        run: |
+          cargo test --locked --no-default-features --test nudb_wal_read_only_audit
+          cargo test --locked --no-default-features --test nudb_checkpoint_pair_verify
       - name: Group commit contract
         run: cargo test --locked --no-default-features --test nudb_group_commit
       - name: Durable transaction receipts, retries and recovery
