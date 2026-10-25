@@ -684,20 +684,23 @@ impl FileWal {
                 });
             }
             let frame_len = WAL_FRAME_HEADER_BYTES + payload.len() + 32;
-            batch_bytes = batch_bytes.checked_add(frame_len).ok_or(WalError::BatchTooLarge {
-                records: writes.len(),
-                bytes: usize::MAX,
-            })?;
+            batch_bytes = batch_bytes
+                .checked_add(frame_len)
+                .ok_or(WalError::BatchTooLarge {
+                    records: writes.len(),
+                    bytes: usize::MAX,
+                })?;
             if batch_bytes > MAX_GROUP_COMMIT_BYTES {
                 return Err(WalError::BatchTooLarge {
                     records: writes.len(),
                     bytes: batch_bytes,
                 });
             }
-            let payload_len = u32::try_from(payload.len()).map_err(|_| WalError::RecordTooLarge {
-                offset: self.file.stream_position()?,
-                length: payload.len(),
-            })?;
+            let payload_len =
+                u32::try_from(payload.len()).map_err(|_| WalError::RecordTooLarge {
+                    offset: self.file.stream_position()?,
+                    length: payload.len(),
+                })?;
             let checksum = blake3::hash(&payload);
             let mut frame = Vec::with_capacity(frame_len);
             frame.extend_from_slice(&encode_frame_header(payload_len));
@@ -727,11 +730,10 @@ impl FileWal {
         }
         self.file.sync_data()?;
         #[cfg(test)]
-        super::interruption::hit(
-            super::interruption::StorageInterruptionPoint::WalGroupAfterSync,
-        )?;
+        super::interruption::hit(super::interruption::StorageInterruptionPoint::WalGroupAfterSync)?;
 
-        self.records.extend(staged.into_iter().map(|(record, _)| record));
+        self.records
+            .extend(staged.into_iter().map(|(record, _)| record));
         self.record_end_offsets.extend(offsets);
         self.tablet_id = next_tablet;
         self.latest_ownership_epoch = next_epoch;
