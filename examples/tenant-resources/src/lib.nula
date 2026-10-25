@@ -1,0 +1,30 @@
+// Illustrative application policy for two resource types.
+// Callers must obtain Actor from a trusted authentication provider. The type
+// itself is not a verified identity or a bearer capability.
+
+pub type Actor = {
+    tenant_id: String,
+    authenticated: Bool,
+    can_read: Bool,
+    can_write: Bool
+}
+
+pub fn can_read_face(principal: Actor, face) -> Bool {
+    principal.authenticated && principal.tenant_id != "" && principal.can_read
+        && principal.tenant_id == face.tenant_id
+}
+
+pub fn can_write_face(principal: Actor, face) -> Bool {
+    principal.authenticated && principal.tenant_id != "" && principal.can_write
+        && principal.tenant_id == face.tenant_id
+}
+
+pub fn can_read_campaign(principal: Actor, campaign, face) -> Bool {
+    can_read_face(principal, face) && campaign.tenant_id == principal.tenant_id
+        && campaign.face_id == face.id
+}
+
+pub fn can_write_campaign(principal: Actor, campaign, face) -> Bool {
+    can_write_face(principal, face) && campaign.tenant_id == principal.tenant_id
+        && campaign.face_id == face.id
+}

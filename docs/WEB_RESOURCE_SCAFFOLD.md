@@ -59,6 +59,15 @@ The web framework already owns route contract extraction and request-binding
 validation under `src/web/`. Future generators should consume those APIs
 rather than invent an alternative router, ORM, or authentication system.
 
+## Executable two-resource tenant policy example
+
+See [`examples/tenant-resources`](../examples/tenant-resources/README.md) for a
+checked-in pair of generated resources and executable authorization assertions:
+positive same-tenant reads/writes and negative cross-tenant, no-permission,
+unauthenticated, and invalid relationship cases. The example is a **policy
+contract**, not a production identity provider, HTTP server, database/RLS
+implementation, or authorization middleware.
+
 ## Verification
 
 ```bash

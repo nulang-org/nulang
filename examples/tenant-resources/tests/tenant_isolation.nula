@@ -1,0 +1,41 @@
+import lib
+import stdlib::test
+
+fn main() {
+    let editor_a = { tenant_id: "tenant-a", authenticated: true, can_read: true, can_write: true }
+    let viewer_a = { tenant_id: "tenant-a", authenticated: true, can_read: true, can_write: false }
+    let editor_b = { tenant_id: "tenant-b", authenticated: true, can_read: true, can_write: true }
+    let reader_b = { tenant_id: "tenant-b", authenticated: true, can_read: true, can_write: false }
+    let no_access = { tenant_id: "tenant-a", authenticated: true, can_read: false, can_write: false }
+    let disabled = { tenant_id: "", authenticated: false, can_read: false, can_write: false }
+    let face_a = { id: "face-a", tenant_id: "tenant-a", name: "Face A", active: true }
+    let face_b = { id: "face-b", tenant_id: "tenant-b", name: "Face B", active: true }
+    let campaign_a = { id: "campaign-a", tenant_id: "tenant-a", face_id: "face-a", title: "Campaign A" }
+    let campaign_b = { id: "campaign-b", tenant_id: "tenant-b", face_id: "face-b", title: "Campaign B" }
+
+    assert(can_read_face(editor_a, face_a), "same-tenant editor can read face")
+    assert(can_write_face(editor_a, face_a), "same-tenant editor can write face")
+    assert(!can_read_face(editor_b, face_a), "cross-tenant face read denied")
+    assert(!can_write_face(editor_b, face_a), "cross-tenant face write denied")
+    assert(can_read_face(reader_b, face_b), "other tenant can read own face")
+    assert(can_write_face(editor_b, face_b), "other tenant can update own face")
+    assert(!can_read_face(no_access, face_a), "matching tenant is not sufficient to read")
+    assert(!can_write_face(no_access, face_a), "matching tenant is not sufficient to write")
+    assert(!can_write_face(viewer_a, face_a), "read-only role cannot write")
+    assert(!can_read_face(disabled, face_a), "missing authenticated context denied")
+    assert(can_read_campaign(editor_a, campaign_a, face_a), "same tenant reference allowed")
+    assert(can_write_campaign(editor_a, campaign_a, face_a), "same tenant campaign write")
+    assert(can_read_campaign(editor_b, campaign_b, face_b), "other tenant can read own campaign")
+    assert(can_write_campaign(editor_b, campaign_b, face_b), "other tenant can write own campaign")
+    let wrong_link = { id: "campaign-wrong", tenant_id: "tenant-a", face_id: "other-face", title: "Tampered" }
+    assert(!can_read_campaign(editor_a, wrong_link, face_a), "mismatched foreign-key read denied")
+    assert(!can_write_campaign(editor_a, wrong_link, face_a), "mismatched foreign-key write denied")
+    assert(!can_read_campaign(no_access, campaign_a, face_a), "same tenant without read grant denied")
+    assert(!can_write_campaign(no_access, campaign_a, face_a), "same tenant without write grant denied")
+    assert(!can_read_campaign(editor_b, campaign_a, face_a), "cross-tenant campaign read denied")
+    assert(!can_write_campaign(editor_b, campaign_a, face_a), "cross-tenant campaign write denied")
+    assert(!can_read_campaign(editor_a, campaign_a, face_b), "foreign face cannot be joined")
+    assert(!can_write_campaign(editor_a, campaign_a, face_b), "foreign face cannot be written")
+    assert(!can_read_campaign(editor_a, campaign_b, face_a), "foreign campaign cannot be joined")
+    assert(!can_write_campaign(viewer_a, campaign_a, face_a), "read-only campaign write denied")
+}
