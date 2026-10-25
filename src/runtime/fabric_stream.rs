@@ -1907,7 +1907,9 @@ mod tests {
         let info = store.stream_info("orders").unwrap();
         assert!(info.segment_count >= 2);
         assert_eq!(info.last_sequence, Some(3));
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(store);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 
     #[test]
@@ -1930,7 +1932,9 @@ mod tests {
         assert_eq!(replay[0].sequence, 2);
         assert_eq!(replay[0].payload, b"b");
         assert_eq!(reopened.append("events", b"c").unwrap(), 3);
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(reopened);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 
     #[test]
@@ -1958,7 +1962,9 @@ mod tests {
             all.iter().map(|record| record.sequence).collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(reopened);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 
     #[test]
@@ -1986,7 +1992,9 @@ mod tests {
             .expect_err("checksum corruption must fail closed");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("checksum mismatch"));
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(reopened);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 
     #[test]
@@ -2011,7 +2019,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(store);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 
     #[test]
@@ -2027,7 +2037,9 @@ mod tests {
         store.commit_cursor("events", "worker", 2).unwrap();
         assert!(store.commit_cursor("events", "worker", 1).is_err());
         assert!(store.commit_cursor("events", "worker", 3).is_err());
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(store);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 
     #[test]
@@ -2064,7 +2076,9 @@ mod tests {
         let promise = reopened.epoch_promise("events").unwrap().unwrap();
         assert_eq!(promise.epoch, 3);
         assert_eq!(promise.proposal_hash, "proposal-c");
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(reopened);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 
     #[test]
@@ -2101,7 +2115,9 @@ mod tests {
         assert!(reopened
             .establish_replication_policy("events", conflicting)
             .is_err());
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(reopened);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 
     #[test]
@@ -2121,7 +2137,9 @@ mod tests {
         assert_eq!(reopened.replica_progress("events", 42).unwrap(), 3);
         reopened.record_replica_progress("events", 42, 5).unwrap();
         assert_eq!(reopened.replica_progress("events", 42).unwrap(), 5);
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(reopened);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 
     #[test]
@@ -2163,7 +2181,9 @@ mod tests {
             .pending_replication_intents("events")
             .unwrap()
             .is_empty());
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(reopened);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 
     #[test]
@@ -2191,7 +2211,9 @@ mod tests {
             .unwrap();
         store.append_reserved_replica("events", 1, b"a").unwrap();
         assert_eq!(store.read_from("events", 1, 10).unwrap().len(), 1);
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(store);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 
     #[test]
@@ -2217,7 +2239,9 @@ mod tests {
         assert_eq!(committed.len(), 1);
         assert_eq!(reopened.read_from("events", 1, 10).unwrap().len(), 2);
         assert!(reopened.commit_through("events", 3).is_err());
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(reopened);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 
     #[test]
@@ -2246,6 +2270,8 @@ mod tests {
             restarted.fabric_stream_append("audit", b"second").unwrap(),
             2
         );
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(restarted);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 }
