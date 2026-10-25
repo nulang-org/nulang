@@ -59,6 +59,8 @@ impl RecoveredBatchRecord {
 pub struct BinaryBatchWal {
     path: PathBuf,
     file: File,
+    // Persistent sidecar lock fences independent writers before recovery.
+    _writer_lock: File,
     records: Vec<RecoveredBatchRecord>,
     tablet_id: Option<TabletId>,
     latest_ownership_epoch: Option<u64>,
@@ -67,10 +69,32 @@ pub struct BinaryBatchWal {
 
 impl BinaryBatchWal {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, BatchWalError> {
-        let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)?;
-        }
+        let requested = path.as_ref();
+        let parent = requested
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+
+        // Match the canonical WAL's single-host ownership rules: canonicalize
+        // the parent, reject aliased WAL/lock inodes, and lock before modifying
+        // either the header or a torn tail. Requires a trusted local directory.
+        let name = requested.file_name().ok_or(BatchWalError::AliasedWalPath)?;
+        let path = fs::canonicalize(parent)?.join(name);
+        reject_writer_path_aliases(&path)?;
+        let mut lock_name = path.as_os_str().to_os_string();
+        lock_name.push(".lock");
+        let lock_path = PathBuf::from(lock_name);
+        reject_writer_path_aliases(&lock_path)?;
+        let writer_lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        writer_lock.try_lock().map_err(|error| match error {
+            fs::TryLockError::WouldBlock => BatchWalError::WriterLocked,
+            fs::TryLockError::Error(error) => BatchWalError::from(error),
+        })?;
 
         let existed = path.exists();
         let mut file = OpenOptions::new()
@@ -150,6 +174,7 @@ impl BinaryBatchWal {
         Ok(Self {
             path,
             file,
+            _writer_lock: writer_lock,
             records,
             tablet_id,
             latest_ownership_epoch,
@@ -234,6 +259,35 @@ impl BinaryBatchWal {
         self.latest_ownership_epoch = latest_epoch;
         self.poisoned = false;
         Ok(())
+    }
+}
+
+impl Drop for BinaryBatchWal {
+    fn drop(&mut self) {
+        // Explicitly relinquish ownership before dropping the WAL file.
+        // Best effort on Drop: the OS also releases the lock on process exit.
+        let _ = self._writer_lock.unlock();
+    }
+}
+
+/// Symlinks or hardlinks can evade a per-path sidecar lock.
+fn reject_writer_path_aliases(path: &Path) -> Result<(), BatchWalError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(BatchWalError::AliasedWalPath);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.nlink() > 1 {
+                    return Err(BatchWalError::AliasedWalPath);
+                }
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -548,6 +602,8 @@ pub enum BatchWalError {
         message: String,
     },
     InvalidFileHeader,
+    WriterLocked,
+    AliasedWalPath,
     InvalidFrameHeader {
         offset: u64,
     },
@@ -597,6 +653,8 @@ impl fmt::Display for BatchWalError {
         match self {
             Self::Io { message, .. } => write!(f, "batch WAL I/O error: {message}"),
             Self::InvalidFileHeader => f.write_str("invalid NulangDB binary batch WAL header"),
+            Self::WriterLocked => f.write_str("binary batch WAL already has an exclusive writer"),
+            Self::AliasedWalPath => f.write_str("binary batch WAL or lock path must not be a symlink or hardlink"),
             Self::InvalidFrameHeader { offset } => write!(f, "invalid batch frame at {offset}"),
             Self::UnsupportedFrameVersion { offset, version } => {
                 write!(f, "unsupported batch frame version {version} at {offset}")
