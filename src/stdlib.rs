@@ -622,6 +622,14 @@ impl StdLib {
                     description: "Get a cookie value from the current HTTP request by name.",
                 },
                 BuiltinOp {
+                    name: "Web.status",
+                    effect: "Web",
+                    op: "status",
+                    signature: "status(code: Int) -> Unit",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Set the current request's response status (200–599, invalid code maps to 500).",
+                },
+                BuiltinOp {
                     name: "Web.set_cookie",
                     effect: "Web",
                     op: "set_cookie",
