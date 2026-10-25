@@ -19,9 +19,21 @@ use super::tablet::{
     transaction_digest, MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite,
     TransactionId, TransactionIdentity, TransactionReceipt,
 };
-use super::wal::{FileWal, WalError};
+use super::wal::{FileWal, WalError, WalReadOnlyReport};
 
 const MAX_RECEIPT_GROUP_TRANSACTIONS: usize = 64;
+
+/// Read-only structural consistency report for a checkpoint/WAL pair.
+///
+/// A passing result validates formats, checksums, metadata, chain ordering,
+/// and checkpoint sequence bounds; it is NOT a verified online snapshot,
+/// byte-for-byte WAL/checkpoint overlap proof, or a successful restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointWalReport {
+    pub checkpoint_sequence: Option<u64>,
+    pub durable_tail: u64,
+    pub wal: WalReadOnlyReport,
+}
 
 #[derive(Debug)]
 pub struct WalBackedTablet {
@@ -31,6 +43,81 @@ pub struct WalBackedTablet {
 }
 
 impl WalBackedTablet {
+    /// Inspect the checkpoint and WAL without creating, truncating, or
+    /// repairing either source file or acquiring a mutable writer lock.
+    ///
+    /// This is a structural diagnostic, not a consistent online backup.
+    /// Run against quiescent files or a separately established immutable,
+    /// atomic snapshot; simultaneous checkpoint publication/WAL reclamation
+    /// can otherwise yield a transient inconsistent observation.
+    ///
+    /// For recovery proof, copy both files into a disposable directory,
+    /// reopen that copy with `WalBackedTablet::open`, and compare the
+    /// recovered state and receipts against an independent reference.
+    pub fn verify_checkpoint_wal_read_only(
+        descriptor: TabletDescriptor,
+        wal_path: impl AsRef<Path>,
+    ) -> Result<CheckpointWalReport, WalBackedError> {
+        let wal_path = wal_path.as_ref();
+        // Never use FileWal::open on the source: opening may create an empty
+        // WAL, acquire/create a lock, or truncate an incomplete crash tail.
+        let wal = FileWal::verify_read_only(wal_path)?;
+
+        if let Some(tablet_id) = wal.tablet_id {
+            if tablet_id != descriptor.id() {
+                return Err(WalError::TabletMismatch {
+                    expected: descriptor.id(),
+                    presented: tablet_id,
+                }
+                .into());
+            }
+        }
+        if let Some(epoch) = wal.last_ownership_epoch {
+            if descriptor.ownership_epoch() < epoch {
+                return Err(WalError::StaleOwnershipEpoch {
+                    durable: epoch,
+                    presented: descriptor.ownership_epoch(),
+                }
+                .into());
+            }
+        }
+
+        let checkpoint_path = checkpoint::checkpoint_path_for_wal(wal_path);
+        let checkpoint_sequence = checkpoint::load_checkpoint(&checkpoint_path, descriptor)?
+            .as_ref()
+            .map(MemoryTablet::current_sequence);
+
+        match checkpoint_sequence {
+            Some(sequence) if sequence < wal.base_sequence => {
+                return Err(WalError::CheckpointTooOld {
+                    checkpoint: sequence,
+                    wal_base: wal.base_sequence,
+                }
+                .into());
+            }
+            Some(sequence) if sequence > wal.last_sequence => {
+                return Err(WalError::CheckpointAheadOfWal {
+                    checkpoint: sequence,
+                    wal_tail: wal.last_sequence,
+                }
+                .into());
+            }
+            None if wal.base_sequence != 0 => {
+                return Err(WalError::CheckpointRequired {
+                    base_sequence: wal.base_sequence,
+                }
+                .into());
+            }
+            _ => {}
+        }
+
+        Ok(CheckpointWalReport {
+            checkpoint_sequence,
+            durable_tail: wal.last_sequence,
+            wal,
+        })
+    }
+
     /// Open a tablet and reconstruct its MVCC state from the valid WAL prefix.
     pub fn open(
         descriptor: TabletDescriptor,
