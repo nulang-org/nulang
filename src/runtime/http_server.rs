@@ -1530,3 +1530,7 @@ mod tests {
         assert_eq!(history, vec!["hello"]);
     }
 }
+
+#[cfg(test)]
+#[path = "tenant_resource_http_tests.rs"]
+mod tenant_resource_http_tests;

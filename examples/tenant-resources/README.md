@@ -42,3 +42,45 @@ nor a generated default-deny hook blocks a route unless that route actually
 calls it. Authentication, persistent database isolation/RLS, and real HTTP
 handlers are **not implemented** by this example. Do not deploy it as an auth
 server or assume this replaces CSRF, origin admission, or server-side RLS.
+
+## Development HTTP boundary regression
+
+`src/http_contract.nula` is a **test-only** pair of GET/POST handlers for both
+resources. `src/runtime/tenant_resource_http_tests.rs` compiles these Nulang
+handlers and runs them through the *real* `WebDevServer` over TCP. The Rust test
+creates high-entropy cookie tokens, seeds the **server-side ephemeral** Web KV
+with principal-to-tenant/permission records, and verifies that requests cannot
+choose their own tenant by adding body, path, or cookie values. It checks
+cross-tenant reads/writes, forged/absent sessions, read-only roles, missing
+and duplicate form fields, a missing CSRF token, same-tenant updates, records
+with identical IDs in different tenant namespaces, and a campaign whose
+referenced face belongs to a foreign tenant. All session and CSRF secrets in
+the test are generated using OS randomness.
+
+Run the focused source-equivalent regression:
+
+```bash
+cargo test --locked --no-default-features --lib \
+  authenticated_http_read_and_mutation_enforce_tenant_and_permissions
+```
+
+**Fail-closed storage contract:** examples use
+`tenant-demo:face:<trusted-tenant>:<id>` (and corresponding campaign keys),
+never a client-provided tenant. Because `Web.kv_get` returns **nil** for absent
+keys, the example requires an explicit positive-equality `"active"` marker
+for an existing resource and valid session CSRF state. It does **not** use
+`value != ""` to decide whether a key exists. POST handlers also count
+concrete `Web.form` string pairs and reject missing or duplicate field names.
+
+**Important limits**: this Web KV is **not durable storage**, transactions, or
+SQL row-level security. Test sessions are pre-seeded by Rust, not issued by an
+OIDC/verified identity integration; the user-facing login flow is absent.
+Current experimental Web handler rendering also returns HTTP **200** for a
+policy-denied handler (its body is `DENIED`), not a production-standard
+401/403. This simple test handler looks up an `X-CSRF-Token` but is **not** a
+replacement for the fail-closed Host/Origin/Fetch-Metadata and robust token
+admission integration in #2186, which is not in this standalone proof's base.
+It must not be exposed to untrusted clients or deployed as an API. Introduce
+verified identity, request-wide origin/CSRF validation, typed response status,
+transactional tenant-scoped SQL and negative RLS tests before generating or
+exposing production CRUD routes.
