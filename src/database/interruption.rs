@@ -150,25 +150,25 @@ mod tests {
             ];
 
             let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
-            let result = with_interruption(point, || {
-                tablet.commit_batch_idempotent(entries.clone())
-            });
+            let result =
+                with_interruption(point, || tablet.commit_batch_idempotent(entries.clone()));
             assert!(result.is_err(), "{point:?} must interrupt the group");
             assert_eq!(
                 tablet.current_sequence(),
                 0,
                 "an ambiguous group must not publish any MVCC record before acknowledgement"
             );
-            let attempted = tablet.commit_batch_idempotent(vec![
-                (
-                    TransactionId::new([4; 16]),
-                    vec![TabletMutation::Put {
-                        key: b"k".to_vec(),
-                        value: b"unsafe".to_vec(),
-                    }],
-                ),
-            ]);
-            assert_eq!(attempted.unwrap_err(), WalBackedError::Wal(WalError::Poisoned));
+            let attempted = tablet.commit_batch_idempotent(vec![(
+                TransactionId::new([4; 16]),
+                vec![TabletMutation::Put {
+                    key: b"k".to_vec(),
+                    value: b"unsafe".to_vec(),
+                }],
+            )]);
+            assert_eq!(
+                attempted.unwrap_err(),
+                WalBackedError::Wal(WalError::Poisoned)
+            );
             drop(tablet);
 
             let mut reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
@@ -179,7 +179,10 @@ mod tests {
             );
             let receipts = reopened.commit_batch_idempotent(entries).unwrap();
             assert_eq!(
-                receipts.iter().map(|receipt| receipt.sequence()).collect::<Vec<_>>(),
+                receipts
+                    .iter()
+                    .map(|receipt| receipt.sequence())
+                    .collect::<Vec<_>>(),
                 vec![1, 2, 3],
                 "retries must reconcile the durable prefix without duplicates"
             );
