@@ -193,6 +193,11 @@ enum FabricControl {
 #[derive(Default)]
 struct FabricRegistry {
     subscriptions: Vec<FabricSubscription>,
+    // Separate exact subjects from wildcard subscriptions. Indices refer to
+    // the canonical insertion-ordered vector; route_scored preserves that
+    // order when combining matches from the two sources.
+    exact_topic_indices: HashMap<String, Vec<usize>>,
+    wildcard_indices: Vec<usize>,
     // Queue-group cursors are scoped by concrete topic as well as group name;
     // unrelated subjects using the same queue-group label must not perturb
     // one another's deterministic round-robin order.
@@ -204,6 +209,44 @@ struct FabricRegistry {
 }
 
 impl FabricRegistry {
+    fn index_subscription(&mut self, index: usize) {
+        let pattern = &self.subscriptions[index].pattern;
+        if pattern.contains('*') || pattern.contains('>') {
+            self.wildcard_indices.push(index);
+        } else {
+            self.exact_topic_indices
+                .entry(pattern.clone())
+                .or_default()
+                .push(index);
+        }
+    }
+
+    fn rebuild_routing_index(&mut self) {
+        self.exact_topic_indices.clear();
+        self.wildcard_indices.clear();
+        for index in 0..self.subscriptions.len() {
+            self.index_subscription(index);
+        }
+    }
+
+    /// Return matching subscription offsets in canonical registration order.
+    /// Nonmatching exact subjects are never visited, while the comparatively
+    /// small wildcard set retains the full NATS-style matching semantics.
+    fn matching_subscription_indices(&self, topic: &str) -> Vec<usize> {
+        let mut indices = self
+            .exact_topic_indices
+            .get(topic)
+            .cloned()
+            .unwrap_or_default();
+        for &index in &self.wildcard_indices {
+            if pattern_matches(&self.subscriptions[index].pattern, topic) {
+                indices.push(index);
+            }
+        }
+        indices.sort_unstable();
+        indices
+    }
+
     fn insert(&mut self, candidate: FabricSubscription) -> bool {
         if let Some(existing) = self
             .subscriptions
@@ -220,6 +263,7 @@ impl FabricRegistry {
             return false;
         }
         self.subscriptions.push(candidate);
+        self.index_subscription(self.subscriptions.len() - 1);
         true
     }
 
@@ -227,14 +271,22 @@ impl FabricRegistry {
         let before = self.subscriptions.len();
         self.subscriptions
             .retain(|sub| sub.node_id.is_some() || sub.actor_id != actor_id);
-        before - self.subscriptions.len()
+        let removed = before - self.subscriptions.len();
+        if removed > 0 {
+            self.rebuild_routing_index();
+        }
+        removed
     }
 
     fn remove_remote_subscriptions(&mut self, node_id: NodeId) -> usize {
         let before = self.subscriptions.len();
         self.subscriptions
             .retain(|sub| sub.node_id != Some(node_id));
-        before - self.subscriptions.len()
+        let removed = before - self.subscriptions.len();
+        if removed > 0 {
+            self.rebuild_routing_index();
+        }
+        removed
     }
 
     fn remove_remote_node(&mut self, node_id: NodeId) -> (usize, bool) {
@@ -338,10 +390,8 @@ impl FabricRegistry {
         let mut grouped: BTreeMap<String, Vec<(FabricTarget, FabricPlacementScore)>> =
             BTreeMap::new();
 
-        for sub in &self.subscriptions {
-            if !pattern_matches(&sub.pattern, topic) {
-                continue;
-            }
+        for index in self.matching_subscription_indices(topic) {
+            let sub = &self.subscriptions[index];
             let target = match (sub.node_id, sub.behavior_id) {
                 (None, Some(behavior_id)) => FabricTarget::Local {
                     actor_id: sub.actor_id,
