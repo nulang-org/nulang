@@ -4,11 +4,11 @@
 //! NULANG_TURSO_TEST_URL=libsql://<disposable-db>.turso.io \
 //! NULANG_TURSO_TEST_TOKEN=<short-lived-scoped-token> \
 //! cargo run --locked --features sqlite --example libsql_live_turso_certification
-//! The constructor creates schema tables: never point this at production.
+//! The constructor creates schema tables and the probe persists one uniquely
+//! keyed snapshot. Only use an isolated disposable database, never production.
 #![cfg(feature = "sqlite")]
 
-#[cfg(not(test))]
-use nulang::runtime::LibsqlStore;
+use nulang::runtime::{ActorSnapshot, LibsqlStore, PersistedValue, PersistenceStore};
 
 const ACKNOWLEDGEMENT: &str = "I_CONFIRM_THIS_DB_MAY_BE_MODIFIED";
 
@@ -43,6 +43,41 @@ fn validate_target(ack: &str, raw_url: &str, token: &str) -> Result<(), &'static
             .is_some_and(|host| host.len() > ".turso.io".len() && host.ends_with(".turso.io"))
     {
         return Err("certification requires an unambiguous Turso cloud HTTPS endpoint");
+    }
+    Ok(())
+}
+
+// This probe exercises the public persistence API, not a raw SQL shortcut.
+// The caller must reconnect before verifying to prove committed remote state.
+// It leaves one uniquely keyed snapshot on the explicitly disposable database.
+fn write_certification_probe(store: &mut LibsqlStore, actor_id: u64) -> Result<(), &'static str> {
+    if actor_id > i64::MAX as u64 || store.load_snapshot(actor_id).is_some() {
+        return Err("certification probe identifier is unsafe or already exists");
+    }
+    let mut snapshot = ActorSnapshot {
+        actor_id,
+        sequence: 1,
+        ..ActorSnapshot::default()
+    };
+    snapshot.state.insert(
+        "nulang_certification".to_string(),
+        PersistedValue::String("verified".to_string()),
+    );
+    store
+        .save_snapshot(snapshot)
+        .map_err(|_| "authenticated SQL write failed")
+}
+
+fn verify_certification_probe(store: &LibsqlStore, actor_id: u64) -> Result<(), &'static str> {
+    let snapshot = store
+        .load_snapshot(actor_id)
+        .ok_or("authenticated SQL recovery read failed")?;
+    if snapshot.actor_id != actor_id
+        || snapshot.sequence != 1
+        || snapshot.state.get("nulang_certification")
+            != Some(&PersistedValue::String("verified".to_string()))
+    {
+        return Err("persisted certification probe does not match the written data");
     }
     Ok(())
 }
@@ -127,6 +162,28 @@ fn test_certification_configuration_accepts_explicit_disposable_turso_target() {
     .is_ok());
 }
 
+#[cfg(test)]
+#[test]
+fn local_certification_probe_survives_reopening_the_database() {
+    let path = std::env::temp_dir().join(format!(
+        "nulang-cert-probe-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let db_path = path.to_str().expect("UTF-8 test path");
+    let mut writer = LibsqlStore::new(db_path).expect("open local libsql");
+    let actor_id = 672_304;
+    write_certification_probe(&mut writer, actor_id).expect("write isolated probe");
+    drop(writer);
+    let reader = LibsqlStore::new(db_path).expect("reopen local libsql");
+    verify_certification_probe(&reader, actor_id).expect("read persisted probe");
+    drop(reader);
+    std::fs::remove_file(path).expect("remove disposable local database");
+}
+
 /// Only the explicit cargo run --example invokes remote SQL; no test is ignored.
 #[cfg(not(test))]
 fn main() {
@@ -139,7 +196,7 @@ fn main() {
 
     // new_remote creates Nulang's schema tables; never invoke on production.
     // Do not print the token or echo libsql's potentially sensitive errors.
-    let store = LibsqlStore::new_remote(&endpoint, &token)
+    let mut store = LibsqlStore::new_remote(&endpoint, &token)
         .unwrap_or_else(|_| panic!("authenticated HTTPS/libSQL connection failed"));
     let rows = store
         .query("SELECT 1", &[])
@@ -153,5 +210,21 @@ fn main() {
         )
         .unwrap_or_else(|_| panic!("schema verification query failed"));
     assert_eq!(rows, vec!["[1]"]);
-    println!("Disposable Turso HTTPS/libSQL round-trip and schema certification passed");
+
+    let actor_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before Unix epoch")
+        .as_nanos();
+    let actor_id = u64::try_from(actor_id).expect("certification ID overflow");
+    write_certification_probe(&mut store, actor_id)
+        .expect("authenticated remote SQL snapshot write failed");
+    drop(store);
+
+    // Force a fresh authenticated connection: an in-process read is not proof
+    // the write was durably committed to the remote database.
+    let reader = LibsqlStore::new_remote(&endpoint, &token)
+        .unwrap_or_else(|_| panic!("remote SQL reconnection failed"));
+    verify_certification_probe(&reader, actor_id)
+        .expect("authenticated remote SQL snapshot recovery failed");
+    println!("Disposable Turso HTTPS/libSQL authenticated write, reconnect, and read passed");
 }

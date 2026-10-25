@@ -61,6 +61,25 @@ fn vm_http_builtins_use_explicit_native_tls_agent() {
 }
 
 #[test]
+fn disposable_turso_certification_proves_remote_write_and_reconnect() {
+    let example = include_str!("../examples/libsql_live_turso_certification.rs");
+    assert!(
+        example.contains("NULANG_TURSO_TEST_IS_DISPOSABLE"),
+        "live certification must remain explicitly opt-in"
+    );
+    assert!(
+        example.contains("write_certification_probe(&mut store, actor_id)"),
+        "certification must write an isolated durable probe"
+    );
+    assert!(
+        example.contains("drop(store)")
+            && example.contains("LibsqlStore::new_remote(&endpoint, &token)")
+            && example.contains("verify_certification_probe(&reader, actor_id)"),
+        "certification must reopen authenticated remote SQL to verify durable readback"
+    );
+}
+
+#[test]
 fn registry_bearer_requests_keep_strict_transport_admission() {
     let registry = include_str!("../src/registry/client.rs");
     let privileged_client = registry
