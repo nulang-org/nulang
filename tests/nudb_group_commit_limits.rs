@@ -122,3 +122,27 @@ fn oversized_encoded_group_is_rejected_before_writing_and_writer_remains_usable(
     assert_eq!(tablet.current_sequence(), 1);
     assert_eq!(tablet.read_latest(b"k"), Some(&b"safe"[..]));
 }
+
+#[test]
+fn a_retry_only_request_larger_than_the_group_limit_is_rejected_up_front() {
+    let fixture = Fixture::new();
+    let mut tablet = fixture.open();
+    // Duplicate identifiers let us detect whether the input count is checked
+    // *before* allocating a large seen-ID set and processing every item.
+    let entries = (0..65)
+        .map(|_| (id(1), put(b"same".to_vec())))
+        .collect();
+    assert_eq!(
+        tablet.commit_batch_idempotent(entries).unwrap_err(),
+        WalBackedError::Wal(WalError::BatchTooLarge {
+            records: 65,
+            bytes: 0,
+        })
+    );
+    assert_eq!(tablet.current_sequence(), 0);
+
+    assert_eq!(
+        tablet.commit_idempotent(id(2), put(b"safe".to_vec())).unwrap().sequence(),
+        1
+    );
+}
