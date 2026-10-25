@@ -19,7 +19,7 @@ use super::tablet::{
     transaction_digest, MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite,
     TransactionId, TransactionIdentity, TransactionReceipt,
 };
-use super::wal::{FileWal, WalError};
+use super::wal::{FileWal, WalError, MAX_GROUP_COMMIT_RECORDS};
 
 #[derive(Debug)]
 pub struct WalBackedTablet {
@@ -119,6 +119,14 @@ impl WalBackedTablet {
         &mut self,
         entries: Vec<(TransactionId, Vec<TabletMutation>)>,
     ) -> Result<Vec<TransactionReceipt>, WalBackedError> {
+        // Bound the *request*, not just new WAL records. A replay-only batch
+        // must not bypass admission limits and allocate an unbounded dedup set.
+        if entries.len() > MAX_GROUP_COMMIT_RECORDS {
+            return Err(WalBackedError::Wal(WalError::BatchTooLarge {
+                records: entries.len(),
+                bytes: 0,
+            }));
+        }
         let mut seen = HashSet::with_capacity(entries.len());
         let mut ids = Vec::with_capacity(entries.len());
         let mut pending = Vec::new();
