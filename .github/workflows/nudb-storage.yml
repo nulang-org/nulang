@@ -30,6 +30,7 @@ jobs:
           cargo test --locked --no-default-features --test nudb_wal_batch
           cargo test --locked --no-default-features --test nudb_wal_batch_recovery
           cargo test --locked --no-default-features --test nudb_wal_batch_decoder_hardening
+          cargo test --locked --no-default-features --test nudb_batch_safety
       - name: Group commit contract
         run: cargo test --locked --no-default-features --test nudb_group_commit
       - name: Storage interruption matrix
