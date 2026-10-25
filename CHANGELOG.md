@@ -1,8 +1,9 @@
 # Nulang Changelog
 
-### October RustSec dependency remediation (partial) — 2026-10-25
-- **Resolved five of six October 2026 Cargo audit vulnerabilities without weakening the audit gate.** Upgraded Wasmtime 48.0.6 → 48.0.7 (with matching Cranelift/Pulley crates), `rustls-webpki` 0.103.14 → 0.103.16, `webpki-roots` 1.0.9 → 1.0.10, and `ctutils` 0.4.2 → 0.4.4 using Cargo's resolver.
-- **The remaining `rustls-webpki` 0.102.8 advisory is not resolved.** It is pulled in by `libsql` → `hyper-rustls` 0.25 → `rustls` 0.22; libSQL 0.10.0 still has this dependency. Do not claim `cargo audit` clean, suppress the advisory, remove TLS, or promote releases until an upstream-compatible TLS migration is validated. See #2093.
+### October RustSec dependency remediation (validation pending) — 2026-10-25
+- **Updated Wasmtime 48.0.7, compatible Cranelift/Pulley packages, rustls-webpki 0.103.16, webpki-roots 1.0.10 and ctutils 0.4.4** with Cargo's dependency resolver.
+- **Migrated libSQL remote TLS to a custom connector based on supported rustls 0.23 and tokio-rustls 0.26.** This retains libSQL local/remote behavior, native root certificates, server-name verification and Hyper 0.14 protocol compatibility without pulling unsupported rustls-webpki 0.102.
+- **Release status:** tests of the certificate verifier, local SQLite behavior, full cargo audit and exact-head CI are mandatory before promotion. No security advisory is waived. See #2093.
 
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
