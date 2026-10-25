@@ -1,5 +1,10 @@
 name: NulangDB Storage
 
+# Superseded PR commits should not consume scarce CI runner capacity.
+concurrency:
+  group: nudb-storage-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   pull_request:
     paths:
@@ -24,7 +29,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
       - name: Format
         run: cargo fmt --all -- --check
       - name: Batch WAL contract
@@ -48,6 +55,8 @@ jobs:
           cargo test --locked --no-default-features --test tablet_wal
           cargo test --locked --no-default-features --test wal_backed_tablet
           cargo test --locked --no-default-features --test checkpoint_reclamation
+          cargo test --locked --no-default-features --test nudb_single_node_safety
+          cargo test --locked --no-default-features --test nudb_legacy_checkpoint
           cargo test --locked --no-default-features --test nudb_crash_recovery
       - name: Benchmark harness compiles
         run: cargo bench --locked --no-default-features --bench bench_main --no-run
