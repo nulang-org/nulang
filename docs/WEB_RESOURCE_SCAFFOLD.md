@@ -87,8 +87,9 @@ validated through the native `WebDevServer` real TCP integration test. This
 shows policy-denied requests cannot observe or mutate test-owned Web KV keys.
 The reference stores test records under server-derived tenant-qualified keys
 and checks positive existence markers rather than treating `nil` as empty text.
-The Web KV backend is **ephemeral**, and denied handlers currently render
-HTTP 200 with `DENIED` bodies. The regression **does not prove durable tenant
+The Web KV backend is **ephemeral**. With the new request-local
+`Web.status` effect, denied handlers use 401 for missing sessions and 403 for
+authenticated authorization failure, with no-store text responses. The regression **does not prove durable tenant
 persistence, verified external authentication, or SQL-level RLS**. Do not
 connect these example handlers to public routes before those independent
 boundaries and the strict origin/CSRF admission stack are completed.

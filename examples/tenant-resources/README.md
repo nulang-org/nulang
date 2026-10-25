@@ -75,9 +75,10 @@ concrete `Web.form` string pairs and reject missing or duplicate field names.
 **Important limits**: this Web KV is **not durable storage**, transactions, or
 SQL row-level security. Test sessions are pre-seeded by Rust, not issued by an
 OIDC/verified identity integration; the user-facing login flow is absent.
-Current experimental Web handler rendering also returns HTTP **200** for a
-policy-denied handler (its body is `DENIED`), not a production-standard
-401/403. This simple test handler looks up an `X-CSRF-Token` but is **not** a
+This stacked branch adds request-local `Web.status(code)`: missing or forged
+sessions return **401** and authenticated policy failures return **403**.
+Non-success responses use `text/plain`, `Cache-Control: no-store`, and do not
+inject the client Web runtime. Out-of-range statuses are coerced to 500. This simple test handler looks up an `X-CSRF-Token` but is **not** a
 replacement for the fail-closed Host/Origin/Fetch-Metadata and robust token
 admission integration in #2186, which is not in this standalone proof's base.
 It must not be exposed to untrusted clients or deployed as an API. Introduce

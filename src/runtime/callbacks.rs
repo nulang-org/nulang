@@ -501,6 +501,11 @@ pub(crate) fn perform_web_builtin(
             }
             Some(alloc_array(callbacks, tuples))
         }
+        Some("status") => {
+            let code = regs.first().and_then(|value| value.as_int());
+            crate::runtime::http_server::set_response_status(code);
+            Some(crate::vm::Value::unit())
+        }
         Some("set_cookie") => {
             let name = resolve(constants, *regs.first()?);
             let value = resolve(constants, *regs.get(1)?);

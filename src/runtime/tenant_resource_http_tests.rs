@@ -211,6 +211,10 @@ fn authenticated_http_read_and_mutation_enforce_tenant_and_permissions() {
         None,
         "",
     );
+    assert!(
+        ok.starts_with("HTTP/1.1 200 OK"),
+        "unexpected ok status: {ok}"
+    );
     assert!(ok.contains("Existing A"), "{ok}");
     let denied = send(
         server.port,
@@ -221,10 +225,26 @@ fn authenticated_http_read_and_mutation_enforce_tenant_and_permissions() {
         "",
     );
     assert!(
+        denied.starts_with("HTTP/1.1 403 Forbidden"),
+        "unexpected denied status: {denied}"
+    );
+    assert!(
         !denied.contains("Existing A"),
         "cross tenant data leaked: {denied}"
     );
+    assert!(
+        denied.contains("Cache-Control: no-store"),
+        "denied responses must not cache: {denied}"
+    );
+    assert!(
+        denied.contains("Content-Type: text/plain; charset=utf-8"),
+        "denied response should not be HTML: {denied}"
+    );
     let anonymous = send(server.port, "GET", "/faces/face-a", None, None, "");
+    assert!(
+        anonymous.starts_with("HTTP/1.1 401 Unauthorized"),
+        "unexpected anonymous status: {anonymous}"
+    );
     assert!(
         !anonymous.contains("Existing A"),
         "anonymous data leaked: {anonymous}"
@@ -236,6 +256,10 @@ fn authenticated_http_read_and_mutation_enforce_tenant_and_permissions() {
         Some("forged-token"),
         None,
         "",
+    );
+    assert!(
+        forged.starts_with("HTTP/1.1 401 Unauthorized"),
+        "unexpected forged status: {forged}"
     );
     assert!(
         !forged.contains("Existing A"),
@@ -250,6 +274,10 @@ fn authenticated_http_read_and_mutation_enforce_tenant_and_permissions() {
         "",
     );
     assert!(
+        viewer_read.starts_with("HTTP/1.1 200 OK"),
+        "unexpected viewer_read status: {viewer_read}"
+    );
+    assert!(
         viewer_read.contains("Existing A"),
         "read-only role cannot read: {viewer_read}"
     );
@@ -260,6 +288,10 @@ fn authenticated_http_read_and_mutation_enforce_tenant_and_permissions() {
         Some(&token_viewer),
         Some(&csrf_viewer),
         "name=Viewer%20write",
+    );
+    assert!(
+        viewer_write.starts_with("HTTP/1.1 403 Forbidden"),
+        "unexpected viewer_write status: {viewer_write}"
     );
     assert!(
         !viewer_write.contains("UPDATED"),
@@ -274,6 +306,10 @@ fn authenticated_http_read_and_mutation_enforce_tenant_and_permissions() {
         "name=Stolen",
     );
     assert!(
+        bad_write.starts_with("HTTP/1.1 403 Forbidden"),
+        "unexpected bad_write status: {bad_write}"
+    );
+    assert!(
         !bad_write.contains("UPDATED"),
         "cross-tenant write succeeded: {bad_write}"
     );
@@ -284,6 +320,10 @@ fn authenticated_http_read_and_mutation_enforce_tenant_and_permissions() {
         Some(&token_a),
         None,
         "name=Stolen",
+    );
+    assert!(
+        wrong_csrf.starts_with("HTTP/1.1 403 Forbidden"),
+        "unexpected wrong_csrf status: {wrong_csrf}"
     );
     assert!(
         !wrong_csrf.contains("UPDATED"),
@@ -353,6 +393,10 @@ fn authenticated_http_read_and_mutation_enforce_tenant_and_permissions() {
         None,
         "",
     );
+    assert!(
+        campaign_ok.starts_with("HTTP/1.1 200 OK"),
+        "unexpected campaign_ok status: {campaign_ok}"
+    );
     assert!(campaign_ok.contains("Original campaign A"), "{campaign_ok}");
     let campaign_foreign = send(
         server.port,
@@ -363,10 +407,18 @@ fn authenticated_http_read_and_mutation_enforce_tenant_and_permissions() {
         "",
     );
     assert!(
+        campaign_foreign.starts_with("HTTP/1.1 403 Forbidden"),
+        "unexpected campaign_foreign status: {campaign_foreign}"
+    );
+    assert!(
         !campaign_foreign.contains("Original campaign A"),
         "cross-tenant campaign read: {campaign_foreign}"
     );
     let campaign_missing = send(server.port, "GET", "/campaigns/campaign-a", None, None, "");
+    assert!(
+        campaign_missing.starts_with("HTTP/1.1 401 Unauthorized"),
+        "unexpected campaign_missing status: {campaign_missing}"
+    );
     assert!(
         !campaign_missing.contains("Original campaign A"),
         "anonymous campaign read: {campaign_missing}"
@@ -378,6 +430,10 @@ fn authenticated_http_read_and_mutation_enforce_tenant_and_permissions() {
         Some(&token_viewer),
         None,
         "",
+    );
+    assert!(
+        viewer_campaign_read.starts_with("HTTP/1.1 200 OK"),
+        "unexpected viewer_campaign_read status: {viewer_campaign_read}"
     );
     assert!(
         viewer_campaign_read.contains("Original campaign A"),
@@ -392,6 +448,10 @@ fn authenticated_http_read_and_mutation_enforce_tenant_and_permissions() {
         "title=Viewer%20write",
     );
     assert!(
+        viewer_campaign_write.starts_with("HTTP/1.1 403 Forbidden"),
+        "unexpected viewer_campaign_write status: {viewer_campaign_write}"
+    );
+    assert!(
         !viewer_campaign_write.contains("UPDATED"),
         "read-only role modified campaign: {viewer_campaign_write}"
     );
@@ -402,6 +462,10 @@ fn authenticated_http_read_and_mutation_enforce_tenant_and_permissions() {
         Some(&token_b),
         Some(&csrf_b),
         "title=Stolen",
+    );
+    assert!(
+        bad_campaign_write.starts_with("HTTP/1.1 403 Forbidden"),
+        "unexpected bad_campaign_write status: {bad_campaign_write}"
     );
     assert!(
         !bad_campaign_write.contains("UPDATED"),
@@ -476,4 +540,35 @@ fn authenticated_http_read_and_mutation_enforce_tenant_and_permissions() {
         kv_get("tenant-demo:campaign:tenant-a:campaign-a").as_deref(),
         Some("Campaign updated")
     );
+}
+
+#[test]
+fn explicit_response_status_is_request_scoped_and_invalid_status_fails_closed() {
+    let new_context = || super::RequestContext {
+        request: super::HttpRequest {
+            method: super::HttpMethod::Get,
+            path: "/status".to_string(),
+            headers: vec![],
+            body: vec![],
+        },
+        params: std::collections::HashMap::new(),
+    };
+
+    // Calls outside an active Web request cannot affect the next request.
+    super::set_response_status(Some(403));
+    assert_eq!(super::take_response_status(), None);
+    super::with_request_context(new_context(), || {
+        assert_eq!(super::take_response_status(), None);
+        super::set_response_status(Some(401));
+        assert_eq!(super::take_response_status(), Some(401));
+        super::set_response_status(Some(999));
+        assert_eq!(super::take_response_status(), Some(500));
+        super::set_response_status(None);
+        assert_eq!(super::take_response_status(), Some(500));
+        super::set_response_status(Some(403));
+        assert_eq!(super::take_response_status(), Some(403));
+    });
+    super::with_request_context(new_context(), || {
+        assert_eq!(super::take_response_status(), None);
+    });
 }

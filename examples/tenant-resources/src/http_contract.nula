@@ -40,10 +40,18 @@ fn can_write_face_id(id: String) -> Bool {
     can_read_face_id(id) && (role == "tenant-a:editor" || role == "tenant-b:editor")
 }
 
+// Demo-only response status. A real app needs verified server-side identity,
+// and the origin/CSRF admission layer before exposing these handlers.
+fn denied() -> String {
+    if current_tenant() == "" then { perform Web.status(401) }
+    else { perform Web.status(403) };
+    "DENIED"
+}
+
 fn read_face() -> String {
     let id = perform Web.param("id")
     if can_read_face_id(id) then { perform Web.kv_get(face_key(current_tenant(), id)) }
-    else { "DENIED" }
+    else { denied() }
 }
 
 // Web.form_value returns nil when absent, so `value != ""` is not a sound
@@ -73,7 +81,7 @@ fn write_face() -> String {
         && expected_csrf == submitted_csrf && exactly_one_nonempty_form_field("name") then {
         perform Web.kv_set(face_key(current_tenant(), id), proposed_name)
         "UPDATED"
-    } else { "DENIED" }
+    } else { denied() }
 }
 
 fn can_read_campaign_id(id: String) -> Bool {
@@ -91,7 +99,7 @@ fn can_write_campaign_id(id: String) -> Bool {
 fn read_campaign() -> String {
     let id = perform Web.param("id")
     if can_read_campaign_id(id) then { perform Web.kv_get(campaign_key(current_tenant(), id)) }
-    else { "DENIED" }
+    else { denied() }
 }
 
 fn write_campaign() -> String {
@@ -105,5 +113,5 @@ fn write_campaign() -> String {
         && expected_csrf == submitted_csrf && exactly_one_nonempty_form_field("title") then {
         perform Web.kv_set(campaign_key(current_tenant(), id), proposed_title)
         "UPDATED"
-    } else { "DENIED" }
+    } else { denied() }
 }

@@ -520,6 +520,7 @@ pub struct RequestContext {
 thread_local! {
     static CURRENT_REQUEST: RefCell<Option<RequestContext>> = const { RefCell::new(None) };
     static RESPONSE_COOKIES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static RESPONSE_STATUS: RefCell<Option<u16>> = const { RefCell::new(None) };
 }
 
 /// Set the request context for the current thread, run `f`, then clear it.
@@ -529,9 +530,28 @@ where
 {
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = Some(ctx));
     RESPONSE_COOKIES.with(|c| c.borrow_mut().clear());
+    RESPONSE_STATUS.with(|status| *status.borrow_mut() = None);
     let result = f();
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = None);
     result
+}
+
+/// Set a status only for the active Web request. Invalid status codes fail
+/// closed to 500 instead of silently sending 200 or fabricating a status line.
+/// Request-local storage must not affect other connections.
+pub fn set_response_status(code: Option<i64>) {
+    if CURRENT_REQUEST.with(|ctx| ctx.borrow().is_none()) {
+        return;
+    }
+    let status = match code {
+        Some(200..=599) => code.unwrap() as u16,
+        _ => 500,
+    };
+    RESPONSE_STATUS.with(|slot| *slot.borrow_mut() = Some(status));
+}
+
+fn take_response_status() -> Option<u16> {
+    RESPONSE_STATUS.with(|slot| slot.borrow_mut().take())
 }
 
 /// Add a `Set-Cookie` header for the current response.
@@ -1045,8 +1065,8 @@ impl WebDevServer {
                     request: request.clone(),
                     params: params.clone(),
                 };
-                let rendered =
-                    with_request_context(ctx, || match render_direct_request(route, &values) {
+                let (rendered, requested_status) = with_request_context(ctx, || {
+                    let result = match render_direct_request(route, &values) {
                         Ok(Some(rendered)) => Ok(Some(rendered)),
                         Ok(None) => Ok(render_route_handler(
                             &route.route.handler_module,
@@ -1054,13 +1074,30 @@ impl WebDevServer {
                             None,
                         )),
                         Err(error) => Err(error),
-                    });
+                    };
+                    (result, take_response_status())
+                });
                 match rendered {
-                    Ok(Some(html)) => HttpResponse {
-                        status: 200,
-                        headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())],
-                        body: inject_client_runtime_script(&html).into_bytes(),
-                    },
+                    Ok(Some(html)) => {
+                        let status = requested_status.unwrap_or(200);
+                        let error_response = status >= 400;
+                        HttpResponse {
+                            status,
+                            headers: if error_response {
+                                vec![
+                                    ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+                                    ("Cache-Control".into(), "no-store".into()),
+                                ]
+                            } else {
+                                vec![("Content-Type".into(), "text/html; charset=utf-8".into())]
+                            },
+                            body: if error_response {
+                                html.into_bytes()
+                            } else {
+                                inject_client_runtime_script(&html).into_bytes()
+                            },
+                        }
+                    }
                     Ok(None) => HttpResponse {
                         status: 500,
                         headers: vec![("Content-Type".into(), "text/plain".into())],

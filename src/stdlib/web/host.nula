@@ -101,6 +101,12 @@ pub fn kv_all() -> [(String, String)] ! {Web, Request} {
     perform Web.kv_all()
 }
 
+/// Set the HTTP response status for the active Web request. Invalid codes
+/// produce a 500 response; this does not affect other requests.
+pub fn status(code: Int) -> Unit ! {Web, Respond} {
+    perform Web.status(code)
+}
+
 /// Set a response cookie.
 pub fn set_cookie(name: String, value: String) -> Unit ! {Web, Respond} {
     perform Web.set_cookie(name, value)
