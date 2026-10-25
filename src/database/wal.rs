@@ -19,6 +19,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::tablet::{MemoryTablet, TabletDescriptor, TabletId, TabletMutation, TabletWrite};
 
@@ -140,6 +141,8 @@ impl WalRecord {
 pub struct FileWal {
     path: PathBuf,
     file: File,
+    // Stable sidecar ownership survives WAL rename and replacement.
+    writer_lock: Arc<File>,
     records: Vec<WalRecord>,
     record_end_offsets: Vec<u64>,
     base_sequence: u64,
@@ -151,15 +154,44 @@ pub struct FileWal {
 }
 
 impl FileWal {
+    /// Acquire a nonblocking, single-host exclusive writer lock before WAL
+    /// creation, replay, repair, or crash-tail truncation. Keep the sidecar
+    /// file permanently: unlinking it while locked breaks exclusion.
+    ///
+    /// This requires a trusted local filesystem and operator-controlled
+    /// directory; it does not implement distributed fencing.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WalError> {
-        let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path
+        let requested = path.as_ref();
+        let parent = requested
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent)?;
-        }
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
 
+        // Resolve relative and symlinked parent directories to one lock.
+        // Reject WAL/lockfile symlinks and hardlinks that could alias the
+        // same inode under an independently locked filename.
+        let name = requested.file_name().ok_or(WalError::AliasedWalPath)?;
+        let path = fs::canonicalize(parent)?.join(name);
+        reject_path_aliases(&path)?;
+        let lock_path = writer_lock_path(&path);
+        reject_path_aliases(&lock_path)?;
+
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        lock.try_lock().map_err(|error| match error {
+            fs::TryLockError::WouldBlock => WalError::WriterLocked,
+            fs::TryLockError::Error(error) => WalError::from(error),
+        })?;
+        Self::open_locked(path, Arc::new(lock))
+    }
+
+    fn open_locked(path: PathBuf, writer_lock: Arc<File>) -> Result<Self, WalError> {
+        // Called only while already holding the sidecar lock, also during
+        // checkpoint reclaim. Never acquire a second lock on this path.
         let file_existed = path.exists();
         let mut file = OpenOptions::new()
             .create(true)
@@ -250,6 +282,7 @@ impl FileWal {
         Ok(Self {
             path,
             file,
+            writer_lock,
             records,
             record_end_offsets,
             base_sequence,
@@ -440,7 +473,9 @@ impl FileWal {
             super::interruption::StorageInterruptionPoint::WalReclaimAfterDirectorySync,
         )?;
 
-        *self = Self::open(&self.path)?;
+        // The cloned guard remains live while the replacement is verified.
+        // No other process can acquire ownership between rename and reopen.
+        *self = Self::open_locked(self.path.clone(), Arc::clone(&self.writer_lock))?;
         Ok(())
     }
 
@@ -712,6 +747,35 @@ fn validate_record_chain(
     Ok(())
 }
 
+fn writer_lock_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Path aliases can evade sidecar locks; reject symlinks and hardlinks.
+/// Directories must be trusted: concurrent external path replacement and
+/// network-filesystem lock semantics are deliberately unsupported.
+fn reject_path_aliases(path: &Path) -> Result<(), WalError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(WalError::AliasedWalPath);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.nlink() > 1 {
+                    return Err(WalError::AliasedWalPath);
+                }
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn reclaim_temp_path(path: &Path) -> PathBuf {
     let mut temp = path.as_os_str().to_os_string();
     temp.push(".reclaim.tmp");
@@ -760,6 +824,8 @@ pub enum WalError {
         message: String,
     },
     InvalidHeader,
+    WriterLocked,
+    AliasedWalPath,
     WalHeaderChecksumMismatch,
     InvalidFrameHeader {
         offset: u64,
@@ -839,6 +905,10 @@ impl fmt::Display for WalError {
         match self {
             Self::Io { message, .. } => write!(f, "WAL I/O error: {message}"),
             Self::InvalidHeader => f.write_str("invalid NuDB WAL header"),
+            Self::WriterLocked => f.write_str("NuDB WAL already has an exclusive writer"),
+            Self::AliasedWalPath => {
+                f.write_str("NuDB WAL or lock path must not be a symlink or hardlink")
+            }
             Self::WalHeaderChecksumMismatch => f.write_str("NuDB WAL header checksum mismatch"),
             Self::InvalidFrameHeader { offset, reason } => {
                 write!(
