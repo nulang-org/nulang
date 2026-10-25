@@ -12,6 +12,7 @@ use super::marshal::Signature;
 
 /// Resolve a package-local Cargo adapter alias without allowing path traversal.
 /// The original alias remains the registry and FFI allowlist identity.
+#[cfg(any(feature = "ffi", test))]
 fn resolved_library_path(library: &str) -> Result<std::path::PathBuf, String> {
     let Some(target) = library.strip_prefix("nula-native:") else {
         return Ok(library.into());

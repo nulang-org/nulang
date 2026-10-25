@@ -248,6 +248,15 @@ crate-type = ["cdylib"]
             r#"#[no_mangle] pub extern "C" fn add_one(x: i64) -> i64 { x + 1 }"#,
         )
         .unwrap();
+        let unlocked = build_native(
+            &root,
+            &RustSection {
+                manifest: "native/Cargo.toml".into(),
+            },
+        )
+        .expect_err("Cargo bridge must not create a missing lockfile");
+        assert!(format!("{unlocked}").contains("Cargo "), "{unlocked}");
+
         let status = Command::new("cargo")
             .args(["generate-lockfile", "--offline", "--manifest-path"])
             .arg(native.join("Cargo.toml"))

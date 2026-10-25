@@ -2054,24 +2054,28 @@ fn cmd_list() -> NuResult<()> {
 /// `nula clean`: remove build artifacts (.nula/dist/ directory).
 fn cmd_clean() -> NuResult<()> {
     let root = package_root()?;
-    let native_dir = root.join(".nula").join("native");
-    if native_dir.exists() {
-        std::fs::remove_dir_all(&native_dir).map_err(|e| NuError::PackageError {
-            msg: format!("cannot remove {}: {}", native_dir.display(), e),
-            span: Span::default(),
-        })?;
+    let mut removed = false;
+    for dir in [
+        root.join(".nula").join("native"),
+        root.join(".nula").join("dist"),
+    ] {
+        if dir.exists() {
+            eprintln!("Cleaning build artifacts from {}...", dir.display());
+            std::fs::remove_dir_all(&dir).map_err(|e| NuError::PackageError {
+                msg: format!("cannot remove {}: {}", dir.display(), e),
+                span: Span::default(),
+            })?;
+            removed = true;
+        }
     }
-    let dist_dir = root.join(".nula").join("dist");
-    if dist_dir.exists() {
-        eprintln!("Cleaning build artifacts...");
-        std::fs::remove_dir_all(&dist_dir).map_err(|e| NuError::PackageError {
-            msg: format!("cannot remove {}: {}", dist_dir.display(), e),
-            span: Span::default(),
-        })?;
-        println!("Removed build artifacts.");
-    } else {
-        println!("No build artifacts found.");
-    }
+    println!(
+        "{}",
+        if removed {
+            "Removed build artifacts."
+        } else {
+            "No build artifacts found."
+        }
+    );
     Ok(())
 }
 

@@ -53,6 +53,7 @@ impl Default for WebSection {
 
 /// Cargo manifest for a native C ABI adapter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RustSection {
     pub manifest: String,
 }
