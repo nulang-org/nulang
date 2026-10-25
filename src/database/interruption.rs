@@ -14,6 +14,8 @@ pub(crate) enum StorageInterruptionPoint {
     WalAfterPayload,
     WalAfterChecksum,
     WalAfterSync,
+    WalGroupAfterFirstFrame,
+    WalGroupAfterSync,
     CheckpointAfterTempWrite,
     CheckpointAfterTempSync,
     CheckpointAfterRename,
@@ -111,6 +113,84 @@ mod tests {
             )
             .unwrap();
         tablet.commit(write).unwrap();
+    }
+
+    #[test]
+    fn grouped_writes_remain_replayable_after_pre_sync_and_post_sync_failures() {
+        use super::super::tablet::TransactionId;
+
+        for (point, recovered_sequence) in [
+            (StorageInterruptionPoint::WalGroupAfterFirstFrame, 1),
+            (StorageInterruptionPoint::WalGroupAfterSync, 3),
+        ] {
+            let path = temp_wal("group");
+            cleanup(&path);
+            let entries = vec![
+                (
+                    TransactionId::new([1; 16]),
+                    vec![TabletMutation::Put {
+                        key: b"k".to_vec(),
+                        value: b"one".to_vec(),
+                    }],
+                ),
+                (
+                    TransactionId::new([2; 16]),
+                    vec![TabletMutation::Put {
+                        key: b"k".to_vec(),
+                        value: b"two".to_vec(),
+                    }],
+                ),
+                (
+                    TransactionId::new([3; 16]),
+                    vec![TabletMutation::Put {
+                        key: b"k".to_vec(),
+                        value: b"three".to_vec(),
+                    }],
+                ),
+            ];
+
+            let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
+            let result =
+                with_interruption(point, || tablet.commit_batch_idempotent(entries.clone()));
+            assert!(result.is_err(), "{point:?} must interrupt the group");
+            assert_eq!(
+                tablet.current_sequence(),
+                0,
+                "an ambiguous group must not publish any MVCC record before acknowledgement"
+            );
+            let attempted = tablet.commit_batch_idempotent(vec![(
+                TransactionId::new([4; 16]),
+                vec![TabletMutation::Put {
+                    key: b"k".to_vec(),
+                    value: b"unsafe".to_vec(),
+                }],
+            )]);
+            assert_eq!(
+                attempted.unwrap_err(),
+                WalBackedError::Wal(WalError::Poisoned)
+            );
+            drop(tablet);
+
+            let mut reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
+            assert_eq!(
+                reopened.current_sequence(),
+                recovered_sequence,
+                "recovery must select a valid transaction prefix after {point:?}"
+            );
+            let receipts = reopened.commit_batch_idempotent(entries).unwrap();
+            assert_eq!(
+                receipts
+                    .iter()
+                    .map(|receipt| receipt.sequence())
+                    .collect::<Vec<_>>(),
+                vec![1, 2, 3],
+                "retries must reconcile the durable prefix without duplicates"
+            );
+            assert_eq!(reopened.read_latest(b"k"), Some(&b"three"[..]));
+            drop(reopened);
+            cleanup(&path);
+            let _ = fs::remove_file(appended(&path, ".lock"));
+        }
     }
 
     #[test]

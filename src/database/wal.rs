@@ -34,6 +34,8 @@ const WAL_RECORD_VERSION: u16 = 1;
 const WAL_FRAME_PREFIX_BYTES: usize = 4 + 2 + 4;
 const WAL_FRAME_HEADER_BYTES: usize = WAL_FRAME_PREFIX_BYTES + 32;
 const MAX_WAL_RECORD_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_GROUP_COMMIT_RECORDS: usize = 64;
+const MAX_GROUP_COMMIT_BYTES: usize = 8 * 1024 * 1024;
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -631,6 +633,115 @@ impl FileWal {
         Ok(())
     }
 
+    /// Append a bounded group of ordered transactions with one durability sync.
+    ///
+    /// All records are validated and serialized before touching the WAL. On a
+    /// successful sync, every record becomes visible in the local WAL index.
+    /// On I/O failure the handle stays poisoned: an intact prefix (including
+    /// possibly the whole group) may survive, so clients must reopen and
+    /// reconcile by durable transaction ID before retrying.
+    ///
+    /// A group is NOT an atomic multi-transaction unit after a crash. Each
+    /// member is individually checksummed and replayable.
+    pub fn append_batch(&mut self, writes: &[TabletWrite]) -> Result<(), WalError> {
+        if self.poisoned {
+            return Err(WalError::Poisoned);
+        }
+        if writes.is_empty() {
+            return Ok(());
+        }
+        if writes.len() > MAX_GROUP_COMMIT_RECORDS {
+            return Err(WalError::BatchTooLarge {
+                records: writes.len(),
+                bytes: 0,
+            });
+        }
+
+        let mut next_sequence = self.last_sequence();
+        let mut next_tablet = self.tablet_id;
+        let mut next_epoch = self.latest_ownership_epoch;
+        let mut staged = Vec::with_capacity(writes.len());
+        let mut batch_bytes = 0_usize;
+
+        for write in writes {
+            let record = WalRecord::from_write(write);
+            validate_record_chain(
+                &record,
+                next_tablet,
+                next_epoch,
+                next_sequence,
+                self.file.stream_position()?,
+            )?;
+
+            let payload =
+                serde_json::to_vec(&record.to_disk()).map_err(|error| WalError::Serialization {
+                    message: error.to_string(),
+                })?;
+            if payload.len() > MAX_WAL_RECORD_BYTES {
+                return Err(WalError::RecordTooLarge {
+                    offset: self.file.stream_position()?,
+                    length: payload.len(),
+                });
+            }
+            let frame_len = WAL_FRAME_HEADER_BYTES + payload.len() + 32;
+            batch_bytes = batch_bytes
+                .checked_add(frame_len)
+                .ok_or(WalError::BatchTooLarge {
+                    records: writes.len(),
+                    bytes: usize::MAX,
+                })?;
+            if batch_bytes > MAX_GROUP_COMMIT_BYTES {
+                return Err(WalError::BatchTooLarge {
+                    records: writes.len(),
+                    bytes: batch_bytes,
+                });
+            }
+            let record_offset = self.file.stream_position()?;
+            let payload_len =
+                u32::try_from(payload.len()).map_err(|_| WalError::RecordTooLarge {
+                    offset: record_offset,
+                    length: payload.len(),
+                })?;
+            let checksum = blake3::hash(&payload);
+            let mut frame = Vec::with_capacity(frame_len);
+            frame.extend_from_slice(&encode_frame_header(payload_len));
+            frame.extend_from_slice(&payload);
+            frame.extend_from_slice(checksum.as_bytes());
+
+            next_sequence = record.sequence;
+            next_tablet = Some(record.tablet_id);
+            next_epoch = Some(record.ownership_epoch);
+            staged.push((record, frame));
+        }
+
+        // From the first possible file mutation onward, any error requires
+        // closing/reopening this writer and reconciling transaction receipts.
+        self.file.seek(SeekFrom::End(0))?;
+        self.poisoned = true;
+        let mut offsets = Vec::with_capacity(staged.len());
+        for (_, frame) in &staged {
+            self.file.write_all(frame)?;
+            offsets.push(self.file.stream_position()?);
+            #[cfg(test)]
+            if offsets.len() == 1 {
+                super::interruption::hit(
+                    super::interruption::StorageInterruptionPoint::WalGroupAfterFirstFrame,
+                )?;
+            }
+        }
+        self.file.sync_data()?;
+        #[cfg(test)]
+        super::interruption::hit(super::interruption::StorageInterruptionPoint::WalGroupAfterSync)?;
+
+        self.records
+            .extend(staged.into_iter().map(|(record, _)| record));
+        self.record_end_offsets.extend(offsets);
+        self.tablet_id = next_tablet;
+        self.latest_ownership_epoch = next_epoch;
+        self.poisoned = false;
+        Ok(())
+    }
+
     #[cfg(test)]
     fn set_append_failpoint_for_test(&mut self, point: AppendFailPoint) {
         self.append_failpoint = Some(point);
@@ -858,6 +969,10 @@ pub enum WalError {
         offset: u64,
         length: usize,
     },
+    BatchTooLarge {
+        records: usize,
+        bytes: usize,
+    },
     ChecksumMismatch {
         offset: u64,
     },
@@ -945,6 +1060,10 @@ impl fmt::Display for WalError {
             Self::RecordTooLarge { offset, length } => write!(
                 f,
                 "WAL record at byte offset {offset} is too large ({length} bytes)"
+            ),
+            Self::BatchTooLarge { records, bytes } => write!(
+                f,
+                "WAL group commit exceeds bounded limit ({records} records, {bytes} bytes)"
             ),
             Self::ChecksumMismatch { offset } => {
                 write!(f, "WAL checksum mismatch at byte offset {offset}")
