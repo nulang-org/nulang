@@ -60,6 +60,9 @@ fn checkpoint_reclaims_wal_prefix_and_restart_restores_mvcc_history() {
         tablet.checkpoint().unwrap();
 
         assert_eq!(tablet.current_sequence(), 3);
+        // An inspector opening a writable WAL handle must wait until the
+        // checkpointing writer has released its exclusive sidecar lock.
+        drop(tablet);
         let wal = FileWal::open(&wal_path).unwrap();
         assert_eq!(wal.base_sequence(), 3);
         assert!(wal.records().is_empty());

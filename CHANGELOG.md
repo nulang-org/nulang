@@ -1,4 +1,9 @@
 # Nulang Changelog
+### NuDB single-node WAL ownership and duplicate-key recovery — 2026-10-25
+- **NuDB now rejects competing writable WAL handles before file initialization or recovery**, using an exclusive persistent sidecar lock that remains held across checkpoint/WAL replacement. Path aliases are rejected; this is single-host local-filesystem safety, not a distributed lease.
+- **A transaction with repeated mutations to the same key records one MVCC version per committed sequence**, preserving last-write-wins behavior through checkpoint publication and restart.
+- **Dedicated red-to-green regressions and deterministic recovery-model tests** cover duplicate keys, writer contention across processes, owner termination, alias paths, crash interruption, and checkpoint replay. Older checkpoints already written with duplicate-sequence histories still require a separate compatibility/migration policy.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
