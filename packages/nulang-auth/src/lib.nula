@@ -16,6 +16,18 @@ fn session_key(token: String) -> String {
     "nulang_auth:session:" + token
 }
 
+fn csrf_key(token: String) -> String {
+    "nulang_auth:csrf:" + token
+}
+
+/// Return the synchronizer token to render as a hidden _csrf form field or
+/// send as X-CSRF-Token. It is intentionally not exposed in a cookie.
+pub fn csrf_token() -> String ! {Web, Request, String} {
+    let token = cookie("nulang_session")
+    if token == "" then { "" }
+    else { kv_get(csrf_key(token)) }
+}
+
 fn next_token() -> String ! {Web, Request} {
     // Never derive authentication tokens from predictable counters.
     // An unavailable OS CSPRNG returns "" and login must fail closed.
@@ -48,8 +60,10 @@ pub fn require(with_user) -> Html ! {Web, Request, String, Respond} {
 /// Start a development session with an unguessable token.\n/// The web KV store is ephemeral: do not use this package in production yet.
 pub fn login(user: User) -> Unit ! {Web, Request, String, Int, Respond} {
     let token = next_token()
-    if token != "" then {
+    let csrf = next_token()
+    if token != "" && csrf != "" then {
         kv_set(session_key(token), user)
+        kv_set(csrf_key(token), csrf)
         set_cookie("nulang_session", token)
     } else {
         // Authentication must not succeed when secure randomness is unavailable.
@@ -61,6 +75,7 @@ pub fn logout() -> Unit ! {Web, Request, String, Respond} {
     let token = cookie("nulang_session")
     if token != "" then {
         kv_delete(session_key(token))
+        kv_delete(csrf_key(token))
     } else {}
     clear_cookie("nulang_session")
 }
