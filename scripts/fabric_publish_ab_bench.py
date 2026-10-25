@@ -40,6 +40,15 @@ EXACT_COUNTS = (0, 256, 2048)
 EXACT_BENCHMARK_GROUP = "actor/fabric_publish_unmatched_exact_subscriptions"
 
 
+def select_mode(base: str, candidate: str) -> str | None:
+    """Run paired A/B only when a recognized benchmark fixture was added."""
+    if EXACT_START in candidate and EXACT_START not in base:
+        return "exact"
+    if START in candidate and START not in base:
+        return "idle"
+    return None
+
+
 def matched_fixture(base: str, candidate: str, mode: str = "idle") -> str:
     """Reject every benchmark difference except the selected fixture."""
     if mode == "idle":
