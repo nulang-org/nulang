@@ -75,15 +75,18 @@ pub fn run(args: &[String]) -> NuResult<()> {
             }
             cmd_new(path_arg, template)
         }
-        Some("generate") => {
-            if args.len() != 3 || args.get(1).map(String::as_str) != Some("resource") {
-                return Err(NuError::PackageError {
-                    msg: "usage: nula generate resource <PascalCaseName>".into(),
-                    span: Span::default(),
-                });
+        Some("generate") => match args.get(1).map(String::as_str) {
+            Some("resource") if args.len() == 3 => {
+                crate::package::resource::generate_resource(&package_root()?, &args[2])
             }
-            crate::package::resource::generate_resource(&package_root()?, &args[2])
-        }
+            Some("model") => {
+                crate::package::model_generator::run(&args[1..], &package_root()?).map(|_| ())
+            }
+            _ => Err(NuError::PackageError {
+                msg: "usage: nula generate resource <PascalCaseName> OR nula generate model <PascalCaseName> --field name:Type [--field ...]".into(),
+                span: Span::default(),
+            }),
+        },
         Some("init") => cmd_init(),
         Some("build") => {
             let web = args.get(1).map(String::as_str) == Some("--web");
@@ -299,6 +302,7 @@ fn print_usage() {
     println!(
         "  generate resource <PascalCaseName>  Add GET-only resource routes to a web template"
     );
+    println!("  generate model <PascalCaseName> --field name:Type [...]  Create typed model and deny-all policy hooks");
     println!("  init          Scaffold a new package in the current directory");
     println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
     println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
@@ -2630,6 +2634,76 @@ fn cmd_remove(name: Option<&str>) -> NuResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_generate_model_and_resource_keep_independent_outputs() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_resource_model_and_routes_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        scaffold_package(&dir, "resource-app", "web").unwrap();
+        let _guard = ChangeDir::new(&dir);
+
+        let model_args: Vec<String> = [
+            "generate",
+            "model",
+            "BlogPost",
+            "--field",
+            "title:String",
+            "--field",
+            "published:Bool",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        run(&model_args).expect("typed-model generator should coexist with read-only routes");
+        let model_path = dir.join("src/resources/blog_post.nula");
+        let model = std::fs::read_to_string(&model_path).unwrap();
+        assert!(model.contains("pub type BlogPost = {"));
+        assert!(model.contains("pub type BlogPostInput = {"));
+        assert!(model.contains("can_read_blog_post"));
+        assert!(model.contains("-> Bool { false }"));
+
+        let resource_args: Vec<String> = ["generate", "resource", "BlogPost"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        run(&resource_args).expect("GET-only routes should remain independently available");
+        let routes = std::fs::read_to_string(dir.join("src/main.nula")).unwrap();
+        assert!(routes.contains(r#"route "GET" "/blog_posts" -> blog_posts_index"#));
+        assert_eq!(std::fs::read_to_string(&model_path).unwrap(), model);
+
+        assert!(
+            run(&model_args).is_err(),
+            "never overwrite an existing model"
+        );
+        assert!(
+            run(&resource_args).is_err(),
+            "never duplicate existing routes"
+        );
+        assert_eq!(std::fs::read_to_string(&model_path).unwrap(), model);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/main.nula")).unwrap(),
+            routes
+        );
+
+        let invalid: Vec<String> = [
+            "generate",
+            "model",
+            "BlogPost",
+            "--field",
+            "tenant_id:String",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert!(
+            run(&invalid).is_err(),
+            "reserved tenant_id must be rejected"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_generate_web_resource_adds_compiler_visible_routes() {
