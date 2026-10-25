@@ -501,6 +501,10 @@ pub(crate) fn perform_web_builtin(
             }
             Some(alloc_array(callbacks, tuples))
         }
+        Some("secure_token") => {
+            let token = crate::runtime::http_server::secure_session_token().unwrap_or_default();
+            Some(callbacks.alloc_string(&token))
+        }
         Some("set_cookie") => {
             let name = resolve(constants, *regs.first()?);
             let value = resolve(constants, *regs.get(1)?);
