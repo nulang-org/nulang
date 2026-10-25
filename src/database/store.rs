@@ -13,9 +13,10 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use super::changefeed::{self, ChangefeedError};
 use super::checkpoint::{self, CheckpointError};
 use super::tablet::{MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite};
-use super::wal::{FileWal, WalError};
+use super::wal::{FileWal, WalError, WalRecord};
 
 #[derive(Debug)]
 pub struct WalBackedTablet {
@@ -76,6 +77,18 @@ impl WalBackedTablet {
 
     pub fn read_latest(&self, key: &[u8]) -> Option<&[u8]> {
         self.tablet.read_latest(key)
+    }
+
+    /// Read whole committed transactions after a retained WAL sequence.
+    ///
+    /// This is a local, read-only feed and not a durable subscription. The
+    /// caller must handle `HistoryPruned` after checkpoint reclamation;
+    /// it must not silently treat missing transactions as an empty feed.
+    pub fn committed_after(
+        &self,
+        after_sequence: u64,
+    ) -> Result<&[WalRecord], ChangefeedError> {
+        changefeed::committed_after(&self.wal, after_sequence)
     }
 
     /// Atomically publish a checkpoint without reclaiming the WAL.
