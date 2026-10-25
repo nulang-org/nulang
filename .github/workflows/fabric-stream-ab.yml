@@ -1,0 +1,61 @@
+name: Fabric stream tail-read exact-base A/B
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/fabric-stream-ab.yml'
+      - 'scripts/fabric_stream_ab_bench.py'
+      - 'scripts/tests/test_fabric_stream_ab_bench.py'
+      - 'benches/persist_bench.rs'
+      - 'src/runtime/fabric_stream.rs'
+
+concurrency:
+  group: fabric-stream-ab-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  paired:
+    name: Matched-fixture stream tail read A/B
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate benchmark harness
+        run: python3 -m unittest discover -s scripts/tests -p test_fabric_stream_ab_bench.py -v
+
+      - name: Paired exact-base Criterion comparison
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python3 scripts/fabric_stream_ab_bench.py \
+            --base-ref "$BASE_SHA" --runs 8 --warmup 1 \
+            --output fabric-stream-ab.json
+
+      - name: Publish measurements with provenance
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          report = json.loads(Path("fabric-stream-ab.json").read_text())
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("## Exact-base Fabric stream tail-read A/B\n\n")
+              f.write(f"Base: `{report['base_sha']}` · Candidate: `{report['candidate_sha']}`\n\n")
+              f.write(f"Fixture SHA256: `{report['fixture_sha256']}` · Pinned CPU: {report['cpu']}\n\n")
+              f.write("| Retained segments | Base ns | Candidate ns | Paired median speedup |\n")
+              f.write("| ---: | ---: | ---: | ---: |\n")
+              for count, row in report["comparison"].items():
+                  f.write(
+                      f"| {count} | {row['median_base_ns']:.1f} | "
+                      f"{row['median_candidate_ns']:.1f} | "
+                      f"{row['median_speedup_x']:.3f}x |\n"
+                  )
+              f.write("\nWarm tail reads only; no end-to-end consumer p99 or replica throughput claim.\n")
+          PY
