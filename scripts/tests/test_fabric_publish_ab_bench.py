@@ -70,6 +70,15 @@ class FixtureContractTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "exactly one"):
             mod.matched_fixture(base, base, mode="exact")
 
+    def test_fixture_mode_selection_uses_newly_added_fixture_only(self):
+        older_base, first_candidate = fixture_sources()
+        base, exact_candidate = exact_fixture_sources()
+        self.assertEqual(mod.select_mode(older_base, first_candidate), "idle")
+        self.assertEqual(mod.select_mode(base, exact_candidate), "exact")
+        self.assertIsNone(mod.select_mode(base, base))
+        self.assertIsNone(mod.select_mode(exact_candidate, exact_candidate))
+
+
 
 class ResultContractTests(unittest.TestCase):
     def test_results_require_all_actor_counts(self):
