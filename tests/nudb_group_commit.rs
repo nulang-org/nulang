@@ -147,3 +147,31 @@ fn malformed_batch_sequence_is_rejected_before_wal_mutation() {
     let wal = FileWal::open(&fixture.path).unwrap();
     assert_eq!(wal.last_sequence(), 0);
 }
+
+#[test]
+fn oversized_record_count_is_rejected_without_advancing_the_wal() {
+    let fixture = TestWal::new();
+    let mut wal = FileWal::open(&fixture.path).unwrap();
+    let writes: Vec<TabletWrite> = (0..65)
+        .map(|sequence| {
+            TabletWrite::prepare(
+                &descriptor(),
+                EPOCH,
+                sequence,
+                sequence,
+                vec![put(b"k", b"small")],
+            )
+            .unwrap()
+        })
+        .collect();
+
+    assert_eq!(
+        wal.append_batch(&writes).unwrap_err(),
+        nulang::database::wal::WalError::BatchTooLarge {
+            records: 65,
+            bytes: 0,
+        }
+    );
+    assert_eq!(wal.last_sequence(), 0);
+    assert!(wal.records().is_empty());
+}
