@@ -27,3 +27,12 @@ Both are visible to the compiler-owned Web Contract IR and work with the current
 - Security-sensitive mutation endpoints must separately validate input, authorize access, and commit with appropriate transaction/outbox guarantees.
 
 This is the first additive step toward model-backed typed scaffolding. Future generators should consume the existing validated compiler contracts rather than inventing parallel runtime metadata.
+
+## Source-checkout stdlib path workaround
+
+On current main, a Nulang binary built from source may fail to resolve standard-library imports during Web Contract IR extraction when run from a generated app outside the compiler checkout. Until issue #2171 is fixed, set NULANG_STDLIB to the absolute path of the compiler checkout's src/stdlib directory before running the web build:
+
+    export NULANG_STDLIB=/absolute/path/to/nulang/src/stdlib
+    nulang nula build --web
+
+This issue also reproduces on an unmodified web starter and is not introduced by the generator.
