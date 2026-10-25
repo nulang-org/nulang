@@ -215,7 +215,98 @@ pub struct FileWal {
     append_failpoint: Option<AppendFailPoint>,
 }
 
+/// Metadata-only result of a non-mutating sequential WAL audit.
+/// Values, mutation contents, and authentication material are never returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalReadOnlyReport {
+    pub base_sequence: u64,
+    pub last_sequence: u64,
+    pub record_count: u64,
+    pub tablet_id: Option<TabletId>,
+    pub last_ownership_epoch: Option<u64>,
+    pub bytes_checked: u64,
+}
+
 impl FileWal {
+    /// Verify the complete on-disk NUDBWAL3 chain without modifying the file.
+    ///
+    /// Unlike `open`, this never creates a WAL/lockfile, acquires a writer
+    /// lock, truncates torn crash tails, or changes the source bytes.
+    /// Run on an immutable copy or a quiescent WAL: a concurrent writer can
+    /// otherwise expose a transient, incomplete frame to this diagnostic.
+    /// Memory use is bounded by a single maximum-sized WAL payload.
+    ///
+    /// This audits WAL structure and transaction digests, not checkpoints,
+    /// disk snapshots, application-level invariants, or external effects.
+    pub fn verify_read_only(path: impl AsRef<Path>) -> Result<WalReadOnlyReport, WalError> {
+        let path = path.as_ref();
+        reject_path_aliases(path)?;
+        let mut file = File::open(path)?;
+
+        let mut wal_header = [0_u8; WAL_HEADER_BYTES];
+        if read_up_to(&mut file, &mut wal_header)? != wal_header.len() {
+            return Err(WalError::InvalidHeader);
+        }
+        let (base_sequence, mut tablet_id, mut latest_ownership_epoch) =
+            decode_wal_header(&wal_header)?;
+
+        let mut last_sequence = base_sequence;
+        let mut record_count = 0_u64;
+
+        loop {
+            let offset = file.stream_position()?;
+            let mut frame_header = [0_u8; WAL_FRAME_HEADER_BYTES];
+            let read = read_up_to(&mut file, &mut frame_header)?;
+            if read == 0 {
+                break;
+            }
+            if read != frame_header.len() {
+                return Err(WalError::IncompleteFrame { offset });
+            }
+            let payload_len = decode_frame_header(&frame_header, offset)?;
+            let mut payload = vec![0_u8; payload_len];
+            if read_up_to(&mut file, &mut payload)? != payload_len {
+                return Err(WalError::IncompleteFrame { offset });
+            }
+
+            let mut checksum = [0_u8; 32];
+            if read_up_to(&mut file, &mut checksum)? != checksum.len() {
+                return Err(WalError::IncompleteFrame { offset });
+            }
+            if checksum != *blake3::hash(&payload).as_bytes() {
+                return Err(WalError::ChecksumMismatch { offset });
+            }
+
+            let disk: DiskWalRecord =
+                serde_json::from_slice(&payload).map_err(|error| WalError::InvalidRecord {
+                    offset,
+                    reason: error.to_string(),
+                })?;
+            let record = WalRecord::from_disk(disk, offset)?;
+            validate_record_chain(
+                &record,
+                tablet_id,
+                latest_ownership_epoch,
+                last_sequence,
+                offset,
+            )?;
+            tablet_id = Some(record.tablet_id);
+            latest_ownership_epoch = Some(record.ownership_epoch);
+            last_sequence = record.sequence;
+            record_count = record_count
+                .checked_add(1)
+                .ok_or(WalError::SequenceOverflow)?;
+        }
+        Ok(WalReadOnlyReport {
+            base_sequence,
+            last_sequence,
+            record_count,
+            tablet_id,
+            last_ownership_epoch: latest_ownership_epoch,
+            bytes_checked: file.stream_position()?,
+        })
+    }
+
     /// Acquire a nonblocking, single-host exclusive writer lock before WAL
     /// creation, replay, repair, or crash-tail truncation. Keep the sidecar
     /// file permanently: unlinking it while locked breaks exclusion.
@@ -999,6 +1090,10 @@ pub enum WalError {
     WriterLocked,
     AliasedWalPath,
     WalHeaderChecksumMismatch,
+    /// Read-only audit detected a torn frame and deliberately did not repair it.
+    IncompleteFrame {
+        offset: u64,
+    },
     InvalidFrameHeader {
         offset: u64,
         reason: String,
@@ -1084,6 +1179,10 @@ impl fmt::Display for WalError {
                 f.write_str("NuDB WAL or lock path must not be a symlink or hardlink")
             }
             Self::WalHeaderChecksumMismatch => f.write_str("NuDB WAL header checksum mismatch"),
+            Self::IncompleteFrame { offset } => write!(
+                f,
+                "incomplete WAL frame at byte offset {offset}; read-only audit did not truncate"
+            ),
             Self::InvalidFrameHeader { offset, reason } => {
                 write!(
                     f,
