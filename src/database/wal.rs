@@ -20,7 +20,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use super::tablet::{MemoryTablet, TabletDescriptor, TabletId, TabletMutation, TabletWrite};
+use super::tablet::{
+    transaction_digest, MemoryTablet, TabletDescriptor, TabletId, TabletMutation, TabletWrite,
+    TransactionIdentity,
+};
 
 const WAL_MAGIC: &[u8; 8] = b"NUDBWAL3";
 const WAL_HEADER_PREFIX_BYTES: usize = 8 + 8 + 8 + 8;
@@ -49,6 +52,9 @@ struct DiskWalRecord {
     sequence: u64,
     expected_previous_sequence: u64,
     mutations: Vec<TabletMutation>,
+    // Optional in version-1 WAL records for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity: Option<TransactionIdentity>,
 }
 
 /// One validated record recovered from or appended to a tablet WAL.
@@ -59,6 +65,7 @@ pub struct WalRecord {
     sequence: u64,
     expected_previous_sequence: u64,
     mutations: Vec<TabletMutation>,
+    identity: Option<TransactionIdentity>,
 }
 
 impl WalRecord {
@@ -69,6 +76,7 @@ impl WalRecord {
             sequence: write.sequence(),
             expected_previous_sequence: write.expected_previous_sequence(),
             mutations: write.mutations().to_vec(),
+            identity: write.identity(),
         }
     }
 
@@ -90,12 +98,22 @@ impl WalRecord {
             });
         }
 
+        if let Some(identity) = disk.identity {
+            if transaction_digest(&disk.mutations) != identity.digest {
+                return Err(WalError::InvalidRecord {
+                    offset,
+                    reason: "transaction digest does not match WAL mutations".to_string(),
+                });
+            }
+        }
+
         Ok(Self {
             tablet_id,
             ownership_epoch: disk.ownership_epoch,
             sequence: disk.sequence,
             expected_previous_sequence: disk.expected_previous_sequence,
             mutations: disk.mutations,
+            identity: disk.identity,
         })
     }
 
@@ -107,6 +125,7 @@ impl WalRecord {
             sequence: self.sequence,
             expected_previous_sequence: self.expected_previous_sequence,
             mutations: self.mutations.clone(),
+            identity: self.identity,
         }
     }
 
@@ -128,6 +147,10 @@ impl WalRecord {
 
     pub fn mutations(&self) -> &[TabletMutation] {
         &self.mutations
+    }
+
+    pub(crate) fn identity(&self) -> Option<TransactionIdentity> {
+        self.identity
     }
 }
 
@@ -321,10 +344,11 @@ impl FileWal {
         let mut tablet = MemoryTablet::new(descriptor);
         for record in &self.records {
             tablet
-                .replay_committed(
+                .replay_committed_with_identity(
                     record.sequence,
                     record.expected_previous_sequence,
                     record.mutations.clone(),
+                    record.identity(),
                 )
                 .map_err(|error| WalError::ReplayRejected {
                     sequence: record.sequence,
@@ -372,10 +396,11 @@ impl FileWal {
             .filter(|record| record.sequence > checkpoint_sequence)
         {
             tablet
-                .replay_committed(
+                .replay_committed_with_identity(
                     record.sequence,
                     record.expected_previous_sequence,
                     record.mutations.clone(),
+                    record.identity(),
                 )
                 .map_err(|error| WalError::ReplayRejected {
                     sequence: record.sequence,
