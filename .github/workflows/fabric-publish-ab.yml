@@ -50,7 +50,7 @@ jobs:
           if mode is not None:
               matched_fixture(base, candidate, mode=mode)
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write(f"mode={mode or 'skip'}\\n")
+              output.write(f"mode={mode or 'skip'}\n")
           print(f"Fabric A/B mode: {mode or 'skip'}")
           PY
 
