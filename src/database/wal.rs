@@ -697,10 +697,11 @@ impl FileWal {
                 });
             }
             let record_offset = self.file.stream_position()?;
-            let payload_len = u32::try_from(payload.len()).map_err(|_| WalError::RecordTooLarge {
-                offset: record_offset,
-                length: payload.len(),
-            })?;
+            let payload_len =
+                u32::try_from(payload.len()).map_err(|_| WalError::RecordTooLarge {
+                    offset: record_offset,
+                    length: payload.len(),
+                })?;
             let checksum = blake3::hash(&payload);
             let mut frame = Vec::with_capacity(frame_len);
             frame.extend_from_slice(&encode_frame_header(payload_len));
