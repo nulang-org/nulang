@@ -69,7 +69,28 @@ pub fn generate_resource(root: &Path, name: &str) -> NuResult<()> {
             "resource scaffolding requires a web package ([web] in Nulang.toml)",
         ));
     }
-    let main = root.join("src/main.nula");
+    // Never rewrite a file reached through a symlinked source directory or
+    // entrypoint. On Unix this would otherwise replace data outside the
+    // intended package root; a symlinked entrypoint would be silently replaced.
+    // This does not protect against concurrent hostile filesystem mutation.
+    let source_dir = root.join("src");
+    if fs::symlink_metadata(&source_dir)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(invalid(
+            "resource scaffolding refuses a symlinked src/ directory",
+        ));
+    }
+    let main = source_dir.join("main.nula");
+    if fs::symlink_metadata(&main)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(invalid(
+            "resource scaffolding refuses a symlinked src/main.nula",
+        ));
+    }
     let source = fs::read_to_string(&main)
         .map_err(|e| invalid(format!("cannot read {}: {}", main.display(), e)))?;
     for marker in [HANDLERS_START, HANDLERS_END, ROUTES_START, ROUTES_END] {
