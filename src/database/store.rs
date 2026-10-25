@@ -97,9 +97,10 @@ impl WalBackedTablet {
         let write = write.with_identity(TransactionIdentity { id, digest });
         let sequence = self.commit(write)?;
         // This lookup is infallible after a successful durable commit.
-        let receipt = self.tablet.transaction_receipt(id).expect(
-            "committed transaction identity must be recorded atomically",
-        );
+        let receipt = self
+            .tablet
+            .transaction_receipt(id)
+            .expect("committed transaction identity must be recorded atomically");
         debug_assert_eq!(receipt.sequence(), sequence);
         Ok(receipt)
     }
@@ -173,7 +174,7 @@ impl fmt::Display for WalBackedError {
             Self::Checkpoint(error) => write!(f, "tablet checkpoint failure: {error}"),
             Self::IdempotencyConflict(id) => {
                 write!(f, "transaction ID {id:?} reused with different mutations")
-            },
+            }
         }
     }
 }

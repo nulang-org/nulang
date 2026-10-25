@@ -189,8 +189,9 @@ pub(crate) fn transaction_digest(mutations: &[TabletMutation]) -> [u8; 32] {
 
 /// Caller-provided, stable transaction identifier within a single tablet.
 /// Generate a distinct ID for each logical transaction, and reuse it on retry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct TransactionId([u8; 16]);
 
 impl TransactionId {
@@ -536,7 +537,8 @@ impl MemoryTablet {
         let sequence = write.sequence;
         self.apply_mutations(sequence, write.mutations);
         if let Some(identity) = write.identity {
-            self.receipts.insert(identity.id, identity.receipt(sequence));
+            self.receipts
+                .insert(identity.id, identity.receipt(sequence));
         }
         sequence
     }
@@ -583,7 +585,8 @@ impl MemoryTablet {
 
         self.apply_mutations(sequence, mutations);
         if let Some(identity) = identity {
-            self.receipts.insert(identity.id, identity.receipt(sequence));
+            self.receipts
+                .insert(identity.id, identity.receipt(sequence));
         }
         Ok(())
     }
