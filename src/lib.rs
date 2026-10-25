@@ -7,6 +7,40 @@
 // replacing those values with mathematical constants would change test semantics.
 #![cfg_attr(test, allow(clippy::approx_constant))]
 
+// Keep the hosted bytecode runner incapable of compiling host-integrating
+// subsystems. Cloud must select --no-default-features --features untrusted-runner.
+#[cfg(all(
+    feature = "untrusted-runner",
+    any(
+        feature = "ffi",
+        feature = "tcp",
+        feature = "ureq",
+        feature = "python",
+        feature = "native-codegen",
+        feature = "ai-runtime",
+        feature = "http-client",
+        feature = "sqlite",
+        feature = "rocksdb",
+        feature = "postgres",
+        feature = "cache-server",
+        feature = "lsp",
+        feature = "otel",
+        // Explicitly fence every public Cargo feature, including features
+        // that currently imply a forbidden one. A new feature must be
+        // classified here before the hosted-runner profile can ship.
+        feature = "default",
+        feature = "full",
+        feature = "release-cli",
+        feature = "wasm-backend",
+        feature = "wasmfx-backend",
+        feature = "difffuzz",
+        feature = "mobile-runtime",
+        feature = "savina-bench",
+        feature = "tls"
+    )
+))]
+compile_error!("untrusted-runner forbids host-integrating features; use --no-default-features --features untrusted-runner");
+
 mod actor_protocol;
 pub mod agent;
 #[cfg(feature = "native-codegen")]

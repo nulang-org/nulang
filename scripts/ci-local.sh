@@ -53,8 +53,8 @@ run cargo clippy --locked --all-targets --no-default-features -- -D clippy::corr
 # WASM/all-features paths catch backend-specific semantic drift.
 run cargo build --locked --all-targets --features wasm-backend
 run cargo test --locked --features wasm-backend
-run cargo clippy --locked --all-targets --all-features -- -D clippy::correctness
-run cargo check --locked --all-features
+run cargo clippy --locked --all-targets --no-default-features --features "$(python3 scripts/ci/compatible-cargo-features.py)" -- -D clippy::correctness
+run cargo check --locked --no-default-features --features "$(python3 scripts/ci/compatible-cargo-features.py)"
 
 if [[ "$FULL" -eq 1 ]]; then
   run cargo build --locked --release
