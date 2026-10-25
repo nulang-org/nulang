@@ -1977,6 +1977,8 @@ mod tests {
         let payload_offset = SEGMENT_HEADER_LEN + RECORD_HEADER_LEN;
         bytes[payload_offset] ^= 0xFF;
         fs::write(path, bytes).unwrap();
+        // Recovery is a new ownership epoch, not a concurrent second writer.
+        drop(store);
 
         let mut reopened = FileFabricStreamStore::open(&root).unwrap();
         let error = reopened
