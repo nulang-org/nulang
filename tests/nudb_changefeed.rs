@@ -60,9 +60,7 @@ fn put(key: &[u8], value: &[u8]) -> TabletMutation {
 
 fn commit(tablet: &mut WalBackedTablet, mutations: Vec<TabletMutation>) -> u64 {
     let previous = tablet.current_sequence();
-    let write = tablet
-        .prepare_write(EPOCH, previous, mutations)
-        .unwrap();
+    let write = tablet.prepare_write(EPOCH, previous, mutations).unwrap();
     tablet.commit(write).unwrap()
 }
 
@@ -83,7 +81,10 @@ fn feed_exposes_only_complete_committed_transactions_and_preserves_mutation_orde
         put(b"m", b"other"),
     ];
     assert_eq!(commit(&mut tablet, batch.clone()), 1);
-    assert!(tablet.commit(rejected).is_err(), "stale write must be rejected");
+    assert!(
+        tablet.commit(rejected).is_err(),
+        "stale write must be rejected"
+    );
     assert_eq!(commit(&mut tablet, vec![put(b"n", b"second")]), 2);
 
     let changes = tablet.committed_after(0).unwrap();
@@ -96,7 +97,12 @@ fn feed_exposes_only_complete_committed_transactions_and_preserves_mutation_orde
     assert_eq!(changes[1].mutations(), &[put(b"n", b"second")]);
 
     assert_eq!(
-        tablet.committed_after(1).unwrap().iter().map(|record| record.sequence()).collect::<Vec<_>>(),
+        tablet
+            .committed_after(1)
+            .unwrap()
+            .iter()
+            .map(|record| record.sequence())
+            .collect::<Vec<_>>(),
         vec![2]
     );
     assert!(tablet.committed_after(2).unwrap().is_empty());
@@ -115,7 +121,12 @@ fn checkpoint_publication_preserves_feed_but_reclamation_expires_old_cursors() {
 
     let mut tablet = fixture.open();
     assert_eq!(
-        tablet.committed_after(0).unwrap().iter().map(|record| record.sequence()).collect::<Vec<_>>(),
+        tablet
+            .committed_after(0)
+            .unwrap()
+            .iter()
+            .map(|record| record.sequence())
+            .collect::<Vec<_>>(),
         vec![1, 2],
         "reopen must reconstruct committed feed from durable WAL"
     );
@@ -144,7 +155,12 @@ fn checkpoint_publication_preserves_feed_but_reclamation_expires_old_cursors() {
         }
     );
     assert_eq!(
-        tablet.committed_after(2).unwrap().iter().map(|record| record.sequence()).collect::<Vec<_>>(),
+        tablet
+            .committed_after(2)
+            .unwrap()
+            .iter()
+            .map(|record| record.sequence())
+            .collect::<Vec<_>>(),
         vec![3]
     );
 }
