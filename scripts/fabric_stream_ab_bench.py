@@ -41,6 +41,18 @@ CANDIDATE_GROUP_TAIL = (
 )
 
 
+def select_fixture_mode(base: str, candidate: str) -> str | None:
+    """Only benchmark when this PR adds the stream tail-read fixture.
+
+    Source-only PRs after the fixture has landed on main should not be
+    rejected for lacking a *new* benchmark. The A/B runner still fails
+    closed on any unrelated changes in a newly introduced fixture.
+    """
+    if FIXTURE_START in candidate and FIXTURE_START not in base:
+        return "new"
+    return None
+
+
 def matched_fixture(base: str, candidate: str) -> str:
     """Reject every unrelated benchmark change before overlaying the fixture."""
     if (
