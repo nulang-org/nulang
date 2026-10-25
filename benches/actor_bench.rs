@@ -296,6 +296,40 @@ fn bench_fabric_publish_unmatched(c: &mut Criterion) {
     group.finish();
 }
 
+/// Unmatched publication with many unrelated exact-subject subscriptions.
+///
+/// This measures the former O(subscription-count) scan rather than delivery.
+/// Subscription insertion and actor construction are outside the timed section.
+fn bench_fabric_publish_unmatched_exact_subscriptions(c: &mut Criterion) {
+    let mut group = c.benchmark_group("actor/fabric_publish_unmatched_exact_subscriptions");
+    for subscription_count in [0usize, 256, 2_048] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(subscription_count),
+            &subscription_count,
+            |b, &count| {
+                let (mut rt, actor_id) = runtime_with_consumer();
+                for index in 0..count {
+                    rt.fabric_subscribe(&format!("noise.{index}"), actor_id, "handle")
+                        .expect("subscribe exact Fabric subject");
+                }
+                assert_eq!(rt.fabric_subscription_count(), count);
+                let initial = rt
+                    .fabric_publish_report("bench.unmatched", &[])
+                    .expect("benchmark publication");
+                assert_eq!(initial.selected, 0);
+
+                b.iter(|| {
+                    black_box(
+                        rt.fabric_publish_report(black_box("bench.unmatched"), &[])
+                            .expect("unmatched publication"),
+                    );
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_spawn_idle_batch,
@@ -303,5 +337,6 @@ criterion_group!(
     bench_message_enqueue,
     bench_message_drain,
     bench_selective_receive,
-    bench_fabric_publish_unmatched
+    bench_fabric_publish_unmatched,
+    bench_fabric_publish_unmatched_exact_subscriptions
 );
