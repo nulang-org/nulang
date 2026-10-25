@@ -66,8 +66,7 @@ impl HttpRequestBindingInputs {
     /// a form binding.
     pub fn capture(target: &str, headers: &[(String, String)], body: &[u8]) -> Self {
         let query_text = target.split_once('?').map_or("", |(_, query)| query);
-        let (query, duplicate_query_keys) =
-            parse_urlencoded_with_duplicates(query_text.as_bytes());
+        let (query, duplicate_query_keys) = parse_urlencoded_with_duplicates(query_text.as_bytes());
 
         let mut cookies = HashMap::new();
         for (_, value) in headers
@@ -85,8 +84,7 @@ impl HttpRequestBindingInputs {
         };
         // A repeated action identifier is not a valid authorization envelope,
         // even when the legacy form parser would otherwise keep its last value.
-        let (ui_message, ui_message_error) = if duplicate_form_keys
-            .contains("__nulang_ui_message")
+        let (ui_message, ui_message_error) = if duplicate_form_keys.contains("__nulang_ui_message")
             || duplicate_form_keys.contains("__nulang_action")
         {
             (None, Some(UiActionEnvelopeError::Malformed))
@@ -114,12 +112,8 @@ impl HttpRequestBindingInputs {
         bindings: &'a [RouteBindingContract],
     ) -> Option<&'a RouteBindingContract> {
         bindings.iter().find(|binding| match binding.source {
-            RouteBindingSource::Query => {
-                self.duplicate_query_keys.contains(&binding.source_name)
-            }
-            RouteBindingSource::Form => {
-                self.duplicate_form_keys.contains(&binding.source_name)
-            }
+            RouteBindingSource::Query => self.duplicate_query_keys.contains(&binding.source_name),
+            RouteBindingSource::Form => self.duplicate_form_keys.contains(&binding.source_name),
             _ => false,
         })
     }
@@ -417,7 +411,10 @@ mod tests {
         ] {
             let captured = HttpRequestBindingInputs::capture("/", &headers, body);
             assert!(captured.ui_message.is_none());
-            assert_eq!(captured.ui_message_error, Some(UiActionEnvelopeError::Malformed));
+            assert_eq!(
+                captured.ui_message_error,
+                Some(UiActionEnvelopeError::Malformed)
+            );
         }
     }
 
