@@ -1312,6 +1312,102 @@ pub enum SqliteSyncMode {
     Full,
 }
 
+/// Validate remote libSQL destinations before passing a bearer token to any
+/// HTTP/TLS connector. libsql:// and bare hostnames use HTTPS, but an
+/// explicit plaintext URL is permitted only for exact loopback hosts.
+#[cfg(feature = "sqlite")]
+fn validate_libsql_remote_url(raw: &str) -> io::Result<()> {
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "remote libSQL URL requires HTTPS (or libsql://); HTTP is only allowed on loopback",
+        )
+    };
+    if raw.is_empty()
+        || raw.trim() != raw
+        || raw.chars().any(|ch| ch.is_ascii_control() || ch == '\\')
+    {
+        return Err(invalid());
+    }
+
+    let explicit_scheme =
+        raw.starts_with("https://") || raw.starts_with("http://") || raw.starts_with("libsql://");
+    if raw.contains("://") && !explicit_scheme {
+        return Err(invalid());
+    }
+    let candidate = if explicit_scheme {
+        raw.to_owned()
+    } else {
+        // Keep libSQL's existing bare-hostname interpretation (HTTPS).
+        format!("https://{raw}")
+    };
+    let parsed = url::Url::parse(&candidate).map_err(|_| invalid())?;
+    let Some(host) = parsed.host() else {
+        return Err(invalid());
+    };
+    if !parsed.username().is_empty() || parsed.password().is_some() || parsed.fragment().is_some() {
+        return Err(invalid());
+    }
+
+    let loopback = match host {
+        url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => ip.is_loopback(),
+    };
+    match parsed.scheme() {
+        "https" | "libsql" => Ok(()),
+        "http" if loopback => Ok(()),
+        _ => Err(invalid()),
+    }
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod libsql_remote_url_validation_tests {
+    use super::validate_libsql_remote_url;
+    use std::io;
+
+    #[test]
+    fn permits_verified_remote_schemes_and_only_loopback_plaintext() {
+        for uri in [
+            "https://database.turso.io",
+            "libsql://database.turso.io",
+            "database.turso.io",
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://127.2.3.4:8080",
+            "http://[::1]:8080",
+        ] {
+            assert!(validate_libsql_remote_url(uri).is_ok(), "{uri}");
+        }
+    }
+
+    #[test]
+    fn rejects_credential_leaks_and_ambiguous_remote_authorities_before_io() {
+        let credentials = "secret-do-not-expose";
+        for uri in [
+            "http://192.0.2.10:80",
+            "http://0.0.0.0",
+            "http://localhost.evil.invalid",
+            "http://127.0.0.1.evil.invalid",
+            "http://127.0.0.1@192.0.2.10",
+            "http://localhost\\@evil.invalid",
+            "https://alice:secret-do-not-expose@database.turso.io",
+            "https://database.turso.io#fragment",
+            "ftp://database.turso.io",
+            "javascript:alert(1)",
+            "https://",
+            "",
+            " https://database.turso.io",
+            "https://database.turso.io\n",
+        ] {
+            let err = validate_libsql_remote_url(uri).expect_err(uri);
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{uri:?}");
+            assert!(!err.to_string().contains(credentials));
+            assert!(!err.to_string().contains("alice"));
+        }
+    }
+}
+
 #[cfg(feature = "sqlite")]
 pub struct LibsqlStore {
     conn: std::sync::Mutex<libsql::Connection>,
@@ -1370,6 +1466,8 @@ impl LibsqlStore {
     /// skipped: a Turso server manages its own journal and durability
     /// policy.
     pub fn new_remote(url: &str, auth_token: &str) -> io::Result<Self> {
+        // Fail closed before runtime allocation, DNS, TCP, TLS, or token use.
+        validate_libsql_remote_url(url)?;
         let rt =
             tokio::runtime::Runtime::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let db = rt.block_on(async {

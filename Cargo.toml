@@ -61,7 +61,7 @@ mobile-runtime = []
 # Enables the standalone Savina-style actor benchmark runner without pulling optional subsystems.
 savina-bench = []
 python = ["dep:pyo3"]
-sqlite = ["dep:libsql", "dep:tokio", "dep:hyper", "dep:tokio-rustls", "dep:rustls-native-certs", "dep:tower-service"]
+sqlite = ["dep:libsql", "dep:tokio", "dep:hyper", "dep:tokio-rustls", "dep:rustls-native-certs", "dep:tower-service", "dep:url"]
 lsp = ["dep:tower-lsp", "dep:tokio", "dep:futures", "dep:tower-service"]
 ai-runtime = ["dep:nulang-ai", "dep:nulang-ai-local", "dep:uuid", "dep:reqwest", "dep:tokio"]
 wasm-backend = ["native-codegen", "dep:wasm-encoder", "dep:wasmtime", "dep:wat", "dep:borsh"]
@@ -159,6 +159,8 @@ libsql = { version = "0.10.0-pre.4", optional = true, default-features = false, 
 hyper = { version = "0.14", optional = true, features = ["client", "http1", "tcp"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"], optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
+# Parse remote authorities before handing bearer credentials to libSQL.
+url = { version = "2", optional = true }
 # RocksDB persistence backend (feature `rocksdb`).
 rocksdb = { version = "0.21", optional = true, default-features = false }
 # PostgreSQL persistence backend (feature `postgres`). Sync wrapper over tokio-postgres.
