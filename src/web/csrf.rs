@@ -146,10 +146,61 @@ mod tests {
     }
 
     #[test]
-    fn safe_requests_need_no_origin_or_host() {
+    fn safe_requests_require_a_trusted_host_but_no_origin() {
         for method in ["GET", "HEAD", "OPTIONS"] {
-            assert_eq!(validate_mutation_origin(method, &[], None, None), Ok(()));
+            let trusted = headers(&[("Host", "localhost:8080")]);
+            assert_eq!(
+                validate_mutation_origin(method, &trusted, Some(loopback()), None),
+                Ok(())
+            );
+            // Existing Web HTTP smoke fixtures use this loopback-only form.
+            let legacy = headers(&[("Host", "localhost")]);
+            assert_eq!(
+                validate_mutation_origin(method, &legacy, Some(loopback()), None),
+                Ok(())
+            );
+            assert_eq!(
+                validate_mutation_origin(method, &[], Some(loopback()), None),
+                Err(OriginCheckError::MissingHost)
+            );
+            let rebound = headers(&[("Host", "attacker.example:8080")]);
+            assert_eq!(
+                validate_mutation_origin(method, &rebound, Some(loopback()), None),
+                Err(OriginCheckError::UntrustedHost)
+            );
+            let duplicate = headers(&[
+                ("Host", "localhost:8080"),
+                ("Host", "attacker.example:8080"),
+            ]);
+            assert_eq!(
+                validate_mutation_origin(method, &duplicate, Some(loopback()), None),
+                Err(OriginCheckError::DuplicateHeader)
+            );
         }
+    }
+
+    #[test]
+    fn read_requests_through_proxy_require_configured_public_host() {
+        let wrong_host = headers(&[("Host", "attacker.example")]);
+        assert_eq!(
+            validate_mutation_origin(
+                "GET",
+                &wrong_host,
+                Some(loopback()),
+                Some("https://app.example.com")
+            ),
+            Err(OriginCheckError::UntrustedHost)
+        );
+        let trusted = headers(&[("Host", "app.example.com")]);
+        assert_eq!(
+            validate_mutation_origin(
+                "GET",
+                &trusted,
+                Some(loopback()),
+                Some("https://app.example.com")
+            ),
+            Ok(())
+        );
     }
 
     #[test]
