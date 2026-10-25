@@ -75,15 +75,18 @@ pub fn run(args: &[String]) -> NuResult<()> {
             }
             cmd_new(path_arg, template)
         }
-        Some("generate") => {
-            if args.len() != 3 || args.get(1).map(String::as_str) != Some("resource") {
-                return Err(NuError::PackageError {
-                    msg: "usage: nula generate resource <PascalCaseName>".into(),
-                    span: Span::default(),
-                });
+        Some("generate") => match args.get(1).map(String::as_str) {
+            Some("resource") if args.len() == 3 => {
+                crate::package::resource::generate_resource(&package_root()?, &args[2])
             }
-            crate::package::resource::generate_resource(&package_root()?, &args[2])
-        }
+            Some("model") => {
+                crate::package::model_generator::run(&args[1..], &package_root()?).map(|_| ())
+            }
+            _ => Err(NuError::PackageError {
+                msg: "usage: nula generate resource <PascalCaseName> OR nula generate model <PascalCaseName> --field name:Type [--field ...]".into(),
+                span: Span::default(),
+            }),
+        },
         Some("init") => cmd_init(),
         Some("build") => {
             let web = args.get(1).map(String::as_str) == Some("--web");
@@ -299,6 +302,7 @@ fn print_usage() {
     println!(
         "  generate resource <PascalCaseName>  Add GET-only resource routes to a web template"
     );
+    println!("  generate model <PascalCaseName> --field name:Type [...]  Create typed model and deny-all policy hooks");
     println!("  init          Scaffold a new package in the current directory");
     println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
     println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");

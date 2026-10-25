@@ -36,3 +36,26 @@ On current main, a Nulang binary built from source may fail to resolve standard-
     nulang nula build --web
 
 This issue also reproduces on an unmodified web starter and is not introduced by the generator.
+
+
+## Typed records are a separate, explicit command
+
+The GET-only route scaffold above does **not** generate a database model,
+persistence, mutations, or authorization. To create a typed data record and
+a separate input type instead, run:
+
+    nulang nula generate model BlogPost --field title:String --field published:Bool
+
+This writes `src/resources/blog_post.nula` containing `BlogPost`,
+`BlogPostInput`, and `can_read_blog_post`/`can_write_blog_post` policy
+hooks that **return false by default**. It never registers HTTP routes.
+Generated fields are canonicalized and validated with the Nulang lexer.
+Both commands reject overwriting previously generated output. A model
+and GET-only routes can be generated for the same name independently,
+without implicitly connecting the model or policy to those routes.
+
+**Do not treat generated tenant_id equality, deny-all hook declarations,
+or read-only pages as authorization.** A real service still needs
+authenticated identity, tenant membership, resource permission checks,
+storage transactions, CSRF and input validation, with negative tests.
+Neither generator supplies production CRUD.

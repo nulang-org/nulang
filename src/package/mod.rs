@@ -15,6 +15,7 @@ pub mod identity;
 mod identity_verify;
 pub mod lockfile;
 pub mod manifest;
+mod model_generator;
 pub mod module_invalidation;
 pub mod resolver;
 pub mod resource;
