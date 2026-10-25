@@ -262,4 +262,54 @@ mod tests {
             cleanup(&wal_path);
         }
     }
+
+    #[test]
+    fn epoch_fence_error_is_reconciled_against_the_durable_wal() {
+        for (point, expected_epoch, expected_sequence) in [
+            (StorageInterruptionPoint::WalAfterHeader, 7, 1),
+            (StorageInterruptionPoint::WalAfterSync, 8, 2),
+        ] {
+            let wal_path = temp_wal("epoch_fence");
+            cleanup(&wal_path);
+
+            let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+            commit_put(&mut tablet, b"before-fence");
+            assert!(with_interruption(point, || tablet.advance_ownership_epoch(7, 8))
+                .is_err());
+            assert_eq!(tablet.descriptor().ownership_epoch(), 7);
+            assert_eq!(tablet.current_sequence(), 1);
+
+            // Even an apparent failure must poison the live WAL so a retry
+            // cannot race an incompletely appended or already-durable fence.
+            assert_eq!(
+                tablet.advance_ownership_epoch(7, 8).unwrap_err(),
+                WalBackedError::Wal(WalError::Poisoned)
+            );
+            drop(tablet);
+
+            let expected = TabletDescriptor::new(
+                TabletId::new(97).unwrap(),
+                KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+                expected_epoch,
+            )
+            .unwrap();
+            let rejected_epoch = if expected_epoch == 7 { 8 } else { 7 };
+            let rejected = TabletDescriptor::new(
+                TabletId::new(97).unwrap(),
+                KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+                rejected_epoch,
+            )
+            .unwrap();
+            assert!(
+                WalBackedTablet::open(rejected, &wal_path).is_err(),
+                "recovery must reject mismatched epoch after {point:?}"
+            );
+
+            let reopened = WalBackedTablet::open(expected, &wal_path).unwrap();
+            assert_eq!(reopened.current_sequence(), expected_sequence);
+            assert_eq!(reopened.read_latest(b"k"), Some(&b"before-fence"[..]));
+            drop(reopened);
+            cleanup(&wal_path);
+        }
+    }
 }

@@ -35,6 +35,10 @@ const WAL_FRAME_PREFIX_BYTES: usize = 4 + 2 + 4;
 const WAL_FRAME_HEADER_BYTES: usize = WAL_FRAME_PREFIX_BYTES + 32;
 const MAX_WAL_RECORD_BYTES: usize = 64 * 1024 * 1024;
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppendFailPoint {
@@ -55,6 +59,10 @@ struct DiskWalRecord {
     // Optional in version-1 WAL records for backward compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     identity: Option<TransactionIdentity>,
+    // Legacy records omit this flag; only explicit barriers advance the
+    // ownership epoch for newly written records.
+    #[serde(default, skip_serializing_if = "is_false")]
+    epoch_fence: bool,
 }
 
 /// One validated record recovered from or appended to a tablet WAL.
@@ -66,6 +74,7 @@ pub struct WalRecord {
     expected_previous_sequence: u64,
     mutations: Vec<TabletMutation>,
     identity: Option<TransactionIdentity>,
+    epoch_fence: bool,
 }
 
 impl WalRecord {
@@ -77,6 +86,7 @@ impl WalRecord {
             expected_previous_sequence: write.expected_previous_sequence(),
             mutations: write.mutations().to_vec(),
             identity: write.identity(),
+            epoch_fence: write.epoch_fence(),
         }
     }
 
@@ -98,6 +108,12 @@ impl WalRecord {
             });
         }
 
+        if disk.epoch_fence && (!disk.mutations.is_empty() || disk.identity.is_some()) {
+            return Err(WalError::InvalidRecord {
+                offset,
+                reason: "epoch fence must not contain user mutations or a transaction ID".to_string(),
+            });
+        }
         if let Some(identity) = disk.identity {
             if transaction_digest(&disk.mutations) != identity.digest {
                 return Err(WalError::InvalidRecord {
@@ -114,6 +130,7 @@ impl WalRecord {
             expected_previous_sequence: disk.expected_previous_sequence,
             mutations: disk.mutations,
             identity: disk.identity,
+            epoch_fence: disk.epoch_fence,
         })
     }
 
@@ -126,6 +143,7 @@ impl WalRecord {
             expected_previous_sequence: self.expected_previous_sequence,
             mutations: self.mutations.clone(),
             identity: self.identity,
+            epoch_fence: self.epoch_fence,
         }
     }
 
@@ -151,6 +169,10 @@ impl WalRecord {
 
     pub(crate) fn identity(&self) -> Option<TransactionIdentity> {
         self.identity
+    }
+
+    pub fn is_epoch_fence(&self) -> bool {
+        self.epoch_fence
     }
 }
 
@@ -333,6 +355,22 @@ impl FileWal {
         self.base_sequence
     }
 
+    pub fn latest_ownership_epoch(&self) -> Option<u64> {
+        self.latest_ownership_epoch
+    }
+
+    fn validate_presented_epoch(&self, presented: u64) -> Result<(), WalError> {
+        if let Some(durable) = self.latest_ownership_epoch {
+            if presented < durable {
+                return Err(WalError::StaleOwnershipEpoch { durable, presented });
+            }
+            if presented > durable {
+                return Err(WalError::UnknownOwnershipEpoch { durable, presented });
+            }
+        }
+        Ok(())
+    }
+
     pub fn last_sequence(&self) -> u64 {
         self.records
             .last()
@@ -363,14 +401,7 @@ impl FileWal {
                 });
             }
         }
-        if let Some(durable_epoch) = self.latest_ownership_epoch {
-            if descriptor.ownership_epoch() < durable_epoch {
-                return Err(WalError::StaleOwnershipEpoch {
-                    durable: durable_epoch,
-                    presented: descriptor.ownership_epoch(),
-                });
-            }
-        }
+        self.validate_presented_epoch(descriptor.ownership_epoch())?;
 
         if self.base_sequence != 0 {
             return Err(WalError::CheckpointRequired {
@@ -417,14 +448,7 @@ impl FileWal {
                 });
             }
         }
-        if let Some(durable_epoch) = self.latest_ownership_epoch {
-            if tablet.descriptor().ownership_epoch() < durable_epoch {
-                return Err(WalError::StaleOwnershipEpoch {
-                    durable: durable_epoch,
-                    presented: tablet.descriptor().ownership_epoch(),
-                });
-            }
-        }
+        self.validate_presented_epoch(tablet.descriptor().ownership_epoch())?;
 
         let checkpoint_sequence = tablet.current_sequence();
         for record in self
@@ -554,13 +578,32 @@ impl FileWal {
                 });
             }
         }
-        if let Some(durable_epoch) = self.latest_ownership_epoch {
-            if record.ownership_epoch < durable_epoch {
+        if let Some(durable) = self.latest_ownership_epoch {
+            if record.ownership_epoch < durable {
                 return Err(WalError::StaleOwnershipEpoch {
-                    durable: durable_epoch,
+                    durable,
                     presented: record.ownership_epoch,
                 });
             }
+            if record.epoch_fence {
+                if record.ownership_epoch <= durable {
+                    return Err(WalError::UnfencedEpochAdvance {
+                        durable,
+                        presented: record.ownership_epoch,
+                    });
+                }
+            } else if record.ownership_epoch > durable {
+                return Err(WalError::UnfencedEpochAdvance {
+                    durable,
+                    presented: record.ownership_epoch,
+                });
+            }
+        }
+        if record.epoch_fence && (!record.mutations.is_empty() || record.identity.is_some()) {
+            return Err(WalError::InvalidRecord {
+                offset: self.file.stream_position()?,
+                reason: "epoch fence must not have mutations or transaction ID".to_string(),
+            });
         }
 
         let payload =
@@ -758,6 +801,12 @@ fn validate_record_chain(
                 presented: record.ownership_epoch,
             });
         }
+        if record.epoch_fence && record.ownership_epoch <= durable_epoch {
+            return Err(WalError::InvalidRecord {
+                offset,
+                reason: "epoch fence does not advance the durable epoch".to_string(),
+            });
+        }
     }
 
     if record.expected_previous_sequence != last_sequence {
@@ -869,6 +918,14 @@ pub enum WalError {
         durable: u64,
         presented: u64,
     },
+    UnknownOwnershipEpoch {
+        durable: u64,
+        presented: u64,
+    },
+    UnfencedEpochAdvance {
+        durable: u64,
+        presented: u64,
+    },
     SequenceMismatch {
         committed: u64,
         expected_previous: u64,
@@ -961,6 +1018,14 @@ impl fmt::Display for WalError {
             Self::StaleOwnershipEpoch { durable, presented } => write!(
                 f,
                 "WAL ownership epoch {presented} is stale; durable epoch is {durable}"
+            ),
+            Self::UnknownOwnershipEpoch { durable, presented } => write!(
+                f,
+                "WAL ownership epoch {presented} is ahead of committed epoch {durable}; an explicit barrier is required"
+            ),
+            Self::UnfencedEpochAdvance { durable, presented } => write!(
+                f,
+                "WAL write at epoch {presented} cannot advance committed epoch {durable} without a fence barrier"
             ),
             Self::SequenceMismatch {
                 committed,
