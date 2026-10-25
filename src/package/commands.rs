@@ -75,6 +75,15 @@ pub fn run(args: &[String]) -> NuResult<()> {
             }
             cmd_new(path_arg, template)
         }
+        Some("generate") => {
+            if args.len() != 3 || args.get(1).map(String::as_str) != Some("resource") {
+                return Err(NuError::PackageError {
+                    msg: "usage: nula generate resource <PascalCaseName>".into(),
+                    span: Span::default(),
+                });
+            }
+            crate::package::resource::generate_resource(&package_root()?, &args[2])
+        }
         Some("init") => cmd_init(),
         Some("build") => {
             let web = args.get(1).map(String::as_str) == Some("--web");
@@ -266,7 +275,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
 
         Some(other) => Err(NuError::PackageError {
             msg: format!(
-                "unknown nula subcommand '{}' (expected new, init, build, build-wasm, test, run, add, remove, publish, deploy, watch, doc, list, or clean)",
+                "unknown nula subcommand '{}' (expected new, init, generate, build, build-wasm, test, run, add, remove, publish, deploy, watch, doc, list, or clean)",
                 other
             ),
             span: Span::default(),
@@ -286,7 +295,10 @@ fn print_usage() {
     println!("Commands:");
     println!("  new   <path> [--template <name>]");
     println!("                Scaffold a new package directory");
-    println!("                Templates: default, cli, lib, full");
+    println!("                Templates: default, cli, lib, full, distributed, ai-agent, web");
+    println!(
+        "  generate resource <PascalCaseName>  Add GET-only resource routes to a web template"
+    );
     println!("  init          Scaffold a new package in the current directory");
     println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
     println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
@@ -701,9 +713,14 @@ fn home() -> Html {
     )
 }
 
+// nula:resources:handlers-start
+// nula:resources:handlers-end
+
 app "todos" {
     route "GET" "/" -> home
     route "POST" "/" -> home
+    // nula:resources:routes-start
+    // nula:resources:routes-end
 }
 "#,
             ),
@@ -2613,6 +2630,70 @@ fn cmd_remove(name: Option<&str>) -> NuResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_generate_web_resource_adds_compiler_visible_routes() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_web_resource_generated_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        scaffold_package(&dir, "resource-app", "web").unwrap();
+
+        crate::package::resource::generate_resource(&dir, "BlogPost").unwrap();
+        let main = std::fs::read_to_string(dir.join("src/main.nula")).unwrap();
+        assert!(main.contains("fn blog_posts_index() -> Html"));
+        assert!(main.contains("fn blog_posts_new() -> Html"));
+        assert!(main.contains(r#"route "GET" "/blog_posts" -> blog_posts_index"#));
+        assert!(main.contains(r#"route "GET" "/blog_posts/new" -> blog_posts_new"#));
+
+        let compilation =
+            crate::web::validation::compile_validated_contracts_from_tree(&dir.join("src"))
+                .expect("generated routes must share the compiler contract");
+        assert!(compilation.routes.iter().any(|r| r.path == "/blog_posts"));
+        assert!(compilation
+            .routes
+            .iter()
+            .any(|r| r.path == "/blog_posts/new"));
+
+        let snapshot = main;
+        let error = crate::package::resource::generate_resource(&dir, "BlogPost")
+            .expect_err("duplicate resource must not overwrite code");
+        assert!(error.to_string().contains("already"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/main.nula")).unwrap(),
+            snapshot
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_generate_web_resource_rejects_unsafe_input_without_mutation() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_web_resource_validation_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        scaffold_package(&dir, "resource-app", "web").unwrap();
+        let original = std::fs::read_to_string(dir.join("src/main.nula")).unwrap();
+
+        for invalid in ["", "../foo", "project;", "3Projects", "hello world"] {
+            assert!(crate::package::resource::generate_resource(&dir, invalid).is_err());
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/main.nula")).unwrap(),
+            original
+        );
+
+        // Refuse to rewrite web apps that don't contain the managed extension points.
+        std::fs::write(dir.join("src/main.nula"), "app \"minimal\" {}").unwrap();
+        assert!(crate::package::resource::generate_resource(&dir, "Project").is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/main.nula")).unwrap(),
+            "app \"minimal\" {}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_manifest_language_pin() {
