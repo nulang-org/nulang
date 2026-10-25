@@ -463,21 +463,26 @@ impl MemoryTablet {
     }
 
     fn apply_mutations(&mut self, sequence: u64, mutations: Vec<TabletMutation>) {
+        // All writes within one commit share a sequence number. Collapse
+        // repeated keys so checkpoint history has strictly increasing
+        // versions, retaining the final mutation for each key.
+        let mut final_values = BTreeMap::new();
         for mutation in mutations {
             match mutation {
                 TabletMutation::Put { key, value } => {
-                    self.rows.entry(key).or_default().push(VersionedValue {
-                        sequence,
-                        value: Some(value),
-                    });
+                    final_values.insert(key, Some(value));
                 }
                 TabletMutation::Delete { key } => {
-                    self.rows.entry(key).or_default().push(VersionedValue {
-                        sequence,
-                        value: None,
-                    });
+                    final_values.insert(key, None);
                 }
             }
+        }
+
+        for (key, value) in final_values {
+            self.rows
+                .entry(key)
+                .or_default()
+                .push(VersionedValue { sequence, value });
         }
         self.current_sequence = sequence;
     }
