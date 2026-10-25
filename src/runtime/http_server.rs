@@ -1244,11 +1244,7 @@ mod tests {
     fn duplicate_typed_query_parameter_returns_structured_http_400() {
         use crate::web::bindings::{RouteBindingContract, RouteBindingSource};
 
-        let captured = HttpRequestBindingInputs::capture(
-            "/users?limit=1&%6cimit=2",
-            &[],
-            b"",
-        );
+        let captured = HttpRequestBindingInputs::capture("/users?limit=1&%6cimit=2", &[], b"");
         let bound = RouteBindingContract {
             source: RouteBindingSource::Query,
             source_name: "limit".to_string(),
@@ -1266,11 +1262,15 @@ mod tests {
         assert_eq!(body["source"], "query");
         assert_eq!(body["source_name"], "limit");
         assert!(body.get("handler_param").is_none());
-        assert!(duplicate_bound_input_response(&captured, &[RouteBindingContract {
-            source: RouteBindingSource::Query,
-            source_name: "page".to_string(),
-            ..bound
-        }]).is_none());
+        assert!(duplicate_bound_input_response(
+            &captured,
+            &[RouteBindingContract {
+                source: RouteBindingSource::Query,
+                source_name: "page".to_string(),
+                ..bound
+            }]
+        )
+        .is_none());
     }
 
     // A deterministic reader forces TCP-like fragmentation without sleeps.
