@@ -67,14 +67,21 @@ def check_warnings_for(feature_args, label):
 
 def check_warnings():
     """Run cargo check --tests across every feature combination CI exercises
-    (default, --no-default-features, --all-features) and fail if any of them
+    (default, --no-default-features, all compatible features) and fail if any of them
     produce compiler warnings/errors. Checking only the default feature set
     is not sufficient — see check_warnings_for's docstring.
     """
     return (
         check_warnings_for([], "(default features)")
         and check_warnings_for(["--no-default-features"], "(--no-default-features)")
-        and check_warnings_for(["--all-features"], "(--all-features)")
+        and check_warnings_for(
+            ["--no-default-features", "--features",
+             subprocess.check_output(
+                 [sys.executable, "scripts/ci/compatible-cargo-features.py"],
+                 text=True,
+             ).strip()],
+            "(all compatible features, excluding isolated untrusted-runner)",
+        )
     )
 
 
