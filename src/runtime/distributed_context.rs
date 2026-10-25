@@ -989,6 +989,102 @@ mod tests {
     }
 
     #[test]
+    fn fabric_exact_topic_index_preserves_mixed_registration_order() {
+        let mut fabric = FabricRegistry::default();
+        for id in 100_u64..356 {
+            assert!(fabric.insert(
+                FabricSubscription::local(
+                    &format!("unrelated.{id}"),
+                    id,
+                    "handle",
+                    id as u16,
+                    None
+                )
+                .unwrap()
+            ));
+        }
+
+        assert!(fabric.insert(
+            FabricSubscription::local("orders.created", 1, "handle", 1, None).unwrap()
+        ));
+        assert!(fabric.insert(
+            FabricSubscription::local("orders.*", 2, "handle", 2, None).unwrap()
+        ));
+        assert!(fabric.insert(
+            FabricSubscription::local("orders.created", 3, "handle", 3, None).unwrap()
+        ));
+
+        // The index selects only relevant entries without changing the
+        // pre-existing registration order of mixed exact/wildcard fanout.
+        assert_eq!(
+            fabric.matching_subscription_indices("orders.created"),
+            vec![256, 257, 258]
+        );
+        assert_eq!(
+            fabric.route("orders.created").unwrap(),
+            vec![
+                FabricTarget::Local {
+                    actor_id: 1,
+                    behavior_id: 1
+                },
+                FabricTarget::Local {
+                    actor_id: 2,
+                    behavior_id: 2
+                },
+                FabricTarget::Local {
+                    actor_id: 3,
+                    behavior_id: 3
+                },
+            ]
+        );
+        assert!(fabric.matching_subscription_indices("missing.topic").is_empty());
+    }
+
+    #[test]
+    fn fabric_exact_topic_index_rebuilds_after_unsubscribe_and_remote_replacement() {
+        let mut fabric = FabricRegistry::default();
+        assert!(fabric.insert(
+            FabricSubscription::local("events.created", 7, "handle", 1, None).unwrap()
+        ));
+        let remote = FabricSubscription::remote(FabricAdvertisement {
+            node_id: NodeId(42),
+            pattern: "events.created".into(),
+            actor_id: 99,
+            behavior: "handle".into(),
+            group: None,
+        })
+        .unwrap();
+        assert_eq!(fabric.replace_remote_node(NodeId(42), 1, vec![remote]), 1);
+        assert_eq!(fabric.matching_subscription_indices("events.created"), vec![0, 1]);
+
+        assert_eq!(fabric.unsubscribe_local_actor(7), 1);
+        assert_eq!(fabric.matching_subscription_indices("events.created"), vec![0]);
+        assert_eq!(
+            fabric.route("events.created").unwrap(),
+            vec![FabricTarget::Remote {
+                node_id: NodeId(42),
+                actor_id: 99,
+                behavior: "handle".into(),
+            }]
+        );
+
+        let replacement = FabricSubscription::remote(FabricAdvertisement {
+            node_id: NodeId(42),
+            pattern: "events.changed".into(),
+            actor_id: 99,
+            behavior: "handle".into(),
+            group: None,
+        })
+        .unwrap();
+        assert_eq!(fabric.replace_remote_node(NodeId(42), 2, vec![replacement]), 2);
+        assert!(fabric.matching_subscription_indices("events.created").is_empty());
+        assert_eq!(fabric.matching_subscription_indices("events.changed"), vec![0]);
+        assert_eq!(fabric.route("events.changed").unwrap().len(), 1);
+        assert_eq!(fabric.remove_remote_node(NodeId(42)).0, 1);
+        assert!(fabric.matching_subscription_indices("events.changed").is_empty());
+    }
+
+    #[test]
     fn fabric_deduplicates_identical_subscriptions_and_removes_local_actor_entries() {
         let mut fabric = FabricRegistry::default();
         let fanout = FabricSubscription::local("events.>", 7, "handle", 1, None).unwrap();
