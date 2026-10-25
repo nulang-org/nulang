@@ -1096,6 +1096,13 @@ pub fn process_network_packets(
     for incoming in packets {
         match incoming.packet {
             Packet::Heartbeat { node_id, .. } => {
+                if node_id != incoming.from_node {
+                    warn!(
+                        "nulang-net: rejecting heartbeat claiming {:?} from transport peer {:?}",
+                        node_id, incoming.from_node
+                    );
+                    continue;
+                }
                 let cluster_node_id = NodeId(node_id.0);
                 // A Failed -> Healthy transition may be the same NodeId coming
                 // back as a fresh process. Receiver-specific CRDT knowledge
@@ -1580,6 +1587,13 @@ pub fn process_network_packets(
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
             Packet::NodeGoodbye { node_id, durable } => {
+                if node_id != incoming.from_node {
+                    warn!(
+                        "nulang-net: rejecting goodbye claiming {:?} from transport peer {:?}",
+                        node_id, incoming.from_node
+                    );
+                    continue;
+                }
                 // RFC 0014 §1 path 1: the sender declares its durable actors
                 // checkpointed and terminated. Fold its manifest into the
                 // directory (highest-epoch-wins) and confirm-gone it, then
