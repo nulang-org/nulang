@@ -357,6 +357,21 @@ impl HttpServerState {
     }
 
     fn write_response(stream: &mut TcpStream, response: &HttpResponse) {
+        // The writer owns HTTP framing. Never interpolate untrusted header
+        // names/values or allow callers to override Content-Length/encoding.
+        if response
+            .headers
+            .iter()
+            .any(|(name, value)| !safe_response_header(name, value))
+        {
+            let fallback = HttpResponse {
+                status: 500,
+                headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+                body: b"Internal server error".to_vec(),
+            };
+            return Self::write_response(stream, &fallback);
+        }
+
         let status_text = match response.status {
             200 => "OK",
             201 => "Created",
@@ -535,14 +550,51 @@ where
     result
 }
 
+/// RFC HTTP field names and RFC 6265 cookie names use the token grammar.
+fn http_token(input: &str) -> bool {
+    !input.is_empty()
+        && input
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+}
+
+/// Disallow response header injection and caller-controlled framing fields.
+fn safe_response_header(name: &str, value: &str) -> bool {
+    http_token(name)
+        && !name.eq_ignore_ascii_case("content-length")
+        && !name.eq_ignore_ascii_case("transfer-encoding")
+        && value
+            .bytes()
+            .all(|byte| byte == b'\t' || (byte >= 0x20 && byte != 0x7f))
+}
+
+/// Cookie-octet excludes separators, whitespace, quotes, and controls.
+fn cookie_value_is_safe(value: &str) -> bool {
+    value.bytes().all(|byte| {
+        byte == 0x21
+            || (0x23..=0x2b).contains(&byte)
+            || (0x2d..=0x3a).contains(&byte)
+            || (0x3c..=0x5b).contains(&byte)
+            || (0x5d..=0x7e).contains(&byte)
+    })
+}
+
 /// Add a `Set-Cookie` header for the current response.
 pub fn set_cookie(name: &str, value: &str) {
+    // The public Web.set_cookie effect returns Unit; reject invalid values
+    // until that API can expose typed errors.
+    if !http_token(name) || !cookie_value_is_safe(value) {
+        return;
+    }
     let cookie = format!("{}={}; Path=/; HttpOnly; SameSite=Lax", name, value);
     RESPONSE_COOKIES.with(|c| c.borrow_mut().push(cookie));
 }
 
 /// Add a `Set-Cookie` header that clears the named cookie.
 pub fn clear_cookie(name: &str) {
+    if !http_token(name) {
+        return;
+    }
     let cookie = format!("{}=; Path=/; Max-Age=0; SameSite=Lax", name);
     RESPONSE_COOKIES.with(|c| c.borrow_mut().push(cookie));
 }
