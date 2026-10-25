@@ -17,6 +17,7 @@ use std::time::Duration;
 use crate::bytecode::CodeModule;
 use crate::value_layout::PAYLOAD_MASK;
 use crate::vm::{resolve_value_string, Value, CLOSURE_ENV_FLAG, VM};
+use crate::web::csrf::validate_mutation_origin;
 use crate::web::dispatch::{render_direct_request, DirectRequestRenderError};
 use crate::web::http_problem::request_decode_problem_response;
 use crate::web::http_request::HttpRequestBindingInputs;
@@ -356,12 +357,29 @@ impl HttpServerState {
     }
 
     fn write_response(stream: &mut TcpStream, response: &HttpResponse) {
+        // The writer owns HTTP framing. Never interpolate untrusted header
+        // names/values or allow callers to override Content-Length/encoding.
+        if response
+            .headers
+            .iter()
+            .any(|(name, value)| !safe_response_header(name, value))
+        {
+            let fallback = HttpResponse {
+                status: 500,
+                headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+                body: b"Internal server error".to_vec(),
+            };
+            return Self::write_response(stream, &fallback);
+        }
+
         let status_text = match response.status {
             200 => "OK",
             201 => "Created",
+            202 => "Accepted",
             204 => "No Content",
             301 => "Moved Permanently",
             302 => "Found",
+            303 => "See Other",
             304 => "Not Modified",
             400 => "Bad Request",
             401 => "Unauthorized",
@@ -369,6 +387,7 @@ impl HttpServerState {
             404 => "Not Found",
             405 => "Method Not Allowed",
             408 => "Request Timeout",
+            409 => "Conflict",
             413 => "Payload Too Large",
             417 => "Expectation Failed",
             422 => "Unprocessable Entity",
@@ -520,6 +539,9 @@ pub struct RequestContext {
 thread_local! {
     static CURRENT_REQUEST: RefCell<Option<RequestContext>> = const { RefCell::new(None) };
     static RESPONSE_COOKIES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    // Explicit Web.respond_* outcomes are scoped to one route invocation.
+    // Err records invalid response metadata without leaking the requested body.
+    static RESPONSE_OVERRIDE: RefCell<Option<Result<HttpResponse, ()>>> = const { RefCell::new(None) };
 }
 
 /// Set the request context for the current thread, run `f`, then clear it.
@@ -529,19 +551,184 @@ where
 {
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = Some(ctx));
     RESPONSE_COOKIES.with(|c| c.borrow_mut().clear());
+    RESPONSE_OVERRIDE.with(|c| *c.borrow_mut() = None);
     let result = f();
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = None);
     result
 }
 
+/// Explicit response statuses must have a known HTTP reason phrase and a
+/// supported body policy. Redirects use Web.redirect rather than synthesizing
+/// 3xx responses without a Location header.
+fn supported_explicit_response_status(status: u16) -> bool {
+    matches!(
+        status,
+        200 | 201
+            | 202
+            | 204
+            | 400
+            | 401
+            | 403
+            | 404
+            | 405
+            | 408
+            | 409
+            | 413
+            | 417
+            | 422
+            | 429
+            | 431
+            | 500
+            | 501
+            | 502
+            | 503
+    )
+}
+
+/// Route all explicit HTTP outcomes through one request-scoped slot.
+/// Multiple declarations are an error, including a redirect after JSON.
+fn stage_explicit_http_response(response: Result<HttpResponse, ()>) {
+    RESPONSE_OVERRIDE.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        if cell.is_some() {
+            *cell = Some(Err(()));
+        } else {
+            *cell = Some(response);
+        }
+    });
+}
+
+/// Admit root-relative redirects only. Reject cross-origin, CRLF, control
+/// bytes, and markup characters before constructing a Location header.
+pub(crate) fn valid_explicit_redirect_target(target: &str) -> bool {
+    let bytes = target.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 8192
+        && bytes[0] == b'/'
+        && bytes.get(1) != Some(&b'/')
+        && bytes
+            .iter()
+            .all(|b| (0x21..=0x7e).contains(b) && !matches!(*b, b'\\' | b'"' | b'<' | b'>'))
+}
+
+/// Register a wire-level redirect in the same slot as JSON/text responses.
+/// A GET redirects with 302, and POST redirects with 303 to avoid replay.
+pub fn register_explicit_http_redirect(target: &str) -> bool {
+    let is_post = CURRENT_REQUEST.with(|current| {
+        current
+            .borrow()
+            .as_ref()
+            .map(|ctx| ctx.request.method == HttpMethod::Post)
+    });
+    let Some(is_post) = is_post else {
+        return false;
+    };
+    let response = if valid_explicit_redirect_target(target) {
+        Ok(HttpResponse {
+            status: if is_post { 303 } else { 302 },
+            headers: vec![
+                ("Location".into(), target.to_string()),
+                ("Cache-Control".into(), "no-store".into()),
+            ],
+            body: Vec::new(),
+        })
+    } else {
+        Err(())
+    };
+    stage_explicit_http_response(response);
+    true
+}
+
+/// Stage one HTTP response from a Nulang route handler. This is a transport
+/// adapter rather than a new source-language response type. Json bodies are
+/// parsed and reserialized so malformed JSON is never served as JSON.
+pub fn register_explicit_http_response(status: u16, body: &str, json: bool) -> bool {
+    CURRENT_REQUEST.with(|current| {
+        if current.borrow().is_none() {
+            return false;
+        }
+        let response = if !supported_explicit_response_status(status)
+            || body.len() > MAX_HTTP_BODY_SIZE
+            || (status == 204 && (!body.is_empty() || json))
+        {
+            Err(())
+        } else if status == 204 {
+            Ok(HttpResponse {
+                status,
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+        } else if json {
+            serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|value| serde_json::to_vec(&value).ok())
+                .map(|bytes| HttpResponse {
+                    status,
+                    headers: vec![("Content-Type".into(), "application/json".into())],
+                    body: bytes,
+                })
+                .ok_or(())
+        } else {
+            Ok(HttpResponse {
+                status,
+                headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+                body: body.as_bytes().to_vec(),
+            })
+        };
+        stage_explicit_http_response(response);
+        true
+    })
+}
+
+fn take_explicit_http_response() -> Option<Result<HttpResponse, ()>> {
+    RESPONSE_OVERRIDE.with(|cell| cell.borrow_mut().take())
+}
+
+/// RFC HTTP field names and RFC 6265 cookie names use the token grammar.
+fn http_token(input: &str) -> bool {
+    !input.is_empty()
+        && input
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+}
+
+/// Disallow response header injection and caller-controlled framing fields.
+fn safe_response_header(name: &str, value: &str) -> bool {
+    http_token(name)
+        && !name.eq_ignore_ascii_case("content-length")
+        && !name.eq_ignore_ascii_case("transfer-encoding")
+        && value
+            .bytes()
+            .all(|byte| byte == b'\t' || (byte >= 0x20 && byte != 0x7f))
+}
+
+/// Cookie-octet excludes separators, whitespace, quotes, and controls.
+fn cookie_value_is_safe(value: &str) -> bool {
+    value.bytes().all(|byte| {
+        byte == 0x21
+            || (0x23..=0x2b).contains(&byte)
+            || (0x2d..=0x3a).contains(&byte)
+            || (0x3c..=0x5b).contains(&byte)
+            || (0x5d..=0x7e).contains(&byte)
+    })
+}
+
 /// Add a `Set-Cookie` header for the current response.
 pub fn set_cookie(name: &str, value: &str) {
+    // The public Web.set_cookie effect returns Unit; reject invalid values
+    // until that API can expose typed errors.
+    if !http_token(name) || !cookie_value_is_safe(value) {
+        return;
+    }
     let cookie = format!("{}={}; Path=/; HttpOnly; SameSite=Lax", name, value);
     RESPONSE_COOKIES.with(|c| c.borrow_mut().push(cookie));
 }
 
 /// Add a `Set-Cookie` header that clears the named cookie.
 pub fn clear_cookie(name: &str) {
+    if !http_token(name) {
+        return;
+    }
     let cookie = format!("{}=; Path=/; Max-Age=0; SameSite=Lax", name);
     RESPONSE_COOKIES.with(|c| c.borrow_mut().push(cookie));
 }
@@ -815,6 +1002,61 @@ pub fn render_route_handler(
     }
 }
 
+/// Experimental Web rejects ambiguous or cross-origin browser mutations before
+/// handler dispatch. This does not replace authentication or authorization.
+fn unsafe_origin_response(
+    request: &HttpRequest,
+    local_addr: Option<std::net::SocketAddr>,
+    public_origin: Option<&str>,
+) -> Option<HttpResponse> {
+    let failure = validate_mutation_origin(
+        request.method.as_str(),
+        &request.headers,
+        local_addr,
+        public_origin,
+    )
+    .err()?;
+    eprintln!("Nulang Web denied state-changing request: {failure:?}");
+    Some(HttpResponse {
+        status: 403,
+        headers: vec![
+            ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+            ("Cache-Control".into(), "no-store".into()),
+        ],
+        body: b"Forbidden: invalid request origin".to_vec(),
+    })
+}
+
+/// Map compiler-derived source return types to HTTP payload representations.
+///
+/// An absent response contract preserves legacy HTML rendering. Explicit
+/// primitive scalar responses are text, not HTML; we must not inject the
+/// browser hydration script into API or text responses. Unsupported response
+/// types fail closed until their wire representation is defined in Web
+/// Contract IR, rather than making up JSON or leaking VM debug values.
+fn response_from_rendered(response_type: Option<&str>, body: String) -> HttpResponse {
+    match response_type {
+        Some("String" | "Int" | "Float" | "Bool") => HttpResponse {
+            status: 200,
+            headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+            body: body.into_bytes(),
+        },
+        Some("Html") | None => HttpResponse {
+            status: 200,
+            headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())],
+            body: inject_client_runtime_script(&body).into_bytes(),
+        },
+        Some(other) => {
+            eprintln!("unsupported typed web response type: {other}");
+            HttpResponse {
+                status: 500,
+                headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+                body: b"Unsupported typed response".to_vec(),
+            }
+        }
+    }
+}
+
 fn invalid_ui_action_response(captured: &HttpRequestBindingInputs) -> Option<HttpResponse> {
     captured
         .ui_message_error
@@ -1024,7 +1266,14 @@ impl WebDevServer {
         };
         let path = request.path.clone();
 
-        let mut response = if path.starts_with(Self::SSE_PATH_PREFIX) {
+        // Apply mutation provenance policy before routing, even for legacy
+        // handlers. Proxy deployments must explicitly configure public origin.
+        let public_origin = std::env::var("NULANG_WEB_PUBLIC_ORIGIN").ok();
+        let mut response = if let Some(forbidden) =
+            unsafe_origin_response(&request, stream.local_addr().ok(), public_origin.as_deref())
+        {
+            forbidden
+        } else if path.starts_with(Self::SSE_PATH_PREFIX) {
             let room = &path[Self::SSE_PATH_PREFIX.len()..];
             Self::serve_sse(room, &mut stream, shutdown.clone());
             return;
@@ -1055,18 +1304,35 @@ impl WebDevServer {
                         )),
                         Err(error) => Err(error),
                     });
-                match rendered {
-                    Ok(Some(html)) => HttpResponse {
-                        status: 200,
-                        headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())],
-                        body: inject_client_runtime_script(&html).into_bytes(),
-                    },
-                    Ok(None) => HttpResponse {
+                let explicit_response = take_explicit_http_response();
+                match (rendered, explicit_response) {
+                    (Ok(Some(_)), Some(Ok(response))) => response,
+                    (Ok(Some(_)), Some(Err(()))) => {
+                        // Do not commit cookies when the response declaration
+                        // itself was rejected.
+                        take_response_cookies();
+                        HttpResponse {
+                            status: 500,
+                            headers: vec![(
+                                "Content-Type".into(),
+                                "text/plain; charset=utf-8".into(),
+                            )],
+                            body: b"Invalid explicit response".to_vec(),
+                        }
+                    }
+                    (Ok(Some(body)), None) => response_from_rendered(
+                        route
+                            .plan
+                            .as_ref()
+                            .and_then(|plan| plan.response_type.as_deref()),
+                        body,
+                    ),
+                    (Ok(None), _) => HttpResponse {
                         status: 500,
                         headers: vec![("Content-Type".into(), "text/plain".into())],
                         body: b"Internal server error".to_vec(),
                     },
-                    Err(DirectRequestRenderError::Decode(error)) => {
+                    (Err(DirectRequestRenderError::Decode(error)), _) => {
                         let problem = request_decode_problem_response(&error);
                         HttpResponse {
                             status: problem.status,
@@ -1074,7 +1340,7 @@ impl WebDevServer {
                             body: problem.body,
                         }
                     }
-                    Err(DirectRequestRenderError::Execution(error)) => {
+                    (Err(DirectRequestRenderError::Execution(error)), _) => {
                         eprintln!("typed route dispatch error: {error}");
                         HttpResponse {
                             status: 500,
@@ -1206,6 +1472,93 @@ fn guess_content_type(path: &Path) -> &'static str {
 mod tests {
     use super::*;
 
+    #[test]
+    fn explicit_text_response_types_are_plain_text_without_browser_runtime() {
+        for type_name in ["String", "Int", "Float", "Bool"] {
+            let response = response_from_rendered(Some(type_name), "42".into());
+            assert_eq!(response.status, 200);
+            assert_eq!(
+                response.headers,
+                vec![("Content-Type".into(), "text/plain; charset=utf-8".into())]
+            );
+            assert_eq!(response.body, b"42");
+        }
+    }
+
+    #[test]
+    fn html_response_type_keeps_html_rendering_but_unknown_types_fail_closed() {
+        let html = response_from_rendered(Some("Html"), "<p>OK</p>".into());
+        assert_eq!(html.status, 200);
+        assert!(html
+            .headers
+            .iter()
+            .any(|(k, v)| { k == "Content-Type" && v == "text/html; charset=utf-8" }));
+        assert!(String::from_utf8_lossy(&html.body).contains("<p>OK</p>"));
+
+        let legacy = response_from_rendered(None, "<p>old</p>".into());
+        assert_eq!(legacy.status, 200);
+        assert!(legacy
+            .headers
+            .iter()
+            .any(|(k, v)| { k == "Content-Type" && v == "text/html; charset=utf-8" }));
+
+        let unsupported = response_from_rendered(Some("CustomRecord"), "secret".into());
+        assert_eq!(unsupported.status, 500);
+        assert!(!String::from_utf8_lossy(&unsupported.body).contains("secret"));
+    }
+
+    #[test]
+    fn explicit_no_content_status_requires_an_empty_text_body() {
+        let context = RequestContext {
+            request: HttpRequest {
+                method: HttpMethod::Get,
+                path: "/test".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+        with_request_context(context.clone(), || {
+            assert!(register_explicit_http_response(204, "", false));
+        });
+        let no_content = take_explicit_http_response().unwrap().unwrap();
+        assert_eq!(no_content.status, 204);
+        assert!(no_content.headers.is_empty());
+        assert!(no_content.body.is_empty());
+
+        with_request_context(context.clone(), || {
+            assert!(register_explicit_http_response(
+                204,
+                "forbidden body",
+                false
+            ));
+        });
+        assert!(take_explicit_http_response().unwrap().is_err());
+
+        with_request_context(context, || {
+            assert!(register_explicit_http_response(204, "null", true));
+        });
+        assert!(take_explicit_http_response().unwrap().is_err());
+    }
+
+    #[test]
+    fn multiple_explicit_response_calls_fail_closed() {
+        let context = RequestContext {
+            request: HttpRequest {
+                method: HttpMethod::Get,
+                path: "/test".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+        with_request_context(context, || {
+            assert!(register_explicit_http_response(200, "first", false));
+            assert!(register_explicit_http_response(200, "second", false));
+        });
+        assert!(take_explicit_http_response().unwrap().is_err());
+    }
+
     // A deterministic reader forces TCP-like fragmentation without sleeps.
     struct FixedChunkReader<'a> {
         remaining: &'a [u8],
@@ -1275,6 +1628,143 @@ mod tests {
                 name == "Content-Type" && value == "application/javascript; charset=utf-8"
             }));
         }
+    }
+
+    #[test]
+    fn web_dev_server_fences_cross_origin_mutations_before_dispatch() {
+        fn send(port: u16, raw: &str) -> String {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream.write_all(raw.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        }
+
+        let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
+        let host = format!("localhost:{}", server.port);
+        // A cross-origin script can DNS-rebind attacker.example to localhost.
+        // Read-only routes must reject that Host before any page or SSE dispatch.
+        let rebound_read = format!(
+            "GET / HTTP/1.1\r\nHost: attacker.example:{}\r\n\r\n",
+            server.port
+        );
+        assert!(
+            send(server.port, &rebound_read).starts_with("HTTP/1.1 403 Forbidden"),
+            "read routes must reject DNS-rebound hosts"
+        );
+
+        let trusted_read = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        assert!(
+            send(server.port, &trusted_read).starts_with("HTTP/1.1 404 Not Found"),
+            "valid read requests must reach normal routing"
+        );
+
+        let rebound_sse = format!(
+            "GET /__nulang/sse/room HTTP/1.1\r\nHost: attacker.example:{}\r\n\r\n",
+            server.port
+        );
+        assert!(
+            send(server.port, &rebound_sse).starts_with("HTTP/1.1 403 Forbidden"),
+            "SSE must reject an untrusted Host before subscribing"
+        );
+
+        let missing_host = "GET / HTTP/1.1\r\nConnection: close\r\n\r\n";
+        assert!(
+            send(server.port, missing_host).starts_with("HTTP/1.1 403 Forbidden"),
+            "HTTP reads without Host must fail closed"
+        );
+
+        let foreign = format!(
+            "POST /mutation HTTP/1.1\r\nHost: {host}\r\nOrigin: https://attacker.example\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(send(server.port, &foreign).starts_with("HTTP/1.1 403 Forbidden"));
+
+        let missing =
+            format!("POST /mutation HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\n\r\n");
+        assert!(send(server.port, &missing).starts_with("HTTP/1.1 403 Forbidden"));
+
+        let trusted = format!(
+            "POST /mutation HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(
+            send(server.port, &trusted).starts_with("HTTP/1.1 404 Not Found"),
+            "same-origin requests must reach normal routing"
+        );
+
+        let duplicate = format!(
+            "POST /mutation HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nOrigin: https://attacker.example\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(send(server.port, &duplicate).starts_with("HTTP/1.1 403 Forbidden"));
+
+        let unknown = format!("TRACE / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        assert!(send(server.port, &unknown).starts_with("HTTP/1.1 501 Not Implemented"));
+    }
+
+    // Regression for untrusted response metadata crossing the HTTP/1.1 wire.
+    fn write_test_response(response: HttpResponse) -> String {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local test listener");
+        let address = listener.local_addr().expect("local listener address");
+        let server = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().expect("accept test connection");
+            HttpServerState::write_response(&mut connection, &response);
+        });
+        let mut connection = TcpStream::connect(address).expect("connect test client");
+        let mut output = Vec::new();
+        connection
+            .read_to_end(&mut output)
+            .expect("read HTTP response");
+        server.join().expect("response writer did not panic");
+        String::from_utf8(output).expect("HTTP output is UTF-8")
+    }
+
+    #[test]
+    fn test_response_writer_rejects_crlf_and_framing_headers() {
+        for (name, value) in [
+            ("X-Test\r\nX-Injected", "safe"),
+            ("X-Test", "safe\r\nX-Injected: yes"),
+            ("X-Test", "safe\nX-Injected: yes"),
+            ("X-Test", "safe\0trailing"),
+            ("Content-Length", "1"),
+            ("Transfer-Encoding", "chunked"),
+        ] {
+            let result = write_test_response(HttpResponse {
+                status: 200,
+                headers: vec![(name.into(), value.into())],
+                body: b"trusted".to_vec(),
+            });
+            assert!(
+                result.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+                "{result}"
+            );
+            assert!(!result.contains("X-Injected"), "{result}");
+            assert!(!result.contains("trusted"), "{result}");
+            assert_eq!(result.matches("Content-Length:").count(), 1, "{result}");
+        }
+    }
+
+    #[test]
+    fn test_cookie_helpers_reject_header_and_attribute_injection() {
+        let _ = take_response_cookies();
+        set_cookie("session\r\nX-Injected: yes", "token");
+        set_cookie("session", "token\r\nX-Injected: yes");
+        set_cookie("session", "token; SameSite=None");
+        set_cookie("session", "token\"; Secure");
+        clear_cookie("session\r\nX-Injected: yes");
+        assert!(take_response_cookies().is_empty());
+
+        set_cookie("session", "safe_token-123");
+        clear_cookie("session");
+        let cookies = take_response_cookies();
+        assert_eq!(cookies.len(), 2);
+        assert_eq!(
+            cookies[0],
+            "session=safe_token-123; Path=/; HttpOnly; SameSite=Lax"
+        );
+        assert_eq!(cookies[1], "session=; Path=/; Max-Age=0; SameSite=Lax");
     }
 
     #[test]
