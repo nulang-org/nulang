@@ -31,6 +31,9 @@ const WAL_RECORD_VERSION: u16 = 1;
 const WAL_FRAME_PREFIX_BYTES: usize = 4 + 2 + 4;
 const WAL_FRAME_HEADER_BYTES: usize = WAL_FRAME_PREFIX_BYTES + 32;
 const MAX_WAL_RECORD_BYTES: usize = 64 * 1024 * 1024;
+// Hard ceilings on the direct group-commit API, independent of owner scheduling.
+const MAX_WAL_BATCH_RECORDS: usize = 4096;
+const MAX_WAL_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,12 +288,6 @@ impl FileWal {
         self.record_end_offsets.get(index).copied()
     }
 
-    /// Rebuild the single-node MVCC tablet from the durable WAL prefix.
-    ///
-    /// Historical ownership epochs are retained as log metadata but are not
-    /// compared with the descriptor's current owner epoch during replay.
-    /// Tablet identity, sequence order, and key-range membership remain
-    /// fail-closed.
     pub fn recover_memory_tablet(
         &self,
         descriptor: TabletDescriptor,
@@ -334,7 +331,6 @@ impl FileWal {
         Ok(tablet)
     }
 
-    /// Replay records newer than an already restored checkpoint.
     pub fn replay_after_checkpoint(&self, tablet: &mut MemoryTablet) -> Result<(), WalError> {
         if tablet.current_sequence() < self.base_sequence {
             return Err(WalError::CheckpointTooOld {
@@ -385,10 +381,6 @@ impl FileWal {
         Ok(())
     }
 
-    /// Atomically replace the WAL with an empty log whose durable predecessor
-    /// is `base_sequence`. Initial reclamation is intentionally tail-only:
-    /// checkpoints are taken at the current committed sequence, so no retained
-    /// post-checkpoint records need to be copied during the rewrite.
     pub fn reclaim_through(&mut self, base_sequence: u64) -> Result<(), WalError> {
         if self.poisoned {
             return Err(WalError::Poisoned);
@@ -401,11 +393,6 @@ impl FileWal {
             });
         }
 
-        // Reclamation can replace the canonical WAL path while `self.file`
-        // still references the old inode. From the first fallible mutation
-        // onward, any error therefore requires reopening the WAL before another
-        // append is allowed. A successful reopen below replaces `self` and
-        // clears the poison state.
         self.poisoned = true;
 
         let temp = reclaim_temp_path(&self.path);
@@ -444,11 +431,6 @@ impl FileWal {
         Ok(())
     }
 
-    /// Durably append one prepared tablet write.
-    ///
-    /// The in-memory tail advances only after the complete record and checksum
-    /// have been written and `sync_data` succeeds. If an I/O failure leaves a
-    /// partial physical append, reopening the WAL truncates that crash tail.
     pub fn append_write(&mut self, write: &TabletWrite) -> Result<(), WalError> {
         if self.poisoned {
             return Err(WalError::Poisoned);
@@ -510,10 +492,6 @@ impl FileWal {
         let checksum = blake3::hash(&payload);
         let header = encode_frame_header(payload_len);
 
-        // Seeking does not mutate the file. Once the first frame byte may have
-        // been emitted, every early return leaves this handle poisoned. The
-        // only safe way to continue is to reopen, which validates/truncates the
-        // physical tail before accepting another append.
         self.file.seek(SeekFrom::End(0))?;
         self.poisoned = true;
 
@@ -556,6 +534,137 @@ impl FileWal {
         self.latest_ownership_epoch = Some(record.ownership_epoch);
         self.records.push(record);
         self.record_end_offsets.push(end);
+        self.poisoned = false;
+        Ok(())
+    }
+
+    /// Durably append a consecutive group of prepared writes with one sync.
+    ///
+    /// Every record is validated and serialized before the first file mutation.
+    /// The on-disk format remains the existing self-validating `NUDBWAL3`
+    /// record stream, so restart and checkpoint compatibility are unchanged.
+    /// If an I/O error occurs after bytes begin to be emitted, the live handle
+    /// remains poisoned and callers must reopen to resolve the durable prefix.
+    pub fn append_batch(&mut self, writes: &[TabletWrite]) -> Result<(), WalError> {
+        if self.poisoned {
+            return Err(WalError::Poisoned);
+        }
+        if writes.is_empty() {
+            return Ok(());
+        }
+        // Preflight count before cloning, serializing, or writing anything.
+        if writes.len() > MAX_WAL_BATCH_RECORDS {
+            return Err(WalError::BatchTooManyRecords(writes.len()));
+        }
+
+        let start_offset = self.file.seek(SeekFrom::End(0))?;
+        let mut next_offset = start_offset;
+        let mut expected_tablet = self.tablet_id;
+        let mut latest_epoch = self.latest_ownership_epoch;
+        let mut last_sequence = self.last_sequence();
+        let mut prepared = Vec::with_capacity(writes.len());
+        let mut total_frame_bytes = 0_usize;
+
+        for write in writes {
+            let record = WalRecord::from_write(write);
+            validate_record_chain(
+                &record,
+                expected_tablet,
+                latest_epoch,
+                last_sequence,
+                next_offset,
+            )?;
+
+            let payload =
+                serde_json::to_vec(&record.to_disk()).map_err(|error| WalError::Serialization {
+                    message: error.to_string(),
+                })?;
+            if payload.len() > MAX_WAL_RECORD_BYTES {
+                return Err(WalError::RecordTooLarge {
+                    offset: next_offset,
+                    length: payload.len(),
+                });
+            }
+            let payload_len =
+                u32::try_from(payload.len()).map_err(|_| WalError::RecordTooLarge {
+                    offset: next_offset,
+                    length: payload.len(),
+                })?;
+            let header = encode_frame_header(payload_len);
+            let checksum = *blake3::hash(&payload).as_bytes();
+            let frame_len = header
+                .len()
+                .checked_add(payload.len())
+                .and_then(|len| len.checked_add(checksum.len()))
+                .ok_or_else(|| WalError::InvalidRecord {
+                    offset: next_offset,
+                    reason: "encoded WAL frame length overflow".to_string(),
+                })?;
+            // Bound aggregate staged frames even for direct append_batch callers.
+            // This runs before the first mutation of the file; failures remain
+            // retryable and do not poison the live handle.
+            total_frame_bytes = total_frame_bytes
+                .checked_add(frame_len)
+                .ok_or(WalError::BatchTooLarge(usize::MAX))?;
+            if total_frame_bytes > MAX_WAL_BATCH_BYTES {
+                return Err(WalError::BatchTooLarge(total_frame_bytes));
+            }
+            let end_offset = next_offset.checked_add(frame_len as u64).ok_or_else(|| {
+                WalError::InvalidRecord {
+                    offset: next_offset,
+                    reason: "WAL file offset overflow".to_string(),
+                }
+            })?;
+
+            expected_tablet = Some(record.tablet_id);
+            latest_epoch = Some(record.ownership_epoch);
+            last_sequence = record.sequence;
+            prepared.push((record, header, payload, checksum, end_offset));
+            next_offset = end_offset;
+        }
+
+        self.file.seek(SeekFrom::End(0))?;
+        self.poisoned = true;
+        for (_index, (_, header, payload, checksum, _)) in prepared.iter().enumerate() {
+            self.file.write_all(header)?;
+            #[cfg(test)]
+            if _index == 0 {
+                super::interruption::hit(
+                    super::interruption::StorageInterruptionPoint::WalBatchAfterHeader,
+                )?;
+            }
+
+            self.file.write_all(payload)?;
+            #[cfg(test)]
+            if _index == 0 {
+                super::interruption::hit(
+                    super::interruption::StorageInterruptionPoint::WalBatchAfterPayload,
+                )?;
+            }
+
+            self.file.write_all(checksum)?;
+            #[cfg(test)]
+            if _index == 0 {
+                super::interruption::hit(
+                    super::interruption::StorageInterruptionPoint::WalBatchAfterChecksum,
+                )?;
+            }
+        }
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::WalBatchAfterFrames,
+        )?;
+
+        self.file.sync_data()?;
+        #[cfg(test)]
+        super::interruption::hit(super::interruption::StorageInterruptionPoint::WalBatchAfterSync)?;
+
+        for (record, _, _, _, end_offset) in prepared {
+            self.records.push(record);
+            self.record_end_offsets.push(end_offset);
+        }
+        self.tablet_id = expected_tablet;
+        self.latest_ownership_epoch = latest_epoch;
         self.poisoned = false;
         Ok(())
     }
@@ -752,7 +861,6 @@ fn read_up_to(file: &mut File, buffer: &mut [u8]) -> io::Result<usize> {
     Ok(total)
 }
 
-/// WAL validation or I/O failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalError {
     Io {
@@ -784,6 +892,8 @@ pub enum WalError {
         offset: u64,
         length: usize,
     },
+    BatchTooManyRecords(usize),
+    BatchTooLarge(usize),
     ChecksumMismatch {
         offset: u64,
     },
@@ -867,6 +977,12 @@ impl fmt::Display for WalError {
                 f,
                 "WAL record at byte offset {offset} is too large ({length} bytes)"
             ),
+            Self::BatchTooManyRecords(count) => {
+                write!(f, "WAL group commit has too many records ({count})")
+            }
+            Self::BatchTooLarge(bytes) => {
+                write!(f, "WAL group commit exceeds staged byte limit ({bytes} bytes)")
+            }
             Self::ChecksumMismatch { offset } => {
                 write!(f, "WAL checksum mismatch at byte offset {offset}")
             }
@@ -984,7 +1100,6 @@ mod hardening_tests {
                 .write(true)
                 .open(&path)
                 .unwrap();
-            // WAL header (64) + record magic (4) + frame version (2) => payload length.
             file.seek(SeekFrom::Start(70)).unwrap();
             let mut length = [0_u8; 4];
             std::io::Read::read_exact(&mut file, &mut length).unwrap();
@@ -1051,9 +1166,6 @@ mod hardening_tests {
 
         drop(wal);
 
-        // A complete frame can be visible on reopen even though no durability
-        // acknowledgement was returned. Recovery, not an in-process retry,
-        // resolves that ambiguous outcome.
         let reopened = FileWal::open(&path).unwrap();
         assert_eq!(reopened.last_sequence(), 1);
 
@@ -1079,8 +1191,6 @@ mod hardening_tests {
 
         drop(wal);
 
-        // The injected failure happens after sync_data: reopening resolves the
-        // ambiguous outcome by recovering the durable record.
         let reopened = FileWal::open(&path).unwrap();
         assert_eq!(reopened.last_sequence(), 1);
         assert_eq!(reopened.records().len(), 1);

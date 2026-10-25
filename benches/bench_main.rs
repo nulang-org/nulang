@@ -7,6 +7,7 @@ mod actor_bench;
 #[cfg(feature = "native-codegen")]
 mod aot_bench;
 mod cache_bench;
+mod database_bench;
 mod dist_bench;
 mod gc_bench;
 mod interp_bench;
@@ -30,6 +31,7 @@ criterion_main!(
     dist_bench::benches,
     persist_bench::benches,
     scheduler_bench::benches,
+    database_bench::benches,
 );
 
 #[cfg(not(feature = "native-codegen"))]
@@ -42,4 +44,5 @@ criterion_main!(
     dist_bench::benches,
     persist_bench::benches,
     scheduler_bench::benches,
+    database_bench::benches,
 );
