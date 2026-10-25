@@ -317,17 +317,32 @@ impl MemoryTablet {
                 return Err(TabletError::KeyOutsideTabletRange);
             }
 
+            // Before duplicate-key batches were normalized on commit, v1
+            // checkpoints could contain consecutive versions with identical
+            // sequences. Accept only that historical representation, and
+            // retain its last value (including a tombstone) for each commit.
+            // Zero, future, or decreasing sequences remain invalid.
+            let mut versions = row.versions;
             let mut previous = 0_u64;
-            for version in &row.versions {
+            for version in &versions {
                 if version.sequence == 0
                     || version.sequence > state.current_sequence
-                    || version.sequence <= previous
+                    || version.sequence < previous
                 {
                     return Err(TabletError::InvalidSnapshotHistory);
                 }
                 previous = version.sequence;
             }
-            if rows.insert(row.key, row.versions).is_some() {
+            // dedup_by passes the later item first. Transfer its value into
+            // the retained earlier item without cloning or reallocating.
+            versions.dedup_by(|later, earlier| {
+                if later.sequence != earlier.sequence {
+                    return false;
+                }
+                earlier.value = later.value.take();
+                true
+            });
+            if rows.insert(row.key, versions).is_some() {
                 return Err(TabletError::InvalidSnapshotHistory);
             }
         }
