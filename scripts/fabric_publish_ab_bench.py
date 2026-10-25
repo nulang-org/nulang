@@ -30,39 +30,67 @@ START = "/// Cost of publishing to an unmatched Fabric topic as unrelated idle a
 GROUP = "criterion_group!(\n    benches,"
 CANDIDATE_GROUP_TAIL = "    bench_selective_receive,\n    bench_fabric_publish_unmatched\n);"
 BASE_GROUP_TAIL = "    bench_selective_receive\n);"
+EXACT_START = "/// Unmatched publication with many unrelated exact-subject subscriptions."
+EXACT_CANDIDATE_TAIL = (
+    "    bench_fabric_publish_unmatched,\n"
+    "    bench_fabric_publish_unmatched_exact_subscriptions\n);"
+)
+EXACT_BASE_TAIL = "    bench_fabric_publish_unmatched\n);"
+EXACT_COUNTS = (0, 256, 2048)
+EXACT_BENCHMARK_GROUP = "actor/fabric_publish_unmatched_exact_subscriptions"
 
 
-def matched_fixture(base: str, candidate: str) -> str:
-    """Reject any benchmark differences other than this one measured fixture."""
-    if candidate.count(START) != 1 or candidate.count(CANDIDATE_GROUP_TAIL) != 1:
+def select_mode(base: str, candidate: str) -> str | None:
+    """Run paired A/B only when a recognized benchmark fixture was added."""
+    if EXACT_START in candidate and EXACT_START not in base:
+        return "exact"
+    if START in candidate and START not in base:
+        return "idle"
+    return None
+
+
+def matched_fixture(base: str, candidate: str, mode: str = "idle") -> str:
+    """Reject every benchmark difference except the selected fixture."""
+    if mode == "idle":
+        start, candidate_tail, base_tail = START, CANDIDATE_GROUP_TAIL, BASE_GROUP_TAIL
+    elif mode == "exact":
+        start, candidate_tail, base_tail = (
+            EXACT_START, EXACT_CANDIDATE_TAIL, EXACT_BASE_TAIL
+        )
+    else:
+        raise ValueError(f"unknown Fabric benchmark mode: {mode}")
+    if candidate.count(start) != 1 or candidate.count(candidate_tail) != 1:
         raise RuntimeError("expected exactly one Fabric benchmark fixture and group entry")
-    begin = candidate.index(START)
+    begin = candidate.index(start)
     end = candidate.find(GROUP, begin)
     if end < 0:
         raise RuntimeError("benchmark group missing after Fabric fixture")
     stripped = candidate[:begin] + candidate[end:]
-    stripped = stripped.replace(CANDIDATE_GROUP_TAIL, BASE_GROUP_TAIL, 1)
+    stripped = stripped.replace(candidate_tail, base_tail, 1)
     if stripped != base:
         raise RuntimeError("base and candidate benchmark bodies differ beyond Fabric fixture")
     return candidate
 
 
-def read_estimates(target_dir: Path) -> dict[str, float]:
+def read_estimates(
+    target_dir: Path,
+    counts: tuple[int, ...] = COUNTS,
+    benchmark_group: str = BENCHMARK_GROUP,
+) -> dict[str, float]:
     results: dict[str, float] = {}
-    for count in COUNTS:
+    for count in counts:
         path = (
-            target_dir / "criterion" / CRITERION_GROUP_DIR / str(count)
-            / "new" / "estimates.json"
+            target_dir / "criterion" / benchmark_group.replace("/", "_")
+            / str(count) / "new" / "estimates.json"
         )
         if not path.is_file():
             raise RuntimeError(f"Criterion report missing: {path}")
         payload = json.loads(path.read_text())
         value = float(payload["mean"]["point_estimate"])
         if not math.isfinite(value) or value <= 0:
-            raise RuntimeError(f"invalid Criterion mean for {count} actors")
+            raise RuntimeError(f"invalid Criterion mean for {count} entries")
         results[str(count)] = value
     return results
-
 
 def summarize_pairs(base: list[float], candidate: list[float]) -> dict[str, float | int]:
     if len(base) != len(candidate) or not base:
@@ -100,6 +128,7 @@ def execute(command: list[str], cwd: Path, env: dict[str, str] | None = None,
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-ref", required=True)
+    parser.add_argument("--mode", choices=("idle", "exact"), default="idle")
     parser.add_argument("--runs", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--output", type=Path, default=Path("fabric-publish-ab.json"))
@@ -112,6 +141,10 @@ def main() -> int:
     if not allowed:
         raise RuntimeError("no allowed CPU")
     cpu = allowed[0]
+    counts = EXACT_COUNTS if args.mode == "exact" else COUNTS
+    benchmark_group = (
+        EXACT_BENCHMARK_GROUP if args.mode == "exact" else BENCHMARK_GROUP
+    )
 
     root = Path(tempfile.mkdtemp(prefix="fabric-publish-ab-"))
     base = root / "base"
@@ -121,7 +154,7 @@ def main() -> int:
         created = True
         candidate_content = (ROOT / BENCH_FILE).read_text()
         base_path = base / BENCH_FILE
-        fixture = matched_fixture(base_path.read_text(), candidate_content)
+        fixture = matched_fixture(base_path.read_text(), candidate_content, mode=args.mode)
         base_path.write_text(fixture)
 
         variants = {"base": base, "candidate": ROOT}
@@ -137,7 +170,7 @@ def main() -> int:
             )
 
         samples: dict[str, dict[str, list[float]]] = {
-            name: {str(count): [] for count in COUNTS} for name in variants
+            name: {str(count): [] for count in counts} for name in variants
         }
         for i in range(args.warmup + args.runs):
             order = ("base", "candidate") if i % 2 == 0 else ("candidate", "base")
@@ -145,11 +178,14 @@ def main() -> int:
                 print(f"[{'warmup' if i < args.warmup else 'sample'} {i + 1}] {name}", flush=True)
                 execute(
                     ["cargo", "bench", "--locked", "--no-default-features",
-                     "--bench", "bench_main", "--", BENCHMARK_GROUP,
+                     "--bench", "bench_main", "--", benchmark_group,
                      "--sample-size", "10", "--warm-up-time", "0.2",
                      "--measurement-time", "1", "--noplot"], variants[name], envs[name], cpu,
                 )
-                recorded = read_estimates(Path(envs[name]["CARGO_TARGET_DIR"]))
+                recorded = read_estimates(
+                    Path(envs[name]["CARGO_TARGET_DIR"]), counts=counts,
+                    benchmark_group=benchmark_group,
+                )
                 if i >= args.warmup:
                     for count, estimate in recorded.items():
                         samples[name][count].append(estimate)
@@ -157,10 +193,13 @@ def main() -> int:
         comparisons = {
             str(count): summarize_pairs(
                 samples["base"][str(count)], samples["candidate"][str(count)]
-            ) for count in COUNTS
+            ) for count in counts
         }
         report = {
             "schema": 1,
+            "mode": args.mode,
+            "benchmark_group": benchmark_group,
+            "counts": list(counts),
             "methodology": "exact-base same-fixture paired Criterion, 1 pinned CPU",
             "base_ref": args.base_ref,
             "base_sha": execute(["git", "rev-parse", "HEAD"], base).strip(),
@@ -175,7 +214,7 @@ def main() -> int:
         args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
         for count, row in comparisons.items():
             print(
-                f"fabric_publish_unmatched/{count}: "
+                f"{benchmark_group}/{count}: "
                 f"{row['median_base_ns']:.1f} ns base, "
                 f"{row['median_candidate_ns']:.1f} ns candidate, "
                 f"{row['median_speedup_x']:.3f}x paired speedup"
