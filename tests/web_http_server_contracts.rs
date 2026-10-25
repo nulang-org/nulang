@@ -92,7 +92,11 @@ fn web_main() {
         .parse_module()
         .expect("parse form contract source");
     let contracts = compile_module_contracts(&ast);
-    assert!(contracts.diagnostics.is_empty(), "{:?}", contracts.diagnostics);
+    assert!(
+        contracts.diagnostics.is_empty(),
+        "{:?}",
+        contracts.diagnostics
+    );
     let plan =
         compile_runtime_route_plan(&contracts.routes[0]).expect("compile form runtime route plan");
 
@@ -261,7 +265,10 @@ fn unambiguous_typed_form_executes_over_real_http() {
     );
     let response = send_raw_request(server.port, &request);
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
-    assert!(response_body(&response).starts_with("hello world"), "{response}");
+    assert!(
+        response_body(&response).starts_with("hello world"),
+        "{response}"
+    );
 }
 
 #[test]
