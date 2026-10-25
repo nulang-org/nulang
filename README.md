@@ -197,6 +197,8 @@ nulang registry serve        # run a local package registry server
 nulang nula remove <name>    # remove a dependency
 nulang nula list             # list locked dependencies
 nulang nula clean            # remove build artifacts
+# Optional: a package can declare [rust] manifest = "native/Cargo.toml"
+# for a Cargo-managed, locked native cdylib adapter (see docs/CARGO_INTEROP.md).
 nulang nula doc              # generate Markdown API docs
 ```
 

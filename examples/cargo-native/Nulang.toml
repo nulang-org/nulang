@@ -1,0 +1,7 @@
+[package]
+name = "cargo-native-demo"
+version = "0.1.0"
+entry = "src/main.nula"
+
+[rust]
+manifest = "native/Cargo.toml"

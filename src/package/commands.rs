@@ -840,6 +840,10 @@ fn prepare_package() -> NuResult<PathBuf> {
             span: Span::default(),
         })?;
 
+    if let Some(native) = &manifest.rust {
+        super::cargo::build_native(&root, native)?;
+    }
+
     let entry = root.join(&manifest.package.entry);
     if !entry.exists() {
         return Err(NuError::PackageError {
@@ -1246,6 +1250,12 @@ fn cmd_build_wasm() -> NuResult<()> {
         span: Span::default(),
     })?;
     let name = manifest.package.name.clone();
+    if manifest.rust.is_some() {
+        return Err(NuError::PackageError {
+            msg: "native Cargo adapters are not supported by nula build-wasm".into(),
+            span: Span::default(),
+        });
+    }
 
     let entry = prepare_package()?;
     let entry_str = entry.to_string_lossy().into_owned();
@@ -2044,6 +2054,13 @@ fn cmd_list() -> NuResult<()> {
 /// `nula clean`: remove build artifacts (.nula/dist/ directory).
 fn cmd_clean() -> NuResult<()> {
     let root = package_root()?;
+    let native_dir = root.join(".nula").join("native");
+    if native_dir.exists() {
+        std::fs::remove_dir_all(&native_dir).map_err(|e| NuError::PackageError {
+            msg: format!("cannot remove {}: {}", native_dir.display(), e),
+            span: Span::default(),
+        })?;
+    }
     let dist_dir = root.join(".nula").join("dist");
     if dist_dir.exists() {
         eprintln!("Cleaning build artifacts...");
