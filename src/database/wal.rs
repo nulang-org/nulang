@@ -51,6 +51,20 @@ struct DiskWalRecord {
     mutations: Vec<TabletMutation>,
 }
 
+/// Serialize from the retained WAL record without cloning its mutations again.
+///
+/// Field names and ordering intentionally match `DiskWalRecord` so legacy
+/// NUDBWAL3 JSON frames remain byte-for-byte compatible.
+#[derive(serde::Serialize)]
+struct DiskWalRecordRef<'a> {
+    version: u16,
+    tablet_id: u64,
+    ownership_epoch: u64,
+    sequence: u64,
+    expected_previous_sequence: u64,
+    mutations: &'a [TabletMutation],
+}
+
 /// One validated record recovered from or appended to a tablet WAL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalRecord {
@@ -99,6 +113,7 @@ impl WalRecord {
         })
     }
 
+    #[cfg(test)]
     fn to_disk(&self) -> DiskWalRecord {
         DiskWalRecord {
             version: WAL_RECORD_VERSION,
@@ -128,6 +143,19 @@ impl WalRecord {
 
     pub fn mutations(&self) -> &[TabletMutation] {
         &self.mutations
+    }
+}
+
+impl<'a> From<&'a WalRecord> for DiskWalRecordRef<'a> {
+    fn from(record: &'a WalRecord) -> Self {
+        Self {
+            version: WAL_RECORD_VERSION,
+            tablet_id: record.tablet_id.get(),
+            ownership_epoch: record.ownership_epoch,
+            sequence: record.sequence,
+            expected_previous_sequence: record.expected_previous_sequence,
+            mutations: &record.mutations,
+        }
     }
 }
 
@@ -492,10 +520,11 @@ impl FileWal {
             }
         }
 
-        let payload =
-            serde_json::to_vec(&record.to_disk()).map_err(|error| WalError::Serialization {
+        let payload = serde_json::to_vec(&DiskWalRecordRef::from(&record)).map_err(|error| {
+            WalError::Serialization {
                 message: error.to_string(),
-            })?;
+            }
+        })?;
         if payload.len() > MAX_WAL_RECORD_BYTES {
             return Err(WalError::RecordTooLarge {
                 offset: self.file.stream_position()?,
@@ -966,6 +995,38 @@ mod hardening_tests {
             }],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn borrowed_wal_encoding_preserves_legacy_json_bytes() {
+        let descriptor = descriptor();
+        let write = TabletWrite::prepare(
+            &descriptor,
+            1,
+            0,
+            0,
+            vec![
+                TabletMutation::Put {
+                    key: b"escaped".to_vec(),
+                    value: b"quoted \"value\" with newline\\n".to_vec(),
+                },
+                TabletMutation::Delete {
+                    key: b"gone".to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+        let record = WalRecord::from_write(&write);
+        let legacy = record.to_disk();
+        let borrowed = DiskWalRecordRef::from(&record);
+
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+        let borrowed_bytes = serde_json::to_vec(&borrowed).unwrap();
+        assert_eq!(borrowed_bytes, legacy_bytes);
+
+        let decoded: DiskWalRecord = serde_json::from_slice(&borrowed_bytes).unwrap();
+        assert_eq!(decoded.sequence, write.sequence());
+        assert_eq!(decoded.mutations, write.mutations());
     }
 
     #[test]
