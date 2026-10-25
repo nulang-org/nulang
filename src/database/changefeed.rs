@@ -23,10 +23,7 @@ pub enum ChangefeedError {
         oldest_available_after: u64,
     },
     /// The cursor is ahead of the tablet's last committed transaction.
-    CursorAhead {
-        requested_after: u64,
-        latest: u64,
-    },
+    CursorAhead { requested_after: u64, latest: u64 },
 }
 
 impl fmt::Display for ChangefeedError {
