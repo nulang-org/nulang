@@ -318,7 +318,10 @@ pub fn parse_urlencoded_with_duplicates(
         }
         let (key, value) = part.split_once('=').unwrap_or((part, ""));
         let name = percent_decode_form(key);
-        if out.insert(name.clone(), percent_decode_form(value)).is_some() {
+        if out
+            .insert(name.clone(), percent_decode_form(value))
+            .is_some()
+        {
             duplicates.insert(name);
         }
     }
