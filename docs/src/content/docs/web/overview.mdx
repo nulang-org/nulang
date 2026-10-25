@@ -117,6 +117,49 @@ The `stdlib::web::html` module adds ergonomic helpers: `el`, `txt`, `attr`, `bod
 `Web.redirect` produces an HTML page with a `<meta http-equiv="refresh">` and is sent with status 200 — not an HTTP 3xx. Browsers follow it; API clients will not.
 :::
 
+### Typed response content types (experimental)
+
+The compiler-visible Web Contract IR now retains a route handler's explicit
+return type for the development HTTP host:
+
+| Return type | HTTP media type | Notes |
+|---|---|---|
+| `Html` | `text/html; charset=utf-8` | Browser runtime injection remains enabled |
+| `String`, `Int`, `Float`, `Bool` | `text/plain; charset=utf-8` | No browser runtime injected |
+| No source return type available | Legacy `text/html; charset=utf-8` | Backwards compatible |
+| Any other explicit type | HTTP 500 | Fails closed until its transport encoding is defined |
+
+These are response *media* semantics only; this is not yet an implementation of
+`Json[T]`, binary streaming, custom HTTP statuses, or structured response
+headers. In particular, an arbitrary String is **not** automatically encoded as
+JSON. The portable WASM/Cloud Web host boundary is not yet equivalent.
+
+### Explicit JSON, text, and status responses (experimental)
+
+For a routed native development-server request, use the new `Web` response
+effects when an API endpoint must return JSON or a non-default status:
+
+```nulang
+fn created() {
+    perform Web.respond_json(201, "{\"ok\":true}")
+}
+
+fn rejected() {
+    perform Web.respond_text(422, "validation failed")
+}
+```
+
+`Web.respond_json(status, body)` accepts a **pre-encoded JSON string** that
+the HTTP host validates and reserializes; it does **not** serialize arbitrary
+Nulang values or supply a schema-typed `Json[T]`. The native host sets
+`application/json` without browser runtime injection. `Web.respond_text`
+uses `text/plain; charset=utf-8`. Invalid JSON, unsupported statuses, and
+multiple response calls fail closed. Status `204` is allowed only for an empty
+text response; use `Web.redirect` for redirect responses.
+
+These effects do not yet provide custom headers, binary payloads, streaming,
+or equivalent Cloud/WASM execution. They are **not production-certified**.
+
 ### Reading the Request
 
 Inside a handler, these operations access the current request:
