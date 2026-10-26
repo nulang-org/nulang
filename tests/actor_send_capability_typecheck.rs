@@ -1,7 +1,8 @@
 //! Keep payload type matching separate from actor-message transfer authority.
 //! These are compiler source tests, not assertions about an arbitrarily shared
 //! `target/debug/nulang` binary from another Cargo worktree.
-use nulang::effect_checker::EffectChecker;
+use nulang::ast::Decl;
+use nulang::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
 use nulang::lexer::Lexer;
 use nulang::parser::Parser;
 use nulang::typechecker::TypeChecker;
@@ -20,7 +21,16 @@ fn compile_actor_send(capability: &str, value: &str) -> Result<(), String> {
         .map_err(|e| format!("type: {e}"))?;
     EffectChecker::new()
         .check_module(&ast.decls)
-        .map_err(|e| format!("cap: {e}"))?;
+        .map_err(|e| format!("effect: {e}"))?;
+    // Mirrors main.rs's independent capability-analysis pass: EffectChecker
+    // analyzes effect rows; it does not enforce sendability on its own.
+    let mut caps = CapabilityAnalyzer::new();
+    for decl in &ast.decls {
+        if let Decl::Function { body, .. } = decl {
+            caps.infer_cap(&CapContext::new(), body)
+                .map_err(|e| format!("cap: {e}"))?;
+        }
+    }
     Ok(())
 }
 
