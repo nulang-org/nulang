@@ -92,15 +92,19 @@ fn workflow_emit_success_is_visible_in_journal_after_commit() {
 #[test]
 fn workflow_emit_rejects_unresolved_payload_instead_of_persisting_nil() {
     let (mut rt, id) = fresh_workflow();
+    // Spawning a workflow already persists WorkflowStarted. A failed Emit
+    // must preserve that existing journal exactly, without adding output.
+    let journal_before = serde_json::to_value(rt.persistence.read_workflow_events(id)).unwrap();
     // This is a string-pool reference without an owning module. Legacy
     // serialization silently converts it into PersistedValue::Nil.
     let error = rt
         .try_emit_event(id, "WorkflowOutput", &[Value::string(999)])
         .expect_err("an unresolved value cannot become a durable nil receipt");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-    assert!(
-        rt.persistence.read_workflow_events(id).is_empty(),
-        "a rejected output must not enter the durable journal"
+    let journal_after = serde_json::to_value(rt.persistence.read_workflow_events(id)).unwrap();
+    assert_eq!(
+        journal_after, journal_before,
+        "a rejected output must not alter the pre-existing durable journal"
     );
     assert!(
         rt.actors[&id].event_log.is_empty(),
@@ -145,6 +149,7 @@ fn workflow_emit_persists_live_actor_heap_string_with_exact_contents() {
 #[test]
 fn workflow_emit_rejects_non_string_actor_heap_pointer_without_a_receipt() {
     let (mut rt, id) = fresh_workflow();
+    let journal_before = serde_json::to_value(rt.persistence.read_workflow_events(id)).unwrap();
     let array = rt
         .actors
         .get_mut(&id)
@@ -156,7 +161,11 @@ fn workflow_emit_rejects_non_string_actor_heap_pointer_without_a_receipt() {
         .try_emit_event(id, "WorkflowOutput", &[array])
         .expect_err("non-string heap payload must fail rather than become Nil");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-    assert!(rt.persistence.read_workflow_events(id).is_empty());
+    let journal_after = serde_json::to_value(rt.persistence.read_workflow_events(id)).unwrap();
+    assert_eq!(
+        journal_after, journal_before,
+        "a rejected pointer must preserve the pre-existing durable journal"
+    );
     assert!(rt.actors[&id].event_log.is_empty());
 }
 
