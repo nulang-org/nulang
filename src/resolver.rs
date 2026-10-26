@@ -403,7 +403,11 @@ mod tests {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/behavior");
         let resolved = resolve_path(&base, "subpkg::helper");
         assert_eq!(resolved, base.join("subpkg").join("helper.nula"));
-        assert!(resolved.is_file(), "expected existing nested module: {}", resolved.display());
+        assert!(
+            resolved.is_file(),
+            "expected existing nested module: {}",
+            resolved.display()
+        );
     }
 
     #[test]
