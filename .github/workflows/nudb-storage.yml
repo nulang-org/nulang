@@ -27,6 +27,20 @@ on:
 jobs:
   storage:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: nudb
+          POSTGRES_USER: nudb
+          POSTGRES_PASSWORD: nudbtest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nudb -d nudb"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -58,6 +72,10 @@ jobs:
           cargo test --locked --no-default-features --test nudb_consumer_ack_receipts
           cargo test --locked --no-default-features --test nudb_durable_file_sink
           cargo test --locked --no-default-features --test nudb_consumer_retirement
+      - name: Transactional PostgreSQL consumer effect/receipt contract
+        env:
+          NUDB_POSTGRES_TEST_URL: "host=127.0.0.1 port=5432 user=nudb password=nudbtest dbname=nudb"
+        run: cargo test --locked --no-default-features --features postgres --test nudb_postgres_sink
       - name: Group commit contract
         run: cargo test --locked --no-default-features --test nudb_group_commit
       - name: Durable transaction receipts, retries and recovery
