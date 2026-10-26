@@ -1,0 +1,7 @@
+// Capability unwrapping in send must not erase payload types.
+actor Sink { behavior recv(value: Int) { perform IO.print(value) } }
+fn main() {
+    let s = spawn Sink {}
+    let v = "wrong" :cap iso
+    send s recv(v)
+}
