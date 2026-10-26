@@ -286,3 +286,34 @@ provider-idempotent consumer or a durable Prepared/Completed effect adapter
 with crash-window tests. Complete exact-head CI, optional backend and
 compiler profile validation, and security review before enabling production
 receipt delivery.
+
+### Receipt-backed workflow output dispatch (experimental trusted host)
+
+`workflow_output_delivery::deliver_output_with_deduplication` connects a
+**verified** `WorkflowOutput` journal receipt with the existing durable effect
+coordinator. It first validates the entire workflow journal through the
+fallible read API, rejecting a forged/missing/ambiguous receipt. The durable
+request binds version, workflow actor, sequence, replay activation/ordinal,
+exact destination and output text. A replay whose destination or payload
+differs from the previously Prepared or Completed request is rejected before
+any provider call.
+
+On a new delivery, Prepared is **atomically committed** before invoking the
+provider. After a successful provider response, Completed records the result.
+A completed receipt is returned during replay **without redispatch**. If the
+provider returns an error or response is lost after acceptance, the state
+remains Prepared and recovery **must retry the same idempotency key**. The
+provider MUST durably deduplicate that key: a server that merely logs keys
+without enforcing them can still perform the external action twice. A trusted
+host must authenticate the actor/fencing epoch, authorize the exact delivery
+destination, configure retry/backoff, and use a compatible atomic persistence
+backend. This is a host Rust adapter, **not** an ambient VM network effect or
+an independent permission grant.
+
+Neither this adapter nor Prepared/Completed journal records provide an
+unconditional exactly-once guarantee across a remote boundary. Crash windows
+between provider acceptance and client acknowledgement cannot be closed by
+local journaling alone. The currently supported contract is provider-enforced
+**effectively-once deduplicated delivery**. Provider receipts and request
+identities must be retained for at least the workflow's retry horizon; new
+provider integrations require a separate security and replay review.
