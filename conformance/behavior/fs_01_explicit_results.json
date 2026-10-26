@@ -1,0 +1,8 @@
+{
+  "exit_code": 0,
+  "stdout": "write=ok\nappend=ok\nread=one+two\nempty_write=ok\nempty_read=ok\nmissing=read-failed\nwrite_dir=write-failed\nappend_dir=append-failed",
+  "stderr": "",
+  "capabilities": [
+    "fs"
+  ]
+}
