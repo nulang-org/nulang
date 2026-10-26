@@ -834,6 +834,25 @@ impl FileWal {
     /// If an I/O error occurs after bytes begin to be emitted, the live handle
     /// remains poisoned and callers must reopen to resolve the durable prefix.
     pub fn append_batch(&mut self, writes: &[TabletWrite]) -> Result<(), WalError> {
+        self.append_batch_internal(writes, None)
+    }
+
+    /// Opt-in physical WAL limit for a complete group: refuse every frame
+    /// before the first file mutation if their aggregate encoding exceeds
+    /// this caller-supplied budget. Never silently split a group to fit.
+    pub fn append_batch_with_budget(
+        &mut self,
+        writes: &[TabletWrite],
+        max_wal_bytes: u64,
+    ) -> Result<(), WalError> {
+        self.append_batch_internal(writes, Some(max_wal_bytes))
+    }
+
+    fn append_batch_internal(
+        &mut self,
+        writes: &[TabletWrite],
+        max_wal_bytes: Option<u64>,
+    ) -> Result<(), WalError> {
         if self.poisoned {
             return Err(WalError::Poisoned);
         }
@@ -911,6 +930,15 @@ impl FileWal {
             last_sequence = record.sequence;
             prepared.push((record, header, payload, checksum, end_offset));
             next_offset = end_offset;
+        }
+
+        if let Some(max_bytes) = max_wal_bytes {
+            if next_offset > max_bytes {
+                return Err(WalError::BudgetExceeded {
+                    max_bytes,
+                    projected_bytes: next_offset,
+                });
+            }
         }
 
         self.file.seek(SeekFrom::End(0))?;

@@ -216,6 +216,26 @@ impl WalBackedTablet {
         id: TransactionId,
         mutations: Vec<TabletMutation>,
     ) -> Result<TransactionReceipt, WalBackedError> {
+        self.commit_idempotent_internal(id, mutations, None)
+    }
+
+    /// Opt-in WAL budget for a new identified transaction. Already durable
+    /// matching receipts are returned without appending, even at a zero budget.
+    pub fn commit_idempotent_with_wal_budget(
+        &mut self,
+        id: TransactionId,
+        mutations: Vec<TabletMutation>,
+        max_wal_bytes: u64,
+    ) -> Result<TransactionReceipt, WalBackedError> {
+        self.commit_idempotent_internal(id, mutations, Some(max_wal_bytes))
+    }
+
+    fn commit_idempotent_internal(
+        &mut self,
+        id: TransactionId,
+        mutations: Vec<TabletMutation>,
+        max_wal_bytes: Option<u64>,
+    ) -> Result<TransactionReceipt, WalBackedError> {
         let digest = transaction_digest(&mutations);
         if let Some(receipt) = self.tablet.transaction_receipt(id) {
             if receipt.digest() != digest {
@@ -230,7 +250,10 @@ impl WalBackedTablet {
             mutations,
         )?;
         let write = write.with_identity(TransactionIdentity { id, digest });
-        let sequence = self.commit(write)?;
+        let sequence = match max_wal_bytes {
+            Some(max) => self.commit_with_wal_budget(write, max)?,
+            None => self.commit(write)?,
+        };
         // This lookup is infallible after a successful durable commit.
         let receipt = self
             .tablet
@@ -252,6 +275,25 @@ impl WalBackedTablet {
     pub fn commit_batch_idempotent(
         &mut self,
         entries: Vec<(TransactionId, Vec<TabletMutation>)>,
+    ) -> Result<Vec<TransactionReceipt>, WalBackedError> {
+        self.commit_batch_idempotent_internal(entries, None)
+    }
+
+    /// Opt-in WAL limit for every new record in an identified group. The
+    /// complete pending subset is admitted atomically before the first byte
+    /// is written; existing matching receipts cost zero additional WAL bytes.
+    pub fn commit_batch_idempotent_with_wal_budget(
+        &mut self,
+        entries: Vec<(TransactionId, Vec<TabletMutation>)>,
+        max_wal_bytes: u64,
+    ) -> Result<Vec<TransactionReceipt>, WalBackedError> {
+        self.commit_batch_idempotent_internal(entries, Some(max_wal_bytes))
+    }
+
+    fn commit_batch_idempotent_internal(
+        &mut self,
+        entries: Vec<(TransactionId, Vec<TabletMutation>)>,
+        max_wal_bytes: Option<u64>,
     ) -> Result<Vec<TransactionReceipt>, WalBackedError> {
         // Bound the *request*, not just new WAL records. A replay-only batch
         // must not bypass admission limits and allocate an unbounded dedup set.
@@ -292,7 +334,10 @@ impl WalBackedTablet {
         }
 
         if !pending.is_empty() {
-            self.wal.append_batch(&pending)?;
+            match max_wal_bytes {
+                Some(max) => self.wal.append_batch_with_budget(&pending, max)?,
+                None => self.wal.append_batch(&pending)?,
+            }
             for write in pending {
                 self.tablet.publish_validated(write);
             }
@@ -336,6 +381,24 @@ impl WalBackedTablet {
     /// error during the append can leave an ambiguous durable prefix, so the
     /// poisoned WAL contract requires reopen/recovery before retrying.
     pub fn commit_batch(&mut self, writes: Vec<TabletWrite>) -> Result<u64, WalBackedError> {
+        self.commit_batch_internal(writes, None)
+    }
+
+    /// Opt-in WAL limit for the entire prepared group (never partial
+    /// admission). No checkpoint or retention cursor mutation is attempted.
+    pub fn commit_batch_with_wal_budget(
+        &mut self,
+        writes: Vec<TabletWrite>,
+        max_wal_bytes: u64,
+    ) -> Result<u64, WalBackedError> {
+        self.commit_batch_internal(writes, Some(max_wal_bytes))
+    }
+
+    fn commit_batch_internal(
+        &mut self,
+        writes: Vec<TabletWrite>,
+        max_wal_bytes: Option<u64>,
+    ) -> Result<u64, WalBackedError> {
         if writes.is_empty() {
             return Ok(self.tablet.current_sequence());
         }
@@ -347,7 +410,10 @@ impl WalBackedTablet {
             projected_sequence = write.sequence();
         }
 
-        self.wal.append_batch(&writes)?;
+        match max_wal_bytes {
+            Some(max) => self.wal.append_batch_with_budget(&writes, max)?,
+            None => self.wal.append_batch(&writes)?,
+        }
         for write in writes {
             self.tablet.publish_validated(write);
         }
