@@ -47,6 +47,8 @@ jobs:
           cargo test --locked --no-default-features --test nudb_owner_backup_capture
           cargo test --locked --no-default-features --test nudb_backup_manifest_audit
           cargo test --locked --no-default-features --lib database::backup::tests
+      - name: Conservative retention decision contract
+        run: cargo test --locked --no-default-features --test nudb_retention_policy
       - name: Group commit contract
         run: cargo test --locked --no-default-features --test nudb_group_commit
       - name: Durable transaction receipts, retries and recovery
