@@ -1591,6 +1591,17 @@ pub fn process_network_packets(
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
             Packet::NodeGoodbye { node_id, durable } => {
+                // Confirmed removal may trigger durable actor re-spawn. The
+                // claimed identity must match the transport's sender before
+                // applying any directory entry or removal tombstone.
+                if node_id != incoming.from_node {
+                    warn!(
+                        "nulang-net: reject NodeGoodbye for {:?} from different peer {:?}",
+                        node_id, incoming.from_node
+                    );
+                    continue;
+                }
+
                 // RFC 0014 §1 path 1: the sender declares its durable actors
                 // checkpointed and terminated. Fold its manifest into the
                 // directory (highest-epoch-wins) and confirm-gone it, then
@@ -2891,6 +2902,62 @@ mod tests {
         let peer_id = NodeId::new(&peer_addr);
         cluster.handle_heartbeat(peer_id, peer_addr);
         peer_id
+    }
+
+    // A peer cannot declare another peer removed by forging the payload id.
+    // Check both the removal tombstone and durable-directory side effects.
+    #[test]
+    fn test_node_goodbye_rejects_claimed_peer_other_than_transport_sender() {
+        use crate::runtime::network::DeterministicNetworkTransport;
+
+        let bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let mut receiver =
+            DeterministicNetworkTransport::bind_with_bus(addr(9000), bus.clone()).unwrap();
+        let mut attacker =
+            DeterministicNetworkTransport::bind_with_bus(addr(9001), bus.clone()).unwrap();
+        let mut victim = DeterministicNetworkTransport::bind_with_bus(addr(9002), bus).unwrap();
+        receiver.register_on_bus();
+        let mut cluster = make_cluster(9000);
+        let attacker_id = add_peer(&mut cluster, 9001);
+        let victim_id = add_peer(&mut cluster, 9002);
+        let mut resolver = AddressResolver::new(NodeId::new(&addr(9000)));
+        let mut runtime = Runtime::new();
+
+        attacker.send(
+            NodeId::new(&addr(9000)),
+            addr(9000),
+            Packet::NodeGoodbye {
+                node_id: victim_id,
+                durable: vec![(500, 7)],
+            },
+        );
+        process_network_packets(&mut runtime, &mut receiver, &mut cluster, &mut resolver);
+        assert!(
+            !cluster.is_removed(victim_id),
+            "forged goodbye removed a different peer"
+        );
+        assert!(!cluster.is_removed(attacker_id));
+        assert!(
+            cluster.directory_entry(500).is_none(),
+            "forged goodbye polluted durable directory"
+        );
+
+        // The peer's own, sender-bound goodbye is still accepted.
+        victim.send(
+            NodeId::new(&addr(9000)),
+            addr(9000),
+            Packet::NodeGoodbye {
+                node_id: victim_id,
+                durable: vec![(500, 7)],
+            },
+        );
+        process_network_packets(&mut runtime, &mut receiver, &mut cluster, &mut resolver);
+        assert!(cluster.is_removed(victim_id));
+        let entry = cluster
+            .directory_entry(500)
+            .expect("legitimate durable manifest applied");
+        assert_eq!(entry.node_id, victim_id);
+        assert_eq!(entry.epoch, 7);
     }
 
     // -- 1. Local ActorAddress ----------------------------------------------
