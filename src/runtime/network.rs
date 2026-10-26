@@ -3456,6 +3456,91 @@ mod tests {
         client.shutdown();
     }
 
+    /// The queue-driven sender uses a different connect path from
+    /// TcpTransport::connect. A CA-trusted certificate must not be able to
+    /// claim a different NUL0 NodeId there either, but a legitimate
+    /// certificate-bound connection must still succeed.
+    #[test]
+    #[cfg(feature = "tcp")]
+    fn test_mtls_sender_worker_binds_ca_trusted_peer_to_node_id() {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_pem = ca_params.self_signed(&ca_key).unwrap().pem().into_bytes();
+        let issuer = Issuer::from_params(&ca_params, &ca_key);
+        let issue_leaf = || {
+            let key = KeyPair::generate().unwrap();
+            let cert = CertificateParams::new(vec!["localhost".into()])
+                .unwrap()
+                .signed_by(&key, &issuer)
+                .unwrap();
+            (cert.pem().into_bytes(), key.serialize_pem().into_bytes())
+        };
+        let (server_cert, server_key) = issue_leaf();
+        let (client_cert, client_key) = issue_leaf();
+        let server_id = NodeId::from_cert_der(&parse_pem_cert(&server_cert).unwrap());
+        let local_id = NodeId::from_cert_der(&parse_pem_cert(&client_cert).unwrap());
+        let claimed_other = NodeId(0xbed0_0bad_cafe_0001);
+        assert_ne!(server_id, claimed_other);
+        assert_ne!(local_id, server_id);
+        let config = |cert, key| TlsConfig::MutualTls {
+            ca_cert_pem: ca_pem.clone(),
+            server_cert_pem: cert,
+            server_key_pem: key,
+            server_name: Some("localhost".into()),
+        };
+        let client_config = config(client_cert, client_key);
+        let server_config = config(server_cert, server_key);
+        let connections = Arc::new(Mutex::new(HashMap::new()));
+        let (incoming_tx, _incoming_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        for (advertised_id, expect_success) in [(claimed_other, false), (server_id, true)] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let listen_addr = listener.local_addr().unwrap();
+            let tls = server_config.clone();
+            let server = thread::spawn(move || {
+                let (tcp, _) = listener.accept().unwrap();
+                tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                tcp.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut stream = tls_wrap_server(tcp, &tls).unwrap();
+                write_handshake(&mut stream, advertised_id).unwrap();
+                read_handshake(&mut stream).unwrap()
+            });
+            let result = connect_in_sender(
+                &connections,
+                &incoming_tx,
+                &shutdown,
+                local_id,
+                advertised_id,
+                listen_addr,
+                &client_config,
+            );
+            if expect_success {
+                assert!(
+                    result.is_ok(),
+                    "sender must accept genuine certificate identity: {result:?}"
+                );
+            } else {
+                assert_eq!(
+                    result
+                        .expect_err("sender accepted another node's NUL0 identity")
+                        .kind(),
+                    io::ErrorKind::InvalidData
+                );
+                assert!(
+                    lock_ignore_poison(&connections).is_empty(),
+                    "forged sender connection was registered"
+                );
+            }
+            assert_eq!(server.join().unwrap(), local_id);
+        }
+        shutdown.store(true, Ordering::Relaxed);
+    }
+
     // ------------------------------------------------------------------
     // 7. Transport bind
     // ------------------------------------------------------------------
