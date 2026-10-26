@@ -13,6 +13,7 @@ registry cannot silently drift from the in-tree standard library.
 |---|---|---|---|---|---|
 | `core` | `stdlib::core` | experimental | `src/stdlib/core.nula` | — | General-purpose core combinators. Prelude-owned Option and Result types are available without importing this module. |
 | `math` | `stdlib::math` | experimental | `src/stdlib/math.nula` | — | Numeric helpers including abs, min, max, clamp, pow, factorial, gcd, and sqrt. |
+| `bytes` | `stdlib::bytes` | experimental | `src/stdlib/bytes.nula` | — | Bounded in-memory binary readers and writers with explicit Result errors. |
 | `list` | `stdlib::list` | experimental | `src/stdlib/list.nula` | — | Functional array/list combinators including map, filter, fold, append, reverse, and sort. |
 | `string` | `stdlib::string` | experimental | `src/stdlib/string.nula` | — | String helpers including trim, split, join, replace, case conversion, and search. |
 | `map` | `stdlib::map` | experimental | `src/stdlib/map.nula` | — | Persistent map helpers implemented in Nulang over array-backed key/value records. |
