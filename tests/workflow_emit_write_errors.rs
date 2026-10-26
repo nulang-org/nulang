@@ -121,6 +121,65 @@ fn workflow_emit_preserves_an_explicit_nil_payload() {
     )));
 }
 
+#[test]
+fn workflow_emit_persists_live_actor_heap_string_with_exact_contents() {
+    let (mut rt, id) = fresh_workflow();
+    let string = rt
+        .actors
+        .get_mut(&id)
+        .unwrap()
+        .allocate_string("live actor receipt");
+    assert!(!string.is_nil());
+    rt.try_emit_event(id, "WorkflowOutput", &[string])
+        .expect("a live string in the owning actor heap must remain serializable");
+
+    let events = rt.persistence.read_workflow_events(id);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        WorkflowEvent::Custom { name, args, .. }
+            if name == "WorkflowOutput"
+                && args == &vec![PersistedValue::String("live actor receipt".to_string())]
+    )));
+}
+
+#[test]
+fn workflow_emit_rejects_non_string_actor_heap_pointer_without_a_receipt() {
+    let (mut rt, id) = fresh_workflow();
+    let array = rt
+        .actors
+        .get_mut(&id)
+        .unwrap()
+        .allocate_array(vec![Value::int(7)]);
+    assert!(!array.is_nil());
+
+    let error = rt
+        .try_emit_event(id, "WorkflowOutput", &[array])
+        .expect_err("non-string heap payload must fail rather than become Nil");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(rt.persistence.read_workflow_events(id).is_empty());
+    assert!(rt.actors[&id].event_log.is_empty());
+}
+
+#[test]
+fn workflow_emit_preserves_string_from_actor_module_constant_pool() {
+    use nulang::bytecode::{CodeModule, Constant};
+
+    let (mut rt, id) = fresh_workflow();
+    let mut module = CodeModule::new("durable-output");
+    let index = module.add_constant(Constant::String("compiled receipt".to_string()));
+    rt.actors.get_mut(&id).unwrap().bytecode_module = Some(Box::new(module));
+
+    rt.try_emit_event(id, "WorkflowOutput", &[Value::string(index as u32)])
+        .expect("valid actor-owned compiled constants remain serializable");
+    let events = rt.persistence.read_workflow_events(id);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        WorkflowEvent::Custom { name, args, .. }
+            if name == "WorkflowOutput"
+                && args == &vec![PersistedValue::String("compiled receipt".to_string())]
+    )));
+}
+
 fn broken_runtime() -> (
     std::rc::Rc<std::cell::RefCell<Runtime>>,
     u64,
