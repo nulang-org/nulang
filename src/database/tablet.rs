@@ -400,6 +400,15 @@ impl MemoryTablet {
         self.current_sequence
     }
 
+    /// Compare complete committed MVCC histories and durable receipts without
+    /// cloning values or allocating a second snapshot representation.
+    pub(crate) fn same_committed_state(&self, other: &Self) -> bool {
+        self.descriptor == other.descriptor
+            && self.current_sequence == other.current_sequence
+            && self.rows == other.rows
+            && self.receipts == other.receipts
+    }
+
     pub(crate) fn snapshot_state(&self) -> TabletSnapshotState {
         TabletSnapshotState {
             current_sequence: self.current_sequence,

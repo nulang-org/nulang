@@ -4,6 +4,7 @@
 //! separate from actor semantics. Actors may own and coordinate tablets, but
 //! inner storage and query loops remain ordinary local computation.
 
+pub mod backup;
 pub mod checkpoint;
 pub mod owner;
 pub mod store;

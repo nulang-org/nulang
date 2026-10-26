@@ -32,6 +32,10 @@ pub(crate) enum StorageInterruptionPoint {
     WalReclaimAfterReplacementSync,
     WalReclaimAfterRename,
     WalReclaimAfterDirectorySync,
+    BackupAfterWalStaged,
+    BackupAfterCheckpointStaged,
+    BackupAfterRestoreProof,
+    BackupBeforeCompletion,
 }
 
 thread_local! {
