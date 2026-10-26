@@ -213,3 +213,32 @@ helper functions containing these operations are also checked.
 Non-durable HTTP keeps its existing resource-capability requirements. Durable
 external work requires a replay-stable, receipt-backed adapter; ordinary
 HTTP is not safe merely because it appears inside a workflow.
+
+## Replay-identified workflow output projection (experimental)
+
+Workflow steps must **not** use ambient `perform IO.print` as a durable
+output mechanism. Instead, a workflow may record the typed custom event
+`emit WorkflowOutput("message")`. Runtime workflow event journaling attaches
+an activation-scoped `WorkflowReplayEventId` and consumes that same event on
+replay rather than appending a second copy. This is *journal data*, not stdout
+or an external notification.
+
+The host-only Rust API
+`workflow_output::read_workflow_output_receipts(store, actor_id, after_sequence, max_items)`
+reads a bounded, sequence-based page of already-journaled outputs, each with a
+replay identity and stable `idempotency_key()`. It checks the complete retrieved
+journal before returning a page, rejecting legacy output without identity,
+malformed payloads, cross-actor identities, duplicate replay identities
+(including collision with timer events), and out-of-order sequences. Ordinary
+non-output workflow events are excluded. The API never performs network I/O,
+prints messages, mutates the journal, or marks external delivery complete.
+
+An external output consumer **must** persist and enforce deduplication of the
+provided idempotency key or use a separately durable dispatch/receipt adapter.
+Re-reading a page after a crash will return the same journaled outputs, but
+that alone cannot guarantee single delivery: a crash between provider commit
+and consumer acknowledgment can still result in repeated delivery. Do not
+mistake the read-only output projection for an end-to-end exactly-once outbox.
+The existing durable-effect coordinator supplies an explicit Prepared/Completed
+state machine for suitably authorized and idempotent provider calls; connecting
+that state machine to live workflow output delivery is a separate release gate.

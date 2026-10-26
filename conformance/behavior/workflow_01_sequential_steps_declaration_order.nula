@@ -1,16 +1,18 @@
 // SPEC2 10.2/10.3/10.4: workflow declaration with steps; steps run in
 // declaration order (sequential execution is the default mode).
+// Outputs are durable journal records, not replay-unsafe stdout effects.
+// The Rust receipt tests verify ordering and stable replay identities.
 workflow OrderFulfillment {
   step receive_order {
-    perform IO.print("Processing order")
+    emit WorkflowOutput("Processing order")
   }
 
   step validate_inventory {
-    perform IO.print("Checking stock")
+    emit WorkflowOutput("Checking stock")
   }
 
   step charge_payment {
-    perform IO.print("Charging payment")
+    emit WorkflowOutput("Charging payment")
   }
 }
 
