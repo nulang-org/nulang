@@ -93,7 +93,7 @@ ureq = ["dep:ureq"]
 # RocksDB persistence backend (production-grade LSM-tree storage).
 rocksdb = ["dep:rocksdb"]
 # PostgreSQL persistence backend (production-grade relational storage).
-postgres = ["dep:postgres"]
+postgres = ["dep:postgres", "dep:uuid"]
 # Differential fuzzing driver binary (src/bin/nula_difffuzz.rs).
 difffuzz = ["native-codegen"]
 
@@ -160,7 +160,7 @@ libsql = { version = "0.10.0-pre.4", optional = true, default-features = false, 
 # RocksDB persistence backend (feature `rocksdb`).
 rocksdb = { version = "0.21", optional = true, default-features = false }
 # PostgreSQL persistence backend (feature `postgres`). Sync wrapper over tokio-postgres.
-postgres = { version = "0.19", optional = true }
+postgres = { version = "0.19", optional = true, features = ["with-serde_json-1", "with-uuid-1"] }
 # Native library loading (optional, see [features])
 libloading = { version = "0.8", optional = true }
 # Dynamic C function calls with runtime-described signatures (optional, see [features])
