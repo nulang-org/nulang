@@ -764,6 +764,15 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
         }
     }
 
+    fn try_emit_event(&mut self, event: &str, args: &[crate::vm::Value]) -> Result<(), String> {
+        let mut rt = self.runtime.borrow_mut();
+        let actor_id = rt
+            .current_actor
+            .ok_or_else(|| "durable emit outside actor context".to_string())?;
+        rt.try_emit_event(actor_id, event, args)
+            .map_err(|error| error.to_string())
+    }
+
     fn perform_effect(
         &mut self,
         effect_name: &str,
@@ -1569,6 +1578,11 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
         unsafe {
             (*self.runtime).emit_event(self.actor_id, event, args);
         }
+    }
+
+    fn try_emit_event(&mut self, event: &str, args: &[crate::vm::Value]) -> Result<(), String> {
+        unsafe { (*self.runtime).try_emit_event(self.actor_id, event, args) }
+            .map_err(|error| error.to_string())
     }
 
     fn wait_signal(&mut self, name: &str) -> crate::vm::SignalWaitResult {

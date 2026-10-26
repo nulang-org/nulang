@@ -1566,13 +1566,16 @@ macro_rules! define_aot_emit {
     ($name:ident, $($arg:ident),*) => {
         /// Emit an event from AOT-compiled code.
         #[no_mangle]
-        pub unsafe extern "C" fn $name(event_raw: u64 $(, $arg: u64)*) {
+        pub unsafe extern "C" fn $name(event_raw: u64 $(, $arg: u64)*) -> u64 {
             let event = resolve_string_coerce(event_raw).unwrap_or_default();
             let args = [$(unsafe { Value::from_bits($arg) }),*];
-            let _ = try_with_callbacks(|cb| {
-                cb.emit_event(&event, &args);
-                true
-            });
+            match try_with_callbacks(|cb| cb.try_emit_event(&event, &args)) {
+                Some(Err(error)) => {
+                    aot_set_pending_error(format!("durable emit {event}: {error}"));
+                    0 // native code must return immediately on a failed write
+                }
+                Some(Ok(())) | None => 1,
+            }
         }
     };
 }
@@ -2226,10 +2229,10 @@ mod tests {
         let _ = super::nulang_aot_receive_payload as unsafe extern "C" fn(u64) -> u64;
         let _ = super::nulang_aot_receive_pop as unsafe extern "C" fn() -> u64;
         let _ = super::nulang_aot_spawn_push as unsafe extern "C" fn(u64, u64);
-        let _ = super::nulang_aot_emit_0 as unsafe extern "C" fn(u64);
-        let _ = super::nulang_aot_emit_1 as unsafe extern "C" fn(u64, u64);
+        let _ = super::nulang_aot_emit_0 as unsafe extern "C" fn(u64) -> u64;
+        let _ = super::nulang_aot_emit_1 as unsafe extern "C" fn(u64, u64) -> u64;
         let _ = super::nulang_aot_emit_8
-            as unsafe extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64);
+            as unsafe extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
     }
 
     #[test]

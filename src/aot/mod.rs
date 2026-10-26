@@ -1476,6 +1476,11 @@ impl crate::vm::ActorVmCallbacks for AotRuntimeCallbacks {
         unsafe { (*self.runtime).emit_event(self.actor_id, event, args) };
     }
 
+    fn try_emit_event(&mut self, event: &str, args: &[crate::vm::Value]) -> Result<(), String> {
+        unsafe { (*self.runtime).try_emit_event(self.actor_id, event, args) }
+            .map_err(|error| error.to_string())
+    }
+
     fn try_receive(&mut self) -> Option<(u16, crate::vm::Value)> {
         // SAFETY: as above; mailbox access runs on the owning scheduler thread.
         unsafe {
@@ -1749,6 +1754,17 @@ impl crate::vm::ActorVmCallbacks for AotTopLevelCallbacks {
             if let Some(actor_id) = rt.current_actor {
                 rt.emit_event(actor_id, event, args);
             }
+        }
+    }
+
+    fn try_emit_event(&mut self, event: &str, args: &[crate::vm::Value]) -> Result<(), String> {
+        unsafe {
+            let rt = &mut *self.runtime;
+            let actor_id = rt
+                .current_actor
+                .ok_or_else(|| "durable emit outside actor context".to_string())?;
+            rt.try_emit_event(actor_id, event, args)
+                .map_err(|error| error.to_string())
         }
     }
 

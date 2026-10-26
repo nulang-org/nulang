@@ -1362,7 +1362,7 @@ pub fn compile_mir_function_body(
             let func_ref = module.declare_func_in_func(h_id, builder.func);
             h.insert(h_name, func_ref);
         }
-        // emit helpers: nulang_aot_emit_N(event, arg0..argN-1) -> void
+        // emit helpers: nulang_aot_emit_N(event, arg0..argN-1) -> i64 success flag
         const AOT_EMIT_HELPERS: [&str; 9] = [
             "nulang_aot_emit_0",
             "nulang_aot_emit_1",
@@ -1380,6 +1380,7 @@ pub fn compile_mir_function_body(
             for _ in 0..n {
                 h_sig.params.push(AbiParam::new(types::I64));
             }
+            h_sig.returns.push(AbiParam::new(types::I64)); // 1=committed, 0=failed
             let h_id = module
                 .declare_function(h_name, Linkage::Import, &h_sig)
                 .map_err(|e| AotCompileError::Cranelift(e.to_string()))?;
@@ -2373,7 +2374,20 @@ fn compile_stmt(
             let mut call_args = Vec::with_capacity(arg_vals.len() + 1);
             call_args.push(event_val);
             call_args.extend(arg_vals);
-            call_void_helper(builder, helpers, helper_name, &call_args)?;
+            let status = call_helper(builder, helpers, helper_name, &call_args)?;
+            // A failed append must abort the native activation *before* any
+            // later statement can perform a side effect. The helper also
+            // records a first-error-wins diagnostic for the AOT driver.
+            let committed = builder.ins().icmp_imm(IntCC::NotEqual, status, 0);
+            let on_failure = builder.create_block();
+            let on_success = builder.create_block();
+            builder.ins().brif(committed, on_success, &[], on_failure, &[]);
+            builder.switch_to_block(on_failure);
+            let nil = builder.ins().iconst(types::I64, TAG_NIL_I64);
+            builder.ins().return_(&[nil]);
+            builder.seal_block(on_failure);
+            builder.switch_to_block(on_success);
+            builder.seal_block(on_success);
             Ok(())
         }
         mir::Stmt::StateSet { field, src } => {

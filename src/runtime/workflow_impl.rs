@@ -86,24 +86,6 @@ fn committed_replay_event(
     Ok(committed)
 }
 
-fn custom_event_replay_disposition(
-    rt: &Runtime,
-    actor_id: u64,
-    replay_id: WorkflowReplayEventId,
-    event: &str,
-    payload: &[PersistedValue],
-) -> ReplayDisposition {
-    match committed_replay_event(rt, actor_id, replay_id) {
-        Ok(None) => ReplayDisposition::Append,
-        Ok(Some(WorkflowEvent::Custom { name, args, .. }))
-            if name == event && args.as_slice() == payload =>
-        {
-            ReplayDisposition::Consume
-        }
-        Ok(Some(_)) | Err(()) => ReplayDisposition::Conflict,
-    }
-}
-
 fn timer_set_replay_disposition(
     rt: &Runtime,
     actor_id: u64,
@@ -378,8 +360,122 @@ fn resolve_string_constant(rt: &Runtime, actor_id: u64, value: &Value) -> Option
 /// actors this appends to the durable journal and forces a checkpoint. For
 /// event-sourced (non-workflow) actors the event is persisted to the event
 /// journal and a checkpoint is forced.
-pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[Value]) {
+/// Strict event-emission path: durable workflows never report success until
+/// their replay identity and journal write have been validated and persisted.
+/// It performs no in-memory event-log mutation until durable append succeeds.
+pub(crate) fn try_emit_event(
+    rt: &mut Runtime,
+    actor_id: u64,
+    event: &str,
+    args: &[Value],
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
     let is_workflow = actor_is_workflow(rt, actor_id);
+    if !is_workflow {
+        if !rt.actors.contains_key(&actor_id) {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                "emitting actor does not exist",
+            ));
+        }
+        // Event-sourced actors retain their compatibility callback while a
+        // separate atomic-apply migration is developed. This branch is not a
+        // durable workflow receipt transaction.
+        emit_event(rt, actor_id, event, args);
+        return Ok(());
+    }
+    let seq = next_sequence(rt, actor_id);
+    let module = rt
+        .actors
+        .get(&actor_id)
+        .and_then(|actor| actor.bytecode_module.as_deref());
+    let payload: Vec<PersistedValue> = args
+        .iter()
+        .map(|value| PersistedValue::from_value_resolved(value, module))
+        .collect();
+    let mut checkpoint = false;
+    if event == "ParallelBranchCompleted" && args.len() == 2 {
+        let name = resolve_string_constant(rt, actor_id, &args[0]).unwrap_or_default();
+        let branch = resolve_string_constant(rt, actor_id, &args[1]).unwrap_or_default();
+        rt.persistence
+            .append_parallel_branch_completed(actor_id, seq, name, branch)?;
+        if let Some(actor) = rt.actors.get_mut(&actor_id) {
+            let progress = actor
+                .get_state_field("parallel_progress")
+                .and_then(|v| v.as_int())
+                .unwrap_or(0);
+            actor.set_state_field("parallel_progress", Value::int(progress + 1));
+        }
+        checkpoint = true;
+    } else if let Some(replay_id) = current_workflow_replay_id(rt, actor_id) {
+        let mut committed = None;
+        for previous in rt.persistence.try_read_workflow_events(actor_id)? {
+            if previous.replay_id() == Some(replay_id) {
+                if committed.is_some() {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "conflict: duplicated workflow replay identity",
+                    ));
+                }
+                committed = Some(previous);
+            }
+        }
+        match committed {
+            Some(WorkflowEvent::Custom { name, args, .. }) if name == event && args == payload => { /* consumed exact receipt */
+            }
+            Some(_) => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "conflict: workflow replay identity payload differs from committed event",
+                ))
+            }
+            None => {
+                rt.persistence.append_workflow_event(
+                    actor_id,
+                    WorkflowEvent::Custom {
+                        sequence: seq,
+                        replay_id: Some(replay_id),
+                        name: event.to_string(),
+                        args: payload,
+                    },
+                )?;
+            }
+        }
+        advance_workflow_replay_id(rt, actor_id, replay_id);
+    } else {
+        rt.persistence.append_workflow_event(
+            actor_id,
+            WorkflowEvent::Custom {
+                sequence: seq,
+                replay_id: None,
+                name: event.to_string(),
+                args: payload,
+            },
+        )?;
+        checkpoint = true;
+    }
+    // Journal write is now durable (or the exact replay receipt was consumed).
+    // Do not advertise the output through the actor's live event log until
+    // the required checkpoint has succeeded as well.
+    if checkpoint {
+        try_checkpoint_actor(rt, actor_id)?;
+    }
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.event_log.push((event.to_string(), args.to_vec()));
+    }
+    Ok(())
+}
+
+/// Compatibility API: new VM/JIT/AOT callbacks MUST call `try_emit_event`.
+/// Failures are visible in logs, but this legacy void API cannot abort its
+/// caller and therefore must never be used for transactional delivery.
+pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[Value]) {
+    if actor_is_workflow(rt, actor_id) {
+        if let Err(error) = try_emit_event(rt, actor_id, event, args) {
+            tracing::error!(actor_id, event, %error, "failed to commit durable workflow output");
+        }
+        return;
+    }
     let seq = next_sequence(rt, actor_id);
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.event_log.push((event.to_string(), args.to_vec()));
@@ -395,7 +491,7 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
             }
         }
         // Persist events for EventSourced fields (non-workflow actors).
-        if !is_workflow && !event_sourced_names.is_empty() {
+        if !event_sourced_names.is_empty() {
             let module = actor.bytecode_module.as_deref();
             let persisted_args: Vec<PersistedValue> = args
                 .iter()
@@ -421,93 +517,6 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                     actor.event_sourced_sequences.insert(name.clone(), seq);
                 }
                 actor.sequence = seq;
-            }
-        }
-    }
-    if is_workflow {
-        if event == "ParallelBranchCompleted" && args.len() == 2 {
-            let parallel_step_name =
-                resolve_string_constant(rt, actor_id, &args[0]).unwrap_or_default();
-            let branch_name = resolve_string_constant(rt, actor_id, &args[1]).unwrap_or_default();
-            let _ = rt.persistence.append_parallel_branch_completed(
-                actor_id,
-                seq,
-                parallel_step_name,
-                branch_name,
-            );
-            if let Some(actor) = rt.actors.get_mut(&actor_id) {
-                let current = actor
-                    .get_state_field("parallel_progress")
-                    .and_then(|v| v.as_int())
-                    .unwrap_or(0);
-                actor.set_state_field("parallel_progress", Value::int(current + 1));
-            }
-            checkpoint_actor(rt, actor_id);
-        } else {
-            let module = rt
-                .actors
-                .get(&actor_id)
-                .and_then(|a| a.bytecode_module.as_deref());
-            let payload: Vec<PersistedValue> = args
-                .iter()
-                .map(|v| PersistedValue::from_value_resolved(v, module))
-                .collect();
-            let replay_id = current_workflow_replay_id(rt, actor_id);
-            let mut should_checkpoint = false;
-            if let Some(replay_id) = replay_id {
-                match custom_event_replay_disposition(rt, actor_id, replay_id, event, &payload) {
-                    ReplayDisposition::Consume => {
-                        advance_workflow_replay_id(rt, actor_id, replay_id);
-                    }
-                    ReplayDisposition::Conflict => {
-                        tracing::error!(
-                            actor_id,
-                            activation_actor_id = replay_id.activation.actor_id,
-                            activation_command_sequence = replay_id.activation.command_sequence,
-                            ordinal = replay_id.ordinal,
-                            event,
-                            "nulang-workflow: replay identity conflicts with committed custom event; refusing durable mutation"
-                        );
-                    }
-                    ReplayDisposition::Append => {
-                        let appended = rt
-                            .persistence
-                            .append_workflow_event(
-                                actor_id,
-                                WorkflowEvent::Custom {
-                                    sequence: seq,
-                                    replay_id: Some(replay_id),
-                                    name: event.to_string(),
-                                    args: payload,
-                                },
-                            )
-                            .is_ok();
-                        if appended {
-                            // This event belongs to an open activation. Keep the
-                            // last completed snapshot unchanged so recovery can
-                            // re-execute the command and consume this exact
-                            // replay identity instead of treating partial state
-                            // as completed progress.
-                            advance_workflow_replay_id(rt, actor_id, replay_id);
-                        }
-                    }
-                }
-            } else {
-                should_checkpoint = rt
-                    .persistence
-                    .append_workflow_event(
-                        actor_id,
-                        WorkflowEvent::Custom {
-                            sequence: seq,
-                            replay_id: None,
-                            name: event.to_string(),
-                            args: payload,
-                        },
-                    )
-                    .is_ok();
-            }
-            if should_checkpoint {
-                checkpoint_actor(rt, actor_id);
             }
         }
     }
