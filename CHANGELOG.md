@@ -1,5 +1,8 @@
 # Nulang Changelog
 
+### list.find conformance Option contract — 2026-10-13
+- **The list.find behavior fixture now matches its Option[T] API.** Both the matched `Some(2)` payload and unmatched `None` variant are pattern-matched before rendering. Previously it passed the tagged Option directly to `Int.to_string` and expected a legacy `-1` miss sentinel. The underlying `stdlib::list.find` implementation is unchanged; the exact-head Nulang conformance run remains required.
+
 ### Project-relative namespaced import resolution — 2026-10-26
 - **Local imports now resolve `::` segments as directories**, consistent with standard-library module paths. For example, `import subpkg::helper` resolves to `subpkg/helper.nula` relative to the importing source file; slash paths and explicit `.nula` extensions remain supported.
 - **The existing `modimport_13_subdirectory_package` conformance failure now has focused resolver regression tests.** No grammar or frozen format changes are needed; full language-suite and exact-head CI verification are still required.
