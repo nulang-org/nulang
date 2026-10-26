@@ -26,10 +26,12 @@ def case_command(nulang_bin: str, case: Path, expected: dict, store_root: Path) 
     # Unique case stem under a fresh suite-scoped TemporaryDirectory. The
     # runtime may create the directory; it is removed when the suite exits.
     store = Path(store_root) / case.stem
-    command = [str(nulang_bin), "--store", str(store)]
+    # Keep the script in argv[1]: System.arg(1) is part of the language
+    # contract, even when the runner grants runtime capabilities or store.
+    command = [str(nulang_bin), str(case), "--store", str(store)]
     if caps:
         command.extend(["--with", ",".join(caps)])
-    return [*command, str(case)]
+    return command
 
 
 def run_case(nulang_bin: str, case: Path, expected: dict, store_root: Path) -> bool:
@@ -52,6 +54,12 @@ def run_case(nulang_bin: str, case: Path, expected: dict, store_root: Path) -> b
     return passed
 
 
+def script_argument(case: Path) -> Path:
+    """Keep checked-in fixtures repository-relative for System.arg(1)."""
+    case = Path(case)
+    return case.relative_to(ROOT) if case.is_relative_to(ROOT) else case
+
+
 def run_suite(nulang_bin: str, behavior_dir: Path = BEHAVIOR) -> tuple[int, int]:
     passed = failed = 0
     with tempfile.TemporaryDirectory(prefix="nulang-conformance-store-") as tmp:
@@ -61,7 +69,7 @@ def run_suite(nulang_bin: str, behavior_dir: Path = BEHAVIOR) -> tuple[int, int]
             if not expectation.exists():
                 continue
             expected = json.loads(expectation.read_text(encoding="utf-8"))
-            if run_case(nulang_bin, case, expected, root):
+            if run_case(nulang_bin, script_argument(case), expected, root):
                 passed += 1
             else:
                 failed += 1

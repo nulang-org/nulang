@@ -21,7 +21,19 @@ class ConformanceIsolationTests(unittest.TestCase):
         second = run.case_command("nulang", self.root / "two.nula", {}, self.root)
         self.assertIn("--store", first)
         self.assertNotEqual(first[first.index("--store") + 1], second[second.index("--store") + 1])
-        self.assertEqual(first[-1], str(self.root / "one.nula"))
+        self.assertEqual(first[1], str(self.root / "one.nula"))
+
+    def test_repository_behavior_case_uses_relative_script_argument(self):
+        from conformance.run import BEHAVIOR, ROOT
+        self.assertEqual(
+            run.script_argument(BEHAVIOR / "beffect_system_arg.nula"),
+            Path("conformance/behavior/beffect_system_arg.nula"),
+        )
+
+    def test_program_argument_one_is_the_script(self):
+        case = self.root / "system_arg.nula"
+        command = run.case_command("nulang", case, {"capabilities": ["os"]}, self.root)
+        self.assertEqual(command[1], str(case))
 
     def test_explicit_fs_capabilities_preserved(self):
         command = run.case_command("nulang", self.root / "fs.nula", {"capabilities": ["fs"]}, self.root)
