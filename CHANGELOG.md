@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Experimental bounded scoped tasks — 2026-10-26
+- **Ported the executor-neutral scoped-task admission coordinator and deterministic reference runner from the draft #1838/#1847/#1841 stack.** Bounded FIFO queues and running-child counts, sticky failure/parent/deadline cancellation, explicit termination acknowledgements, and ordered joins remain Experimental; no source-level `par` change.
+- **Unified cancellation with PR #2216's canonical runtime token.** A read-only `TaskCancellation` view prevents children from cancelling the owning scope; parent cancellation and deadlines propagate through the existing token. `try_join` retains running-child ownership on `NotQuiescent`, while a successful join closes admission. Drop requests cooperative cancellation but cannot synchronously terminate running work.
+- **Added public-API regression tests** for inherited cancellation/deadline, bounded admission, first-child failure, safe join, and deterministic result order. No production parallel scheduler or WASM semantics are claimed.
+
 ### Experimental scoped cancellation — 2026-10-26
 - **Ported the transient, executor-neutral cancellation token from draft PR #1705 onto current `main`.** Clones share cancellation, child scopes observe ancestor requests and inherit the earliest monotonic deadline, and independent siblings remain unaffected by child cancellation. Cancellation is idempotent and thread-safe.
 - **Added public-API contract tests** for parent/child propagation, deterministic deadline boundaries, handle lifetime, and concurrent first-cancel races. This does not interrupt actors or implement structured task joins, durable cancellation, or concurrent `par` execution.
