@@ -20,7 +20,7 @@ pub struct WorkflowOutputReceipt {
 impl WorkflowOutputReceipt {
     /// Stable cross-retry key for a consumer which *actually* deduplicates it.
     /// This method does not deliver, acknowledge, or mark outputs consumed.
-    pub fn idempotency_key(&self) -> String {
+    pub fn durable_effect_id(&self) -> DurableEffectId {
         DurableEffectId::derive(
             self.replay_id.activation.actor_id,
             &format!(
@@ -30,7 +30,10 @@ impl WorkflowOutputReceipt {
             self.replay_id.ordinal,
             WORKFLOW_OUTPUT_EVENT,
         )
-        .idempotency_key()
+    }
+
+    pub fn idempotency_key(&self) -> String {
+        self.durable_effect_id().idempotency_key()
     }
 }
 
