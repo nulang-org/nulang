@@ -1,1 +1,5 @@
-{"exit_code": 6, "stdout": "", "stderr": "got box"}
+{
+  "exit_code": 6,
+  "stdout": "",
+  "stderr": "send argument with capability box is not sendable"
+}
