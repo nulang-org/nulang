@@ -62,6 +62,39 @@ fn owner(s: &Sandbox) -> DurableRetentionRegistry {
     DurableRetentionRegistry::open(s.registry(), 211, 4).unwrap()
 }
 
+/// Tests which deliberately drop the WAL owner then reopen it can run
+/// alongside tests spawning subprocesses. On Unix an inheriting child may
+/// briefly retain the former open-file-description lock until exec closes its
+/// CLOEXEC fd. This bounded TEST-ONLY retry never changes FileWal::open's
+/// fail-fast, nonblocking, exclusive-writer contract.
+fn reopen_after_dropped_owner(path: PathBuf) -> Result<FileWal, WalError> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match FileWal::open(&path) {
+            Err(WalError::WriterLocked) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            result => return result,
+        }
+    }
+}
+
+#[test]
+fn fixture_reopen_retry_never_overrides_an_active_writer() {
+    let s = Sandbox::new();
+    let db = filled(&s);
+    // A genuine live owner must remain excluded even if the fixture retries
+    // a short-lived WriterLocked after a separate owner has already dropped.
+    assert!(matches!(
+        reopen_after_dropped_owner(s.wal()),
+        Err(WalError::WriterLocked)
+    ));
+    drop(db);
+    let reopened = reopen_after_dropped_owner(s.wal()).unwrap();
+    assert_eq!(reopened.last_sequence(), 1);
+}
+
 #[test]
 fn direct_filewal_reclaim_cannot_bypass_managed_retention() {
     let s = Sandbox::new();
@@ -69,7 +102,7 @@ fn direct_filewal_reclaim_cannot_bypass_managed_retention() {
     let _owner = owner(&s);
     drop(db);
     let before = fs::read(s.wal()).unwrap();
-    let mut wal = FileWal::open(s.wal()).unwrap();
+    let mut wal = reopen_after_dropped_owner(s.wal()).unwrap();
     assert!(matches!(
         wal.reclaim_through(1),
         Err(WalError::RetentionManaged)
@@ -91,7 +124,7 @@ fn stranded_registry_lock_or_pending_stage_also_blocks_direct_reclaim() {
         fs::write(path, b"leftover").unwrap();
         drop(db);
         let before = fs::read(s.wal()).unwrap();
-        let mut wal = FileWal::open(s.wal()).unwrap();
+        let mut wal = reopen_after_dropped_owner(s.wal()).unwrap();
         assert!(matches!(
             wal.reclaim_through(1),
             Err(WalError::RetentionManaged)
@@ -311,7 +344,7 @@ fn symlinked_gate_is_rejected_before_any_log_mutation() {
     symlink(&target, s.gate()).unwrap();
     drop(db);
     let before = fs::read(s.wal()).unwrap();
-    let mut wal = FileWal::open(s.wal()).unwrap();
+    let mut wal = reopen_after_dropped_owner(s.wal()).unwrap();
     assert!(wal.reclaim_through(1).is_err());
     assert_eq!(fs::read(s.wal()).unwrap(), before);
     assert!(DurableRetentionRegistry::open(s.registry(), 211, 4).is_err());
