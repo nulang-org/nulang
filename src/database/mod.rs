@@ -6,6 +6,7 @@
 
 pub mod backup;
 pub mod checkpoint;
+pub mod consumer_sink;
 pub mod owner;
 pub mod retention;
 pub(crate) mod retention_admission;
