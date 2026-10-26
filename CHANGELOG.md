@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Sender-bound NodeGoodbye removal (review-only) — 2026-10-26
+- **Ported the previously RED/GREEN-tested NodeGoodbye sender check and deterministic poisoning regression from #2131** onto the audited TLS, distributed recovery, compiler, and remote URL/heartbeat security stack. A packet cannot mark a different node Removed or merge its durable actor directory manifest unless the payload NodeId equals the transport-reported sender.
+- **This is a transport-identity consistency check, not a cryptographic guarantee for plaintext TCP.** Preserve valid self-goodbye/rejoin behavior; require same-head native/WASM/release CI and independent review, including authenticated transport identity binding and the disposable Turso HTTPS database test. Tracks #2132 and #2130.
+
 ### Sender-bound heartbeat liveness (review-only) — 2026-10-26
 - **Reject heartbeats whose packet-claimed NodeId differs from the transport-reported peer identity** before changing cluster membership or CRDT recovery state; no ACK is issued for a rejected control packet. Add a deterministic three-peer forgery and legitimate-recovery regression. This is a fail-closed consistency check, not a substitute for mTLS peer authentication or a claim that plaintext transports resist spoofing. Tracks #2132.
 - **Security-stack validation remains gated:** exact-head test and release CI, independent identity/TLS review, disposable authenticated remote libSQL SQL certification, and main-branch protection are still required; no source wire format or timers change.
