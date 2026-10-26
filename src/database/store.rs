@@ -315,6 +315,19 @@ impl WalBackedTablet {
         Ok(self.tablet.publish_validated(write))
     }
 
+    /// Opt-in per-commit WAL physical-byte budget. Deny oversized append
+    /// before the first write or MVCC publication. This does not compact
+    /// retained history or enforce a global quota across other commit paths.
+    pub fn commit_with_wal_budget(
+        &mut self,
+        write: TabletWrite,
+        max_wal_bytes: u64,
+    ) -> Result<u64, WalBackedError> {
+        self.tablet.validate_write(&write)?;
+        self.wal.append_write_with_budget(&write, max_wal_bytes)?;
+        Ok(self.tablet.publish_validated(write))
+    }
+
     /// Durably commit a consecutive group of independent writes with one WAL
     /// synchronization boundary, then publish them to MVCC state in order.
     ///
