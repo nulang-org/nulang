@@ -19,8 +19,12 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use super::tablet::{MemoryTablet, TabletDescriptor, TabletId, TabletMutation, TabletWrite};
+use super::tablet::{
+    transaction_digest, MemoryTablet, TabletDescriptor, TabletId, TabletMutation, TabletWrite,
+    TransactionIdentity,
+};
 
 const WAL_MAGIC: &[u8; 8] = b"NUDBWAL3";
 const WAL_HEADER_PREFIX_BYTES: usize = 8 + 8 + 8 + 8;
@@ -31,6 +35,9 @@ const WAL_RECORD_VERSION: u16 = 1;
 const WAL_FRAME_PREFIX_BYTES: usize = 4 + 2 + 4;
 const WAL_FRAME_HEADER_BYTES: usize = WAL_FRAME_PREFIX_BYTES + 32;
 const MAX_WAL_RECORD_BYTES: usize = 64 * 1024 * 1024;
+// Hard ceilings on the direct group-commit API, independent of owner scheduling.
+const MAX_WAL_BATCH_RECORDS: usize = 4096;
+const MAX_WAL_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +56,25 @@ struct DiskWalRecord {
     sequence: u64,
     expected_previous_sequence: u64,
     mutations: Vec<TabletMutation>,
+    // Optional in version-1 WAL records for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity: Option<TransactionIdentity>,
+}
+
+/// Serialize from the retained WAL record without cloning its mutations again.
+///
+/// Field names and ordering intentionally match `DiskWalRecord` so legacy
+/// NUDBWAL3 JSON frames remain byte-for-byte compatible.
+#[derive(serde::Serialize)]
+struct DiskWalRecordRef<'a> {
+    version: u16,
+    tablet_id: u64,
+    ownership_epoch: u64,
+    sequence: u64,
+    expected_previous_sequence: u64,
+    mutations: &'a [TabletMutation],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity: Option<TransactionIdentity>,
 }
 
 /// One validated record recovered from or appended to a tablet WAL.
@@ -59,6 +85,7 @@ pub struct WalRecord {
     sequence: u64,
     expected_previous_sequence: u64,
     mutations: Vec<TabletMutation>,
+    identity: Option<TransactionIdentity>,
 }
 
 impl WalRecord {
@@ -69,6 +96,7 @@ impl WalRecord {
             sequence: write.sequence(),
             expected_previous_sequence: write.expected_previous_sequence(),
             mutations: write.mutations().to_vec(),
+            identity: write.identity(),
         }
     }
 
@@ -90,15 +118,26 @@ impl WalRecord {
             });
         }
 
+        if let Some(identity) = disk.identity {
+            if transaction_digest(&disk.mutations) != identity.digest {
+                return Err(WalError::InvalidRecord {
+                    offset,
+                    reason: "transaction digest does not match WAL mutations".to_string(),
+                });
+            }
+        }
+
         Ok(Self {
             tablet_id,
             ownership_epoch: disk.ownership_epoch,
             sequence: disk.sequence,
             expected_previous_sequence: disk.expected_previous_sequence,
             mutations: disk.mutations,
+            identity: disk.identity,
         })
     }
 
+    #[cfg(test)]
     fn to_disk(&self) -> DiskWalRecord {
         DiskWalRecord {
             version: WAL_RECORD_VERSION,
@@ -107,6 +146,7 @@ impl WalRecord {
             sequence: self.sequence,
             expected_previous_sequence: self.expected_previous_sequence,
             mutations: self.mutations.clone(),
+            identity: self.identity,
         }
     }
 
@@ -129,9 +169,32 @@ impl WalRecord {
     pub fn mutations(&self) -> &[TabletMutation] {
         &self.mutations
     }
+
+    pub(crate) fn identity(&self) -> Option<TransactionIdentity> {
+        self.identity
+    }
+}
+
+impl<'a> From<&'a WalRecord> for DiskWalRecordRef<'a> {
+    fn from(record: &'a WalRecord) -> Self {
+        Self {
+            version: WAL_RECORD_VERSION,
+            tablet_id: record.tablet_id.get(),
+            ownership_epoch: record.ownership_epoch,
+            sequence: record.sequence,
+            expected_previous_sequence: record.expected_previous_sequence,
+            mutations: &record.mutations,
+            identity: record.identity,
+        }
+    }
 }
 
 /// File-backed, per-tablet append-only WAL.
+///
+/// Opening requires an OS-exclusive `<wal>.lock` sidecar. This protects
+/// cooperative single-host writers sharing a canonical WAL path; it is not
+/// quorum fencing and cannot protect against paths aliasing through hardlinks,
+/// deletion of a live sidecar, or filesystems with unreliable lock semantics.
 ///
 /// A WAL starts at tablet sequence 1 and requires each new record to name the
 /// current tail as its predecessor. Ownership epochs may advance over time,
@@ -140,6 +203,8 @@ impl WalRecord {
 pub struct FileWal {
     path: PathBuf,
     file: File,
+    // Stable sidecar ownership survives WAL rename and replacement.
+    writer_lock: Arc<File>,
     records: Vec<WalRecord>,
     record_end_offsets: Vec<u64>,
     base_sequence: u64,
@@ -151,15 +216,44 @@ pub struct FileWal {
 }
 
 impl FileWal {
+    /// Acquire a nonblocking, single-host exclusive writer lock before WAL
+    /// creation, replay, repair, or crash-tail truncation. Keep the sidecar
+    /// file permanently: unlinking it while locked breaks exclusion.
+    ///
+    /// This requires a trusted local filesystem and operator-controlled
+    /// directory; it does not implement distributed fencing.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WalError> {
-        let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path
+        let requested = path.as_ref();
+        let parent = requested
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent)?;
-        }
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
 
+        // Resolve relative and symlinked parent directories to one lock.
+        // Reject WAL/lockfile symlinks and hardlinks that could alias the
+        // same inode under an independently locked filename.
+        let name = requested.file_name().ok_or(WalError::AliasedWalPath)?;
+        let path = fs::canonicalize(parent)?.join(name);
+        reject_path_aliases(&path)?;
+        let lock_path = writer_lock_path(&path);
+        reject_path_aliases(&lock_path)?;
+
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        lock.try_lock().map_err(|error| match error {
+            fs::TryLockError::WouldBlock => WalError::WriterLocked,
+            fs::TryLockError::Error(error) => WalError::from(error),
+        })?;
+        Self::open_locked(path, Arc::new(lock))
+    }
+
+    fn open_locked(path: PathBuf, writer_lock: Arc<File>) -> Result<Self, WalError> {
+        // Called only while already holding the sidecar lock, also during
+        // checkpoint reclaim. Never acquire a second lock on this path.
         let file_existed = path.exists();
         let mut file = OpenOptions::new()
             .create(true)
@@ -250,6 +344,7 @@ impl FileWal {
         Ok(Self {
             path,
             file,
+            writer_lock,
             records,
             record_end_offsets,
             base_sequence,
@@ -285,12 +380,6 @@ impl FileWal {
         self.record_end_offsets.get(index).copied()
     }
 
-    /// Rebuild the single-node MVCC tablet from the durable WAL prefix.
-    ///
-    /// Historical ownership epochs are retained as log metadata but are not
-    /// compared with the descriptor's current owner epoch during replay.
-    /// Tablet identity, sequence order, and key-range membership remain
-    /// fail-closed.
     pub fn recover_memory_tablet(
         &self,
         descriptor: TabletDescriptor,
@@ -321,10 +410,11 @@ impl FileWal {
         let mut tablet = MemoryTablet::new(descriptor);
         for record in &self.records {
             tablet
-                .replay_committed(
+                .replay_committed_with_identity(
                     record.sequence,
                     record.expected_previous_sequence,
                     record.mutations.clone(),
+                    record.identity(),
                 )
                 .map_err(|error| WalError::ReplayRejected {
                     sequence: record.sequence,
@@ -334,7 +424,6 @@ impl FileWal {
         Ok(tablet)
     }
 
-    /// Replay records newer than an already restored checkpoint.
     pub fn replay_after_checkpoint(&self, tablet: &mut MemoryTablet) -> Result<(), WalError> {
         if tablet.current_sequence() < self.base_sequence {
             return Err(WalError::CheckpointTooOld {
@@ -372,10 +461,11 @@ impl FileWal {
             .filter(|record| record.sequence > checkpoint_sequence)
         {
             tablet
-                .replay_committed(
+                .replay_committed_with_identity(
                     record.sequence,
                     record.expected_previous_sequence,
                     record.mutations.clone(),
+                    record.identity(),
                 )
                 .map_err(|error| WalError::ReplayRejected {
                     sequence: record.sequence,
@@ -385,10 +475,6 @@ impl FileWal {
         Ok(())
     }
 
-    /// Atomically replace the WAL with an empty log whose durable predecessor
-    /// is `base_sequence`. Initial reclamation is intentionally tail-only:
-    /// checkpoints are taken at the current committed sequence, so no retained
-    /// post-checkpoint records need to be copied during the rewrite.
     pub fn reclaim_through(&mut self, base_sequence: u64) -> Result<(), WalError> {
         if self.poisoned {
             return Err(WalError::Poisoned);
@@ -401,11 +487,6 @@ impl FileWal {
             });
         }
 
-        // Reclamation can replace the canonical WAL path while `self.file`
-        // still references the old inode. From the first fallible mutation
-        // onward, any error therefore requires reopening the WAL before another
-        // append is allowed. A successful reopen below replaces `self` and
-        // clears the poison state.
         self.poisoned = true;
 
         let temp = reclaim_temp_path(&self.path);
@@ -440,15 +521,12 @@ impl FileWal {
             super::interruption::StorageInterruptionPoint::WalReclaimAfterDirectorySync,
         )?;
 
-        *self = Self::open(&self.path)?;
+        // The cloned guard remains live while the replacement is verified.
+        // No other process can acquire ownership between rename and reopen.
+        *self = Self::open_locked(self.path.clone(), Arc::clone(&self.writer_lock))?;
         Ok(())
     }
 
-    /// Durably append one prepared tablet write.
-    ///
-    /// The in-memory tail advances only after the complete record and checksum
-    /// have been written and `sync_data` succeeds. If an I/O failure leaves a
-    /// partial physical append, reopening the WAL truncates that crash tail.
     pub fn append_write(&mut self, write: &TabletWrite) -> Result<(), WalError> {
         if self.poisoned {
             return Err(WalError::Poisoned);
@@ -492,10 +570,11 @@ impl FileWal {
             }
         }
 
-        let payload =
-            serde_json::to_vec(&record.to_disk()).map_err(|error| WalError::Serialization {
+        let payload = serde_json::to_vec(&DiskWalRecordRef::from(&record)).map_err(|error| {
+            WalError::Serialization {
                 message: error.to_string(),
-            })?;
+            }
+        })?;
         if payload.len() > MAX_WAL_RECORD_BYTES {
             return Err(WalError::RecordTooLarge {
                 offset: self.file.stream_position()?,
@@ -510,10 +589,6 @@ impl FileWal {
         let checksum = blake3::hash(&payload);
         let header = encode_frame_header(payload_len);
 
-        // Seeking does not mutate the file. Once the first frame byte may have
-        // been emitted, every early return leaves this handle poisoned. The
-        // only safe way to continue is to reopen, which validates/truncates the
-        // physical tail before accepting another append.
         self.file.seek(SeekFrom::End(0))?;
         self.poisoned = true;
 
@@ -556,6 +631,139 @@ impl FileWal {
         self.latest_ownership_epoch = Some(record.ownership_epoch);
         self.records.push(record);
         self.record_end_offsets.push(end);
+        self.poisoned = false;
+        Ok(())
+    }
+
+    /// Durably append a consecutive group of prepared writes with one sync.
+    ///
+    /// Every record is validated and serialized before the first file mutation.
+    /// The on-disk format remains the existing self-validating `NUDBWAL3`
+    /// record stream, so restart and checkpoint compatibility are unchanged.
+    /// If an I/O error occurs after bytes begin to be emitted, the live handle
+    /// remains poisoned and callers must reopen to resolve the durable prefix.
+    pub fn append_batch(&mut self, writes: &[TabletWrite]) -> Result<(), WalError> {
+        if self.poisoned {
+            return Err(WalError::Poisoned);
+        }
+        if writes.is_empty() {
+            return Ok(());
+        }
+        // Preflight count before cloning, serializing, or writing anything.
+        if writes.len() > MAX_WAL_BATCH_RECORDS {
+            return Err(WalError::BatchTooManyRecords(writes.len()));
+        }
+
+        let start_offset = self.file.seek(SeekFrom::End(0))?;
+        let mut next_offset = start_offset;
+        let mut expected_tablet = self.tablet_id;
+        let mut latest_epoch = self.latest_ownership_epoch;
+        let mut last_sequence = self.last_sequence();
+        let mut prepared = Vec::with_capacity(writes.len());
+        let mut total_frame_bytes = 0_usize;
+
+        for write in writes {
+            let record = WalRecord::from_write(write);
+            validate_record_chain(
+                &record,
+                expected_tablet,
+                latest_epoch,
+                last_sequence,
+                next_offset,
+            )?;
+
+            let payload =
+                serde_json::to_vec(&DiskWalRecordRef::from(&record)).map_err(|error| {
+                    WalError::Serialization {
+                        message: error.to_string(),
+                    }
+                })?;
+            if payload.len() > MAX_WAL_RECORD_BYTES {
+                return Err(WalError::RecordTooLarge {
+                    offset: next_offset,
+                    length: payload.len(),
+                });
+            }
+            let payload_len =
+                u32::try_from(payload.len()).map_err(|_| WalError::RecordTooLarge {
+                    offset: next_offset,
+                    length: payload.len(),
+                })?;
+            let header = encode_frame_header(payload_len);
+            let checksum = *blake3::hash(&payload).as_bytes();
+            let frame_len = header
+                .len()
+                .checked_add(payload.len())
+                .and_then(|len| len.checked_add(checksum.len()))
+                .ok_or_else(|| WalError::InvalidRecord {
+                    offset: next_offset,
+                    reason: "encoded WAL frame length overflow".to_string(),
+                })?;
+            // Bound aggregate staged frames even for direct append_batch callers.
+            // This runs before the first mutation of the file; failures remain
+            // retryable and do not poison the live handle.
+            total_frame_bytes = total_frame_bytes
+                .checked_add(frame_len)
+                .ok_or(WalError::BatchTooLarge(usize::MAX))?;
+            if total_frame_bytes > MAX_WAL_BATCH_BYTES {
+                return Err(WalError::BatchTooLarge(total_frame_bytes));
+            }
+            let end_offset = next_offset.checked_add(frame_len as u64).ok_or_else(|| {
+                WalError::InvalidRecord {
+                    offset: next_offset,
+                    reason: "WAL file offset overflow".to_string(),
+                }
+            })?;
+
+            expected_tablet = Some(record.tablet_id);
+            latest_epoch = Some(record.ownership_epoch);
+            last_sequence = record.sequence;
+            prepared.push((record, header, payload, checksum, end_offset));
+            next_offset = end_offset;
+        }
+
+        self.file.seek(SeekFrom::End(0))?;
+        self.poisoned = true;
+        for (_index, (_, header, payload, checksum, _)) in prepared.iter().enumerate() {
+            self.file.write_all(header)?;
+            #[cfg(test)]
+            if _index == 0 {
+                super::interruption::hit(
+                    super::interruption::StorageInterruptionPoint::WalBatchAfterHeader,
+                )?;
+            }
+
+            self.file.write_all(payload)?;
+            #[cfg(test)]
+            if _index == 0 {
+                super::interruption::hit(
+                    super::interruption::StorageInterruptionPoint::WalBatchAfterPayload,
+                )?;
+            }
+
+            self.file.write_all(checksum)?;
+            #[cfg(test)]
+            if _index == 0 {
+                super::interruption::hit(
+                    super::interruption::StorageInterruptionPoint::WalBatchAfterChecksum,
+                )?;
+            }
+        }
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::WalBatchAfterFrames,
+        )?;
+
+        self.file.sync_data()?;
+        #[cfg(test)]
+        super::interruption::hit(super::interruption::StorageInterruptionPoint::WalBatchAfterSync)?;
+
+        for (record, _, _, _, end_offset) in prepared {
+            self.records.push(record);
+            self.record_end_offsets.push(end_offset);
+        }
+        self.tablet_id = expected_tablet;
+        self.latest_ownership_epoch = latest_epoch;
         self.poisoned = false;
         Ok(())
     }
@@ -712,6 +920,35 @@ fn validate_record_chain(
     Ok(())
 }
 
+fn writer_lock_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Path aliases can evade sidecar locks; reject symlinks and hardlinks.
+/// Directories must be trusted: concurrent external path replacement and
+/// network-filesystem lock semantics are deliberately unsupported.
+fn reject_path_aliases(path: &Path) -> Result<(), WalError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(WalError::AliasedWalPath);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.nlink() > 1 {
+                    return Err(WalError::AliasedWalPath);
+                }
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn reclaim_temp_path(path: &Path) -> PathBuf {
     let mut temp = path.as_os_str().to_os_string();
     temp.push(".reclaim.tmp");
@@ -752,7 +989,6 @@ fn read_up_to(file: &mut File, buffer: &mut [u8]) -> io::Result<usize> {
     Ok(total)
 }
 
-/// WAL validation or I/O failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalError {
     Io {
@@ -760,6 +996,8 @@ pub enum WalError {
         message: String,
     },
     InvalidHeader,
+    WriterLocked,
+    AliasedWalPath,
     WalHeaderChecksumMismatch,
     InvalidFrameHeader {
         offset: u64,
@@ -784,6 +1022,8 @@ pub enum WalError {
         offset: u64,
         length: usize,
     },
+    BatchTooManyRecords(usize),
+    BatchTooLarge(usize),
     ChecksumMismatch {
         offset: u64,
     },
@@ -839,6 +1079,10 @@ impl fmt::Display for WalError {
         match self {
             Self::Io { message, .. } => write!(f, "WAL I/O error: {message}"),
             Self::InvalidHeader => f.write_str("invalid NuDB WAL header"),
+            Self::WriterLocked => f.write_str("NuDB WAL already has an exclusive writer"),
+            Self::AliasedWalPath => {
+                f.write_str("NuDB WAL or lock path must not be a symlink or hardlink")
+            }
             Self::WalHeaderChecksumMismatch => f.write_str("NuDB WAL header checksum mismatch"),
             Self::InvalidFrameHeader { offset, reason } => {
                 write!(
@@ -867,6 +1111,12 @@ impl fmt::Display for WalError {
                 f,
                 "WAL record at byte offset {offset} is too large ({length} bytes)"
             ),
+            Self::BatchTooManyRecords(count) => {
+                write!(f, "WAL group commit has too many records ({count})")
+            }
+            Self::BatchTooLarge(bytes) => {
+                write!(f, "WAL group commit exceeds staged byte limit ({bytes} bytes)")
+            }
             Self::ChecksumMismatch { offset } => {
                 write!(f, "WAL checksum mismatch at byte offset {offset}")
             }
@@ -969,6 +1219,38 @@ mod hardening_tests {
     }
 
     #[test]
+    fn borrowed_wal_encoding_preserves_legacy_json_bytes() {
+        let descriptor = descriptor();
+        let write = TabletWrite::prepare(
+            &descriptor,
+            1,
+            0,
+            0,
+            vec![
+                TabletMutation::Put {
+                    key: b"escaped".to_vec(),
+                    value: b"quoted \"value\" with newline\\n".to_vec(),
+                },
+                TabletMutation::Delete {
+                    key: b"gone".to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+        let record = WalRecord::from_write(&write);
+        let legacy = record.to_disk();
+        let borrowed = DiskWalRecordRef::from(&record);
+
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+        let borrowed_bytes = serde_json::to_vec(&borrowed).unwrap();
+        assert_eq!(borrowed_bytes, legacy_bytes);
+
+        let decoded: DiskWalRecord = serde_json::from_slice(&borrowed_bytes).unwrap();
+        assert_eq!(decoded.sequence, write.sequence());
+        assert_eq!(decoded.mutations, write.mutations());
+    }
+
+    #[test]
     fn corrupted_record_header_is_not_treated_as_a_torn_tail() {
         let path = temp_wal("header_corruption");
         let _ = fs::remove_file(&path);
@@ -984,7 +1266,6 @@ mod hardening_tests {
                 .write(true)
                 .open(&path)
                 .unwrap();
-            // WAL header (64) + record magic (4) + frame version (2) => payload length.
             file.seek(SeekFrom::Start(70)).unwrap();
             let mut length = [0_u8; 4];
             std::io::Read::read_exact(&mut file, &mut length).unwrap();
@@ -1051,9 +1332,6 @@ mod hardening_tests {
 
         drop(wal);
 
-        // A complete frame can be visible on reopen even though no durability
-        // acknowledgement was returned. Recovery, not an in-process retry,
-        // resolves that ambiguous outcome.
         let reopened = FileWal::open(&path).unwrap();
         assert_eq!(reopened.last_sequence(), 1);
 
@@ -1079,8 +1357,6 @@ mod hardening_tests {
 
         drop(wal);
 
-        // The injected failure happens after sync_data: reopening resolves the
-        // ambiguous outcome by recovering the durable record.
         let reopened = FileWal::open(&path).unwrap();
         assert_eq!(reopened.last_sequence(), 1);
         assert_eq!(reopened.records().len(), 1);
