@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Experimental scoped cancellation — 2026-10-26
+- **Ported the transient, executor-neutral cancellation token from draft PR #1705 onto current `main`.** Clones share cancellation, child scopes observe ancestor requests and inherit the earliest monotonic deadline, and independent siblings remain unaffected by child cancellation. Cancellation is idempotent and thread-safe.
+- **Added public-API contract tests** for parent/child propagation, deterministic deadline boundaries, handle lifetime, and concurrent first-cancel races. This does not interrupt actors or implement structured task joins, durable cancellation, or concurrent `par` execution.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
