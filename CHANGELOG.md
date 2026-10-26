@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Fail-closed remote libSQL URL admission (review-only) — 2026-10-26
+- **Ported the existing URL-admission logic and regressions from draft #2228 onto the audited TLS, cluster-recovery and compiler integration stack.** Nonloopback plaintext HTTP destinations, ambiguous schemes, deceptive loopback names, userinfo (including empty `@` authorities), fragments, backslashes and controls fail with `InvalidInput` before constructing a token-bearing client; numeric IPv4/IPv6 loopback remains available for development.
+- **Preserved patched rustls 0.23/Turso TLS and native certificate verification.** Added two inline validation tests, public URL-admission regressions, and a deliberately ignored disposable-Turso SQL certification harness with strict endpoint/credential safeguards. Real authenticated remote SQL and independent security approval remain required.
+
 ### Stack-bounded let and binary-expression compilation — 2026-10-26
 - **Type inference, effect checking and capability analysis now traverse consecutive let bindings iteratively**, preserving lexical shadowing, generalized types and linear consumption-state restoration.
 - **HIR lowering iteratively processes left-associative binary expression chains**, retaining operand evaluation order and special assignment/range lowering.
