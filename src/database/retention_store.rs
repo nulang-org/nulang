@@ -62,6 +62,7 @@ pub enum RegistryError {
     NoDeliveryIntent,
     DeliveryMismatch,
     ConflictingReceipt,
+    RetiredConsumer,
     HistoryUnavailable { earliest: u64, requested: u64 },
 }
 
@@ -115,6 +116,7 @@ impl fmt::Display for RegistryError {
             Self::ConflictingReceipt => {
                 out.write_str("conflicting or reused delivery acknowledgment")
             }
+            Self::RetiredConsumer => out.write_str("consumer identity permanently retired"),
             Self::HistoryUnavailable {
                 earliest,
                 requested,
@@ -141,6 +143,7 @@ struct RegistryState {
     certified: BTreeSet<RetentionClass>,
     pins: BTreeMap<(RetentionClass, String), u64>,
     receipt_managed: BTreeMap<(RetentionClass, String), ReceiptState>,
+    retired: BTreeMap<(RetentionClass, String), RetiredConsumer>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -158,6 +161,8 @@ struct DiskState {
     pins: Vec<DiskPin>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     receipt_managed: Vec<DiskReceiptConsumer>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    retired: Vec<DiskRetiredConsumer>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -200,6 +205,22 @@ struct DiskReceiptConsumer {
     committed: Option<CommittedReceipt>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetiredConsumer {
+    final_cursor: u64,
+    retirement_id: String,
+    receipt_digest: [u8; 32],
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiskRetiredConsumer {
+    class: RetentionClass,
+    consumer: String,
+    final_cursor: u64,
+    retirement_id: String,
+    receipt_digest: [u8; 32],
+}
 impl RegistryState {
     fn encode(&self) -> Result<Vec<u8>, RegistryError> {
         let disk = DiskState {
@@ -226,6 +247,17 @@ impl RegistryState {
                     consumer: consumer.clone(),
                     pending: state.pending.clone(),
                     committed: state.committed.clone(),
+                })
+                .collect(),
+            retired: self
+                .retired
+                .iter()
+                .map(|((class, consumer), record)| DiskRetiredConsumer {
+                    class: *class,
+                    consumer: consumer.clone(),
+                    final_cursor: record.final_cursor,
+                    retirement_id: record.retirement_id.clone(),
+                    receipt_digest: record.receipt_digest,
                 })
                 .collect(),
         };
@@ -270,6 +302,7 @@ impl RegistryState {
         if disk.pins.len() > MAX_CONSUMERS
             || disk.certified.len() > 5
             || disk.receipt_managed.len() > MAX_CONSUMERS
+            || disk.retired.len() > MAX_CONSUMERS
         {
             return Err(RegistryError::Corrupt("invalid pin capacity"));
         }
@@ -333,6 +366,32 @@ impl RegistryState {
                 return Err(RegistryError::Corrupt("duplicate receipt-managed consumer"));
             }
         }
+        let mut retired = BTreeMap::new();
+        for item in disk.retired {
+            let key = (item.class, item.consumer);
+            if key.0 == RetentionClass::Snapshot
+                || !valid_consumer(&key.1)
+                || !valid_consumer(&item.retirement_id)
+                || item.final_cursor == 0
+                || pins.contains_key(&key)
+                || receipt_managed.contains_key(&key)
+            {
+                return Err(RegistryError::Corrupt("invalid retired consumer tombstone"));
+            }
+            if retired
+                .insert(
+                    key,
+                    RetiredConsumer {
+                        final_cursor: item.final_cursor,
+                        retirement_id: item.retirement_id,
+                        receipt_digest: item.receipt_digest,
+                    },
+                )
+                .is_some()
+            {
+                return Err(RegistryError::Corrupt("duplicate retired consumer"));
+            }
+        }
         Ok(Self {
             tablet_id: disk.tablet_id,
             epoch: disk.ownership_epoch,
@@ -341,6 +400,7 @@ impl RegistryState {
             certified,
             pins,
             receipt_managed,
+            retired,
         })
     }
 }
@@ -595,6 +655,7 @@ impl DurableRetentionRegistry {
                     certified: BTreeSet::new(),
                     pins: BTreeMap::new(),
                     receipt_managed: BTreeMap::new(),
+                    retired: BTreeMap::new(),
                 };
                 let mut file = new_private_file(&path)?;
                 file.write_all(&initial.encode()?)?;
@@ -732,6 +793,90 @@ impl DurableRetentionRegistry {
         self.persist(state)
     }
 
+    /// A consumer tombstone permanently reserves its identity, even after
+    /// the live WAL pin is durably released.
+    pub fn consumer_retirement(
+        &self,
+        class: RetentionClass,
+        consumer: &str,
+    ) -> Result<Option<(u64, String, [u8; 32])>, RegistryError> {
+        if self.poisoned {
+            return Err(RegistryError::Poisoned);
+        }
+        if !valid_consumer(consumer) {
+            return Err(RegistryError::InvalidConsumer);
+        }
+        Ok(self
+            .state
+            .retired
+            .get(&(class, consumer.to_owned()))
+            .map(|v| (v.final_cursor, v.retirement_id.clone(), v.receipt_digest)))
+    }
+
+    /// Called by an in-crate local sink only AFTER its immutable closure is
+    /// fsynced; does not independently prove remote consumer shutdown.
+    pub(crate) fn finish_local_retirement(
+        &mut self,
+        class: RetentionClass,
+        consumer: &str,
+        final_cursor: u64,
+        retirement_id: &str,
+        receipt_digest: [u8; 32],
+    ) -> Result<u64, RegistryError> {
+        if self.poisoned {
+            return Err(RegistryError::Poisoned);
+        }
+        if class == RetentionClass::Snapshot
+            || !valid_consumer(consumer)
+            || !valid_consumer(retirement_id)
+            || final_cursor == 0
+        {
+            return Err(RegistryError::InvalidReceipt);
+        }
+        let key = (class, consumer.to_owned());
+        if let Some(prior) = self.state.retired.get(&key) {
+            return if prior.final_cursor == final_cursor
+                && prior.retirement_id == retirement_id
+                && prior.receipt_digest == receipt_digest
+            {
+                Ok(self.state.revision)
+            } else {
+                Err(RegistryError::RetiredConsumer)
+            };
+        }
+        let pinned = *self
+            .state
+            .pins
+            .get(&key)
+            .ok_or(RegistryError::MissingConsumer)?;
+        let track = self
+            .state
+            .receipt_managed
+            .get(&key)
+            .ok_or(RegistryError::ReceiptRequired)?;
+        if track.pending.is_some() {
+            return Err(RegistryError::DeliveryInFlight);
+        }
+        if pinned != final_cursor {
+            return Err(RegistryError::DeliveryMismatch);
+        }
+        if self.state.retired.len() >= MAX_CONSUMERS {
+            return Err(RegistryError::CapacityExceeded);
+        }
+        let mut state = self.state.clone();
+        state.pins.remove(&key);
+        state.receipt_managed.remove(&key);
+        state.retired.insert(
+            key,
+            RetiredConsumer {
+                final_cursor,
+                retirement_id: retirement_id.to_owned(),
+                receipt_digest,
+            },
+        );
+        self.persist(state)
+    }
+
     /// Atomically enroll a WAL consumer in receipt-gated mode. The pin and
     /// mode are committed in one registry snapshot. A crash cannot expose an
     /// unprotected classic registration. All external enrollment and delivery
@@ -758,6 +903,9 @@ impl DurableRetentionRegistry {
             });
         }
         let key = (class, consumer.to_string());
+        if self.state.retired.contains_key(&key) {
+            return Err(RegistryError::RetiredConsumer);
+        }
         if self.state.pins.contains_key(&key) {
             return Err(RegistryError::AlreadyRegistered);
         }
@@ -787,6 +935,9 @@ impl DurableRetentionRegistry {
             return Err(RegistryError::InvalidReceipt);
         }
         let key = (class, consumer.to_string());
+        if self.state.retired.contains_key(&key) {
+            return Err(RegistryError::RetiredConsumer);
+        }
         let pinned = *self
             .state
             .pins
@@ -888,6 +1039,9 @@ impl DurableRetentionRegistry {
         if pending.next_needed != next_needed || pending.delivery_id != delivery_id {
             return Err(RegistryError::DeliveryMismatch);
         }
+        if self.state.retired.contains_key(&key) {
+            return Err(RegistryError::RetiredConsumer);
+        }
         let pinned = *self
             .state
             .pins
@@ -932,6 +1086,9 @@ impl DurableRetentionRegistry {
             });
         }
         let key = (class, consumer.to_string());
+        if self.state.retired.contains_key(&key) {
+            return Err(RegistryError::RetiredConsumer);
+        }
         if self.state.pins.contains_key(&key) {
             return Err(RegistryError::AlreadyRegistered);
         }
