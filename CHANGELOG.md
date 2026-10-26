@@ -2,6 +2,7 @@
 ### Fail-closed remote libSQL URL admission — 2026-10-26
 - **Ported the remote URL admission contract from draft #2100 onto the audited #2184 TLS connector and #2226 scoped-runtime integration.** Nonloopback plaintext destinations, ambiguous schemes, lookalike loopback hostnames, userinfo, fragments, backslashes and control characters are rejected as `InvalidInput` before constructing a token-bearing client. Numeric IPv4/IPv6 loopback remains available for development; production HTTPS and libsql:// URLs preserve certificate and hostname verification.
 - **Added public regression coverage and module-level accept/reject tests.** No TLS verification policy, remote SQL semantics, security audit policy, or source-level task concurrency is weakened. Authenticated disposable Turso SQL certification remains pending.
+- **Ported a deliberately ignored live Turso certification harness** with a strict disposable-database acknowledgement, cloud endpoint/authority restrictions, generic error messages, and fail-closed configuration tests. No live endpoint or credentials are used in ordinary CI.
 
 ### One-shot bounded CoreVM lexical join — 2026-10-26
 - **Added a finite, synchronous CoreVM child-scope runner** on top of the existing coordinator and per-instruction fuel budget. Admission occurs before any child execution; pending submissions, active admission count, and each child’s instruction budget are explicit bounds.
