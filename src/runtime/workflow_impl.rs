@@ -385,18 +385,21 @@ pub(crate) fn try_emit_event(
         return Ok(());
     }
     let seq = next_sequence(rt, actor_id);
-    let module = rt
-        .actors
-        .get(&actor_id)
-        .and_then(|actor| actor.bytecode_module.as_deref());
-    // The legacy serializer intentionally maps unresolved string IDs and
-    // unrecognized pointer-backed values to Nil. That compatibility fallback
-    // cannot be used as proof of a durable workflow receipt: a replay would
-    // observe different arguments from the original execution.
+    let actor = rt.actors.get(&actor_id).ok_or_else(|| {
+        Error::new(
+            ErrorKind::NotFound,
+            "emitting workflow actor does not exist",
+        )
+    })?;
+    // Reuse the actor-owned, provenance-checked serializer. It resolves
+    // compiled string constants and live actor-heap String allocations but
+    // never interprets arbitrary pointers as strings. The legacy fallback
+    // may still produce Nil on unsupported values: reject those before
+    // writing a durable receipt unless the source value really is Nil.
     let payload: Vec<PersistedValue> = args
         .iter()
         .map(|value| {
-            let persisted = PersistedValue::from_value_resolved(value, module);
+            let persisted = actor.persist_value(value);
             if persisted == PersistedValue::Nil && !value.is_nil() {
                 return Err(Error::new(
                     ErrorKind::InvalidData,
