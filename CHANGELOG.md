@@ -1,5 +1,10 @@
 # Nulang Changelog
 
+### Stack-bounded let and binary-expression compilation — 2026-10-26
+- **Type inference, effect checking and capability analysis now traverse consecutive let bindings iteratively**, preserving lexical shadowing, generalized types and linear consumption-state restoration.
+- **HIR lowering iteratively processes left-associative binary expression chains**, retaining operand evaluation order and special assignment/range lowering.
+- **Both existing compiler-spill conformance fixtures now type-check and execute with an 8 MiB host stack**, producing `9870` and `7750` in a focused Linux reproduction. An exact-head CI smoke retains that ordinary stack limit; full tests and other behavior-conformance failures remain independent gates. Tracks #2227.
+
 ### Project-relative namespaced import resolution — 2026-10-26
 - **Local imports now resolve `::` segments as directories**, consistent with standard-library module paths. For example, `import subpkg::helper` resolves to `subpkg/helper.nula` relative to the importing source file; slash paths and explicit `.nula` extensions remain supported.
 - **The existing `modimport_13_subdirectory_package` conformance failure now has focused resolver regression tests.** No grammar or frozen format changes are needed; full language-suite and exact-head CI verification are still required.
