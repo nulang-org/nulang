@@ -11,6 +11,7 @@ use std::time::Instant;
 use tracing::warn;
 
 mod actor;
+pub(crate) mod application_db;
 mod behavior_ownership;
 mod blocking_executor;
 pub mod cache;
@@ -96,6 +97,7 @@ mod cluster_sim;
 mod tests;
 
 pub use actor::*;
+pub use application_db::*;
 pub use blocking_executor::*;
 pub use cache::*;
 pub use cache_cluster::*;
@@ -452,6 +454,9 @@ pub struct Runtime {
 
     // Persistence engine (v0.7)
     pub persistence: Box<dyn PersistenceStore>,
+    /// Application SQL is never dispatched through the durability backend.
+    application_database: Option<Box<dyn ApplicationDatabase>>,
+
     // Immutable shared object store for large `val` buffers.
     pub object_store: ObjectStore,
     // Virtual actor (grain) type registry and resident mapping.
@@ -686,6 +691,7 @@ impl Runtime {
             process_groups: ProcessGroups::new(),
             pending_fetched_messages: HashMap::new(),
             persistence: Box::new(MemoryStore::new()),
+            application_database: None,
             object_store: ObjectStore::new(),
             grain_registry: GrainRegistry::new(),
             grain_residents: HashMap::new(),

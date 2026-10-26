@@ -1016,8 +1016,16 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
             return Some(Value::nil());
         }
         if effect_name == "DB" {
-            // DB.query requires a runtime with a configured database.
-            // Standalone VM returns nil.
+            // Standalone VM never acquires database credentials implicitly.
+            // The checked API reports missing configuration explicitly.
+            if op_name == Some("query_result") {
+                return Some(
+                    self.alloc_string(&crate::runtime::application_db::query_error_json(
+                        "DATABASE_NOT_CONFIGURED",
+                        "application database is not configured",
+                    )),
+                );
+            }
             return Some(Value::nil());
         }
         if effect_name == "Timer" {
