@@ -1,4 +1,9 @@
 # Nulang Changelog
+
+### Project-relative namespaced import resolution — 2026-10-26
+- **Local imports now resolve `::` segments as directories**, consistent with standard-library module paths. For example, `import subpkg::helper` resolves to `subpkg/helper.nula` relative to the importing source file; slash paths and explicit `.nula` extensions remain supported.
+- **The existing `modimport_13_subdirectory_package` conformance failure now has focused resolver regression tests.** No grammar or frozen format changes are needed; full language-suite and exact-head CI verification are still required.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
