@@ -377,6 +377,33 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_project_relative_namespaced_import() {
+        let base = Path::new("some_project/src");
+        assert_eq!(
+            resolve_path(base, "subpkg::helper"),
+            base.join("subpkg").join("helper.nula")
+        );
+        assert_eq!(
+            resolve_path(base, "subpkg::helper.nula"),
+            base.join("subpkg").join("helper.nula")
+        );
+        // Slash paths keep their pre-existing behavior.
+        assert_eq!(
+            resolve_path(base, "subpkg/helper"),
+            base.join("subpkg").join("helper.nula")
+        );
+    }
+
+    #[test]
+    fn test_resolve_conformance_subdirectory_module() {
+        // Pinned by conformance/behavior/modimport_13_subdirectory_package.nula.
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/behavior");
+        let resolved = resolve_path(&base, "subpkg::helper");
+        assert_eq!(resolved, base.join("subpkg").join("helper.nula"));
+        assert!(resolved.is_file(), "expected existing nested module: {}", resolved.display());
+    }
+
+    #[test]
     fn test_resolve_module_path() {
         std::env::set_var("NULANG_MODULE_PATH", "@nulang/auth=/tmp/nulang_auth_mod");
         let base = std::path::Path::new(".");
