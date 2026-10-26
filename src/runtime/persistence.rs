@@ -2924,7 +2924,7 @@ fn postgres_float_json(
 /// array or extension value through String::from_sql can panic or truncate
 /// semantics; callers must cast explicitly until an exact codec is installed.
 #[cfg(feature = "postgres")]
-fn postgres_row_json(row: &postgres::Row) -> io::Result<String> {
+pub(super) fn postgres_row_json(row: &postgres::Row) -> io::Result<String> {
     use postgres::types::Type;
 
     let mut columns = Vec::with_capacity(row.len());
