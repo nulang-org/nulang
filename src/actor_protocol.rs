@@ -418,6 +418,7 @@ fn validate_call(
     env: &Env,
     protocols: &FxHashMap<String, ActorProtocol>,
     span: Span,
+    annotate_arguments: bool,
 ) -> NuResult<Option<Type>> {
     let Some(actor_name) = actor_name_for_expr(actor, env) else {
         return Ok(None);
@@ -466,6 +467,16 @@ fn validate_call(
             found_type: Some(format!("{} argument(s)", args.len())),
             similar_names: None,
         });
+    }
+
+    // Do not inject TypeAnnotate over send arguments: that would demand that
+    // `&iso Int` unify directly with Int *before* the actor-send typechecker
+    // can validate the payload and EffectChecker can validate transfer rights.
+    // Send payload types are checked against the declared behavior protocol
+    // by TypeChecker::infer_actor_protocol_call; ask keeps its return-and-arg
+    // annotations for backward compatibility.
+    if !annotate_arguments {
+        return Ok(sig.ret.clone());
     }
 
     for (arg, expected) in args.iter_mut().zip(sig.params.iter()) {
@@ -666,7 +677,7 @@ fn annotate_expr(
             for arg in args.iter_mut() {
                 annotate_expr(arg, env, protocols)?;
             }
-            let _ = validate_call(actor, behavior, args, env, protocols, *span)?;
+            let _ = validate_call(actor, behavior, args, env, protocols, *span, false)?;
             qualify_known_behavior(actor, behavior, env, protocols);
             Ok(())
         }
@@ -682,7 +693,7 @@ fn annotate_expr(
                 annotate_expr(arg, env, protocols)?;
             }
             let ask_span = *span;
-            let ret = validate_call(actor, behavior, args, env, protocols, ask_span)?;
+            let ret = validate_call(actor, behavior, args, env, protocols, ask_span, true)?;
             qualify_known_behavior(actor, behavior, env, protocols);
             if let Some(ret) = ret {
                 let placeholder = Expr::Literal(Literal::Unit, ask_span);
