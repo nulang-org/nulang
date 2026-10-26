@@ -3574,6 +3574,7 @@ impl TypeChecker {
         args: &[Expr],
         span: Span,
         allow_unspecified: bool,
+        for_send: bool,
     ) -> NuResult<(Substitution, Type)> {
         let (param, ret) = protocol_call_signature(protocol, behavior, span)?;
         let expected_args = protocol_param_types(param);
@@ -3601,11 +3602,29 @@ impl TypeChecker {
                 continue;
             }
 
-            let s_match = mgu(
-                &apply_subst(&arg_ty, &subst),
-                &apply_subst(expected, &subst),
-                span,
-            )?;
+            let resolved_arg = apply_subst(&arg_ty, &subst);
+            let resolved_expected = apply_subst(expected, &subst);
+            // `:cap iso/tag/...` annotates ownership of a value, not a new
+            // payload type. For sends to a plain behavior parameter, match
+            // its underlying type; EffectChecker separately enforces whether
+            // the capability is legal to transfer across the actor boundary.
+            // Do NOT unwrap when the callee explicitly expects a reference or
+            // for asks: those calls retain their normal typed-reference rule.
+            let payload_ty = if for_send && !matches!(resolved_expected, Type::Reference { .. }) {
+                // A value can be attenuated more than once (e.g. ref -> tag).
+                // Peel only ownership wrappers when the behavior expects a
+                // plain payload. The capability pass still checks the outer
+                // transferable capability; explicit reference parameters and
+                // asks retain strict reference-type matching.
+                let mut inner = &resolved_arg;
+                while let Type::Reference { inner: value, .. } = inner {
+                    inner = value.as_ref();
+                }
+                inner
+            } else {
+                &resolved_arg
+            };
+            let s_match = mgu(payload_ty, &resolved_expected, span)?;
             subst = compose_subst(&s_match, &subst);
         }
 
@@ -3625,8 +3644,9 @@ impl TypeChecker {
         behavior: &str,
         args: &[Expr],
         span: Span,
+        for_send: bool,
     ) -> NuResult<(Substitution, Type)> {
-        self.infer_actor_protocol_call(ctx, subst, protocol, behavior, args, span, false)
+        self.infer_actor_protocol_call(ctx, subst, protocol, behavior, args, span, false, for_send)
     }
 
     fn infer_actor_decl(
@@ -3830,7 +3850,8 @@ impl TypeChecker {
         let resolved_actor = apply_subst(&actor_ty, &s1);
 
         if let Some(protocol) = resolved_actor.actor_ref_protocol() {
-            let (subst, _) = self.infer_actor_ref_call(ctx, s1, protocol, behavior, args, span)?;
+            let (subst, _) =
+                self.infer_actor_ref_call(ctx, s1, protocol, behavior, args, span, true)?;
             return Ok((subst, Type::unit()));
         }
 
@@ -3840,8 +3861,9 @@ impl TypeChecker {
         {
             if matches!(protocol.as_ref(), Type::Record(_)) {
                 let behavior = behavior.rsplit('.').next().unwrap_or(behavior);
-                let (subst, _) =
-                    self.infer_actor_protocol_call(ctx, s1, protocol, behavior, args, span, true)?;
+                let (subst, _) = self.infer_actor_protocol_call(
+                    ctx, s1, protocol, behavior, args, span, true, true,
+                )?;
                 return Ok((subst, Type::unit()));
             }
         }
@@ -3876,7 +3898,7 @@ impl TypeChecker {
         let resolved_actor = apply_subst(&actor_ty, &s1);
 
         if let Some(protocol) = resolved_actor.actor_ref_protocol() {
-            return self.infer_actor_ref_call(ctx, s1, protocol, behavior, args, span);
+            return self.infer_actor_ref_call(ctx, s1, protocol, behavior, args, span, false);
         }
 
         if let Type::Actor {
@@ -3885,8 +3907,9 @@ impl TypeChecker {
         {
             if matches!(protocol.as_ref(), Type::Record(_)) {
                 let behavior = behavior.rsplit('.').next().unwrap_or(behavior);
-                return self
-                    .infer_actor_protocol_call(ctx, s1, protocol, behavior, args, span, true);
+                return self.infer_actor_protocol_call(
+                    ctx, s1, protocol, behavior, args, span, true, false,
+                );
             }
         }
 

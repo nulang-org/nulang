@@ -1,1 +1,5 @@
-{"exit_code": 6, "stdout": "", "stderr": "got trn"}
+{
+  "exit_code": 6,
+  "stdout": "",
+  "stderr": "send argument with capability trn is not sendable"
+}
