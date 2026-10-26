@@ -94,13 +94,19 @@ impl RelationalSchema {
     /// This is structural validation, not SQL parsing or compatibility analysis.
     pub fn validate(&self) -> Result<(), SchemaContractError> {
         if self.version != RELATIONAL_SCHEMA_VERSION {
-            return Err(invalid(format!("unsupported relational schema contract '{}'", self.version)));
+            return Err(invalid(format!(
+                "unsupported relational schema contract '{}'",
+                self.version
+            )));
         }
 
         let mut tables = BTreeMap::new();
         for table in &self.tables {
             check_name(&table.name, "table")?;
-            if tables.insert(identifier_key(self.dialect, &table.name), table).is_some() {
+            if tables
+                .insert(identifier_key(self.dialect, &table.name), table)
+                .is_some()
+            {
                 return Err(invalid(format!("duplicate table '{}'", table.name)));
             }
         }
@@ -113,7 +119,10 @@ impl RelationalSchema {
             for column in &table.columns {
                 check_name(&column.name, "column")?;
                 if !columns.insert(identifier_key(self.dialect, &column.name)) {
-                    return Err(invalid(format!("duplicate column '{}' on '{}'", column.name, table.name)));
+                    return Err(invalid(format!(
+                        "duplicate column '{}' on '{}'",
+                        column.name, table.name
+                    )));
                 }
                 check_text(&column.sql_type, "SQL type")?;
                 if let Some(default_sql) = &column.default_sql {
@@ -121,12 +130,21 @@ impl RelationalSchema {
                 }
             }
 
-            check_columns(&table.primary_key, &columns, self.dialect, false, &table.name)?;
+            check_columns(
+                &table.primary_key,
+                &columns,
+                self.dialect,
+                false,
+                &table.name,
+            )?;
             let mut index_names = BTreeSet::new();
             for index in &table.indexes {
                 check_name(&index.name, "index")?;
                 if !index_names.insert(identifier_key(self.dialect, &index.name)) {
-                    return Err(invalid(format!("duplicate index '{}' on '{}'", index.name, table.name)));
+                    return Err(invalid(format!(
+                        "duplicate index '{}' on '{}'",
+                        index.name, table.name
+                    )));
                 }
                 check_columns(&index.columns, &columns, self.dialect, true, &index.name)?;
             }
@@ -135,21 +153,45 @@ impl RelationalSchema {
             for foreign_key in &table.foreign_keys {
                 check_name(&foreign_key.name, "foreign key")?;
                 if !foreign_key_names.insert(identifier_key(self.dialect, &foreign_key.name)) {
-                    return Err(invalid(format!("duplicate foreign key '{}' on '{}'", foreign_key.name, table.name)));
+                    return Err(invalid(format!(
+                        "duplicate foreign key '{}' on '{}'",
+                        foreign_key.name, table.name
+                    )));
                 }
-                check_columns(&foreign_key.columns, &columns, self.dialect, true, &foreign_key.name)?;
+                check_columns(
+                    &foreign_key.columns,
+                    &columns,
+                    self.dialect,
+                    true,
+                    &foreign_key.name,
+                )?;
                 check_name(&foreign_key.references_table, "referenced table")?;
                 if foreign_key.columns.len() != foreign_key.references_columns.len() {
-                    return Err(invalid(format!("foreign key '{}' has mismatched column counts", foreign_key.name)));
+                    return Err(invalid(format!(
+                        "foreign key '{}' has mismatched column counts",
+                        foreign_key.name
+                    )));
                 }
-                let target = tables.get(&identifier_key(self.dialect, &foreign_key.references_table))
-                    .ok_or_else(|| invalid(format!("foreign key '{}' references missing table '{}'",
-                        foreign_key.name, foreign_key.references_table)))?;
-                let target_columns: BTreeSet<String> = target.columns.iter()
+                let target = tables
+                    .get(&identifier_key(self.dialect, &foreign_key.references_table))
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "foreign key '{}' references missing table '{}'",
+                            foreign_key.name, foreign_key.references_table
+                        ))
+                    })?;
+                let target_columns: BTreeSet<String> = target
+                    .columns
+                    .iter()
                     .map(|column| identifier_key(self.dialect, &column.name))
                     .collect();
-                check_columns(&foreign_key.references_columns, &target_columns,
-                    self.dialect, true, &foreign_key.name)?;
+                check_columns(
+                    &foreign_key.references_columns,
+                    &target_columns,
+                    self.dialect,
+                    true,
+                    &foreign_key.name,
+                )?;
             }
         }
         Ok(())
@@ -181,10 +223,17 @@ impl RelationalSchema {
     /// Resolve a named column. For trusted metadata only: callers should
     /// validate untrusted schemas before calling this convenience method.
     pub fn column(&self, table: &str, column: &str) -> Option<&SchemaColumn> {
-        self.tables.iter()
-            .find(|item| identifier_key(self.dialect, &item.name) == identifier_key(self.dialect, table))
-            .and_then(|item| item.columns.iter().find(|field|
-                identifier_key(self.dialect, &field.name) == identifier_key(self.dialect, column)))
+        self.tables
+            .iter()
+            .find(|item| {
+                identifier_key(self.dialect, &item.name) == identifier_key(self.dialect, table)
+            })
+            .and_then(|item| {
+                item.columns.iter().find(|field| {
+                    identifier_key(self.dialect, &field.name)
+                        == identifier_key(self.dialect, column)
+                })
+            })
     }
 
     fn normalized(&self) -> Result<Self, SchemaContractError> {
@@ -236,7 +285,9 @@ fn check_columns(
         check_name(name, "column reference")?;
         let key = identifier_key(dialect, name);
         if !known.contains(&key) {
-            return Err(invalid(format!("'{owner}' references unknown column '{name}'")));
+            return Err(invalid(format!(
+                "'{owner}' references unknown column '{name}'"
+            )));
         }
         if !seen.insert(key) {
             return Err(invalid(format!("'{owner}' repeats column '{name}'")));
