@@ -1,1 +1,7 @@
-{ "exit_code": 0, "stdout": "hello\ntrue" }
+{
+  "exit_code": 0,
+  "stdout": "hello\ntrue",
+  "capabilities": [
+    "fs"
+  ]
+}

@@ -1,0 +1,76 @@
+// In-memory binary buffers must enforce limits and reject invalid bytes.
+import stdlib::bytes
+
+fn main() {
+    let w = match new_writer(3) { Ok(value) => value, Error(_) => {bytes: [], limit: 3} };
+    let first = match write_chunk(w, [0, 128]) {
+        Ok(updated) => updated,
+        Error(_) => w,
+    };
+    match write_chunk(first, [255, 1]) {
+        Ok(_) => perform IO.print("over_limit=unexpected"),
+        Error(LimitExceeded) => perform IO.print("over_limit=ok"),
+        Error(_) => perform IO.print("over_limit=wrong-error"),
+    };
+    let final_writer = match write_chunk(first, [255]) {
+        Ok(updated) => updated,
+        Error(_) => first,
+    };
+    match new_reader(to_bytes(final_writer), 3) {
+        Ok(reader) => {
+            let first_read = match read_chunk(reader, 2) {
+                Ok(c) => c,
+                Error(_) => {bytes: [], reader: reader, eof: false},
+            };
+            perform IO.print("first=" + perform Int.to_string(first_read.bytes[0]) + "," + perform Int.to_string(first_read.bytes[1]));
+            perform IO.print("first_eof=" + (if first_read.eof then "true" else "false"));
+            let tail = match read_chunk(first_read.reader, 100) {
+                Ok(c) => c,
+                Error(_) => {bytes: [], reader: reader, eof: false},
+            };
+            perform IO.print("tail=" + perform Int.to_string(tail.bytes[0]));
+            perform IO.print("tail_eof=" + (if tail.eof then "true" else "false"));
+        },
+        Error(_) => perform IO.print("reader=unexpected-error"),
+    };
+    match new_reader([256], 4) {
+        Ok(_) => perform IO.print("bad_byte=unexpected"),
+        Error(InvalidByte(_)) => perform IO.print("bad_byte=ok"),
+        Error(_) => perform IO.print("bad_byte=wrong-error"),
+    };
+    match new_reader([0, 255], 1) {
+        Ok(_) => perform IO.print("bad_length=unexpected"),
+        Error(LimitExceeded) => perform IO.print("bad_length=ok"),
+        Error(_) => perform IO.print("bad_length=wrong-error"),
+    };
+    match new_writer(-1) {
+        Ok(_) => perform IO.print("bad_limit=unexpected"),
+        Error(InvalidLimit) => perform IO.print("bad_limit=ok"),
+        Error(_) => perform IO.print("bad_limit=wrong-error"),
+    };
+    match read_chunk({bytes: [10], offset: -1}, 1) {
+        Error(InvalidState) => perform IO.print("invalid_reader=ok"),
+        _ => perform IO.print("invalid_reader=unexpected"),
+    };
+    match write_chunk({bytes: [3, 300], limit: 4}, []) {
+        Error(InvalidByte(300)) => perform IO.print("invalid_writer_byte=ok"),
+        _ => perform IO.print("invalid_writer_byte=unexpected"),
+    };
+    match write_chunk({bytes: [0, 1, 2], limit: 2}, []) {
+        Error(InvalidState) => perform IO.print("invalid_writer_limit=ok"),
+        _ => perform IO.print("invalid_writer_limit=unexpected"),
+    };
+    match read_chunk({bytes: [10], offset: 2}, 1) {
+        Error(InvalidState) => perform IO.print("invalid_reader_offset=ok"),
+        _ => perform IO.print("invalid_reader_offset=unexpected"),
+    };
+    match read_chunk({bytes: [], offset: 0}, -1) {
+        Error(InvalidReadSize) => perform IO.print("negative_read=ok"),
+        _ => perform IO.print("negative_read=unexpected"),
+    };
+    match write_chunk(first, [-1]) {
+        Ok(_) => perform IO.print("bad_write=unexpected"),
+        Error(InvalidByte(_)) => perform IO.print("bad_write=ok"),
+        Error(_) => perform IO.print("bad_write=wrong-error"),
+    }
+}
