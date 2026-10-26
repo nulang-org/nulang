@@ -597,12 +597,26 @@ impl EffectChecker {
 
             // Let: effects of value + effects of body. The binding shadows a
             // same-named module function inside the body.
-            Expr::Let {
-                name, value, body, ..
-            } => {
-                let val_row = self.infer_effects(ctx, value)?;
-                let body_row = self.infer_with_bound(ctx, std::slice::from_ref(name), body)?;
-                Ok(effect_row_union(&val_row, &body_row))
+            Expr::Let { .. } => {
+                // A parser-generated let chain can contain hundreds of bindings.
+                // Traverse its tail iteratively to avoid exhausting the host
+                // compiler stack while retaining shadowing and effect unions.
+                let base = self.shadowed.len();
+                let result = (|| {
+                    let mut row = EffectRow::empty();
+                    let mut tail = expr;
+                    while let Expr::Let {
+                        name, value, body, ..
+                    } = tail
+                    {
+                        row = effect_row_union(&row, &self.infer_effects(ctx, value)?);
+                        self.shadowed.push(name.clone());
+                        tail = body;
+                    }
+                    Ok(effect_row_union(&row, &self.infer_effects(ctx, tail)?))
+                })();
+                self.shadowed.truncate(base);
+                result
             }
 
             // Let-rec: similar to let, but the binding is recursive (in scope
@@ -1934,59 +1948,66 @@ impl CapabilityAnalyzer {
                 Ok(cap)
             }
 
-            // Let: capability of the body. A `LinearIso`/`Linear` binding
-            // must be consumed exactly once: `consume_linear` (via any Var
-            // reference) already rejects a *second* use; here we reject
-            // *zero* uses once the body's scope closes, completing the
-            // exactly-once discipline (see `spec/formal/capabilities.lean`'s
-            // `linear_at_most_once` theorem and its doc comment).
-            Expr::Let {
-                name,
-                value,
-                body,
-                span,
-                ..
-            } => {
-                let val_cap = self.infer_cap_tracked(ctx, value, consumed)?;
-                let body_ctx = ctx.with_binding(name.clone(), val_cap);
-                // Shadowing: the new binding hides any outer binding of the
-                // same name. Hide the outer consumption state while analyzing
-                // the body, then restore it; the inner binding's own
-                // consumption is scope-local and never leaks out.
-                let outer_consumed = consumed.remove(name);
-                let result = self.infer_cap_tracked(&body_ctx, body, consumed);
-                // A bare rebind (`let a = x` or `let a = consume x`) is
-                // transparent: evaluating `value` already discharged the
-                // source binding's own obligation (via `consume_linear` in
-                // the Var/Consume cases below), so `a` doesn't carry a
-                // *second*, independent must-use obligation for the same
-                // underlying value — only a genuinely fresh linear value
-                // (a literal/call annotated `:cap lineariso`, a function
-                // return, etc.) does.
-                let is_transparent_rebind = match value.as_ref() {
-                    Expr::Var(..) => true,
-                    Expr::Consume { expr: inner, .. } => matches!(inner.as_ref(), Expr::Var(..)),
-                    _ => false,
+            // Let: process consecutive bindings iteratively so valid wide
+            // source programs cannot overflow the compiler thread stack.
+            // Shadowed consumption states and must-use checks unwind in the
+            // same innermost-first order as the recursive implementation.
+            Expr::Let { .. } => {
+                let mut context = ctx.clone();
+                let mut tail = expr;
+                let mut frames = Vec::new();
+                let mut result = loop {
+                    let Expr::Let {
+                        name,
+                        value,
+                        body,
+                        span,
+                        ..
+                    } = tail
+                    else {
+                        break self.infer_cap_tracked(&context, tail, consumed);
+                    };
+                    let val_cap = match self.infer_cap_tracked(&context, value, consumed) {
+                        Ok(cap) => cap,
+                        Err(err) => break Err(err),
+                    };
+                    let outer_consumed = consumed.remove(name);
+                    let transparent_rebind = match value.as_ref() {
+                        Expr::Var(..) => true,
+                        Expr::Consume { expr: inner, .. } => {
+                            matches!(inner.as_ref(), Expr::Var(..))
+                        }
+                        _ => false,
+                    };
+                    frames.push((
+                        name.clone(),
+                        val_cap,
+                        outer_consumed,
+                        transparent_rebind,
+                        *span,
+                    ));
+                    context = context.with_binding(name.clone(), val_cap);
+                    tail = body;
                 };
-                if result.is_ok()
-                    && val_cap.is_linear()
-                    && !is_transparent_rebind
-                    && !consumed.contains(name)
+                for (name, val_cap, outer_consumed, transparent_rebind, span) in
+                    frames.into_iter().rev()
                 {
-                    let msg = format!(
-                        "linear value `{}` is never used ({} bindings must be consumed exactly once — pass it to a function, `send` it, or `consume {}` it explicitly)",
-                        name, val_cap, name
-                    );
-                    self.diagnostics.push(msg.clone());
-                    consumed.remove(name);
-                    if outer_consumed {
-                        consumed.insert(name.clone());
+                    if result.is_ok()
+                        && val_cap.is_linear()
+                        && !transparent_rebind
+                        && !consumed.contains(&name)
+                    {
+                        let msg = format!(
+                            "linear value `{}` is never used ({} bindings must be consumed exactly once — pass it to a function, `send` it, or `consume {}` it explicitly)",
+                            name, val_cap, name,
+                        );
+                        self.diagnostics.push(msg.clone());
+                        result = Err(NuError::cap_error(msg, span));
                     }
-                    return Err(NuError::cap_error(msg, *span));
-                }
-                consumed.remove(name);
-                if outer_consumed {
-                    consumed.insert(name.clone());
+                    consumed.remove(&name);
+                    if outer_consumed {
+                        consumed.insert(name);
+                    }
                 }
                 result
             }

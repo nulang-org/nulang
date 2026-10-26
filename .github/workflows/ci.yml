@@ -131,6 +131,44 @@ jobs:
           print("PASS:", case)
           PY
 
+      # These checked-in source fixtures must compile and execute without
+      # a raised process stack, ignored conformance failures, or SIGABRT.
+      - name: Smoke bounded compiler traversal (8 MiB stack)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          ulimit -s 8192
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import subprocess
+
+          target_dir = json.loads(subprocess.check_output(
+              ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+              text=True,
+          ))["target_directory"]
+          binary = str(Path(target_dir) / "debug" / "nulang")
+          for name in (
+              "spill_03_wide_spill_correct_sum",
+              "spill_04_nested_lets_correct_sum",
+          ):
+              case = Path("conformance/behavior") / f"{name}.nula"
+              expected = json.loads(case.with_suffix(".json").read_text(encoding="utf-8"))
+              for args in ((binary, "--check", str(case)), (binary, str(case))):
+                  result = subprocess.run(
+                      args, capture_output=True, text=True, timeout=45,
+                  )
+                  assert result.returncode == 0, (
+                      f"{case}: {args!r} exited {result.returncode}: {result.stderr}"
+                  )
+                  if "--check" not in args:
+                      assert result.stdout.strip() == expected["stdout"].strip(), (
+                          f"{case}: expected {expected['stdout']!r}, got {result.stdout!r}"
+                      )
+              print("PASS: typecheck and execution at 8 MiB:", case)
+          PY
+
       - name: Test
         # nextest isolates individual tests in their own processes and schedules
         # test binaries concurrently, reducing wall-clock time without changing
