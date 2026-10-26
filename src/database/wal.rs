@@ -21,6 +21,8 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::retention_admission;
+use super::retention_store::DurableRetentionRegistry;
 use super::tablet::{
     transaction_digest, MemoryTablet, TabletDescriptor, TabletId, TabletMutation, TabletWrite,
     TransactionIdentity,
@@ -571,7 +573,61 @@ impl FileWal {
         Ok(())
     }
 
+    /// Unmanaged WAL reclaim refuses any registered retention owner.
+    /// Admission is exclusive with retention registry initialization, so a
+    /// racing registry cannot activate between the safety check and rename.
     pub fn reclaim_through(&mut self, base_sequence: u64) -> Result<(), WalError> {
+        let registry_path = retention_admission::registry_path_for_wal(&self.path);
+        let _admission =
+            retention_admission::acquire(&registry_path).map_err(Self::admission_error)?;
+        if retention_admission::managed_artifact_exists(&registry_path)? {
+            return Err(WalError::RetentionManaged);
+        }
+        self.reclaim_unchecked(base_sequence)
+    }
+
+    /// Called ONLY after the tablet coordinator has verified the exact
+    /// checkpoint and persistently reserved the WAL floor. Re-check at the
+    /// actual mutation boundary, under the same admission lock used when
+    /// the registry is initialized. The registry owner lock must remain live.
+    pub(crate) fn reclaim_through_managed(
+        &mut self,
+        base_sequence: u64,
+        registry: &DurableRetentionRegistry,
+        tablet_id: u64,
+        epoch: u64,
+    ) -> Result<(), WalError> {
+        let registry_path = retention_admission::registry_path_for_wal(&self.path);
+        let _admission =
+            retention_admission::acquire(&registry_path).map_err(Self::admission_error)?;
+        if !registry.matches_owner(&registry_path, tablet_id, epoch)
+            || self
+                .tablet_id
+                .map(|id| id.get())
+                .is_some_and(|id| id != tablet_id)
+            || self
+                .latest_ownership_epoch
+                .is_some_and(|durable| durable > epoch)
+            || registry.minimum_wal_cursor() <= base_sequence
+            || registry
+                .policy()
+                .wal_reclaim_bound(Some(base_sequence), base_sequence)
+                != Ok(base_sequence)
+        {
+            return Err(WalError::RetentionManaged);
+        }
+        self.reclaim_unchecked(base_sequence)
+    }
+
+    fn admission_error(error: io::Error) -> WalError {
+        match error.kind() {
+            io::ErrorKind::WouldBlock => WalError::WriterLocked,
+            io::ErrorKind::InvalidInput => WalError::AliasedWalPath,
+            _ => error.into(),
+        }
+    }
+
+    fn reclaim_unchecked(&mut self, base_sequence: u64) -> Result<(), WalError> {
         if self.poisoned {
             return Err(WalError::Poisoned);
         }
@@ -1159,6 +1215,7 @@ pub enum WalError {
         current: u64,
         requested: u64,
     },
+    RetentionManaged,
     Serialization {
         message: String,
     },
@@ -1270,6 +1327,7 @@ impl fmt::Display for WalError {
                 f,
                 "cannot reclaim WAL through sequence {requested}; current tail is {current}"
             ),
+            Self::RetentionManaged => f.write_str("retention-managed WAL must use verified guarded reclamation"),
             Self::Serialization { message } => {
                 write!(f, "WAL serialization error: {message}")
             }

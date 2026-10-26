@@ -468,7 +468,12 @@ impl WalBackedTablet {
         // Crash after reservation but before actual reclaim is conservative:
         // full WAL remains, but no new consumer can join below the floor.
         registry.reserve_reclaim_through(tail, tail)?;
-        self.wal.reclaim_through(tail)?;
+        self.wal.reclaim_through_managed(
+            tail,
+            registry,
+            self.tablet.descriptor().id().get(),
+            self.tablet.descriptor().ownership_epoch(),
+        )?;
         Ok(())
     }
 
