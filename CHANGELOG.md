@@ -1,5 +1,18 @@
 # Nulang Changelog
 
+### Stack-bounded let and binary-expression compilation — 2026-10-26
+- **Type inference, effect checking and capability analysis now traverse consecutive let bindings iteratively**, preserving lexical shadowing, generalized types and linear consumption-state restoration.
+- **HIR lowering iteratively processes left-associative binary expression chains**, retaining operand evaluation order and special assignment/range lowering.
+- **Both existing compiler-spill conformance fixtures now type-check and execute with an 8 MiB host stack**, producing `9870` and `7750` in a focused Linux reproduction. An exact-head CI smoke retains that ordinary stack limit; full tests and other behavior-conformance failures remain independent gates. Tracks #2227.
+
+### Project-relative namespaced import resolution — 2026-10-26
+- **Local imports now resolve `::` segments as directories**, consistent with standard-library module paths. For example, `import subpkg::helper` resolves to `subpkg/helper.nula` relative to the importing source file; slash paths and explicit `.nula` extensions remain supported.
+- **The existing `modimport_13_subdirectory_package` conformance failure now has focused resolver regression tests.** No grammar or frozen format changes are needed; full language-suite and exact-head CI verification are still required.
+
+### Fail-closed language conformance runner — 2026-10-13
+- **Behavioral conformance can no longer report success without executing any cases.** Missing `.json` expectations and orphaned expectations now fail before compiling; fixture discovery is deterministic.
+- **The runner isolates and reports malformed expectations, failed processes, mismatched outputs and per-case timeouts.** Twelve Python regression tests exercise both passing and deliberately failing paths without requiring a Rust toolchain. The separate CI wiring remains in draft PR #1587; these changes do not claim a full Nulang runtime pass.
+
 ### Post-partition peer readiness and TCP writer fencing (review-only) — 2026-10-26
 - **Post-heal delivery readiness requires two-way peer-attributed heartbeat acknowledgments and Healthy membership on both peers.** An unrelated node's ACK cannot satisfy the intended peer's recovery probe.
 - **Failed TCP writer cleanup fences by connection generation** so an old writer cannot evict a replacement connection. Deterministic regressions cover wrong-peer ACKs, membership rearming, and replacement delivery.
