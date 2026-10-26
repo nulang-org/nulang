@@ -451,6 +451,11 @@ impl FileWal {
         &self.path
     }
 
+    /// An ambiguous append or reclaim must never be exported as a clean backup.
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     pub fn records(&self) -> &[WalRecord] {
         &self.records
     }

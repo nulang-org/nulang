@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use super::backup::{self, BackupError, BackupReceipt};
 use super::checkpoint::{self, CheckpointError};
 use super::tablet::{
     transaction_digest, MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite,
@@ -43,6 +44,47 @@ pub struct WalBackedTablet {
 }
 
 impl WalBackedTablet {
+    /// Capture a consistent single-tablet local backup from the live owner.
+    ///
+    /// The owned WAL's exclusive cooperative single-host writer lock remains
+    /// held and this shared borrow prevents in-process mutations during the
+    /// entire copy, staging, disposable restore, and durable publication.
+    /// The destination must not exist; a failed capture leaves no valid
+    /// COMPLETE.json marker. Never use this on untrusted/network filesystems.
+    ///
+    /// This does not implement remote backups, consensus, or cross-tablet
+    /// transactionally consistent snapshots.
+    pub fn capture_consistent_backup(
+        &self,
+        destination: impl AsRef<Path>,
+    ) -> Result<BackupReceipt, BackupError> {
+        if self.wal.is_poisoned() || self.wal.last_sequence() != self.tablet.current_sequence() {
+            return Err(BackupError::UnstableSource);
+        }
+        let descriptor = self.tablet.descriptor().clone();
+        let source_report =
+            Self::verify_checkpoint_wal_read_only(descriptor.clone(), self.wal.path())?;
+        if source_report.durable_tail != self.tablet.current_sequence() {
+            return Err(BackupError::UnstableSource);
+        }
+        backup::capture_locked(
+            self.wal.path(),
+            &self.checkpoint_path,
+            descriptor.clone(),
+            source_report,
+            destination.as_ref(),
+            |proof_wal| {
+                // Only reopen a separate disposable copy. Recovery may create
+                // sidecars or repair tails there; it must never touch source.
+                let restored = Self::open(descriptor, proof_wal)?;
+                if !self.tablet.same_committed_state(&restored.tablet) {
+                    return Err(BackupError::RestoreMismatch);
+                }
+                Ok(())
+            },
+        )
+    }
+
     /// Inspect the checkpoint and WAL without creating, truncating, or
     /// repairing either source file or acquiring a mutable writer lock.
     ///
