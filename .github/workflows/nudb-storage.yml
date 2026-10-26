@@ -45,6 +45,7 @@ jobs:
           cargo test --locked --no-default-features --test nudb_wal_read_only_audit
           cargo test --locked --no-default-features --test nudb_checkpoint_pair_verify
           cargo test --locked --no-default-features --test nudb_owner_backup_capture
+          cargo test --locked --no-default-features --test nudb_backup_manifest_audit
           cargo test --locked --no-default-features --lib database::backup::tests
       - name: Group commit contract
         run: cargo test --locked --no-default-features --test nudb_group_commit
