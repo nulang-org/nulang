@@ -385,3 +385,25 @@ and deliberately drops a response **after** acceptance, proving a retry returns
 the same provider key/result. These tests do not prove public TLS certificate
 validation under a live third-party CA, actual provider production behavior,
 DNS rebinding defenses, or cross-node recovery. Those remain release gates.
+
+### Outbound DNS-to-socket restrictions for authenticated workflow HTTPS
+
+The production HTTPS provider now installs a **connection-time Ureq resolver**
+restricted to its explicitly approved origin and port 443. All DNS answers
+must be present and publicly routable according to the conservative address
+filter; a mixed response containing even one loopback, private, link-local,
+multicast, shared-address, documentation, benchmarking, reserved or transition
+address fails the entire connection. IPv4-embedded and 6to4 IPv6 ranges are
+not approved. The filter runs when the HTTP client's connector resolves the
+socket, rather than validating DNS separately and re-resolving afterward.
+Redirect following and environment-proxy discovery remain disabled, and the
+original hostname continues to drive TLS SNI and certificate verification.
+
+**This is defense in depth, not a substitute for deployment-level egress
+policy.** Network/firewall policy must independently prohibit private,
+metadata-service, and unapproved destination ranges, and DNS ownership and
+approved hostnames must be controlled by the trusted operator. DNS resolution
+may change over time; the custom resolver applies its checks for each newly
+opened network connection. Hostname authorization and provider-side durable
+idempotency remain separate requirements. No public insecure or unrestricted
+DNS resolver switch exists for workflow execution.
