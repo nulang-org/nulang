@@ -106,3 +106,34 @@ cargo test --no-default-features --test relational_schema_contract
 Do not confuse the contract fingerprint with
 `semantic_schema::canonical_actor_state_schema_bytes` or the existing
 RFC 0020 behavior manifest; those track different semantics.
+
+
+## Experimental typed SQL read planning
+
+The Rust API in \`database::typed_sql\` accepts a validated relational schema
+contract plus an explicit \`SelectSpec\`. It returns SQL with **bound placeholders**
+and an ordered list of \`SqlParameter\` values; it **does not execute** any SQL.
+
+Supported in v0alpha1: one table, selected named columns, a single typed
+equality or null predicate, and a compulsory \`LIMIT\` between 1 and 1,000.
+Unknown tables/columns, invalid schema contracts, duplicate projections,
+unsupported SQL types, mismatched parameter types and unbounded reads fail
+closed. PostgreSQL uses positional \`$1\` parameters; SQLite uses \`?1\` and
+both dialects safely quote identifiers.
+
+Output projection metadata includes declared SQL type names and nullability.
+This is **not** proof of Nulang language compile-time type checking, and is
+**not** a general SQL dialect implementation. There are no joins, writes,
+transactions, permission checks, expression indexes, prepared-statement
+execution, nullable bind values, user-controlled ORDER BY, or migration DDL.
+
+The caller must enforce authorization/tenant isolation, use a driver capable of
+binding \`SqlParameter\` correctly, and independently ensure the live database
+matches the versioned contract. In particular, SQLite's declared affinities
+can differ from values actually stored at runtime.
+
+Focused validation:
+
+\`\`\`sh
+cargo test --no-default-features --test typed_sql_read_plan
+\`\`\`
