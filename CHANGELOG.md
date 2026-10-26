@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Native parallel CoreVM scoped children — 2026-10-26
+- **Added an opt-in native adapter between bounded scoped OS-thread workers and fuel-limited CoreVM execution.** Each child runs on an isolated fresh VM with instruction-boundary cancellation, bounded concurrency and guaranteed synchronous lexical thread joins. Failure cancels pending children and signals running siblings; outcomes remain in submission order.
+- **Added test-first public integration coverage** for isolated results, exhausted fuel, failure cancellation, parent cancellation, capacity errors and empty scopes. This is not a change to sequential source-language `par` lowering, not a WASM task scheduler, and cannot preempt blocking host operations.
+
 ### Experimental native scoped-thread host — 2026-10-26
 - **Added opt-in native scoped threads that actually execute concurrently with lexical join-on-return**, using the canonical `TaskScope` admission/cancellation protocol. `max_in_flight` limits simultaneous OS workers, `max_pending` caps the whole submitted batch, and completion results remain in submission order. A failing child cancels queued tasks and signals active siblings; all launched threads are joined before outcomes are returned, including after a child panic.
 - **Added test-first lifetime/concurrency coverage** for worker overlap, borrowed stack state, parent cancellation, first-failure sibling cancellation, queued task nonexecution, early capacity rejection, and draining after panics. Threads are native-only and opt-in; this does not change source-level `par`, the VM/WASM backends, interrupt blocking host calls, or provide durability. Worker cancellation is cooperative.

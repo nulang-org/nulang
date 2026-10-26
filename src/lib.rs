@@ -90,6 +90,8 @@ pub mod registry;
 pub mod repl;
 pub mod resolver;
 pub mod runtime;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod scoped_core_vm_threads;
 #[cfg(test)]
 mod scoped_task_conformance;
 pub mod scoped_task_core_vm;
