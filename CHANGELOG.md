@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Experimental relational schema contracts — 2026-10-26
+- **Added the `nulang.relational-schema/v0alpha1` Rust metadata contract for PostgreSQL/SQLite table, column, primary-key, index, and foreign-key schemas.** It validates references, rejects unknown contract fields/versions, exports normalized JSON, and computes a domain-separated BLAKE3 fingerprint independent of declaration order.
+- **This is not a general ORM, SQL executor, introspector or migration planner.** Catalog coverage is deliberately incomplete; production drift/deployment gates must not treat this fingerprint as proof of full-schema equivalence. Seven focused contract tests cover determinism and invalid inputs.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
