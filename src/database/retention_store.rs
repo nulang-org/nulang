@@ -29,6 +29,10 @@ const MAX_FILE: usize = 1024 * 1024;
 const MAX_CONSUMERS: usize = 1024;
 const VERSION: u16 = 1;
 
+fn initial_wal_cursor() -> u64 {
+    1
+}
+
 #[derive(Debug)]
 pub enum RegistryError {
     Io(io::Error),
@@ -46,6 +50,10 @@ pub enum RegistryError {
     CapacityExceeded,
     Poisoned,
     RevisionOverflow,
+    MissingRegistry,
+    InvalidReclaimBound,
+    ReclaimBlocked(String),
+    HistoryUnavailable { earliest: u64, requested: u64 },
 }
 
 impl fmt::Display for RegistryError {
@@ -74,6 +82,18 @@ impl fmt::Display for RegistryError {
             }
             Self::Poisoned => out.write_str("owner encountered an ambiguous write; reopen blocked"),
             Self::RevisionOverflow => out.write_str("retention revision exhausted"),
+            Self::MissingRegistry => {
+                out.write_str("durable registry missing after prior initialization")
+            }
+            Self::InvalidReclaimBound => out.write_str("invalid or overflowing reclaim watermark"),
+            Self::ReclaimBlocked(reason) => write!(out, "retention watermark blocked: {reason}"),
+            Self::HistoryUnavailable {
+                earliest,
+                requested,
+            } => write!(
+                out,
+                "consumer requested WAL position {requested} before durable floor {earliest}"
+            ),
         }
     }
 }
@@ -89,6 +109,7 @@ struct RegistryState {
     tablet_id: u64,
     epoch: u64,
     revision: u64,
+    minimum_wal_cursor: u64,
     certified: BTreeSet<RetentionClass>,
     pins: BTreeMap<(RetentionClass, String), u64>,
 }
@@ -100,6 +121,10 @@ struct DiskState {
     tablet_id: u64,
     ownership_epoch: u64,
     revision: u64,
+    // Old NUDBPIN1 snapshots had no watermark; treating them as 1 is
+    // conservative. Older binaries reject the new field and fail closed.
+    #[serde(default = "initial_wal_cursor")]
+    minimum_wal_cursor: u64,
     certified: Vec<RetentionClass>,
     pins: Vec<DiskPin>,
 }
@@ -119,6 +144,7 @@ impl RegistryState {
             tablet_id: self.tablet_id,
             ownership_epoch: self.epoch,
             revision: self.revision,
+            minimum_wal_cursor: self.minimum_wal_cursor,
             certified: self.certified.iter().copied().collect(),
             pins: self
                 .pins
@@ -159,7 +185,11 @@ impl RegistryState {
         }
         let disk: DiskState = serde_json::from_slice(payload)
             .map_err(|_| RegistryError::Corrupt("invalid payload schema"))?;
-        if disk.version != VERSION || disk.tablet_id == 0 || disk.ownership_epoch == 0 {
+        if disk.version != VERSION
+            || disk.tablet_id == 0
+            || disk.ownership_epoch == 0
+            || disk.minimum_wal_cursor == 0
+        {
             return Err(RegistryError::Corrupt(
                 "unsupported version or invalid identity",
             ));
@@ -175,7 +205,11 @@ impl RegistryState {
         }
         let mut pins = BTreeMap::new();
         for pin in disk.pins {
-            if !valid_consumer(&pin.consumer) || !valid_cursor(pin.class, pin.next_needed) {
+            if !valid_consumer(&pin.consumer)
+                || !valid_cursor(pin.class, pin.next_needed)
+                || (pin.class != RetentionClass::Snapshot
+                    && pin.next_needed < disk.minimum_wal_cursor)
+            {
                 return Err(RegistryError::Corrupt("invalid persisted pin"));
             }
             if pins
@@ -189,6 +223,7 @@ impl RegistryState {
             tablet_id: disk.tablet_id,
             epoch: disk.ownership_epoch,
             revision: disk.revision,
+            minimum_wal_cursor: disk.minimum_wal_cursor,
             certified,
             pins,
         })
@@ -316,6 +351,10 @@ impl DurableRetentionRegistry {
             for file in [&path, &lock_path, &pending_path, &stage_path] {
                 check_regular_unaliased(file)?;
             }
+            // A surviving lock sidecar proves a previous registry existed.
+            // Never silently recreate an empty registry if its authoritative
+            // snapshot has disappeared: disconnected pins may be lost.
+            let prior_lock = check_regular_unaliased(&lock_path)?;
             use std::os::unix::fs::OpenOptionsExt;
             let mut lock_options = OpenOptions::new();
             lock_options.create(true).read(true).write(true).mode(0o600);
@@ -330,10 +369,14 @@ impl DurableRetentionRegistry {
             let state = if check_regular_unaliased(&path)? {
                 read_snapshot(&path)?
             } else {
+                if prior_lock {
+                    return Err(RegistryError::MissingRegistry);
+                }
                 let initial = RegistryState {
                     tablet_id,
                     epoch,
                     revision: 0,
+                    minimum_wal_cursor: 1,
                     certified: BTreeSet::new(),
                     pins: BTreeMap::new(),
                 };
@@ -358,6 +401,49 @@ impl DurableRetentionRegistry {
 
     pub fn revision(&self) -> u64 {
         self.state.revision
+    }
+
+    /// Minimum WAL first-needed cursor that a *new* consumer may register.
+    /// A persisted reserve barrier must precede any physical WAL deletion.
+    /// This getter never authorizes reclaim by itself.
+    pub fn minimum_wal_cursor(&self) -> u64 {
+        self.state.minimum_wal_cursor
+    }
+
+    /// Reserve a monotonic WAL reclamation barrier *before* physical cleanup.
+    ///
+    /// This does not inspect or delete WAL/checkpoint files. Callers must
+    /// independently prove a durable checkpoint and coordinate all enrollment
+    /// through this exclusive owner. Unknown coverage or a pin at/before the
+    /// proposed boundary blocks the reservation. A crash during publication
+    /// poisons the registry rather than authorizing stale registrations.
+    pub fn reserve_reclaim_through(
+        &mut self,
+        reclaimed_through: u64,
+        durable_tail: u64,
+    ) -> Result<u64, RegistryError> {
+        if self.poisoned {
+            return Err(RegistryError::Poisoned);
+        }
+        if reclaimed_through > durable_tail || reclaimed_through == u64::MAX {
+            return Err(RegistryError::InvalidReclaimBound);
+        }
+        let new_floor = reclaimed_through + 1;
+        if new_floor <= self.state.minimum_wal_cursor {
+            return Ok(self.state.revision);
+        }
+        let allowed = self
+            .policy()
+            .wal_reclaim_bound(Some(reclaimed_through), durable_tail)
+            .map_err(|reason| RegistryError::ReclaimBlocked(format!("{reason:?}")))?;
+        if allowed < reclaimed_through {
+            return Err(RegistryError::ReclaimBlocked(format!(
+                "requested {reclaimed_through} but pinned cursors only permit {allowed}"
+            )));
+        }
+        let mut state = self.state.clone();
+        state.minimum_wal_cursor = new_floor;
+        self.persist(state)
     }
 
     pub fn consumer_cursor(
@@ -436,6 +522,12 @@ impl DurableRetentionRegistry {
         }
         if !valid_cursor(class, next_needed) {
             return Err(RegistryError::InvalidCursor);
+        }
+        if class != RetentionClass::Snapshot && next_needed < self.state.minimum_wal_cursor {
+            return Err(RegistryError::HistoryUnavailable {
+                earliest: self.state.minimum_wal_cursor,
+                requested: next_needed,
+            });
         }
         let key = (class, consumer.to_string());
         if self.state.pins.contains_key(&key) {
