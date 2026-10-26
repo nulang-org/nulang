@@ -21,6 +21,14 @@ pub const STDLIB_MODULES: &[StdlibModule] = &[
         package_mirror: None,
     },
     StdlibModule {
+        name: "bytes",
+        import_path: "stdlib::bytes",
+        source_path: "src/stdlib/bytes.nula",
+        stability: StabilityTier::Experimental,
+        description: "Bounded in-memory binary readers and writers with explicit Result errors.",
+        package_mirror: None,
+    },
+    StdlibModule {
         name: "list",
         import_path: "stdlib::list",
         source_path: "src/stdlib/list.nula",
