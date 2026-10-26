@@ -1341,6 +1341,16 @@ fn validate_libsql_remote_url(raw: &str) -> io::Result<()> {
         // Keep libSQL's existing bare-hostname interpretation (HTTPS).
         format!("https://{raw}")
     };
+    // `Url::username()` is empty for both absent userinfo and `@host`.
+    // Reject the raw authority delimiter before normalization so even an
+    // empty userinfo section cannot silently pass credential admission.
+    let authority = candidate
+        .split_once("://")
+        .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or_default())
+        .ok_or_else(invalid)?;
+    if authority.contains('@') {
+        return Err(invalid());
+    }
     let parsed = url::Url::parse(&candidate).map_err(|_| invalid())?;
     let Some(host) = parsed.host() else {
         return Err(invalid());
@@ -1396,6 +1406,8 @@ mod libsql_remote_url_validation_tests {
             "http://127.0.0.1@192.0.2.10",
             r"http://localhost\@external.invalid",
             "https://alice:password@database.turso.io",
+            "http://@127.0.0.1:0",
+            "https://@database.turso.io",
             "https://database.turso.io#fragment",
             "ftp://database.turso.io",
             "",

@@ -25,6 +25,8 @@ fn rejects_unsafe_authorities_schemes_and_lookalikes() {
         "http://127.0.0.1.evil.invalid:0",
         "http://127.0.0.1@192.0.2.123:0",
         "https://user:password@database.turso.io",
+        "http://@127.0.0.1:0",
+        "https://@database.turso.io",
         "https://database.turso.io#fragment",
         "ftp://database.turso.io",
         "javascript:alert(1)",
