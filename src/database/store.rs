@@ -358,6 +358,55 @@ impl WalBackedTablet {
         Ok(())
     }
 
+    /// Adopt a WAL that was *already* fully reclaimed before retention was
+    /// enabled. The WAL owner lock must remain held and this immutable borrow
+    /// prevents same-process commits during proof. Audit both files read-only,
+    /// verify exact committed MVCC/receipt equality, then durably initialize
+    /// an Unknown-coverage registry at wal.base_sequence + 1.
+    ///
+    /// This does not discover or certify detached consumers, and cannot
+    /// recover pre-compaction WAL records. Any existing registry is refused:
+    /// operator reconciliation of its pins is a separate manual process.
+    pub fn bootstrap_retention_after_verified_compaction(
+        &self,
+    ) -> Result<DurableRetentionRegistry, WalBackedError> {
+        if self.wal.is_poisoned() || self.wal.last_sequence() != self.tablet.current_sequence() {
+            return Err(WalBackedError::UnverifiedCheckpoint);
+        }
+        let report = Self::verify_checkpoint_wal_read_only(
+            self.tablet.descriptor().clone(),
+            self.wal.path(),
+        )?;
+        let base = report.wal.base_sequence;
+        if base == 0
+            || base == u64::MAX
+            || report.checkpoint_sequence.is_none()
+            || report.durable_tail != self.tablet.current_sequence()
+        {
+            return Err(WalBackedError::UnverifiedCheckpoint);
+        }
+        let loaded =
+            checkpoint::load_checkpoint(&self.checkpoint_path, self.tablet.descriptor().clone())?
+                .ok_or(WalBackedError::UnverifiedCheckpoint)?;
+        // A valid checksum/sequence by itself cannot prove the checkpoint
+        // represents the exact data and committed transaction receipts.
+        let mut reconstructed = loaded.clone();
+        // This WAL may have records after its compacted base; verify their
+        // logical replay as well against the live state.
+        // We already own the live WAL, so use its retained WAL chain.
+        self.wal.replay_after_checkpoint(&mut reconstructed)?;
+        if !reconstructed.same_committed_state(&self.tablet) {
+            return Err(WalBackedError::UnverifiedCheckpoint);
+        }
+        DurableRetentionRegistry::bootstrap_compacted(
+            self.retention_registry_path(),
+            self.tablet.descriptor().id().get(),
+            self.tablet.descriptor().ownership_epoch(),
+            base,
+        )
+        .map_err(Into::into)
+    }
+
     /// Canonical registry path for opt-in, cooperative, single-host retention.
     /// The canonical WAL parent is used to prevent equivalent relative paths
     /// from silently producing independent retention owners.

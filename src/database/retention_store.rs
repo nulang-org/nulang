@@ -22,6 +22,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::retention::{Coverage, RetentionClass, RetentionPolicy};
+use super::wal::FileWal;
 use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8; 8] = b"NUDBPIN1";
@@ -51,6 +52,8 @@ pub enum RegistryError {
     Poisoned,
     RevisionOverflow,
     MissingRegistry,
+    BootstrapRequired { wal_base: u64 },
+    WalAudit(String),
     InvalidReclaimBound,
     ReclaimBlocked(String),
     HistoryUnavailable { earliest: u64, requested: u64 },
@@ -85,6 +88,11 @@ impl fmt::Display for RegistryError {
             Self::MissingRegistry => {
                 out.write_str("durable registry missing after prior initialization")
             }
+            Self::BootstrapRequired { wal_base } => write!(
+                out,
+                "WAL was already compacted through {wal_base}; verified retention adoption required"
+            ),
+            Self::WalAudit(message) => write!(out, "read-only WAL audit failed: {message}"),
             Self::InvalidReclaimBound => out.write_str("invalid or overflowing reclaim watermark"),
             Self::ReclaimBlocked(reason) => write!(out, "retention watermark blocked: {reason}"),
             Self::HistoryUnavailable {
@@ -324,6 +332,32 @@ impl DurableRetentionRegistry {
     /// Unknown, never implicitly empty/complete. Durable operations and
     /// durability of the original WAL are independent.
     pub fn open(path: impl AsRef<Path>, tablet_id: u64, epoch: u64) -> Result<Self, RegistryError> {
+        Self::open_inner(path, tablet_id, epoch, None)
+    }
+
+    /// Only the live WAL owner may call this after verifying its exact
+    /// checkpoint and comparing all committed logical state/receipts.
+    /// Every consumer class remains Unknown after bootstrap.
+    pub(crate) fn bootstrap_compacted(
+        path: impl AsRef<Path>,
+        tablet_id: u64,
+        epoch: u64,
+        verified_base: u64,
+    ) -> Result<Self, RegistryError> {
+        if verified_base == 0 || verified_base == u64::MAX {
+            return Err(RegistryError::BootstrapRequired {
+                wal_base: verified_base,
+            });
+        }
+        Self::open_inner(path, tablet_id, epoch, Some(verified_base))
+    }
+
+    fn open_inner(
+        path: impl AsRef<Path>,
+        tablet_id: u64,
+        epoch: u64,
+        verified_base: Option<u64>,
+    ) -> Result<Self, RegistryError> {
         if tablet_id == 0 || epoch == 0 {
             return Err(RegistryError::IdentityMismatch);
         }
@@ -354,6 +388,47 @@ impl DurableRetentionRegistry {
                     io::ErrorKind::InvalidInput => RegistryError::UnsafePath,
                     _ => RegistryError::Io(error),
                 })?;
+            // If this is a WAL-backed registry, inspect the actual WAL base
+            // before constructing any durable registry file or consumer floor.
+            // A previously compacted WAL cannot accept an unverified initial
+            // floor of one, or it could promise history already discarded.
+            let wal_path = name
+                .to_str()
+                .and_then(|n| n.strip_suffix(".pins"))
+                .map(|stem| parent.join(stem));
+            let observed_base = if let Some(wal_path) = &wal_path {
+                if check_regular_unaliased(wal_path)? {
+                    let audit = FileWal::verify_read_only(wal_path)
+                        .map_err(|error| RegistryError::WalAudit(error.to_string()))?;
+                    if audit.tablet_id.is_some_and(|id| id.get() != tablet_id)
+                        || audit
+                            .last_ownership_epoch
+                            .is_some_and(|durable| durable > epoch)
+                    {
+                        return Err(RegistryError::IdentityMismatch);
+                    }
+                    Some(audit.base_sequence)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            // Reject unverified adoption BEFORE creating the durable owner
+            // lock sidecar. Otherwise a refused first open would leave a
+            // stranded .lock and prevent a later verified bootstrap.
+            if !check_regular_unaliased(&path)? {
+                match (observed_base, verified_base) {
+                    (Some(base), Some(proven)) if base > 0 && base == proven => {}
+                    (Some(base), _) if base > 0 => {
+                        return Err(RegistryError::BootstrapRequired { wal_base: base });
+                    }
+                    (Some(0), Some(_)) | (None, Some(_)) => {
+                        return Err(RegistryError::BootstrapRequired { wal_base: 0 });
+                    }
+                    _ => {}
+                }
+            }
             let lock_path = suffix(&path, ".lock");
             let pending_path = suffix(&path, ".pending");
             let stage_path = suffix(&path, ".stage");
@@ -376,16 +451,40 @@ impl DurableRetentionRegistry {
                 return Err(RegistryError::AmbiguousCommit);
             }
             let state = if check_regular_unaliased(&path)? {
-                read_snapshot(&path)?
+                if verified_base.is_some() {
+                    // Never reset existing pins/certifications through adoption.
+                    return Err(RegistryError::BootstrapRequired {
+                        wal_base: observed_base.unwrap_or(0),
+                    });
+                }
+                let loaded = read_snapshot(&path)?;
+                if let Some(base) = observed_base {
+                    if loaded.minimum_wal_cursor <= base {
+                        return Err(RegistryError::BootstrapRequired { wal_base: base });
+                    }
+                }
+                loaded
             } else {
                 if prior_lock {
                     return Err(RegistryError::MissingRegistry);
                 }
+                let minimum_wal_cursor = match (observed_base, verified_base) {
+                    (Some(base), Some(proven)) if base > 0 && base == proven && base < u64::MAX => {
+                        base + 1
+                    }
+                    (Some(base), _) if base > 0 => {
+                        return Err(RegistryError::BootstrapRequired { wal_base: base });
+                    }
+                    (Some(0), Some(_)) | (None, Some(_)) => {
+                        return Err(RegistryError::BootstrapRequired { wal_base: 0 });
+                    }
+                    _ => 1,
+                };
                 let initial = RegistryState {
                     tablet_id,
                     epoch,
                     revision: 0,
-                    minimum_wal_cursor: 1,
+                    minimum_wal_cursor,
                     certified: BTreeSet::new(),
                     pins: BTreeMap::new(),
                 };
