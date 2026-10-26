@@ -353,6 +353,28 @@ impl TransportStream {
     }
 }
 
+/// Validate the certificate-derived peer identity, not only the NUL0 claim.
+/// Called exclusively for MutualTls; plaintext mode is explicitly unauthenticated.
+#[cfg(feature = "tcp")]
+fn verify_tls_peer_identity(expected: NodeId, observed: Option<NodeId>) -> io::Result<()> {
+    let actual = observed.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "mutual TLS peer certificate missing after NUL0 handshake",
+        )
+    })?;
+    if actual != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "TLS peer identity mismatch: expected {:?}, observed {:?}",
+                expected, actual
+            ),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(feature = "tcp")]
 impl Read for TransportStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -1934,6 +1956,14 @@ pub struct IncomingPacket {
     pub packet: Packet,
 }
 
+// Transport-local admission evidence. Not serialized on NUL0 and not a
+// distributed node-incarnation/actor-ownership epoch.
+#[cfg(feature = "tcp")]
+struct TcpQueuedPacket {
+    generation: u64,
+    incoming: IncomingPacket,
+}
+
 /// A packet to be sent to another node.
 #[derive(Debug, Clone)]
 pub struct OutgoingPacket {
@@ -2097,10 +2127,10 @@ pub struct TcpTransport {
     /// Active connections to other nodes.
     connections: Arc<Mutex<HashMap<NodeId, TcpConnection>>>,
     /// Channel endpoint used to receive packets from other nodes.
-    incoming_rx: mpsc::Receiver<IncomingPacket>,
+    incoming_rx: mpsc::Receiver<TcpQueuedPacket>,
     /// Cloneable send side of the incoming channel, handed to reader
     /// threads spawned for dialled outbound connections.
-    incoming_tx: mpsc::SyncSender<IncomingPacket>,
+    incoming_tx: mpsc::SyncSender<TcpQueuedPacket>,
     /// Channel endpoint used to enqueue packets for transmission.
     outgoing_tx: mpsc::SyncSender<OutgoingPacket>,
     /// Transport-local failure queue. The sender thread reports connect/write
@@ -2236,22 +2266,7 @@ impl TcpTransport {
             tls_wrap_client(tcp, &self.tls_config)?
         };
 
-        // When TLS is active, verify the peer's certificate matches the
-        // expected node identity *before* accepting the NUL0 handshake.
-        if !self.tls_config.is_plaintext() {
-            if let Some(cert_id) = stream.peer_cert_node_id() {
-                if cert_id != node_id {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "TLS cert identity mismatch: expected {:?}, cert fingerprint {:?}",
-                            node_id, cert_id
-                        ),
-                    ));
-                }
-            }
-        }
-
+        // Complete TLS handshake I/O before inspecting the peer certificate.
         write_handshake(&mut stream, self.node_id)?;
         let peer_id = read_handshake(&mut stream)?;
 
@@ -2263,6 +2278,10 @@ impl TcpTransport {
                     node_id, peer_id
                 ),
             ));
+        }
+
+        if !self.tls_config.is_plaintext() {
+            verify_tls_peer_identity(node_id, stream.peer_cert_node_id())?;
         }
 
         let generation = next_connection_generation();
@@ -2378,7 +2397,20 @@ impl TcpTransport {
         let mut packets = Vec::new();
         loop {
             match self.incoming_rx.try_recv() {
-                Ok(p) => packets.push(p),
+                Ok(queued) => {
+                    // A prior socket may have queued frames before a newer
+                    // generation for the same stable NodeId was installed.
+                    // Preserve queued EOF/Goodbye frames if no connection is
+                    // currently registered; connection replacement is the
+                    // only authority revoked by this local generation fence.
+                    let active = lock_ignore_poison(&self.connections);
+                    if active
+                        .get(&queued.incoming.from_node)
+                        .is_none_or(|conn| conn.generation == queued.generation)
+                    {
+                        packets.push(queued.incoming);
+                    }
+                }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => break,
             }
@@ -2466,7 +2498,7 @@ impl TcpTransport {
 #[cfg(feature = "tcp")]
 fn listener_thread(
     listener: TcpListener,
-    incoming_tx: mpsc::SyncSender<IncomingPacket>,
+    incoming_tx: mpsc::SyncSender<TcpQueuedPacket>,
     connections: Arc<Mutex<HashMap<NodeId, TcpConnection>>>,
     shutdown_flag: Arc<AtomicBool>,
     local_node_id: NodeId,
@@ -2513,7 +2545,7 @@ fn listener_thread(
 fn connection_reader(
     tcp: TcpStream,
     addr: SocketAddr,
-    incoming_tx: mpsc::SyncSender<IncomingPacket>,
+    incoming_tx: mpsc::SyncSender<TcpQueuedPacket>,
     connections: Arc<Mutex<HashMap<NodeId, TcpConnection>>>,
     shutdown_flag: Arc<AtomicBool>,
     local_node_id: NodeId,
@@ -2544,17 +2576,11 @@ fn connection_reader(
         Err(_) => return,
     };
 
-    // When TLS is active, verify the peer's certificate fingerprint
-    // matches the node_id claimed in the NUL0 handshake.
+    // Verify that the NUL0 claim matches the TLS certificate identity.
     if !tls_config.is_plaintext() {
-        if let Some(cert_id) = stream.peer_cert_node_id() {
-            if cert_id != peer_id {
-                warn!(
-                    "TLS cert identity mismatch for {}: handshake claims {:?}, cert fingerprint {:?}",
-                    addr, peer_id, cert_id
-                );
-                return;
-            }
+        if let Err(error) = verify_tls_peer_identity(peer_id, stream.peer_cert_node_id()) {
+            warn!("TLS peer identity rejected for {}: {}", addr, error);
+            return;
         }
     }
 
@@ -2598,12 +2624,22 @@ fn connection_read_loop(
     mut stream: TransportStream,
     peer_id: NodeId,
     generation: u64,
-    incoming_tx: mpsc::SyncSender<IncomingPacket>,
+    incoming_tx: mpsc::SyncSender<TcpQueuedPacket>,
     connections: Arc<Mutex<HashMap<NodeId, TcpConnection>>>,
     shutdown_flag: Arc<AtomicBool>,
 ) {
     'read_loop: loop {
         if shutdown_flag.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Connection replacement invalidates the old reader's authority.
+        // An old socket may remain readable after a newer connection for
+        // the same NodeId has been registered.
+        if !lock_ignore_poison(&connections)
+            .get(&peer_id)
+            .is_some_and(|conn| conn.generation == generation)
+        {
             break;
         }
 
@@ -2613,8 +2649,14 @@ fn connection_read_loop(
             match stream.read_exact(&mut len_buf) {
                 Ok(()) => break u32::from_be_bytes(len_buf),
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    // TLS read timeout: release lock briefly so the
-                    // sender thread can acquire it.
+                    // This connection may have been superseded while idle.
+                    if !lock_ignore_poison(&connections)
+                        .get(&peer_id)
+                        .is_some_and(|conn| conn.generation == generation)
+                    {
+                        break 'read_loop;
+                    }
+                    // Release the TLS lock so a writer can interleave.
                     std::thread::sleep(Duration::from_millis(1));
                     continue;
                 }
@@ -2631,6 +2673,12 @@ fn connection_read_loop(
             match stream.read_exact(&mut payload) {
                 Ok(()) => break,
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if !lock_ignore_poison(&connections)
+                        .get(&peer_id)
+                        .is_some_and(|conn| conn.generation == generation)
+                    {
+                        break 'read_loop;
+                    }
                     std::thread::sleep(Duration::from_millis(1));
                     continue;
                 }
@@ -2638,11 +2686,16 @@ fn connection_read_loop(
             }
         }
 
-        // Update last-activity timestamp.
+        // A new connection may have superseded this reader while read_exact
+        // waited on a frame. Do not update its activity or enqueue stale
+        // packets under the replacement's identity.
         {
             let mut conns = lock_ignore_poison(&connections);
-            if let Some(conn) = conns.get_mut(&peer_id) {
-                conn.last_activity = Instant::now();
+            match conns.get_mut(&peer_id) {
+                Some(conn) if conn.generation == generation => {
+                    conn.last_activity = Instant::now();
+                }
+                _ => break 'read_loop,
             }
         }
 
@@ -2652,7 +2705,13 @@ fn connection_read_loop(
                 seq,
                 packet,
             };
-            if incoming_tx.send(incoming).is_err() {
+            if incoming_tx
+                .send(TcpQueuedPacket {
+                    generation,
+                    incoming,
+                })
+                .is_err()
+            {
                 break;
             }
         }
@@ -2669,6 +2728,28 @@ fn connection_read_loop(
     let _ = stream.shutdown();
 }
 
+/// Retire only the connection on which the failed write occurred.
+///
+/// The listener or a reader can install a newer generation while the sender
+/// is between its write lock and cleanup lock. A failed sender must not evict
+/// that replacement.
+#[cfg(feature = "tcp")]
+fn retire_failed_sender_generation(
+    connections: &mut HashMap<NodeId, TcpConnection>,
+    node_id: NodeId,
+    failed_generation: Option<u64>,
+) -> Option<TcpConnection> {
+    let generation = failed_generation?;
+    if connections
+        .get(&node_id)
+        .is_some_and(|conn| conn.generation == generation)
+    {
+        connections.remove(&node_id)
+    } else {
+        None
+    }
+}
+
 /// Sender thread entry point.
 ///
 /// Drains the outgoing queue, looks up (or creates) the TCP connection
@@ -2679,7 +2760,7 @@ fn sender_thread(
     connections: Arc<Mutex<HashMap<NodeId, TcpConnection>>>,
     shutdown_flag: Arc<AtomicBool>,
     local_node_id: NodeId,
-    incoming_tx: mpsc::SyncSender<IncomingPacket>,
+    incoming_tx: mpsc::SyncSender<TcpQueuedPacket>,
     send_failure_tx: mpsc::Sender<TransportSendFailure>,
     tls_config: TlsConfig,
 ) {
@@ -2732,21 +2813,25 @@ fn sender_thread(
         // correlated with the logical operation that produced this packet.
         let bytes = outgoing.packet.to_bytes(outgoing.seq);
 
-        let result = {
+        let (result, attempted_generation) = {
             let mut conns = lock_ignore_poison(&connections);
             if let Some(conn) = conns.get_mut(&outgoing.to_node) {
-                conn.send_packet(&bytes)
+                let generation = conn.generation;
+                (conn.send_packet(&bytes), Some(generation))
             } else {
-                Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "connection disappeared",
-                ))
+                (
+                    Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "connection disappeared",
+                    )),
+                    None,
+                )
             }
         };
 
         if let Err(e) = result {
             warn!(
-                "[nulang-net] Send to {:?} failed: {}; removing connection",
+                "[nulang-net] Send to {:?} failed: {}; retiring failed connection",
                 outgoing.to_node, e
             );
             let _ = send_failure_tx.send(TransportSendFailure {
@@ -2756,7 +2841,9 @@ fn sender_thread(
                 reason: TransportSendFailureReason::Write,
             });
             let mut conns = lock_ignore_poison(&connections);
-            if let Some(conn) = conns.remove(&outgoing.to_node) {
+            if let Some(conn) =
+                retire_failed_sender_generation(&mut conns, outgoing.to_node, attempted_generation)
+            {
                 let _ = conn.stream.shutdown();
             }
         }
@@ -2773,7 +2860,7 @@ fn sender_thread(
 #[cfg(feature = "tcp")]
 fn connect_in_sender(
     connections: &Arc<Mutex<HashMap<NodeId, TcpConnection>>>,
-    incoming_tx: &mpsc::SyncSender<IncomingPacket>,
+    incoming_tx: &mpsc::SyncSender<TcpQueuedPacket>,
     shutdown_flag: &Arc<AtomicBool>,
     local_node_id: NodeId,
     node_id: NodeId,
@@ -2791,19 +2878,7 @@ fn connect_in_sender(
         tls_wrap_client(tcp, tls_config)?
     };
 
-    // When TLS is active, verify the peer's certificate matches the
-    // expected node identity.
-    if !tls_config.is_plaintext() {
-        if let Some(cert_id) = stream.peer_cert_node_id() {
-            if cert_id != node_id {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "TLS cert identity mismatch in sender connect",
-                ));
-            }
-        }
-    }
-
+    // TLS streams are lazy: complete handshake I/O before checking certs.
     write_handshake(&mut stream, local_node_id)?;
     let peer_id = read_handshake(&mut stream)?;
 
@@ -2812,6 +2887,10 @@ fn connect_in_sender(
             io::ErrorKind::InvalidData,
             "node id handshake mismatch in sender connect",
         ));
+    }
+
+    if !tls_config.is_plaintext() {
+        verify_tls_peer_identity(node_id, stream.peer_cert_node_id())?;
     }
 
     let read_stream = stream.try_clone()?;
@@ -2849,6 +2928,18 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     #[cfg(feature = "tcp")]
     use std::thread::sleep;
+
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_tls_peer_identity_rejects_absent_cert_and_mismatch() {
+        let expected = NodeId(101);
+        assert!(
+            verify_tls_peer_identity(expected, None).is_err(),
+            "mTLS identity admission must fail closed when the peer cert is absent"
+        );
+        assert!(verify_tls_peer_identity(expected, Some(NodeId(102))).is_err());
+        assert!(verify_tls_peer_identity(expected, Some(expected)).is_ok());
+    }
 
     // ------------------------------------------------------------------
     // 1. NodeId hashing
@@ -3548,7 +3639,7 @@ mod tests {
         let old_client = TcpStream::connect(listen_addr).unwrap();
         let (old_server, old_peer_addr) = listener.accept().unwrap();
         old_server
-            .set_read_timeout(Some(Duration::from_secs(1)))
+            .set_read_timeout(Some(Duration::from_millis(50)))
             .unwrap();
 
         let peer_id = NodeId(0xBEEF);
@@ -3596,8 +3687,19 @@ mod tests {
             },
         );
 
+        // The replacement must retire the old *idle* reader promptly,
+        // even if the former TCP peer keeps its socket open.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let exited_before_peer_closed = handle.is_finished();
         drop(old_client);
         handle.join().unwrap();
+        assert!(
+            exited_before_peer_closed,
+            "superseded idle reader kept running on an obsolete connection"
+        );
 
         assert_eq!(
             lock_ignore_poison(&connections)
@@ -3608,6 +3710,256 @@ mod tests {
         );
 
         drop(new_client);
+    }
+
+    /// Old readers must not inject packets through a connection superseded
+    /// for the same stable NodeId, even while the old socket remains live.
+    #[test]
+    #[cfg(feature = "tcp")]
+    fn test_replaced_tcp_reader_cannot_deliver_stale_packet() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let mut old_client = TcpStream::connect(listen_addr).unwrap();
+        let (old_server, old_addr) = listener.accept().unwrap();
+        old_server
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+
+        let peer_id = NodeId(0xBEEF);
+        let old_reader = TransportStream::Raw(old_server);
+        let old_writer = old_reader.try_clone().unwrap();
+        let old_generation = next_connection_generation();
+        let connections = Arc::new(Mutex::new(HashMap::new()));
+        lock_ignore_poison(&connections).insert(
+            peer_id,
+            TcpConnection {
+                node_id: peer_id,
+                generation: old_generation,
+                addr: old_addr,
+                stream: old_writer,
+                last_activity: Instant::now(),
+            },
+        );
+        let (incoming_tx, incoming_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let reader_connections = Arc::clone(&connections);
+        let reader_shutdown = Arc::clone(&shutdown_flag);
+        let handle = thread::spawn(move || {
+            connection_read_loop(
+                old_reader,
+                peer_id,
+                old_generation,
+                incoming_tx,
+                reader_connections,
+                reader_shutdown,
+            );
+        });
+
+        let new_client = TcpStream::connect(listen_addr).unwrap();
+        let (new_server, new_addr) = listener.accept().unwrap();
+        let new_generation = next_connection_generation();
+        let new_activity = Instant::now();
+        lock_ignore_poison(&connections).insert(
+            peer_id,
+            TcpConnection {
+                node_id: peer_id,
+                generation: new_generation,
+                addr: new_addr,
+                stream: TransportStream::Raw(new_server),
+                last_activity: new_activity,
+            },
+        );
+
+        let packet = Packet::Heartbeat {
+            node_id: peer_id,
+            timestamp: 321,
+        }
+        .to_bytes(19);
+        old_client
+            .write_all(&(packet.len() as u32).to_be_bytes())
+            .unwrap();
+        old_client.write_all(&packet).unwrap();
+        old_client.flush().unwrap();
+
+        assert!(
+            incoming_rx
+                .recv_timeout(Duration::from_millis(600))
+                .is_err(),
+            "superseded TCP reader delivered a packet from the old session"
+        );
+        assert_eq!(
+            lock_ignore_poison(&connections)
+                .get(&peer_id)
+                .unwrap()
+                .last_activity,
+            new_activity,
+            "superseded reader refreshed activity of the new connection"
+        );
+        drop(old_client);
+        handle.join().unwrap();
+        assert_eq!(
+            lock_ignore_poison(&connections)
+                .get(&peer_id)
+                .unwrap()
+                .generation,
+            new_generation
+        );
+        drop(new_client);
+    }
+
+    /// Queued frames from a replaced TCP session must not cross into the
+    /// newer session with the same stable NodeId.
+    #[test]
+    #[cfg(feature = "tcp")]
+    fn test_tcp_receive_fences_queued_old_connection_generation() {
+        let mut transport = TcpTransport::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            TlsConfig::PlaintextInsecure,
+        )
+        .unwrap();
+        let peer_id = NodeId(0xCAFE);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, addr) = listener.accept().unwrap();
+        let old_generation = next_connection_generation();
+        let new_generation = next_connection_generation();
+
+        transport
+            .incoming_tx
+            .send(TcpQueuedPacket {
+                generation: old_generation,
+                incoming: IncomingPacket {
+                    from_node: peer_id,
+                    seq: 1,
+                    packet: Packet::Heartbeat {
+                        node_id: peer_id,
+                        timestamp: 1,
+                    },
+                },
+            })
+            .unwrap();
+
+        lock_ignore_poison(&transport.connections).insert(
+            peer_id,
+            TcpConnection {
+                node_id: peer_id,
+                generation: new_generation,
+                addr,
+                stream: TransportStream::Raw(server),
+                last_activity: Instant::now(),
+            },
+        );
+
+        transport
+            .incoming_tx
+            .send(TcpQueuedPacket {
+                generation: new_generation,
+                incoming: IncomingPacket {
+                    from_node: peer_id,
+                    seq: 2,
+                    packet: Packet::Heartbeat {
+                        node_id: peer_id,
+                        timestamp: 2,
+                    },
+                },
+            })
+            .unwrap();
+
+        // A frame queued before a peer disconnects is still admissible when
+        // there has been no replacement for that peer (e.g. final Goodbye).
+        let disconnected = NodeId(0xBABA);
+        transport
+            .incoming_tx
+            .send(TcpQueuedPacket {
+                generation: next_connection_generation(),
+                incoming: IncomingPacket {
+                    from_node: disconnected,
+                    seq: 3,
+                    packet: Packet::Heartbeat {
+                        node_id: disconnected,
+                        timestamp: 3,
+                    },
+                },
+            })
+            .unwrap();
+
+        let received = transport.receive();
+        assert_eq!(
+            received.iter().map(|p| p.seq).collect::<Vec<_>>(),
+            vec![2, 3],
+            "replacement must fence old frames without dropping unrelated queued packets"
+        );
+        assert_ne!(old_generation, new_generation);
+        transport.shutdown();
+    }
+
+    /// A stale writer failure must not evict a replacement connection or
+    /// prevent the replacement from delivering the next framed packet.
+    #[test]
+    #[cfg(feature = "tcp")]
+    fn test_failed_sender_generation_preserves_replacement_delivery() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+
+        let stale_client = TcpStream::connect(listen_addr).unwrap();
+        let stale_server = listener.accept().unwrap().0;
+        drop(stale_client);
+        drop(stale_server);
+
+        let replacement_client = TcpStream::connect(listen_addr).unwrap();
+        let (mut replacement_server, replacement_addr) = listener.accept().unwrap();
+        replacement_server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+
+        let peer_id = NodeId(0x9001);
+        let stale_generation = next_connection_generation();
+        let replacement_generation = next_connection_generation();
+        let mut connections = HashMap::new();
+        connections.insert(
+            peer_id,
+            TcpConnection {
+                node_id: peer_id,
+                generation: replacement_generation,
+                addr: replacement_addr,
+                stream: TransportStream::Raw(replacement_client),
+                last_activity: Instant::now(),
+            },
+        );
+
+        assert!(
+            retire_failed_sender_generation(&mut connections, peer_id, Some(stale_generation))
+                .is_none(),
+            "a stale writer failure must not remove the replacement"
+        );
+
+        let packet = Packet::Heartbeat {
+            node_id: NodeId(7),
+            timestamp: 42,
+        };
+        let packet_bytes = packet.to_bytes(1);
+        connections
+            .get_mut(&peer_id)
+            .expect("replacement connection must remain cached")
+            .send_packet(&packet_bytes)
+            .unwrap();
+
+        let mut length = [0u8; 4];
+        replacement_server.read_exact(&mut length).unwrap();
+        let mut frame = vec![0u8; u32::from_be_bytes(length) as usize];
+        replacement_server.read_exact(&mut frame).unwrap();
+        let (seq, delivered) = Packet::from_bytes(&frame).expect("replacement frame");
+        assert_eq!(seq, 1);
+        assert_eq!(delivered, packet);
+
+        let retired = retire_failed_sender_generation(
+            &mut connections,
+            peer_id,
+            Some(replacement_generation),
+        )
+        .expect("matching failed generation must be retired");
+        let _ = retired.stream.shutdown();
+        assert!(connections.is_empty());
     }
 
     // ------------------------------------------------------------------

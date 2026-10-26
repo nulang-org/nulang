@@ -636,6 +636,11 @@ impl ClusterState {
     /// view. A probationary member's first heartbeat confirms it into
     /// the active view.
     pub fn handle_heartbeat(&mut self, from: NodeId, addr: SocketAddr) {
+        // Confirmed removal is a fencing decision, not a temporary failure.
+        // A reused NodeId needs a separately verified reincarnation handshake.
+        if self.removed_nodes.contains(&from) {
+            return;
+        }
         let now = self.now();
         if from != self.local_node {
             self.has_seen_peer = true;
@@ -904,7 +909,7 @@ impl ClusterState {
             }
         }
         for node_id in newly_removed {
-            if self.removed_nodes.insert(node_id) {
+            if self.mark_removed(node_id) {
                 actions.push(ClusterAction::NodeRemoved { node: node_id });
             }
         }
@@ -950,7 +955,8 @@ impl ClusterState {
         if probe_due {
             self.last_probe_sent = Some(now);
             for info in self.members.values() {
-                if info.status == NodeStatus::Failed {
+                if info.status == NodeStatus::Failed && !self.removed_nodes.contains(&info.node_id)
+                {
                     actions.push(ClusterAction::Probe {
                         to: info.node_id,
                         addr: info.address,
@@ -970,7 +976,7 @@ impl ClusterState {
             let heartbeat_start = actions.len();
 
             for info in self.members.values() {
-                if info.node_id == self.local_node {
+                if info.node_id == self.local_node || self.removed_nodes.contains(&info.node_id) {
                     continue;
                 }
                 // Joining members get heartbeats as the join bootstrap:
@@ -1013,6 +1019,9 @@ impl ClusterState {
                 break;
             }
             let id = self.passive_view[(self.reply_cursor + k) % n];
+            if self.removed_nodes.contains(&id) {
+                continue;
+            }
             if let Some(info) = self.members.get(&id) {
                 if matches!(info.status, NodeStatus::Healthy | NodeStatus::Joining)
                     && now.duration_since(info.last_heartbeat) <= self.heartbeat_timeout
@@ -1064,6 +1073,7 @@ impl ClusterState {
             .copied()
             .filter(|id| {
                 *id != self.local_node
+                    && !self.removed_nodes.contains(id)
                     && !self.active_view.contains(id)
                     && !self.probationary.iter().any(|(pid, _)| pid == id)
                     && matches!(
@@ -1091,7 +1101,7 @@ impl ClusterState {
         let now = self.now();
         let mut count = 1;
         for info in self.members.values() {
-            if info.node_id == self.local_node {
+            if info.node_id == self.local_node || self.removed_nodes.contains(&info.node_id) {
                 continue;
             }
             if !matches!(info.status, NodeStatus::Healthy | NodeStatus::Joining) {
@@ -1110,7 +1120,11 @@ impl ClusterState {
     pub fn healthy_members(&self) -> Vec<&NodeInfo> {
         self.members
             .values()
-            .filter(|info| info.node_id != self.local_node && info.status == NodeStatus::Healthy)
+            .filter(|info| {
+                info.node_id != self.local_node
+                    && info.status == NodeStatus::Healthy
+                    && !self.removed_nodes.contains(&info.node_id)
+            })
             .collect()
     }
 
@@ -1135,7 +1149,9 @@ impl ClusterState {
     pub fn healthy_node_count(&self) -> usize {
         self.members
             .values()
-            .filter(|info| info.status == NodeStatus::Healthy)
+            .filter(|info| {
+                info.status == NodeStatus::Healthy && !self.removed_nodes.contains(&info.node_id)
+            })
             .count()
     }
 
@@ -1196,6 +1212,11 @@ impl ClusterState {
 
         let now = self.now();
         for entry in gossip {
+            // Gossip cannot resurrect a confirmed-removed identity, even if
+            // the sender claims a larger membership incarnation.
+            if self.removed_nodes.contains(&entry.node_id) {
+                continue;
+            }
             // Never overwrite local node info from gossip.
             if entry.node_id == self.local_node {
                 continue;
@@ -1228,29 +1249,43 @@ impl ClusterState {
                     if entry.incarnation > stored_incarnation || authoritative_self {
                         let old_status = existing.status;
                         let old_addr = existing.address;
+                        // A sender's self-entry may be older than a version
+                        // relayed by another peer. Trust its own status and
+                        // listen address, but never roll back the local
+                        // incarnation. When that authoritative observation
+                        // changes either field, bump beyond the highest
+                        // observed version so third parties can learn it.
+                        // In particular, a simultaneous Joining -> Healthy
+                        // transition and source-port correction must not
+                        // skip the bump (the previous else-if did).
+                        let corrected_self = authoritative_self
+                            && (old_status != entry.status || old_addr != entry.address);
+                        let mut incarnation = if authoritative_self {
+                            stored_incarnation.max(entry.incarnation)
+                        } else {
+                            entry.incarnation
+                        };
+                        if corrected_self {
+                            incarnation = incarnation.saturating_add(1);
+                        }
                         existing.last_heartbeat = now;
                         existing.status = entry.status;
                         existing.address = entry.address;
                         existing
                             .metadata
-                            .insert("_incarnation".to_string(), entry.incarnation.to_string());
+                            .insert("_incarnation".to_string(), incarnation.to_string());
 
                         if old_status != entry.status {
                             changed = true;
                             if entry.status == NodeStatus::Failed {
                                 self.failed_nodes.insert(entry.node_id, now);
                             }
-                        } else if authoritative_self && old_addr != entry.address {
-                            // A sender self-correction of its own listen
-                            // address is a real table mutation even when
-                            // the status is unchanged. Bump the entry past
-                            // the sender's baseline incarnation so the
-                            // corrected address PROPAGATES: peers that
-                            // learned the stale address via relayed gossip
-                            // (equal incarnation) must accept the fix when
-                            // we re-gossip it.
+                        }
+                        // A newer relayed incarnation may correct an address
+                        // without a status transition. The return value must
+                        // report that mutation so callers can propagate it.
+                        if old_addr != entry.address {
                             changed = true;
-                            Self::bump_entry_incarnation(existing);
                         }
                     } else if !self.active_view.contains(&entry.node_id)
                         && matches!(existing.status, NodeStatus::Healthy | NodeStatus::Joining)
@@ -1298,7 +1333,11 @@ impl ClusterState {
         if self.rng.is_some() {
             // The seeded simulator must serialize the same membership
             // subset in the same order across independently randomized maps.
-            let mut members: Vec<&NodeInfo> = self.members.values().collect();
+            let mut members: Vec<&NodeInfo> = self
+                .members
+                .values()
+                .filter(|info| !self.removed_nodes.contains(&info.node_id))
+                .collect();
             members.sort_unstable_by_key(|info| info.node_id);
             return members
                 .into_iter()
@@ -1310,6 +1349,7 @@ impl ClusterState {
         // Preserve the allocation-free production iteration path.
         self.members
             .values()
+            .filter(|info| !self.removed_nodes.contains(&info.node_id))
             .take(max_entries)
             .map(to_gossip)
             .collect()
@@ -1401,7 +1441,16 @@ impl ClusterState {
     /// Mark a node confirmed gone (RFC 0014 §1 path 1, a positive
     /// `NodeGoodbye`). Returns true when the node was not already removed.
     pub fn mark_removed(&mut self, node: NodeId) -> bool {
-        self.removed_nodes.insert(node)
+        if !self.removed_nodes.insert(node) {
+            return false;
+        }
+        // A confirmed-gone node cannot occupy a live-view slot. Keep its
+        // tombstone until a separately verified incarnation/fencing protocol
+        // permits rejoining; ordinary heartbeat and gossip never clear it.
+        self.active_view.retain(|id| *id != node);
+        self.passive_view.retain(|id| *id != node);
+        self.probationary.retain(|(id, _)| *id != node);
+        true
     }
 
     /// Whether `node` has been confirmed gone.
@@ -1431,6 +1480,9 @@ impl ClusterState {
             .values()
             .map(|info| {
                 let mut info = info.clone();
+                if self.removed_nodes.contains(&info.node_id) {
+                    info.status = NodeStatus::Failed;
+                }
                 if info.node_id != self.local_node
                     && !self.active_view.contains(&info.node_id)
                     && now.duration_since(info.last_heartbeat) > self.heartbeat_timeout
@@ -1813,6 +1865,88 @@ mod tests {
         let changed = cs.merge_membership(gossip);
         assert!(changed);
         assert_eq!(cs.get_node(pid).unwrap().status, NodeStatus::Leaving);
+    }
+
+    // A self-authored change from Joining + an ephemeral source port to
+    // Healthy + the real listen port must outrank equal-version gossip at
+    // third parties that cannot directly contact the peer.
+    #[test]
+    fn test_authoritative_self_gossip_propagates_simultaneous_status_address_correction() {
+        let peer = NodeId(77);
+        let stale_addr = addr(9777);
+        let listen = addr(9900);
+        let mut relay = ClusterState::new(NodeId(1), addr(9001));
+        let mut downstream = ClusterState::new(NodeId(2), addr(9002));
+        let stale = NodeGossip {
+            node_id: peer,
+            address: stale_addr,
+            status: NodeStatus::Joining,
+            incarnation: 1,
+        };
+        relay.merge_membership(vec![stale.clone()]);
+        downstream.merge_membership(vec![stale]);
+        assert!(relay.merge_membership_from_sender(
+            vec![NodeGossip {
+                node_id: peer,
+                address: listen,
+                status: NodeStatus::Healthy,
+                incarnation: 1,
+            }],
+            peer,
+        ));
+        let corrected = relay
+            .gossip_payload(16)
+            .into_iter()
+            .find(|entry| entry.node_id == peer)
+            .unwrap();
+        assert!(
+            corrected.incarnation > 1,
+            "a simultaneous authoritative status/address change must bump its incarnation"
+        );
+        assert!(downstream.merge_membership(vec![corrected]));
+        let result = downstream.get_node(peer).unwrap();
+        assert_eq!(result.status, NodeStatus::Healthy);
+        assert_eq!(result.address, listen);
+    }
+
+    // A peer's self-entry can have an older incarnation than the relay's
+    // retained gossip: accepting the authoritative address must still
+    // propagate at a strictly greater version than what observers hold.
+    #[test]
+    fn test_authoritative_self_gossip_address_correction_keeps_monotonic_incarnation() {
+        let peer = NodeId(77);
+        let stale_addr = addr(9777);
+        let listen = addr(9900);
+        let mut relay = ClusterState::new(NodeId(1), addr(9001));
+        let mut downstream = ClusterState::new(NodeId(2), addr(9002));
+        let stale = NodeGossip {
+            node_id: peer,
+            address: stale_addr,
+            status: NodeStatus::Healthy,
+            incarnation: 40,
+        };
+        relay.merge_membership(vec![stale.clone()]);
+        downstream.merge_membership(vec![stale]);
+        assert!(relay.merge_membership_from_sender(
+            vec![NodeGossip {
+                node_id: peer,
+                address: listen,
+                status: NodeStatus::Healthy,
+                incarnation: 1,
+            }],
+            peer,
+        ));
+        let corrected = relay
+            .gossip_payload(16)
+            .into_iter()
+            .find(|entry| entry.node_id == peer)
+            .unwrap();
+        assert!(
+            corrected.incarnation > 40,
+            "authoritative correction must dominate the highest observed version"
+        );
+        assert!(downstream.merge_membership(vec![corrected]));
+        assert_eq!(downstream.get_node(peer).unwrap().address, listen);
     }
 
     // -- 12b. Sender self-entry is authoritative over a discovered address --
@@ -2726,6 +2860,89 @@ mod tests {
         assert!(!actions
             .iter()
             .any(|a| matches!(a, ClusterAction::NodeRemoved { .. })));
+    }
+
+    #[test]
+    fn test_confirmed_goodbye_fences_old_identity_without_blocking_new_identity() {
+        let a = addr(9000);
+        let local = NodeId::new(&a);
+        let mut cluster = ClusterState::new(local, a);
+        let old = NodeId::new(&addr(9001));
+        cluster.handle_heartbeat(old, addr(9001));
+        assert!(cluster.mark_removed(old));
+        assert!(
+            !cluster.active_view().contains(&old),
+            "removed peer still consumes an active view slot"
+        );
+        assert!(!cluster.passive_view().contains(&old));
+
+        // A stale Healthy membership record must not confer availability.
+        assert_eq!(cluster.healthy_node_count(), 1);
+        assert!(cluster.healthy_members().is_empty());
+        assert!(!cluster.gossip_payload(10).iter().any(|e| e.node_id == old));
+        cluster.last_heartbeat_sent =
+            Instant::now() - cluster.heartbeat_interval - Duration::from_secs(1);
+        let actions = cluster.tick();
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            ClusterAction::SendHeartbeat { to, .. } if *to == old
+        )));
+
+        cluster.handle_heartbeat(old, addr(9011));
+        assert_eq!(cluster.get_node(old).unwrap().address, addr(9001));
+        assert!(!cluster.merge_membership_from_sender(
+            vec![NodeGossip {
+                node_id: old,
+                address: addr(9011),
+                status: NodeStatus::Healthy,
+                incarnation: 999,
+            }],
+            old,
+        ));
+        assert!(cluster.is_removed(old));
+        assert_eq!(cluster.get_node(old).unwrap().address, addr(9001));
+        assert_eq!(cluster.healthy_node_count(), 1);
+
+        // A fresh identity remains eligible; no unsafe tombstone clearing.
+        let fresh = NodeId::new(&addr(9002));
+        cluster.handle_heartbeat(fresh, addr(9002));
+        assert_eq!(cluster.get_node(fresh).unwrap().status, NodeStatus::Healthy);
+        assert!(!cluster.is_removed(fresh));
+        assert_eq!(cluster.healthy_node_count(), 2);
+    }
+
+    #[test]
+    fn test_timeout_confirmed_removal_rejects_stale_peer_revival() {
+        let a = addr(9000);
+        let mut cluster = ClusterState::new(NodeId::new(&a), a);
+        let old = NodeId::new(&addr(9001));
+        cluster.handle_heartbeat(old, addr(9001));
+        let stale = Instant::now()
+            - DEFAULT_HEARTBEAT_TIMEOUT
+            - DEFAULT_SUSPICION_DURATION
+            - Duration::from_secs(1);
+        cluster.members.get_mut(&old).unwrap().last_heartbeat = stale;
+        cluster.tick();
+        assert_eq!(cluster.get_node(old).unwrap().status, NodeStatus::Failed);
+        cluster.removal_confirmation_timeout = Duration::from_secs(1);
+        *cluster.failed_nodes.get_mut(&old).unwrap() = Instant::now() - Duration::from_secs(2);
+        assert!(cluster
+            .tick()
+            .iter()
+            .any(|action| matches!(action, ClusterAction::NodeRemoved { node } if *node == old)));
+        cluster.handle_heartbeat(old, addr(9001));
+        assert!(!cluster.merge_membership_from_sender(
+            vec![NodeGossip {
+                node_id: old,
+                address: addr(9001),
+                status: NodeStatus::Healthy,
+                incarnation: 999,
+            }],
+            old,
+        ));
+        assert!(cluster.is_removed(old));
+        assert_eq!(cluster.get_node(old).unwrap().status, NodeStatus::Failed);
+        assert_eq!(cluster.healthy_node_count(), 1);
     }
 
     #[test]
