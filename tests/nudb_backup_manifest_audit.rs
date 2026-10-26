@@ -67,7 +67,7 @@ fn assert_rejected_unchanged(directory: &Path) {
             .len(),
         before_manifest.len()
     );
-    assert!(!directory.join("tablet.lock").exists());
+    assert!(!directory.join("tablet.wal.lock").exists());
 }
 
 #[test]
@@ -81,7 +81,7 @@ fn valid_wal_only_backup_is_audited_without_mutating_files() {
     assert_eq!(audit.checkpoint_bytes, None);
     assert_eq!(audit.wal_bytes as usize, before.len());
     assert_eq!(fs::read(dir.join("tablet.wal")).unwrap(), before);
-    assert!(!dir.join("tablet.lock").exists());
+    assert!(!dir.join("tablet.wal.lock").exists());
 }
 
 #[test]
@@ -101,7 +101,7 @@ fn missing_completion_marker_must_not_be_trusted() {
     let dir = make_backup(&root, false);
     fs::remove_file(dir.join("COMPLETE.json")).unwrap();
     assert!(audit_completed_backup_read_only(descriptor(), &dir).is_err());
-    assert!(!dir.join("tablet.lock").exists());
+    assert!(!dir.join("tablet.wal.lock").exists());
 }
 
 #[test]
@@ -172,6 +172,6 @@ fn symlinked_marker_or_wal_is_rejected_without_following_it() {
         fs::rename(dir.join(file), &real).unwrap();
         symlink(&real, dir.join(file)).unwrap();
         assert!(audit_completed_backup_read_only(descriptor(), &dir).is_err());
-        assert!(!dir.join("tablet.lock").exists());
+        assert!(!dir.join("tablet.wal.lock").exists());
     }
 }
