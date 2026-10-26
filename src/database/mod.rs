@@ -8,6 +8,7 @@ pub mod backup;
 pub mod checkpoint;
 pub mod owner;
 pub mod retention;
+pub(crate) mod retention_admission;
 pub mod retention_store;
 pub mod store;
 pub mod tablet;

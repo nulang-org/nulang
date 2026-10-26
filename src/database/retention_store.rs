@@ -345,6 +345,15 @@ impl DurableRetentionRegistry {
             let parent = fs::canonicalize(parent)?;
             let name = requested.file_name().ok_or(RegistryError::UnsafePath)?;
             let path = parent.join(name);
+            // Shared with the lower-level WAL reclaimer. The admission guard
+            // stays held across registry initialization and publication so
+            // either activation wins first, or the reclaimer wins first.
+            let _admission =
+                super::retention_admission::acquire(&path).map_err(|error| match error.kind() {
+                    io::ErrorKind::WouldBlock => RegistryError::WriterLocked,
+                    io::ErrorKind::InvalidInput => RegistryError::UnsafePath,
+                    _ => RegistryError::Io(error),
+                })?;
             let lock_path = suffix(&path, ".lock");
             let pending_path = suffix(&path, ".pending");
             let stage_path = suffix(&path, ".stage");

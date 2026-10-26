@@ -53,6 +53,7 @@ jobs:
           cargo test --locked --no-default-features --test nudb_durable_retention
           cargo test --locked --no-default-features --test nudb_reclaim_watermark
           cargo test --locked --no-default-features --test nudb_guarded_checkpoint
+          cargo test --locked --no-default-features --test nudb_wal_admission_fence
       - name: Group commit contract
         run: cargo test --locked --no-default-features --test nudb_group_commit
       - name: Durable transaction receipts, retries and recovery
