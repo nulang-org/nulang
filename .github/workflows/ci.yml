@@ -48,6 +48,9 @@ jobs:
       - name: Smoke test browser playground
         run: node playground/web/test/smoke.mjs
 
+      - name: Smoke test Nulang Web action events
+        run: node scripts/tests/web_action_events.mjs
+
       - name: Install docs dependencies
         run: |
           cd docs
@@ -98,6 +101,41 @@ jobs:
 
       - name: Build
         run: cargo build --locked --all-targets
+
+      # Rust resolver unit tests do not exercise source -> import resolution ->
+      # compiler -> VM. Pin this existing language-level regression without
+      # enabling the entire currently-red behavioral conformance corpus.
+      - name: Smoke known language conformance regressions
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import subprocess
+
+          target = json.loads(subprocess.check_output(
+              ["cargo", "metadata", "--format-version", "1", "--no-deps"], text=True
+          ))["target_directory"]
+          binary = Path(target) / "debug" / "nulang"
+          for name in (
+              "modimport_13_subdirectory_package",
+              "stdlib_03_list_any_all_find",
+          ):
+              case = Path("conformance/behavior") / f"{name}.nula"
+              expected = json.loads(case.with_suffix(".json").read_text(encoding="utf-8"))
+              result = subprocess.run(
+                  [str(binary), str(case)],
+                  capture_output=True, text=True, timeout=30,
+              )
+              assert result.returncode == expected["exit_code"], (
+                  f"{case}: expected exit {expected['exit_code']}, "
+                  f"got {result.returncode}: {result.stderr}"
+              )
+              assert result.stdout.strip() == expected["stdout"], (
+                  f"{case}: expected stdout {expected['stdout']!r}, "
+                  f"got {result.stdout.strip()!r}"
+              )
+              print("PASS:", case)
+          PY
 
       - name: Test
         # nextest isolates individual tests in their own processes and schedules

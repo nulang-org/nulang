@@ -67,6 +67,8 @@ pub mod crdt_reg;
 mod distribution;
 mod exit;
 mod http_server;
+#[cfg(feature = "sqlite")]
+mod libsql_tls;
 #[cfg(feature = "ai-runtime")]
 mod llm;
 mod metrics;
@@ -85,6 +87,9 @@ pub use trace::TraceContext;
 
 #[cfg(test)]
 mod cluster_dst;
+
+#[cfg(test)]
+mod cluster_dst_trace_tests;
 
 #[cfg(test)]
 mod cluster_sim;

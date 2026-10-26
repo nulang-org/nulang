@@ -3,6 +3,44 @@
 ### list.find conformance Option contract — 2026-10-13
 - **The list.find behavior fixture now matches its Option[T] API.** Both the matched `Some(2)` payload and unmatched `None` variant are pattern-matched before rendering. Previously it passed the tagged Option directly to `Int.to_string` and expected a legacy `-1` miss sentinel. The underlying `stdlib::list.find` implementation is unchanged; the exact-head Nulang conformance run remains required.
 
+### Project-relative namespaced import resolution — 2026-10-26
+- **Local imports now resolve `::` segments as directories**, consistent with standard-library module paths. For example, `import subpkg::helper` resolves to `subpkg/helper.nula` relative to the importing source file; slash paths and explicit `.nula` extensions remain supported.
+- **The existing `modimport_13_subdirectory_package` conformance failure now has focused resolver regression tests.** No grammar or frozen format changes are needed; full language-suite and exact-head CI verification are still required.
+
+### Fail-closed language conformance runner — 2026-10-13
+- **Behavioral conformance can no longer report success without executing any cases.** Missing `.json` expectations and orphaned expectations now fail before compiling; fixture discovery is deterministic.
+- **The runner isolates and reports malformed expectations, failed processes, mismatched outputs and per-case timeouts.** Twelve Python regression tests exercise both passing and deliberately failing paths without requiring a Rust toolchain. The separate CI wiring remains in draft PR #1587; these changes do not claim a full Nulang runtime pass.
+
+### October RustSec dependency remediation (validation pending) — 2026-10-25
+- **Updated Wasmtime 48.0.7, compatible Cranelift/Pulley packages, rustls-webpki 0.103.16, webpki-roots 1.0.10 and ctutils 0.4.4** with Cargo's dependency resolver.
+- **Migrated libSQL remote TLS to a custom connector based on supported rustls 0.23 and tokio-rustls 0.26.** This retains libSQL local/remote behavior, native root certificates, server-name verification and Hyper 0.14 protocol compatibility without pulling unsupported rustls-webpki 0.102.
+- **Release status:** tests of the certificate verifier, local SQLite behavior, full cargo audit and exact-head CI are mandatory before promotion. No security advisory is waived. See #2093.
+
+### Native float division/modulo nil parity — 2026-10-19
+- **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
+- **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
+
+### Fabric on-demand mailbox scoring — 2026-10-18
+- **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
+- **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
+
+### Bounded Nulang Web development-server connections — 2026-10-16
+- **The experimental Web development listener caps active connections at 64**, including SSE, and returns `503` with `Retry-After: 1` when full.
+- **Worker capacity is returned by a scoped RAII lease** after normal completion, panic, or thread-spawn failure. One shared `Arc` route table replaces per-connection clones of compiled route modules.
+- **Existing deterministic capacity and concurrent-admission regressions are preserved** from draft #1774; current-main static containment and bounded HTTP framing remain intact. Exact-head CI and real TCP saturation validation are required before promotion.
+
+### Web static-root containment — 2026-10-15
+- **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
+- **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.
+
+### Experimental Web HTML host hardening — 2026-10-15
+- **`Web.html` now validates dynamic element and attribute names and URL-bearing attributes before rendering.** Unsafe markup and scriptable URL schemes fail closed; quoted attribute delimiters are escaped while already escaped `Html` text is preserved.
+- **Six focused regression tests cover normal markup, attribute breakouts, event attributes, high-risk elements, obfuscated URLs, and safe relative/HTTP links.** `Web.raw` remains a trusted-only escape hatch; dynamic script/style/SVG and inline style/event attributes are intentionally rejected pending a future typed context-aware API.
+
+### Rustls and Wasmtime security updates — 2026-10-15
+- **Pinned supported TLS and WASM runtime dependencies to patched versions.** Updated rustls 0.23.45 to 0.23.46 and Wasmtime 48.0.5 to 48.0.6 (including compatible Cranelift and runtime lockfile packages) to address October 2026 RustSec advisories.
+- **Documented the remaining legacy rustls 0.22 advisories in the Cargo audit policy.** The affected version is transitive through libsql's hyper-rustls 0.25 path; explicit advisory exceptions are restricted to the documented IDs until the upstream dependency chain is upgraded.
+
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.

@@ -1374,6 +1374,10 @@ impl LibsqlStore {
             tokio::runtime::Runtime::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let db = rt.block_on(async {
             libsql::Builder::new_remote(url.to_string(), auth_token.to_string())
+                .connector(
+                    crate::runtime::libsql_tls::connector()
+                        .map_err(|e| io::Error::other(e.to_string()))?,
+                )
                 .build()
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
