@@ -1,4 +1,9 @@
 # Nulang Changelog
+### One-shot bounded CoreVM lexical join — 2026-10-26
+- **Added a finite, synchronous CoreVM child-scope runner** on top of the existing coordinator and per-instruction fuel budget. Admission occurs before any child execution; pending submissions, active admission count, and each child’s instruction budget are explicit bounds.
+- **Join is completed before returning successful outcomes**: separate CoreVM instances run admitted children to terminal states; the first failure cancels remaining siblings; outcomes remain in submission order. Over-capacity admission fails before running any child.
+- **Added test-first public integration checks** for successful multi-tick joining, failed-child sibling cancellation, pre-canceled parents, capacity errors and empty scopes. This is a cooperative one-shot reference path, **not parallel `par`, source-syntax integration, or a guaranteed preemption of blocking host instructions**.
+
 ### Portable CoreVM scoped execution limits — 2026-10-26
 - **Ported opt-in CoreVM instruction fuel and cancellation checks from draft #1985** to the canonical scoped-task stack. `CoreVM::run_with_limits` checks before each bytecode instruction, with `Halt` charged one unit and zero fuel executing no instructions. Existing unrestricted `CoreVM::run` remains the default, including for the browser playground.
 - **Added a one-shot scoped CoreVM adapter** that consumes the scope's read-only cancellation view, reports termination only after bounded VM execution returns, maps cancellation to `TaskPoll::Cancelled`, and reports fuel exhaustion as a terminal error so sibling work is cancelled. Interrupted VM state is not resumable; no parallel source `par`, durable cancellation, or preemption of long-running effects is claimed.
