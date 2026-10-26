@@ -1,0 +1,50 @@
+// Strict JSON parsing must never silently accept malformed payloads.
+import stdlib::json
+
+fn check(input: String) -> String {
+    match parse_strict(input) {
+        Ok(value) => "ok:" + stringify(value),
+        Error(e) => "error:" + e.reason,
+    }
+}
+
+fn error_offset(input: String) -> String {
+    match parse_strict(input) {
+        Ok(_) => "missing-error",
+        Error(e) => perform Int.to_string(e.offset),
+    }
+}
+
+fn main() {
+    perform IO.print("null=" + check("null"))
+    perform IO.print("object=" + check(" {\"a\": [true, null, -1.25e2]} "))
+    perform IO.print("escaped=" + check("\"\\u0041\\u0042\""))
+    perform IO.print("pair=" + check("\"\\uD83D\\uDE00\""))
+    perform IO.print("raw_unicode=" + check("\"café 😀\""))
+    perform IO.print("empty=" + check(""))
+    perform IO.print("trailing=" + check("12garbage"))
+    perform IO.print("trailing_object=" + check("{} {}"))
+    perform IO.print("truncated=" + check("[1,2"))
+    perform IO.print("object_truncated=" + check("{\"a\":1"))
+    perform IO.print("bad_comma=" + check("[1,]"))
+    perform IO.print("bad_colon=" + check("{\"a\" 1}"))
+    perform IO.print("leading_zero=" + check("01"))
+    perform IO.print("missing_frac=" + check("1."))
+    perform IO.print("missing_exp=" + check("1e+"))
+    perform IO.print("invalid_escape=" + check("\"\\x\""))
+    perform IO.print("missing_quote=" + check("\"abc"))
+    perform IO.print("lone_high=" + check("\"\\uD83D\""))
+    perform IO.print("lone_low=" + check("\"\\uDE00\""))
+    perform IO.print("bad_literal=" + check("tru"))
+    perform IO.print("duplicate_key=" + check("{\"a\":1,\"a\":2}"))
+    perform IO.print("overflow=" + check("1e9999"))
+    perform IO.print("raw_control=" + check("\"" + perform String.from_char(1) + "\""))
+    perform IO.print("offset=" + error_offset("0 2"))
+    var deep = "0";
+    var i = 0;
+    while i < 65 {
+        deep = "[" + deep + "]";
+        i = i + 1
+    };
+    perform IO.print("depth=" + check(deep))
+}
