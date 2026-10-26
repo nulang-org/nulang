@@ -12,10 +12,13 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use super::backup::{self, BackupError, BackupReceipt};
 use super::checkpoint::{self, CheckpointError};
+use super::retention_store::{DurableRetentionRegistry, RegistryError};
 use super::tablet::{
     transaction_digest, MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite,
     TransactionId, TransactionIdentity, TransactionReceipt,
@@ -355,11 +358,136 @@ impl WalBackedTablet {
         Ok(())
     }
 
-    /// Publish a durable checkpoint, then reclaim the WAL through that exact
-    /// committed sequence. The ordering is safety-critical: if reclamation
-    /// fails, the already-published checkpoint plus the full WAL remain a valid
-    /// recovery state.
+    /// Canonical registry path for opt-in, cooperative, single-host retention.
+    /// The canonical WAL parent is used to prevent equivalent relative paths
+    /// from silently producing independent retention owners.
+    pub fn retention_registry_path(&self) -> PathBuf {
+        let mut name = self.wal.path().as_os_str().to_os_string();
+        name.push(".pins");
+        PathBuf::from(name)
+    }
+
+    /// Reject the legacy full-tail checkpoint reclaim once a retention
+    /// registry was initialized. Requiring the complete managed protocol
+    /// prevents accidental bypass by callers of the historical API.
+    ///
+    /// This is a cooperative trusted-directory boundary, not a distributed
+    /// enrollment fence against concurrent external path manipulation.
+    fn reject_legacy_retention_bypass(&self) -> Result<(), WalBackedError> {
+        let base = self.retention_registry_path();
+        for extension in ["", ".lock", ".pending", ".stage"] {
+            let mut name = base.as_os_str().to_os_string();
+            name.push(extension);
+            match fs::symlink_metadata(PathBuf::from(name)) {
+                Ok(_) => return Err(WalBackedError::RetentionManaged),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(WalBackedError::Io(error.to_string())),
+            }
+        }
+        Ok(())
+    }
+
+    /// Authorize only a full-tail reclaim with the exact local tablet
+    /// registry held exclusively by the caller. No physical files change.
+    fn preflight_retention_reclaim(
+        &self,
+        registry: &DurableRetentionRegistry,
+    ) -> Result<u64, WalBackedError> {
+        if !registry.matches_owner(
+            &self.retention_registry_path(),
+            self.tablet.descriptor().id().get(),
+            self.tablet.descriptor().ownership_epoch(),
+        ) {
+            return Err(WalBackedError::RetentionMismatch);
+        }
+        let tail = self.tablet.current_sequence();
+        if self.wal.is_poisoned() || self.wal.last_sequence() != tail {
+            return Err(WalBackedError::UnverifiedCheckpoint);
+        }
+        // Existing compacted logs cannot be retroactively covered by a
+        // freshly initialized registry with floor 1. That historical gap
+        // requires explicit operator reconciliation before managed reclaim.
+        if self.wal.base_sequence() != 0
+            && registry.minimum_wal_cursor() <= self.wal.base_sequence()
+        {
+            return Err(WalBackedError::RetentionBootstrapRequired);
+        }
+        if tail == u64::MAX {
+            return Err(WalBackedError::Retention(
+                RegistryError::InvalidReclaimBound.to_string(),
+            ));
+        }
+        let allowed = registry
+            .policy()
+            .wal_reclaim_bound(Some(tail), tail)
+            .map_err(|error| {
+                WalBackedError::Retention(
+                    RegistryError::ReclaimBlocked(format!("{error:?}")).to_string(),
+                )
+            })?;
+        if allowed != tail {
+            return Err(WalBackedError::Retention(
+                RegistryError::ReclaimBlocked(format!(
+                    "WAL consumer still needs sequence {}",
+                    allowed.saturating_add(1)
+                ))
+                .to_string(),
+            ));
+        }
+        Ok(tail)
+    }
+
+    /// Verify an already-published, exact, *logically identical* checkpoint
+    /// and WAL under the live writer lock, then durably reserve the retention
+    /// watermark BEFORE rewriting the WAL. No partial-prefix cleanup exists.
+    ///
+    /// This is opt-in, local, and cooperative: source enrollment/completion
+    /// must be certified by the external consumer owner, and no distributed
+    /// fencing is implied. On uncertainty, do NOT reset/delete the registry.
+    pub fn reclaim_verified_checkpoint_with_retention(
+        &mut self,
+        registry: &mut DurableRetentionRegistry,
+    ) -> Result<(), WalBackedError> {
+        let tail = self.preflight_retention_reclaim(registry)?;
+        let report = Self::verify_checkpoint_wal_read_only(
+            self.tablet.descriptor().clone(),
+            self.wal.path(),
+        )?;
+        if report.checkpoint_sequence != Some(tail)
+            || report.durable_tail != tail
+            || report.wal.base_sequence != self.wal.base_sequence()
+        {
+            return Err(WalBackedError::UnverifiedCheckpoint);
+        }
+        let restored =
+            checkpoint::load_checkpoint(&self.checkpoint_path, self.tablet.descriptor().clone())?
+                .ok_or(WalBackedError::UnverifiedCheckpoint)?;
+        if !restored.same_committed_state(&self.tablet) {
+            return Err(WalBackedError::UnverifiedCheckpoint);
+        }
+        // Crash after reservation but before actual reclaim is conservative:
+        // full WAL remains, but no new consumer can join below the floor.
+        registry.reserve_reclaim_through(tail, tail)?;
+        self.wal.reclaim_through(tail)?;
+        Ok(())
+    }
+
+    /// Publish checkpoint and perform the independently verified guarded
+    /// reclaim, but only after fail-closed retention admission succeeds.
+    pub fn checkpoint_with_retention(
+        &mut self,
+        registry: &mut DurableRetentionRegistry,
+    ) -> Result<(), WalBackedError> {
+        self.preflight_retention_reclaim(registry)?;
+        self.publish_checkpoint()?;
+        self.reclaim_verified_checkpoint_with_retention(registry)
+    }
+
+    /// Legacy full-tail checkpoint: valid only when retention is not enabled.
+    /// Existing unregistered applications preserve the historical behavior;
+    /// once a pin registry/sidecar exists, use checkpoint_with_retention.
     pub fn checkpoint(&mut self) -> Result<(), WalBackedError> {
+        self.reject_legacy_retention_bypass()?;
         self.publish_checkpoint()?;
         self.wal.reclaim_through(self.tablet.current_sequence())?;
         Ok(())
@@ -371,6 +499,12 @@ pub enum WalBackedError {
     Tablet(TabletError),
     Wal(WalError),
     Checkpoint(CheckpointError),
+    Retention(String),
+    RetentionManaged,
+    RetentionMismatch,
+    RetentionBootstrapRequired,
+    UnverifiedCheckpoint,
+    Io(String),
     IdempotencyConflict(TransactionId),
     DuplicateBatchId(TransactionId),
     TooManyReceiptTransactions { requested: usize, limit: usize },
@@ -393,6 +527,11 @@ impl From<CheckpointError> for WalBackedError {
         Self::Checkpoint(error)
     }
 }
+impl From<RegistryError> for WalBackedError {
+    fn from(error: RegistryError) -> Self {
+        Self::Retention(error.to_string())
+    }
+}
 
 impl fmt::Display for WalBackedError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -400,6 +539,20 @@ impl fmt::Display for WalBackedError {
             Self::Tablet(error) => write!(f, "tablet commit rejected: {error}"),
             Self::Wal(error) => write!(f, "tablet WAL failure: {error}"),
             Self::Checkpoint(error) => write!(f, "tablet checkpoint failure: {error}"),
+            Self::Retention(error) => write!(f, "tablet retention admission failed: {error}"),
+            Self::RetentionManaged => {
+                f.write_str("retention-managed WAL cannot use the legacy checkpoint reclaimer")
+            }
+            Self::RetentionMismatch => f.write_str(
+                "retention registry is not the exclusive owner for this WAL/tablet epoch",
+            ),
+            Self::RetentionBootstrapRequired => f.write_str(
+                "existing reclaimed WAL history requires retention floor reconciliation",
+            ),
+            Self::UnverifiedCheckpoint => f.write_str(
+                "checkpoint and WAL are not a proven exact copy of live committed history",
+            ),
+            Self::Io(error) => write!(f, "retention guard I/O error: {error}"),
             Self::TooManyReceiptTransactions { requested, limit } => {
                 write!(
                     f,
