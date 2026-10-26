@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Experimental SQLite catalog inspection — 2026-10-26
+- **Added a read-only SQLite catalog inspector behind the existing `sqlite` feature.** It extracts the representable tables, typed columns, simple indexes and explicit foreign keys into relational schema v0alpha1 metadata, binds names safely, and checks for concurrent schema changes.
+- **Drift admission intentionally remains disabled.** The reader rejects several unsupported catalog objects and always marks the returned metadata as incomplete because v0alpha1 cannot represent all SQLite DDL semantics. No database migrations or Cloud deployment gates are enabled.
+
 ### Experimental relational schema contracts — 2026-10-26
 - **Added the `nulang.relational-schema/v0alpha1` Rust metadata contract for PostgreSQL/SQLite table, column, primary-key, index, and foreign-key schemas.** It validates references, rejects unknown contract fields/versions, exports normalized JSON, and computes a domain-separated BLAKE3 fingerprint independent of declaration order.
 - **This is not a general ORM, SQL executor, introspector or migration planner.** Catalog coverage is deliberately incomplete; production drift/deployment gates must not treat this fingerprint as proof of full-schema equivalence. Seven focused contract tests cover determinism and invalid inputs.
