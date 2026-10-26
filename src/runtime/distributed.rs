@@ -1097,6 +1097,17 @@ pub fn process_network_packets(
         match incoming.packet {
             Packet::Heartbeat { node_id, .. } => {
                 let cluster_node_id = NodeId(node_id.0);
+                // A packet-claimed NodeId is not authority. Only the peer
+                // identity supplied by the transport may promote liveness.
+                // This check does not replace authentication of that
+                // transport identity (TLS certificate binding is separate).
+                if cluster_node_id != incoming.from_node {
+                    warn!(
+                        "nulang-net: dropping heartbeat for {:?} from peer {:?}",
+                        cluster_node_id, incoming.from_node
+                    );
+                    continue;
+                }
                 // A Failed -> Healthy transition may be the same NodeId coming
                 // back as a fresh process. Receiver-specific CRDT knowledge
                 // from the old process is therefore no longer trustworthy.

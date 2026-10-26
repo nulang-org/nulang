@@ -7647,6 +7647,88 @@ fn test_dst_run_scheduler_deterministic_reproducible() {
     assert_eq!(v1, 5, "all 5 inc messages must be processed");
 }
 
+/// An authenticated transport peer cannot revive another member by
+/// impersonating its NodeId in a heartbeat payload. Ordinary recovery from
+/// that member's actual transport identity must remain possible.
+#[test]
+fn test_heartbeat_sender_claim_must_match_transport_peer() {
+    use crate::runtime::cluster::{ClusterState, NodeGossip, NodeStatus};
+    use crate::runtime::distributed::{process_network_packets, AddressResolver};
+    use crate::runtime::network::{DeterministicNetworkTransport, Packet};
+    use crate::runtime::NetworkTransport;
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+
+    let addr = |port| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let receiver_addr = addr(15111);
+    let victim_addr = addr(15112);
+    let attacker_addr = addr(15113);
+    let bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let mut receiver =
+        DeterministicNetworkTransport::bind_with_bus(receiver_addr, bus.clone()).unwrap();
+    let mut victim =
+        DeterministicNetworkTransport::bind_with_bus(victim_addr, bus.clone()).unwrap();
+    let mut attacker = DeterministicNetworkTransport::bind_with_bus(attacker_addr, bus).unwrap();
+    let receiver_id = receiver.node_id();
+    let victim_id = victim.node_id();
+    assert_ne!(victim_id, attacker.node_id());
+    receiver.register_on_bus();
+    victim.register_on_bus();
+    attacker.register_on_bus();
+    victim.connect(receiver_id, receiver_addr).unwrap();
+    attacker.connect(receiver_id, receiver_addr).unwrap();
+
+    let mut cluster = ClusterState::new(receiver_id, receiver_addr);
+    cluster.handle_heartbeat(victim_id, victim_addr);
+    cluster.merge_membership(vec![NodeGossip {
+        node_id: victim_id,
+        address: victim_addr,
+        status: NodeStatus::Failed,
+        incarnation: 1_000_000,
+    }]);
+    assert_eq!(
+        cluster.get_node(victim_id).unwrap().status,
+        NodeStatus::Failed
+    );
+    let mut runtime = Runtime::new();
+    let mut resolver = AddressResolver::new(receiver_id);
+
+    // Attacker's connection identifies attacker, but the payload claims victim.
+    attacker.send(
+        receiver_id,
+        receiver_addr,
+        Packet::Heartbeat {
+            node_id: victim_id,
+            timestamp: 0,
+        },
+    );
+    process_network_packets(&mut runtime, &mut receiver, &mut cluster, &mut resolver);
+    assert_eq!(
+        cluster.get_node(victim_id).unwrap().status,
+        NodeStatus::Failed,
+        "a forged heartbeat must not revive another transport peer",
+    );
+
+    // Recovery must still work when the same NodeId actually sent the frame.
+    victim.send(
+        receiver_id,
+        receiver_addr,
+        Packet::Heartbeat {
+            node_id: victim_id,
+            timestamp: 1,
+        },
+    );
+    process_network_packets(&mut runtime, &mut receiver, &mut cluster, &mut resolver);
+    assert_eq!(
+        cluster.get_node(victim_id).unwrap().status,
+        NodeStatus::Healthy
+    );
+    attacker.shutdown();
+    victim.shutdown();
+    receiver.shutdown();
+}
+
 /// Verify that `DeterministicNetworkTransport` correctly delivers
 /// messages between two runtimes connected in-memory (no real TCP).
 #[test]

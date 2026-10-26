@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Sender-bound heartbeat liveness (review-only) — 2026-10-26
+- **Reject heartbeats whose packet-claimed NodeId differs from the transport-reported peer identity** before changing cluster membership or CRDT recovery state; no ACK is issued for a rejected control packet. Add a deterministic three-peer forgery and legitimate-recovery regression. This is a fail-closed consistency check, not a substitute for mTLS peer authentication or a claim that plaintext transports resist spoofing. Tracks #2132.
+- **Security-stack validation remains gated:** exact-head test and release CI, independent identity/TLS review, disposable authenticated remote libSQL SQL certification, and main-branch protection are still required; no source wire format or timers change.
+
 ### Fail-closed remote libSQL URL admission (review-only) — 2026-10-26
 - **Ported the existing URL-admission logic and regressions from draft #2228 onto the audited TLS, cluster-recovery and compiler integration stack.** Nonloopback plaintext HTTP destinations, ambiguous schemes, deceptive loopback names, userinfo (including empty `@` authorities), fragments, backslashes and controls fail with `InvalidInput` before constructing a token-bearing client; numeric IPv4/IPv6 loopback remains available for development.
 - **Preserved patched rustls 0.23/Turso TLS and native certificate verification.** Added two inline validation tests, public URL-admission regressions, and a deliberately ignored disposable-Turso SQL certification harness with strict endpoint/credential safeguards. Real authenticated remote SQL and independent security approval remain required.
