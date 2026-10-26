@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Fail-closed post-handshake mTLS peer identity (review-only) — 2026-10-26
+- **Fixed a reproduced CA-trusted outbound NUL0 NodeId impersonation**: Rustls' certificate accessor was called before the lazy TLS handshake completed, returned no peer certificate, and an `if let Some` check silently skipped identity binding. The old code accepted a malicious NUL0 claim for a different NodeId; the local regression reproduces that acceptance without insecure trust roots.
+- **Both outbound connection paths and inbound admission now require an available, matching peer certificate after the TLS/NUL0 handshake and before registering a connection.** No wire-format, timeout, recovery protocol or TLS-root policy changes. Preserve strict plaintext opt-out semantics and existing legitimate mTLS interoperability tests. Independent security review, exact-head release/native/WASM/CodeQL and disposable Turso remote SQL validation remain required.
+
 ### Sender-bound NodeGoodbye removal (review-only) — 2026-10-26
 - **Ported the previously RED/GREEN-tested NodeGoodbye sender check and deterministic poisoning regression from #2131** onto the audited TLS, distributed recovery, compiler, and remote URL/heartbeat security stack. A packet cannot mark a different node Removed or merge its durable actor directory manifest unless the payload NodeId equals the transport-reported sender.
 - **This is a transport-identity consistency check, not a cryptographic guarantee for plaintext TCP.** Preserve valid self-goodbye/rejoin behavior; require same-head native/WASM/release CI and independent review, including authenticated transport identity binding and the disposable Turso HTTPS database test. Tracks #2132 and #2130.
