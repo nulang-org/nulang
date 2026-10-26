@@ -248,3 +248,60 @@ fn workflow_emit_output_is_journaled_and_readable_after_runtime_restart() {
         "restarting the runtime must not duplicate receipts"
     );
 }
+
+#[test]
+fn file_store_read_failure_must_not_be_reported_as_empty_journal() {
+    use nulang::runtime::JsonFileStore;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "nulang-fallible-workflow-{unique}-{}",
+        std::process::id()
+    ));
+    let mut store = JsonFileStore::new(&root).unwrap();
+    assert!(
+        read_workflow_output_receipts(&store, ACTOR, 0, 10)
+            .unwrap()
+            .is_empty(),
+        "missing file is empty"
+    );
+    store
+        .append_workflow_event(ACTOR, output(1, Some(identity(100, 0)), "ok"))
+        .unwrap();
+    assert_eq!(
+        read_workflow_output_receipts(&store, ACTOR, 0, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    // The old infallible reader silently skipped the malformed trailing row;
+    // a one-item page must still reject the *whole* corrupted journal.
+    use std::io::Write;
+    let path = root.join(format!("actor_{ACTOR}/workflow_events.jsonl"));
+    writeln!(
+        fs::OpenOptions::new().append(true).open(&path).unwrap(),
+        "invalid json"
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            read_workflow_output_receipts(&store, ACTOR, 0, 10),
+            Err(WorkflowOutputError::Storage(_))
+        ),
+        "corrupt data must fail closed"
+    );
+    fs::remove_file(root.join(format!("actor_{ACTOR}/workflow_events.jsonl"))).unwrap();
+    fs::create_dir(root.join(format!("actor_{ACTOR}/workflow_events.jsonl"))).unwrap();
+    assert!(
+        matches!(
+            read_workflow_output_receipts(&store, ACTOR, 0, 10),
+            Err(WorkflowOutputError::Storage(_))
+        ),
+        "IO read error must fail closed"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
