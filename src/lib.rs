@@ -90,6 +90,7 @@ pub mod registry;
 pub mod repl;
 pub mod resolver;
 pub mod runtime;
+pub mod scoped_task_core_vm;
 pub mod scoped_task_reference;
 pub mod scoped_tasks;
 pub mod semantic_identity;

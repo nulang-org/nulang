@@ -83,6 +83,9 @@ pub struct CoreVM {
     pub strings: Vec<String>,
     pub halted: bool,
     pub exit_code: i64,
+    /// Set after bounded execution cancels or exhausts fuel. Partial frames
+    /// must never be interpreted as a resumable CoreVM continuation.
+    scoped_interrupted: bool,
     /// Optional capture sink for `IO.print` output. When set (e.g. by the
     /// browser playground), printed lines are appended to the buffer
     /// *instead of* going to process stdout.
@@ -99,6 +102,7 @@ impl CoreVM {
             strings: Vec::new(),
             halted: false,
             exit_code: 0,
+            scoped_interrupted: false,
             output_sink: None,
         }
     }
@@ -159,9 +163,49 @@ impl CoreVM {
     }
 
     pub fn run(&mut self, module_idx: usize, entry_pc: usize) -> Result<Value, String> {
-        self.run_inner(module_idx, entry_pc)
+        // Preserve the unrestricted legacy path. The compiler specializes out
+        // the limits branch for this invocation.
+        self.run_inner(module_idx, entry_pc, None::<(u64, fn() -> bool)>)
     }
-    fn run_inner(&mut self, module_idx: usize, entry_pc: usize) -> Result<Value, String> {
+
+    /// Execute with a hard instruction budget and cooperative cancellation.
+    ///
+    /// The callback is sampled *before each bytecode instruction*. An
+    /// instruction already in progress is not preempted, and this method does
+    /// not prove that a module is effect-free or safe to share across actors.
+    /// Exhausting the budget or requesting cancellation returns an error;
+    /// the partially executed VM is permanently invalidated and refuses any
+    /// subsequent run. Construct a fresh VM instead of attempting resumption.
+    /// Zero fuel executes no instructions; the Halt instruction costs one.
+    pub fn run_with_limits<F>(
+        &mut self,
+        module_idx: usize,
+        entry_pc: usize,
+        instruction_budget: u64,
+        cancellation_requested: F,
+    ) -> Result<Value, String>
+    where
+        F: FnMut() -> bool,
+    {
+        self.run_inner(
+            module_idx,
+            entry_pc,
+            Some((instruction_budget, cancellation_requested)),
+        )
+    }
+
+    fn run_inner<F>(
+        &mut self,
+        module_idx: usize,
+        entry_pc: usize,
+        mut limits: Option<(u64, F)>,
+    ) -> Result<Value, String>
+    where
+        F: FnMut() -> bool,
+    {
+        if self.scoped_interrupted {
+            return Err("CoreVM cannot be reused after bounded interruption".to_string());
+        }
         let frame = Frame::new(None, module_idx);
         self.frames.push(frame);
         let frame_idx = self.frames.len() - 1;
@@ -171,6 +215,17 @@ impl CoreVM {
         loop {
             if self.halted || self.frames.is_empty() {
                 break;
+            }
+            if let Some((remaining, cancellation_requested)) = limits.as_mut() {
+                if cancellation_requested() {
+                    self.scoped_interrupted = true;
+                    return Err("CoreVM execution cancelled".to_string());
+                }
+                if *remaining == 0 {
+                    self.scoped_interrupted = true;
+                    return Err("CoreVM instruction budget exhausted".to_string());
+                }
+                *remaining -= 1;
             }
             // Always use the topmost frame for PC/instr fetch
             let top = self.frames.len() - 1;
@@ -709,6 +764,68 @@ mod tests {
     fn assert_int(source: &str, expected: i64) {
         let v = run_core(source).unwrap_or_else(|e| panic!("{source}: {e}"));
         assert_eq!(value_layout::as_int_raw(v), expected, "source: {source}");
+    }
+
+    #[test]
+    fn scoped_instruction_budget_counts_halt_and_rejects_zero_fuel() {
+        let mut module = CodeModule::new("budgeted_core_vm");
+        module.emit(Instruction::new1(OpCode::Const1, 0));
+        module.emit(Instruction::new0(OpCode::Halt));
+        let mut vm = CoreVM::new();
+        let idx = vm.load_module_from_code(&module).unwrap();
+        assert!(vm
+            .run_with_limits(idx, 0, 0, || false)
+            .unwrap_err()
+            .contains("instruction budget exhausted"));
+
+        let mut vm = CoreVM::new();
+        let idx = vm.load_module_from_code(&module).unwrap();
+        assert!(vm
+            .run_with_limits(idx, 0, 1, || false)
+            .unwrap_err()
+            .contains("instruction budget exhausted"));
+
+        let mut vm = CoreVM::new();
+        let idx = vm.load_module_from_code(&module).unwrap();
+        let result = vm.run_with_limits(idx, 0, 2, || false).unwrap();
+        assert_eq!(value_layout::as_int_raw(result), 1);
+    }
+
+    #[test]
+    fn scoped_instruction_budget_stops_an_infinite_bytecode_loop() {
+        let mut module = CodeModule::new("looping_core_vm");
+        module.emit(Instruction::new1(OpCode::Const1, 0));
+        // Offset zero at PC 1 jumps back to PC 1 indefinitely.
+        module.emit(Instruction::new0(OpCode::Jmp));
+        let mut vm = CoreVM::new();
+        let idx = vm.load_module_from_code(&module).unwrap();
+        assert!(vm
+            .run_with_limits(idx, 0, 8, || false)
+            .unwrap_err()
+            .contains("instruction budget exhausted"));
+    }
+
+    #[test]
+    fn scoped_core_vm_cooperatively_cancels_between_instructions() {
+        let mut module = CodeModule::new("cancelled_core_vm");
+        module.emit(Instruction::new1(OpCode::Const1, 0));
+        module.emit(Instruction::new1(OpCode::Const2, 1));
+        module.emit(Instruction::new3(OpCode::IAdd, 0, 1, 0));
+        module.emit(Instruction::new0(OpCode::Halt));
+        let mut vm = CoreVM::new();
+        let idx = vm.load_module_from_code(&module).unwrap();
+        let mut polls = 0;
+        let err = vm
+            .run_with_limits(idx, 0, 16, || {
+                polls += 1;
+                polls == 3
+            })
+            .unwrap_err();
+        assert_eq!(polls, 3);
+        assert!(
+            err.contains("execution cancelled"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
