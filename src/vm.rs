@@ -247,6 +247,14 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
     /// Emit an event in the current actor.  Default is a no-op.
     fn emit_event(&mut self, _event: &str, _args: &[Value]) {}
 
+    /// Fallible durable emission. Runtime-backed callbacks override this and
+    /// propagate journal append/replay conflicts all the way to the VM.
+    /// Legacy callbacks retain source compatibility via the void method.
+    fn try_emit_event(&mut self, event: &str, args: &[Value]) -> Result<(), String> {
+        self.emit_event(event, args);
+        Ok(())
+    }
+
     /// Authorize one foreign-function call before any library is loaded or
     /// symbol resolved. Standalone callbacks retain the historic ambient
     /// behavior; runtime-backed actor callbacks override this and require an
@@ -5240,7 +5248,11 @@ impl VM {
                 let event = self.module_const_string(module_idx, event_idx);
                 let arg_count = instr.op3 as usize;
                 let args: Vec<Value> = (0..arg_count).map(|i| frame.regs[i]).collect();
-                self.actor_callbacks.emit_event(&event, &args);
+                self.actor_callbacks
+                    .try_emit_event(&event, &args)
+                    .map_err(|msg| {
+                        NuError::vm_error(format!("durable emit {event}: {msg}"), Span::default())
+                    })?;
             }
             OpCode::SignalWait => {
                 let name_idx = instr.imm16() as usize;

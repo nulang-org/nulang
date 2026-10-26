@@ -1160,6 +1160,15 @@ impl Runtime {
     }
 
     /// Record an emitted event on an actor. Delegates to the workflow subsystem.
+    pub fn try_emit_event(
+        &mut self,
+        actor_id: u64,
+        event: &str,
+        args: &[crate::vm::Value],
+    ) -> std::io::Result<()> {
+        workflow::try_emit_event(self, actor_id, event, args)
+    }
+
     pub fn emit_event(&mut self, actor_id: u64, event: &str, args: &[crate::vm::Value]) {
         workflow::emit_event(self, actor_id, event, args)
     }

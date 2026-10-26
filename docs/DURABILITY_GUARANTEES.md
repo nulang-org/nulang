@@ -260,3 +260,29 @@ journal; unreadable or malformed present files are errors. A single corrupt
 record invalidates the entire candidate page, even if it falls after the page
 cursor. Storage I/O errors must never be interpreted as proof that no durable
 effect was recorded.
+
+
+### Fail-closed workflow event emission (experimental)
+
+For execution under an actor-backed runtime, `Emit` now uses a fallible
+`ActorVmCallbacks::try_emit_event` callback. Workflow journal append, read and
+replay-identity conflicts are propagated to the bytecode VM as execution
+errors, not merely logged. Runtime staging writes the journal before
+publishing a matching event to the in-memory event log, and reports required
+checkpoint failures. Failed append operations do not consume the replay
+ordinal or expose an uncommitted workflow output.
+
+Compiled emit helpers return a 1/0 commit status rather than void. Native
+Cranelift code checks the result and branches to an early return on failure;
+the existing first-error-wins AOT error slot makes the error visible to the
+AOT driver. Do not perform external work after a failed emit. The legacy void
+`Runtime::emit_event` and `ActorVmCallbacks::emit_event` entry points remain
+for compatibility and are **not** suitable as durable output/delivery
+contracts. The non-workflow EventSourced legacy multi-field append path is
+not an atomic workflow receipt transaction.
+
+This is still **not** an acknowledged outbox. External delivery needs a
+provider-idempotent consumer or a durable Prepared/Completed effect adapter
+with crash-window tests. Complete exact-head CI, optional backend and
+compiler profile validation, and security review before enabling production
+receipt delivery.
