@@ -1,1 +1,4 @@
-{ "exit_code": 0, "stdout": "main-done\nProcessing order\nChecking stock\nCharging payment" }
+{
+  "exit_code": 0,
+  "stdout": "main-done"
+}
