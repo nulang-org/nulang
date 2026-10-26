@@ -256,19 +256,14 @@ fn old_compacted_wal_requires_explicit_retention_bootstrap() {
         FileWal::verify_read_only(root.wal()).unwrap().base_sequence,
         1
     );
-    let mut owner = registry(&db);
-    certify(&mut owner);
-    let wal_before = fs::read(root.wal()).unwrap();
+    // An unverified, default-floor registration is no longer possible.
     assert!(matches!(
-        db.checkpoint_with_retention(&mut owner),
-        Err(WalBackedError::RetentionBootstrapRequired)
+        DurableRetentionRegistry::open(db.retention_registry_path(), 211, 4),
+        Err(nulang::database::retention_store::RegistryError::BootstrapRequired { wal_base: 1 })
     ));
-    assert_eq!(fs::read(root.wal()).unwrap(), wal_before);
-    assert_eq!(owner.minimum_wal_cursor(), 1);
-    // The external operator may reconcile the existing WAL base only after
-    // certifying all detached consumers and their resume positions.
-    owner.reserve_reclaim_through(1, 1).unwrap();
+    let mut owner = db.bootstrap_retention_after_verified_compaction().unwrap();
     assert_eq!(owner.minimum_wal_cursor(), 2);
+    certify(&mut owner);
     db.checkpoint_with_retention(&mut owner).unwrap();
     assert_eq!(
         FileWal::verify_read_only(root.wal()).unwrap().base_sequence,
