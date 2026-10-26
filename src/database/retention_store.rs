@@ -56,6 +56,12 @@ pub enum RegistryError {
     WalAudit(String),
     InvalidReclaimBound,
     ReclaimBlocked(String),
+    ReceiptRequired,
+    InvalidReceipt,
+    DeliveryInFlight,
+    NoDeliveryIntent,
+    DeliveryMismatch,
+    ConflictingReceipt,
     HistoryUnavailable { earliest: u64, requested: u64 },
 }
 
@@ -95,6 +101,20 @@ impl fmt::Display for RegistryError {
             Self::WalAudit(message) => write!(out, "read-only WAL audit failed: {message}"),
             Self::InvalidReclaimBound => out.write_str("invalid or overflowing reclaim watermark"),
             Self::ReclaimBlocked(reason) => write!(out, "retention watermark blocked: {reason}"),
+            Self::ReceiptRequired => {
+                out.write_str("receipt-managed consumer requires two-phase delivery API")
+            }
+            Self::InvalidReceipt => {
+                out.write_str("invalid delivery id or external acknowledgment receipt")
+            }
+            Self::DeliveryInFlight => out.write_str("a prior delivery is still durably pending"),
+            Self::NoDeliveryIntent => out.write_str("no matching persisted delivery intent"),
+            Self::DeliveryMismatch => {
+                out.write_str("delivery id or cursor does not match persisted intent")
+            }
+            Self::ConflictingReceipt => {
+                out.write_str("conflicting or reused delivery acknowledgment")
+            }
             Self::HistoryUnavailable {
                 earliest,
                 requested,
@@ -120,6 +140,7 @@ struct RegistryState {
     minimum_wal_cursor: u64,
     certified: BTreeSet<RetentionClass>,
     pins: BTreeMap<(RetentionClass, String), u64>,
+    receipt_managed: BTreeMap<(RetentionClass, String), ReceiptState>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -135,6 +156,8 @@ struct DiskState {
     minimum_wal_cursor: u64,
     certified: Vec<RetentionClass>,
     pins: Vec<DiskPin>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    receipt_managed: Vec<DiskReceiptConsumer>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -143,6 +166,38 @@ struct DiskPin {
     class: RetentionClass,
     consumer: String,
     next_needed: u64,
+}
+
+/// A durable delivery intent is persisted BEFORE the caller attempts an
+/// external side effect. A crash leaves the previous WAL pin in place.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeliveryIntent {
+    next_needed: u64,
+    delivery_id: String,
+}
+
+/// Last committed acknowledgment is retained to make retries after an
+/// uncertain local fsync idempotent. Receipt bytes never enter registry disk.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommittedReceipt {
+    next_needed: u64,
+    delivery_id: String,
+    receipt_digest: [u8; 32],
+}
+#[derive(Clone, Debug, Default)]
+struct ReceiptState {
+    pending: Option<DeliveryIntent>,
+    committed: Option<CommittedReceipt>,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiskReceiptConsumer {
+    class: RetentionClass,
+    consumer: String,
+    pending: Option<DeliveryIntent>,
+    committed: Option<CommittedReceipt>,
 }
 
 impl RegistryState {
@@ -161,6 +216,16 @@ impl RegistryState {
                     class: *class,
                     consumer: consumer.clone(),
                     next_needed,
+                })
+                .collect(),
+            receipt_managed: self
+                .receipt_managed
+                .iter()
+                .map(|((class, consumer), state)| DiskReceiptConsumer {
+                    class: *class,
+                    consumer: consumer.clone(),
+                    pending: state.pending.clone(),
+                    committed: state.committed.clone(),
                 })
                 .collect(),
         };
@@ -202,7 +267,10 @@ impl RegistryState {
                 "unsupported version or invalid identity",
             ));
         }
-        if disk.pins.len() > MAX_CONSUMERS || disk.certified.len() > 5 {
+        if disk.pins.len() > MAX_CONSUMERS
+            || disk.certified.len() > 5
+            || disk.receipt_managed.len() > MAX_CONSUMERS
+        {
             return Err(RegistryError::Corrupt("invalid pin capacity"));
         }
         let mut certified = BTreeSet::new();
@@ -227,6 +295,44 @@ impl RegistryState {
                 return Err(RegistryError::Corrupt("duplicate consumer pin"));
             }
         }
+        let mut receipt_managed = BTreeMap::new();
+        for entry in disk.receipt_managed {
+            let key = (entry.class, entry.consumer);
+            if key.0 == RetentionClass::Snapshot || !valid_consumer(&key.1) {
+                return Err(RegistryError::Corrupt("invalid receipt-managed consumer"));
+            }
+            let pinned = *pins.get(&key).ok_or(RegistryError::Corrupt(
+                "receipt-managed consumer missing WAL pin",
+            ))?;
+            if let Some(pending) = &entry.pending {
+                if !valid_consumer(&pending.delivery_id) || pending.next_needed <= pinned {
+                    return Err(RegistryError::Corrupt("invalid pending delivery"));
+                }
+            }
+            if let Some(committed) = &entry.committed {
+                if !valid_consumer(&committed.delivery_id)
+                    || committed.next_needed > pinned
+                    || entry
+                        .pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.delivery_id == committed.delivery_id)
+                {
+                    return Err(RegistryError::Corrupt("invalid committed receipt"));
+                }
+            }
+            if receipt_managed
+                .insert(
+                    key,
+                    ReceiptState {
+                        pending: entry.pending,
+                        committed: entry.committed,
+                    },
+                )
+                .is_some()
+            {
+                return Err(RegistryError::Corrupt("duplicate receipt-managed consumer"));
+            }
+        }
         Ok(Self {
             tablet_id: disk.tablet_id,
             epoch: disk.ownership_epoch,
@@ -234,6 +340,7 @@ impl RegistryState {
             minimum_wal_cursor: disk.minimum_wal_cursor,
             certified,
             pins,
+            receipt_managed,
         })
     }
 }
@@ -487,6 +594,7 @@ impl DurableRetentionRegistry {
                     minimum_wal_cursor,
                     certified: BTreeSet::new(),
                     pins: BTreeMap::new(),
+                    receipt_managed: BTreeMap::new(),
                 };
                 let mut file = new_private_file(&path)?;
                 file.write_all(&initial.encode()?)?;
@@ -624,6 +732,182 @@ impl DurableRetentionRegistry {
         self.persist(state)
     }
 
+    /// Atomically enroll a WAL consumer in receipt-gated mode. The pin and
+    /// mode are committed in one registry snapshot. A crash cannot expose an
+    /// unprotected classic registration. All external enrollment and delivery
+    /// issuance must still be coordinated by the caller.
+    pub fn register_receipt_managed(
+        &mut self,
+        class: RetentionClass,
+        consumer: &str,
+        next_needed: u64,
+    ) -> Result<u64, RegistryError> {
+        if self.poisoned {
+            return Err(RegistryError::Poisoned);
+        }
+        if class == RetentionClass::Snapshot || !valid_consumer(consumer) {
+            return Err(RegistryError::InvalidConsumer);
+        }
+        if !valid_cursor(class, next_needed) {
+            return Err(RegistryError::InvalidCursor);
+        }
+        if next_needed < self.state.minimum_wal_cursor {
+            return Err(RegistryError::HistoryUnavailable {
+                earliest: self.state.minimum_wal_cursor,
+                requested: next_needed,
+            });
+        }
+        let key = (class, consumer.to_string());
+        if self.state.pins.contains_key(&key) {
+            return Err(RegistryError::AlreadyRegistered);
+        }
+        if self.state.pins.len() >= MAX_CONSUMERS {
+            return Err(RegistryError::CapacityExceeded);
+        }
+        let mut state = self.state.clone();
+        state.pins.insert(key.clone(), next_needed);
+        state.receipt_managed.insert(key, ReceiptState::default());
+        self.persist(state)
+    }
+
+    /// Stage the exact delivery cursor/id durably BEFORE dispatch. The old pin
+    /// remains in force while the external sink is processing the delivery.
+    /// Retrying the same pending intent is idempotent after process restart.
+    pub fn begin_delivery(
+        &mut self,
+        class: RetentionClass,
+        consumer: &str,
+        next_needed: u64,
+        delivery_id: &str,
+    ) -> Result<u64, RegistryError> {
+        if self.poisoned {
+            return Err(RegistryError::Poisoned);
+        }
+        if !valid_consumer(delivery_id) {
+            return Err(RegistryError::InvalidReceipt);
+        }
+        let key = (class, consumer.to_string());
+        let pinned = *self
+            .state
+            .pins
+            .get(&key)
+            .ok_or(RegistryError::MissingConsumer)?;
+        let track = self
+            .state
+            .receipt_managed
+            .get(&key)
+            .ok_or(RegistryError::ReceiptRequired)?;
+        if next_needed <= pinned {
+            return Err(RegistryError::CursorRegression);
+        }
+        if track
+            .committed
+            .as_ref()
+            .is_some_and(|last| last.delivery_id == delivery_id)
+        {
+            return Err(RegistryError::ConflictingReceipt);
+        }
+        if let Some(pending) = &track.pending {
+            if pending.next_needed == next_needed && pending.delivery_id == delivery_id {
+                return Ok(self.state.revision);
+            }
+            return Err(RegistryError::DeliveryInFlight);
+        }
+        let mut state = self.state.clone();
+        state.receipt_managed.get_mut(&key).unwrap().pending = Some(DeliveryIntent {
+            next_needed,
+            delivery_id: delivery_id.to_owned(),
+        });
+        self.persist(state)
+    }
+
+    /// Read the persisted, *not-yet-acknowledged* intent. An external sink can
+    /// replay this with the same idempotency key after a crash/disconnect.
+    pub fn delivery_intent(
+        &self,
+        class: RetentionClass,
+        consumer: &str,
+    ) -> Result<Option<(u64, String)>, RegistryError> {
+        if self.poisoned {
+            return Err(RegistryError::Poisoned);
+        }
+        let key = (class, consumer.to_string());
+        let track = self
+            .state
+            .receipt_managed
+            .get(&key)
+            .ok_or(RegistryError::ReceiptRequired)?;
+        Ok(track
+            .pending
+            .as_ref()
+            .map(|pending| (pending.next_needed, pending.delivery_id.clone())))
+    }
+
+    /// Commit a downstream acknowledgment *attested by the caller*. The
+    /// caller must obtain this receipt only after the external sink durably
+    /// commits BOTH effect and replay identity. This local registry cannot
+    /// verify remote durability and does not guarantee distributed exactly-once.
+    /// A crash before this snapshot is durable keeps the previous WAL pin;
+    /// retrying with the same external idempotency key is at-least-once safe.
+    pub fn commit_delivery(
+        &mut self,
+        class: RetentionClass,
+        consumer: &str,
+        next_needed: u64,
+        delivery_id: &str,
+        external_receipt: &[u8],
+    ) -> Result<u64, RegistryError> {
+        if self.poisoned {
+            return Err(RegistryError::Poisoned);
+        }
+        if !valid_consumer(delivery_id)
+            || external_receipt.is_empty()
+            || external_receipt.len() > 512
+        {
+            return Err(RegistryError::InvalidReceipt);
+        }
+        let key = (class, consumer.to_owned());
+        let track = self
+            .state
+            .receipt_managed
+            .get(&key)
+            .ok_or(RegistryError::ReceiptRequired)?;
+        let receipt_digest = *blake3::hash(external_receipt).as_bytes();
+        if track.pending.is_none() {
+            if let Some(last) = &track.committed {
+                if last.delivery_id == delivery_id {
+                    if last.next_needed == next_needed && last.receipt_digest == receipt_digest {
+                        return Ok(self.state.revision);
+                    }
+                    return Err(RegistryError::ConflictingReceipt);
+                }
+            }
+            return Err(RegistryError::NoDeliveryIntent);
+        }
+        let pending = track.pending.as_ref().unwrap();
+        if pending.next_needed != next_needed || pending.delivery_id != delivery_id {
+            return Err(RegistryError::DeliveryMismatch);
+        }
+        let pinned = *self
+            .state
+            .pins
+            .get(&key)
+            .ok_or(RegistryError::MissingConsumer)?;
+        if next_needed <= pinned {
+            return Err(RegistryError::CursorRegression);
+        }
+        let mut state = self.state.clone();
+        state.pins.insert(key.clone(), next_needed);
+        let track = state.receipt_managed.get_mut(&key).unwrap();
+        track.pending = None;
+        track.committed = Some(CommittedReceipt {
+            next_needed,
+            delivery_id: delivery_id.to_owned(),
+            receipt_digest,
+        });
+        self.persist(state)
+    }
+
     /// Register before relying on an externally held pin; callers must
     /// atomically coordinate this with creation of that consumer.
     pub fn register(
@@ -678,6 +962,9 @@ impl DurableRetentionRegistry {
             return Err(RegistryError::InvalidCursor);
         }
         let key = (class, consumer.to_string());
+        if self.state.receipt_managed.contains_key(&key) {
+            return Err(RegistryError::ReceiptRequired);
+        }
         let old = *self
             .state
             .pins
@@ -702,6 +989,13 @@ impl DurableRetentionRegistry {
         }
         if !valid_consumer(consumer) {
             return Err(RegistryError::InvalidConsumer);
+        }
+        if self
+            .state
+            .receipt_managed
+            .contains_key(&(class, consumer.to_string()))
+        {
+            return Err(RegistryError::ReceiptRequired);
         }
         let mut state = self.state.clone();
         if state.pins.remove(&(class, consumer.to_string())).is_none() {
