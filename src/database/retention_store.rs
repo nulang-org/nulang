@@ -686,6 +686,11 @@ impl DurableRetentionRegistry {
             && self.state.epoch == epoch
     }
 
+    /// Registry identity used to bind an external transactional sink.
+    pub fn tablet_identity(&self) -> (u64, u64) {
+        (self.state.tablet_id, self.state.epoch)
+    }
+
     pub fn revision(&self) -> u64 {
         self.state.revision
     }

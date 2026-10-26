@@ -6,6 +6,8 @@
 
 pub mod backup;
 pub mod checkpoint;
+#[cfg(feature = "postgres")]
+pub mod consumer_postgres;
 pub mod consumer_sink;
 pub mod owner;
 pub mod retention;
