@@ -114,6 +114,8 @@ pub mod wasmfx_backend;
 pub mod wasmfx_runtime;
 pub mod web;
 pub mod witgen;
+#[cfg(feature = "ureq")]
+pub mod workflow_http_provider;
 pub mod workflow_local_provider;
 pub mod workflow_output;
 pub mod workflow_output_delivery;

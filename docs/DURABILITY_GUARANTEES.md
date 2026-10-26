@@ -351,3 +351,37 @@ transactionally idempotent endpoint, provider-side retention and timeout
 recovery, authorization checks, and cross-node/process failure testing. The
 underlying workflow adapter must continue refusing unauthenticated destinations
 and replay-unsafe ambient network effects.
+
+### Authenticated HTTPS output provider (experimental)
+
+When built with the existing `ureq` feature, the **trusted-host**
+`workflow_http_provider::AuthenticatedWorkflowHttpProvider` can deliver a
+validated `WorkflowOutput` through `deliver_output_with_deduplication` to one
+explicitly approved HTTPS endpoint. It requires an exact lower-case DNS
+hostname chosen by the trusted host, a fixed delivery destination, and a
+secret-supplied bearer token. The endpoint cannot contain credentials, a query
+string, fragment, arbitrary port, or IP literal. Redirects and environment
+proxy discovery are disabled. Connection and response timeouts, a 64 KiB output
+limit and a 4 KiB acceptance receipt limit are enforced. A successful provider
+must reply with HTTP 200/201, an `Idempotency-Key` header equal to the request,
+and a nonempty bounded receipt. Nonacceptance, redirects, mismatched keys,
+oversize receipts, transport errors, and authorization errors are surfaced to
+the coordinator as failures; a Prepared record must be retried with the same
+key. Credential values are never included in adapter error strings.
+
+**The trusted host must authorize the exact destination and the provider's
+hostname**, supply secrets through protected configuration, and restrict
+outbound DNS/egress to prevent a nominally approved domain from resolving to
+internal services. The adapter does not grant a network capability to Nulang
+source code or relax ambient HTTP replay restrictions. It does not infer that
+a generic 200 response constitutes durable provider deduplication. Production
+receivers must authenticate requests, persist key→result receipts and enforce
+same-key/same-request semantics transactionally over the full retry horizon.
+
+Only the internal `#[cfg(test)]` test module can create a localhost plaintext
+HTTP client; the public constructor requires HTTPS. The test receiver combines
+an authenticated local HTTP boundary with the filesystem acceptance provider
+and deliberately drops a response **after** acceptance, proving a retry returns
+the same provider key/result. These tests do not prove public TLS certificate
+validation under a live third-party CA, actual provider production behavior,
+DNS rebinding defenses, or cross-node recovery. Those remain release gates.
