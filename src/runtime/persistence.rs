@@ -2867,6 +2867,108 @@ impl PostgresStore {
 }
 
 #[cfg(feature = "postgres")]
+fn postgres_decode_error(
+    row: &postgres::Row,
+    index: usize,
+    reason: impl std::fmt::Display,
+) -> io::Error {
+    let column = &row.columns()[index];
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "PostgreSQL column '{}' (type {}) cannot be decoded: {reason}",
+            column.name(),
+            column.type_().name()
+        ),
+    )
+}
+
+/// Convert a PostgreSQL value without assuming that narrower wire types are
+/// interchangeable with i64/f64 or that non-NULL columns are always present.
+#[cfg(feature = "postgres")]
+fn postgres_column_json<T>(row: &postgres::Row, index: usize) -> io::Result<serde_json::Value>
+where
+    T: for<'a> postgres::types::FromSql<'a> + serde::Serialize,
+{
+    let value: Option<T> = row
+        .try_get(index)
+        .map_err(|error| postgres_decode_error(row, index, error))?;
+    serde_json::to_value(value).map_err(|error| postgres_decode_error(row, index, error))
+}
+
+#[cfg(feature = "postgres")]
+fn postgres_float_json(
+    row: &postgres::Row,
+    index: usize,
+    is_float4: bool,
+) -> io::Result<serde_json::Value> {
+    let value = if is_float4 {
+        row.try_get::<_, Option<f32>>(index)
+            .map_err(|error| postgres_decode_error(row, index, error))?
+            .map(f64::from)
+    } else {
+        row.try_get::<_, Option<f64>>(index)
+            .map_err(|error| postgres_decode_error(row, index, error))?
+    };
+    match value {
+        None => Ok(serde_json::Value::Null),
+        Some(number) => serde_json::Number::from_f64(number)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| {
+                postgres_decode_error(row, index, "non-finite float cannot be represented in JSON")
+            }),
+    }
+}
+
+/// Fail closed on unknown PostgreSQL types. Mapping a date, decimal, enum,
+/// array or extension value through String::from_sql can panic or truncate
+/// semantics; callers must cast explicitly until an exact codec is installed.
+#[cfg(feature = "postgres")]
+fn postgres_row_json(row: &postgres::Row) -> io::Result<String> {
+    use postgres::types::Type;
+
+    let mut columns = Vec::with_capacity(row.len());
+    for (index, column) in row.columns().iter().enumerate() {
+        let ty = column.type_();
+        let value = if ty == &Type::BOOL {
+            postgres_column_json::<bool>(row, index)?
+        } else if ty == &Type::INT2 {
+            postgres_column_json::<i16>(row, index)?
+        } else if ty == &Type::INT4 {
+            postgres_column_json::<i32>(row, index)?
+        } else if ty == &Type::INT8 {
+            postgres_column_json::<i64>(row, index)?
+        } else if ty == &Type::FLOAT4 {
+            postgres_float_json(row, index, true)?
+        } else if ty == &Type::FLOAT8 {
+            postgres_float_json(row, index, false)?
+        } else if matches!(
+            ty,
+            &Type::TEXT | &Type::VARCHAR | &Type::BPCHAR | &Type::NAME
+        ) {
+            postgres_column_json::<String>(row, index)?
+        } else if ty == &Type::BYTEA {
+            // JSON arrays of unsigned bytes are lossless and require no codec.
+            postgres_column_json::<Vec<u8>>(row, index)?
+        } else if ty == &Type::JSON || ty == &Type::JSONB {
+            postgres_column_json::<serde_json::Value>(row, index)?
+        } else if ty == &Type::UUID {
+            postgres_column_json::<uuid::Uuid>(row, index)?
+        } else {
+            return Err(postgres_decode_error(
+                row,
+                index,
+                "unsupported PostgreSQL type; use an explicit SQL cast or add a typed codec",
+            ));
+        };
+        columns.push(value);
+    }
+
+    serde_json::to_string(&columns)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+#[cfg(feature = "postgres")]
 impl PersistenceStore for PostgresStore {
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
         let state_json = serde_json::to_string(&snapshot.state)
@@ -3178,37 +3280,9 @@ impl PersistenceStore for PostgresStore {
         let rows = conn
             .query(sql, &param_refs)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(rows.len());
         for row in &rows {
-            let mut cols: Vec<serde_json::Value> = Vec::with_capacity(row.len());
-            for i in 0..row.len() {
-                let json_val = match row.columns().get(i).map(|c| c.type_().name()) {
-                    Some("bool") => {
-                        let v: bool = row.get(i);
-                        serde_json::Value::Bool(v)
-                    }
-                    Some("int2") | Some("int4") | Some("int8") => {
-                        let v: i64 = row.get(i);
-                        serde_json::value::Number::from_i128(v as i128)
-                            .map(serde_json::Value::Number)
-                            .unwrap_or(serde_json::Value::Null)
-                    }
-                    Some("float4") | Some("float8") => {
-                        let v: f64 = row.get(i);
-                        serde_json::value::Number::from_f64(v)
-                            .map(serde_json::Value::Number)
-                            .unwrap_or(serde_json::Value::Null)
-                    }
-                    _ => {
-                        let v: String = row.get(i);
-                        serde_json::Value::String(v)
-                    }
-                };
-                cols.push(json_val);
-            }
-            let json = serde_json::to_string(&cols)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            results.push(json);
+            results.push(postgres_row_json(row)?);
         }
         Ok(results)
     }
@@ -3714,7 +3788,15 @@ mod postgres_store_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn pg_url() -> Option<String> {
-        std::env::var("NU_TEST_POSTGRES_URL").ok()
+        let url = std::env::var("NU_TEST_POSTGRES_URL").ok()?;
+        // A fresh PostgreSQL schema can race during concurrent CREATE TABLE
+        // initialization. Initialize it once before independent tests open
+        // their own connections.
+        static INITIALIZED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INITIALIZED.get_or_init(|| {
+            PostgresStore::new(&url).expect("initialize PostgreSQL test schema");
+        });
+        Some(url)
     }
 
     fn fresh_actor_id() -> u64 {
@@ -3879,6 +3961,96 @@ mod postgres_store_tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], "[42,3.14,true]");
+    }
+
+    #[test]
+    fn test_postgres_store_query_preserves_numeric_widths_and_nulls() {
+        let Some(url) = pg_url() else { return };
+        let store = PostgresStore::new(&url).unwrap();
+        let rows = store
+            .query(
+                "SELECT 7::int2, 2147483647::int4, 1234567890123::int8, \
+             1.5::float4, 3.25::float8, TRUE::bool, NULL::int4, NULL::text",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rows[0]).unwrap(),
+            serde_json::json!([
+                7,
+                2147483647_i64,
+                1234567890123_i64,
+                1.5,
+                3.25,
+                true,
+                null,
+                null
+            ])
+        );
+    }
+
+    #[test]
+    fn test_postgres_store_query_preserves_bytea_and_nullable_bytea() {
+        let Some(url) = pg_url() else { return };
+        let store = PostgresStore::new(&url).unwrap();
+        let rows = store
+            .query("SELECT decode('00ff7f', 'hex')::bytea, NULL::bytea", &[])
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rows[0]).unwrap(),
+            serde_json::json!([[0, 255, 127], null])
+        );
+    }
+
+    #[test]
+    fn test_postgres_store_query_preserves_jsonb_and_uuid() {
+        let Some(url) = pg_url() else { return };
+        let store = PostgresStore::new(&url).unwrap();
+        let rows = store
+            .query(
+                r#"SELECT '{"enabled": true, "count": 2}'::jsonb,
+             '00000000-0000-0000-0000-000000000001'::uuid, NULL::jsonb"#,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rows[0]).unwrap(),
+            serde_json::json!([{"enabled": true, "count": 2}, "00000000-0000-0000-0000-000000000001", null])
+        );
+    }
+
+    #[test]
+    fn test_postgres_store_query_rejects_nonfinite_float_instead_of_null() {
+        let Some(url) = pg_url() else { return };
+        let store = PostgresStore::new(&url).unwrap();
+        let attempted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.query("SELECT 'NaN'::float8", &[])
+        }));
+        assert!(attempted.is_ok());
+        let error = attempted.unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("non-finite"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_postgres_store_query_unsupported_types_return_errors_not_panics() {
+        let Some(url) = pg_url() else { return };
+        let store = PostgresStore::new(&url).unwrap();
+        let attempted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.query("SELECT 12.5::numeric", &[])
+        }));
+        assert!(
+            attempted.is_ok(),
+            "query must not panic on a PostgreSQL type mismatch"
+        );
+        let error = attempted.unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("numeric"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
