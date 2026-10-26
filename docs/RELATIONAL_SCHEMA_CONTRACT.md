@@ -106,3 +106,36 @@ cargo test --no-default-features --test relational_schema_contract
 Do not confuse the contract fingerprint with
 `semantic_schema::canonical_actor_state_schema_bytes` or the existing
 RFC 0020 behavior manifest; those track different semantics.
+
+
+## SQLite catalog inspection (feature `sqlite`)
+
+`database::sqlite_inspection::inspect_sqlite(&libsql_connection).await` takes an
+existing libsql connection and produces a structurally validated
+`SqliteInspection { schema }`. It does **not** execute DDL, and it binds
+table/index names as values in table-valued PRAGMA queries. The introspector
+captures declared columns and defaults, primary-key ordering, simple named and
+unique indexes, and explicit-target, default-action foreign keys.
+
+The reader rejects unrepresentable views, triggers, virtual/generated columns,
+partial and expression indexes, non-default index collations/ordering, SQLite
+STRICT/WITHOUT ROWID tables, and non-default foreign-key actions, rather than
+silently discarding them. A SQLite schema-version check detects concurrent DDL
+during the read; for stronger snapshot guarantees callers must manage their
+own consistent read transactions.
+
+**No production completeness guarantee.** Not every SQLite semantic has a
+catalog PRAGMA and v0alpha1 intentionally omits CHECK constraints, column
+collation, conflict algorithms and other DDL constructs. Therefore
+`inspection.coverage_is_complete()` is always false and
+`inspection.require_complete()` always fails. Its fingerprint covers only
+the represented subset. Do not use it to approve migrations/deployments.
+
+Focused integration test:
+
+```sh
+cargo test --no-default-features --features sqlite --test sqlite_catalog_inspection
+```
+
+The PostgreSQL adapter, full catalog coverage, migration planner and Nulang
+Cloud deployment gate are separate follow-up work.
