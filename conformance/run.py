@@ -24,7 +24,14 @@ for file in os.listdir("conformance/behavior"):
     with open(json_path) as f:
         expected = json.load(f)
         
-    res = subprocess.run([nulang_bin, nula_path], capture_output=True, text=True)
+    capabilities = expected.get("capabilities", [])
+    if not isinstance(capabilities, list) or not all(c in ("fs", "net", "os") for c in capabilities):
+        raise ValueError(f"Invalid capabilities in {json_path}: {capabilities!r}")
+    command = [nulang_bin]
+    if capabilities:
+        command += ["--with", ",".join(capabilities)]
+    command.append(nula_path)
+    res = subprocess.run(command, capture_output=True, text=True)
     out = res.stdout.strip()
     err = res.stderr.strip()
     code = res.returncode

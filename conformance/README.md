@@ -9,3 +9,7 @@ conforming Nulang implementation.
 - `behavior/`: End-to-end execution cases (`.nula` + expected `.json` output).
 
 Run with `./run.py`.
+
+Cases that deliberately exercise gated effects can specify `"capabilities": ["fs"]`
+in their expected-output JSON. `run.py` forwards the listed grants via `--with`.
+Cases without this field receive no additional resource capabilities.

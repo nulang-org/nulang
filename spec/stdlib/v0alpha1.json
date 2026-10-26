@@ -16,6 +16,13 @@
       "description": "Numeric helpers including abs, min, max, clamp, pow, factorial, gcd, and sqrt."
     },
     {
+      "name": "bytes",
+      "import": "stdlib::bytes",
+      "source": "src/stdlib/bytes.nula",
+      "stability": "experimental",
+      "description": "Bounded in-memory binary readers and writers with explicit Result errors."
+    },
+    {
       "name": "list",
       "import": "stdlib::list",
       "source": "src/stdlib/list.nula",
@@ -89,7 +96,7 @@
         "path": "packages/json/src/lib.nula",
         "replacement_preamble": [
           "// Package: `json` (official seed package, registry tier: Experimental).",
-          "// Standalone port of `src/stdlib/json.nula` — generated from the stdlib source.",
+          "// Standalone port of `src/stdlib/json.nula` \u2014 generated from the stdlib source.",
           "// Consume with: `import lib` (or via `nula add json`)."
         ]
       }
