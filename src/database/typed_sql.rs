@@ -5,9 +5,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use super::schema_contract::{
-    RelationalSchema, SchemaColumn, SchemaDialect, SchemaTable,
-};
+use super::schema_contract::{RelationalSchema, SchemaColumn, SchemaDialect, SchemaTable};
 
 pub const MAX_SELECT_LIMIT: u32 = 1000;
 
@@ -123,10 +121,7 @@ pub fn prepare_select(
                 } else {
                     "IS NOT NULL"
                 };
-                sql.push_str(&format!(
-                    " WHERE {} {op}",
-                    quote_identifier(&field.name)?
-                ));
+                sql.push_str(&format!(" WHERE {} {op}", quote_identifier(&field.name)?));
             }
         }
     }
@@ -135,11 +130,18 @@ pub fn prepare_select(
         placeholder(schema.dialect, parameters.len() + 1)
     ));
     parameters.push(SqlParameter::Integer(i64::from(spec.limit)));
-    Ok(PreparedSelect { sql, parameters, projection })
+    Ok(PreparedSelect {
+        sql,
+        parameters,
+        projection,
+    })
 }
 
 fn find_table<'a>(schema: &'a RelationalSchema, name: &str) -> Option<&'a SchemaTable> {
-    schema.tables.iter().find(|t| names_match(schema.dialect, &t.name, name))
+    schema
+        .tables
+        .iter()
+        .find(|t| names_match(schema.dialect, &t.name, name))
 }
 
 fn find_column<'a>(
@@ -147,7 +149,10 @@ fn find_column<'a>(
     table: &'a SchemaTable,
     name: &str,
 ) -> Option<&'a SchemaColumn> {
-    table.columns.iter().find(|c| names_match(dialect, &c.name, name))
+    table
+        .columns
+        .iter()
+        .find(|c| names_match(dialect, &c.name, name))
 }
 
 fn names_match(dialect: SchemaDialect, actual: &str, requested: &str) -> bool {
@@ -164,7 +169,8 @@ fn quote_table(table: &str) -> Result<String, TypedSqlError> {
     if parts.len() > 2 {
         return Err(fail("ambiguous table identity: more than two segments"));
     }
-    parts.into_iter()
+    parts
+        .into_iter()
         .map(quote_identifier)
         .collect::<Result<Vec<_>, _>>()
         .map(|names| names.join("."))
@@ -191,11 +197,25 @@ fn verify_value(
 ) -> Result<(), TypedSqlError> {
     let ty = column.sql_type.trim().to_ascii_lowercase();
     let valid = match (dialect, ty.as_str(), value) {
-        (SchemaDialect::Postgres, "integer" | "int" | "int4" | "bigint" | "int8", SqlParameter::Integer(_)) => true,
-        (SchemaDialect::Postgres, "smallint" | "int2", SqlParameter::Integer(v)) => i16::try_from(*v).is_ok(),
-        (SchemaDialect::Postgres, "text" | "character varying" | "varchar", SqlParameter::Text(_)) => true,
+        (
+            SchemaDialect::Postgres,
+            "integer" | "int" | "int4" | "bigint" | "int8",
+            SqlParameter::Integer(_),
+        ) => true,
+        (SchemaDialect::Postgres, "smallint" | "int2", SqlParameter::Integer(v)) => {
+            i16::try_from(*v).is_ok()
+        }
+        (
+            SchemaDialect::Postgres,
+            "text" | "character varying" | "varchar",
+            SqlParameter::Text(_),
+        ) => true,
         (SchemaDialect::Postgres, "boolean" | "bool", SqlParameter::Boolean(_)) => true,
-        (SchemaDialect::Postgres, "double precision" | "float8" | "real" | "float4", SqlParameter::Real(v)) => v.is_finite(),
+        (
+            SchemaDialect::Postgres,
+            "double precision" | "float8" | "real" | "float4",
+            SqlParameter::Real(v),
+        ) => v.is_finite(),
         (SchemaDialect::Postgres, "bytea", SqlParameter::Bytes(_)) => true,
         (SchemaDialect::Sqlite, "integer" | "int", SqlParameter::Integer(_)) => true,
         (SchemaDialect::Sqlite, "text", SqlParameter::Text(_)) => true,
