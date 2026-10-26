@@ -1,9 +1,7 @@
 use nulang::database::schema_contract::{
     RelationalSchema, SchemaColumn, SchemaDialect, SchemaTable, RELATIONAL_SCHEMA_VERSION,
 };
-use nulang::database::typed_sql::{
-    prepare_select, SelectSpec, SqlParameter, SqlPredicate,
-};
+use nulang::database::typed_sql::{prepare_select, SelectSpec, SqlParameter, SqlPredicate};
 
 fn users(dialect: SchemaDialect) -> RelationalSchema {
     RelationalSchema {
@@ -16,10 +14,35 @@ fn users(dialect: SchemaDialect) -> RelationalSchema {
             }
             .into(),
             columns: vec![
-                SchemaColumn { name: "id".into(), sql_type: "integer".into(), nullable: false, default_sql: None },
-                SchemaColumn { name: "email".into(), sql_type: "text".into(), nullable: false, default_sql: None },
-                SchemaColumn { name: "active".into(), sql_type: if dialect == SchemaDialect::Postgres { "boolean" } else { "INTEGER" }.into(), nullable: false, default_sql: None },
-                SchemaColumn { name: "nickname".into(), sql_type: "text".into(), nullable: true, default_sql: None },
+                SchemaColumn {
+                    name: "id".into(),
+                    sql_type: "integer".into(),
+                    nullable: false,
+                    default_sql: None,
+                },
+                SchemaColumn {
+                    name: "email".into(),
+                    sql_type: "text".into(),
+                    nullable: false,
+                    default_sql: None,
+                },
+                SchemaColumn {
+                    name: "active".into(),
+                    sql_type: if dialect == SchemaDialect::Postgres {
+                        "boolean"
+                    } else {
+                        "INTEGER"
+                    }
+                    .into(),
+                    nullable: false,
+                    default_sql: None,
+                },
+                SchemaColumn {
+                    name: "nickname".into(),
+                    sql_type: "text".into(),
+                    nullable: true,
+                    default_sql: None,
+                },
             ],
             primary_key: vec!["id".into()],
             indexes: vec![],
@@ -47,7 +70,10 @@ fn postgres_select_quotes_identifiers_and_binds_filter_and_limit() {
     );
     assert_eq!(
         plan.parameters,
-        vec![SqlParameter::Text("x' OR 1=1--".into()), SqlParameter::Integer(25)]
+        vec![
+            SqlParameter::Text("x' OR 1=1--".into()),
+            SqlParameter::Integer(25)
+        ]
     );
     assert_eq!(plan.projection.len(), 2);
     assert!(plan.projection[1].nullable);
@@ -57,15 +83,19 @@ fn postgres_select_quotes_identifiers_and_binds_filter_and_limit() {
 #[test]
 fn sqlite_select_uses_indexed_placeholders() {
     let schema = users(SchemaDialect::Sqlite);
-    let plan = prepare_select(&schema, &SelectSpec {
-        table: "users".into(),
-        columns: vec!["email".into()],
-        predicate: Some(SqlPredicate::Eq {
-            column: "id".into(),
-            value: SqlParameter::Integer(17),
-        }),
-        limit: 1,
-    }).unwrap();
+    let plan = prepare_select(
+        &schema,
+        &SelectSpec {
+            table: "users".into(),
+            columns: vec!["email".into()],
+            predicate: Some(SqlPredicate::Eq {
+                column: "id".into(),
+                value: SqlParameter::Integer(17),
+            }),
+            limit: 1,
+        },
+    )
+    .unwrap();
     assert_eq!(
         plan.sql,
         r#"SELECT "email" FROM "users" WHERE "id" = ?1 LIMIT ?2"#
@@ -76,13 +106,22 @@ fn sqlite_select_uses_indexed_placeholders() {
 #[test]
 fn null_predicates_have_no_value_parameter_and_preserve_projection_nullability() {
     let schema = users(SchemaDialect::Postgres);
-    let plan = prepare_select(&schema, &SelectSpec {
-        table: "public.users".into(),
-        columns: vec!["nickname".into()],
-        predicate: Some(SqlPredicate::IsNull { column: "nickname".into() }),
-        limit: 5,
-    }).unwrap();
-    assert_eq!(plan.sql, r#"SELECT "nickname" FROM "public"."users" WHERE "nickname" IS NULL LIMIT $1"#);
+    let plan = prepare_select(
+        &schema,
+        &SelectSpec {
+            table: "public.users".into(),
+            columns: vec!["nickname".into()],
+            predicate: Some(SqlPredicate::IsNull {
+                column: "nickname".into(),
+            }),
+            limit: 5,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        plan.sql,
+        r#"SELECT "nickname" FROM "public"."users" WHERE "nickname" IS NULL LIMIT $1"#
+    );
     assert_eq!(plan.parameters, vec![SqlParameter::Integer(5)]);
     assert!(plan.projection[0].nullable);
 }
@@ -103,7 +142,9 @@ fn unknown_tables_and_fields_fail_closed() {
     assert!(prepare_select(&schema, &spec).is_err());
 
     spec.columns = vec!["id".into()];
-    spec.predicate = Some(SqlPredicate::IsNotNull { column: "missing".into() });
+    spec.predicate = Some(SqlPredicate::IsNotNull {
+        column: "missing".into(),
+    });
     assert!(prepare_select(&schema, &spec).is_err());
 }
 
@@ -158,12 +199,16 @@ fn bounded_select_only_and_duplicate_projection_rejection() {
 #[test]
 fn sqlite_identifier_case_resolution_is_correct() {
     let schema = users(SchemaDialect::Sqlite);
-    let plan = prepare_select(&schema, &SelectSpec {
-        table: "USERS".into(),
-        columns: vec!["EMAIL".into()],
-        predicate: None,
-        limit: 10,
-    }).unwrap();
+    let plan = prepare_select(
+        &schema,
+        &SelectSpec {
+            table: "USERS".into(),
+            columns: vec!["EMAIL".into()],
+            predicate: None,
+            limit: 10,
+        },
+    )
+    .unwrap();
     assert_eq!(plan.sql, r#"SELECT "email" FROM "users" LIMIT ?1"#);
 }
 
@@ -176,12 +221,16 @@ fn malicious_column_names_are_quoted_not_executed() {
         nullable: false,
         default_sql: None,
     });
-    let plan = prepare_select(&schema, &SelectSpec {
-        table: "public.users".into(),
-        columns: vec!["x\"; DROP TABLE users; --".into()],
-        predicate: None,
-        limit: 1,
-    }).unwrap();
+    let plan = prepare_select(
+        &schema,
+        &SelectSpec {
+            table: "public.users".into(),
+            columns: vec!["x\"; DROP TABLE users; --".into()],
+            predicate: None,
+            limit: 1,
+        },
+    )
+    .unwrap();
     assert_eq!(
         plan.sql,
         r#"SELECT "x""; DROP TABLE users; --" FROM "public"."users" LIMIT $1"#
@@ -193,10 +242,14 @@ fn malicious_column_names_are_quoted_not_executed() {
 fn schema_unknown_or_invalid_metadata_cannot_prepare_queries() {
     let mut schema = users(SchemaDialect::Postgres);
     schema.version = "nulang.relational-schema/v99".into();
-    assert!(prepare_select(&schema, &SelectSpec {
-        table: "public.users".into(),
-        columns: vec!["id".into()],
-        predicate: None,
-        limit: 1,
-    }).is_err());
+    assert!(prepare_select(
+        &schema,
+        &SelectSpec {
+            table: "public.users".into(),
+            columns: vec!["id".into()],
+            predicate: None,
+            limit: 1,
+        }
+    )
+    .is_err());
 }
