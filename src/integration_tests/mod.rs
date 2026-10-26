@@ -61,6 +61,19 @@ mod tests {
         fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
             self.0.lock().unwrap().read_workflow_events(actor_id)
         }
+        // Forward the audited fallible read contract. Without this override,
+        // the default Unsupported error aborts each strict workflow Emit and
+        // prevents the step's subsequent state mutation and recovery.
+        fn try_read_workflow_events(&self, actor_id: u64) -> std::io::Result<Vec<WorkflowEvent>> {
+            self.0
+                .lock()
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "shared workflow test store lock poisoned: {error}"
+                    ))
+                })?
+                .try_read_workflow_events(actor_id)
+        }
         fn clear(&mut self, actor_id: u64) -> std::io::Result<()> {
             self.0.lock().unwrap().clear(actor_id)
         }
@@ -70,6 +83,36 @@ mod tests {
         fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
             self.0.lock().unwrap().read_events(actor_id)
         }
+    }
+
+    #[test]
+    fn test_shared_memory_workflow_store_implements_fallible_read_contract() {
+        let mut store = SharedMemoryStore::new();
+        assert!(store.try_read_workflow_events(17).unwrap().is_empty());
+        store
+            .append_workflow_event(
+                17,
+                WorkflowEvent::Custom {
+                    sequence: 1,
+                    replay_id: None,
+                    name: "Recorded".to_string(),
+                    args: vec![],
+                },
+            )
+            .unwrap();
+        assert_eq!(store.try_read_workflow_events(17).unwrap().len(), 1);
+
+        // A poisoned lock is a read error, never proof of an empty journal.
+        let poisoned = store.0.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("inject shared-memory store poison");
+        })
+        .join();
+        assert_eq!(
+            store.try_read_workflow_events(17).unwrap_err().kind(),
+            std::io::ErrorKind::Other
+        );
     }
 
     // -----------------------------------------------------------------------
