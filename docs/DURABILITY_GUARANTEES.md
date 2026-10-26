@@ -317,3 +317,37 @@ local journaling alone. The currently supported contract is provider-enforced
 **effectively-once deduplicated delivery**. Provider receipts and request
 identities must be retained for at least the workflow's retry horizon; new
 provider integrations require a separate security and replay review.
+
+### Concrete local acceptance provider (integration reference only)
+
+`workflow_local_provider::LocalAcceptanceProvider` is a real on-disk,
+key-to-result **acceptance ledger** for exercising the verified output-delivery
+adapter. It atomically accepts a 64-character lowercase durable-effect key,
+exact destination and bounded output bytes. Acceptance is **only the durable
+local receipt**; no HTTP request, email, charge, or remote side effect occurs.
+A subsequent call with the same key and request returns identical receipt
+bytes, including after a fresh provider instance opens the same directory.
+Using the same key for another destination or payload is rejected rather than
+silently performing new work.
+
+Records are versioned and include the destination, payload digest, operation
+key and deterministic unkeyed integrity checksum (not an authentication proof). Each new record is completely written
+and fsynced in a temporary file before an atomic, create-if-absent hard link
+publishes its key. The directory is then synced before success is returned;
+existing valid receipts are read back and the directory synced on retries.
+Competing threads/processes may safely race to publish the same key on a
+trusted **local filesystem implementing POSIX hard-link and fsync semantics**.
+A corrupt or malformed published record fails closed. Temporary files are
+cleaned on normal errors; a process killed mid-write may leave an unreferenced
+`.pending-*` file requiring supervised cleanup. The reference store is not
+supported on untrusted directories or remote/network filesystems with unknown
+atomicity and durability behavior.
+
+This is a concrete provider **simulator** demonstrating provider-side receipt
+persistence and deduplication, not a deployable webhook/payment service. Its
+side effect and idempotency record are deliberately the *same atomic object*;
+a production provider performing a separate external action needs an actual
+transactionally idempotent endpoint, provider-side retention and timeout
+recovery, authorization checks, and cross-node/process failure testing. The
+underlying workflow adapter must continue refusing unauthenticated destinations
+and replay-unsafe ambient network effects.
