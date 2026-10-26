@@ -11,8 +11,18 @@ fn fixture() -> RelationalSchema {
             SchemaTable {
                 name: "public.users".into(),
                 columns: vec![
-                    SchemaColumn { name: "id".into(), sql_type: "uuid".into(), nullable: false, default_sql: None },
-                    SchemaColumn { name: "email".into(), sql_type: "text".into(), nullable: false, default_sql: None },
+                    SchemaColumn {
+                        name: "id".into(),
+                        sql_type: "uuid".into(),
+                        nullable: false,
+                        default_sql: None,
+                    },
+                    SchemaColumn {
+                        name: "email".into(),
+                        sql_type: "text".into(),
+                        nullable: false,
+                        default_sql: None,
+                    },
                 ],
                 primary_key: vec!["id".into()],
                 indexes: vec![Index {
@@ -25,8 +35,18 @@ fn fixture() -> RelationalSchema {
             SchemaTable {
                 name: "public.orders".into(),
                 columns: vec![
-                    SchemaColumn { name: "id".into(), sql_type: "uuid".into(), nullable: false, default_sql: None },
-                    SchemaColumn { name: "user_id".into(), sql_type: "uuid".into(), nullable: false, default_sql: None },
+                    SchemaColumn {
+                        name: "id".into(),
+                        sql_type: "uuid".into(),
+                        nullable: false,
+                        default_sql: None,
+                    },
+                    SchemaColumn {
+                        name: "user_id".into(),
+                        sql_type: "uuid".into(),
+                        nullable: false,
+                        default_sql: None,
+                    },
                 ],
                 primary_key: vec!["id".into()],
                 indexes: vec![],
@@ -47,7 +67,10 @@ fn order_insensitive_declarations_have_identical_fingerprints() {
     let mut reordered = fixture();
     reordered.tables.reverse();
     reordered.tables[0].columns.reverse();
-    assert_eq!(original.fingerprint().unwrap(), reordered.fingerprint().unwrap());
+    assert_eq!(
+        original.fingerprint().unwrap(),
+        reordered.fingerprint().unwrap()
+    );
     assert_eq!(original.to_json().unwrap(), reordered.to_json().unwrap());
 }
 
@@ -56,15 +79,24 @@ fn schema_changes_invalidate_the_fingerprint() {
     let original = fixture();
     let mut changed = fixture();
     changed.tables[0].columns[1].nullable = true;
-    assert_ne!(original.fingerprint().unwrap(), changed.fingerprint().unwrap());
+    assert_ne!(
+        original.fingerprint().unwrap(),
+        changed.fingerprint().unwrap()
+    );
 
     changed = fixture();
     changed.tables[0].indexes[0].unique = false;
-    assert_ne!(original.fingerprint().unwrap(), changed.fingerprint().unwrap());
+    assert_ne!(
+        original.fingerprint().unwrap(),
+        changed.fingerprint().unwrap()
+    );
 
     changed = fixture();
     changed.tables[1].foreign_keys[0].references_columns = vec!["email".into()];
-    assert_ne!(original.fingerprint().unwrap(), changed.fingerprint().unwrap());
+    assert_ne!(
+        original.fingerprint().unwrap(),
+        changed.fingerprint().unwrap()
+    );
 }
 
 #[test]
@@ -101,7 +133,8 @@ fn unrecognized_contract_versions_and_unknown_fields_fail_closed() {
     schema.version = "nulang.relational-schema/v99".into();
     assert!(schema.validate().is_err());
 
-    let mut json: serde_json::Value = serde_json::from_slice(&fixture().to_json().unwrap()).unwrap();
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&fixture().to_json().unwrap()).unwrap();
     json["unexpected"] = serde_json::json!(true);
     assert!(RelationalSchema::from_json(&serde_json::to_vec(&json).unwrap()).is_err());
 }
@@ -111,9 +144,15 @@ fn fingerprint_and_json_round_trip_are_stable() {
     let original = fixture();
     let encoded = original.to_json().unwrap();
     let decoded = RelationalSchema::from_json(&encoded).unwrap();
-    assert_eq!(original.fingerprint().unwrap(), decoded.fingerprint().unwrap());
+    assert_eq!(
+        original.fingerprint().unwrap(),
+        decoded.fingerprint().unwrap()
+    );
     assert!(decoded.fingerprint().unwrap().starts_with("blake3:"));
-    assert_eq!(decoded.column("public.users", "email").unwrap().sql_type, "text");
+    assert_eq!(
+        decoded.column("public.users", "email").unwrap().sql_type,
+        "text"
+    );
 }
 
 #[test]
