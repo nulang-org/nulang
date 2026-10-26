@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Scoped runtime event-trace conformance — 2026-10-26
+- **Forward-ported the test-only deterministic event-trace conformance harness from draft #1842 onto canonical runtime cancellation and the audited scoped-task integration stack.** Compare the single-thread reference executor with an independent direct `TaskScope` scheduler over identical ordered submissions, bounded admissions, pending/ready/failed polls and explicit cancellation acknowledgements.
+- **Added reproducible seeded scheduling traces** and explicit FIFO, first-failure sibling cancellation, running-child cancellation acknowledgment and queued-work nonexecution checks. This exercises the abstract cooperative state machine only; it does **not** prove independent WASM/VM parity, parallel source `par` or nonblocking host operations.
+
 ### Fail-closed remote libSQL URL admission — 2026-10-26
 - **Ported the remote URL admission contract from draft #2100 onto the audited #2184 TLS connector and #2226 scoped-runtime integration.** Nonloopback plaintext destinations, ambiguous schemes, lookalike loopback hostnames, userinfo, fragments, backslashes and control characters are rejected as `InvalidInput` before constructing a token-bearing client. Numeric IPv4/IPv6 loopback remains available for development; production HTTPS and libsql:// URLs preserve certificate and hostname verification.
 - **Added public regression coverage and module-level accept/reject tests.** No TLS verification policy, remote SQL semantics, security audit policy, or source-level task concurrency is weakened. Authenticated disposable Turso SQL certification remains pending.
