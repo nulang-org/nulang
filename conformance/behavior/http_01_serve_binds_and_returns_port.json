@@ -1,1 +1,7 @@
-{ "exit_code": 0, "stdout": "true\ntrue" }
+{
+  "exit_code": 0,
+  "stdout": "true\ntrue",
+  "capabilities": [
+    "net"
+  ]
+}
