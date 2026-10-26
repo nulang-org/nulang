@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Experimental native scoped-thread host — 2026-10-26
+- **Added opt-in native scoped threads that actually execute concurrently with lexical join-on-return**, using the canonical `TaskScope` admission/cancellation protocol. `max_in_flight` limits simultaneous OS workers, `max_pending` caps the whole submitted batch, and completion results remain in submission order. A failing child cancels queued tasks and signals active siblings; all launched threads are joined before outcomes are returned, including after a child panic.
+- **Added test-first lifetime/concurrency coverage** for worker overlap, borrowed stack state, parent cancellation, first-failure sibling cancellation, queued task nonexecution, early capacity rejection, and draining after panics. Threads are native-only and opt-in; this does not change source-level `par`, the VM/WASM backends, interrupt blocking host calls, or provide durability. Worker cancellation is cooperative.
+
 ### Scoped runtime event-trace conformance — 2026-10-26
 - **Forward-ported the test-only deterministic event-trace conformance harness from draft #1842 onto canonical runtime cancellation and the audited scoped-task integration stack.** Compare the single-thread reference executor with an independent direct `TaskScope` scheduler over identical ordered submissions, bounded admissions, pending/ready/failed polls and explicit cancellation acknowledgements.
 - **Added reproducible seeded scheduling traces** and explicit FIFO, first-failure sibling cancellation, running-child cancellation acknowledgment and queued-work nonexecution checks. This exercises the abstract cooperative state machine only; it does **not** prove independent WASM/VM parity, parallel source `par` or nonblocking host operations.

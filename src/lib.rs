@@ -95,6 +95,8 @@ mod scoped_task_conformance;
 pub mod scoped_task_core_vm;
 pub mod scoped_task_reference;
 pub mod scoped_tasks;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod scoped_thread_host;
 pub mod semantic_identity;
 pub mod semantic_schema;
 pub mod stdlib;
