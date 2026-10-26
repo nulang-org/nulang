@@ -13,7 +13,9 @@
 //! consumer cursor N needs log entries starting at N. Do not use a snapshot
 //! floor as an unconditional "drop versions before S" instruction.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum RetentionClass {
     Snapshot,
     Changefeed,
