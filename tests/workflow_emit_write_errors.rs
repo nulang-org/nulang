@@ -89,6 +89,38 @@ fn workflow_emit_success_is_visible_in_journal_after_commit() {
     assert_eq!(rt.actors[&id].event_log.len(), 1);
 }
 
+#[test]
+fn workflow_emit_rejects_unresolved_payload_instead_of_persisting_nil() {
+    let (mut rt, id) = fresh_workflow();
+    // This is a string-pool reference without an owning module. Legacy
+    // serialization silently converts it into PersistedValue::Nil.
+    let error = rt
+        .try_emit_event(id, "WorkflowOutput", &[Value::string(999)])
+        .expect_err("an unresolved value cannot become a durable nil receipt");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        rt.persistence.read_workflow_events(id).is_empty(),
+        "a rejected output must not enter the durable journal"
+    );
+    assert!(
+        rt.actors[&id].event_log.is_empty(),
+        "a rejected output must not be published in memory"
+    );
+}
+
+#[test]
+fn workflow_emit_preserves_an_explicit_nil_payload() {
+    let (mut rt, id) = fresh_workflow();
+    rt.try_emit_event(id, "WorkflowOutput", &[Value::nil()])
+        .expect("a real nil is a supported durable value");
+    let events = rt.persistence.read_workflow_events(id);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        WorkflowEvent::Custom { name, args, .. }
+            if name == "WorkflowOutput" && args == &vec![PersistedValue::Nil]
+    )));
+}
+
 fn broken_runtime() -> (
     std::rc::Rc<std::cell::RefCell<Runtime>>,
     u64,
