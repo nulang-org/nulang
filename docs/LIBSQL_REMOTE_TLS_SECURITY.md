@@ -15,6 +15,12 @@ Before passing bearer credentials to libSQL, `LibsqlStore::new_remote` validates
 - cargo test --locked --no-default-features --features sqlite --test libsql_remote_url_admission
 - cargo check --locked --all-features
 - cargo audit (without ignore flags)
-- Remote database integration smoke using an authorized HTTPS endpoint
+- `cargo test --locked --no-default-features --features sqlite --test turso_remote_smoke` (runs the fail-closed admission test; the live test stays ignored)
+- Authenticated remote Turso smoke, run **only** against an authorized, dedicated disposable database named `nulang-smoke-*` using HTTPS or `libsql://`:
+  - Provision an isolated database and a short-lived, limited credential; never point the test at production/shared data.
+  - Supply `NULANG_TURSO_E2E_URL`, `NULANG_TURSO_E2E_TOKEN`, and `NULANG_TURSO_E2E_CONFIRM=DISPOSABLE_DB_SCHEMA_CHANGES_OK` as protected environment variables. Do not put tokens on the command line, in a shell history, or in logs.
+  - Execute `cargo test --locked --no-default-features --features sqlite --test turso_remote_smoke -- --ignored --exact authenticated_disposable_turso_snapshot_survives_reconnect` in the authorized environment.
+  - The smoke creates/migrates Nulang tables and writes one unique actor snapshot, drops the client, reconnects, and verifies the value. It intentionally does not delete records; retire the **entire disposable database** through the normal approved teardown process.
+  - Record exact Git SHA, endpoint hostname (no token), pass/fail boundary, and disposable-database retirement evidence. Never claim the remote gate passed without observing this command exit successfully.
 
 Certificate-chain and hostname tests exercise local TLS handshakes and are not substitutes for real remote-database compatibility testing.

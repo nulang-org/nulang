@@ -8,8 +8,11 @@ concurrency:
 on:
   pull_request:
     paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "src/database/**"
       - "tests/nudb_*.rs"
+      - "tests/turso_remote_smoke.rs"
       - "tests/tablet_owner_admission.rs"
       - "benches/database_bench.rs"
       - "benches/bench_main.rs"
@@ -17,8 +20,11 @@ on:
   push:
     branches: [main]
     paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "src/database/**"
       - "tests/nudb_*.rs"
+      - "tests/turso_remote_smoke.rs"
       - "tests/tablet_owner_admission.rs"
       - "benches/database_bench.rs"
       - "benches/bench_main.rs"
