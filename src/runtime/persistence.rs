@@ -691,6 +691,16 @@ pub trait PersistenceStore: Send + Sync {
     /// Read all workflow events for an actor in order.
     fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent>;
 
+    /// Read the complete workflow journal without suppressing storage errors.
+    /// Implementations that have not been audited for fallible reads must
+    /// fail closed rather than reinterpret an I/O failure as an empty history.
+    fn try_read_workflow_events(&self, _actor_id: u64) -> io::Result<Vec<WorkflowEvent>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "fallible workflow journal reads are not implemented for this backend",
+        ))
+    }
+
     /// Append a `TimerSet` workflow event.
     fn append_timer_set(
         &mut self,
@@ -1031,6 +1041,10 @@ impl PersistenceStore for MemoryStore {
             .unwrap_or_default()
     }
 
+    fn try_read_workflow_events(&self, actor_id: u64) -> io::Result<Vec<WorkflowEvent>> {
+        Ok(self.read_workflow_events(actor_id))
+    }
+
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
         self.events.entry(actor_id).or_default().push(entry);
         Ok(())
@@ -1215,6 +1229,30 @@ impl PersistenceStore for JsonFileStore {
         data.lines()
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect()
+    }
+
+    fn try_read_workflow_events(&self, actor_id: u64) -> io::Result<Vec<WorkflowEvent>> {
+        let path = self.workflow_events_path(actor_id);
+        let data = match fs::read_to_string(&path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut events = Vec::new();
+        for (line_index, line) in data.lines().enumerate() {
+            let event = serde_json::from_str::<WorkflowEvent>(line).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid workflow journal record at {} line {}: {error}",
+                        path.display(),
+                        line_index + 1
+                    ),
+                )
+            })?;
+            events.push(event);
+        }
+        Ok(events)
     }
 
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
@@ -2323,6 +2361,42 @@ impl PersistenceStore for LibsqlStore {
         })
     }
 
+    fn try_read_workflow_events(&self, actor_id: u64) -> io::Result<Vec<WorkflowEvent>> {
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut events = Vec::new();
+            for sql in [
+                "SELECT event FROM workflow_events WHERE actor_id = ?1 ORDER BY sequence ASC",
+                "SELECT event FROM durable_workflow_events WHERE actor_id = ?1 ORDER BY sequence ASC, ordinal ASC",
+            ] {
+                let mut rows = conn
+                    .query(sql, libsql::params![actor_id as i64])
+                    .await
+                    .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+                loop {
+                    match rows
+                        .next()
+                        .await
+                        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
+                    {
+                        Some(row) => {
+                            let json: String = row.get(0).map_err(|error| {
+                                io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                            })?;
+                            let event = serde_json::from_str::<WorkflowEvent>(&json).map_err(|error| {
+                                io::Error::new(io::ErrorKind::InvalidData, error)
+                            })?;
+                            events.push(event);
+                        }
+                        None => break,
+                    }
+                }
+            }
+            events.sort_by_key(WorkflowEvent::sequence);
+            Ok(events)
+        })
+    }
+
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
         let args_json = serde_json::to_string(&entry.args)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -2673,6 +2747,26 @@ impl PersistenceStore for RocksDbStore {
             }
         }
         events
+    }
+
+    fn try_read_workflow_events(&self, actor_id: u64) -> io::Result<Vec<WorkflowEvent>> {
+        let cf = self.cf(Self::CF_WORKFLOW_EVENTS)?;
+        let start = Self::actor_seq_key(actor_id, 0);
+        let mut events = Vec::new();
+        for item in self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward),
+        ) {
+            let (key, value) =
+                item.map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+            if key.len() < 8 || key[..8] != Self::actor_key(actor_id) {
+                break;
+            }
+            let event = serde_json::from_slice::<WorkflowEvent>(&value)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            events.push(event);
+        }
+        Ok(events)
     }
 
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
@@ -3039,6 +3133,30 @@ impl PersistenceStore for PostgresStore {
             .filter_map(|row| {
                 let event_json: String = row.get(0);
                 serde_json::from_str(&event_json).ok()
+            })
+            .collect()
+    }
+
+    fn try_read_workflow_events(&self, actor_id: u64) -> io::Result<Vec<WorkflowEvent>> {
+        let mut conn = self.conn.lock().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("PostgreSQL connection lock poisoned: {error}"),
+            )
+        })?;
+        let rows = conn
+            .query(
+                "SELECT event FROM workflow_events WHERE actor_id = $1 ORDER BY sequence ASC",
+                &[&(actor_id as i64)],
+            )
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+        rows.into_iter()
+            .map(|row| {
+                let json: String = row
+                    .try_get(0)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                serde_json::from_str::<WorkflowEvent>(&json)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
             })
             .collect()
     }

@@ -38,6 +38,7 @@ impl WorkflowOutputReceipt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkflowOutputError {
     InvalidLimit,
+    Storage(String),
     InvalidSequence { previous: u64, current: u64 },
     MissingReplayIdentity { sequence: u64 },
     WrongActor { expected: u64, actual: u64 },
@@ -72,7 +73,10 @@ pub fn read_workflow_output_receipts(
     let mut last_sequence = None;
     let mut seen = HashSet::<WorkflowReplayEventId>::new();
     let mut page = Vec::new();
-    for event in store.read_workflow_events(actor_id) {
+    for event in store
+        .try_read_workflow_events(actor_id)
+        .map_err(|error| WorkflowOutputError::Storage(error.to_string()))?
+    {
         let sequence = event.sequence();
         if let Some(previous) = last_sequence {
             if sequence <= previous {

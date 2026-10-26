@@ -242,3 +242,21 @@ mistake the read-only output projection for an end-to-end exactly-once outbox.
 The existing durable-effect coordinator supplies an explicit Prepared/Completed
 state machine for suitably authorized and idempotent provider calls; connecting
 that state machine to live workflow output delivery is a separate release gate.
+
+### Fail-closed workflow journal reads
+
+The workflow-output projection must distinguish an absent journal (no output
+recorded yet) from a journal that could not be read in full. The new
+`PersistenceStore::try_read_workflow_events` returns `io::Result` and is used
+by `read_workflow_output_receipts`, which returns a `Storage` error rather than
+an empty or partial page when a backend read, decoding, or JSON validation
+fails. The fallible path covers the in-memory, JSON-file, libSQL, RocksDB, and
+PostgreSQL stores; any other backend defaults to `Unsupported`, not an unsafe
+success fallback. The legacy infallible reader remains for existing runtime
+callers and is **not** suitable for new receipt/delivery integrations.
+
+The JSON-file backend treats only a genuinely missing events file as an empty
+journal; unreadable or malformed present files are errors. A single corrupt
+record invalidates the entire candidate page, even if it falls after the page
+cursor. Storage I/O errors must never be interpreted as proof that no durable
+effect was recorded.
