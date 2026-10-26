@@ -399,6 +399,16 @@ impl DurableRetentionRegistry {
         }
     }
 
+    /// Returns true only for the canonical registry path and its exact
+    /// tablet owner. The caller must keep this exclusive lock held through
+    /// any WAL reclamation that relies on retention state.
+    pub(crate) fn matches_owner(&self, path: &Path, tablet_id: u64, epoch: u64) -> bool {
+        !self.poisoned
+            && self.path == path
+            && self.state.tablet_id == tablet_id
+            && self.state.epoch == epoch
+    }
+
     pub fn revision(&self) -> u64 {
         self.state.revision
     }
