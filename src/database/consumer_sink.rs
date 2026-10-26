@@ -18,6 +18,7 @@ use super::retention::RetentionClass;
 use super::retention_store::{DurableRetentionRegistry, RegistryError};
 
 const MAGIC: &[u8; 8] = b"NUDBFX01";
+const RETIRED_MAGIC: &[u8; 8] = b"NUDBRT01";
 const MAX_EFFECT_BYTES: usize = 64 * 1024;
 const MAX_RECORD_BYTES: u64 = 1024 * 1024;
 
@@ -30,6 +31,7 @@ pub enum SinkError {
     InvalidDelivery,
     Conflict,
     Corrupt,
+    Retired,
 }
 impl fmt::Display for SinkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -43,6 +45,7 @@ impl fmt::Display for SinkError {
             }
             Self::Conflict => f.write_str("delivery id already contains different durable effect"),
             Self::Corrupt => f.write_str("durable file sink record invalid, incomplete or corrupt"),
+            Self::Retired => f.write_str("local sink consumer permanently retired"),
         }
     }
 }
@@ -67,6 +70,55 @@ struct EffectRecord {
     delivery_id: String,
     next_needed: u64,
     effect: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetirementRecord {
+    version: u8,
+    class: RetentionClass,
+    consumer: String,
+    retirement_id: String,
+    final_cursor: u64,
+}
+
+fn encode_retirement(rec: &RetirementRecord) -> Result<Vec<u8>, SinkError> {
+    let payload = serde_json::to_vec(rec).map_err(|_| SinkError::InvalidDelivery)?;
+    if payload.len() as u64 > MAX_RECORD_BYTES - 44 {
+        return Err(SinkError::InvalidDelivery);
+    }
+    let mut bytes = Vec::with_capacity(payload.len() + 44);
+    bytes.extend_from_slice(RETIRED_MAGIC);
+    bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&payload);
+    bytes.extend_from_slice(blake3::hash(&payload).as_bytes());
+    Ok(bytes)
+}
+fn decode_retirement(bytes: &[u8]) -> Result<RetirementRecord, SinkError> {
+    if bytes.len() < 44 || bytes.len() as u64 > MAX_RECORD_BYTES || &bytes[..8] != RETIRED_MAGIC {
+        return Err(SinkError::Corrupt);
+    }
+    let n = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    if n + 44 != bytes.len() {
+        return Err(SinkError::Corrupt);
+    }
+    let payload = &bytes[12..12 + n];
+    if bytes[12 + n..] != *blake3::hash(payload).as_bytes() {
+        return Err(SinkError::Corrupt);
+    }
+    let record: RetirementRecord =
+        serde_json::from_slice(payload).map_err(|_| SinkError::Corrupt)?;
+    if record.version != 1
+        || !valid_fields(
+            record.class,
+            &record.consumer,
+            &record.retirement_id,
+            record.final_cursor,
+        )
+    {
+        return Err(SinkError::Corrupt);
+    }
+    Ok(record)
 }
 
 fn valid_identifier(s: &str) -> bool {
@@ -192,6 +244,125 @@ impl DurableFileSink {
     /// Name depends only on (class, consumer, id), not requested cursor or
     /// effect: an attempted ID reuse is detected rather than silently routed
     /// to a new file.
+    fn retirement_name(class: RetentionClass, consumer: &str) -> String {
+        let key = serde_json::to_vec(&(class, consumer)).expect("fixed fields");
+        format!("retired-{}.bin", blake3::hash(&key).to_hex())
+    }
+
+    fn read_retirement(
+        &self,
+        class: RetentionClass,
+        consumer: &str,
+    ) -> Result<Option<(RetirementRecord, [u8; 32])>, SinkError> {
+        let path = self.root.join(Self::retirement_name(class, consumer));
+        if !safe_file(&path)? {
+            return Ok(None);
+        }
+        let mut file = File::open(&path)?;
+        if file.metadata()?.len() > MAX_RECORD_BYTES {
+            return Err(SinkError::Corrupt);
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let rec = decode_retirement(&bytes)?;
+        if rec.class != class || rec.consumer != consumer {
+            return Err(SinkError::Corrupt);
+        }
+        file.sync_all()?;
+        sync_directory(&self.root)?;
+        Ok(Some((rec, *blake3::hash(&bytes).as_bytes())))
+    }
+
+    /// Persist an immutable terminal local sink record while the registry
+    /// still retains its WAL pin. If the process dies here, replay closes the
+    /// registry later; if a delivery is in-flight, closure is forbidden.
+    pub fn seal_consumer(
+        &self,
+        registry: &DurableRetentionRegistry,
+        class: RetentionClass,
+        consumer: &str,
+        retirement_id: &str,
+    ) -> Result<[u8; 32], SinkError> {
+        if !valid_fields(class, consumer, retirement_id, 1) {
+            return Err(SinkError::InvalidDelivery);
+        }
+        let final_cursor =
+            if let Some((cursor, prior_id, _)) = registry.consumer_retirement(class, consumer)? {
+                if prior_id != retirement_id {
+                    return Err(SinkError::Conflict);
+                }
+                cursor
+            } else {
+                let pending = registry.delivery_intent(class, consumer)?;
+                if pending.is_some() {
+                    return Err(SinkError::Registry(RegistryError::DeliveryInFlight));
+                }
+                registry
+                    .consumer_cursor(class, consumer)?
+                    .ok_or(SinkError::Registry(RegistryError::MissingConsumer))?
+            };
+        let record = RetirementRecord {
+            version: 1,
+            class,
+            consumer: consumer.to_owned(),
+            retirement_id: retirement_id.to_owned(),
+            final_cursor,
+        };
+        if let Some((prior, receipt)) = self.read_retirement(class, consumer)? {
+            if prior != record {
+                return Err(SinkError::Conflict);
+            }
+            return Ok(receipt);
+        }
+        let bytes = encode_retirement(&record)?;
+        let path = self.root.join(Self::retirement_name(class, consumer));
+        let mut file = match new_private_file(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                let (prior, receipt) = self
+                    .read_retirement(class, consumer)?
+                    .ok_or(SinkError::Corrupt)?;
+                if prior != record {
+                    return Err(SinkError::Conflict);
+                }
+                return Ok(receipt);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        sync_directory(&self.root)?;
+        Ok(*blake3::hash(&bytes).as_bytes())
+    }
+
+    /// Only removes the pin after the sink's terminal marker and its parent
+    /// directory are synced. The registry atomically adds a permanent
+    /// tombstone in the same snapshot as pin removal.
+    pub fn retire_consumer(
+        &self,
+        registry: &mut DurableRetentionRegistry,
+        class: RetentionClass,
+        consumer: &str,
+        retirement_id: &str,
+    ) -> Result<u64, SinkError> {
+        let digest = self.seal_consumer(registry, class, consumer, retirement_id)?;
+        let final_cursor =
+            if let Some((cursor, _, _)) = registry.consumer_retirement(class, consumer)? {
+                cursor
+            } else {
+                registry
+                    .consumer_cursor(class, consumer)?
+                    .ok_or(SinkError::Registry(RegistryError::MissingConsumer))?
+            };
+        Ok(registry.finish_local_retirement(
+            class,
+            consumer,
+            final_cursor,
+            retirement_id,
+            digest,
+        )?)
+    }
+
     pub fn record_name(class: RetentionClass, consumer: &str, delivery_id: &str) -> String {
         let key = serde_json::to_vec(&(class, consumer, delivery_id))
             .expect("serializing a fixed tuple cannot fail");
@@ -239,6 +410,9 @@ impl DurableFileSink {
             || effect.len() > MAX_EFFECT_BYTES
         {
             return Err(SinkError::InvalidDelivery);
+        }
+        if self.read_retirement(class, consumer)?.is_some() {
+            return Err(SinkError::Retired);
         }
         let rec = EffectRecord {
             version: 1,
@@ -311,6 +485,10 @@ impl DurableFileSink {
             || effect.len() > MAX_EFFECT_BYTES
         {
             return Err(SinkError::InvalidDelivery);
+        }
+        // Check the local durable closure BEFORE staging any intent.
+        if self.read_retirement(class, consumer)?.is_some() {
+            return Err(SinkError::Retired);
         }
         registry.begin_delivery(class, consumer, next_needed, delivery_id)?;
         let receipt = self.apply(class, consumer, next_needed, delivery_id, effect)?;
