@@ -1,0 +1,8 @@
+// HTTP is an external effect: a durable workflow must not repeat the call
+// after a crash before an execution receipt is committed.
+workflow UnsafeFetch {
+  step fetch {
+    perform Http.get("http://127.0.0.1:1/")
+  }
+}
+fn main() { nil }

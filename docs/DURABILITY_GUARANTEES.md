@@ -201,3 +201,15 @@ equivalent workload:
 Report semantics separately from speed. A system that completes faster by
 allowing duplicate mutation is not equivalent to one that closes the crash
 window through deduplication.
+
+### HTTP operations on replayed execution paths
+
+Ambient HTTP operations are network effects. They are prohibited in durable
+workflow steps and compensations, persistent actor behaviors, and entity
+replay handlers, just like Net and FS operations. Crash recovery can otherwise
+repeat network operations or observe different responses. Calls to local
+helper functions containing these operations are also checked.
+
+Non-durable HTTP keeps its existing resource-capability requirements. Durable
+external work requires a replay-stable, receipt-backed adapter; ordinary
+HTTP is not safe merely because it appears inside a workflow.

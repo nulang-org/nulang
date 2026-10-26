@@ -1276,7 +1276,7 @@ impl EffectChecker {
 fn is_forbidden_in_durable(effect: &str, op: &str) -> bool {
     match effect {
         "Rand" => true,
-        "Net" | "FS" => true,
+        "Net" | "Http" | "FS" => true,
         "Time" => op != "sleep",
         "IO" => matches!(op, "print" | "println" | "read"),
         _ => false,
