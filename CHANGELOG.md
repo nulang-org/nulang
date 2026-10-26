@@ -1,5 +1,13 @@
 # Nulang Changelog
 
+### Project-relative namespaced import resolution — 2026-10-26
+- **Local imports now resolve `::` segments as directories**, consistent with standard-library module paths. For example, `import subpkg::helper` resolves to `subpkg/helper.nula` relative to the importing source file; slash paths and explicit `.nula` extensions remain supported.
+- **The existing `modimport_13_subdirectory_package` conformance failure now has focused resolver regression tests.** No grammar or frozen format changes are needed; full language-suite and exact-head CI verification are still required.
+
+### Fail-closed language conformance runner — 2026-10-13
+- **Behavioral conformance can no longer report success without executing any cases.** Missing `.json` expectations and orphaned expectations now fail before compiling; fixture discovery is deterministic.
+- **The runner isolates and reports malformed expectations, failed processes, mismatched outputs and per-case timeouts.** Twelve Python regression tests exercise both passing and deliberately failing paths without requiring a Rust toolchain. The separate CI wiring remains in draft PR #1587; these changes do not claim a full Nulang runtime pass.
+
 ### October RustSec dependency remediation (validation pending) — 2026-10-25
 - **Updated Wasmtime 48.0.7, compatible Cranelift/Pulley packages, rustls-webpki 0.103.16, webpki-roots 1.0.10 and ctutils 0.4.4** with Cargo's dependency resolver.
 - **Migrated libSQL remote TLS to a custom connector based on supported rustls 0.23 and tokio-rustls 0.26.** This retains libSQL local/remote behavior, native root certificates, server-name verification and Hyper 0.14 protocol compatibility without pulling unsupported rustls-webpki 0.102.
