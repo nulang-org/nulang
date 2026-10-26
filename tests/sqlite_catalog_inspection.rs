@@ -170,18 +170,29 @@ async fn rejects_unrepresented_foreign_key_actions_and_index_ordering() {
     let conn = connection().await;
     conn.execute_batch(
         "CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT);\
-         CREATE TABLE orders(user_id INTEGER REFERENCES users(id) ON DELETE CASCADE);"
-    ).await.unwrap();
+         CREATE TABLE orders(user_id INTEGER REFERENCES users(id) ON DELETE CASCADE);",
+    )
+    .await
+    .unwrap();
     let error = inspect_sqlite(&conn).await.unwrap_err();
     assert!(error.to_string().contains("action"), "{error}");
 
     conn.execute("DROP TABLE orders", ()).await.unwrap();
-    conn.execute("CREATE INDEX users_email_desc ON users(email DESC)", ()).await.unwrap();
+    conn.execute("CREATE INDEX users_email_desc ON users(email DESC)", ())
+        .await
+        .unwrap();
     let error = inspect_sqlite(&conn).await.unwrap_err();
     assert!(error.to_string().contains("descending"), "{error}");
 
-    conn.execute("DROP INDEX users_email_desc", ()).await.unwrap();
-    conn.execute("CREATE INDEX users_email_nocase ON users(email COLLATE NOCASE)", ()).await.unwrap();
+    conn.execute("DROP INDEX users_email_desc", ())
+        .await
+        .unwrap();
+    conn.execute(
+        "CREATE INDEX users_email_nocase ON users(email COLLATE NOCASE)",
+        (),
+    )
+    .await
+    .unwrap();
     let error = inspect_sqlite(&conn).await.unwrap_err();
     assert!(error.to_string().contains("collation"), "{error}");
 }
@@ -189,12 +200,22 @@ async fn rejects_unrepresented_foreign_key_actions_and_index_ordering() {
 #[tokio::test]
 async fn rejects_strict_and_without_rowid_table_modes() {
     let conn = connection().await;
-    conn.execute("CREATE TABLE strict_users(id INTEGER PRIMARY KEY) STRICT", ()).await.unwrap();
+    conn.execute(
+        "CREATE TABLE strict_users(id INTEGER PRIMARY KEY) STRICT",
+        (),
+    )
+    .await
+    .unwrap();
     let error = inspect_sqlite(&conn).await.unwrap_err();
     assert!(error.to_string().contains("STRICT"), "{error}");
 
     conn.execute("DROP TABLE strict_users", ()).await.unwrap();
-    conn.execute("CREATE TABLE no_rowid(id TEXT PRIMARY KEY) WITHOUT ROWID", ()).await.unwrap();
+    conn.execute(
+        "CREATE TABLE no_rowid(id TEXT PRIMARY KEY) WITHOUT ROWID",
+        (),
+    )
+    .await
+    .unwrap();
     let error = inspect_sqlite(&conn).await.unwrap_err();
     assert!(error.to_string().contains("WITHOUT ROWID"), "{error}");
 }
@@ -202,7 +223,9 @@ async fn rejects_strict_and_without_rowid_table_modes() {
 #[tokio::test]
 async fn does_not_hide_user_tables_whose_names_start_with_sqlite_but_not_sqlite_underscore() {
     let conn = connection().await;
-    conn.execute("CREATE TABLE sqlitearchive(id INTEGER)", ()).await.unwrap();
+    conn.execute("CREATE TABLE sqlitearchive(id INTEGER)", ())
+        .await
+        .unwrap();
     let inspection = inspect_sqlite(&conn).await.unwrap();
     assert!(inspection.schema.column("sqlitearchive", "id").is_some());
 }
