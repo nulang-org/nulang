@@ -1,4 +1,23 @@
 # Nulang Changelog
+### One-shot bounded CoreVM lexical join — 2026-10-26
+- **Added a finite, synchronous CoreVM child-scope runner** on top of the existing coordinator and per-instruction fuel budget. Admission occurs before any child execution; pending submissions, active admission count, and each child’s instruction budget are explicit bounds.
+- **Join is completed before returning successful outcomes**: separate CoreVM instances run admitted children to terminal states; the first failure cancels remaining siblings; outcomes remain in submission order. Over-capacity admission fails before running any child.
+- **Added test-first public integration checks** for successful multi-tick joining, failed-child sibling cancellation, pre-canceled parents, capacity errors and empty scopes. This is a cooperative one-shot reference path, **not parallel `par`, source-syntax integration, or a guaranteed preemption of blocking host instructions**.
+
+### Portable CoreVM scoped execution limits — 2026-10-26
+- **Ported opt-in CoreVM instruction fuel and cancellation checks from draft #1985** to the canonical scoped-task stack. `CoreVM::run_with_limits` checks before each bytecode instruction, with `Halt` charged one unit and zero fuel executing no instructions. Existing unrestricted `CoreVM::run` remains the default, including for the browser playground.
+- **Added a one-shot scoped CoreVM adapter** that consumes the scope's read-only cancellation view, reports termination only after bounded VM execution returns, maps cancellation to `TaskPoll::Cancelled`, and reports fuel exhaustion as a terminal error so sibling work is cancelled. Interrupted VM state is not resumable; no parallel source `par`, durable cancellation, or preemption of long-running effects is claimed.
+- **Added test-first public regressions** for fuel, infinite loops, mid-execution cancellation, cancellation acknowledgment before scope closure, and ordered child outcomes.
+
+### Experimental bounded scoped tasks — 2026-10-26
+- **Ported the executor-neutral scoped-task admission coordinator and deterministic reference runner from the draft #1838/#1847/#1841 stack.** Bounded FIFO queues and running-child counts, sticky failure/parent/deadline cancellation, explicit termination acknowledgements, and ordered joins remain Experimental; no source-level `par` change.
+- **Unified cancellation with PR #2216's canonical runtime token.** A read-only `TaskCancellation` view prevents children from cancelling the owning scope; parent cancellation and deadlines propagate through the existing token. `try_join` retains running-child ownership on `NotQuiescent`, while a successful join closes admission. Drop requests cooperative cancellation but cannot synchronously terminate running work.
+- **Added public-API regression tests** for inherited cancellation/deadline, bounded admission, first-child failure, safe join, and deterministic result order. No production parallel scheduler or WASM semantics are claimed.
+
+### Experimental scoped cancellation — 2026-10-26
+- **Ported the transient, executor-neutral cancellation token from draft PR #1705 onto current `main`.** Clones share cancellation, child scopes observe ancestor requests and inherit the earliest monotonic deadline, and independent siblings remain unaffected by child cancellation. Cancellation is idempotent and thread-safe.
+- **Added public-API contract tests** for parent/child propagation, deterministic deadline boundaries, handle lifetime, and concurrent first-cancel races. This does not interrupt actors or implement structured task joins, durable cancellation, or concurrent `par` execution.
+
 
 ### October RustSec dependency remediation (validation pending) — 2026-10-25
 - **Updated Wasmtime 48.0.7, compatible Cranelift/Pulley packages, rustls-webpki 0.103.16, webpki-roots 1.0.10 and ctutils 0.4.4** with Cargo's dependency resolver.
