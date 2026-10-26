@@ -109,5 +109,28 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(runner.run_suite(self.executable, fixtures, self.directory, timeout_seconds=0.05), (0, 1))
 
 
+    def test_each_case_gets_a_fresh_persistence_store(self):
+        import os
+        fixtures = [
+            *self.fixture("good", {"stdout": "hello"}),
+            *self.fixture("another", {"stdout": "hello"}),
+        ]
+        before = os.environ.get("NULANG_STORE_PATH")
+        paths = []
+
+        def capture_run(args, **kwargs):
+            store = Path(kwargs["env"]["NULANG_STORE_PATH"])
+            self.assertTrue(store.is_dir())
+            paths.append(str(store))
+            return runner.subprocess.CompletedProcess(args, 0, "hello", "")
+
+        with mock.patch.object(runner.subprocess, "run", side_effect=capture_run):
+            self.assertEqual(runner.run_suite(self.executable, fixtures, self.directory), (2, 0))
+
+        self.assertEqual(len(set(paths)), 2)
+        self.assertTrue(all(not Path(path).exists() for path in paths))
+        self.assertEqual(os.environ.get("NULANG_STORE_PATH"), before)
+
+
 if __name__ == "__main__":
     unittest.main()

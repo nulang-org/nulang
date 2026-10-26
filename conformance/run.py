@@ -7,6 +7,8 @@ building Rust so its discovery/runner contracts can be unit tested cheaply.
 """
 
 import json
+import os
+import tempfile
 from pathlib import Path
 import subprocess
 import sys
@@ -62,13 +64,20 @@ def run_suite(nulang_binary, fixtures, working_dir, timeout_seconds=60):
     for source, specification in fixtures:
         try:
             exp_code, exp_out, exp_err = load_expectation(specification)
-            result = subprocess.run(
-                [str(nulang_binary), str(source)],
-                cwd=working_dir,
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-            )
+            # Each fixture runs as a separate program with a fresh durable
+            # state directory. Reusing the CLI default `.nulang/store` silently
+            # changes the output of persistent-entity fixtures across runs.
+            with tempfile.TemporaryDirectory(prefix="nulang-conformance-") as store:
+                env = os.environ.copy()
+                env["NULANG_STORE_PATH"] = store
+                result = subprocess.run(
+                    [str(nulang_binary), str(source)],
+                    cwd=working_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_seconds,
+                    env=env,
+                )
         except (ValueError, OSError, json.JSONDecodeError) as exc:
             print(f"FAIL: {source.name} (invalid fixture or execution: {exc})")
             failed += 1

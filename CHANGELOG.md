@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Isolated durable state for language conformance fixtures — 2026-10-26
+- **Each behavior fixture now receives a fresh temporary `NULANG_STORE_PATH`**, avoiding false failures and nondeterminism caused by persisted entity state from earlier runs. State survives for the duration of that one fixture but is never shared with other cases.
+- **A regression asserts unique per-case stores, cleanup and preservation of the parent environment.** The focused runner suite passes 13/13 tests and the broader Python test suite passes 77/77. Actual language conformance still has unrelated failures; this is not a waiver.
+
 ### Fail-closed language conformance runner — 2026-10-13
 - **Behavioral conformance can no longer report success without executing any cases.** Missing `.json` expectations and orphaned expectations now fail before compiling; fixture discovery is deterministic.
 - **The runner isolates and reports malformed expectations, failed processes, mismatched outputs and per-case timeouts.** Twelve Python regression tests exercise both passing and deliberately failing paths without requiring a Rust toolchain. The separate CI wiring remains in draft PR #1587; these changes do not claim a full Nulang runtime pass.
