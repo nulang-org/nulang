@@ -6,7 +6,7 @@
 //! destination and actor before invoking the durable delivery coordinator.
 
 use std::io::{self, Error, ErrorKind, Read};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 const MAX_RESPONSE_BYTES: usize = 4096;
@@ -49,21 +49,36 @@ impl AuthenticatedWorkflowHttpProvider {
         {
             return Err(invalid("endpoint path may not contain query or fragment"));
         }
-        Self::build(endpoint, destination, bearer_token)
+        Self::build(endpoint, destination, bearer_token, Some(trusted_host))
     }
 
-    fn build(endpoint: &str, destination: &str, bearer_token: &str) -> io::Result<Self> {
+    fn build(
+        endpoint: &str,
+        destination: &str,
+        bearer_token: &str,
+        trusted_host: Option<&str>,
+    ) -> io::Result<Self> {
         if !valid_header_value(destination, 2048) || !valid_bearer_token(bearer_token) {
             return Err(invalid("invalid destination or bearer credential"));
         }
-        let agent = ureq::AgentBuilder::new()
+        let builder = ureq::AgentBuilder::new()
             .redirects(0)
             .try_proxy_from_env(false)
             .timeout_connect(Duration::from_secs(2))
             .timeout_read(Duration::from_secs(5))
             .timeout_write(Duration::from_secs(5))
-            .timeout(Duration::from_secs(10))
-            .build();
+            .timeout(Duration::from_secs(10));
+        // Validate the actual socket addresses returned *at connection time*.
+        // Resolving ahead of the request would allow DNS rebinding between
+        // validation and connection. The TLS URL keeps the original host for
+        // certificate and SNI checks.
+        let builder = match trusted_host {
+            Some(host) => builder.resolver(PublicDnsResolver {
+                trusted_host: host.to_string(),
+            }),
+            None => builder, // private test-only loopback constructor
+        };
+        let agent = builder.build();
         Ok(Self {
             endpoint: endpoint.to_string(),
             destination: destination.to_string(),
@@ -154,8 +169,90 @@ impl AuthenticatedWorkflowHttpProvider {
         if !addr.ip().is_loopback() {
             return Err(invalid("test-only HTTP must bind loopback"));
         }
-        Self::build(endpoint, destination, token)
+        Self::build(endpoint, destination, token, None)
     }
+}
+
+/// Fail-closed DNS resolver for a single preapproved public HTTPS origin.
+/// All returned addresses must be eligible, not just the first candidate.
+/// TLS still validates the original hostname when the HTTP client connects.
+struct PublicDnsResolver {
+    trusted_host: String,
+}
+
+impl ureq::Resolver for PublicDnsResolver {
+    fn resolve(&self, netloc: &str) -> io::Result<Vec<SocketAddr>> {
+        let answers = netloc.to_socket_addrs()?.collect();
+        validate_dns_answers(netloc, &self.trusted_host, answers)
+    }
+}
+
+fn validate_dns_answers(
+    netloc: &str,
+    trusted_host: &str,
+    answers: Vec<SocketAddr>,
+) -> io::Result<Vec<SocketAddr>> {
+    // The connector is pinned to HTTPS/443 with redirects and proxies off.
+    // Reject any attempt to resolve an alternate hostname or port, including
+    // unexpectedly requested netlocs from future HTTP-client changes.
+    if netloc != format!("{trusted_host}:443") || answers.is_empty() {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "outbound DNS origin not approved",
+        ));
+    }
+    if answers
+        .iter()
+        .any(|address| address.port() != 443 || !public_address(address.ip()))
+    {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "outbound DNS returned a restricted address",
+        ));
+    }
+    Ok(answers)
+}
+
+fn public_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(value) => public_ipv4(value),
+        IpAddr::V6(value) => public_ipv6(value),
+    }
+}
+
+fn public_ipv4(address: Ipv4Addr) -> bool {
+    let [a, b, c, _] = address.octets();
+    // Deny IANA special-purpose, private, loopback, link-local, shared,
+    // documentation, benchmark, broadcast, reserved and multicast ranges.
+    if a == 0
+        || a == 10
+        || a == 127
+        || a >= 224
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 168)
+        || (a == 192 && b == 0 && (c == 0 || c == 2))
+        || (a == 192 && b == 88 && c == 99)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+    {
+        return false;
+    }
+    true
+}
+
+fn public_ipv6(address: Ipv6Addr) -> bool {
+    // Accept native globally scoped unicast only. Block documentation and
+    // transition/special-purpose ranges even when under 2000::/3. In
+    // particular, 6to4 could tunnel an embedded private IPv4 address.
+    let segments = address.segments();
+    let first = segments[0];
+    first & 0xe000 == 0x2000
+        && !(first == 0x2001 && (segments[1] <= 0x01ff || segments[1] == 0x0db8))
+        && first != 0x2002 // 6to4 transition addresses
+        && first != 0x3fff // documentation range
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -310,6 +407,73 @@ mod tests {
         stream.write_all(headers.as_bytes())?;
         stream.write_all(body)?;
         stream.flush()
+    }
+
+    #[test]
+    fn production_dns_resolver_fails_closed_on_internal_or_mixed_answers() {
+        use std::net::SocketAddr;
+        fn addr(value: &str) -> SocketAddr {
+            value.parse().unwrap()
+        }
+        let public = vec![addr("8.8.8.8:443"), addr("[2606:4700:4700::1111]:443")];
+        assert_eq!(
+            validate_dns_answers(
+                "events.example.com:443",
+                "events.example.com",
+                public.clone()
+            )
+            .unwrap(),
+            public
+        );
+        assert!(
+            validate_dns_answers("events.example.com:443", "events.example.com", vec![]).is_err()
+        );
+        assert!(
+            validate_dns_answers("evil.example.com:443", "events.example.com", public.clone())
+                .is_err()
+        );
+        assert!(validate_dns_answers(
+            "events.example.com:80",
+            "events.example.com",
+            public.clone()
+        )
+        .is_err());
+        assert!(validate_dns_answers(
+            "events.example.com:443",
+            "events.example.com",
+            vec![public[0], addr("127.0.0.1:443")]
+        )
+        .is_err());
+        for private in [
+            "0.0.0.0:443",
+            "10.0.0.2:443",
+            "127.0.0.1:443",
+            "169.254.169.254:443",
+            "172.16.2.5:443",
+            "192.168.1.1:443",
+            "100.64.0.1:443",
+            "192.0.2.3:443",
+            "198.18.0.1:443",
+            "203.0.113.10:443",
+            "224.0.0.1:443",
+            "[::1]:443",
+            "[fd00::1]:443",
+            "[fe80::1]:443",
+            "[::ffff:127.0.0.1]:443",
+            "[2001:db8::1]:443",
+            "[2002:c0a8:0101::1]:443",
+            "[3fff::1]:443",
+        ] {
+            assert!(
+                validate_dns_answers(
+                    "events.example.com:443",
+                    "events.example.com",
+                    vec![addr(private)]
+                )
+                .is_err(),
+                "unexpected accepted address {private}"
+            );
+        }
     }
 
     #[test]
