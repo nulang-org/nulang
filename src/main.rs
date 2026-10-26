@@ -2003,6 +2003,7 @@ fn run_source(
                 if let Some(dir) = store_dir.as_deref() {
                     install_persistence_store(&mut rt, dir)?;
                 }
+                install_application_database_from_env(&mut rt)?;
                 if let Some(port) = metrics_port {
                     let _ = rt.enable_metrics_server(port);
                 }
@@ -2247,6 +2248,34 @@ fn install_persistence_store(runtime: &mut nulang::runtime::Runtime, uri: &str) 
     }
 }
 
+/// Application SQL uses separately configured credentials. Never inherit
+/// the actor journal/snapshot credentials from NULANG_STORE_PATH.
+fn install_application_database_from_env(runtime: &mut nulang::runtime::Runtime) -> NuResult<()> {
+    let url = match std::env::var("NULANG_APP_POSTGRES_URL") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => return Ok(()),
+    };
+    #[cfg(feature = "postgres")]
+    {
+        let db = nulang::runtime::PostgresApplicationDatabase::connect(&url).map_err(|_| {
+            NuError::RuntimeError {
+                msg: "failed to connect to NULANG_APP_POSTGRES_URL".to_string(),
+                span: Span::default(),
+            }
+        })?;
+        runtime.set_application_database(Box::new(db));
+        Ok(())
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        let _ = (runtime, url);
+        Err(NuError::RuntimeError {
+            msg: "NULANG_APP_POSTGRES_URL requires --features postgres".to_string(),
+            span: Span::default(),
+        })
+    }
+}
+
 /// Execute a module that declares actors against a real `Runtime`.
 ///
 /// The top-level code runs on a VM with runtime-backed callbacks (so
@@ -2279,6 +2308,7 @@ fn run_with_runtime(
             }
         }
         for shard in &mut shards {
+            install_application_database_from_env(shard)?;
             shard.register_module_grains(&m);
         }
         let remaining = shards.split_off(1);
@@ -2330,6 +2360,7 @@ fn run_with_runtime(
         if let Some(dir) = store_dir {
             install_persistence_store(&mut runtime.borrow_mut(), dir)?;
         }
+        install_application_database_from_env(&mut runtime.borrow_mut())?;
         runtime.borrow_mut().register_module_grains(&m);
         let mut vm = VM::new();
         vm.load_module(m);
