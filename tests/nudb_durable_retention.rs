@@ -179,7 +179,7 @@ fn corrupted_or_missing_registry_does_not_silently_become_empty() {
 }
 
 #[test]
-fn accidentally_missing_registry_reinitializes_to_unknown_not_empty_coverage() {
+fn accidentally_missing_registry_with_surviving_lock_is_not_reinitialized() {
     let root = Sandbox::new();
     {
         let mut owner = open(&root);
@@ -189,17 +189,10 @@ fn accidentally_missing_registry_reinitializes_to_unknown_not_empty_coverage() {
             .unwrap();
     }
     fs::remove_file(root.registry()).unwrap();
-    let restarted = open(&root);
-    assert_eq!(restarted.revision(), 0);
-    assert_eq!(
-        restarted.policy().wal_reclaim_bound(Some(7), 7),
-        Err(RetentionBlock::Unknown(vec![
-            RetentionClass::Changefeed,
-            RetentionClass::Backup,
-            RetentionClass::Replica,
-            RetentionClass::Branch,
-        ]))
-    );
+    assert!(matches!(
+        DurableRetentionRegistry::open(root.registry(), 201, 4),
+        Err(RegistryError::MissingRegistry)
+    ));
 }
 
 #[test]
