@@ -210,7 +210,10 @@ fn resolve_path(base: &Path, import: &str) -> PathBuf {
         return resolve_module_path(module);
     }
 
-    let p = Path::new(import);
+    // Project-relative module names use the same `::` segment separator as
+    // stdlib imports; normal slash paths and explicit file extensions still work.
+    let normalized_import = import.replace("::", std::path::MAIN_SEPARATOR_STR);
+    let p = Path::new(&normalized_import);
     let resolved = if p.is_absolute() {
         p.to_path_buf()
     } else {
