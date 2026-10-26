@@ -1,0 +1,1 @@
+{"exit_code":5,"stdout":"","stderr":"effect 'Http.get' is not allowed in durable replay surfaces"}
