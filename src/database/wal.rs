@@ -680,6 +680,27 @@ impl FileWal {
     }
 
     pub fn append_write(&mut self, write: &TabletWrite) -> Result<(), WalError> {
+        self.append_write_internal(write, None)
+    }
+
+    /// Opt-in WAL size admission for one standalone append. The full encoded
+    /// frame must fit the caller-supplied physical byte budget *before* bytes
+    /// are written. Rejection leaves the writer usable and never reclaims
+    /// history or advances the tablet. Callers must apply the same admission
+    /// to ALL their write paths; this is not a persistent database-wide quota.
+    pub fn append_write_with_budget(
+        &mut self,
+        write: &TabletWrite,
+        max_wal_bytes: u64,
+    ) -> Result<(), WalError> {
+        self.append_write_internal(write, Some(max_wal_bytes))
+    }
+
+    fn append_write_internal(
+        &mut self,
+        write: &TabletWrite,
+        max_wal_bytes: Option<u64>,
+    ) -> Result<(), WalError> {
         if self.poisoned {
             return Err(WalError::Poisoned);
         }
@@ -740,6 +761,24 @@ impl FileWal {
         })?;
         let checksum = blake3::hash(&payload);
         let header = encode_frame_header(payload_len);
+
+        if let Some(max_bytes) = max_wal_bytes {
+            let current_bytes = self.file.metadata()?.len();
+            let projected_bytes = current_bytes
+                .checked_add(header.len() as u64)
+                .and_then(|bytes| bytes.checked_add(payload.len() as u64))
+                .and_then(|bytes| bytes.checked_add(checksum.as_bytes().len() as u64))
+                .ok_or(WalError::BudgetExceeded {
+                    max_bytes,
+                    projected_bytes: u64::MAX,
+                })?;
+            if projected_bytes > max_bytes {
+                return Err(WalError::BudgetExceeded {
+                    max_bytes,
+                    projected_bytes,
+                });
+            }
+        }
 
         self.file.seek(SeekFrom::End(0))?;
         self.poisoned = true;
@@ -1180,6 +1219,10 @@ pub enum WalError {
     },
     BatchTooManyRecords(usize),
     BatchTooLarge(usize),
+    BudgetExceeded {
+        max_bytes: u64,
+        projected_bytes: u64,
+    },
     ChecksumMismatch {
         offset: u64,
     },
@@ -1278,6 +1321,13 @@ impl fmt::Display for WalError {
             Self::BatchTooLarge(bytes) => {
                 write!(f, "WAL group commit exceeds staged byte limit ({bytes} bytes)")
             }
+            Self::BudgetExceeded {
+                max_bytes,
+                projected_bytes,
+            } => write!(
+                f,
+                "NuDB WAL append requires {projected_bytes} bytes, above caller budget of {max_bytes} bytes"
+            ),
             Self::ChecksumMismatch { offset } => {
                 write!(f, "WAL checksum mismatch at byte offset {offset}")
             }
