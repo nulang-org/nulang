@@ -158,3 +158,130 @@ fn pinned_consumer_budget_exhaustion_never_checkpoints_or_reclaims_history() {
     let persisted_pins = DurableRetentionRegistry::open(&registry_path, 819, 1).unwrap();
     assert_eq!(persisted_pins.minimum_wal_cursor(), 1);
 }
+
+fn identified(n: u8) -> nulang::database::tablet::TransactionId {
+    nulang::database::tablet::TransactionId::new([n; 16])
+}
+
+fn mutation(value: &[u8]) -> TabletMutation {
+    TabletMutation::Put {
+        key: b"k".to_vec(),
+        value: value.to_vec(),
+    }
+}
+
+#[test]
+fn batch_budget_rejects_all_records_atomically_before_mutating_wal() {
+    use nulang::database::tablet::TabletWrite;
+    let root = TempWal::new();
+    let wal = root.wal();
+    let mut db = WalBackedTablet::open(descriptor(), &wal).unwrap();
+    let writes = vec![
+        TabletWrite::prepare(&descriptor(), 1, 0, 0, vec![mutation(b"one")]).unwrap(),
+        TabletWrite::prepare(&descriptor(), 1, 1, 1, vec![mutation(&vec![b'q'; 2048])]).unwrap(),
+    ];
+    let initial = fs::read(&wal).unwrap();
+    assert!(matches!(
+        db.commit_batch_with_wal_budget(writes.clone(), initial.len() as u64 + 512),
+        Err(WalBackedError::Wal(WalError::BudgetExceeded { .. }))
+    ));
+    assert_eq!(fs::read(&wal).unwrap(), initial);
+    assert_eq!(db.current_sequence(), 0);
+    assert_eq!(db.read_latest(b"k"), None);
+    assert_eq!(
+        db.commit_batch_with_wal_budget(writes, 16 * 1024).unwrap(),
+        2
+    );
+    drop(db);
+    let db = WalBackedTablet::open(descriptor(), &wal).unwrap();
+    assert_eq!(db.read_at(b"k", 1).unwrap(), Some(&b"one"[..]));
+    assert_eq!(db.read_latest(b"k"), Some(&vec![b'q'; 2048][..]));
+}
+
+#[test]
+fn idempotent_single_budget_denial_preserves_receipts_and_retry() {
+    let root = TempWal::new();
+    let wal = root.wal();
+    let mut db = WalBackedTablet::open(descriptor(), &wal).unwrap();
+    let first = vec![mutation(b"first")];
+    let committed = db
+        .commit_idempotent_with_wal_budget(identified(1), first.clone(), 4096)
+        .unwrap();
+    assert_eq!(committed.sequence(), 1);
+    let bytes = fs::read(&wal).unwrap();
+    let denied = db.commit_idempotent_with_wal_budget(
+        identified(2),
+        vec![mutation(b"second")],
+        bytes.len() as u64,
+    );
+    assert!(matches!(
+        denied,
+        Err(WalBackedError::Wal(WalError::BudgetExceeded { .. }))
+    ));
+    assert_eq!(fs::read(&wal).unwrap(), bytes);
+    assert_eq!(db.current_sequence(), 1);
+    assert_eq!(
+        db.commit_idempotent_with_wal_budget(identified(1), first, 0)
+            .unwrap(),
+        committed,
+        "previously durable idempotent retry has no WAL growth"
+    );
+    assert_eq!(
+        db.commit_idempotent_with_wal_budget(identified(2), vec![mutation(b"second")], 8192)
+            .unwrap()
+            .sequence(),
+        2
+    );
+    drop(db);
+    let db = WalBackedTablet::open(descriptor(), &wal).unwrap();
+    assert_eq!(db.current_sequence(), 2);
+    assert_eq!(db.read_at(b"k", 1).unwrap(), Some(&b"first"[..]));
+}
+
+#[test]
+fn identified_group_budget_denial_keeps_all_new_receipts_absent() {
+    let root = TempWal::new();
+    let wal = root.wal();
+    let mut db = WalBackedTablet::open(descriptor(), &wal).unwrap();
+    let prior = db
+        .commit_idempotent(identified(3), vec![mutation(b"prior")])
+        .unwrap();
+    let bytes = fs::read(&wal).unwrap();
+    let entries = vec![
+        (identified(4), vec![mutation(b"four")]),
+        (identified(3), vec![mutation(b"prior")]),
+        (identified(5), vec![mutation(&vec![b'z'; 2048])]),
+    ];
+    assert!(matches!(
+        db.commit_batch_idempotent_with_wal_budget(entries.clone(), bytes.len() as u64 + 512),
+        Err(WalBackedError::Wal(WalError::BudgetExceeded { .. }))
+    ));
+    assert_eq!(fs::read(&wal).unwrap(), bytes);
+    assert_eq!(db.current_sequence(), 1);
+    let receipts = db
+        .commit_batch_idempotent_with_wal_budget(entries, 16 * 1024)
+        .unwrap();
+    assert_eq!(
+        receipts.iter().map(|r| r.sequence()).collect::<Vec<_>>(),
+        vec![2, 1, 3]
+    );
+    assert_eq!(receipts[1], prior);
+    drop(db);
+    let mut recovered = WalBackedTablet::open(descriptor(), &wal).unwrap();
+    assert_eq!(recovered.current_sequence(), 3);
+    let bytes = fs::read(&wal).unwrap();
+    let replay = recovered
+        .commit_batch_idempotent_with_wal_budget(
+            vec![
+                (identified(4), vec![mutation(b"four")]),
+                (identified(5), vec![mutation(&vec![b'z'; 2048])]),
+            ],
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        replay.iter().map(|r| r.sequence()).collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+    assert_eq!(fs::read(&wal).unwrap(), bytes);
+}
