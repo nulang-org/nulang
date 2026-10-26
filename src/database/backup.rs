@@ -10,6 +10,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
+
 use super::store::{CheckpointWalReport, WalBackedError};
 use super::tablet::TabletDescriptor;
 
@@ -31,6 +33,7 @@ pub enum BackupError {
     RestoreMismatch,
     UnsafeDestination,
     Metadata(String),
+    InvalidBackup(&'static str),
 }
 
 impl From<io::Error> for BackupError {
@@ -56,6 +59,7 @@ impl fmt::Display for BackupError {
                 "backup destination must be a new directory under a trusted non-symlink parent",
             ),
             Self::Metadata(e) => write!(f, "backup manifest serialization failed: {e}"),
+            Self::InvalidBackup(reason) => write!(f, "backup integrity check failed: {reason}"),
         }
     }
 }
@@ -129,6 +133,170 @@ fn copy_with_hash(source: &Path, dest: &Path) -> io::Result<(u64, String)> {
     }
     out.sync_all()?;
     Ok((total, digest.finalize().to_hex().to_string()))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupFileMetadata {
+    bytes: u64,
+    blake3: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OptionalBackupFileMetadata {
+    bytes: Option<u64>,
+    blake3: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupManifest {
+    format: String,
+    sequence: u64,
+    tablet_id: Option<u64>,
+    ownership_epoch: Option<u64>,
+    checkpoint_sequence: Option<u64>,
+    wal: BackupFileMetadata,
+    checkpoint: OptionalBackupFileMetadata,
+    proof: String,
+}
+
+fn require_regular_file(path: &Path) -> Result<u64, BackupError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(BackupError::InvalidBackup("non-regular backup component"));
+    }
+    Ok(metadata.len())
+}
+
+/// Audit an already-completed, immutable, single-tablet local backup without
+/// mutating its WAL, checkpoint, completion marker, or lock sidecars.
+///
+/// Requires a trusted, quiescent local directory. It rejects symlinks in the
+/// supplied directory and immediate components, but is NOT safe against an
+/// attacker concurrently replacing ancestor directories or file entries.
+/// BLAKE3 provides accidental-corruption detection, NOT source authentication:
+/// an attacker able to rewrite files and the marker can forge both.
+/// This checks the captured file hashes, metadata and WAL/checkpoint structure;
+/// it does NOT rerun the capture-time logical state comparison, prove all WAL
+/// and checkpoint overlap, or replace a disposable restore rehearsal.
+pub fn audit_completed_backup_read_only(
+    descriptor: TabletDescriptor,
+    directory: impl AsRef<Path>,
+) -> Result<BackupReceipt, BackupError> {
+    const MAX_MARKER_BYTES: u64 = 16 * 1024;
+    let directory = directory.as_ref();
+    if !fs::symlink_metadata(directory)?.file_type().is_dir() {
+        return Err(BackupError::InvalidBackup(
+            "backup directory is not a real directory",
+        ));
+    }
+
+    let marker_path = directory.join("COMPLETE.json");
+    let marker_len = require_regular_file(&marker_path)?;
+    if marker_len == 0 || marker_len > MAX_MARKER_BYTES {
+        return Err(BackupError::InvalidBackup("invalid completion marker size"));
+    }
+    let mut marker = Vec::with_capacity(marker_len as usize);
+    File::open(&marker_path)?
+        .take(MAX_MARKER_BYTES + 1)
+        .read_to_end(&mut marker)?;
+    if marker.len() as u64 != marker_len {
+        return Err(BackupError::InvalidBackup(
+            "completion marker changed during read",
+        ));
+    }
+    let document: serde_json::Value = serde_json::from_slice(&marker)
+        .map_err(|error| BackupError::Metadata(error.to_string()))?;
+    for name in [
+        "format",
+        "sequence",
+        "tablet_id",
+        "ownership_epoch",
+        "checkpoint_sequence",
+        "wal",
+        "checkpoint",
+        "proof",
+    ] {
+        if document.get(name).is_none() {
+            return Err(BackupError::InvalidBackup(
+                "required manifest field missing",
+            ));
+        }
+    }
+    for name in ["bytes", "blake3"] {
+        if document
+            .get("checkpoint")
+            .and_then(|c| c.get(name))
+            .is_none()
+        {
+            return Err(BackupError::InvalidBackup(
+                "checkpoint manifest field missing",
+            ));
+        }
+    }
+    let manifest: BackupManifest = serde_json::from_value(document)
+        .map_err(|error| BackupError::Metadata(error.to_string()))?;
+    if manifest.format != "NUDBBACKUP1"
+        || manifest.proof != "disposable-full-mvcc-and-receipt-match"
+    {
+        return Err(BackupError::InvalidBackup("unsupported backup manifest"));
+    }
+
+    let wal_path = directory.join("tablet.wal");
+    if require_regular_file(&wal_path)? != manifest.wal.bytes
+        || hash_file(&wal_path)? != (manifest.wal.bytes, manifest.wal.blake3.clone())
+    {
+        return Err(BackupError::InvalidBackup("WAL size or digest mismatch"));
+    }
+
+    let checkpoint_path = directory.join("tablet.checkpoint");
+    let checkpoint = match (
+        manifest.checkpoint.bytes,
+        manifest.checkpoint.blake3.as_ref(),
+    ) {
+        (None, None) => {
+            match fs::symlink_metadata(&checkpoint_path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+                Ok(_) => return Err(BackupError::InvalidBackup("unexpected checkpoint file")),
+            }
+            None
+        }
+        (Some(bytes), Some(digest)) => {
+            if require_regular_file(&checkpoint_path)? != bytes
+                || hash_file(&checkpoint_path)? != (bytes, digest.clone())
+            {
+                return Err(BackupError::InvalidBackup(
+                    "checkpoint size or digest mismatch",
+                ));
+            }
+            Some((bytes, digest.clone()))
+        }
+        _ => return Err(BackupError::InvalidBackup("incomplete checkpoint manifest")),
+    };
+
+    let report =
+        super::store::WalBackedTablet::verify_checkpoint_wal_read_only(descriptor, &wal_path)?;
+    if report.durable_tail != manifest.sequence
+        || report.checkpoint_sequence != manifest.checkpoint_sequence
+        || report.wal.tablet_id.map(|id| id.get()) != manifest.tablet_id
+        || report.wal.last_ownership_epoch != manifest.ownership_epoch
+    {
+        return Err(BackupError::InvalidBackup(
+            "WAL or checkpoint metadata mismatch",
+        ));
+    }
+
+    Ok(BackupReceipt {
+        destination: directory.to_path_buf(),
+        sequence: manifest.sequence,
+        wal_bytes: manifest.wal.bytes,
+        checkpoint_bytes: checkpoint.as_ref().map(|(bytes, _)| *bytes),
+        wal_blake3: manifest.wal.blake3,
+        checkpoint_blake3: checkpoint.map(|(_, digest)| digest),
+    })
 }
 
 /// Capture, restore-proof and publish a new backup directory while the caller
