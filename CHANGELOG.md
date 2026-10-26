@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Experimental parameterized typed SQL read planning — 2026-10-26
+- **Added a schema-validated Rust read-plan builder for PostgreSQL and SQLite.** It produces quoted SQL identifiers, ordered bind parameters, explicit projection metadata, a typed equality/null filter, and a required limit of 1–1,000 rows.
+- **Unsupported query shapes and type mappings fail closed.** This is not a Nulang language compiler integration, execution engine, database introspector, general ORM, authorization layer, or production schema-compatibility guarantee. Focused regression tests cover injection-shaped values, SQL dialect parameters, invalid fields, nullability, and unsupported types.
+
 ### Experimental relational schema contracts — 2026-10-26
 - **Added the `nulang.relational-schema/v0alpha1` Rust metadata contract for PostgreSQL/SQLite table, column, primary-key, index, and foreign-key schemas.** It validates references, rejects unknown contract fields/versions, exports normalized JSON, and computes a domain-separated BLAKE3 fingerprint independent of declaration order.
 - **This is not a general ORM, SQL executor, introspector or migration planner.** Catalog coverage is deliberately incomplete; production drift/deployment gates must not treat this fingerprint as proof of full-schema equivalence. Seven focused contract tests cover determinism and invalid inputs.
