@@ -4,7 +4,7 @@
 
 use nulang::bytecode::{CodeModule, Instruction, OpCode};
 use nulang::runtime::CancellationToken;
-use nulang::scoped_core_vm_threads::run_parallel_core_vm_scope;
+use nulang::scoped_core_vm_threads::{run_parallel_core_vm_scope, ParallelCoreVmError};
 use nulang::scoped_task_core_vm::ScopedCoreVmTask;
 use nulang::scoped_tasks::{ScopeError, TaskOutcome};
 use nulang::scoped_thread_host::ScopedThreadError;
@@ -82,7 +82,9 @@ fn pre_cancelled_parent_never_launches_a_vm() {
     }];
     assert!(matches!(
         run_parallel_core_vm_scope(&tasks, 1, 1, 2, &parent),
-        Err(ScopedThreadError::Scope(ScopeError::Cancelled))
+        Err(ParallelCoreVmError::Worker(ScopedThreadError::Scope(
+            ScopeError::Cancelled
+        )))
     ));
 }
 
@@ -99,11 +101,15 @@ fn capacity_errors_are_detected_before_vm_execution() {
     let parent = CancellationToken::new();
     assert!(matches!(
         run_parallel_core_vm_scope(&tasks, 1, 1, 2, &parent),
-        Err(ScopedThreadError::Scope(ScopeError::QueueFull))
+        Err(ParallelCoreVmError::Worker(ScopedThreadError::Scope(
+            ScopeError::QueueFull
+        )))
     ));
     assert!(matches!(
         run_parallel_core_vm_scope(&tasks, 0, 2, 2, &parent),
-        Err(ScopedThreadError::Scope(ScopeError::ZeroLimit))
+        Err(ParallelCoreVmError::Worker(ScopedThreadError::Scope(
+            ScopeError::ZeroLimit
+        )))
     ));
 }
 
@@ -129,4 +135,74 @@ fn empty_scope_returns_without_worker_launch() {
     let tasks: [ScopedCoreVmTask<'_>; 0] = [];
     let result = run_parallel_core_vm_scope(&tasks, 2, 2, 10, &CancellationToken::new()).unwrap();
     assert!(result.is_empty());
+}
+
+#[test]
+fn disallowed_effects_are_rejected_even_after_an_unreachable_halt() {
+    // The forbidden instruction is unreachable; executing the VM would succeed,
+    // so a failure here proves whole-module validation before worker startup.
+    for forbidden in [
+        OpCode::SPrint,
+        OpCode::SRead,
+        OpCode::FOpen,
+        OpCode::FWrite,
+        OpCode::Print,
+        OpCode::DbgPrint,
+        OpCode::Spawn,
+        OpCode::Send,
+        OpCode::Receive,
+        OpCode::StateSet,
+        OpCode::Perform,
+        OpCode::PerformAsync,
+        OpCode::FFICall,
+        OpCode::PyCall,
+        OpCode::Call,
+        OpCode::Closure,
+        OpCode::Panic,
+    ] {
+        let mut module = one();
+        module.emit(Instruction::new0(forbidden));
+        let tasks = [ScopedCoreVmTask {
+            module: &module,
+            entry_pc: 0,
+        }];
+        let result = run_parallel_core_vm_scope(&tasks, 1, 1, 3, &CancellationToken::new());
+        assert!(
+            matches!(
+                result,
+                Err(ParallelCoreVmError::UnsafeOpcode {
+                    task_index: 0,
+                    instruction_index: 2,
+                    opcode,
+                }) if opcode == forbidden
+            ),
+            "unapproved opcode {forbidden:?} was not rejected at the exact instruction"
+        );
+    }
+}
+
+#[test]
+fn unsafe_later_child_fails_the_whole_batch_before_running_the_first() {
+    let safe = one();
+    let mut forbidden = one();
+    forbidden.emit(Instruction::new0(OpCode::FFICall));
+    let tasks = [
+        ScopedCoreVmTask {
+            module: &safe,
+            entry_pc: 0,
+        },
+        ScopedCoreVmTask {
+            module: &forbidden,
+            entry_pc: 0,
+        },
+    ];
+    let result = run_parallel_core_vm_scope(&tasks, 1, 2, 2, &CancellationToken::new());
+    assert!(matches!(
+        result,
+        Err(ParallelCoreVmError::UnsafeOpcode {
+            task_index: 1,
+            instruction_index: 2,
+            opcode: OpCode::FFICall,
+        })
+    ));
 }

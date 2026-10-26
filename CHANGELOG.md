@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Fail-closed bytecode admission for native parallel CoreVM — 2026-10-26
+- **Reject all unsupported instructions in every submitted CoreVM module before any native worker launches.** Explicitly allow only local register, constant, arithmetic, comparison and branch operations. Calls, effects, I/O, actor messaging, heap mutations, FFI, Python interop and future unrecognized opcodes fail closed, including unreachable instructions. Error reports identify the original task and instruction.
+- **Added test-first public regression coverage** proving a module with an unreachable `SPrint` was previously admitted; all side-effecting opcode categories and later queued modules are now rejected. The existing fuel/cancellation and native thread join guarantees are unchanged. This is conservative bytecode-level screening, not source-level effect-system proof or WASM concurrency.
+
 ### Native parallel CoreVM scoped children — 2026-10-26
 - **Added an opt-in native adapter between bounded scoped OS-thread workers and fuel-limited CoreVM execution.** Each child runs on an isolated fresh VM with instruction-boundary cancellation, bounded concurrency and guaranteed synchronous lexical thread joins. Failure cancels pending children and signals running siblings; outcomes remain in submission order.
 - **Added test-first public integration coverage** for isolated results, exhausted fuel, failure cancellation, parent cancellation, capacity errors and empty scopes. This is not a change to sequential source-language `par` lowering, not a WASM task scheduler, and cannot preempt blocking host operations.
