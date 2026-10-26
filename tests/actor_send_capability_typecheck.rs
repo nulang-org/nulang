@@ -12,7 +12,11 @@ fn compile_actor_send(capability: &str, value: &str) -> Result<(), String> {
         "actor Sink {{ behavior recv(x: Int) {{ perform IO.print(x) }} }}\n\
          fn main() {{ let s = spawn Sink {{}}; let v = {value} :cap {capability}; send s recv(v); unit }}"
     );
-    let lexed = Lexer::new(&src).lex().map_err(|e| e.to_string())?;
+    compile_source(&src)
+}
+
+fn compile_source(src: &str) -> Result<(), String> {
+    let lexed = Lexer::new(src).lex().map_err(|e| e.to_string())?;
     let ast = Parser::new(lexed)
         .parse_module()
         .map_err(|e| e.to_string())?;
@@ -57,4 +61,15 @@ fn forbidden_capabilities_are_rejected_by_capability_checker() {
 fn sender_capability_does_not_erase_payload_type() {
     let err = compile_actor_send("iso", "\"incorrect\"").expect_err("String is not Int");
     assert!(err.starts_with("type:"), "expected type error: {err}");
+}
+
+#[test]
+fn coercing_ref_to_opaque_tag_preserves_payload_type() {
+    // This existing conformance case has two nested capability annotations.
+    // Sending its opaque tag should check the Int payload, not try to unify
+    // &ref Int with the behavior's plain Int parameter.
+    compile_source(include_str!(
+        "../conformance/behavior/cap_10_coerce_ref_to_tag_send.nula"
+    ))
+    .expect("tag attenuation must typecheck and be sendable");
 }

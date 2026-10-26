@@ -3610,10 +3610,19 @@ impl TypeChecker {
             // the capability is legal to transfer across the actor boundary.
             // Do NOT unwrap when the callee explicitly expects a reference or
             // for asks: those calls retain their normal typed-reference rule.
-            let payload_ty = match (&resolved_arg, &resolved_expected) {
-                (Type::Reference { .. }, Type::Reference { .. }) => &resolved_arg,
-                (Type::Reference { inner, .. }, _) if for_send => inner.as_ref(),
-                _ => &resolved_arg,
+            let payload_ty = if for_send && !matches!(resolved_expected, Type::Reference { .. }) {
+                // A value can be attenuated more than once (e.g. ref -> tag).
+                // Peel only ownership wrappers when the behavior expects a
+                // plain payload. The capability pass still checks the outer
+                // transferable capability; explicit reference parameters and
+                // asks retain strict reference-type matching.
+                let mut inner = &resolved_arg;
+                while let Type::Reference { inner: value, .. } = inner {
+                    inner = value.as_ref();
+                }
+                inner
+            } else {
+                &resolved_arg
             };
             let s_match = mgu(payload_ty, &resolved_expected, span)?;
             subst = compose_subst(&s_match, &subst);
