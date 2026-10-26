@@ -6,9 +6,9 @@
 
 pub mod checkpoint;
 pub mod schema_contract;
-pub mod typed_sql;
 pub mod store;
 pub mod tablet;
+pub mod typed_sql;
 pub mod wal;
 
 #[cfg(test)]
