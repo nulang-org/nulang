@@ -41,7 +41,7 @@ pub async fn inspect_sqlite(
     let mut tables = Vec::new();
     let mut catalog = conn.query(
         "SELECT name, type, coalesce(sql, '') FROM sqlite_schema \
-         WHERE name NOT LIKE 'sqlite_%' ORDER BY name",
+         WHERE substr(lower(name), 1, 7) != 'sqlite_' ORDER BY name",
         (),
     ).await.map_err(db_error)?;
 
