@@ -158,7 +158,7 @@ fn required_host_authority(
             }
             other("System", "Arg", Some(index.to_string()))
         }
-        ("DB", Some("query")) => other("DB", "Query", None),
+        ("DB", Some("query" | "query_result")) => other("DB", "Query", None),
         ("Python", Some(op)) if !op.is_empty() => other("Python", op, None),
         ("Provider", Some("ask")) => other("Provider", "Ask", Some(string_arg(0)?)),
         // Inference/LLM asks are runtime-mediated: the node already holds the
@@ -814,27 +814,17 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
             let mut rt = self.runtime.borrow_mut();
             return rt.query_workflow(workflow_id, &query_name);
         }
-        #[cfg(feature = "sqlite")]
-        if effect_name == "DB" && op_name == Some("query") {
-            let sql = match regs.first().and_then(|v| v.as_string_id()) {
-                Some(id) => match constants.get(id as usize) {
-                    Some(crate::bytecode::Constant::String(s)) => s.clone(),
-                    _ => return Some(crate::vm::Value::nil()),
-                },
-                None => return Some(crate::vm::Value::nil()),
+        if effect_name == "DB" && matches!(op_name, Some("query" | "query_result")) {
+            let json = {
+                let rt = self.runtime.borrow();
+                super::application_db::dispatch_application_query(
+                    &rt,
+                    op_name.unwrap_or_default(),
+                    constants,
+                    regs,
+                )
             };
-            let params: Vec<crate::vm::Value> = regs.iter().skip(1).copied().collect();
-            let rt = self.runtime.borrow_mut();
-            let query_result = rt.persistence.query(&sql, &params);
-            drop(rt);
-            let result = match query_result {
-                Ok(rows) => {
-                    let json = serde_json::to_string(&rows).unwrap_or_default();
-                    self.alloc_string(&json)
-                }
-                Err(_) => crate::vm::Value::nil(),
-            };
-            return Some(result);
+            return Some(json.map_or_else(crate::vm::Value::nil, |json| self.alloc_string(&json)));
         }
         if effect_name == "Timer" && op_name == Some("after") {
             let ms = regs.first().and_then(|v| v.as_int()).unwrap_or(0);
@@ -1639,27 +1629,20 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                 };
                 return (*self.runtime).query_workflow(workflow_id, &query_name);
             }
-            #[cfg(feature = "sqlite")]
-            if effect_name == "DB" && op_name == Some("query") {
-                let sql = match regs.first().and_then(|v| v.as_string_id()) {
-                    Some(id) => match constants.get(id as usize) {
-                        Some(crate::bytecode::Constant::String(s)) => s.clone(),
-                        _ => return Some(crate::vm::Value::nil()),
-                    },
-                    None => return Some(crate::vm::Value::nil()),
-                };
-                let params: Vec<crate::vm::Value> = regs.iter().skip(1).copied().collect();
-                return match (*self.runtime).persistence.query(&sql, &params) {
-                    Ok(rows) => {
-                        let json = serde_json::to_string(&rows).unwrap_or_default();
-                        if let Some(vm) = &mut (*self.runtime).vm {
-                            Some(vm.allocate_string(&json))
-                        } else {
-                            Some(crate::vm::Value::nil())
-                        }
-                    }
-                    Err(_) => Some(crate::vm::Value::nil()),
-                };
+            if effect_name == "DB" && matches!(op_name, Some("query" | "query_result")) {
+                let json = super::application_db::dispatch_application_query(
+                    &*self.runtime,
+                    op_name.unwrap_or_default(),
+                    constants,
+                    regs,
+                );
+                return Some(match json {
+                    Some(json) => (*self.runtime)
+                        .vm
+                        .as_mut()
+                        .map_or_else(crate::vm::Value::nil, |vm| vm.allocate_string(&json)),
+                    None => crate::vm::Value::nil(),
+                });
             }
             if effect_name == "Actor" {
                 return (*self.runtime).perform_actor_builtin(
