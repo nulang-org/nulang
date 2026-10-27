@@ -1,9 +1,14 @@
 //! Manual, isolated compatibility gate for replacing libSQL's local SQLite
 //! driver. This does NOT migrate cloud URLs, credentials or production data.
+use nulang::durable_effect::{DurableEffectId, DurableEffectRecord, DurableEffectSpec};
+use nulang::durable_effect_persistence::DurableEffectPersistenceRecord;
+use nulang::primitives::{DeliverySemantics, EffectBoundary};
 use nulang::runtime::{
-    ActorSnapshot, DurableTransition, JournalEntry, LibsqlStore, PersistedValue, PersistenceStore,
+    ActorSnapshot, DurableOutboxMessage, DurableTransition, EventEntry, JournalEntry, LibsqlStore,
+    PersistedValue, PersistenceStore, WorkflowActivationId, WorkflowEvent,
     DURABLE_TRANSITION_VERSION,
 };
+use nulang::semantic_identity::{effect_site_id, EffectSiteOwnerKind};
 use std::{collections::HashMap, error::Error};
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -39,6 +44,23 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Exercise the actual atomic durable-transition/fencing contract before
     // switching readers, rather than synthesizing look-alike SQL rows.
     let durable_actor = 29;
+    let effect_site = effect_site_id(
+        "turso-schema-compat",
+        EffectSiteOwnerKind::Behavior,
+        "MigrationProbe.run",
+        "Provider.ask",
+        0,
+    );
+    let effect_id = DurableEffectId::derive_from_site(durable_actor, "turn:1", effect_site, 0);
+    let effect = DurableEffectPersistenceRecord::from_effect(DurableEffectRecord::prepare(
+        DurableEffectSpec::new(
+            effect_id,
+            "Provider.ask",
+            EffectBoundary::External,
+            DeliverySemantics::AtLeastOnce,
+        ),
+        b"migration-probe-request",
+    ));
     let committed = DurableTransition {
         version: DURABLE_TRANSITION_VERSION,
         actor_id: durable_actor,
@@ -56,10 +78,25 @@ fn main() -> Result<(), Box<dyn Error>> {
             activation_epoch: 7,
             ..ActorSnapshot::default()
         }),
-        workflow_events: vec![],
-        domain_events: vec![],
-        durable_effects: vec![],
-        outbox: vec![],
+        workflow_events: vec![WorkflowEvent::StepCompleted {
+            sequence: 1,
+            activation: Some(WorkflowActivationId::new(durable_actor, 1)),
+            step_name: "step-migrated".to_owned(),
+        }],
+        domain_events: vec![EventEntry {
+            sequence: 1,
+            field_name: "count".to_owned(),
+            event_name: "Incremented".to_owned(),
+            args: vec![PersistedValue::Int(99)],
+            value: PersistedValue::Int(100),
+        }],
+        durable_effects: vec![effect.clone()],
+        outbox: vec![DurableOutboxMessage {
+            destination_actor_id: 30,
+            ordinal: 0,
+            behavior_id: 12,
+            payload: vec![PersistedValue::Int(99)],
+        }],
     };
     {
         let mut legacy = LibsqlStore::new(&db_file)?;
@@ -156,6 +193,79 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
         drop(transitions);
 
+        // Every committed transition component must survive a driver swap,
+        // not just tail metadata. The RED probe failed when these were empty.
+        for table in [
+            "durable_workflow_events",
+            "durable_domain_events",
+            "durable_effect_records",
+            "durable_outbox",
+        ] {
+            let query = format!("SELECT COUNT(*) FROM {table} WHERE actor_id=29 AND sequence=1");
+            let mut rows = conn.query(&query, ()).await?;
+            let count: i64 = rows
+                .next()
+                .await?
+                .ok_or("missing durable row count")?
+                .get(0)?;
+            assert_eq!(count, 1, "Turso lost the committed {table} record");
+        }
+
+        let mut workflow_rows = conn
+            .query(
+                "SELECT ordinal, event FROM durable_workflow_events WHERE actor_id=29 AND sequence=1",
+                (),
+            )
+            .await?;
+        let workflow = workflow_rows.next().await?.ok_or("missing workflow event")?;
+        assert_eq!(workflow.get::<i64>(0)?, 0);
+        let workflow_json: String = workflow.get(1)?;
+        assert!(workflow_json.contains("step-migrated"), "workflow payload drift");
+        drop(workflow_rows);
+
+        let mut domain_rows = conn
+            .query(
+                "SELECT ordinal, event FROM durable_domain_events WHERE actor_id=29 AND sequence=1",
+                (),
+            )
+            .await?;
+        let domain = domain_rows.next().await?.ok_or("missing domain event")?;
+        assert_eq!(domain.get::<i64>(0)?, 0);
+        let domain_json: String = domain.get(1)?;
+        assert!(domain_json.contains("Incremented"), "domain event payload drift");
+        drop(domain_rows);
+
+        let mut effect_rows = conn
+            .query(
+                "SELECT ordinal, record FROM durable_effect_records WHERE actor_id=29 AND sequence=1",
+                (),
+            )
+            .await?;
+        let recorded = effect_rows.next().await?.ok_or("missing durable effect")?;
+        assert_eq!(recorded.get::<i64>(0)?, 0);
+        let effect_json: String = recorded.get(1)?;
+        assert_eq!(
+            DurableEffectPersistenceRecord::from_json(effect_json.as_bytes())?,
+            effect,
+            "durable effect identity/status changed across driver"
+        );
+        drop(effect_rows);
+
+        let mut outbox_rows = conn
+            .query(
+                "SELECT ordinal, destination_actor_id, behavior_id, payload
+                 FROM durable_outbox WHERE actor_id=29 AND sequence=1",
+                (),
+            )
+            .await?;
+        let outgoing = outbox_rows.next().await?.ok_or("missing outbox")?;
+        assert_eq!(outgoing.get::<i64>(0)?, 0);
+        assert_eq!(outgoing.get::<i64>(1)?, 30);
+        assert_eq!(outgoing.get::<i64>(2)?, 12);
+        let outbox_payload: String = outgoing.get(3)?;
+        assert_eq!(outbox_payload, r#"[{"tag":"Int","value":99}]"#);
+        drop(outbox_rows);
+
         let mut journal_rows = conn
             .query(
                 "SELECT payload FROM journal WHERE actor_id=17 AND sequence=1",
@@ -186,6 +296,33 @@ fn main() -> Result<(), Box<dyn Error>> {
             (),
         )
         .await?;
+        // A rollback must discard every sibling effect/event/outbox record;
+        // a tail-only rollback would still leave replay-visible side effects.
+        conn.execute(
+            "INSERT INTO durable_workflow_events (actor_id, sequence, ordinal, event)
+             VALUES (31, 1, 0, 'probe-rollback-only')",
+            (),
+        )
+        .await?;
+        conn.execute(
+            "INSERT INTO durable_domain_events (actor_id, sequence, ordinal, event)
+             VALUES (31, 1, 0, 'probe-rollback-only')",
+            (),
+        )
+        .await?;
+        conn.execute(
+            "INSERT INTO durable_effect_records (actor_id, sequence, ordinal, record)
+             VALUES (31, 1, 0, 'probe-rollback-only')",
+            (),
+        )
+        .await?;
+        conn.execute(
+            "INSERT INTO durable_outbox
+             (actor_id, sequence, ordinal, destination_actor_id, behavior_id, payload)
+             VALUES (31, 1, 0, 32, 9, 'probe-rollback-only')",
+            (),
+        )
+        .await?;
         let injected_failure = conn
             .execute(
                 "INSERT INTO durable_transitions
@@ -197,7 +334,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         assert!(injected_failure.is_err(), "primary-key collision must fail");
         conn.execute("ROLLBACK", ()).await?;
 
-        for table in ["durable_tails", "durable_transitions"] {
+        for table in [
+            "durable_tails",
+            "durable_transitions",
+            "durable_workflow_events",
+            "durable_domain_events",
+            "durable_effect_records",
+            "durable_outbox",
+        ] {
             let query = format!("SELECT COUNT(*) FROM {table} WHERE actor_id=31");
             let mut rows = conn.query(&query, ()).await?;
             let row = rows.next().await?.ok_or("missing count result")?;
@@ -236,6 +380,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         (7, 1)
     );
 
+    assert_eq!(legacy.read_workflow_events(durable_actor).len(), 1);
+    assert_eq!(legacy.read_events(durable_actor).len(), 1);
+    assert_eq!(
+        legacy
+            .load_durable_effect(durable_actor, effect_id)?
+            .ok_or("legacy effect lost")?,
+        effect,
+        "legacy store cannot recover the original durable effect"
+    );
+
     let journal = legacy.read_journal(17);
     assert_eq!(journal.len(), 2);
     assert_eq!(journal[0].sequence, 1);
@@ -243,7 +397,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     assert_eq!(journal[1].behavior_id, 3);
     assert_eq!(journal[1].payload, vec![PersistedValue::Int(10)]);
     println!(
-        "PASS: actual Nulang LibsqlStore <-> Turso snapshot/journal, atomic-tail, and rollback compatibility"
+        "PASS: actual Nulang LibsqlStore <-> Turso snapshot/journal, full transition records, and six-table rollback compatibility"
     );
     Ok(())
 }

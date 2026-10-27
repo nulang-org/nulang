@@ -14,12 +14,16 @@ The test uses the actual production Nulang `LibsqlStore` schema and checks:
 - Original Nulang store writes a snapshot and journal; Turso reads state,
   activation epoch, sequence, and payload; Turso writes another journal row;
   Nulang reopens and reads both records.
-- Nulang commits an actual durable transition. Identical replay succeeds;
-  conflicting retry and stale activation epoch fail. Turso reads the
-  committed tail, predecessor sequence, and complete digest.
-- Turso inserts into two durable tables within an immediate transaction,
-  triggers a duplicate-key error, and rolls back; neither table retains
-  the partial write, and Nulang sees no phantom committed tail.
+- Nulang commits an actual durable transition containing a workflow event,
+  domain event, prepared durable external effect and outbound actor message.
+  Identical replay succeeds; conflicting retry and stale activation epoch
+  fail. Turso reads each real-schema record, checks event ordinals, effect
+  envelope identity and outbound destination/behavior/payload, and reads the
+  committed tail, predecessor sequence and full digest. The original libSQL
+  store can still reopen and recover its workflow/domain/effect records.
+- Turso inserts into all six durable-transition tables within an immediate
+  transaction, triggers a duplicate-key error, and rolls back. All six
+  tables must discard the partial actor-31 write; Nulang sees no phantom tail.
 
 The probe is fully local, uses only disposable SQLite files, and requires
 no credentials, external service, production file, or live database.
@@ -29,6 +33,7 @@ production dependency graph.
 
 **Passing is not permission to migrate.** Multi-process contention,
 crash and power-loss durability, real Turso-backed commit/CAS behavior,
-durable outbox/effects, recovery fencing across restarts, schema/authority
-migration, and remote Turso authentication and transaction semantics
+Turso-native durable commit/CAS, restart and concurrent-owner fencing,
+full actor recovery and workflow/outbox effect delivery semantics,
+schema/authority migration, and remote Turso authentication and transaction semantics
 must pass their own recovery and security gates before any replacement.
