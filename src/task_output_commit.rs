@@ -67,8 +67,12 @@ impl fmt::Display for CommitError {
             Self::EpochExhausted => write!(f, "task attempt fencing epoch exhausted"),
             Self::Fenced => write!(f, "attempt does not own the current task epoch"),
             Self::NotStaged => write!(f, "attempt has no staged result"),
-            Self::StageConflict => write!(f, "attempt output differs from its first staged result"),
-            Self::AlreadyCommitted => write!(f, "logical task already has an authoritative result"),
+            Self::StageConflict => {
+                write!(f, "attempt output differs from its first staged result")
+            }
+            Self::AlreadyCommitted => {
+                write!(f, "logical task already has an authoritative result")
+            }
             Self::InvalidCheckpoint(reason) => write!(f, "invalid task checkpoint: {reason}"),
         }
     }
@@ -125,7 +129,10 @@ impl TaskOutputState {
     /// Explicit ownership transition. A controller must prove prior ownership
     /// was fenced *before* atomically persisting this updated state. Heartbeat
     /// expiry or gossip suspicion alone is insufficient proof of fencing.
-    pub fn assign(&mut self, attempt_id: impl Into<String>) -> Result<AttemptToken, CommitError> {
+    pub fn assign(
+        &mut self,
+        attempt_id: impl Into<String>,
+    ) -> Result<AttemptToken, CommitError> {
         let attempt_id = attempt_id.into();
         if attempt_id.trim().is_empty() {
             return Err(CommitError::InvalidAttemptId);
@@ -147,7 +154,10 @@ impl TaskOutputState {
     }
 
     fn require_owner(&self, token: &AttemptToken) -> Result<(), CommitError> {
-        if self.owner.as_ref() == Some(token) && token.epoch != 0 && token.task_key == self.task_key {
+        if self.owner.as_ref() == Some(token)
+            && token.epoch != 0
+            && token.task_key == self.task_key
+        {
             Ok(())
         } else {
             Err(CommitError::Fenced)
