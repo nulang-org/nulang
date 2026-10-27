@@ -133,3 +133,14 @@ fn an_attempt_token_from_another_task_is_not_authorized() {
         CommitDecision::Won
     );
 }
+
+#[test]
+fn repeated_assignment_for_same_attempt_is_idempotent() {
+    let mut task = TaskOutputState::new("task-7").unwrap();
+    let owner = task.assign("worker-a").unwrap();
+    task.stage(&owner, "immutable/object", [7; 32]).unwrap();
+    let checkpoint = task.checkpoint().unwrap();
+    assert_eq!(task.assign("worker-a").unwrap(), owner);
+    assert_eq!(task.checkpoint().unwrap(), checkpoint);
+    assert_eq!(task.current_epoch(), 1);
+}
