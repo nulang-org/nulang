@@ -1,0 +1,15 @@
+[package]
+name = "nulang-turso-storage-compat"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# The probe must not affect Nulang's production Cargo.lock or CI dependency
+# resolution. Run it explicitly from this directory, never from the root.
+[workspace]
+
+[dependencies]
+nulang = { path = "../..", default-features = false, features = ["sqlite"] }
+turso = { version = "=0.8.3", default-features = false }
+tokio = { version = "1.53", features = ["rt", "time"] }
+tempfile = "3"
