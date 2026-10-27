@@ -250,6 +250,43 @@ impl TaskOutputState {
         Ok(checkpoint.state)
     }
 
+    /// Verify that an untrusted persisted successor could have been produced
+    /// by the task state machine. Epoch fencing in a generic actor journal
+    /// alone cannot prevent a same-epoch attempt-owner substitution.
+    pub(crate) fn validate_successor(&self, next: &Self) -> Result<(), CommitError> {
+        let invalid = |reason: &str| CommitError::InvalidCheckpoint(reason.into());
+        if self.task_key != next.task_key {
+            return Err(invalid("task identity changed across checkpoints"));
+        }
+        if self.committed.is_some() && self.committed != next.committed {
+            return Err(invalid("committed task output was rewritten"));
+        }
+        if next.epoch == self.epoch {
+            if next.owner != self.owner {
+                return Err(invalid("same epoch changed the authorized attempt"));
+            }
+            if self.staged.is_some() && self.staged != next.staged {
+                return Err(invalid("staged task output was rewritten"));
+            }
+            if self == next {
+                return Err(invalid("redundant durable task checkpoint"));
+            }
+        } else if self.epoch.checked_add(1) == Some(next.epoch) {
+            if self.committed.is_some()
+                || next.staged.is_some()
+                || next.committed.is_some()
+                || next.owner.is_none()
+                || self.owner.as_ref().map(|owner| owner.attempt_id.as_str())
+                    == next.owner.as_ref().map(|owner| owner.attempt_id.as_str())
+            {
+                return Err(invalid("invalid task attempt epoch handoff"));
+            }
+        } else {
+            return Err(invalid("task attempt epoch jumped or regressed"));
+        }
+        Ok(())
+    }
+
     fn validate_recovered(&self) -> Result<(), CommitError> {
         let bad = |reason: &str| CommitError::InvalidCheckpoint(reason.into());
         if self.task_key.trim().is_empty() {
