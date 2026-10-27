@@ -15,6 +15,9 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+mod durable_store;
+pub use durable_store::{DurableTaskOutputStore, TaskOutputStoreError};
+
 const CHECKPOINT_VERSION: u16 = 1;
 
 /// The owner assigned by a trusted task controller; the epoch is monotonic
@@ -136,6 +139,11 @@ impl TaskOutputState {
         }
         if self.committed.is_some() {
             return Err(CommitError::AlreadyCommitted);
+        }
+        if let Some(owner) = &self.owner {
+            if owner.attempt_id == attempt_id {
+                return Ok(owner.clone());
+            }
         }
         let next_epoch = self
             .epoch
