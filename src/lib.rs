@@ -91,11 +91,11 @@ pub mod repl;
 pub mod resolver;
 pub mod runtime;
 pub mod semantic_identity;
-pub mod task_output_commit;
 pub mod semantic_schema;
 pub mod stdlib;
 #[cfg(test)]
 pub mod stress_tests;
+pub mod task_output_commit;
 pub mod tool_schema;
 pub mod type_ir;
 pub mod type_metadata;
