@@ -1955,18 +1955,26 @@ mod tests {
             assert_eq!(store.cursor("events", "worker").unwrap(), 0);
 
             store.commit_cursor("events", "worker", 1).unwrap();
-            assert!(store.read_consumer("events", "worker", 10).unwrap().is_empty());
+            assert!(store
+                .read_consumer("events", "worker", 10)
+                .unwrap()
+                .is_empty());
         }
 
         // Restart must not expose the pending tail or skip it with the cursor.
         let mut reopened = FileFabricStreamStore::open(&root).unwrap();
         assert_eq!(reopened.cursor("events", "worker").unwrap(), 1);
-        assert!(reopened.read_consumer("events", "worker", 10).unwrap().is_empty());
+        assert!(reopened
+            .read_consumer("events", "worker", 10)
+            .unwrap()
+            .is_empty());
         reopened.commit_through("events", 2).unwrap();
         let visible = reopened.read_consumer("events", "worker", 10).unwrap();
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].payload, b"pending");
-        let _ = fs::remove_dir_all(root);
+        // Release the store before removing the root so locked stores work on Windows.
+        drop(reopened);
+        fs::remove_dir_all(root).expect("clean up replicated consumer test root");
     }
 
     #[test]
@@ -2008,7 +2016,8 @@ mod tests {
             .commit_cursor("events", "worker", 1)
             .expect_err("an invalid cursor must not be silently retained");
         assert_eq!(commit_error.kind(), io::ErrorKind::InvalidData);
-        let _ = fs::remove_dir_all(root);
+        drop(store);
+        fs::remove_dir_all(root).expect("clean up invalid cursor test root");
     }
 
     #[test]
