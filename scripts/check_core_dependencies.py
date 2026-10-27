@@ -30,7 +30,7 @@ def is_forbidden(name):
 def load_metadata(root):
     command = [
         "cargo", "metadata", "--locked", "--format-version", "1",
-        "--package", "nulang", "--no-default-features",
+        "--no-default-features",
     ]
     result = subprocess.run(
         command, cwd=root, text=True, capture_output=True, check=True,
@@ -110,7 +110,11 @@ def main(argv=None):
             return 1
         print("core boundary: PASS (no forbidden optional subsystems)")
         return 0
-    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as exc:
+    except subprocess.CalledProcessError as exc:
+        details = (exc.stderr or "").strip()
+        print(f"ERROR: cargo metadata failed (exit {exc.returncode}): {details}", file=sys.stderr)
+        return 2
+    except (OSError, ValueError, KeyError) as exc:
         print(f"ERROR: could not verify minimal core dependency boundary: {exc}", file=sys.stderr)
         return 2
 
