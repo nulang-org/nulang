@@ -858,7 +858,8 @@ mod http_redirect_authority_tests {
             stream.write_all(reply.as_bytes()).await.unwrap();
         });
         let forbidden_server = tokio::spawn(async move {
-            let Ok(Ok((mut stream, _))) = timeout(Duration::from_secs(2), forbidden.accept()).await else {
+            let Ok(Ok((mut stream, _))) = timeout(Duration::from_secs(2), forbidden.accept()).await
+            else {
                 return false;
             };
             let mut buf = [0; 1024];
@@ -873,7 +874,10 @@ mod http_redirect_authority_tests {
         let client = ReqwestHttpProvider::new();
         let response = timeout(
             Duration::from_secs(3),
-            client.client.get(format!("http://{allowed_address}/start")).send(),
+            client
+                .client
+                .get(format!("http://{allowed_address}/start"))
+                .send(),
         )
         .await
         .expect("HTTP request should finish")
@@ -884,7 +888,10 @@ mod http_redirect_authority_tests {
             "different-port redirect must not be followed"
         );
         allowed_server.await.unwrap();
-        assert!(!forbidden_server.await.unwrap(), "an unauthorized destination received a request");
+        assert!(
+            !forbidden_server.await.unwrap(),
+            "an unauthorized destination received a request"
+        );
     }
 
     #[tokio::test]
