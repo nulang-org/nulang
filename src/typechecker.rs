@@ -1851,15 +1851,7 @@ impl TypeChecker {
             Expr::App { func, args, span } => self.infer_app(ctx, func, args, *span),
 
             // Let binding: infer value, generalize, extend context, infer body
-            Expr::Let {
-                name,
-                ty,
-                value,
-                body,
-                mutable,
-                span,
-                let_in: _,
-            } => self.infer_let(ctx, name, ty.as_ref(), value, body, *mutable, *span),
+            Expr::Let { .. } => self.infer_let_chain(ctx, expr),
 
             // Let-rec: recursive binding
             Expr::LetRec {
@@ -2463,66 +2455,64 @@ impl TypeChecker {
         Ok((final_subst.clone(), apply_subst(&result_ty, &final_subst)))
     }
 
-    /// Infer the type of a let binding.
-    fn infer_let(
+    /// Infer a chain of nonrecursive let bindings without recursively
+    /// re-entering `infer_expr` for every enclosing let body.
+    ///
+    /// The ordering of generalization, shadowing, and substitution composition
+    /// matches the former recursive `infer_let` implementation. Lambda values
+    /// keep their special self-recursive binding treatment.
+    fn infer_let_chain(
         &mut self,
         ctx: &TypeContext,
-        name: &str,
-        ann: Option<&Type>,
-        value: &Expr,
-        body: &Expr,
-        mutable: bool,
-        _span: Span,
+        first: &Expr,
     ) -> NuResult<(Substitution, Type)> {
-        // For let-bound lambdas that reference themselves (e.g.
-        // `let fac = fn(n) ... fac(n-1) ... in ...`), make the binding name
-        // available inside the lambda body with a fresh type variable.
-        if matches!(value, Expr::Lambda { .. }) {
-            let rec_var = Type::Var(TypeVar::fresh());
-            let ctx_with_rec =
-                ctx.extend(name.to_string(), rec_var.clone(), Capability::Ref, mutable);
-            let (s1, val_ty) = self.infer_expr(&ctx_with_rec, value)?;
-            let s2 = mgu(
-                &apply_subst(&rec_var, &s1),
-                &apply_subst(&val_ty, &s1),
-                Span::default(),
-            )?;
-            let mut s_combined = compose_subst(&s2, &s1);
-            // An explicit annotation must unify with the inferred value type.
-            if let Some(ann_ty) = ann {
-                let s_ann =
-                    mgu_assignable(&apply_subst(&val_ty, &s_combined), ann_ty, Span::default())?;
-                s_combined = compose_subst(&s_ann, &s_combined);
-            }
-            let gen_ty = self.do_generalize(ctx, &apply_subst(&val_ty, &s_combined));
-            let new_ctx = ctx.extend(name.to_string(), gen_ty, Capability::Ref, mutable);
-            let (s3, body_ty) = self.infer_expr(&new_ctx, body)?;
-            let final_subst = compose_subst(&s3, &s_combined);
-            return Ok((final_subst.clone(), apply_subst(&body_ty, &final_subst)));
+        let mut context = ctx.clone();
+        let mut substitutions = Vec::new();
+        let mut tail = first;
+
+        while let Expr::Let {
+            name,
+            ty: ann,
+            value,
+            body,
+            mutable,
+            ..
+        } = tail
+        {
+            let (subst, val_ty) = if matches!(value.as_ref(), Expr::Lambda { .. }) {
+                // Preserve the existing recursive-reference inference for a
+                // lambda assigned through ordinary `let`.
+                let rec_var = Type::Var(TypeVar::fresh());
+                let ctx_with_rec =
+                    context.extend(name.to_string(), rec_var.clone(), Capability::Ref, *mutable);
+                let (s1, val_ty) = self.infer_expr(&ctx_with_rec, value)?;
+                let s2 = mgu(
+                    &apply_subst(&rec_var, &s1),
+                    &apply_subst(&val_ty, &s1),
+                    Span::default(),
+                )?;
+                (compose_subst(&s2, &s1), val_ty)
+            } else {
+                self.infer_expr(&context, value)?
+            };
+            let subst = if let Some(ann_ty) = ann.as_ref() {
+                let s_ann = mgu_assignable(&apply_subst(&val_ty, &subst), ann_ty, Span::default())?;
+                compose_subst(&s_ann, &subst)
+            } else {
+                subst
+            };
+            let gen_ty = self.do_generalize(&context, &apply_subst(&val_ty, &subst));
+            context = context.extend(name.to_string(), gen_ty, Capability::Ref, *mutable);
+            substitutions.push(subst);
+            tail = body;
         }
 
-        // Infer the binding value
-        let (s1, val_ty) = self.infer_expr(ctx, value)?;
-
-        // An explicit annotation must unify with the inferred value type.
-        let s1 = if let Some(ann_ty) = ann {
-            let s_ann = mgu_assignable(&apply_subst(&val_ty, &s1), ann_ty, Span::default())?;
-            compose_subst(&s_ann, &s1)
-        } else {
-            s1
-        };
-
-        // Generalize the value type
-        let gen_ty = self.do_generalize(ctx, &apply_subst(&val_ty, &s1));
-
-        // Extend context with generalized type
-        let new_ctx = ctx.extend(name.to_string(), gen_ty, Capability::Ref, mutable);
-
-        // Infer body with extended context
-        let (s2, body_ty) = self.infer_expr(&new_ctx, body)?;
-
-        let final_subst = compose_subst(&s2, &s1);
-        Ok((final_subst.clone(), apply_subst(&body_ty, &final_subst)))
+        let (mut final_subst, mut body_ty) = self.infer_expr(&context, tail)?;
+        for outer in substitutions.into_iter().rev() {
+            final_subst = compose_subst(&final_subst, &outer);
+            body_ty = apply_subst(&body_ty, &final_subst);
+        }
+        Ok((final_subst, body_ty))
     }
 
     /// Infer the type of a recursive let binding.

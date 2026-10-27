@@ -228,9 +228,16 @@ struct StreamState {
 /// Stream metadata and cursor files use atomic temp-file + rename replacement.
 /// On open, a truncated final record is repaired back to the last complete
 /// frame; checksum or sequence corruption fails closed.
+///
+/// A store owns an OS-level exclusive advisory lock for its entire lifetime.
+/// Opening the same directory from another process or runtime fails rather
+/// than allowing competing writers to allocate overlapping log sequences.
+/// This is a local-filesystem ownership guard, not distributed leader fencing.
 #[derive(Debug)]
 pub struct FileFabricStreamStore {
     root: PathBuf,
+    // Keep this file descriptor alive to retain the advisory lock.
+    _root_lock: File,
     states: HashMap<String, StreamState>,
 }
 
@@ -238,8 +245,17 @@ impl FileFabricStreamStore {
     pub fn open(root: impl AsRef<Path>) -> io::Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
+        // Do not unlink or replace this file: OS locks follow file identity.
+        let root_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join(".fabric-store.lock"))?;
+        root_lock.try_lock()?;
         Ok(Self {
             root,
+            _root_lock: root_lock,
             states: HashMap::new(),
         })
     }
@@ -1043,7 +1059,9 @@ impl FileFabricStreamStore {
         Ok(())
     }
 
-    /// Read records after the consumer's last committed sequence.
+    /// Read records after the consumer's cursor, without exposing an
+    /// uncommitted local tail on replicated streams. Standalone local streams
+    /// retain their existing append-and-replay behavior.
     pub fn read_consumer(
         &mut self,
         name: &str,
@@ -1051,13 +1069,25 @@ impl FileFabricStreamStore {
         limit: usize,
     ) -> io::Result<Vec<FabricStreamRecord>> {
         let cursor = self.cursor(name, consumer)?;
+        if self.replication_policy(name)?.is_some() {
+            let committed = self.committed_sequence(name)?;
+            if cursor > committed {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Fabric consumer cursor {cursor} exceeds committed sequence {committed}"
+                    ),
+                ));
+            }
+            return self.read_committed(name, cursor.saturating_add(1), limit);
+        }
         self.read_from(name, cursor.saturating_add(1), limit)
     }
 
     /// Persist a consumer's last fully processed sequence.
     ///
-    /// Cursors are monotonic. Committing beyond the stream tail or moving a
-    /// cursor backwards is rejected.
+    /// Cursors are monotonic and cannot advance beyond the quorum-committed
+    /// index on replicated streams (or the local tail on standalone streams).
     pub fn commit_cursor(&mut self, name: &str, consumer: &str, sequence: u64) -> io::Result<()> {
         validate_name("consumer", consumer)?;
         self.ensure_state(name)?;
@@ -1067,16 +1097,32 @@ impl FileFabricStreamStore {
             .and_then(|state| state.next_sequence.checked_sub(1))
             .filter(|&seq| seq > 0)
             .unwrap_or(0);
-        if sequence > last_sequence {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Fabric cursor {sequence} is beyond stream tail {last_sequence}"),
-            ));
-        }
+        let replicated = self.replication_policy(name)?.is_some();
+        let upper_bound = if replicated {
+            self.committed_sequence(name)?
+        } else {
+            last_sequence
+        };
 
         let path = self.stream_dir(name).join("cursors.json");
         let mut cursors = read_cursors(&path)?;
         let current = cursors.cursors.get(consumer).copied().unwrap_or(0);
+        if replicated && current > upper_bound {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Fabric consumer cursor {current} exceeds committed sequence {upper_bound}"
+                ),
+            ));
+        }
+        if sequence > upper_bound {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Fabric cursor {sequence} is beyond consumer-visible boundary {upper_bound}"
+                ),
+            ));
+        }
         if sequence < current {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1832,6 +1878,36 @@ mod tests {
     }
 
     #[test]
+    fn stream_store_rejects_second_writer_until_first_is_dropped() {
+        let root = test_dir("single-writer");
+        let mut first = FileFabricStreamStore::open(&root).unwrap();
+        first
+            .create_stream("events", FabricStreamConfig::default())
+            .unwrap();
+        assert_eq!(first.append("events", b"first").unwrap(), 1);
+
+        // Opening the same root twice currently succeeds. Two owners can
+        // allocate overlapping sequences and corrupt the segmented log.
+        let error = FileFabricStreamStore::open(&root).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+
+        drop(first);
+        let mut next_owner = FileFabricStreamStore::open(&root).unwrap();
+        assert_eq!(next_owner.append("events", b"second").unwrap(), 2);
+        assert_eq!(
+            next_owner
+                .read_from("events", 1, 10)
+                .unwrap()
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        drop(next_owner);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn segmented_append_replay_and_rotation() {
         let root = test_dir("rotation");
         let mut store = FileFabricStreamStore::open(&root).unwrap();
@@ -1861,7 +1937,9 @@ mod tests {
         let info = store.stream_info("orders").unwrap();
         assert!(info.segment_count >= 2);
         assert_eq!(info.last_sequence, Some(3));
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(store);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 
     #[test]
@@ -1884,7 +1962,112 @@ mod tests {
         assert_eq!(replay[0].sequence, 2);
         assert_eq!(replay[0].payload, b"b");
         assert_eq!(reopened.append("events", b"c").unwrap(), 3);
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(reopened);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
+    }
+
+    #[test]
+    fn replicated_consumer_only_reads_and_commits_quorum_visible_prefix() {
+        let root = test_dir("replicated-consumer-visibility");
+        {
+            let mut store = FileFabricStreamStore::open(&root).unwrap();
+            store
+                .create_stream("events", FabricStreamConfig::default())
+                .unwrap();
+            store
+                .establish_replication_policy(
+                    "events",
+                    FabricStreamReplicationPolicy {
+                        partition: 0,
+                        epoch: FABRIC_STREAM_INITIAL_EPOCH,
+                        leader: 10,
+                        membership_fingerprint: 44,
+                        replication_factor: 2,
+                        replicas: vec![10, 11],
+                    },
+                )
+                .unwrap();
+            store.append_replica("events", 1, b"committed").unwrap();
+            store.append_replica("events", 2, b"pending").unwrap();
+            store.commit_through("events", 1).unwrap();
+
+            // The second record is fsynced locally but has not reached quorum.
+            assert_eq!(store.read_from("events", 1, 10).unwrap().len(), 2);
+            let visible = store.read_consumer("events", "worker", 10).unwrap();
+            assert_eq!(visible.len(), 1);
+            assert_eq!(visible[0].payload, b"committed");
+
+            let error = store
+                .commit_cursor("events", "worker", 2)
+                .expect_err("consumer must not acknowledge an uncommitted record");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(store.cursor("events", "worker").unwrap(), 0);
+
+            store.commit_cursor("events", "worker", 1).unwrap();
+            assert!(store
+                .read_consumer("events", "worker", 10)
+                .unwrap()
+                .is_empty());
+        }
+
+        // Restart must not expose the pending tail or skip it with the cursor.
+        let mut reopened = FileFabricStreamStore::open(&root).unwrap();
+        assert_eq!(reopened.cursor("events", "worker").unwrap(), 1);
+        assert!(reopened
+            .read_consumer("events", "worker", 10)
+            .unwrap()
+            .is_empty());
+        reopened.commit_through("events", 2).unwrap();
+        let visible = reopened.read_consumer("events", "worker", 10).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].payload, b"pending");
+        // Release the store before removing the root so locked stores work on Windows.
+        drop(reopened);
+        fs::remove_dir_all(root).expect("clean up replicated consumer test root");
+    }
+
+    #[test]
+    fn replicated_consumer_rejects_cursor_past_committed_index_on_recovery() {
+        let root = test_dir("consumer-cursor-ahead");
+        let mut store = FileFabricStreamStore::open(&root).unwrap();
+        store
+            .create_stream("events", FabricStreamConfig::default())
+            .unwrap();
+        store
+            .establish_replication_policy(
+                "events",
+                FabricStreamReplicationPolicy {
+                    partition: 0,
+                    epoch: FABRIC_STREAM_INITIAL_EPOCH,
+                    leader: 10,
+                    membership_fingerprint: 44,
+                    replication_factor: 2,
+                    replicas: vec![10, 11],
+                },
+            )
+            .unwrap();
+        store.append_replica("events", 1, b"not-committed").unwrap();
+
+        // Simulate a cursor written by an older build before enforcing quorum.
+        write_json_atomic(
+            &root.join("events").join("cursors.json"),
+            &CursorFile {
+                version: STREAM_FORMAT_VERSION,
+                cursors: BTreeMap::from([("worker".to_string(), 1)]),
+            },
+        )
+        .unwrap();
+        let read_error = store
+            .read_consumer("events", "worker", 10)
+            .expect_err("a cursor beyond committed history must fail closed");
+        assert_eq!(read_error.kind(), io::ErrorKind::InvalidData);
+        let commit_error = store
+            .commit_cursor("events", "worker", 1)
+            .expect_err("an invalid cursor must not be silently retained");
+        assert_eq!(commit_error.kind(), io::ErrorKind::InvalidData);
+        drop(store);
+        fs::remove_dir_all(root).expect("clean up invalid cursor test root");
     }
 
     #[test]
@@ -1912,7 +2095,9 @@ mod tests {
             all.iter().map(|record| record.sequence).collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(reopened);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 
     #[test]
@@ -1923,6 +2108,7 @@ mod tests {
             .create_stream("events", FabricStreamConfig::default())
             .unwrap();
         store.append("events", b"original").unwrap();
+        // Recovery is a new ownership epoch, not a concurrent second writer.
         drop(store);
 
         let segments = list_segments(&root.join("events")).unwrap();
@@ -1938,7 +2124,9 @@ mod tests {
             .expect_err("checksum corruption must fail closed");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("checksum mismatch"));
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(reopened);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 
     #[test]
@@ -1963,7 +2151,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(store);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 
     #[test]
@@ -1979,7 +2169,9 @@ mod tests {
         store.commit_cursor("events", "worker", 2).unwrap();
         assert!(store.commit_cursor("events", "worker", 1).is_err());
         assert!(store.commit_cursor("events", "worker", 3).is_err());
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(store);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 
     #[test]
@@ -2016,7 +2208,9 @@ mod tests {
         let promise = reopened.epoch_promise("events").unwrap().unwrap();
         assert_eq!(promise.epoch, 3);
         assert_eq!(promise.proposal_hash, "proposal-c");
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(reopened);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 
     #[test]
@@ -2053,7 +2247,9 @@ mod tests {
         assert!(reopened
             .establish_replication_policy("events", conflicting)
             .is_err());
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(reopened);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 
     #[test]
@@ -2073,7 +2269,9 @@ mod tests {
         assert_eq!(reopened.replica_progress("events", 42).unwrap(), 3);
         reopened.record_replica_progress("events", 42, 5).unwrap();
         assert_eq!(reopened.replica_progress("events", 42).unwrap(), 5);
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(reopened);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 
     #[test]
@@ -2115,7 +2313,9 @@ mod tests {
             .pending_replication_intents("events")
             .unwrap()
             .is_empty());
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(reopened);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 
     #[test]
@@ -2143,7 +2343,9 @@ mod tests {
             .unwrap();
         store.append_reserved_replica("events", 1, b"a").unwrap();
         assert_eq!(store.read_from("events", 1, 10).unwrap().len(), 1);
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(store);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 
     #[test]
@@ -2169,7 +2371,9 @@ mod tests {
         assert_eq!(committed.len(), 1);
         assert_eq!(reopened.read_from("events", 1, 10).unwrap().len(), 2);
         assert!(reopened.commit_through("events", 3).is_err());
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(reopened);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 
     #[test]
@@ -2185,6 +2389,7 @@ mod tests {
             .fabric_stream_commit_cursor("audit", "consumer-a", 1)
             .unwrap();
 
+        drop(runtime);
         let mut restarted = Runtime::new();
         restarted.fabric_stream_open(&root).unwrap();
         assert_eq!(
@@ -2197,6 +2402,8 @@ mod tests {
             restarted.fabric_stream_append("audit", b"second").unwrap(),
             2
         );
-        let _ = fs::remove_dir_all(root);
+        // Release the advisory lock before removing its root (also on Windows).
+        drop(restarted);
+        fs::remove_dir_all(root).expect("clean up Fabric stream test root");
     }
 }

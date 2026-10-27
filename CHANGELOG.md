@@ -1,4 +1,48 @@
 # Nulang Changelog
+
+### Fail-closed post-handshake mTLS peer identity (review-only) — 2026-10-26
+- **Fixed a reproduced CA-trusted outbound NUL0 NodeId impersonation**: Rustls' certificate accessor was called before the lazy TLS handshake completed, returned no peer certificate, and an `if let Some` check silently skipped identity binding. The old code accepted a malicious NUL0 claim for a different NodeId; the local regression reproduces that acceptance without insecure trust roots.
+- **Both outbound connection paths and inbound admission now require an available, matching peer certificate after the TLS/NUL0 handshake and before registering a connection.** The sender-worker path now has its own CA-trusted forgery rejection plus legitimate-certificate acceptance regression. No wire-format, timeout, recovery protocol or TLS-root policy changes. Preserve strict plaintext opt-out semantics and existing legitimate mTLS interoperability tests. Independent security review, exact-head release/native/WASM/CodeQL and disposable Turso remote SQL validation remain required.
+
+### Sender-bound NodeGoodbye removal (review-only) — 2026-10-26
+- **Ported the previously RED/GREEN-tested NodeGoodbye sender check and deterministic poisoning regression from #2131** onto the audited TLS, distributed recovery, compiler, and remote URL/heartbeat security stack. A packet cannot mark a different node Removed or merge its durable actor directory manifest unless the payload NodeId equals the transport-reported sender.
+- **This is a transport-identity consistency check, not a cryptographic guarantee for plaintext TCP.** Preserve valid self-goodbye/rejoin behavior; require same-head native/WASM/release CI and independent review, including authenticated transport identity binding and the disposable Turso HTTPS database test. Tracks #2132 and #2130.
+
+### Sender-bound heartbeat liveness (review-only) — 2026-10-26
+- **Reject heartbeats whose packet-claimed NodeId differs from the transport-reported peer identity** before changing cluster membership or CRDT recovery state; no ACK is issued for a rejected control packet. Add a deterministic three-peer forgery and legitimate-recovery regression. This is a fail-closed consistency check, not a substitute for mTLS peer authentication or a claim that plaintext transports resist spoofing. Tracks #2132.
+- **Security-stack validation remains gated:** exact-head test and release CI, independent identity/TLS review, disposable authenticated remote libSQL SQL certification, and main-branch protection are still required; no source wire format or timers change.
+
+### Fail-closed remote libSQL URL admission (review-only) — 2026-10-26
+- **Ported the existing URL-admission logic and regressions from draft #2228 onto the audited TLS, cluster-recovery and compiler integration stack.** Nonloopback plaintext HTTP destinations, ambiguous schemes, deceptive loopback names, userinfo (including empty `@` authorities), fragments, backslashes and controls fail with `InvalidInput` before constructing a token-bearing client; numeric IPv4/IPv6 loopback remains available for development.
+- **Preserved patched rustls 0.23/Turso TLS and native certificate verification.** Added two inline validation tests, public URL-admission regressions, and a deliberately ignored disposable-Turso SQL certification harness with strict endpoint/credential safeguards. Real authenticated remote SQL and independent security approval remain required.
+
+### Stack-bounded let and binary-expression compilation — 2026-10-26
+- **Type inference, effect checking and capability analysis now traverse consecutive let bindings iteratively**, preserving lexical shadowing, generalized types and linear consumption-state restoration.
+- **HIR lowering iteratively processes left-associative binary expression chains**, retaining operand evaluation order and special assignment/range lowering.
+- **Both existing compiler-spill conformance fixtures now type-check and execute with an 8 MiB host stack**, producing `9870` and `7750` in a focused Linux reproduction. An exact-head CI smoke retains that ordinary stack limit; full tests and other behavior-conformance failures remain independent gates. Tracks #2227.
+
+### Project-relative namespaced import resolution — 2026-10-26
+- **Local imports now resolve `::` segments as directories**, consistent with standard-library module paths. For example, `import subpkg::helper` resolves to `subpkg/helper.nula` relative to the importing source file; slash paths and explicit `.nula` extensions remain supported.
+- **The existing `modimport_13_subdirectory_package` conformance failure now has focused resolver regression tests.** No grammar or frozen format changes are needed; full language-suite and exact-head CI verification are still required.
+
+### Fail-closed language conformance runner — 2026-10-13
+- **Behavioral conformance can no longer report success without executing any cases.** Missing `.json` expectations and orphaned expectations now fail before compiling; fixture discovery is deterministic.
+- **The runner isolates and reports malformed expectations, failed processes, mismatched outputs and per-case timeouts.** Twelve Python regression tests exercise both passing and deliberately failing paths without requiring a Rust toolchain. The separate CI wiring remains in draft PR #1587; these changes do not claim a full Nulang runtime pass.
+
+### Post-partition peer readiness and TCP writer fencing (review-only) — 2026-10-26
+- **Post-heal delivery readiness requires two-way peer-attributed heartbeat acknowledgments and Healthy membership on both peers.** An unrelated node's ACK cannot satisfy the intended peer's recovery probe.
+- **Failed TCP writer cleanup fences by connection generation** so an old writer cannot evict a replacement connection. Deterministic regressions cover wrong-peer ACKs, membership rearming, and replacement delivery.
+- **No implicit message retries or stronger delivery guarantee are added.** The post-partition actor-message assertion remains one-shot and fail-closed; exact-head native/WASM/release testing and independent review are required before promotion. This stack preserves the patched libSQL/TLS security baseline.
+
+### Monotonic authoritative cluster address correction (review-only) — 2026-10-26
+- **Authoritative self-gossip correcting peer status or listen address now advances its incarnation beyond the highest observed version.** Simultaneous Joining-to-Healthy status and stale source-port correction must propagate to third parties; newer relayed address-only changes report a membership mutation.
+- **Two deterministic regression cases** preserve the real listen address across relayed gossip and reject incarnation rollback. No additional actor-message retries or timeout increases are introduced. Concurrent real-TCP stress exposed address-convergence failures in the preceding peer-bound ACK-only integration; full retesting remains required.
+
+### October RustSec dependency remediation (validation pending) — 2026-10-25
+- **Updated Wasmtime 48.0.7, compatible Cranelift/Pulley packages, rustls-webpki 0.103.16, webpki-roots 1.0.10 and ctutils 0.4.4** with Cargo's dependency resolver.
+- **Migrated libSQL remote TLS to a custom connector based on supported rustls 0.23 and tokio-rustls 0.26.** This retains libSQL local/remote behavior, native root certificates, server-name verification and Hyper 0.14 protocol compatibility without pulling unsupported rustls-webpki 0.102.
+- **Release status:** tests of the certificate verifier, local SQLite behavior, full cargo audit and exact-head CI are mandatory before promotion. No security advisory is waived. See #2093.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.

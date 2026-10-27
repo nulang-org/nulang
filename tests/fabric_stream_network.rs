@@ -171,8 +171,25 @@ fn stream_quorum_commit_waits_for_application_ack() {
         .unwrap()
         .is_empty());
 
+    // A durable local append alone must not be exposed to normal consumers.
+    assert!(leader
+        .fabric_stream_read_consumer("quorum", "billing", 10)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        leader
+            .fabric_stream_commit_cursor("quorum", "billing", 1)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+
     // Follower fsyncs the exact record and emits an application ACK.
     follower.process_network();
+    assert!(follower
+        .fabric_stream_read_consumer("quorum", "billing", 10)
+        .unwrap()
+        .is_empty());
     // Leader consumes the application ACK and advances the durable commit index.
     leader.process_network();
 
@@ -185,6 +202,18 @@ fn stream_quorum_commit_waits_for_application_ack() {
         .unwrap();
     assert_eq!(committed.len(), 1);
     assert_eq!(committed[0].payload, b"pending");
+    let ready = leader
+        .fabric_stream_read_consumer("quorum", "billing", 10)
+        .unwrap();
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].sequence, 1);
+    leader
+        .fabric_stream_commit_cursor("quorum", "billing", 1)
+        .unwrap();
+    assert!(leader
+        .fabric_stream_read_consumer("quorum", "billing", 10)
+        .unwrap()
+        .is_empty());
 
     // Followers currently retain durable replica data but do not independently
     // claim leader commit visibility; commit propagation is a later layer.
