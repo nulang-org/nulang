@@ -815,3 +815,87 @@ mod tests {
         );
     }
 }
+
+// A checked outbound Http effect authorizes only the requested TCP destination.
+// A redirect must never turn that grant into an unapproved second connection.
+#[cfg(all(test, any(feature = "ai-runtime", feature = "http-client")))]
+mod http_redirect_authority_tests {
+    use super::ReqwestHttpProvider;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn outbound_http_does_not_follow_redirect_to_different_port() {
+        let allowed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let forbidden = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let allowed_address = allowed.local_addr().unwrap();
+        let forbidden_address = forbidden.local_addr().unwrap();
+
+        let allowed_server = tokio::spawn(async move {
+            let (mut stream, _) = allowed.accept().await.unwrap();
+            let mut buf = [0; 1024];
+            stream.read(&mut buf).await.unwrap();
+            let reply = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{forbidden_address}/secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(reply.as_bytes()).await.unwrap();
+        });
+        let forbidden_server = tokio::spawn(async move {
+            let Ok(Ok((mut stream, _))) = timeout(Duration::from_secs(2), forbidden.accept()).await else {
+                return false;
+            };
+            let mut buf = [0; 1024];
+            let _ = stream.read(&mut buf).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                .await
+                .unwrap();
+            true
+        });
+
+        let client = ReqwestHttpProvider::new();
+        let response = timeout(
+            Duration::from_secs(3),
+            client.client.get(format!("http://{allowed_address}/start")).send(),
+        )
+        .await
+        .expect("HTTP request should finish")
+        .expect("initial authorized request must succeed");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::FOUND,
+            "different-port redirect must not be followed"
+        );
+        allowed_server.await.unwrap();
+        assert!(!forbidden_server.await.unwrap(), "an unauthorized destination received a request");
+    }
+
+    #[tokio::test]
+    async fn outbound_http_keeps_same_origin_relative_redirects() {
+        let allowed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = allowed.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for response in [
+                b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK".as_slice(),
+            ] {
+                let (mut stream, _) = allowed.accept().await.unwrap();
+                let mut buf = [0; 1024];
+                stream.read(&mut buf).await.unwrap();
+                stream.write_all(response).await.unwrap();
+            }
+        });
+        let client = ReqwestHttpProvider::new();
+        let response = timeout(
+            Duration::from_secs(3),
+            client.client.get(format!("http://{address}/start")).send(),
+        )
+        .await
+        .expect("same-origin redirect should finish")
+        .expect("same-origin redirect must succeed");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "OK");
+        server.await.unwrap();
+    }
+}
