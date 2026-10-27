@@ -95,6 +95,7 @@ pub mod semantic_schema;
 pub mod stdlib;
 #[cfg(test)]
 pub mod stress_tests;
+pub mod task_output_commit;
 pub mod tool_schema;
 pub mod type_ir;
 pub mod type_metadata;
