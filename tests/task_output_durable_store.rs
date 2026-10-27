@@ -247,3 +247,42 @@ fn sqlite_competing_writers_publish_only_one_distinct_output() {
     }
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn recovery_rejects_same_epoch_owner_replacement_even_if_store_accepted_it() {
+    use nulang::runtime::{
+        DurableTransition, EventEntry, PersistedValue, DURABLE_TRANSITION_VERSION,
+    };
+
+    let mut store = MemoryStore::new();
+    let mut authorized = DurableTaskOutputStore::new(&mut store, SLOT, KEY).unwrap();
+    authorized.assign("real-owner").unwrap();
+
+    // A lower-level writer bypassed the task adapter. The generic persistence
+    // backend fences epochs, but does not understand same-epoch task attempts.
+    let mut forged = nulang::task_output_commit::TaskOutputState::new(KEY).unwrap();
+    forged.assign("forged-owner").unwrap();
+    let json = String::from_utf8(forged.checkpoint().unwrap()).unwrap();
+    let unauthorized = DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id: SLOT,
+        activation_epoch: 1,
+        sequence: 2,
+        expected_previous_sequence: 1,
+        command: None,
+        snapshot: None,
+        workflow_events: vec![],
+        domain_events: vec![EventEntry {
+            sequence: 2,
+            field_name: "__nulang.task_output.state.v1".into(),
+            event_name: "TaskOutputCheckpoint".into(),
+            args: vec![],
+            value: PersistedValue::String(json),
+        }],
+        durable_effects: vec![],
+        outbox: vec![],
+    };
+    store.commit_transition(unauthorized).unwrap();
+    let task = DurableTaskOutputStore::new(&mut store, SLOT, KEY).unwrap();
+    assert!(matches!(task.load(), Err(TaskOutputStoreError::Corrupt(_))));
+}
