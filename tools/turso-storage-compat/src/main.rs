@@ -1,5 +1,7 @@
 //! Manual, isolated compatibility gate for replacing libSQL's local SQLite
 //! driver. This does NOT migrate cloud URLs, credentials or production data.
+mod turso_local_commit;
+
 use nulang::durable_effect::{DurableEffectId, DurableEffectRecord, DurableEffectSpec};
 use nulang::durable_effect_persistence::DurableEffectPersistenceRecord;
 use nulang::primitives::{DeliverySemantics, EffectBoundary};
@@ -126,6 +128,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             .ok_or("committed tail missing before migration")?;
         assert_eq!((tail.activation_epoch, tail.sequence), (7, 1));
     }
+
+    let candidate_actor = 41;
+    let candidate_effect_id =
+        DurableEffectId::derive_from_site(candidate_actor, "turn:1", effect_site, 0);
+    let candidate_effect =
+        DurableEffectPersistenceRecord::from_effect(DurableEffectRecord::prepare(
+            DurableEffectSpec::new(
+                candidate_effect_id,
+                "Provider.ask",
+                EffectBoundary::External,
+                DeliverySemantics::AtLeastOnce,
+            ),
+            b"migration-probe-request",
+        ));
 
     // Current Turso is not the same API as the existing remote libSQL path.
     // Test local on-disk compatibility only. No remote requests are made.
@@ -349,6 +365,154 @@ fn main() -> Result<(), Box<dyn Error>> {
             assert_eq!(count, 0, "partial {table} write survived rollback");
         }
 
+        // The existing local LibsqlStore is configured FULL. The Turso
+        // connection must also prove its active fsync policy before writes.
+        let mut sync_rows = conn.query("PRAGMA synchronous", ()).await?;
+        let synchronous: i64 = sync_rows
+            .next()
+            .await?
+            .ok_or("no synchronous PRAGMA value")?
+            .get(0)?;
+        assert_eq!(
+            synchronous, 2,
+            "Turso did not preserve SQLite synchronous=FULL local durability"
+        );
+        drop(sync_rows);
+
+        // Turso writer proof, separate from its already passing read-only
+        // compatibility checks. This is NOT wired to production Nulang.
+        let mut turso_written = committed.clone();
+        turso_written.actor_id = candidate_actor;
+        turso_written.activation_epoch = 9;
+        turso_written.snapshot.as_mut().unwrap().actor_id = candidate_actor;
+        turso_written.snapshot.as_mut().unwrap().activation_epoch = 9;
+        turso_written.workflow_events = vec![WorkflowEvent::StepCompleted {
+            sequence: 1,
+            activation: Some(WorkflowActivationId::new(candidate_actor, 1)),
+            step_name: "turso-first-write".to_owned(),
+        }];
+        turso_written.durable_effects = vec![candidate_effect.clone()];
+
+        // RED: the writer must refuse a connection on a weaker durability
+        // setting rather than claim a durable commit.
+        conn.execute("PRAGMA synchronous=NORMAL", ()).await?;
+        assert!(
+            turso_local_commit::commit(&conn, &turso_written)
+                .await
+                .is_err(),
+            "Turso commit must fail closed if synchronous is weaker than FULL"
+        );
+        conn.execute("PRAGMA synchronous=FULL", ()).await?;
+        let mut denied_rows = conn
+            .query("SELECT COUNT(*) FROM durable_tails WHERE actor_id=41", ())
+            .await?;
+        assert_eq!(
+            denied_rows.next().await?.ok_or("missing tail count")?.get::<i64>(0)?,
+            0,
+            "unsafe durability attempt wrote a tail"
+        );
+        drop(denied_rows);
+
+        let receipt = turso_local_commit::commit(&conn, &turso_written).await?;
+        assert_eq!(receipt.digest, turso_written.digest()?);
+        assert_eq!(receipt.activation_epoch, 9);
+        // Repeated identical logical command must not duplicate any record.
+        assert_eq!(
+            turso_local_commit::commit(&conn, &turso_written)
+                .await?
+                .digest,
+            receipt.digest,
+        );
+
+        let mut conflicting = turso_written.clone();
+        conflicting.command.as_mut().unwrap().payload = vec![PersistedValue::Int(1000)];
+        assert!(
+            turso_local_commit::commit(&conn, &conflicting).await.is_err(),
+            "conflicting digest must never be treated as an idempotent retry"
+        );
+
+        let mut next = turso_written.clone();
+        next.sequence = 2;
+        next.expected_previous_sequence = 1;
+        next.command.as_mut().unwrap().sequence = 2;
+        next.snapshot.as_mut().unwrap().sequence = 2;
+        next.workflow_events = vec![WorkflowEvent::StepCompleted {
+            sequence: 2,
+            activation: Some(WorkflowActivationId::new(candidate_actor, 2)),
+            step_name: "turso-second-write".to_owned(),
+        }];
+        next.domain_events[0].sequence = 2;
+        let mut invalid_predecessor = next.clone();
+        invalid_predecessor.sequence = 3;
+        invalid_predecessor.expected_previous_sequence = 2;
+        invalid_predecessor.command.as_mut().unwrap().sequence = 3;
+        invalid_predecessor.snapshot.as_mut().unwrap().sequence = 3;
+        invalid_predecessor.workflow_events = vec![WorkflowEvent::StepCompleted {
+            sequence: 3,
+            activation: Some(WorkflowActivationId::new(candidate_actor, 3)),
+            step_name: "skip-predecessor".to_owned(),
+        }];
+        invalid_predecessor.domain_events[0].sequence = 3;
+        assert!(
+            turso_local_commit::commit(&conn, &invalid_predecessor)
+                .await
+                .is_err(),
+            "out-of-order predecessor must be rejected"
+        );
+        let mut stale_epoch = next.clone();
+        stale_epoch.activation_epoch = 8;
+        stale_epoch.snapshot.as_mut().unwrap().activation_epoch = 8;
+        assert!(
+            turso_local_commit::commit(&conn, &stale_epoch).await.is_err(),
+            "stale activation must not commit"
+        );
+
+        // Force a late SQL constraint violation after all side effects have
+        // been staged; all of the journal/events/effect/outbox must roll back.
+        conn.execute(
+            "INSERT INTO durable_transitions
+               (actor_id,sequence,activation_epoch,expected_previous_sequence,digest)
+             VALUES (41,2,9,1,'fault-injection-collision')",
+            (),
+        )
+        .await?;
+        assert!(
+            turso_local_commit::commit(&conn, &next).await.is_err(),
+            "late primary-key collision must abort the entire Turso transition"
+        );
+        for table in [
+            "journal",
+            "durable_workflow_events",
+            "durable_domain_events",
+            "durable_effect_records",
+            "durable_outbox",
+        ] {
+            let query = format!("SELECT COUNT(*) FROM {table} WHERE actor_id=41 AND sequence=2");
+            let mut rows = conn.query(&query, ()).await?;
+            let count: i64 = rows.next().await?.ok_or("no count row")?.get(0)?;
+            assert_eq!(count, 0, "partial Turso-origin {table} escaped rollback");
+        }
+        let mut tail = conn
+            .query("SELECT sequence FROM durable_tails WHERE actor_id=41", ())
+            .await?;
+        assert_eq!(tail.next().await?.ok_or("tail disappeared")?.get::<i64>(0)?, 1);
+        drop(tail);
+        conn.execute(
+            "DELETE FROM durable_transitions WHERE actor_id=41 AND sequence=2", (),
+        )
+        .await?;
+
+        // Valid continuation now succeeds after the injected crash boundary.
+        turso_local_commit::commit(&conn, &next).await?;
+        let mut rows = conn.query(
+            "SELECT activation_epoch, sequence FROM durable_tails WHERE actor_id=41",
+            (),
+        ).await?;
+        let row = rows.next().await?.ok_or("Turso writer did not persist a committed tail")?;
+        assert_eq!(row.get::<i64>(0)?, 9);
+        assert_eq!(row.get::<i64>(1)?, 2);
+        drop(rows);
+
         // Turso writes the SAME serialized legacy journal payload, and
         // libSQL must be able to read it back, including behavior ID.
         conn.execute(
@@ -363,7 +527,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     })?;
     drop(rt);
 
-    let legacy = LibsqlStore::new(&db_file)?;
+    let mut legacy = LibsqlStore::new(&db_file)?;
     assert!(
         legacy.load_durable_tail_position(31)?.is_none(),
         "failed Turso transaction leaked a committed durable tail"
@@ -390,14 +554,119 @@ fn main() -> Result<(), Box<dyn Error>> {
         "legacy store cannot recover the original durable effect"
     );
 
+    let turso_tail = legacy
+        .load_durable_tail_position(41)?
+        .ok_or("legacy driver cannot find Turso-committed actor")?;
+    assert_eq!(
+        (turso_tail.activation_epoch, turso_tail.sequence),
+        (9, 2),
+        "legacy reopen lost Turso durable tail"
+    );
+    assert_eq!(legacy.read_journal(41).len(), 2);
+    assert_eq!(legacy.read_workflow_events(41).len(), 2);
+    assert_eq!(legacy.read_events(41).len(), 2);
+    assert_eq!(
+        legacy
+            .load_durable_effect(41, candidate_effect_id)?
+            .ok_or("legacy reopen lost Turso effect")?,
+        candidate_effect
+    );
+    assert_eq!(
+        legacy.query("SELECT COUNT(*) FROM durable_outbox WHERE actor_id=41", &[])?,
+        vec!["[2]".to_owned()],
+        "legacy reopen lost Turso outbound messages"
+    );
+
     let journal = legacy.read_journal(17);
     assert_eq!(journal.len(), 2);
     assert_eq!(journal[0].sequence, 1);
     assert_eq!(journal[1].sequence, 2);
     assert_eq!(journal[1].behavior_id, 3);
     assert_eq!(journal[1].payload, vec![PersistedValue::Int(10)]);
+    // Cold restart into libSQL must not merely parse Turso's schema; the
+    // original production writer must be able to continue the same actor's
+    // fenced durable sequence after Turso committed seq=1 and seq=2.
+    let mut legacy_next = committed.clone();
+    legacy_next.actor_id = candidate_actor;
+    legacy_next.activation_epoch = 9;
+    legacy_next.sequence = 3;
+    legacy_next.expected_previous_sequence = 2;
+    legacy_next.command.as_mut().unwrap().sequence = 3;
+    legacy_next.snapshot.as_mut().unwrap().actor_id = candidate_actor;
+    legacy_next.snapshot.as_mut().unwrap().activation_epoch = 9;
+    legacy_next.snapshot.as_mut().unwrap().sequence = 3;
+    legacy_next.workflow_events = vec![WorkflowEvent::StepCompleted {
+        sequence: 3,
+        activation: Some(WorkflowActivationId::new(candidate_actor, 3)),
+        step_name: "libsql-after-turso".to_owned(),
+    }];
+    legacy_next.domain_events[0].sequence = 3;
+    legacy_next.durable_effects = vec![candidate_effect.clone()];
+    let receipt = legacy.commit_transition(legacy_next.clone())?;
+    assert_eq!(receipt.digest, legacy_next.digest()?);
+    assert_eq!(legacy.read_journal(41).len(), 3);
+    assert_eq!(
+        legacy
+            .load_durable_tail_position(41)?
+            .ok_or("missing third tail")?
+            .sequence,
+        3
+    );
+    drop(legacy);
+
+    // A fresh Turso connection, after libSQL committed again, must see the
+    // correct tail and all records without any file conversion or migration.
+    let fresh_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    fresh_rt.block_on(async {
+        let filename = db_file.to_str().ok_or("non-UTF8 temp filename")?;
+        let reopened = turso::Builder::new_local(filename).build().await?;
+        let connection = reopened.connect()?;
+        let mut rows = connection
+            .query(
+                "SELECT activation_epoch, sequence, digest
+             FROM durable_tails WHERE actor_id=41",
+                (),
+            )
+            .await?;
+        let row = rows
+            .next()
+            .await?
+            .ok_or("Turso missed resumed legacy commit")?;
+        assert_eq!(row.get::<i64>(0)?, 9);
+        assert_eq!(row.get::<i64>(1)?, 3);
+        let digest: String = row.get(2)?;
+        assert_eq!(
+            digest,
+            receipt
+                .digest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        drop(rows);
+        for table in [
+            "journal",
+            "durable_workflow_events",
+            "durable_domain_events",
+            "durable_effect_records",
+            "durable_outbox",
+        ] {
+            let query = format!("SELECT COUNT(*) FROM {table} WHERE actor_id=41");
+            let mut rows = connection.query(&query, ()).await?;
+            let count: i64 = rows
+                .next()
+                .await?
+                .ok_or("no count on cold restart")?
+                .get(0)?;
+            assert_eq!(count, 3, "Turso cold restart lost {table}");
+        }
+        Ok::<(), Box<dyn Error>>(())
+    })?;
+
     println!(
-        "PASS: actual Nulang LibsqlStore <-> Turso snapshot/journal, full transition records, and six-table rollback compatibility"
+        "PASS: real-schema libSQL/Turso bidirectional alternating LibsqlStore/Turso commits, restart, fencing, and rollback parity"
     );
     Ok(())
 }
