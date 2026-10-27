@@ -1,8 +1,17 @@
 name: Core release CLI conformance qualification
 
-# Manual qualification only while known conformance failures remain. This is
-# intentionally NOT a PR required check and does not weaken existing CI gates.
+# PR-scoped diagnostic while known conformance failures remain. The workflow
+# must run before merge: workflow_dispatch alone cannot dispatch a workflow
+# not yet present on the default branch. Do not add as a required merge check
+# until the complete conformance suite is genuinely green.
 on:
+  pull_request:
+    paths:
+      - '.github/workflows/core-release-qualification.yml'
+      - 'conformance/**'
+      - 'scripts/tests/test_conformance_release_binary.py'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
   workflow_dispatch:
 
 permissions:

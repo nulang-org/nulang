@@ -109,5 +109,22 @@ class ReleaseBinaryQualificationTests(unittest.TestCase):
         execute.assert_not_called()
 
 
+class QualificationWorkflowTests(unittest.TestCase):
+    def test_release_qualification_runs_on_pull_request_before_default_branch_merge(self):
+        workflow = (
+            ROOT / ".github" / "workflows" / "core-release-qualification.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("on:\n  pull_request:\n", workflow)
+        self.assertIn("    paths:\n      - '.github/workflows/core-release-qualification.yml'", workflow)
+        self.assertIn("  workflow_dispatch:\n", workflow)
+
+    def test_release_qualification_preserves_non_waivable_failure_gate(self):
+        workflow = (
+            ROOT / ".github" / "workflows" / "core-release-qualification.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn('python3 conformance/run.py --binary "$binary"', workflow)
+        self.assertNotIn("continue-on-error", workflow)
+
+
 if __name__ == "__main__":
     unittest.main()

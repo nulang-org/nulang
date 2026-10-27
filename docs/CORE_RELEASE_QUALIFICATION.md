@@ -12,7 +12,7 @@ target_dir="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import j
 python3 conformance/run.py --binary "$target_dir/release/nulang"
 ```
 
-The manually dispatched [Core release CLI conformance qualification](../.github/workflows/core-release-qualification.yml) workflow builds the same profile and runs the complete suite, **failing on any mismatch, missing fixture, missing executable, or zero executed tests**. It is not a replacement for the repository's separate default, no-default, WASM, release, security, and cross-platform gates.
+The [Core release CLI conformance qualification](../.github/workflows/core-release-qualification.yml) workflow is triggered by qualifying pull-request paths, so its **first review can run before the workflow exists on `main`**. Once installed on the default branch, it can also be dispatched manually. It builds the same release profile and runs the complete suite, **failing on any mismatch, missing fixture, missing executable, or zero executed tests**. It is not a replacement for the repository's separate default, no-default, WASM, release, security, and cross-platform gates.
 
 Without `--binary`, the existing runner still builds and tests its debug executable; do not use the implicit mode as evidence about published release artifacts. A passed binary-selection test proves the harness selected the requested executable; it does not demonstrate language conformance.
 
