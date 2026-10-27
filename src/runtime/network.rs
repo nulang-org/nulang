@@ -3522,7 +3522,7 @@ mod tests {
             if expect_success {
                 assert!(
                     result.is_ok(),
-                    "sender must accept genuine certificate identity: {result:?}"
+                    "sender must accept genuine certificate identity"
                 );
             } else {
                 assert_eq!(
