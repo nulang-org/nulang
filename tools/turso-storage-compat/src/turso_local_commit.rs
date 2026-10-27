@@ -236,6 +236,16 @@ async fn inside_transaction(
 /// Attempt a single all-or-nothing local Turso write, using Nulang's exact
 /// canonical transition digest and schema. Caller must opt in explicitly.
 pub async fn commit(conn: &turso::Connection, t: &DurableTransition) -> io::Result<DurableCommit> {
+    commit_with_precommit_hook(conn, t, || {}).await
+}
+
+/// Test-only interruption hook: fires after all writes and the tail CAS,
+/// but before COMMIT. The cross-process harness SIGKILLs the child there.
+pub async fn commit_with_precommit_hook(
+    conn: &turso::Connection,
+    t: &DurableTransition,
+    before_commit: impl FnOnce(),
+) -> io::Result<DurableCommit> {
     // FULL is a per-connection SQLite policy. Fail closed before BEGIN if
     // a caller inadvertently used NORMAL/OFF (no fsync on each commit).
     let mut sync = conn
@@ -276,6 +286,7 @@ pub async fn commit(conn: &turso::Connection, t: &DurableTransition) -> io::Resu
         })?;
         return Err(error);
     }
+    before_commit();
     if let Err(error) = conn.execute("COMMIT", ()).await {
         let rollback = conn.execute("ROLLBACK", ()).await;
         return Err(io::Error::other(format!(

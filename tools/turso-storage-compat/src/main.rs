@@ -1,5 +1,6 @@
 //! Manual, isolated compatibility gate for replacing libSQL's local SQLite
 //! driver. This does NOT migrate cloud URLs, credentials or production data.
+mod process_recovery;
 mod turso_local_commit;
 
 use nulang::durable_effect::{DurableEffectId, DurableEffectRecord, DurableEffectSpec};
@@ -14,6 +15,10 @@ use nulang::semantic_identity::{effect_site_id, EffectSiteOwnerKind};
 use std::{collections::HashMap, error::Error};
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<_> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--process-worker") {
+        return process_recovery::worker(&args[2..]);
+    }
     let temp = tempfile::tempdir()?;
     let db_file = temp.path().join("durable.db");
 
@@ -665,6 +670,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Ok::<(), Box<dyn Error>>(())
     })?;
 
+    process_recovery::verify()?;
     println!(
         "PASS: real-schema libSQL/Turso bidirectional alternating LibsqlStore/Turso commits, restart, fencing, and rollback parity"
     );
