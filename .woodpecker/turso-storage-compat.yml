@@ -1,0 +1,46 @@
+# Dedicated test-only Turso persistence compatibility evidence.
+# This intentionally does NOT replace required root security/release gates.
+# Fork PRs MUST require Woodpecker approval before running untrusted Rust
+# build scripts on the self-hosted runner. No secrets or privileged plugins.
+labels:
+  platform: linux/amd64
+  pool: bootstrap-ci
+
+# Only compatible changes and explicit operator-run investigations.
+# No target-branch filter: migration PRs use a draft stacked base.
+when:
+  - event: pull_request
+    path:
+      include:
+        - "tools/turso-storage-compat/**"
+        - ".woodpecker/turso-storage-compat.yml"
+  - event: push
+    branch: main
+    path:
+      include:
+        - "tools/turso-storage-compat/**"
+        - ".woodpecker/turso-storage-compat.yml"
+  - event: manual
+
+concurrency:
+  limit: 1
+  group: turso-storage-compat-${CI_COMMIT_PULL_REQUEST}
+
+steps:
+  - name: turso-local-recovery
+    image: rust:1.95-bookworm
+    environment:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_TARGET_DIR: /tmp/nulang-turso-compat-target
+    commands:
+      - set -eu
+      - echo "Checking Turso compatibility for $(git rev-parse HEAD)"
+      - apt-get update
+      - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-dev pkg-config clang libclang-dev
+      - rustup component add rustfmt clippy
+      # A test hang or wedged child process must not exhaust the runner.
+      - timeout --signal=TERM --kill-after=30s 2400s bash tools/turso-storage-compat/ci-validate.sh
+      - git diff --check

@@ -89,10 +89,21 @@ consensus, adversarial filesystem I/O failures, or remote service semantics.
 The callback and child entrypoint exist only in this separate manual test
 workspace, not in the production Nulang storage implementation.
 
-No exact-head hosted execution of this *standalone* harness is implied by
-root CI success. Before a driver rollout, wire these tests to a secure,
-resource-budgeted hosted lane and then complete the release matrix and
-security audit requirements from #2293.
+The dedicated Woodpecker workflow at
+`.woodpecker/turso-storage-compat.yml` runs the standalone harness on
+path-scoped pull requests (including stacked draft bases), `main` pushes
+touching the probe, or explicit manual events. It uses an unprivileged
+Rust 1.95 container, a 40-minute shell timeout plus 30-second kill grace,
+two Cargo build jobs, no credentials, strict Clippy, formatting, locked
+metadata and real executable recovery tests. Forked/untrusted PRs MUST
+require operator approval on the Woodpecker server; do not expose secrets
+to the workflow. This added config is **not evidence it actually ran
+on the exact head**: inspect an actual Woodpecker pipeline result,
+head SHA and complete step logs before certification.
+
+Root GitHub CI success alone does not run or certify this standalone
+probe. Both the existing release matrix and RustSec audit gates from
+#2293 remain mandatory and independent.
 
 This remains a test-only prototype. It does not prove physical power-loss
 crash consistency, authenticated remote transport, independent schema
@@ -102,9 +113,9 @@ Cargo.lock is intentionally scoped to this **test-only** workspace and
 includes the existing legacy libSQL stack: it is not a security-clean
 production dependency graph.
 
-**Passing is not permission to migrate.** Multi-process contention,
-crash and power-loss durability, real Turso-backed commit/CAS behavior,
-Turso-native durable commit/CAS, restart and concurrent-owner fencing,
-full actor recovery and workflow/outbox effect delivery semantics,
-schema/authority migration, and remote Turso authentication and transaction semantics
+**Passing is not permission to migrate.** Beyond these local process
+and restart tests, cross-host coordination, physical power-loss and I/O fault
+durability, a production Turso `PersistenceStore` integration, full actor
+recovery and workflow/outbox effect-delivery guarantees, independent
+schema/authority migration, and remote Turso TLS/authenticated transactions
 must pass their own recovery and security gates before any replacement.
