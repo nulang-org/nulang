@@ -84,3 +84,18 @@ fn invalid_identity_and_output_reference_do_not_mutate_state() {
     assert!(task.committed().is_none());
     assert!(matches!(task.commit(&owner, [4; 32]), Err(CommitError::NotStaged)));
 }
+
+#[test]
+fn an_attempt_token_from_another_task_is_not_authorized() {
+    let mut task_a = TaskOutputState::new("task-a").unwrap();
+    let mut task_b = TaskOutputState::new("task-b").unwrap();
+    let token_a = task_a.assign("same-worker").unwrap();
+    let token_b = task_b.assign("same-worker").unwrap();
+    assert_ne!(token_a, token_b);
+    assert!(matches!(
+        task_b.stage(&token_a, "staging/task-a", [9; 32]),
+        Err(CommitError::Fenced)
+    ));
+    task_b.stage(&token_b, "staging/task-b", [8; 32]).unwrap();
+    assert_eq!(task_b.commit(&token_b, [8; 32]).unwrap(), CommitDecision::Won);
+}
