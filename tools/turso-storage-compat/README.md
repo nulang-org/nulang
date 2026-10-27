@@ -56,11 +56,48 @@ The runner now verifies all of the following using real disposable files:
   Turso-originated transitions is visible, including the exact digest and all
   six record groups, to another fresh Turso connection.
 
-This is a **single-process, single-writer** compatibility test. It does not
-prove two-writer cross-process races, crash consistency after forced power
-loss, storage recovery under I/O failure, authenticated remote transport,
-independent schema bootstrap, or the complete Nulang `PersistenceStore`
-API. No production service should use this prototype.
+## Cross-process recovery and competing writers (test-only)
+
+The manual `cargo +1.95.0 run --locked` runner now additionally launches the
+**same executable in separate OS processes** using an internal
+`--process-worker` mode. All tests use real, disposable, libSQL-initialized
+SQLite files. They are not run against production data or remote endpoints.
+
+- **Twelve conflicting two-writer races:** two child processes wait on a
+  parent-owned file barrier, attempt the same actor/epoch/sequence with
+  different payloads, and must produce exactly one successful commit. A fresh
+  legacy `LibsqlStore` verifies the winner's canonical digest, persisted
+  payload, one atomic tail and exactly one record in *each* snapshot,
+  journal, workflow/domain event, durable effect and outbox table. Losing
+  attempts must leave no duplicate or partial rows. The losing writer may
+  reject on SQLite lock contention or a conflicting digest; this does not
+  prove retry fairness or multi-host distributed arbitration.
+- **Forced termination before COMMIT:** a dedicated test-only callback signals
+  the parent *after* Turso stages all rows and the guarded tail update inside
+  `BEGIN IMMEDIATE`, then blocks. The parent sends a terminating SIGKILL to
+  that child. A newly reopened legacy connection must find **zero** rows in
+  all eight checked actor tables and no durable tail. A second child must
+  then acquire the released lock and successfully commit that same transition.
+- **Previous single-process checks remain active:** epoch/predecessor fencing,
+  conflicting digest and duplicate replay, `synchronous=FULL` guard,
+  injected late constraint rollback, and alternating Turso/libSQL/Turso
+  restart-read interoperability.
+
+Passing is evidence of **local two-process exclusion and OS-process-kill
+rollback**, not proof of physical power-loss durability, two-machine
+consensus, adversarial filesystem I/O failures, or remote service semantics.
+The callback and child entrypoint exist only in this separate manual test
+workspace, not in the production Nulang storage implementation.
+
+No exact-head hosted execution of this *standalone* harness is implied by
+root CI success. Before a driver rollout, wire these tests to a secure,
+resource-budgeted hosted lane and then complete the release matrix and
+security audit requirements from #2293.
+
+This remains a test-only prototype. It does not prove physical power-loss
+crash consistency, authenticated remote transport, independent schema
+bootstrap, complete Nulang `PersistenceStore` compatibility, or recovery
+under storage I/O failure. No production service should use it.
 Cargo.lock is intentionally scoped to this **test-only** workspace and
 includes the existing legacy libSQL stack: it is not a security-clean
 production dependency graph.
