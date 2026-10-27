@@ -1,26 +1,34 @@
 # Manual Turso storage-format compatibility probe
 
-This is a **standalone Cargo workspace** deliberately excluded from Nulang's
-production workspace, default feature set, CI dependency graph, and lockfile.
+This standalone Cargo workspace is excluded from Nulang's production workspace,
+default feature set, CI dependency graph, and root lockfile.
 
 Run manually from this directory:
 
 ```sh
-cargo +1.95.0 run
+cargo +1.95.0 run --locked
 ```
 
-The probe creates a disposable SQLite database with the real Nulang
-`LibsqlStore` (including full journal/snapshot schema), writes one snapshot
-and one journal entry, and closes the store. Turso then reads these rows and
-writes a second journal entry. Reopening with the old Nulang store must
-restore both entries and the correct activation epoch/state.
+The test uses the actual production Nulang `LibsqlStore` schema and checks:
 
-The test requires no external database, credentials, network service, or
-production file. **Passing does not authorize migration**: transactional
-durable transitions, crash/power-loss recovery, replay fencing, versioned
-schemas, authority metadata, cross-process behavior, and the remote Turso
-protocol are separately required gates. In particular, `turso`'s synced
-database API is **not** interchangeable with legacy `libsql::Builder::new_remote`.
+- Original Nulang store writes a snapshot and journal; Turso reads state,
+  activation epoch, sequence, and payload; Turso writes another journal row;
+  Nulang reopens and reads both records.
+- Nulang commits an actual durable transition. Identical replay succeeds;
+  conflicting retry and stale activation epoch fail. Turso reads the
+  committed tail, predecessor sequence, and complete digest.
+- Turso inserts into two durable tables within an immediate transaction,
+  triggers a duplicate-key error, and rolls back; neither table retains
+  the partial write, and Nulang sees no phantom committed tail.
 
-Do not merge this as a production driver replacement or change the
-existing `sqlite` feature based on this test alone.
+The probe is fully local, uses only disposable SQLite files, and requires
+no credentials, external service, production file, or live database.
+Cargo.lock is intentionally scoped to this **test-only** workspace and
+includes the existing legacy libSQL stack: it is not a security-clean
+production dependency graph.
+
+**Passing is not permission to migrate.** Multi-process contention,
+crash and power-loss durability, real Turso-backed commit/CAS behavior,
+durable outbox/effects, recovery fencing across restarts, schema/authority
+migration, and remote Turso authentication and transaction semantics
+must pass their own recovery and security gates before any replacement.
