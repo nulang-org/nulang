@@ -1975,6 +1975,7 @@ mod tests {
             .create_stream("events", FabricStreamConfig::default())
             .unwrap();
         store.append("events", b"original").unwrap();
+        // Recovery is a new ownership epoch, not a concurrent second writer.
         drop(store);
 
         let segments = list_segments(&root.join("events")).unwrap();
@@ -1983,8 +1984,6 @@ mod tests {
         let payload_offset = SEGMENT_HEADER_LEN + RECORD_HEADER_LEN;
         bytes[payload_offset] ^= 0xFF;
         fs::write(path, bytes).unwrap();
-        // Recovery is a new ownership epoch, not a concurrent second writer.
-        drop(store);
 
         let mut reopened = FileFabricStreamStore::open(&root).unwrap();
         let error = reopened
