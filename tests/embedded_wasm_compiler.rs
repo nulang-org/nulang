@@ -73,9 +73,13 @@ fn keywords_inside_a_string_are_not_treated_as_effectful_syntax() {
 fn refuses_interpolated_strings_before_nested_expression_parsing() {
     use nulang::lexer::{Lexer, TokenKind};
     let source = r#"fn main() { f"secret {42}" }"#;
-    let tokens = Lexer::new(source).lex().expect("f-string is lexically recognized");
+    let tokens = Lexer::new(source)
+        .lex()
+        .expect("f-string is lexically recognized");
     assert!(
-        tokens.iter().any(|token| matches!(token.kind, TokenKind::FStringLit(_))),
+        tokens
+            .iter()
+            .any(|token| matches!(token.kind, TokenKind::FStringLit(_))),
         "test must exercise the interpolated-string token"
     );
     assert!(compile_pure_source(source).is_err());
