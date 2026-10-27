@@ -6038,11 +6038,7 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
             .as_ref()
             .and_then(|c| c.get_node(ids[4]))
             .map(|info| (info.status, info.address));
-        let resolver_after = nodes[4]
-            .distributed
-            .resolver
-            .as_ref()
-            .map(|r| r.stats());
+        let resolver_after = nodes[4].distributed.resolver.as_ref().map(|r| r.stats());
         let actor_state = nodes[0].actors.get(&actor_id).map(|actor| {
             (
                 actor.mailbox.len(),
