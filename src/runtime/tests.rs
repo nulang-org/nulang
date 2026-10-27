@@ -5999,6 +5999,9 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
             actor.set_state_field("received", Value::int(n));
         });
     }
+    // Snapshot the resolver before the one-shot send. If delivery fails later,
+    // compare it with the post-send counters without retrying or masking loss.
+    let sender_resolver_before = nodes[4].distributed.resolver.as_ref().map(|r| r.stats());
     let target = ActorAddress::remote(ids[0], actor_id);
     nodes[4].send_distributed(target, "store", &[Value::int(44)]);
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -6019,10 +6022,48 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
         }
         sleep(Duration::from_millis(50));
     };
-    assert!(
-        delivered,
-        "remote delivery across the healed 5-node split-brain boundary failed"
-    );
+    // Diagnostics only on failure: no extra send, scheduling pass, time
+    // advance, or retry that could transform a genuine transport defect
+    // into an apparent success under load.
+    if !delivered {
+        let sender_view = nodes[4]
+            .distributed
+            .cluster
+            .as_ref()
+            .and_then(|c| c.get_node(ids[0]))
+            .map(|info| (info.status, info.address));
+        let receiver_view = nodes[0]
+            .distributed
+            .cluster
+            .as_ref()
+            .and_then(|c| c.get_node(ids[4]))
+            .map(|info| (info.status, info.address));
+        let resolver_after = nodes[4].distributed.resolver.as_ref().map(|r| r.stats());
+        let actor_state = nodes[0].actors.get(&actor_id).map(|actor| {
+            (
+                actor.mailbox.len(),
+                format!("{:?}", actor.run_state),
+                actor
+                    .get_state_field("received")
+                    .and_then(|value| value.as_int()),
+            )
+        });
+        panic!(
+            "remote delivery across healed 5-node split-brain boundary failed: \
+             from_node={:?} to_node={:?} to_actor={} expected_listen={:?} \
+             sender_view={:?} receiver_view={:?} resolver_before={:?} \
+             resolver_after={:?} actor_mailbox_run_state_received={:?}",
+            ids[4],
+            ids[0],
+            actor_id,
+            addrs[0],
+            sender_view,
+            receiver_view,
+            sender_resolver_before,
+            resolver_after,
+            actor_state,
+        );
+    }
 
     shutdown_nodes(&mut nodes.iter_mut().collect::<Vec<_>>());
 }
