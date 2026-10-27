@@ -38,7 +38,10 @@ fn conflicting_stages_and_losing_results_are_rejected() {
     let owner = task.assign("worker-a").unwrap();
     task.stage(&owner, "staging/first", [3; 32]).unwrap();
     task.stage(&owner, "staging/first", [3; 32]).unwrap();
-    assert!(matches!(task.stage(&owner, "staging/different", [3; 32]), Err(CommitError::StageConflict)));
+    assert!(matches!(
+        task.stage(&owner, "staging/different", [3; 32]),
+        Err(CommitError::StageConflict)
+    ));
     assert!(matches!(task.commit(&owner, [4; 32]), Err(CommitError::StageConflict)));
     task.commit(&owner, [3; 32]).unwrap();
     assert!(matches!(task.assign("worker-b"), Err(CommitError::AlreadyCommitted)));
@@ -66,7 +69,8 @@ fn corrupt_or_forward_versioned_checkpoints_fail_closed() {
     let mut task = TaskOutputState::new("task-7").unwrap();
     let lease = task.assign("worker-a").unwrap();
     task.stage(&lease, "staging/one", [5; 32]).unwrap();
-    let mut value: serde_json::Value = serde_json::from_slice(&task.checkpoint().unwrap()).unwrap();
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&task.checkpoint().unwrap()).unwrap();
     value["version"] = serde_json::json!(999);
     assert!(TaskOutputState::restore(&serde_json::to_vec(&value).unwrap()).is_err());
     value["version"] = serde_json::json!(1);
