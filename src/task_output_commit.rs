@@ -22,6 +22,7 @@ const CHECKPOINT_VERSION: u16 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AttemptToken {
+    pub task_key: String,
     pub attempt_id: String,
     pub epoch: u64,
 }
@@ -134,6 +135,7 @@ impl TaskOutputState {
         }
         let next_epoch = self.epoch.checked_add(1).ok_or(CommitError::EpochExhausted)?;
         let token = AttemptToken {
+            task_key: self.task_key.clone(),
             attempt_id,
             epoch: next_epoch,
         };
@@ -145,7 +147,7 @@ impl TaskOutputState {
     }
 
     fn require_owner(&self, token: &AttemptToken) -> Result<(), CommitError> {
-        if self.owner.as_ref() == Some(token) && token.epoch != 0 {
+        if self.owner.as_ref() == Some(token) && token.epoch != 0 && token.task_key == self.task_key {
             Ok(())
         } else {
             Err(CommitError::Fenced)
@@ -247,6 +249,7 @@ impl TaskOutputState {
                 if owner.epoch == 0
                     || owner.epoch != self.epoch
                     || owner.attempt_id.trim().is_empty()
+                    || owner.task_key != self.task_key
                 {
                     return Err(bad("invalid current attempt ownership"));
                 }
