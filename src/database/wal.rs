@@ -368,6 +368,11 @@ impl FileWal {
         // Called only while already holding the sidecar lock, also during
         // checkpoint reclaim. Never acquire a second lock on this path.
         let file_existed = path.exists();
+        // A persisted quota proves this WAL had an acknowledged owner.
+        // Missing storage must not be silently recreated as an empty tablet.
+        if durable_quota.is_some() && !file_existed {
+            return Err(WalError::QuotaWalMissing);
+        }
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -376,6 +381,11 @@ impl FileWal {
             .open(&path)?;
 
         if file.metadata()?.len() == 0 {
+            // A durable quota is evidence of previously initialized storage;
+            // a zero-length WAL must never be rewritten as a fresh database.
+            if durable_quota.is_some() {
+                return Err(WalError::QuotaWalEmpty);
+            }
             let header = encode_wal_header(0, None, None);
             file.write_all(&header)?;
             file.sync_data()?;
@@ -1423,6 +1433,8 @@ pub enum WalError {
         projected_bytes: u64,
     },
     QuotaCorrupt,
+    QuotaWalMissing,
+    QuotaWalEmpty,
     QuotaOwnerMismatch,
     QuotaAlreadySet {
         existing: u64,
@@ -1534,6 +1546,8 @@ impl fmt::Display for WalError {
                 "NuDB WAL append requires {projected_bytes} bytes, above caller budget of {max_bytes} bytes"
             ),
             Self::QuotaCorrupt => f.write_str("NuDB durable WAL quota sidecar is torn or corrupt"),
+            Self::QuotaWalMissing => f.write_str("NuDB quota-protected WAL is missing; refusing to recreate empty storage"),
+            Self::QuotaWalEmpty => f.write_str("NuDB quota-protected WAL is empty; refusing to reinitialize lost storage"),
             Self::QuotaOwnerMismatch => f.write_str("NuDB WAL owner/epoch differs from durable quota owner"),
             Self::QuotaAlreadySet { existing, requested } => write!(
                 f,

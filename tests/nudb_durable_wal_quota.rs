@@ -212,3 +212,90 @@ fn direct_batch_cannot_bypass_quota_or_invent_a_different_owner_epoch() {
     ));
     assert_eq!(fs::read(f.path()).unwrap(), before);
 }
+
+#[test]
+fn quota_protected_missing_wal_fails_closed_without_recreating_storage() {
+    let fixture = Fixture::new();
+    {
+        let mut db = fixture.open();
+        db.activate_durable_wal_quota(4096).unwrap();
+        assert_eq!(db.commit(write(&db, 8)).unwrap(), 1);
+    }
+    let persisted_quota = fs::read(fixture.quota()).unwrap();
+    fs::remove_file(fixture.path()).unwrap();
+
+    let reopened = WalBackedTablet::open(descriptor(), fixture.path());
+    assert!(matches!(
+        reopened,
+        Err(WalBackedError::Wal(WalError::QuotaWalMissing))
+    ));
+    assert!(
+        !fixture.path().exists(),
+        "open must not recreate a missing WAL"
+    );
+    assert_eq!(fs::read(fixture.quota()).unwrap(), persisted_quota);
+}
+
+#[test]
+fn missing_quota_protected_wal_cannot_be_replaced_from_checkpoint_implicitly() {
+    let fixture = Fixture::new();
+    {
+        let mut db = fixture.open();
+        db.activate_durable_wal_quota(4096).unwrap();
+        assert_eq!(db.commit(write(&db, 8)).unwrap(), 1);
+        db.publish_checkpoint().unwrap();
+    }
+    let checkpoint = fixture.path().with_extension("checkpoint");
+    assert!(checkpoint.exists());
+    let preserved_checkpoint = fs::read(&checkpoint).unwrap();
+    fs::remove_file(fixture.path()).unwrap();
+
+    assert!(matches!(
+        WalBackedTablet::open(descriptor(), fixture.path()),
+        Err(WalBackedError::Wal(WalError::QuotaWalMissing))
+    ));
+    assert!(!fixture.path().exists());
+    assert_eq!(fs::read(&checkpoint).unwrap(), preserved_checkpoint);
+}
+
+#[test]
+fn quota_protected_truncated_wal_fails_before_reinitialization() {
+    let fixture = Fixture::new();
+    {
+        let mut db = fixture.open();
+        db.activate_durable_wal_quota(4096).unwrap();
+        assert_eq!(db.commit(write(&db, 8)).unwrap(), 1);
+    }
+    let saved_quota = fs::read(fixture.quota()).unwrap();
+    fs::write(fixture.path(), []).unwrap();
+
+    let result = WalBackedTablet::open(descriptor(), fixture.path());
+    assert!(matches!(
+        result,
+        Err(WalBackedError::Wal(WalError::QuotaWalEmpty))
+    ));
+    assert_eq!(fs::metadata(fixture.path()).unwrap().len(), 0);
+    assert_eq!(fs::read(fixture.quota()).unwrap(), saved_quota);
+}
+
+#[test]
+fn quota_protected_truncated_wal_with_checkpoint_fails_without_modifying_either() {
+    let fixture = Fixture::new();
+    {
+        let mut db = fixture.open();
+        db.activate_durable_wal_quota(4096).unwrap();
+        assert_eq!(db.commit(write(&db, 8)).unwrap(), 1);
+        db.publish_checkpoint().unwrap();
+    }
+    let checkpoint = fixture.path().with_extension("checkpoint");
+    let saved_checkpoint = fs::read(&checkpoint).unwrap();
+    fs::write(fixture.path(), []).unwrap();
+
+    let result = WalBackedTablet::open(descriptor(), fixture.path());
+    assert!(matches!(
+        result,
+        Err(WalBackedError::Wal(WalError::QuotaWalEmpty))
+    ));
+    assert_eq!(fs::metadata(fixture.path()).unwrap().len(), 0);
+    assert_eq!(fs::read(checkpoint).unwrap(), saved_checkpoint);
+}
