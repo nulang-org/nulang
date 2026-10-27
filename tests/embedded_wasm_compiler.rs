@@ -21,7 +21,10 @@ fn repeated_pure_compilation_is_deterministic() {
 #[test]
 fn rejects_unresolved_types_or_syntax() {
     for src in ["fn main() { unknown_name }", "fn main( {", ""] {
-        assert!(compile_pure_source(src).is_err(), "input must fail: {src:?}");
+        assert!(
+            compile_pure_source(src).is_err(),
+            "input must fail: {src:?}"
+        );
     }
 }
 
