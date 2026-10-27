@@ -231,6 +231,13 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # Keep renderer-specific Rust references in the Web subsystem until
+      # its Cargo feature split has independent default/minimal conformance.
+      - name: Verify UI protocol ownership boundary
+        run: |
+          python3 -m unittest scripts/tests/test_check_ui_protocol_ownership.py
+          python3 scripts/check_ui_protocol_ownership.py
+
       # No python3-dev installed here on purpose: this job proves the
       # no-default-features build has zero PyO3/SQLite/LSP dependencies.
       - name: Build
