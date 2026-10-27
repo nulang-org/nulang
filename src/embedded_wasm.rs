@@ -29,7 +29,9 @@ fn rejected(reason: &str) -> NuError {
 /// In particular, a Wasm magic header is not full module validation.
 pub fn compile_pure_source(source: &str) -> NuResult<Vec<u8>> {
     if source.trim().is_empty() || source.len() > MAX_EMBEDDED_SOURCE_BYTES {
-        return Err(rejected("embedded compiler requires nonempty, bounded source"));
+        return Err(rejected(
+            "embedded compiler requires nonempty, bounded source",
+        ));
     }
 
     let tokens = Lexer::new(source).lex()?;
@@ -78,9 +80,14 @@ pub fn compile_pure_source(source: &str) -> NuResult<Vec<u8>> {
         return Err(rejected("embedded compiler rejects parser warnings"));
     }
     if ast.decls.is_empty()
-        || !ast.decls.iter().all(|decl| matches!(decl, Decl::Function { .. }))
+        || !ast
+            .decls
+            .iter()
+            .all(|decl| matches!(decl, Decl::Function { .. }))
     {
-        return Err(rejected("embedded compiler accepts only top-level functions"));
+        return Err(rejected(
+            "embedded compiler accepts only top-level functions",
+        ));
     }
     if !ast.decls.iter().any(|decl| {
         matches!(decl, Decl::Function { name, params, .. } if name == "main" && params.is_empty())
