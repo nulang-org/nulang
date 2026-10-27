@@ -1223,6 +1223,41 @@ fn lower_let_chain(first_body: &Expr, body: &mut hir::Body) -> hir::Operand {
     }
 }
 
+/// Lower a left-associative binary chain without one native Rust frame per
+/// operand. Preserve the original left-before-right evaluation order and the
+/// existing special lowering for assignments and ranges at the chain base.
+fn lower_binary_left_chain(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
+    let mut spine = Vec::new();
+    let mut tail = expr;
+    while let Expr::Binary {
+        op,
+        left,
+        right,
+        span,
+    } = tail
+    {
+        if matches!(op, BinOp::Assign | BinOp::Range) {
+            break;
+        }
+        spine.push((*op, right.as_ref(), *span));
+        tail = left;
+    }
+    let mut lhs = lower_expr(tail, body);
+    for (op, right, span) in spine.into_iter().rev() {
+        let rhs = lower_expr(right, body);
+        let ty = binary_type(&op, &lhs, &rhs);
+        let temp = fresh_temp_name();
+        body.push(hir::Stmt::Let {
+            name: temp.clone(),
+            ty: ty.clone(),
+            value: hir::RValue::Binary(op, lhs, rhs, ty.clone()),
+            span,
+        });
+        lhs = hir::Operand::Var(temp, ty);
+    }
+    lhs
+}
+
 /// Emit all active deferred expressions from all scopes in LIFO order.
 /// Snapshots the defer stack to avoid RefCell double-borrow when deferred
 /// expressions themselves contain blocks/if/match (which re-enter the stack).
@@ -1860,24 +1895,7 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
             });
             hir::Operand::Var(temp, ty)
         }
-        Expr::Binary {
-            op,
-            left,
-            right,
-            span,
-        } => {
-            let l = lower_expr(left, body);
-            let r = lower_expr(right, body);
-            let ty = binary_type(op, &l, &r);
-            let temp = fresh_temp_name();
-            body.push(hir::Stmt::Let {
-                name: temp.clone(),
-                ty: ty.clone(),
-                value: hir::RValue::Binary(*op, l, r, ty.clone()),
-                span: *span,
-            });
-            hir::Operand::Var(temp, ty)
-        }
+        Expr::Binary { .. } => lower_binary_left_chain(expr, body),
         Expr::Unary { op, expr, span } => {
             let e = lower_expr(expr, body);
             let ty = Type::unit();

@@ -40,10 +40,12 @@ def validate(ruleset):
     refs = conditions.get("ref_name")
     refs = refs if isinstance(refs, dict) else {}
     includes = refs.get("include")
-    if not isinstance(includes, list) or not includes or any(
-        ref not in ("refs/heads/main", "~DEFAULT_BRANCH") for ref in includes
+    # ~ALL is valid and *stronger* than main-only; do not force admins to
+    # weaken existing protection of other branches merely to fix main.
+    if not isinstance(includes, list) or not any(
+        ref in ("refs/heads/main", "~DEFAULT_BRANCH", "~ALL") for ref in includes
     ):
-        issues.append("ruleset must target the default branch only, never ~ALL")
+        issues.append("ruleset must include main, ~DEFAULT_BRANCH or ~ALL")
     excludes = refs.get("exclude")
     if not isinstance(excludes, list) or any(
         ref in ("refs/heads/main", "~DEFAULT_BRANCH", "~ALL") for ref in excludes

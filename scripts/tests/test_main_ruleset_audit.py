@@ -39,10 +39,21 @@ class MainRulesetAuditTests(unittest.TestCase):
     def test_complete_policy_is_accepted(self):
         self.assertEqual(audit.validate(safe_ruleset()), [])
 
-    def test_legacy_all_branches_scope_is_rejected(self):
+    def test_scope_missing_main_is_rejected(self):
+        rule = safe_ruleset()
+        rule["conditions"]["ref_name"]["include"] = ["refs/heads/develop"]
+        self.assertTrue(any("main" in s for s in audit.validate(rule)))
+
+    def test_all_branches_scope_protects_main_without_weakening_other_branches(self):
         rule = safe_ruleset()
         rule["conditions"]["ref_name"]["include"] = ["~ALL"]
-        self.assertTrue(any("default branch" in s for s in audit.validate(rule)))
+        self.assertEqual(audit.validate(rule), [])
+
+    def test_main_explicitly_excluded_must_fail_even_with_all_scope(self):
+        rule = safe_ruleset()
+        rule["conditions"]["ref_name"]["include"] = ["~ALL"]
+        rule["conditions"]["ref_name"]["exclude"] = ["refs/heads/main"]
+        self.assertTrue(any("exclude" in s for s in audit.validate(rule)))
 
     def test_missing_required_status_rule_is_rejected(self):
         rule = safe_ruleset()

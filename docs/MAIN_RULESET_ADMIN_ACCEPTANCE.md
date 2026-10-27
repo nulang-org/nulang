@@ -63,9 +63,11 @@ deliberately skipped for this PR.
 ## Administrator change and acceptance
 
 1. Open GitHub **Settings → Rules → Rulesets → rules (25012292)**.
-   Determine whether moving scope from `~ALL` to `~DEFAULT_BRANCH` is
-   appropriate for other long-lived protected branches; preserve any intended
-   additional rules by creating a separate protection policy if needed.
+   **Preserve `~ALL` branch coverage** unless the repository administrator
+   independently justifies a different scope and installs equivalent rules
+   for other branches. `~ALL` already protects `main`; it is not a defect.
+   The audit accepts `~ALL`, `~DEFAULT_BRANCH` or `refs/heads/main` as long as
+   `main` is not excluded.
 2. Add a `required_status_checks` rule for the stable job names above,
    selecting **GitHub Actions** as the producing app for each. Do not use
    `any source`, a path-filtered/check that is usually skipped, or old
