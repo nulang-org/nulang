@@ -27,6 +27,40 @@ The test uses the actual production Nulang `LibsqlStore` schema and checks:
 
 The probe is fully local, uses only disposable SQLite files, and requires
 no credentials, external service, production file, or live database.
+
+## Experimental local Turso commit (opt-in, test only)
+
+The separate `src/turso_local_commit.rs` module is called **only** by the
+manual compatibility probe. It is not a Nulang `PersistenceStore` adapter,
+and its dependencies are not part of Nulang's production workspace.
+
+It uses Nulang's canonical transition digest/structure validation, an
+`BEGIN IMMEDIATE` SQLite transaction, predecessor and activation-epoch
+fencing, digest-based idempotent replay, full snapshot/journal/workflow/domain/
+effect/outbox inserts, a guarded tail compare-and-swap, and explicit rollback
+on errors. A per-connection `PRAGMA synchronous` check refuses any mode other
+than `FULL` before returning a successful durable commit.
+
+The runner now verifies all of the following using real disposable files:
+
+- A Turso-authored full transition (including effect and outbox) can be
+  recovered using the original Nulang `LibsqlStore` after reopening it.
+- Identical replay is idempotent; conflicting digest, stale epoch, and
+  skipped predecessor are refused.
+- A deliberately injected late duplicate transition-key failure rolls back
+  all staged journal/workflow/domain/effect/outbox rows and does not advance
+  the tail; valid retry after removing the test-only fault succeeds.
+- Downgrading the connection to `synchronous=NORMAL` is rejected before the
+  write, and the actor's tail remains absent.
+- A third transition committed with original `LibsqlStore` after two
+  Turso-originated transitions is visible, including the exact digest and all
+  six record groups, to another fresh Turso connection.
+
+This is a **single-process, single-writer** compatibility test. It does not
+prove two-writer cross-process races, crash consistency after forced power
+loss, storage recovery under I/O failure, authenticated remote transport,
+independent schema bootstrap, or the complete Nulang `PersistenceStore`
+API. No production service should use this prototype.
 Cargo.lock is intentionally scoped to this **test-only** workspace and
 includes the existing legacy libSQL stack: it is not a security-clean
 production dependency graph.
