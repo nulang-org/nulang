@@ -42,6 +42,7 @@ pub fn compile_pure_source(source: &str) -> NuResult<Vec<u8>> {
         if matches!(
             token.kind,
             TokenKind::Import
+                | TokenKind::FStringLit(_)
                 | TokenKind::Extern
                 | TokenKind::Perform
                 | TokenKind::Effect
