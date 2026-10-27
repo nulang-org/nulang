@@ -15,6 +15,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# PR code is untrusted; only the main-branch benchmark history job needs writes.
+permissions:
+  contents: read
+
 jobs:
   # -----------------------------------------------------------------------
   # Documentation site + zero-install browser playground
@@ -81,7 +85,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      # Never expose coverage-upload credentials while executing PR code.
+      CODECOV_TOKEN: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.CODECOV_TOKEN || '' }}
     steps:
       - uses: actions/checkout@v7
 

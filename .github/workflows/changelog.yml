@@ -28,10 +28,10 @@ jobs:
 
       - name: Determine if changelog update is needed
         id: check
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
         run: |
-          PR_TITLE="${{ github.event.pull_request.title }}"
-          PR_LABELS="${{ toJson(github.event.pull_request.labels.*.name) }}"
-
           # Explicit exemption wins over title classification. Without this
           # ordering, feat/fix/perf PRs can never use the documented label.
           if echo "$PR_LABELS" | grep -qi "skip-changelog"; then
@@ -60,9 +60,11 @@ jobs:
 
       - name: Verify CHANGELOG.md was modified
         if: steps.check.outputs.needed == 'true'
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          git fetch origin "${{ github.base_ref }}"
-          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" | grep -q "^CHANGELOG.md$"; then
+          git fetch origin "$BASE_REF"
+          if git diff --name-only "origin/$BASE_REF...HEAD" | grep -q "^CHANGELOG.md$"; then
             echo "✓ CHANGELOG.md updated"
             exit 0
           fi
