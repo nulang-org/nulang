@@ -173,47 +173,9 @@ fn merge_imported_decls(
     Ok(())
 }
 
-/// Resolve stdlib imports identically for the parser and the recursive module
-/// resolver. In an installed distribution, prefer the stdlib alongside the
-/// executable. Source-built CLIs also support the build checkout when invoked
-/// from an unrelated package directory, without mutating process-global env.
-pub(crate) fn stdlib_import_path(module: &str) -> PathBuf {
-    let relative = format!(
-        "{}.nula",
-        module.replace("::", std::path::MAIN_SEPARATOR_STR)
-    );
-    if let Ok(root) = std::env::var("NULANG_STDLIB") {
-        // Explicit configuration must win even if its file is missing:
-        // report the bad path rather than silently loading other code.
-        return PathBuf::from(root).join(&relative);
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            let candidate = exe_dir.join("stdlib").join(&relative);
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        let candidate = cwd.join("src").join("stdlib").join(&relative);
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    let source_checkout = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("src")
-        .join("stdlib")
-        .join(&relative);
-    if source_checkout.is_file() {
-        return source_checkout;
-    }
-    PathBuf::from("src").join("stdlib").join(relative)
-}
-
 fn resolve_path(base: &Path, import: &str) -> PathBuf {
     if let Some(module) = import.strip_prefix("stdlib::") {
-        return stdlib_import_path(module);
+        return crate::parser::stdlib_import_path(module);
     }
 
     // @nulang/auth or @nulang/auth/session → resolved via NULANG_MODULE_PATH.

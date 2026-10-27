@@ -100,6 +100,46 @@ fn infix_precedence(op: &TokenKind) -> Option<(u8, bool)> {
     Some((prec, right_assoc))
 }
 
+/// Resolve stdlib imports identically for the parser and the recursive module
+/// resolver. In an installed distribution, prefer the stdlib alongside the
+/// executable. Source-built CLIs also support the build checkout when invoked
+/// from an unrelated package directory, without mutating process-global env.
+pub(crate) fn stdlib_import_path(module: &str) -> std::path::PathBuf {
+    let relative = format!(
+        "{}.nula",
+        module.replace("::", std::path::MAIN_SEPARATOR_STR)
+    );
+    if let Ok(root) = std::env::var("NULANG_STDLIB") {
+        // Explicit configuration must win even if its file is missing:
+        // report the bad path rather than silently loading other code.
+        return std::path::PathBuf::from(root).join(&relative);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let candidate = exe_dir.join("stdlib").join(&relative);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let candidate = cwd.join("src").join("stdlib").join(&relative);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    let source_checkout = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("stdlib")
+        .join(&relative);
+    if source_checkout.is_file() {
+        return source_checkout;
+    }
+    std::path::PathBuf::from("src")
+        .join("stdlib")
+        .join(relative)
+}
+
 // ---------------------------------------------------------------------------
 // Parser
 // ---------------------------------------------------------------------------
@@ -6201,7 +6241,7 @@ impl Parser {
     /// Resolve an import path to a file path. Handles stdlib:: prefix.
     fn resolve_import_path(&self, import_path: &str) -> Option<std::path::PathBuf> {
         if let Some(module) = import_path.strip_prefix("stdlib::") {
-            return Some(crate::resolver::stdlib_import_path(module));
+            return Some(stdlib_import_path(module));
         }
 
         // @nulang/auth or @nulang/auth/session -> resolved via NULANG_MODULE_PATH.
