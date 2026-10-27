@@ -49,6 +49,24 @@ fn refuses_effectful_and_actor_constructs() {
 }
 
 #[test]
+fn requires_unambiguous_zero_argument_main() {
+    for src in [
+        "fn helper() { 42 }",
+        "fn main(x: Int) { x }",
+        "module Hidden { fn main() { 42 } }",
+    ] {
+        assert!(compile_pure_source(src).is_err(), "must reject: {src:?}");
+    }
+}
+
+#[test]
+fn keywords_inside_a_string_are_not_treated_as_effectful_syntax() {
+    let wasm = compile_pure_source(r#"fn main() { "import extern perform spawn" }"#)
+        .expect("keywords inside string literal remain data");
+    assert!(wasm.starts_with(&[0, 97, 115, 109, 1, 0, 0, 0]));
+}
+
+#[test]
 fn bounded_source_and_unapproved_warnings_fail_closed() {
     let too_long = " ".repeat(4 * 1024 * 1024 + 1);
     assert!(compile_pure_source(&too_long).is_err());
