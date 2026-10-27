@@ -5536,19 +5536,70 @@ fn cluster_status(rt: &Runtime, node: NodeId) -> Option<NodeStatus> {
         .map(|info| info.status)
 }
 
-/// True once every node has every OTHER node in its ACTIVE view. The
-/// failure detector watches only the active view, so this — not
-/// `healthy_node_count` — is the real "failure detection is armed"
-/// convergence condition. Membership (gossip) converges in ~1 s virtual,
-/// but active views fill only through the 5 s repair cycle + reciprocal
-/// heartbeat confirmation.
+/// Membership in the active view is not proof that a peer is sendable:
+/// a stale Failed/Suspicious entry can still be present in that view.
+#[cfg(feature = "tcp")]
+fn active_view_has_healthy_peers(
+    local: NodeId,
+    active: &[NodeId],
+    expected: &[NodeId],
+    status: impl Fn(NodeId) -> Option<NodeStatus>,
+) -> bool {
+    expected.iter().all(|id| {
+        *id == local || (active.contains(id) && status(*id) == Some(NodeStatus::Healthy))
+    })
+}
+
+#[cfg(feature = "tcp")]
+#[test]
+fn active_view_containing_failed_peer_is_not_healed() {
+    let local = NodeId(1);
+    let peer = NodeId(2);
+    let expected = [local, peer];
+    let active = [peer];
+
+    for unsafe_status in [
+        NodeStatus::Joining,
+        NodeStatus::Suspicious,
+        NodeStatus::Failed,
+        NodeStatus::Leaving,
+    ] {
+        assert!(
+            !active_view_has_healthy_peers(local, &active, &expected, |_| Some(unsafe_status)),
+            "{unsafe_status:?} peer must not satisfy the post-heal send gate"
+        );
+    }
+    assert!(!active_view_has_healthy_peers(
+        local,
+        &active,
+        &expected,
+        |_| None,
+    ));
+    assert!(!active_view_has_healthy_peers(
+        local,
+        &[],
+        &expected,
+        |_| Some(NodeStatus::Healthy),
+    ));
+    assert!(active_view_has_healthy_peers(
+        local,
+        &active,
+        &expected,
+        |_| Some(NodeStatus::Healthy),
+    ));
+}
+
+/// True once every node both actively monitors every other peer AND knows
+/// it as Healthy. Mere presence in the active view can hide a Failed peer,
+/// so it cannot certify post-heal remote-send readiness.
 #[cfg(feature = "tcp")]
 fn active_views_converged(nodes: &[&Runtime], ids: &[NodeId]) -> bool {
     nodes.iter().all(|rt| {
         let c = rt.distributed.cluster.as_ref().unwrap();
-        let active: Vec<NodeId> = c.active_view().to_vec();
         let local = rt.distributed.node_id.unwrap();
-        ids.iter().all(|id| *id == local || active.contains(id))
+        active_view_has_healthy_peers(local, c.active_view(), ids, |id| {
+            c.get_node(id).map(|info| info.status)
+        })
     })
 }
 
@@ -5988,6 +6039,25 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
         let (first_four, last) = nodes.split_at_mut(4);
         pump_until_peer_roundtrip(&mut last[0], &mut first_four[0], Duration::from_secs(15));
     }
+
+    // The tracked transport/ACK check above pumps only the two endpoints.
+    // It can finish while the sender's *membership* has regressed to Failed,
+    // even with a correct address and a live TCP connection. The real remote
+    // send MUST NOT bypass the resolver; re-establish all-node Healthy status
+    // first using the same bounded virtual-clock progression as healing.
+    // No actor message is sent during this readiness check.
+    let mut post_probe_healthy = active_views_converged(&nodes.iter().collect::<Vec<_>>(), &ids);
+    for _ in 0..400 {
+        if post_probe_healthy {
+            break;
+        }
+        advance_all(&mut nodes.iter_mut().collect::<Vec<_>>(), step);
+        post_probe_healthy = active_views_converged(&nodes.iter().collect::<Vec<_>>(), &ids);
+    }
+    assert!(
+        post_probe_healthy,
+        "5-node membership was not fully Healthy before the one-shot post-heal send"
+    );
 
     // Cross-boundary delivery after healing: E (node 4) -> actor on A
     // (node 0).
