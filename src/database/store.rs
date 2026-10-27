@@ -191,6 +191,22 @@ impl WalBackedTablet {
         self.tablet.current_sequence()
     }
 
+    /// Activates an immutable WAL quota for this exact tablet/ownership epoch.
+    /// The sidecar is fsynced before success and enforced by all WAL append
+    /// paths, including direct FileWal and unbounded legacy tablet methods.
+    pub fn activate_durable_wal_quota(&mut self, max_bytes: u64) -> Result<(), WalBackedError> {
+        self.wal.activate_durable_quota(
+            self.tablet.descriptor().id(),
+            self.tablet.descriptor().ownership_epoch(),
+            max_bytes,
+        )?;
+        Ok(())
+    }
+
+    pub fn durable_wal_quota(&self) -> Option<u64> {
+        self.wal.durable_quota_bytes()
+    }
+
     pub fn prepare_write(
         &self,
         presented_epoch: u64,
