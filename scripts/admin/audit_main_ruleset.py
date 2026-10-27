@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Read-only, fail-closed GitHub main-branch ruleset audit (issue #1652)."""
 import argparse
+from fnmatch import fnmatchcase
 import json
 import os
 import sys
@@ -47,8 +48,14 @@ def validate(ruleset):
     ):
         issues.append("ruleset must include main, ~DEFAULT_BRANCH or ~ALL")
     excludes = refs.get("exclude")
+    # GitHub branch patterns may include globs. Reject any pattern that
+    # could exclude main; Python fnmatch is conservative for slash-spanning
+    # wildcards, so ambiguous patterns cannot silently waive protection.
     if not isinstance(excludes, list) or any(
-        ref in ("refs/heads/main", "~DEFAULT_BRANCH", "~ALL") for ref in excludes
+        not isinstance(ref, str)
+        or ref in ("~DEFAULT_BRANCH", "~ALL")
+        or fnmatchcase("refs/heads/main", ref)
+        for ref in excludes
     ):
         issues.append("ruleset must not exclude main or default branch")
     raw = ruleset.get("rules")

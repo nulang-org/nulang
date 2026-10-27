@@ -55,6 +55,18 @@ class MainRulesetAuditTests(unittest.TestCase):
         rule["conditions"]["ref_name"]["exclude"] = ["refs/heads/main"]
         self.assertTrue(any("exclude" in s for s in audit.validate(rule)))
 
+    def test_wildcard_exclusion_matching_main_is_rejected(self):
+        rule = safe_ruleset()
+        rule["conditions"]["ref_name"]["include"] = ["~ALL"]
+        rule["conditions"]["ref_name"]["exclude"] = ["refs/heads/m*"]
+        self.assertTrue(any("exclude" in s for s in audit.validate(rule)))
+
+    def test_exclusion_for_other_branch_preserves_main(self):
+        rule = safe_ruleset()
+        rule["conditions"]["ref_name"]["include"] = ["~ALL"]
+        rule["conditions"]["ref_name"]["exclude"] = ["refs/heads/automation/*"]
+        self.assertEqual(audit.validate(rule), [])
+
     def test_missing_required_status_rule_is_rejected(self):
         rule = safe_ruleset()
         rule["rules"].pop()
