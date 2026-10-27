@@ -178,3 +178,72 @@ fn sqlite_reopen_preserves_fenced_attempt_and_single_winner() {
     }
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_competing_writers_publish_only_one_distinct_output() {
+    use nulang::runtime::LibsqlStore;
+    use std::sync::{Arc, Barrier};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "nulang-task-output-race-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("tasks.db");
+    let token = {
+        let mut store = LibsqlStore::new(&path).unwrap();
+        DurableTaskOutputStore::new(&mut store, SLOT, KEY)
+            .unwrap()
+            .assign("one-authorized-attempt")
+            .unwrap()
+    };
+
+    let barrier = Arc::new(Barrier::new(3));
+    let mut workers = Vec::new();
+    for index in 0..2_u8 {
+        let path = path.clone();
+        let token = token.clone();
+        let barrier = Arc::clone(&barrier);
+        workers.push(std::thread::spawn(move || {
+            let mut store = LibsqlStore::new(&path).unwrap();
+            let mut task = DurableTaskOutputStore::new(&mut store, SLOT, KEY).unwrap();
+            let key = format!("objects/distinct-{index}");
+            let digest = [index + 1; 32];
+            barrier.wait();
+            task.stage(&token, &key, digest)?;
+            task.commit(&token, digest)
+        }));
+    }
+    barrier.wait();
+
+    let results = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("worker did not panic"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results.iter().filter(|result| {
+            matches!(result, Ok(CommitDecision::Won))
+        }).count(),
+        1,
+        "only one distinct output may be committed: {results:?}"
+    );
+
+    {
+        let mut store = LibsqlStore::new(&path).unwrap();
+        let task = DurableTaskOutputStore::new(&mut store, SLOT, KEY).unwrap();
+        let winner = task.load().unwrap().committed().unwrap().clone();
+        assert!(
+            winner.artifact_key == "objects/distinct-0"
+                || winner.artifact_key == "objects/distinct-1"
+        );
+        assert_eq!(winner.digest, if winner.artifact_key.ends_with("-0") {
+            [1; 32]
+        } else {
+            [2; 32]
+        });
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
