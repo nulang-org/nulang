@@ -1189,7 +1189,7 @@ impl EffectChecker {
                     if !grants.contains(category) {
                         return Err(NuError::EffectError {
                             msg: format!(
-                                "function '{name}' performs effect '{eff}' which requires resource capability '{category}' (not granted; grant it with --with={category})"
+                                "function '{name}' performs effect '{eff}' which requires resource capability '{category}' (not granted; grant it with --with {category})"
                             ),
                             span: Span::default(),
                             missing_effects: None,
@@ -4740,6 +4740,21 @@ mod tests {
         assert!(
             full.check_module(&ast.decls).is_ok(),
             "all resource categories granted must pass"
+        );
+    }
+
+    #[test]
+    fn test_resource_gate_diagnostic_uses_actual_cli_flag_syntax() {
+        let ast = parse_module("fn read_cfg() -> Unit ! {FS} { unit }");
+        let mut checker = EffectChecker::new();
+        checker.set_resource_grants(&[]);
+        let err = checker
+            .check_module(&ast.decls)
+            .expect_err("FS must be denied");
+        let rendered = format!("{err:?}");
+        assert!(
+            rendered.contains("--with fs") && !rendered.contains("--with=fs"),
+            "denial must suggest the recognized --with fs syntax: {rendered}"
         );
     }
 

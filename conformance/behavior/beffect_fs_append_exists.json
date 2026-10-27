@@ -1,1 +1,1 @@
-{ "exit_code": 0, "stdout": "foobar\nfalse" }
+{"exit_code":0,"stdout":"foobar\nfalse","capabilities":["fs"]}

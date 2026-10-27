@@ -16,6 +16,14 @@ The [Core release CLI conformance qualification](../.github/workflows/core-relea
 
 Without `--binary`, the existing runner still builds and tests its debug executable; do not use the implicit mode as evidence about published release artifacts. A passed binary-selection test proves the harness selected the requested executable; it does not demonstrate language conformance.
 
+## Explicit resource-capability fixtures
+
+A behavior expectation may opt into a minimal resource grant for **that one case** with `"capabilities": ["fs"]`, `"capabilities": ["net"]`, or `"capabilities": ["os"]`. The conformance runner validates a nonempty, unique subset of those three exact names before execution and adds `--with fs` (or the corresponding comma-separated list) to that executable invocation only. All fixtures without the field remain **ungranted**; unknown capabilities, raw flags, empty sets, duplicates and invalid types are not accepted as grants. The existing expected exit code, stdout, and stderr remain binding.
+
+The FS and Process tests now explicitly declare their required resource permission rather than weakening the CLI's default-deny admission policy. The closed-body/open-effect-row fixture likewise declares `fs` because its public function signature includes FS even when its body only prints. This **does not** authorize network listeners or broader system access globally. Do not auto-grant missing permissions merely to obtain a green suite. There is a separate `System.arg(1)`/CLI-flag argv semantic mismatch to investigate; it is intentionally not hidden by this change.
+
+On unexpected exit codes or stdout, the runner prints a bounded excerpt of actual stderr so resource denials can be distinguished from compiler/runtime defects.
+
 ## Admission policy
 
 - **RED until proven green:** The full behavior corpus currently contains failing fixtures. Never shrink the corpus, silently skip or rewrite expectations, mark this job `continue-on-error`, or label an incomplete run a production qualification.

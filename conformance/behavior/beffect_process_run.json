@@ -1,1 +1,1 @@
-{ "exit_code": 0, "stdout": "conformance\ntrue" }
+{"exit_code":0,"stdout":"conformance\ntrue","capabilities":["os"]}

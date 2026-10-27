@@ -1,5 +1,10 @@
 # Nulang Changelog
 
+### Explicit conformance resource grants and accurate CLI diagnostics (review-only) — 2026-10-26
+- **Only individually authorized conformance fixtures receive FS or OS resource grants** through strict `capabilities` metadata; all other cases retain the existing default-deny CLI behavior. Five previously failing FS/Process/effect-row cases have unchanged expected exit/stdout, and match a prebuilt diagnostic CLI when given their explicit grants. This does not claim exact-head release parity until CI re-runs.
+- **The conformance runner surfaces bounded actual stderr on unexpected results** instead of hiding resource-denial messages when no expected stderr substring exists. Reject malformed or unknown grant metadata before execution. The CLI permission error now points to its real `--with fs` syntax rather than the unrecognized `--with=fs` spelling. The separate `System.arg` flag/argv mismatch remains unresolved and is not waived.
+- **Production release gate stays red** for any remaining semantic, permission, crash or workflow fixture failure; no global resource grant, fixture deletion or `continue-on-error` has been introduced.
+
 ### Exact release CLI conformance qualification (review-only) — 2026-10-26
 - **The fail-closed conformance runner accepts an explicit `--binary` executable**, allowing the actual `--release --no-default-features --features release-cli` artifact to be tested instead of independently rebuilding debug mode. The old no-argument behavior remains available; a missing supplied binary never falls back to debug.
 - **A path-filtered, non-required PR qualification workflow runs all checked-in behavior fixtures** against the built release CLI and exits nonzero on any mismatch. PR events validate the workflow before it is merged to the default branch; manual dispatch is also available once the workflow exists on `main`. Current known conformance failures remain visible and unwaived. Focused Python tests pin artifact selection, missing binaries, empty suites, failing cases and legacy default behavior. This does not certify the distributed runtime, storage or the security stack.
