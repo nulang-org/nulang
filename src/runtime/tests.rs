@@ -5132,10 +5132,35 @@ fn pump_until_addresses_converge(
         if converged {
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "cluster addresses did not converge to real listen addresses within the timeout"
-        );
+        if Instant::now() >= deadline {
+            // The recovered transport can retain an ephemeral source address
+            // even after active-view convergence. Log only actual mismatches
+            // on failure, without changing deadlines or network processing.
+            let mismatches: Vec<_> = nodes
+                .iter()
+                .flat_map(|rt| {
+                    let local = rt.distributed.node_id.unwrap();
+                    let cluster = rt.distributed.cluster.as_ref().unwrap();
+                    listen.iter().filter_map(move |&(peer, expected)| {
+                        if peer == local {
+                            return None;
+                        }
+                        let observed = cluster.get_node(peer);
+                        (observed.map(|info| info.address) != Some(expected)).then(|| {
+                            (
+                                local,
+                                peer,
+                                expected,
+                                observed.map(|info| (info.address, info.status)),
+                            )
+                        })
+                    })
+                })
+                .collect();
+            panic!(
+                "cluster addresses did not converge to real listen addresses within the timeout; mismatches={mismatches:?}"
+            );
+        }
         sleep(Duration::from_millis(50));
     }
 }
@@ -5146,6 +5171,180 @@ fn pump_until_addresses_converge(
 /// it can briefly describe a stale TCP stream that has not observed EOF yet.
 /// Before a one-shot post-heal actor send, require a tracked heartbeat ACK from
 /// the intended peer so the test proves bidirectional transport readiness.
+/// A unidirectional tracked ACK does not prove the sender may route actor
+/// messages: the resolver still rejects a peer marked Failed.
+#[cfg(feature = "tcp")]
+#[test]
+fn test_roundtrip_rearms_sender_membership_before_actor_send() {
+    let mut sender = start_distributed_node();
+    let mut peer = start_distributed_node();
+    let sender_addr = sender.distributed.transport.as_ref().unwrap().listen_addr();
+    let peer_addr = peer.distributed.transport.as_ref().unwrap().listen_addr();
+    let peer_id = peer.distributed.node_id.unwrap();
+    sender.join_cluster(peer_addr);
+    peer.join_cluster(sender_addr);
+    pump_until_converged(&mut [&mut sender, &mut peer], 2, Duration::from_secs(15));
+
+    // Reproduce the post-heal state observed under concurrent CI load:
+    // authoritative address is correct, but sender still considers peer dead.
+    sender
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .merge_membership(vec![crate::runtime::cluster::NodeGossip {
+            node_id: peer_id,
+            address: peer_addr,
+            status: NodeStatus::Failed,
+            incarnation: 1_000_000,
+        }]);
+    assert_eq!(cluster_status(&sender, peer_id), Some(NodeStatus::Failed));
+
+    pump_until_peer_roundtrip(&mut sender, &mut peer, Duration::from_secs(5));
+    assert_eq!(
+        cluster_status(&sender, peer_id),
+        Some(NodeStatus::Healthy),
+        "a heartbeat ACK is not readiness if sender's resolver still rejects the peer",
+    );
+    shutdown_nodes(&mut [&mut sender, &mut peer]);
+}
+
+/// A transport ACK is not enough for actor routing: the address resolver
+/// refuses targets whose membership status is still Failed after a heal.
+/// Require a verified transport exchange in BOTH directions and healthy
+/// membership on BOTH sides before the one-shot actor send.
+#[cfg(feature = "tcp")]
+fn post_heal_roundtrip_ready(
+    sender: &Runtime,
+    peer: &Runtime,
+    forward_sequences: &[u64],
+    reverse_sequences: &[u64],
+) -> bool {
+    let sender_id = sender.distributed.node_id.expect("sender node id");
+    let peer_id = peer.distributed.node_id.expect("peer node id");
+    let healthy = |rt: &Runtime, id| {
+        rt.distributed
+            .cluster
+            .as_ref()
+            .and_then(|cluster| cluster.get_node(id))
+            .is_some_and(|info| info.status == NodeStatus::Healthy)
+    };
+    healthy(sender, peer_id)
+        && healthy(peer, sender_id)
+        && forward_sequences
+            .iter()
+            .any(|seq| sender.is_acked_from(peer_id, *seq))
+        && reverse_sequences
+            .iter()
+            .any(|seq| peer.is_acked_from(sender_id, *seq))
+}
+
+/// A single forward ACK must never qualify a Failed membership entry as
+/// ready for the AddressResolver's fail-closed one-shot actor send.
+#[cfg(feature = "tcp")]
+#[test]
+fn test_post_heal_roundtrip_requires_healthy_bidirectional_evidence() {
+    let mut sender = start_distributed_node();
+    let mut peer = start_distributed_node();
+    let sender_id = sender.distributed.node_id.unwrap();
+    let peer_id = peer.distributed.node_id.unwrap();
+    let sender_addr = sender.distributed.transport.as_ref().unwrap().listen_addr();
+    let peer_addr = peer.distributed.transport.as_ref().unwrap().listen_addr();
+    sender
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(peer_id, peer_addr);
+    peer.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(sender_id, sender_addr);
+
+    sender.acked_packets.insert(41);
+    sender.acked_packets_by_peer.insert((peer_id.0, 41));
+    assert!(!post_heal_roundtrip_ready(&sender, &peer, &[41], &[42]));
+    peer.acked_packets.insert(42);
+    peer.acked_packets_by_peer.insert((sender_id.0, 42));
+    assert!(post_heal_roundtrip_ready(&sender, &peer, &[41], &[42]));
+
+    sender
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .merge_membership(vec![crate::runtime::cluster::NodeGossip {
+            node_id: peer_id,
+            address: peer_addr,
+            status: NodeStatus::Failed,
+            incarnation: 1_000_000,
+        }]);
+    assert_eq!(cluster_status(&sender, peer_id), Some(NodeStatus::Failed));
+    assert!(
+        !post_heal_roundtrip_ready(&sender, &peer, &[41], &[42]),
+        "ACKs cannot override the resolver's failed membership gate",
+    );
+    sender
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(peer_id, peer_addr);
+    assert!(post_heal_roundtrip_ready(&sender, &peer, &[41], &[42]));
+    shutdown_nodes(&mut [&mut sender, &mut peer]);
+}
+
+/// A sequence from an unrelated connection must not authenticate the peer
+/// whose membership has healed: tracked packet IDs are transport-local.
+#[cfg(feature = "tcp")]
+#[test]
+fn test_post_heal_roundtrip_rejects_wrong_peer_ack_sequence() {
+    let mut sender = start_distributed_node();
+    let mut peer = start_distributed_node();
+    let sender_id = sender.distributed.node_id.unwrap();
+    let peer_id = peer.distributed.node_id.unwrap();
+    let sender_addr = sender.distributed.transport.as_ref().unwrap().listen_addr();
+    let peer_addr = peer.distributed.transport.as_ref().unwrap().listen_addr();
+    sender
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(peer_id, peer_addr);
+    peer.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(sender_id, sender_addr);
+
+    let unrelated = NodeId(0xf00d_cafe);
+    let forward_seq = 101;
+    let reverse_seq = 102;
+    sender.acked_packets.insert(forward_seq);
+    sender
+        .acked_packets_by_peer
+        .insert((unrelated.0, forward_seq));
+    peer.acked_packets.insert(reverse_seq);
+    peer.acked_packets_by_peer
+        .insert((sender_id.0, reverse_seq));
+
+    assert!(
+        !post_heal_roundtrip_ready(&sender, &peer, &[forward_seq], &[reverse_seq]),
+        "an unrelated peer's ACK must never prove the intended peer is ready"
+    );
+    sender
+        .acked_packets_by_peer
+        .insert((peer_id.0, forward_seq));
+    assert!(post_heal_roundtrip_ready(
+        &sender,
+        &peer,
+        &[forward_seq],
+        &[reverse_seq]
+    ));
+    shutdown_nodes(&mut [&mut sender, &mut peer]);
+}
+
 #[cfg(feature = "tcp")]
 fn pump_until_peer_roundtrip(sender: &mut Runtime, peer: &mut Runtime, timeout: Duration) {
     let deadline = Instant::now() + timeout;
@@ -5158,13 +5357,21 @@ fn pump_until_peer_roundtrip(sender: &mut Runtime, peer: &mut Runtime, timeout: 
         .and_then(|cluster| cluster.get_node(peer_id))
         .map(|info| info.address)
         .expect("peer must exist in sender membership");
+    let sender_addr = peer
+        .distributed
+        .cluster
+        .as_ref()
+        .and_then(|cluster| cluster.get_node(sender_id))
+        .map(|info| info.address)
+        .expect("sender must exist in peer membership");
     let mut probe_sequences = Vec::new();
+    let mut reverse_sequences = Vec::new();
 
     loop {
         peer.process_network();
         sender.process_network();
 
-        if probe_sequences.iter().any(|seq| sender.is_acked(*seq)) {
+        if post_heal_roundtrip_ready(sender, peer, &probe_sequences, &reverse_sequences) {
             return;
         }
 
@@ -5189,10 +5396,34 @@ fn pump_until_peer_roundtrip(sender: &mut Runtime, peer: &mut Runtime, timeout: 
                 panic!("TCP readiness probe heartbeat was rejected before send")
             }
         }
+        // The receiver must also heartbeat the sender: a forward heartbeat
+        // may be acknowledged while the sender still considers the receiver
+        // Failed. The reverse heartbeat repairs that membership view.
+        match peer
+            .distributed
+            .transport
+            .as_mut()
+            .expect("peer transport")
+            .send_tracked(
+                sender_id,
+                sender_addr,
+                Packet::Heartbeat {
+                    node_id: peer_id,
+                    timestamp: 0,
+                },
+            ) {
+            TrackedSendOutcome::Sent(seq) => reverse_sequences.push(seq),
+            TrackedSendOutcome::Unsupported => {
+                panic!("reverse TCP readiness probe lacks tracked-send support")
+            }
+            TrackedSendOutcome::Rejected => {
+                panic!("reverse TCP readiness heartbeat was rejected before send")
+            }
+        }
 
         assert!(
             Instant::now() < deadline,
-            "transport did not complete a heartbeat/ACK roundtrip to peer {:?}; local={:?}, cluster_addr={:?}, probes={}",
+            "transport did not complete a healthy bidirectional heartbeat/ACK roundtrip to peer {:?}; local={:?}, cluster_addr={:?}, probes={}",
             peer_id,
             sender.distributed.node_id,
             sender
@@ -5898,10 +6129,36 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
             break;
         }
     }
-    assert!(
-        converged,
-        "5-node cluster did not converge to fully-armed failure detection (active views)"
-    );
+    if !converged {
+        // Failure-only, read-only evidence: separate a missing/Failed member
+        // from a Healthy passive/probationary peer that never armed its
+        // reciprocal heartbeat. Do not extend the virtual clock budget.
+        let states: Vec<_> = nodes
+            .iter()
+            .map(|rt| {
+                let local = rt.distributed.node_id.unwrap();
+                let c = rt.distributed.cluster.as_ref().unwrap();
+                let peers: Vec<_> = ids
+                    .iter()
+                    .filter(|&&peer| peer != local)
+                    .map(|&peer| {
+                        let info = c.get_node(peer);
+                        (
+                            peer,
+                            info.map(|x| (x.status, x.address)),
+                            c.active_view().contains(&peer),
+                            c.passive_view().contains(&peer),
+                            c.probationary().iter().any(|&(id, _)| id == peer),
+                        )
+                    })
+                    .collect();
+                (local, c.healthy_node_count(), peers)
+            })
+            .collect();
+        panic!(
+            "5-node cluster did not converge to fully-armed failure detection (active views): states={states:?}"
+        );
+    }
 
     // Split {A,B} | {C,D,E}.
     let ab_side: HashSet<NodeId> = HashSet::from([ids[2], ids[3], ids[4]]);
@@ -6019,9 +6276,46 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
         }
         sleep(Duration::from_millis(50));
     };
+    // A tracked heartbeat roundtrip passed before the one-shot actor send.
+    // On failure, distinguish a stale route/connection from a message stuck
+    // in the receiver mailbox or a missing behavior dispatch contract. Keep
+    // this diagnostic read-only: the recovery assertion must not gain retries,
+    // longer deadlines, or a modified network/scheduler execution path.
+    let sender_peer = nodes[4]
+        .distributed
+        .cluster
+        .as_ref()
+        .and_then(|cluster| cluster.get_node(ids[0]))
+        .map(|info| (info.status, info.address));
+    let sender_connection = nodes[4]
+        .distributed
+        .transport
+        .as_ref()
+        .and_then(|transport| transport.connection_addr(ids[0]));
+    let receiver_peer = nodes[0]
+        .distributed
+        .cluster
+        .as_ref()
+        .and_then(|cluster| cluster.get_node(ids[4]))
+        .map(|info| (info.status, info.address));
+    let receiver_connection = nodes[0]
+        .distributed
+        .transport
+        .as_ref()
+        .and_then(|transport| transport.connection_addr(ids[4]));
+    let receiver_actor = nodes[0].actors.get(&actor_id).map(|actor| {
+        (
+            actor.state,
+            actor.mailbox.len(),
+            actor
+                .get_state_field("received")
+                .and_then(|value| value.as_int()),
+        )
+    });
+    let receiver_behavior = nodes[0].behavior_id_for(actor_id, "store");
     assert!(
         delivered,
-        "remote delivery across the healed 5-node split-brain boundary failed"
+        "remote delivery across the healed 5-node split-brain boundary failed: sender_peer={sender_peer:?}, sender_connection={sender_connection:?}, receiver_peer={receiver_peer:?}, receiver_connection={receiver_connection:?}, receiver_actor={receiver_actor:?}, receiver_behavior={receiver_behavior:?}"
     );
 
     shutdown_nodes(&mut nodes.iter_mut().collect::<Vec<_>>());
@@ -7351,6 +7645,88 @@ fn test_dst_run_scheduler_deterministic_reproducible() {
     let v2 = run_with_seed(42);
     assert_eq!(v1, v2, "same seed must produce same result");
     assert_eq!(v1, 5, "all 5 inc messages must be processed");
+}
+
+/// An authenticated transport peer cannot revive another member by
+/// impersonating its NodeId in a heartbeat payload. Ordinary recovery from
+/// that member's actual transport identity must remain possible.
+#[test]
+fn test_heartbeat_sender_claim_must_match_transport_peer() {
+    use crate::runtime::cluster::{ClusterState, NodeGossip, NodeStatus};
+    use crate::runtime::distributed::{process_network_packets, AddressResolver};
+    use crate::runtime::network::{DeterministicNetworkTransport, Packet};
+    use crate::runtime::NetworkTransport;
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+
+    let addr = |port| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let receiver_addr = addr(15111);
+    let victim_addr = addr(15112);
+    let attacker_addr = addr(15113);
+    let bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let mut receiver =
+        DeterministicNetworkTransport::bind_with_bus(receiver_addr, bus.clone()).unwrap();
+    let mut victim =
+        DeterministicNetworkTransport::bind_with_bus(victim_addr, bus.clone()).unwrap();
+    let mut attacker = DeterministicNetworkTransport::bind_with_bus(attacker_addr, bus).unwrap();
+    let receiver_id = receiver.node_id();
+    let victim_id = victim.node_id();
+    assert_ne!(victim_id, attacker.node_id());
+    receiver.register_on_bus();
+    victim.register_on_bus();
+    attacker.register_on_bus();
+    victim.connect(receiver_id, receiver_addr).unwrap();
+    attacker.connect(receiver_id, receiver_addr).unwrap();
+
+    let mut cluster = ClusterState::new(receiver_id, receiver_addr);
+    cluster.handle_heartbeat(victim_id, victim_addr);
+    cluster.merge_membership(vec![NodeGossip {
+        node_id: victim_id,
+        address: victim_addr,
+        status: NodeStatus::Failed,
+        incarnation: 1_000_000,
+    }]);
+    assert_eq!(
+        cluster.get_node(victim_id).unwrap().status,
+        NodeStatus::Failed
+    );
+    let mut runtime = Runtime::new();
+    let mut resolver = AddressResolver::new(receiver_id);
+
+    // Attacker's connection identifies attacker, but the payload claims victim.
+    attacker.send(
+        receiver_id,
+        receiver_addr,
+        Packet::Heartbeat {
+            node_id: victim_id,
+            timestamp: 0,
+        },
+    );
+    process_network_packets(&mut runtime, &mut receiver, &mut cluster, &mut resolver);
+    assert_eq!(
+        cluster.get_node(victim_id).unwrap().status,
+        NodeStatus::Failed,
+        "a forged heartbeat must not revive another transport peer",
+    );
+
+    // Recovery must still work when the same NodeId actually sent the frame.
+    victim.send(
+        receiver_id,
+        receiver_addr,
+        Packet::Heartbeat {
+            node_id: victim_id,
+            timestamp: 1,
+        },
+    );
+    process_network_packets(&mut runtime, &mut receiver, &mut cluster, &mut resolver);
+    assert_eq!(
+        cluster.get_node(victim_id).unwrap().status,
+        NodeStatus::Healthy
+    );
+    attacker.shutdown();
+    victim.shutdown();
+    receiver.shutdown();
 }
 
 /// Verify that `DeterministicNetworkTransport` correctly delivers
