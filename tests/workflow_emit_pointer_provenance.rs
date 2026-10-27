@@ -29,7 +29,8 @@ fn assert_rejected_without_mutation(rt: &mut Runtime, id: u64, args: &[Value]) {
         "failed serialization must not consume the replay identity"
     );
     assert_eq!(
-        rt.actors[&id].event_log.len(), log_len,
+        rt.actors[&id].event_log.len(),
+        log_len,
         "failed serialization must not publish an in-memory output"
     );
 }
@@ -40,7 +41,11 @@ fn workflow_output_rejects_live_string_from_another_actor() {
     let owner = workflow(&mut rt, "Owner");
     let other = workflow(&mut rt, "Foreign");
     assert_ne!(owner, other);
-    let foreign_string = rt.actors.get_mut(&other).unwrap().allocate_string("other actor");
+    let foreign_string = rt
+        .actors
+        .get_mut(&other)
+        .unwrap()
+        .allocate_string("other actor");
     assert!(!foreign_string.is_nil());
 
     assert_rejected_without_mutation(&mut rt, owner, &[foreign_string]);
@@ -52,18 +57,21 @@ fn mixed_local_and_foreign_payloads_reject_atomically_then_allow_same_replay_id(
     let owner = workflow(&mut rt, "Owner");
     let other = workflow(&mut rt, "Foreign");
     let activation = WorkflowActivationId::new(owner, 97);
-    rt.actors.get_mut(&owner).unwrap().current_workflow_activation = Some(activation);
+    rt.actors
+        .get_mut(&owner)
+        .unwrap()
+        .current_workflow_activation = Some(activation);
 
     let local_string = rt.actors.get_mut(&owner).unwrap().allocate_string("local");
-    let foreign_string = rt.actors.get_mut(&other).unwrap().allocate_string("foreign");
+    let foreign_string = rt
+        .actors
+        .get_mut(&other)
+        .unwrap()
+        .allocate_string("foreign");
     assert!(!local_string.is_nil());
     assert!(!foreign_string.is_nil());
 
-    assert_rejected_without_mutation(
-        &mut rt,
-        owner,
-        &[local_string, foreign_string],
-    );
+    assert_rejected_without_mutation(&mut rt, owner, &[local_string, foreign_string]);
     rt.try_emit_event(owner, "WorkflowOutput", &[local_string])
         .expect("a rejected mixed payload must not poison the next valid output");
 
@@ -72,9 +80,15 @@ fn mixed_local_and_foreign_payloads_reject_atomically_then_allow_same_replay_id(
         .persistence
         .read_workflow_events(owner)
         .into_iter()
-        .filter(|entry| matches!(entry, WorkflowEvent::Custom { name, .. } if name == "WorkflowOutput"))
+        .filter(
+            |entry| matches!(entry, WorkflowEvent::Custom { name, .. } if name == "WorkflowOutput"),
+        )
         .collect::<Vec<_>>();
-    assert_eq!(outputs.len(), 1, "exactly one durable output must be committed");
+    assert_eq!(
+        outputs.len(),
+        1,
+        "exactly one durable output must be committed"
+    );
 }
 
 #[test]
