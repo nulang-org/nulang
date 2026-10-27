@@ -100,7 +100,24 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Build
-        run: cargo build --locked --all-targets
+        id: profile_build
+        run: |
+          start=$(date +%s)
+          cargo build --locked --all-targets
+          echo "seconds=$(($(date +%s) - start))" >> "$GITHUB_OUTPUT"
+
+      # Uses an already built binary: this introduces no additional compilation.
+      - name: Record full-profile dependency and build baseline
+        continue-on-error: true
+        run: python3 scripts/profile_entropy.py --profile full --output profile-metrics/full.json --binary /tmp/cargo-target/debug/nulang --build-seconds "${{ steps.profile_build.outputs.seconds }}"
+
+      - name: Upload full-profile baseline
+        uses: actions/upload-artifact@v7
+        with:
+          name: nulang-profile-full-${{ github.sha }}
+          path: profile-metrics/full.json
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Test
         # nextest isolates individual tests in their own processes and schedules
@@ -157,7 +174,23 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build (public CLI release profile)
-        run: cargo build --locked --release --no-default-features --features release-cli --bin nulang
+        id: profile_build
+        run: |
+          start=$(date +%s)
+          cargo build --locked --release --no-default-features --features release-cli --bin nulang
+          echo "seconds=$(($(date +%s) - start))" >> "$GITHUB_OUTPUT"
+
+      - name: Record release-CLI dependency and build baseline
+        continue-on-error: true
+        run: python3 scripts/profile_entropy.py --profile release-cli --output profile-metrics/release-cli.json --binary /tmp/cargo-target/release/nulang --build-seconds "${{ steps.profile_build.outputs.seconds }}"
+
+      - name: Upload release-CLI baseline
+        uses: actions/upload-artifact@v7
+        with:
+          name: nulang-profile-release-cli-${{ github.sha }}
+          path: profile-metrics/release-cli.json
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Test (same profile as public release artifacts)
         run: cargo test --locked --release --no-default-features --features release-cli
@@ -234,7 +267,24 @@ jobs:
       # No python3-dev installed here on purpose: this job proves the
       # no-default-features build has zero PyO3/SQLite/LSP dependencies.
       - name: Build
-        run: cargo build --locked --all-targets --no-default-features
+        id: profile_build
+        run: |
+          start=$(date +%s)
+          cargo build --locked --all-targets --no-default-features
+          echo "seconds=$(($(date +%s) - start))" >> "$GITHUB_OUTPUT"
+
+      # Cargo metadata is cheap and avoids building extra feature profiles.
+      - name: Record target-filtered dependency closure for three profiles
+        continue-on-error: true
+        run: python3 scripts/profile_entropy.py --profile minimal --profile release-cli --profile full --output profile-metrics/all-dependencies.json --binary /tmp/cargo-target/debug/nulang --build-seconds "${{ steps.profile_build.outputs.seconds }}"
+
+      - name: Upload target-filtered dependency baseline
+        uses: actions/upload-artifact@v7
+        with:
+          name: nulang-profile-all-${{ github.sha }}
+          path: profile-metrics/all-dependencies.json
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Test
         run: cargo test --locked --no-default-features
