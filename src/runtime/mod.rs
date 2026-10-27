@@ -76,6 +76,8 @@ mod registry;
 pub mod resp;
 pub mod resp_cache;
 mod spawn;
+#[cfg(feature = "turso-remote-probe")]
+mod turso_remote_probe;
 #[cfg(feature = "native-codegen")]
 pub(crate) use spawn::spawn_from_module_with_authority;
 mod timer;
@@ -129,6 +131,8 @@ pub use resp_cache::*;
 pub use scheduler::*;
 pub use supervisor::*;
 pub use timer::*;
+#[cfg(feature = "turso-remote-probe")]
+pub use turso_remote_probe::TursoRemotePreflight;
 
 use crate::crdt_peer_sync::PeerCrdtFrontiers;
 use crate::types::{ExitReason, NuError, Span, VmSuspension};

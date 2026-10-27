@@ -62,6 +62,8 @@ mobile-runtime = []
 savina-bench = []
 python = ["dep:pyo3"]
 sqlite = ["dep:libsql", "dep:tokio"]
+# Opt-in HTTPS-only remote transport preflight. Does not replace PersistenceStore.
+turso-remote-probe = ["dep:turso_serverless", "dep:url"]
 lsp = ["dep:tower-lsp", "dep:tokio", "dep:futures", "dep:tower-service"]
 ai-runtime = ["dep:nulang-ai", "dep:nulang-ai-local", "dep:uuid", "dep:reqwest", "dep:tokio"]
 wasm-backend = ["native-codegen", "dep:wasm-encoder", "dep:wasmtime", "dep:wat", "dep:borsh"]
@@ -157,6 +159,9 @@ pyo3 = { version = "0.29", features = ["auto-initialize", "py-clone"], optional 
 # which nothing in this codebase calls (verified: no `.sync()`/
 # `new_synced_database` usage).
 libsql = { version = "0.10.0-pre.4", optional = true, default-features = false, features = ["core", "remote", "tls"] }
+# Separate modern HTTP remote driver, opt-in only; no production storage selection.
+turso_serverless = { version = "=0.1.3", optional = true }
+url = { version = "2", optional = true }
 # RocksDB persistence backend (feature `rocksdb`).
 rocksdb = { version = "0.21", optional = true, default-features = false }
 # PostgreSQL persistence backend (feature `postgres`). Sync wrapper over tokio-postgres.
