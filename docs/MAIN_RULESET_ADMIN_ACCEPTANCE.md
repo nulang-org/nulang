@@ -51,14 +51,24 @@ The expected provider is **GitHub Actions (integration ID 15368)**:
 - `Format, Clippy & Audit`
 - `Docs site & browser playground`
 - `Validate PR title`
-- `Analyze (Rust) (rust)`
+
+**Do not globally require `Analyze (Rust) (rust)` yet.** The current
+`.github/workflows/codeql.yml` uses pull-request path filters for Rust,
+Cargo, and the CodeQL workflow itself. GitHub does not create that check on
+Python-only changes, as demonstrated by #2286 on commit `04059ef54c250021c152854dd4c4ceeeca557f4d`.
+Requiring it in the main ruleset would make such PRs permanently blocked.
+CodeQL is still expected and reviewed when its workflow is triggered; to
+make it globally mandatory, first change its trigger to emit an always-present
+successful/failed job for every PR, with security review of that change.
 
 Before enforcing, use the actual GitHub Settings ruleset check picker and
 validate each required job is emitted on every ordinary non-draft PR. The
 rule should require checks against an up-to-date branch, not only any passing
 historical status. **Do not require** `Publish Release`,
-`Changelog updated?`, or `Benchmarks (regression-gated)`: those were
-deliberately skipped for this PR.
+`Changelog updated?`, or `Benchmarks (regression-gated)`: those are
+conditionally skipped. Do not require the path-filtered `Release` workflow
+as a global context either; the unconditionally emitted `Release Build` in
+CI is the listed release check.
 
 ## Administrator change and acceptance
 

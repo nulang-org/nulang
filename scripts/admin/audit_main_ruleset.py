@@ -20,8 +20,10 @@ REQUIRED_CONTEXTS = (
     "Format, Clippy & Audit",
     "Docs site & browser playground",
     "Validate PR title",
-    "Analyze (Rust) (rust)",
 )
+# This check is not emitted for Python-only PRs: codeql.yml has Rust/Cargo
+# path filters. Requiring it globally would permanently block such PRs.
+PATH_FILTERED_CONTEXTS = {"Analyze (Rust) (rust)"}
 SKIPPED_CONTEXTS = {
     "Publish Release", "Changelog updated?", "Benchmarks (regression-gated)"
 }
@@ -92,6 +94,8 @@ def validate(ruleset):
                 issues.append(f"required check has untrusted provider: {context}")
         for context in sorted(SKIPPED_CONTEXTS.intersection(checks)):
             issues.append(f"skipped workflow must not be a required check: {context}")
+        for context in sorted(PATH_FILTERED_CONTEXTS.intersection(checks)):
+            issues.append(f"path-filtered check must not be globally required: {context}")
     actors = ruleset.get("bypass_actors")
     if not isinstance(actors, list):
         issues.append("bypass actor list is not inspectable")

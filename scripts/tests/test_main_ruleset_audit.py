@@ -75,11 +75,26 @@ class MainRulesetAuditTests(unittest.TestCase):
     def test_missing_or_skipped_check_is_rejected(self):
         rule = safe_ruleset()
         checks = rule["rules"][-1]["parameters"]["required_status_checks"]
-        checks.pop()
+        checks.pop(0)  # missing always-emitted Build & Test check
         checks.append({"context": "Benchmarks (regression-gated)", "integration_id": 15368})
         issues = audit.validate(rule)
-        self.assertTrue(any("Analyze (Rust) (rust)" in s for s in issues))
+        self.assertTrue(any("Build & Test" in s for s in issues))
         self.assertTrue(any("skipped" in s for s in issues))
+
+    def test_python_only_pr_does_not_require_path_filtered_codeql(self):
+        rule = safe_ruleset()
+        rule["rules"][-1]["parameters"]["required_status_checks"] = [
+            c for c in rule["rules"][-1]["parameters"]["required_status_checks"]
+            if c["context"] != "Analyze (Rust) (rust)"
+        ]
+        self.assertEqual(audit.validate(rule), [])
+
+    def test_globally_required_path_filtered_codeql_is_rejected(self):
+        rule = safe_ruleset()
+        rule["rules"][-1]["parameters"]["required_status_checks"].append(
+            {"context": "Analyze (Rust) (rust)", "integration_id": 15368}
+        )
+        self.assertTrue(any("path-filtered" in s for s in audit.validate(rule)))
 
     def test_untrusted_check_provider_is_rejected(self):
         rule = safe_ruleset()
