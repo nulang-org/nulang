@@ -317,6 +317,11 @@ jobs:
       - name: Check zero warnings (tests)
         run: cargo check --locked --tests
 
+      # Guard against accidental reintroduction of unsupported libSQL
+      # remote/TLS features before running the full RustSec audit.
+      - name: Verify local-only libSQL TLS boundary
+        run: python3 scripts/ci/check-libsql-local-only.py
+
       # Security audit of dependency tree.
       - name: Audit (cargo-audit)
         run: |
