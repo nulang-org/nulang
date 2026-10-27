@@ -5545,9 +5545,9 @@ fn active_view_has_healthy_peers(
     expected: &[NodeId],
     status: impl Fn(NodeId) -> Option<NodeStatus>,
 ) -> bool {
-    expected.iter().all(|id| {
-        *id == local || (active.contains(id) && status(*id) == Some(NodeStatus::Healthy))
-    })
+    expected
+        .iter()
+        .all(|id| *id == local || (active.contains(id) && status(*id) == Some(NodeStatus::Healthy)))
 }
 
 #[cfg(feature = "tcp")]
