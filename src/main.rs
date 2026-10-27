@@ -1064,7 +1064,7 @@ struct Options {
     /// bytecode VM (same as `NULANG_ISO_ARENA=1`). Default off.
     iso_arena: bool,
     ffi_allow: Vec<String>,
-    /// Resource-capability grants for `--with=` (fs, net, os). Empty = no
+    /// Resource-capability grants for `--with <caps>` (fs, net, os). Empty = no
     /// gate (standalone programs run with full access).
     with_capabilities: Vec<String>,
     /// Target ISA for AOT compilation: native (default), ptx, riscv64
@@ -1189,6 +1189,7 @@ fn print_help() {
     println!("  --metrics-port <N>  Start Prometheus metrics server on port N");
     println!("  --emit-signals <file> Emit signal graph JSON for the web framework");
     println!("  --rewrite-signals <file> Rewrite HTML for signals and emit client JS");
+    println!("  --with <caps>    Explicit resource grants: fs,net,os (comma-separated)");
     println!("  --store <uri>    Durable store URI for programs declaring durable");
     println!("                   entities (default: $NULANG_STORE_PATH or .nulang/store/).");
     println!("                   Forms: <dir>|json:<dir>|rocksdb:<path>|postgres:<conn_str>");

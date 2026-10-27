@@ -54,7 +54,19 @@ def load_expectation(path):
         raise ValueError("exit_code must be an integer")
     if not isinstance(stdout, str) or not isinstance(stderr, str):
         raise ValueError("stdout and stderr must be strings")
-    return code, stdout, stderr
+    # Permissions are fixture-scoped and explicit. No ambient grant or raw CLI flags.
+    capabilities = expected.get("capabilities", None)
+    if capabilities is not None:
+        if (
+            not isinstance(capabilities, list)
+            or not capabilities
+            or any(type(cap) is not str or cap not in {"fs", "net", "os"} for cap in capabilities)
+            or len(set(capabilities)) != len(capabilities)
+        ):
+            raise ValueError("capabilities must be a nonempty unique list of fs, net, os")
+    else:
+        capabilities = []
+    return code, stdout, stderr, capabilities
 
 
 def run_suite(nulang_binary, fixtures, working_dir, timeout_seconds=60):
@@ -62,9 +74,13 @@ def run_suite(nulang_binary, fixtures, working_dir, timeout_seconds=60):
     passed = failed = 0
     for source, specification in fixtures:
         try:
-            exp_code, exp_out, exp_err = load_expectation(specification)
+            exp_code, exp_out, exp_err, capabilities = load_expectation(specification)
+            command = [str(nulang_binary)]
+            if capabilities:
+                command.extend(["--with", ",".join(capabilities)])
+            command.append(str(source))
             result = subprocess.run(
-                [str(nulang_binary), str(source)],
+                command,
                 cwd=working_dir,
                 capture_output=True,
                 text=True,
@@ -91,6 +107,10 @@ def run_suite(nulang_binary, fixtures, working_dir, timeout_seconds=60):
         if exp_err and exp_err not in err:
             mismatches.append(f"Err: expected to contain {exp_err!r}, got {err!r}")
         if mismatches:
+            # Surface bounded actual diagnostics on unexpected code/output,
+            # without weakening exit/stdout/stderr expectations.
+            if err and not (exp_err and exp_err not in err):
+                mismatches.append(f"Diagnostic: {err[:1200]!r}")
             print(f"FAIL: {source.name}")
             for mismatch in mismatches:
                 print(f"  {mismatch}")

@@ -108,6 +108,57 @@ class ExecutionTests(unittest.TestCase):
         fixtures = self.fixture("slow", {"stdout": "hello"})
         self.assertEqual(runner.run_suite(self.executable, fixtures, self.directory, timeout_seconds=0.05), (0, 1))
 
+    def test_explicit_fixture_grants_are_passed_only_to_that_case(self):
+        fixtures = self.fixture("good", {"stdout": "hello", "capabilities": ["fs"]})
+        actual_run = runner.subprocess.run
+        recorded = []
+
+        def capture(command, **kwargs):
+            recorded.append(command)
+            return actual_run(command, **kwargs)
+
+        with mock.patch.object(runner.subprocess, "run", side_effect=capture):
+            self.assertEqual(runner.run_suite(self.executable, fixtures, self.directory), (1, 0))
+        self.assertEqual(recorded[0][1:3], ["--with", "fs"])
+        self.assertEqual(recorded[0][-1], str(fixtures[0][0]))
+
+    def test_ungranted_fixture_never_receives_ambient_permissions(self):
+        fixtures = self.fixture("good", {"stdout": "hello"})
+        actual_run = runner.subprocess.run
+        recorded = []
+
+        def capture(command, **kwargs):
+            recorded.append(command)
+            return actual_run(command, **kwargs)
+
+        with mock.patch.object(runner.subprocess, "run", side_effect=capture):
+            self.assertEqual(runner.run_suite(self.executable, fixtures, self.directory), (1, 0))
+        self.assertEqual(recorded[0], [str(self.executable), str(fixtures[0][0])])
+
+    def test_capabilities_reject_unknown_or_unsafe_values(self):
+        invalid = [["fs", "secret"], ["fs", "fs"], "fs", [""], [], [42]]
+        for grants in invalid:
+            with self.subTest(grants=grants):
+                fixtures = self.fixture("good", {"stdout": "hello", "capabilities": grants})
+                with mock.patch.object(runner.subprocess, "run") as execute:
+                    self.assertEqual(
+                        runner.run_suite(self.executable, fixtures, self.directory),
+                        (0, 1),
+                    )
+                    execute.assert_not_called()
+
+    def test_failed_exit_includes_actual_diagnostic_without_weaker_assertions(self):
+        fixtures = self.fixture("runtime_failure", {"stdout": ""})
+        import contextlib
+        import io
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            self.assertEqual(
+                runner.run_suite(self.executable, fixtures, self.directory),
+                (0, 1),
+            )
+        self.assertIn("crash", printed.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
