@@ -129,10 +129,7 @@ impl TaskOutputState {
     /// Explicit ownership transition. A controller must prove prior ownership
     /// was fenced *before* atomically persisting this updated state. Heartbeat
     /// expiry or gossip suspicion alone is insufficient proof of fencing.
-    pub fn assign(
-        &mut self,
-        attempt_id: impl Into<String>,
-    ) -> Result<AttemptToken, CommitError> {
+    pub fn assign(&mut self, attempt_id: impl Into<String>) -> Result<AttemptToken, CommitError> {
         let attempt_id = attempt_id.into();
         if attempt_id.trim().is_empty() {
             return Err(CommitError::InvalidAttemptId);
@@ -140,7 +137,10 @@ impl TaskOutputState {
         if self.committed.is_some() {
             return Err(CommitError::AlreadyCommitted);
         }
-        let next_epoch = self.epoch.checked_add(1).ok_or(CommitError::EpochExhausted)?;
+        let next_epoch = self
+            .epoch
+            .checked_add(1)
+            .ok_or(CommitError::EpochExhausted)?;
         let token = AttemptToken {
             task_key: self.task_key.clone(),
             attempt_id,
@@ -154,9 +154,7 @@ impl TaskOutputState {
     }
 
     fn require_owner(&self, token: &AttemptToken) -> Result<(), CommitError> {
-        if self.owner.as_ref() == Some(token)
-            && token.epoch != 0
-            && token.task_key == self.task_key
+        if self.owner.as_ref() == Some(token) && token.epoch != 0 && token.task_key == self.task_key
         {
             Ok(())
         } else {
