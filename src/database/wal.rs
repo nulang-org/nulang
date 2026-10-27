@@ -29,6 +29,22 @@ use super::tablet::{
 };
 
 const WAL_MAGIC: &[u8; 8] = b"NUDBWAL3";
+const WAL_QUOTA_MAGIC: &[u8; 8] = b"NUDBQOT1";
+const WAL_QUOTA_DATA_BYTES: usize = 8 + 8 + 8 + 8;
+const WAL_QUOTA_BYTES: usize = WAL_QUOTA_DATA_BYTES + 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DurableWalQuota {
+    tablet_id: u64,
+    ownership_epoch: u64,
+    max_bytes: u64,
+}
+
+impl DurableWalQuota {
+    fn accepts(self, tablet_id: TabletId, epoch: u64) -> bool {
+        self.tablet_id == tablet_id.get() && self.ownership_epoch == epoch
+    }
+}
 const WAL_HEADER_PREFIX_BYTES: usize = 8 + 8 + 8 + 8;
 const WAL_HEADER_BYTES: usize = WAL_HEADER_PREFIX_BYTES + 32;
 const WAL_FRAME_MAGIC: &[u8; 4] = b"NREC";
@@ -213,6 +229,7 @@ pub struct FileWal {
     tablet_id: Option<TabletId>,
     latest_ownership_epoch: Option<u64>,
     poisoned: bool,
+    durable_quota: Option<DurableWalQuota>,
     #[cfg(test)]
     append_failpoint: Option<AppendFailPoint>,
 }
@@ -345,6 +362,9 @@ impl FileWal {
     }
 
     fn open_locked(path: PathBuf, writer_lock: Arc<File>) -> Result<Self, WalError> {
+        // Fail before WAL creation or crash-tail recovery if a quota is torn,
+        // corrupt or aliased; silently dropping quota protection is forbidden.
+        let durable_quota = load_durable_quota(&path)?;
         // Called only while already holding the sidecar lock, also during
         // checkpoint reclaim. Never acquire a second lock on this path.
         let file_existed = path.exists();
@@ -371,6 +391,13 @@ impl FileWal {
         }
         let (base_sequence, mut tablet_id, mut latest_ownership_epoch) =
             decode_wal_header(&wal_header)?;
+        if let Some(quota) = durable_quota {
+            if tablet_id.is_some_and(|id| id.get() != quota.tablet_id)
+                || latest_ownership_epoch.is_some_and(|epoch| epoch != quota.ownership_epoch)
+            {
+                return Err(WalError::QuotaOwnerMismatch);
+            }
+        }
 
         file.seek(SeekFrom::Start(WAL_HEADER_BYTES as u64))?;
 
@@ -417,6 +444,11 @@ impl FileWal {
                     reason: error.to_string(),
                 })?;
             let record = WalRecord::from_disk(disk, record_start)?;
+            if durable_quota
+                .is_some_and(|quota| !quota.accepts(record.tablet_id, record.ownership_epoch))
+            {
+                return Err(WalError::QuotaOwnerMismatch);
+            }
             validate_record_chain(
                 &record,
                 tablet_id,
@@ -444,6 +476,7 @@ impl FileWal {
             tablet_id,
             latest_ownership_epoch,
             poisoned: false,
+            durable_quota,
             #[cfg(test)]
             append_failpoint: None,
         })
@@ -679,6 +712,85 @@ impl FileWal {
         Ok(())
     }
 
+    /// Returns the immutable quota installed for this canonical WAL owner.
+    pub fn durable_quota_bytes(&self) -> Option<u64> {
+        self.durable_quota.map(|quota| quota.max_bytes)
+    }
+
+    /// Install an immutable, owner/epoch-scoped physical WAL ceiling. The
+    /// exclusive WAL writer lock must remain held for activation and all
+    /// writes. The sidecar is create-new, checksummed, fsynced and directory-
+    /// synced before returning success; never unlink or reset it on failure.
+    ///
+    /// Trusted local directories only: external file deletion/path replacement,
+    /// network FS locks, and distributed ownership are outside this protocol.
+    pub fn activate_durable_quota(
+        &mut self,
+        tablet_id: TabletId,
+        ownership_epoch: u64,
+        max_bytes: u64,
+    ) -> Result<(), WalError> {
+        if self.poisoned {
+            return Err(WalError::Poisoned);
+        }
+        if ownership_epoch == 0
+            || self.tablet_id.is_some_and(|id| id != tablet_id)
+            || self
+                .latest_ownership_epoch
+                .is_some_and(|epoch| epoch != ownership_epoch)
+        {
+            return Err(WalError::QuotaOwnerMismatch);
+        }
+        let requested = DurableWalQuota {
+            tablet_id: tablet_id.get(),
+            ownership_epoch,
+            max_bytes,
+        };
+        if let Some(existing) = self.durable_quota {
+            if existing == requested {
+                return Ok(());
+            }
+            return Err(WalError::QuotaAlreadySet {
+                existing: existing.max_bytes,
+                requested: max_bytes,
+            });
+        }
+
+        let quota_path = wal_quota_path(&self.path);
+        reject_path_aliases(&quota_path)?;
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&quota_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                self.poisoned = true;
+                return Err(WalError::QuotaCorrupt);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        // A crash or I/O error after creation may leave a partial sidecar.
+        // Keep the live writer poisoned and the sidecar in place for repair.
+        self.poisoned = true;
+        let bytes = encode_durable_quota(requested);
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        sync_parent_directory(&quota_path)?;
+        self.durable_quota = Some(requested);
+        self.poisoned = false;
+        Ok(())
+    }
+
+    fn effective_wal_limit(&self, requested: Option<u64>) -> Option<u64> {
+        match (requested, self.durable_quota) {
+            (Some(a), Some(quota)) => Some(a.min(quota.max_bytes)),
+            (None, Some(quota)) => Some(quota.max_bytes),
+            (other, None) => other,
+        }
+    }
+
     pub fn append_write(&mut self, write: &TabletWrite) -> Result<(), WalError> {
         self.append_write_internal(write, None)
     }
@@ -706,6 +818,12 @@ impl FileWal {
         }
 
         let record = WalRecord::from_write(write);
+        if self
+            .durable_quota
+            .is_some_and(|quota| !quota.accepts(record.tablet_id, record.ownership_epoch))
+        {
+            return Err(WalError::QuotaOwnerMismatch);
+        }
         let last_sequence = self.last_sequence();
 
         if record.expected_previous_sequence != last_sequence {
@@ -762,7 +880,7 @@ impl FileWal {
         let checksum = blake3::hash(&payload);
         let header = encode_frame_header(payload_len);
 
-        if let Some(max_bytes) = max_wal_bytes {
+        if let Some(max_bytes) = self.effective_wal_limit(max_wal_bytes) {
             let current_bytes = self.file.metadata()?.len();
             let projected_bytes = current_bytes
                 .checked_add(header.len() as u64)
@@ -874,6 +992,12 @@ impl FileWal {
 
         for write in writes {
             let record = WalRecord::from_write(write);
+            if self
+                .durable_quota
+                .is_some_and(|quota| !quota.accepts(record.tablet_id, record.ownership_epoch))
+            {
+                return Err(WalError::QuotaOwnerMismatch);
+            }
             validate_record_chain(
                 &record,
                 expected_tablet,
@@ -932,7 +1056,7 @@ impl FileWal {
             next_offset = end_offset;
         }
 
-        if let Some(max_bytes) = max_wal_bytes {
+        if let Some(max_bytes) = self.effective_wal_limit(max_wal_bytes) {
             if next_offset > max_bytes {
                 return Err(WalError::BudgetExceeded {
                     max_bytes,
@@ -1139,6 +1263,53 @@ fn validate_record_chain(
     Ok(())
 }
 
+fn wal_quota_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".quota");
+    PathBuf::from(name)
+}
+
+fn encode_durable_quota(quota: DurableWalQuota) -> [u8; WAL_QUOTA_BYTES] {
+    let mut encoded = [0_u8; WAL_QUOTA_BYTES];
+    encoded[..8].copy_from_slice(WAL_QUOTA_MAGIC);
+    encoded[8..16].copy_from_slice(&quota.tablet_id.to_le_bytes());
+    encoded[16..24].copy_from_slice(&quota.ownership_epoch.to_le_bytes());
+    encoded[24..32].copy_from_slice(&quota.max_bytes.to_le_bytes());
+    let checksum = *blake3::hash(&encoded[..WAL_QUOTA_DATA_BYTES]).as_bytes();
+    encoded[WAL_QUOTA_DATA_BYTES..].copy_from_slice(&checksum);
+    encoded
+}
+
+fn load_durable_quota(wal_path: &Path) -> Result<Option<DurableWalQuota>, WalError> {
+    let path = wal_quota_path(wal_path);
+    reject_path_aliases(&path)?;
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if file.metadata()?.len() != WAL_QUOTA_BYTES as u64 {
+        return Err(WalError::QuotaCorrupt);
+    }
+    let mut encoded = [0_u8; WAL_QUOTA_BYTES];
+    file.read_exact(&mut encoded)?;
+    if &encoded[..8] != WAL_QUOTA_MAGIC
+        || &encoded[WAL_QUOTA_DATA_BYTES..]
+            != blake3::hash(&encoded[..WAL_QUOTA_DATA_BYTES]).as_bytes()
+    {
+        return Err(WalError::QuotaCorrupt);
+    }
+    let quota = DurableWalQuota {
+        tablet_id: u64::from_le_bytes(encoded[8..16].try_into().unwrap()),
+        ownership_epoch: u64::from_le_bytes(encoded[16..24].try_into().unwrap()),
+        max_bytes: u64::from_le_bytes(encoded[24..32].try_into().unwrap()),
+    };
+    if quota.tablet_id == 0 || quota.ownership_epoch == 0 {
+        return Err(WalError::QuotaCorrupt);
+    }
+    Ok(Some(quota))
+}
+
 fn writer_lock_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(".lock");
@@ -1251,6 +1422,12 @@ pub enum WalError {
         max_bytes: u64,
         projected_bytes: u64,
     },
+    QuotaCorrupt,
+    QuotaOwnerMismatch,
+    QuotaAlreadySet {
+        existing: u64,
+        requested: u64,
+    },
     ChecksumMismatch {
         offset: u64,
     },
@@ -1355,6 +1532,12 @@ impl fmt::Display for WalError {
             } => write!(
                 f,
                 "NuDB WAL append requires {projected_bytes} bytes, above caller budget of {max_bytes} bytes"
+            ),
+            Self::QuotaCorrupt => f.write_str("NuDB durable WAL quota sidecar is torn or corrupt"),
+            Self::QuotaOwnerMismatch => f.write_str("NuDB WAL owner/epoch differs from durable quota owner"),
+            Self::QuotaAlreadySet { existing, requested } => write!(
+                f,
+                "NuDB durable WAL quota is immutable: current {existing} bytes, requested {requested} bytes"
             ),
             Self::ChecksumMismatch { offset } => {
                 write!(f, "WAL checksum mismatch at byte offset {offset}")
