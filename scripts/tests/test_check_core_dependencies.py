@@ -81,7 +81,8 @@ class CoreDependencyBoundaryTests(unittest.TestCase):
             guard.load_metadata(pathlib.Path("/test-repo"))
         command = run.call_args.args[0]
         self.assertIn("--no-default-features", command)
-        self.assertEqual(command[command.index("--package") + 1], "nulang")
+        self.assertNotIn("--package", command)
+        self.assertIn("--format-version", command)
         self.assertIn("--locked", command)
 
 
