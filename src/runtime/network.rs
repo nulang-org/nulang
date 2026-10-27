@@ -353,6 +353,28 @@ impl TransportStream {
     }
 }
 
+/// Bind the post-handshake peer certificate to the routing NodeId.
+/// This MUST be called only after TLS and NUL0 read/write have completed:
+/// rustls::StreamOwned is lazy, so asking for the certificate immediately
+/// after `tls_wrap_client` can return None before the handshake.
+#[cfg(feature = "tcp")]
+fn verify_tls_peer_node_id(stream: &TransportStream, expected: NodeId) -> io::Result<()> {
+    match stream.peer_cert_node_id() {
+        Some(actual) if actual == expected => Ok(()),
+        Some(actual) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "TLS peer identity mismatch: expected {:?}, certificate {:?}",
+                expected, actual
+            ),
+        )),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TLS peer certificate is unavailable after the handshake",
+        )),
+    }
+}
+
 #[cfg(feature = "tcp")]
 impl Read for TransportStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -2236,24 +2258,14 @@ impl TcpTransport {
             tls_wrap_client(tcp, &self.tls_config)?
         };
 
-        // When TLS is active, verify the peer's certificate matches the
-        // expected node identity *before* accepting the NUL0 handshake.
-        if !self.tls_config.is_plaintext() {
-            if let Some(cert_id) = stream.peer_cert_node_id() {
-                if cert_id != node_id {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "TLS cert identity mismatch: expected {:?}, cert fingerprint {:?}",
-                            node_id, cert_id
-                        ),
-                    ));
-                }
-            }
-        }
-
         write_handshake(&mut stream, self.node_id)?;
         let peer_id = read_handshake(&mut stream)?;
+
+        // TLS handshake and certificate exchange are complete here.
+        // A matching NUL0 claim alone is not identity authentication.
+        if !self.tls_config.is_plaintext() {
+            verify_tls_peer_node_id(&stream, node_id)?;
+        }
 
         if peer_id != node_id {
             return Err(io::Error::new(
@@ -2544,17 +2556,15 @@ fn connection_reader(
         Err(_) => return,
     };
 
-    // When TLS is active, verify the peer's certificate fingerprint
-    // matches the node_id claimed in the NUL0 handshake.
+    // The NUL0 claim must agree with the authenticated client certificate.
+    // Missing peer certificates are rejected, never treated as plaintext.
     if !tls_config.is_plaintext() {
-        if let Some(cert_id) = stream.peer_cert_node_id() {
-            if cert_id != peer_id {
-                warn!(
-                    "TLS cert identity mismatch for {}: handshake claims {:?}, cert fingerprint {:?}",
-                    addr, peer_id, cert_id
-                );
-                return;
-            }
+        if let Err(error) = verify_tls_peer_node_id(&stream, peer_id) {
+            warn!(
+                "TLS peer identity validation failed for {}: {}",
+                addr, error
+            );
+            return;
         }
     }
 
@@ -2819,21 +2829,14 @@ fn connect_in_sender(
         tls_wrap_client(tcp, tls_config)?
     };
 
-    // When TLS is active, verify the peer's certificate matches the
-    // expected node identity.
-    if !tls_config.is_plaintext() {
-        if let Some(cert_id) = stream.peer_cert_node_id() {
-            if cert_id != node_id {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "TLS cert identity mismatch in sender connect",
-                ));
-            }
-        }
-    }
-
     write_handshake(&mut stream, local_node_id)?;
     let peer_id = read_handshake(&mut stream)?;
+
+    // Enforce the certificate fingerprint after rustls has completed its
+    // lazy handshake, before registering this peer in the connection pool.
+    if !tls_config.is_plaintext() {
+        verify_tls_peer_node_id(&stream, node_id)?;
+    }
 
     if peer_id != node_id {
         return Err(io::Error::new(
@@ -3383,6 +3386,159 @@ mod tests {
         assert_eq!(buf.len(), 2);
         let (decoded, _) = read_value(&buf, 0).unwrap();
         assert_eq!(decoded, v);
+    }
+
+    // Reproduces a CA-trusted server presenting its own certificate while
+    // advertising some *other* node's ID in the NUL0 application handshake.
+    // The client must bind its expected destination to the certificate DER,
+    // not merely to the untrusted handshake claim.
+    #[test]
+    #[cfg(feature = "tcp")]
+    fn test_mtls_rejects_valid_ca_certificate_with_forged_nul0_node_id() {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::from_params(&ca_params, &ca_key);
+
+        let issue_leaf = || {
+            let key = KeyPair::generate().unwrap();
+            let cert = CertificateParams::new(vec!["localhost".into()])
+                .unwrap()
+                .signed_by(&key, &issuer)
+                .unwrap();
+            (cert.pem().into_bytes(), key.serialize_pem().into_bytes())
+        };
+        let (server_cert, server_key) = issue_leaf();
+        let (client_cert, client_key) = issue_leaf();
+        let ca_pem = ca_cert.pem().into_bytes();
+        let tls_config = |cert, key| TlsConfig::MutualTls {
+            ca_cert_pem: ca_pem.clone(),
+            server_cert_pem: cert,
+            server_key_pem: key,
+            server_name: Some("localhost".into()),
+        };
+
+        let certified_server_id = NodeId::from_cert_der(&parse_pem_cert(&server_cert).unwrap());
+        let claimed_other_node = NodeId(0x00c0_ffee_dead_beef);
+        assert_ne!(certified_server_id, claimed_other_node);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_tls = tls_config(server_cert, server_key);
+        let server = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut stream = tls_wrap_server(socket, &server_tls).unwrap();
+            // The TLS server has a genuine, CA-signed identity but lies in NUL0.
+            write_handshake(&mut stream, claimed_other_node).unwrap();
+            read_handshake(&mut stream).unwrap()
+        });
+        let mut client = TcpTransport::bind(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            tls_config(client_cert, client_key),
+        )
+        .unwrap();
+        let client_id = client.node_id();
+        let error = client
+            .connect(claimed_other_node, addr)
+            .expect_err("CA-trusted certificate cannot impersonate another NodeId");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(client.connection_count(), 0);
+        assert_eq!(server.join().unwrap(), client_id);
+        client.shutdown();
+    }
+
+    /// The queue-driven sender uses a different connect path from
+    /// TcpTransport::connect. A CA-trusted certificate must not be able to
+    /// claim a different NUL0 NodeId there either, but a legitimate
+    /// certificate-bound connection must still succeed.
+    #[test]
+    #[cfg(feature = "tcp")]
+    fn test_mtls_sender_worker_binds_ca_trusted_peer_to_node_id() {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_pem = ca_params.self_signed(&ca_key).unwrap().pem().into_bytes();
+        let issuer = Issuer::from_params(&ca_params, &ca_key);
+        let issue_leaf = || {
+            let key = KeyPair::generate().unwrap();
+            let cert = CertificateParams::new(vec!["localhost".into()])
+                .unwrap()
+                .signed_by(&key, &issuer)
+                .unwrap();
+            (cert.pem().into_bytes(), key.serialize_pem().into_bytes())
+        };
+        let (server_cert, server_key) = issue_leaf();
+        let (client_cert, client_key) = issue_leaf();
+        let server_id = NodeId::from_cert_der(&parse_pem_cert(&server_cert).unwrap());
+        let local_id = NodeId::from_cert_der(&parse_pem_cert(&client_cert).unwrap());
+        let claimed_other = NodeId(0xbed0_0bad_cafe_0001);
+        assert_ne!(server_id, claimed_other);
+        assert_ne!(local_id, server_id);
+        let config = |cert, key| TlsConfig::MutualTls {
+            ca_cert_pem: ca_pem.clone(),
+            server_cert_pem: cert,
+            server_key_pem: key,
+            server_name: Some("localhost".into()),
+        };
+        let client_config = config(client_cert, client_key);
+        let server_config = config(server_cert, server_key);
+        let connections = Arc::new(Mutex::new(HashMap::new()));
+        let (incoming_tx, _incoming_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        for (advertised_id, expect_success) in [(claimed_other, false), (server_id, true)] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let listen_addr = listener.local_addr().unwrap();
+            let tls = server_config.clone();
+            let server = thread::spawn(move || {
+                let (tcp, _) = listener.accept().unwrap();
+                tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                tcp.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut stream = tls_wrap_server(tcp, &tls).unwrap();
+                write_handshake(&mut stream, advertised_id).unwrap();
+                read_handshake(&mut stream).unwrap()
+            });
+            let result = connect_in_sender(
+                &connections,
+                &incoming_tx,
+                &shutdown,
+                local_id,
+                advertised_id,
+                listen_addr,
+                &client_config,
+            );
+            if expect_success {
+                assert!(
+                    result.is_ok(),
+                    "sender must accept genuine certificate identity"
+                );
+            } else {
+                assert_eq!(
+                    result
+                        .expect_err("sender accepted another node's NUL0 identity")
+                        .kind(),
+                    io::ErrorKind::InvalidData
+                );
+                assert!(
+                    lock_ignore_poison(&connections).is_empty(),
+                    "forged sender connection was registered"
+                );
+            }
+            assert_eq!(server.join().unwrap(), local_id);
+        }
+        shutdown.store(true, Ordering::Relaxed);
     }
 
     // ------------------------------------------------------------------
