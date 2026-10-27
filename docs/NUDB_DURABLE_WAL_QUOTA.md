@@ -33,10 +33,11 @@ reviewed, authenticated durable transition protocol exists.
 A write failure after the quota sidecar is created poisons the live WAL
 handle; retry by reopening and inspecting the sidecar. Do not unlink, reset,
 overwrite or rename a stranded or corrupt sidecar just to restore writes.
-A partially installed quota fails closed on the next open. A missing WAL with
-an otherwise valid quota sidecar also fails closed before file creation, even
-when a checkpoint remains: recovery of lost WAL storage requires an explicit
-operator-controlled procedure, not implicit creation of an empty log.
+A partially installed quota fails closed on the next open. A missing or
+zero-length WAL with an otherwise valid quota sidecar also fails closed before
+file creation or header repair, even when a checkpoint remains: recovery of
+lost WAL storage requires an explicit operator-controlled procedure, not
+implicit creation of an empty log.
 The existing WAL data is not rewritten by quota activation.
 
 A budget rejection before any frame mutation is retryable and preserves
