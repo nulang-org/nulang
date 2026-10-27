@@ -42,6 +42,8 @@ pub mod diagnostic;
 pub mod difffuzz;
 pub mod docgen;
 pub mod dst;
+#[cfg(feature = "wasm-backend")]
+pub mod embedded_wasm;
 pub mod durable_effect;
 pub mod durable_effect_persistence;
 pub mod durable_effect_runtime;
