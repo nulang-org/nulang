@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Exact release CLI conformance qualification (review-only) — 2026-10-26
+- **The fail-closed conformance runner accepts an explicit `--binary` executable**, allowing the actual `--release --no-default-features --features release-cli` artifact to be tested instead of independently rebuilding debug mode. The old no-argument behavior remains available; a missing supplied binary never falls back to debug.
+- **A manual, non-required Core qualification workflow runs all checked-in behavior fixtures** against the built release CLI and exits nonzero on any mismatch. Current known conformance failures remain visible and unwaived. Focused Python tests pin artifact selection, missing binaries, empty suites, failing cases and legacy default behavior. This does not certify the distributed runtime, storage or the security stack.
+
 ### Fail-closed post-handshake mTLS peer identity (review-only) — 2026-10-26
 - **Fixed a reproduced CA-trusted outbound NUL0 NodeId impersonation**: Rustls' certificate accessor was called before the lazy TLS handshake completed, returned no peer certificate, and an `if let Some` check silently skipped identity binding. The old code accepted a malicious NUL0 claim for a different NodeId; the local regression reproduces that acceptance without insecure trust roots.
 - **Both outbound connection paths and inbound admission now require an available, matching peer certificate after the TLS/NUL0 handshake and before registering a connection.** The sender-worker path now has its own CA-trusted forgery rejection plus legitimate-certificate acceptance regression. No wire-format, timeout, recovery protocol or TLS-root policy changes. Preserve strict plaintext opt-out semantics and existing legitimate mTLS interoperability tests. Independent security review, exact-head release/native/WASM/CodeQL and disposable Turso remote SQL validation remain required.

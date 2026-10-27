@@ -1,0 +1,50 @@
+name: Core release CLI conformance qualification
+
+# Manual qualification only while known conformance failures remain. This is
+# intentionally NOT a PR required check and does not weaken existing CI gates.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: core-release-conformance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-cli-conformance:
+    name: Qualify the release-profile Nulang executable
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-dev
+
+      - name: Install pinned Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test conformance harness contracts
+        run: python3 -m unittest discover -s scripts/tests -p 'test_conformance*.py'
+
+      - name: Build actual public release CLI profile
+        run: cargo build --locked --release --no-default-features --features release-cli --bin nulang
+
+      - name: Gate all checked-in behavior fixtures against built release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          target_dir="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+          binary="$target_dir/release/nulang"
+          test -f "$binary"
+          echo "Commit: $GITHUB_SHA"
+          echo "Checking the built release CLI artifact: $binary"
+          sha256sum "$binary"
+          python3 conformance/run.py --binary "$binary"

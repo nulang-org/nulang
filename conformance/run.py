@@ -6,6 +6,7 @@ suite is an error, not a green CI result. This module is importable without
 building Rust so its discovery/runner contracts can be unit tested cheaply.
 """
 
+import argparse
 import json
 from pathlib import Path
 import subprocess
@@ -101,20 +102,31 @@ def run_suite(nulang_binary, fixtures, working_dir, timeout_seconds=60):
     return passed, failed
 
 
-def main():
+def main(argv=()):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--binary",
+        type=Path,
+        help="qualify this exact prebuilt Nulang executable instead of building debug",
+    )
+    args = parser.parse_args(argv)
     try:
-        # Reject vacuous/incomplete suites *before* the expensive Rust build.
+        # Reject vacuous/incomplete suites *before* invoking Rust or the binary.
         fixtures = discover_fixtures(BEHAVIOR)
-        subprocess.run(["cargo", "build", "--quiet"], cwd=ROOT, check=True)
-        metadata = json.loads(
-            subprocess.check_output(
-                ["cargo", "metadata", "--format-version", "1", "--no-deps"],
-                cwd=ROOT,
+        if args.binary is not None:
+            # Never silently fall back to a debug executable for release checks.
+            nulang_binary = args.binary.resolve()
+        else:
+            subprocess.run(["cargo", "build", "--quiet"], cwd=ROOT, check=True)
+            metadata = json.loads(
+                subprocess.check_output(
+                    ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+                    cwd=ROOT,
+                )
             )
-        )
-        nulang_binary = Path(metadata["target_directory"]) / "debug" / "nulang"
+            nulang_binary = Path(metadata["target_directory"]) / "debug" / "nulang"
         if not nulang_binary.is_file():
-            raise SuiteError(f"compiled Nulang binary missing: {nulang_binary}")
+            raise SuiteError(f"Nulang binary missing: {nulang_binary}")
         passed, failed = run_suite(nulang_binary, fixtures, ROOT)
         return 1 if failed or not passed else 0
     except (SuiteError, OSError, subprocess.CalledProcessError, ValueError, KeyError) as exc:
@@ -123,4 +135,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))
