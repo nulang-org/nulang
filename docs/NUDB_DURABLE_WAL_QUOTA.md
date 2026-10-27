@@ -23,6 +23,23 @@ automatic checkpoint/reclamation, MVCC garbage collection, or remote snapshots.
    and restart. A torn, corrupt or aliased quota prevents writable WAL open;
    it is **never** interpreted as an absent/unlimited configuration.
 
+## Local backup and restore boundary
+
+A completed local backup of a quota-protected tablet must include the immutable
+`tablet.wal.quota` sidecar. New backups use `NUDBBACKUP2` and explicitly record
+the quota's byte length and BLAKE3 digest (or explicitly declare no quota).
+The disposable restore proof includes the sidecar and verifies that it can be
+reopened without dropping enforcement; read-only audits reject missing, modified,
+aliased or unmanifested quota components. Legacy `NUDBBACKUP1` backups remain
+readable only when no quota sidecar is present; they must not be interpreted as
+proving a quota policy that did not exist in that format. BLAKE3 detects
+accidental corruption but does not authenticate an attacker-controlled marker.
+
+This is still a single-host local backup protocol. It does not transfer tenant
+quotas, authenticate a distributed owner, or authorize automatic promotion of a
+restored tablet. Separate ownership-fencing and authorized restore checks remain
+required before operational cutover.
+
 Quota activation can be repeated only with **exactly the same** ID, epoch and
 limit. Raising, lowering, removing or transferring the quota is not available.
 An ownership-epoch change intentionally fails closed until a separately

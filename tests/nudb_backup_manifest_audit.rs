@@ -175,3 +175,87 @@ fn symlinked_marker_or_wal_is_rejected_without_following_it() {
         assert!(!dir.join("tablet.wal.lock").exists());
     }
 }
+
+fn make_quota_backup(root: &Sandbox) -> PathBuf {
+    let mut tablet = WalBackedTablet::open(descriptor(), root.path("quota-owner.wal")).unwrap();
+    tablet
+        .commit_idempotent(
+            TransactionId::new([9; 16]),
+            vec![TabletMutation::Put {
+                key: b"k".to_vec(),
+                value: b"value".to_vec(),
+            }],
+        )
+        .unwrap();
+    tablet.activate_durable_wal_quota(4096).unwrap();
+    let dir = root.path("quota-backup");
+    tablet.capture_consistent_backup(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn quota_backup_audit_rejects_tampered_sidecar_without_mutation() {
+    let root = Sandbox::new();
+    let dir = make_quota_backup(&root);
+    assert!(dir.join("tablet.wal.quota").exists());
+    audit_completed_backup_read_only(descriptor(), &dir).unwrap();
+    let mut corrupted = fs::read(dir.join("tablet.wal.quota")).unwrap();
+    corrupted[10] ^= 0x01;
+    fs::write(dir.join("tablet.wal.quota"), &corrupted).unwrap();
+    assert_rejected_unchanged(&dir);
+    assert_eq!(fs::read(dir.join("tablet.wal.quota")).unwrap(), corrupted);
+}
+
+#[test]
+fn quota_backup_audit_rejects_missing_or_incomplete_quota_manifest_entry() {
+    for variant in ["missing", "incomplete"] {
+        let root = Sandbox::new();
+        let dir = make_quota_backup(&root);
+        let marker = dir.join("COMPLETE.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+        match variant {
+            "missing" => {
+                manifest.as_object_mut().unwrap().remove("quota");
+            }
+            "incomplete" => {
+                manifest["quota"]["blake3"] = serde_json::Value::Null;
+            }
+            _ => unreachable!(),
+        }
+        fs::write(&marker, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert_rejected_unchanged(&dir);
+    }
+}
+
+#[test]
+fn legacy_backup_without_quota_manifest_field_is_still_accepted() {
+    let root = Sandbox::new();
+    let dir = make_backup(&root, true);
+    let marker = dir.join("COMPLETE.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+    manifest.as_object_mut().unwrap().remove("quota");
+    manifest["format"] = serde_json::json!("NUDBBACKUP1");
+    fs::write(&marker, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    assert!(!dir.join("tablet.wal.quota").exists());
+    assert_eq!(
+        audit_completed_backup_read_only(descriptor(), &dir)
+            .unwrap()
+            .sequence,
+        1
+    );
+}
+
+#[test]
+fn backup_v2_cannot_silently_downgrade_after_quota_metadata_is_stripped() {
+    let root = Sandbox::new();
+    let dir = make_backup(&root, false);
+    let marker = dir.join("COMPLETE.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+    assert_eq!(manifest["format"], "NUDBBACKUP2");
+    manifest.as_object_mut().unwrap().remove("quota");
+    fs::write(&marker, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    assert_rejected_unchanged(&dir);
+}
