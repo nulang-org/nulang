@@ -81,7 +81,7 @@ fn restored_checkpoint_preserves_fencing_and_the_winner() {
         Err(CommitError::Fenced)
     ));
     restarted.commit(&new, [2; 32]).unwrap();
-    let terminal = TaskOutputState::restore(&restarted.checkpoint().unwrap()).unwrap();
+    let mut terminal = TaskOutputState::restore(&restarted.checkpoint().unwrap()).unwrap();
     assert_eq!(terminal.committed().unwrap().artifact_key, "staging/new");
     assert_eq!(
         terminal.commit(&new, [2; 32]).unwrap(),
