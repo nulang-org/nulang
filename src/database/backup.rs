@@ -159,6 +159,8 @@ struct BackupManifest {
     checkpoint_sequence: Option<u64>,
     wal: BackupFileMetadata,
     checkpoint: OptionalBackupFileMetadata,
+    #[serde(default)]
+    quota: Option<OptionalBackupFileMetadata>,
     proof: String,
 }
 
@@ -238,10 +240,17 @@ pub fn audit_completed_backup_read_only(
     }
     let manifest: BackupManifest = serde_json::from_value(document)
         .map_err(|error| BackupError::Metadata(error.to_string()))?;
-    if manifest.format != "NUDBBACKUP1"
+    if !matches!(manifest.format.as_str(), "NUDBBACKUP1" | "NUDBBACKUP2")
         || manifest.proof != "disposable-full-mvcc-and-receipt-match"
     {
         return Err(BackupError::InvalidBackup("unsupported backup manifest"));
+    }
+    // V1 cannot carry the newer quota contract, whereas V2 must explicitly
+    // declare it (including the deliberate absence of any quota sidecar).
+    if (manifest.format == "NUDBBACKUP1" && manifest.quota.is_some())
+        || (manifest.format == "NUDBBACKUP2" && manifest.quota.is_none())
+    {
+        return Err(BackupError::InvalidBackup("backup quota format mismatch"));
     }
 
     let wal_path = directory.join("tablet.wal");
@@ -276,6 +285,31 @@ pub fn audit_completed_backup_read_only(
         }
         _ => return Err(BackupError::InvalidBackup("incomplete checkpoint manifest")),
     };
+
+    // Legacy NUDBBACKUP1 predates the durable-quota sidecar. A missing quota
+    // field is valid only on V1 and only when the sidecar is also absent.
+    // Never silently accept an
+    // unaccounted admission policy or a partial (bytes, digest) declaration.
+    let quota_path = directory.join("tablet.wal.quota");
+    let quota = manifest
+        .quota
+        .as_ref()
+        .map(|entry| (&entry.bytes, &entry.blake3));
+    match quota {
+        Some((Some(bytes), Some(digest))) => {
+            if require_regular_file(&quota_path)? != *bytes
+                || hash_file(&quota_path)? != (*bytes, digest.clone())
+            {
+                return Err(BackupError::InvalidBackup("quota size or digest mismatch"));
+            }
+        }
+        Some((None, None)) | None => match fs::symlink_metadata(&quota_path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+            Ok(_) => return Err(BackupError::InvalidBackup("unexpected quota file")),
+        },
+        _ => return Err(BackupError::InvalidBackup("incomplete quota manifest")),
+    }
 
     let report =
         super::store::WalBackedTablet::verify_checkpoint_wal_read_only(descriptor, &wal_path)?;
@@ -345,6 +379,23 @@ pub(crate) fn capture_locked(
         super::interruption::StorageInterruptionPoint::BackupAfterCheckpointStaged,
     )?;
 
+    // A backed-up WAL must retain its persistently enforced admission limit.
+    // This is opt-in and backward-compatible: unconfigured/legacy sources have
+    // no quota component, while configured backups capture one immutable file.
+    let mut quota_name = source_wal.as_os_str().to_os_string();
+    quota_name.push(".quota");
+    let quota_source = PathBuf::from(quota_name);
+    let quota_destination = destination.join("tablet.wal.quota");
+    let (quota_bytes, quota_blake3) = match fs::symlink_metadata(&quota_source) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let (bytes, digest) = copy_with_hash(&quota_source, &quota_destination)?;
+            (Some(bytes), Some(digest))
+        }
+        Ok(_) => return Err(BackupError::InvalidBackup("non-regular source quota")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (None, None),
+        Err(error) => return Err(error.into()),
+    };
+
     let expected_wal = (wal_bytes, wal_blake3.clone());
     if hash_file(source_wal)? != expected_wal {
         return Err(BackupError::UnstableSource);
@@ -354,6 +405,13 @@ pub(crate) fn capture_locked(
             return Err(BackupError::UnstableSource);
         }
     } else if source_checkpoint.exists() {
+        return Err(BackupError::UnstableSource);
+    }
+    if let (Some(bytes), Some(digest)) = (quota_bytes, quota_blake3.as_ref()) {
+        if hash_file(&quota_source)? != (bytes, digest.clone()) {
+            return Err(BackupError::UnstableSource);
+        }
+    } else if fs::symlink_metadata(&quota_source).is_ok() {
         return Err(BackupError::UnstableSource);
     }
 
@@ -378,6 +436,9 @@ pub(crate) fn capture_locked(
             &proof_dir.join("tablet.checkpoint"),
         )?;
     }
+    if quota_bytes.is_some() {
+        copy_with_hash(&quota_destination, &proof_dir.join("tablet.wal.quota"))?;
+    }
     verify_disposable_restore(&proof_wal)?;
     // The proof folder is ours, was freshly created under the private output,
     // and is removed only after its recovery handle has been dropped.
@@ -397,7 +458,7 @@ pub(crate) fn capture_locked(
         checkpoint_blake3,
     };
     let manifest = serde_json::to_vec_pretty(&serde_json::json!({
-        "format": "NUDBBACKUP1",
+        "format": "NUDBBACKUP2",
         "sequence": receipt.sequence,
         "tablet_id": source_report.wal.tablet_id.map(|id| id.get()),
         "ownership_epoch": source_report.wal.last_ownership_epoch,
@@ -407,6 +468,7 @@ pub(crate) fn capture_locked(
             "bytes": receipt.checkpoint_bytes,
             "blake3": receipt.checkpoint_blake3
         },
+        "quota": {"bytes": quota_bytes, "blake3": quota_blake3},
         "proof": "disposable-full-mvcc-and-receipt-match"
     }))
     .map_err(|error| BackupError::Metadata(error.to_string()))?;

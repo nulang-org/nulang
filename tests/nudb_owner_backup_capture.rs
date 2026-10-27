@@ -195,3 +195,35 @@ fn checksum_valid_checkpoint_with_wrong_logical_values_fails_restore_proof() {
     assert_eq!(fs::read(&checkpoint).unwrap(), source_checkpoint);
     assert_eq!(fs::read(original.wal()).unwrap(), source_wal);
 }
+
+#[test]
+fn quota_protected_backup_preserves_enforced_wal_quota_after_restore() {
+    let sandbox = Sandbox::new();
+    let mut db = WalBackedTablet::open(descriptor(), sandbox.wal()).unwrap();
+    commit(&mut db, b"k", b"value");
+    db.activate_durable_wal_quota(4096).unwrap();
+    let destination = sandbox.target("quota-protected-backup");
+
+    let receipt = db.capture_consistent_backup(&destination).unwrap();
+    assert_eq!(receipt.sequence, 1);
+    assert!(
+        destination.join("tablet.wal.quota").is_file(),
+        "captured backup must not silently drop the durable admission policy"
+    );
+    let mut restored = WalBackedTablet::open(descriptor(), destination.join("tablet.wal")).unwrap();
+    assert_eq!(restored.durable_wal_quota(), Some(4096));
+    let write = restored
+        .prepare_write(
+            4,
+            restored.current_sequence(),
+            put(b"large", &vec![1; 8192]),
+        )
+        .unwrap();
+    assert!(matches!(
+        restored.commit(write),
+        Err(nulang::database::store::WalBackedError::Wal(
+            nulang::database::wal::WalError::BudgetExceeded { .. }
+        ))
+    ));
+    assert_eq!(restored.current_sequence(), 1);
+}
