@@ -308,10 +308,26 @@ pub struct ReqwestHttpProvider {
 impl ReqwestHttpProvider {
     /// Create a new reqwest-backed HTTP provider with a default timeout.
     pub fn new() -> Self {
+        // The actor authority gate authorizes the original HTTP destination.
+        // Reqwest's default cross-origin redirects would silently turn that
+        // grant into a request to an unapproved host, port, or scheme.
+        // Retain same-origin redirects only, with the usual 10-hop bound.
+        let redirects = reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 10 {
+                return attempt.stop();
+            }
+            match attempt.previous().first() {
+                Some(original) if original.origin() == attempt.url().origin() => attempt.follow(),
+                _ => attempt.stop(),
+            }
+        });
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
+            .redirect(redirects)
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            // A fallback to Client::new() would silently restore permissive
+            // cross-origin redirects if secure client construction failed.
+            .expect("cannot initialize same-origin-only HTTP client");
         ReqwestHttpProvider { client }
     }
 }
