@@ -174,35 +174,8 @@ fn merge_imported_decls(
 }
 
 fn resolve_path(base: &Path, import: &str) -> PathBuf {
-    // stdlib::set → resolve to STDLIB_DIR/set.nula or dev fallback.
-    // stdlib::web::types → STDLIB_DIR/web/types.nula.
     if let Some(module) = import.strip_prefix("stdlib::") {
-        let module_path = module.replace("::", std::path::MAIN_SEPARATOR_STR);
-        // Try NULANG_STDLIB env var first
-        if let Ok(dir) = std::env::var("NULANG_STDLIB") {
-            return PathBuf::from(dir).join(format!("{}.nula", module_path));
-        }
-        // Try relative to executable
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(exe_dir) = exe.parent() {
-                let candidate = exe_dir.join("stdlib").join(format!("{}.nula", module_path));
-                if candidate.exists() {
-                    return candidate;
-                }
-            }
-        }
-        // Development fallback: src/stdlib/ relative to CWD
-        if let Ok(cwd) = std::env::current_dir() {
-            let dev_path = cwd
-                .join("src")
-                .join("stdlib")
-                .join(format!("{}.nula", module_path));
-            if dev_path.exists() {
-                return dev_path;
-            }
-        }
-        // Last resort: relative to CWD
-        return PathBuf::from(format!("src/stdlib/{}.nula", module_path));
+        return crate::parser::stdlib_import_path(module);
     }
 
     // @nulang/auth or @nulang/auth/session → resolved via NULANG_MODULE_PATH.
