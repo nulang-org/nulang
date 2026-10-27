@@ -48,6 +48,12 @@ jobs:
           toolchain: "1.95.0"
       - name: Format
         run: cargo fmt --all -- --check
+      - name: WAL budget and durable quota admission
+        run: |
+          cargo test --locked --no-default-features --test nudb_wal_budget
+          cargo test --locked --no-default-features --test nudb_durable_wal_quota
+      # The capacity profile is an intentionally ignored, load-sensitive
+      # diagnostic benchmark; do not treat its opt-in timing as a CI gate.
       - name: Batch WAL contract
         run: |
           cargo test --locked --no-default-features --test nudb_wal_batch
