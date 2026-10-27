@@ -103,6 +103,7 @@ impl<'a> DurableTaskOutputStore<'a> {
         }
 
         let mut recovered = None;
+        let mut predecessor = TaskOutputState::new(self.task_key.clone())?;
         for (ordinal, event) in events.iter().enumerate() {
             let expected_sequence = ordinal as u64 + 1;
             if event.sequence != expected_sequence
@@ -128,6 +129,10 @@ impl<'a> DurableTaskOutputStore<'a> {
                     "task key differs from durable slot identity".into(),
                 ));
             }
+            predecessor
+                .validate_successor(&state)
+                .map_err(|error| TaskOutputStoreError::Corrupt(error.to_string()))?;
+            predecessor = state.clone();
             recovered = Some(state);
         }
 
