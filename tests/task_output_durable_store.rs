@@ -26,11 +26,14 @@ fn atomic_transitions_keep_staged_output_private_until_commit() {
         task.load().unwrap().committed().unwrap().artifact_key,
         "objects/task-48/attempt-1"
     );
+    drop(task);
     assert_eq!(store.latest_sequence(SLOT), 3);
+    let mut task = DurableTaskOutputStore::new(&mut store, SLOT, KEY).unwrap();
     assert_eq!(
         task.commit(&owner, [4; 32]).unwrap(),
         CommitDecision::AlreadyWon
     );
+    drop(task);
     assert_eq!(store.latest_sequence(SLOT), 3);
 }
 
@@ -62,14 +65,19 @@ fn repeated_lease_assignment_and_exact_staging_are_sequence_noops() {
     let mut task = DurableTaskOutputStore::new(&mut store, SLOT, KEY).unwrap();
     let token = task.assign("attempt-1").unwrap();
     assert_eq!(task.assign("attempt-1").unwrap(), token);
+    drop(task);
     assert_eq!(store.latest_sequence(SLOT), 1);
+    let mut task = DurableTaskOutputStore::new(&mut store, SLOT, KEY).unwrap();
     task.stage(&token, "objects/immutable", [9; 32]).unwrap();
     task.stage(&token, "objects/immutable", [9; 32]).unwrap();
+    drop(task);
     assert_eq!(store.latest_sequence(SLOT), 2);
+    let mut task = DurableTaskOutputStore::new(&mut store, SLOT, KEY).unwrap();
     assert!(matches!(
         task.stage(&token, "objects/mutated", [9; 32]),
         Err(TaskOutputStoreError::Semantic(CommitError::StageConflict))
     ));
+    drop(task);
     assert_eq!(store.latest_sequence(SLOT), 2);
 }
 
