@@ -289,7 +289,7 @@ The web runtime now has a separate, revisioned HTML patch stream: `Realtime.patc
 
 Every connection receives a current-state snapshot, followed by typed `nulang-ui-html/1` events with decimal-string revisions. Duplicate updates are ignored and revision gaps trigger a fresh snapshot. Limits per development-server process: 32 rooms, 32 targets per room, 8 subscribers per room, 8 queued updates per subscriber, and 64 KiB per update. Falling-behind subscribers are disconnected instead of buffering indefinitely.
 
-**Security and durability:** This experimental endpoint has no subscriber authentication, tenant isolation, persistent history, or cross-process distribution. Do not publish private data into shared rooms or expose the development server to untrusted clients. Actor-backed subscriptions and application authorization are future work.
+**Security and durability:** Unlike the general dev-server routes, this UI stream accepts **only loopback TCP connections** with a literal local `Host` (`localhost`, `127.0.0.1`, or `[::1]`) and rejects cross-origin browser requests (including DNS-rebinding Host values and cross-site Fetch Metadata). It is **not an authentication system**: local processes and local reverse proxies can still access streams, and the rest of the dev server binds to all interfaces. There is no subscriber identity, tenant isolation, persistent history, or cross-process distribution. Do not publish private data into shared rooms, forward the stream from a publicly reachable proxy, or expose the development server to untrusted clients. Actor-backed subscriptions and application authorization remain future work.
 
 ## Realtime Broadcast
 

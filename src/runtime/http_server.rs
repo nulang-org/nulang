@@ -829,6 +829,75 @@ pub fn ui_stream_publish(room: &str, target: &str, html: &str) -> bool {
 /// Every subscription begins with an atomic current snapshot. This makes
 /// Last-Event-ID / reconnect gap recovery independent of any event-history
 /// retention and prevents reconnects from replaying stale mutations.
+/// This first-generation stream has no authentication or tenant identity.
+/// Restrict transport to same-origin browser access over loopback, regardless
+/// of the dev server's broader listen address. Do not trust proxy headers.
+fn ui_stream_local_request_allowed(request: &HttpRequest, peer: std::net::IpAddr) -> bool {
+    if !peer.is_loopback() {
+        return false;
+    }
+
+    // Accept only literal loopback authorities. Reject DNS rebinding via an
+    // attacker-controlled Host even if it resolves to 127.0.0.1.
+    let mut hosts = request
+        .headers
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case("host"));
+    let Some((_, host)) = hosts.next() else {
+        return false;
+    };
+    if hosts.next().is_some() {
+        return false;
+    }
+    let host = host.trim();
+    let allowed_host = ["localhost", "127.0.0.1", "[::1]"].iter().any(|name| {
+        if host.eq_ignore_ascii_case(name) {
+            return true;
+        }
+        host.get(..name.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(name))
+            && host.get(name.len()..).is_some_and(|suffix| {
+                suffix.strip_prefix(':').is_some_and(|port| {
+                    !port.is_empty()
+                        && port.bytes().all(|b| b.is_ascii_digit())
+                        && port.parse::<u16>().is_ok_and(|port| port != 0)
+                })
+            })
+    });
+    if !allowed_host {
+        return false;
+    }
+
+    // Browser EventSource is same-origin. Cross-site scripts should never
+    // consume local SSE connections, including DNS-rebinding attempts.
+    let mut origins = request
+        .headers
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case("origin"));
+    if let Some((_, origin)) = origins.next() {
+        if !origin
+            .trim()
+            .eq_ignore_ascii_case(&format!("http://{host}"))
+        {
+            return false;
+        }
+    }
+    if origins.next().is_some() {
+        return false;
+    }
+
+    let mut fetch_sites = request
+        .headers
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case("sec-fetch-site"));
+    if let Some((_, site)) = fetch_sites.next() {
+        if !matches!(site.trim(), "same-origin" | "none") {
+            return false;
+        }
+    }
+    fetch_sites.next().is_none()
+}
+
 fn ui_stream_subscribe(
     room: &str,
 ) -> Option<(nulang_ui_protocol::UiHtmlStreamMessage, UiStreamSubscriber)> {
@@ -1199,7 +1268,20 @@ impl WebDevServer {
 
         let mut response = if path.starts_with(Self::UI_SSE_PATH_PREFIX) {
             let room = &path[Self::UI_SSE_PATH_PREFIX.len()..];
-            if request.method != HttpMethod::Get {
+            if !stream
+                .peer_addr()
+                .ok()
+                .is_some_and(|peer| ui_stream_local_request_allowed(&request, peer.ip()))
+            {
+                HttpResponse {
+                    status: 403,
+                    headers: vec![
+                        ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+                        ("Cache-Control".into(), "no-store".into()),
+                    ],
+                    body: b"UI stream access denied".to_vec(),
+                }
+            } else if request.method != HttpMethod::Get {
                 HttpResponse {
                     status: 405,
                     headers: vec![("Allow".into(), "GET".into())],
@@ -1763,6 +1845,171 @@ mod tests {
         let names: Vec<&str> = response.headers.iter().map(|(k, _)| k.as_str()).collect();
         assert!(names.contains(&"X-Content-Type-Options"));
         assert!(names.contains(&"X-Frame-Options"));
+    }
+
+    fn sse_tcp_connect(
+        port: u16,
+        room: &str,
+        extra_headers: &str,
+    ) -> std::io::BufReader<TcpStream> {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        write!(
+            stream,
+            "GET /__nulang/ui-sse/{room} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: text/event-stream\r\n{extra_headers}\r\n"
+        ).unwrap();
+        std::io::BufReader::new(stream)
+    }
+
+    fn sse_tcp_frame(reader: &mut impl std::io::BufRead) -> String {
+        let mut frame = String::new();
+        for _ in 0..128 {
+            let mut line = String::new();
+            let count = reader.read_line(&mut line).unwrap();
+            assert!(count > 0, "SSE stream closed unexpectedly");
+            if line == "\r\n" || line == "\n" {
+                return frame;
+            }
+            frame.push_str(&line);
+        }
+        panic!("SSE frame exceeded the configured line limit");
+    }
+
+    #[test]
+    fn ui_stream_tcp_snapshot_patch_and_reconnect() {
+        let room = format!("tcp-ui-{}", std::process::id());
+        assert!(ui_stream_publish(
+            &room,
+            "#status",
+            "<p id=\"status\">one</p>"
+        ));
+        let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
+        let mut first = sse_tcp_connect(server.port, &room, "");
+        let headers = sse_tcp_frame(&mut first);
+        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"), "{headers}");
+        assert!(
+            headers.contains("Content-Type: text/event-stream"),
+            "{headers}"
+        );
+        assert!(
+            headers.contains("X-Content-Type-Options: nosniff"),
+            "{headers}"
+        );
+
+        let snapshot = sse_tcp_frame(&mut first);
+        assert!(snapshot.contains("event: nulang-ui-snapshot"), "{snapshot}");
+        assert!(snapshot.contains("id: 1"), "{snapshot}");
+        assert!(snapshot.contains(r#""revision":"1""#), "{snapshot}");
+
+        assert!(ui_stream_publish(
+            &room,
+            "#status",
+            "<p id=\"status\">two</p>"
+        ));
+        let patch = sse_tcp_frame(&mut first);
+        assert!(patch.contains("event: nulang-ui-patch"), "{patch}");
+        assert!(patch.contains("id: 2"), "{patch}");
+        assert!(patch.contains(r#""base_revision":"1""#), "{patch}");
+        assert!(patch.contains("two"), "{patch}");
+
+        drop(first);
+        let mut reconnect = sse_tcp_connect(server.port, &room, "Last-Event-ID: 1\r\n");
+        assert!(sse_tcp_frame(&mut reconnect).starts_with("HTTP/1.1 200 OK"));
+        let latest = sse_tcp_frame(&mut reconnect);
+        assert!(latest.contains("event: nulang-ui-snapshot"), "{latest}");
+        assert!(latest.contains("id: 2"), "{latest}");
+        assert!(latest.contains("two"), "{latest}");
+        drop(reconnect);
+        drop(server);
+    }
+
+    #[test]
+    fn ui_stream_tcp_rejects_cross_origin_before_subscribing() {
+        let room = format!("tcp-origin-{}", std::process::id());
+        let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
+        let mut cross_site = sse_tcp_connect(
+            server.port,
+            &room,
+            "Origin: https://evil.example\r\nSec-Fetch-Site: cross-site\r\n",
+        );
+        let headers = sse_tcp_frame(&mut cross_site);
+        assert!(headers.starts_with("HTTP/1.1 403 Forbidden"), "{headers}");
+        let count = ui_stream_rooms()
+            .lock()
+            .unwrap()
+            .get(&room)
+            .map(|room| room.listeners.len())
+            .unwrap_or(0);
+        assert_eq!(count, 0, "rejected origins must never subscribe");
+        drop(cross_site);
+        drop(server);
+    }
+
+    #[test]
+    fn ui_stream_security_policy_rejects_nonloopback_and_dns_rebinding() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let remote = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5));
+        let mut request = HttpRequest {
+            method: HttpMethod::Get,
+            path: "/__nulang/ui-sse/tasks".into(),
+            headers: vec![("Host".into(), "localhost:1234".into())],
+            body: vec![],
+        };
+        assert!(ui_stream_local_request_allowed(&request, loopback));
+        assert!(!ui_stream_local_request_allowed(&request, remote));
+        request.headers[0].1 = "attacker.example:1234".into();
+        assert!(!ui_stream_local_request_allowed(&request, loopback));
+        request.headers[0].1 = "localhost.evil.example:1234".into();
+        assert!(!ui_stream_local_request_allowed(&request, loopback));
+        request.headers[0].1 = "127.0.0.1:1234".into();
+        request
+            .headers
+            .push(("Origin".into(), "http://127.0.0.1:1234".into()));
+        request
+            .headers
+            .push(("Sec-Fetch-Site".into(), "same-origin".into()));
+        assert!(ui_stream_local_request_allowed(&request, loopback));
+        request.headers[2].1 = "cross-site".into();
+        assert!(!ui_stream_local_request_allowed(&request, loopback));
+        request.headers[2].1 = "same-origin".into();
+        request
+            .headers
+            .push(("Origin".into(), "http://127.0.0.1:1234".into()));
+        assert!(!ui_stream_local_request_allowed(&request, loopback));
+        request.headers.pop();
+        request.headers[1].1 = "null".into();
+        assert!(!ui_stream_local_request_allowed(&request, loopback));
+    }
+
+    #[test]
+    fn ui_stream_tcp_allows_same_origin_and_rejects_cross_site_fetch() {
+        let room = format!("tcp-guard-{}", std::process::id());
+        let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
+        let headers = format!(
+            "Origin: http://127.0.0.1:{}\r\nSec-Fetch-Site: same-origin\r\n",
+            server.port
+        );
+        let mut trusted = sse_tcp_connect(server.port, &room, &headers);
+        assert!(sse_tcp_frame(&mut trusted).starts_with("HTTP/1.1 200 OK"));
+        assert!(sse_tcp_frame(&mut trusted).contains("event: nulang-ui-snapshot"));
+        drop(trusted);
+
+        let mut cross_site = sse_tcp_connect(server.port, &room, "Sec-Fetch-Site: cross-site\r\n");
+        let headers = sse_tcp_frame(&mut cross_site);
+        assert!(headers.starts_with("HTTP/1.1 403 Forbidden"), "{headers}");
+        drop(cross_site);
+
+        let mut rebinding = sse_tcp_connect(server.port, &room, "Host: attacker.example\r\n");
+        let headers = sse_tcp_frame(&mut rebinding);
+        assert!(headers.starts_with("HTTP/1.1 403 Forbidden"), "{headers}");
+        drop(rebinding);
+        drop(server);
     }
 
     #[test]
