@@ -190,3 +190,35 @@ delivery. Such tests require a dedicated constrained mount or a
 fault-injecting SQLite VFS and must not run against shared production
 volumes. The test-only SQL page limit also cannot certify the behavior
 of all SQLite implementations, platforms, or file systems.
+
+## Targeted Linux SQLite WAL syscall-failure injection
+
+A Linux-only C test shim lives in the fault_shim directory and is
+compiled with cc into the verifier's **disposable temp directory**.
+Only the rusqlite_atomic_fixture child receives LD_PRELOAD, with
+NULANG_SQLITE_FAULT_DB_PATH set to that child's unique copied fixture.
+The shim inspects /proc/self/fd and injects failures **only** for the
+exact database-path + -wal descriptor. Other files, processes,
+and actual repositories are not affected. Missing path or mode means
+no injection, and both tests explicitly require an interception marker.
+
+The two additional tests enforce:
+- pwrite/pwrite64/write on the target SQLite WAL return
+  -1, errno=ENOSPC, exercising SQLite's propagation of a kernel-style
+  no-space write error (distinct from SQLite max_page_count).
+- fdatasync/fsync on the target WAL return -1, errno=EIO,
+  exercising SQLite's handling of sync failure before successful commit.
+
+Each test checks that the child **does not report success**, the old
+tail/snapshot/journal/outbox remain unchanged in a fresh process, and
+the same file accepts a clean later commit when the isolated shim is no
+longer present. The harness retains the two-process runtime separation.
+
+**Limits:** These are libc syscall **injections**, not a physically full
+filesystem, storage-controller failure, bit-for-bit durability
+certification, or actual hardware power loss. Some SQLite versions
+invoke different I/O functions; the marker requirement makes those
+changes a hard test failure rather than an incorrectly reported pass.
+Production Nulang PersistenceStore, manifests, schema and defaults
+are not modified. A real dedicated-mount ENOSPC / hardware fault matrix
+still requires an authorized isolated filesystem or dedicated agent.
