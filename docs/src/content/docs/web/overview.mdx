@@ -331,3 +331,148 @@ The WASM backends (`--backend wasm`, `wasm-run`, `wasm-aot`, and `nula build-was
 - [Actor Model](/actors/overview/) — the actor runtime that web requests dispatch into
 - [Http Effect](/stdlib/http/) — the auto-generated operation reference
 - [Distribution & Clustering](/actors/distribution/) — take a served actor system multi-node
+
+
+## HTMX-compatible partial HTML
+
+Nulang's Web server can respond to stock HTMX 2.x and 4.x clients without a
+Nulang-specific browser runtime. Import `stdlib::web::htmx` to use escaped
+HTML attributes, request negotiation and HTTP response headers.
+
+```nulang
+import stdlib::web::htmx
+import stdlib::web::html
+import stdlib::web::types
+
+fn results() -> Html {
+    el("ul", [], [el("li", [], [text("Result")])])
+}
+
+fn search() -> Html {
+    if is_fragment() then {
+        results()
+    } else {
+        document(
+            head([title("Search")]),
+            body([
+                el("form", [("action", text("/search")), ("method", text("GET"))], [
+                    el("input", [
+                        ("name", text("q")),
+                        get("/search"),
+                        target("#results"),
+                        trigger("input changed delay:250ms"),
+                        sync("this:replace")
+                    ], []),
+                    el("button", [("type", text("submit"))], [text("Search")])
+                ]),
+                el("div", [("id", text("results"))], [results()])
+            ])
+        )
+    }
+}
+
+app "search" {
+    route "GET" "/search" -> search
+}
+```
+
+The form's native `action` and `method` allow navigation without JavaScript.
+When HTMX is loaded, the `hx-*` attributes perform incremental requests.
+Load HTMX independently (and use a version appropriate for your app).
+
+`is_fragment()` sets `Vary` and returns true for `HX-Request: true`,
+unless the request explicitly requests `HX-Request-Type: full` (HTMX 4),
+is a history restoration, or is boosted navigation. The route decides which
+HTML to render. **Do not use `HX-Request` as an authentication, authorization,
+CSRF, or security boundary**: request headers are controlled by callers.
+The `HX-Target` format differs between HTMX 2 and HTMX 4; treat it as
+request metadata, not a trusted CSS selector.
+
+HTMX response helpers (`trigger_event`, `client_redirect`, `retarget`,
+`reswap`, `push_url`, `refresh`) set the corresponding `HX-*`
+headers on successful route responses. `Web.set_header` also supports
+`Vary` and other safe application headers; it drops invalid names/values,
+CRLF injection, framing overrides, and server-owned security headers.
+A later write replaces an earlier header with the same case-insensitive
+name, except `Vary`, which combines unique case-insensitive field names and
+preserves `Vary: *`. Use `Web.set_cookie` for cookies. The HTTP server automatically sets
+`Content-Type: text/html; charset=utf-8`.
+
+The helpers intentionally do **not** ship a second reactive runtime. Use
+HTMX/Alpine.js for progressive enhancement, or Nulang's existing compiled
+signals and actor-backed SSE for more complex interactions. Browser request
+coordination (`hx-sync`) runs on the HTMX client; it does not cancel server-side
+work automatically.
+
+## Unpoly-compatible partial HTML (optional)
+
+Import `stdlib::web::unpoly` to respond to stock Unpoly 3 clients without
+shipping a second Nulang JavaScript runtime. The full example is in
+[`examples/unpoly-compat/src/main.nula`](https://github.com/nulang-org/nulang/tree/main/examples/unpoly-compat).
+
+```nulang
+import stdlib::web::unpoly
+import stdlib::web::html
+import stdlib::web::types
+
+fn results() -> Html {
+    el("main", [("id", text("results"))], [text("Updated")])
+}
+
+fn page() -> Html {
+    if is_target("#results") then {
+        results()
+    } else {
+        document(
+            head([title("Results")]),
+            body([
+                el("a", [
+                    ("href", text("/results")), follow(), target("#results")
+                ], [text("Refresh")]),
+                results()
+            ])
+        )
+    }
+}
+```
+
+`is_fragment()` detects `X-Up-Version` and adds
+`Vary: X-Up-Version, X-Up-Target, X-Up-Fail-Target, X-Up-Mode, X-Up-Validate`
+for the full-page and fragment variants. `is_fragment()` only identifies
+an Unpoly request; it does not prove the requested selector is supported.
+Use `is_target("#results")` to render just one known fragment when its
+`X-Up-Target` matches exactly. Combined selectors (e.g.
+`#results, #notifications`), missing targets, and other selectors must fall
+back to a complete document containing the requested elements. This keeps
+Unpoly's merged fragment requests correct. `request_target()`, `fail_target()`,
+`layer_mode()`, and `validation_fields()` expose optional request metadata.
+The caller must still validate expected targets and authorize the action.
+
+Attribute helpers include `follow()`, `submit()`, `target(selector)`,
+`fail_target_attr(selector)`, `layer(kind)`, `validate()` and `hungry()`.
+Response helpers include `retarget(selector)`, `set_title(value)`,
+`location(url)`, `events(json)`, `accept_layer(value)` and
+`dismiss_layer(value)`. All user-controlled attribute values pass through
+the HTML escaping constructor, and response headers pass the host's
+CRLF/forbidden-field checks.
+
+Unpoly must be loaded separately by the application. Ordinary links and forms
+retain their native `href`, `action`, and `method` for no-JavaScript
+navigation. The `X-Up-*` headers are not authentication or CSRF signals.
+`is_fail_target("#signup")` checks the exact `X-Up-Fail-Target` selector
+for HTTP 422 responses. `is_validation()` recognizes enhanced requests with
+`X-Up-Validate`; **do not save or commit** on those requests. Batched validation
+may contain multiple field names and combined targets. Always render a full
+form/document when a requested target is unsupported or combined.
+
+The example in `examples/unpoly-form-outcome/` combines the optional Unpoly
+adapter with `FormOutcome`: `form_ok(Html)` emits HTTP 200 using the success
+target; `form_invalid(Html)` emits HTTP 422 using the failure target. The
+request-scoped `Vary` header is preserved for both statuses, and validation
+requests do not write to the example store. Unpoly interprets validation
+requests as validation regardless of their status; the example emits 200.
+
+All `X-Up-*` values are untrusted client metadata, never an authentication,
+CSRF, authorization, or tenant authority check. The application must perform
+those checks independently before mutations. This experiment does not add a
+browser runtime, generic typed fragments, ETag/304, or deployment hardening.

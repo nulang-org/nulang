@@ -521,6 +521,7 @@ pub struct RequestContext {
 thread_local! {
     static CURRENT_REQUEST: RefCell<Option<RequestContext>> = const { RefCell::new(None) };
     static RESPONSE_COOKIES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static RESPONSE_HEADERS: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Set the request context for the current thread, run `f`, then clear it.
@@ -530,9 +531,100 @@ where
 {
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = Some(ctx));
     RESPONSE_COOKIES.with(|c| c.borrow_mut().clear());
+    RESPONSE_HEADERS.with(|h| h.borrow_mut().clear());
     let result = f();
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = None);
     result
+}
+
+/// Queue a response header for the current Web route only.
+///
+/// Reject invalid wire syntax, protocol-managed framing, cookies and security
+/// headers. Header names are matched case-insensitively and later writes
+/// replace earlier values (Set-Cookie uses its own multi-valued API).
+/// Returns false outside a request or for invalid / reserved headers.
+pub fn set_response_header(name: &str, value: &str) -> bool {
+    if name.is_empty()
+        || name.len() > 128
+        || value.len() > 8192
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+        || !value
+            .bytes()
+            .all(|b| b == b'\t' || (b >= 0x20 && b != 0x7f))
+    {
+        return false;
+    }
+    if [
+        "content-length",
+        "content-type",
+        "content-encoding",
+        "transfer-encoding",
+        "connection",
+        "keep-alive",
+        "upgrade",
+        "proxy-connection",
+        "trailer",
+        "te",
+        "host",
+        "server",
+        "set-cookie",
+        "x-content-type-options",
+        "x-frame-options",
+        "referrer-policy",
+        "content-security-policy",
+    ]
+    .iter()
+    .any(|reserved| name.eq_ignore_ascii_case(reserved))
+    {
+        return false;
+    }
+    if !CURRENT_REQUEST.with(|c| c.borrow().is_some()) {
+        return false;
+    }
+    RESPONSE_HEADERS.with(|h| {
+        let mut headers = h.borrow_mut();
+        if let Some((old_name, old_value)) = headers
+            .iter_mut()
+            .find(|(existing, _)| existing.eq_ignore_ascii_case(name))
+        {
+            if name.eq_ignore_ascii_case("vary") {
+                // Multiple render adapters may negotiate independent variants.
+                // Replacing Vary would cause shared caches to serve the wrong HTML.
+                let old = old_value.clone();
+                if old.trim() == "*" || value.trim() == "*" {
+                    *old_value = "*".to_string();
+                } else {
+                    let mut fields: Vec<&str> = Vec::new();
+                    for token in old.split(',').chain(value.split(',')) {
+                        let field = token.trim();
+                        if !field.is_empty()
+                            && !fields
+                                .iter()
+                                .any(|previous| previous.eq_ignore_ascii_case(field))
+                        {
+                            fields.push(field);
+                        }
+                    }
+                    *old_value = fields.join(", ");
+                }
+            } else {
+                *old_value = value.to_string();
+            }
+            *old_name = name.to_string();
+        } else if headers.len() < 64 {
+            headers.push((name.to_string(), value.to_string()));
+        } else {
+            return false;
+        }
+        true
+    })
+}
+
+/// Drain request-scoped response headers (never reuse them for another route).
+pub fn take_response_headers() -> Vec<(String, String)> {
+    RESPONSE_HEADERS.with(|h| h.borrow_mut().drain(..).collect())
 }
 
 /// Add a `Set-Cookie` header for the current response.
@@ -1056,9 +1148,15 @@ impl WebDevServer {
                         )),
                         Err(error) => Err(error),
                     });
+                // User headers are honored only for a successfully rendered page.
+                // Discard pending headers on decode/handler errors.
+                let response_headers = take_response_headers();
                 match rendered {
                     Ok(Some(html)) => match Self::render_web_response(route, &html) {
-                        Ok(response) => response,
+                        Ok(mut response) => {
+                            response.headers.extend(response_headers);
+                            response
+                        }
                         Err(error) => {
                             eprintln!("invalid web response: {error}");
                             HttpResponse {
@@ -1256,6 +1354,67 @@ mod tests {
             remaining: input,
             max_chunk,
         }
+    }
+
+    #[test]
+    fn response_header_rejects_injection_and_transport_overrides() {
+        let ctx = RequestContext {
+            request: HttpRequest {
+                method: HttpMethod::Get,
+                path: "/".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+        with_request_context(ctx, || {
+            assert!(set_response_header("HX-Trigger", "saved"));
+            assert!(set_response_header("hx-trigger", "changed"));
+            assert!(set_response_header("Vary", "HX-Request"));
+            assert!(!set_response_header("HX-Trigger", "x\r\nX-Evil: true"));
+            assert!(!set_response_header("Content-Length", "9"));
+            assert!(!set_response_header("Transfer-Encoding", "chunked"));
+            assert!(!set_response_header("Set-Cookie", "session=leak"));
+            assert!(!set_response_header("Bad Header", "value"));
+            assert_eq!(
+                take_response_headers(),
+                vec![
+                    ("hx-trigger".into(), "changed".into()),
+                    ("Vary".into(), "HX-Request".into()),
+                ]
+            );
+        });
+        assert!(take_response_headers().is_empty());
+    }
+
+    #[test]
+    fn vary_headers_combine_without_losing_cache_partition_keys() {
+        let ctx = RequestContext {
+            request: HttpRequest {
+                method: HttpMethod::Get,
+                path: "/".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+        with_request_context(ctx, || {
+            assert!(set_response_header("Vary", "Accept-Language"));
+            assert!(set_response_header(
+                "vary",
+                "X-Up-Version, accept-language, X-Up-Target"
+            ));
+            assert_eq!(
+                take_response_headers(),
+                vec![(
+                    "vary".into(),
+                    "Accept-Language, X-Up-Version, X-Up-Target".into()
+                )]
+            );
+            assert!(set_response_header("Vary", "*"));
+            assert!(set_response_header("Vary", "X-Up-Mode"));
+            assert_eq!(take_response_headers(), vec![("Vary".into(), "*".into())]);
+        });
     }
 
     // Fail closed on URL parent components and symlinks outside static roots.
