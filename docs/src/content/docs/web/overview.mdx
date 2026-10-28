@@ -326,7 +326,38 @@ make the experimental HTTP/action host production-ready.
 
 The web runtime now has a separate, revisioned HTML patch stream: `Realtime.patch(room, target, html)` via `stdlib::web::realtime::patch`. In the browser use `window.nulang.stream("tasks")`, which returns a handle with `close()` for cancellation. The native EventSource endpoint is `/__nulang/ui-sse/tasks`.
 
-Every connection receives a current-state snapshot, followed by typed `nulang-ui-html/1` events with decimal-string revisions. Duplicate updates are ignored and revision gaps trigger a fresh snapshot. Limits per development-server process: 32 rooms, 32 targets per room, 8 subscribers per room, 8 queued updates per subscriber, and 64 KiB per update. Falling-behind subscribers are disconnected instead of buffering indefinitely.
+Every connection receives a current-state snapshot, followed by typed `nulang-ui-html/1` events with decimal-string revisions. Duplicate updates are ignored and revision gaps trigger a fresh snapshot. Limits per development-server process: 32 rooms, 32 targets per room, 8 subscribers per room, 8 queued updates per subscriber, and 64 KiB per HTML update. Falling-behind subscribers are disconnected instead of buffering indefinitely.
+
+### Actor-triggered fragment invalidation (experimental)
+
+When a durable actor or server action changes application state, it can explicitly
+request that subscribers refresh an affected region without constructing a
+server-side HTML patch:
+
+```nulang
+import stdlib::web::realtime
+
+// After the authoritative mutation has committed:
+let accepted = invalidate("tasks", "#summary")
+```
+
+`Realtime.invalidate(room, target)` publishes a revisioned `invalidate`
+event. Each subscribed browser fetches its **current page URL** using a
+same-origin, no-store GET, then morphs the matching stable `#id` from the
+canonical HTML response. A stale GET response is ignored when a newer patch,
+invalidation, reconnect, or navigation supersedes it.
+
+The server removes the target's previous cached HTML from the room snapshot
+and records the target as invalidated. A reconnect therefore refreshes the
+target rather than replaying obsolete HTML. Publishing a new HTML patch clears
+that invalidation. The union of cached and invalidated targets remains bounded
+at 32 per room. This is an explicit event-to-view bridge, **not** automatic
+compiler-derived resource dependency tracking. The application must identify
+which view target changed and ensure the GET route renders authoritative data.
+
+Invalidation transport is in-process and experimental; do **not** use it for
+private or tenant-scoped updates on a public server. It is not a durable event
+log, an authentication mechanism, or an exactly-once mutation guarantee.
 
 **Security and durability:** Unlike the general dev-server routes, this UI stream accepts **only loopback TCP connections** with a literal local `Host` (`localhost`, `127.0.0.1`, or `[::1]`) and rejects cross-origin browser requests (including DNS-rebinding Host values and cross-site Fetch Metadata). It is **not an authentication system**: local processes and local reverse proxies can still access streams, and the rest of the dev server binds to all interfaces. There is no subscriber identity, tenant isolation, persistent history, or cross-process distribution. Do not publish private data into shared rooms, forward the stream from a publicly reachable proxy, or expose the development server to untrusted clients. Actor-backed subscriptions and application authorization remain future work.
 
@@ -366,9 +397,9 @@ regions. HTTP request admission and response safety remain separately gated.
 
 ## Realtime Broadcast
 
-`Realtime` currently has a single operation:
+For the legacy broadcast channel:
 
-- `perform Realtime.broadcast(room: String, message: String) -> Unit` — broadcast a message to all subscribers of a realtime room.
+- `perform Realtime.broadcast(room: String, message: String) -> Unit` broadcasts to subscribers of a realtime room. Unlike the revisioned UI stream, this channel does not provide bounded snapshot recovery.
 
 Subscribers connect to the built-in Server-Sent Events endpoint `/<room-prefix>/sse/<room>` — in the dev server that is `GET /__nulang/sse/<room>`. In the server above, `perform Realtime.broadcast("signs", msg)` in the `sign` handler pushes `data: "<msg>"` events to every open SSE connection:
 

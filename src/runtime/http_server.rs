@@ -5,7 +5,7 @@
 //! Status is always 200; Content-Type is always text/plain.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
@@ -722,6 +722,7 @@ const UI_STREAM_CHANNEL_DEPTH: usize = 8;
 struct UiStreamRoom {
     revision: u64,
     elements: BTreeMap<String, String>,
+    invalidated: BTreeSet<String>,
     listeners: Vec<(u64, SyncSender<nulang_ui_protocol::UiHtmlStreamMessage>)>,
 }
 
@@ -801,9 +802,13 @@ pub fn ui_stream_publish(room: &str, target: &str, html: &str) -> bool {
         .or_insert_with(|| UiStreamRoom {
             revision: 0,
             elements: BTreeMap::new(),
+            invalidated: BTreeSet::new(),
             listeners: Vec::new(),
         });
-    if !entry.elements.contains_key(target) && entry.elements.len() >= UI_STREAM_MAX_TARGETS {
+    if !entry.elements.contains_key(target)
+        && !entry.invalidated.contains(target)
+        && entry.elements.len() + entry.invalidated.len() >= UI_STREAM_MAX_TARGETS
+    {
         return false;
     }
     let Some(next) = entry.revision.checked_add(1) else {
@@ -817,9 +822,72 @@ pub fn ui_stream_publish(room: &str, target: &str, html: &str) -> bool {
     );
     entry.revision = next;
     entry.elements.insert(target.into(), html.into());
+    entry.invalidated.remove(target);
     entry
         .listeners
         .retain(|(_, sender)| match sender.try_send(patch.clone()) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
+        });
+    true
+}
+
+/// Mark an HTML fragment stale without broadcasting HTML. Subscribers fetch
+/// canonical GET content; reconnect snapshots carry pending invalidations.
+/// Producers may be actor handlers but this local dev transport is NOT
+/// authenticated or tenant-scoped.
+pub fn ui_stream_invalidate(room: &str, target: &str) -> bool {
+    use nulang_ui_protocol::{DocumentId, Revision, UiHtmlStreamMessage};
+    if room.is_empty()
+        || room.len() > 128
+        || !room
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+    {
+        return false;
+    }
+    let probe = UiHtmlStreamMessage::invalidate(
+        DocumentId::from(room),
+        Revision(0),
+        Revision(1),
+        target.to_owned(),
+    );
+    if probe.validate().is_err() {
+        return false;
+    }
+    let mut rooms = ui_stream_rooms().lock().unwrap();
+    if !rooms.contains_key(room) && rooms.len() >= UI_STREAM_MAX_ROOMS {
+        return false;
+    }
+    let entry = rooms
+        .entry(room.to_owned())
+        .or_insert_with(|| UiStreamRoom {
+            revision: 0,
+            elements: BTreeMap::new(),
+            invalidated: BTreeSet::new(),
+            listeners: Vec::new(),
+        });
+    if !entry.elements.contains_key(target)
+        && !entry.invalidated.contains(target)
+        && entry.elements.len() + entry.invalidated.len() >= UI_STREAM_MAX_TARGETS
+    {
+        return false;
+    }
+    let Some(next) = entry.revision.checked_add(1) else {
+        return false;
+    };
+    let event = UiHtmlStreamMessage::invalidate(
+        DocumentId::from(room),
+        Revision(entry.revision),
+        Revision(next),
+        target.to_owned(),
+    );
+    entry.revision = next;
+    entry.elements.remove(target);
+    entry.invalidated.insert(target.to_owned());
+    entry
+        .listeners
+        .retain(|(_, sender)| match sender.try_send(event.clone()) {
             Ok(()) => true,
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
         });
@@ -919,12 +987,13 @@ fn ui_stream_subscribe(
         .or_insert_with(|| UiStreamRoom {
             revision: 0,
             elements: BTreeMap::new(),
+            invalidated: BTreeSet::new(),
             listeners: Vec::new(),
         });
     if entry.listeners.len() >= UI_STREAM_MAX_LISTENERS {
         return None;
     }
-    let snapshot = UiHtmlStreamMessage::snapshot(
+    let snapshot = UiHtmlStreamMessage::snapshot_with_invalidated(
         DocumentId::from(room),
         Revision(entry.revision),
         entry
@@ -935,6 +1004,7 @@ fn ui_stream_subscribe(
                 html: html.clone(),
             })
             .collect(),
+        entry.invalidated.iter().cloned().collect(),
     );
     let (tx, rx) = sync_channel(UI_STREAM_CHANNEL_DEPTH);
     let id = UI_STREAM_LISTENER_ID.fetch_add(1, Ordering::Relaxed);
@@ -1445,6 +1515,7 @@ impl WebDevServer {
         let event = match msg {
             nulang_ui_protocol::UiHtmlStreamMessage::Snapshot { .. } => "nulang-ui-snapshot",
             nulang_ui_protocol::UiHtmlStreamMessage::Patch { .. } => "nulang-ui-patch",
+            nulang_ui_protocol::UiHtmlStreamMessage::Invalidate { .. } => "nulang-ui-invalidate",
         };
         let json = serde_json::to_string(msg).map_err(std::io::Error::other)?;
         write!(
@@ -2033,6 +2104,40 @@ mod tests {
 
         let (snapshot, _rx) = ui_stream_subscribe(&room).unwrap();
         assert_eq!(snapshot.revision(), nulang_ui_protocol::Revision(2));
+    }
+
+    #[test]
+    fn ui_stream_invalidation_survives_reconnect_without_replaying_stale_html() {
+        let room = format!("ui-invalidate-{}", std::process::id());
+        assert!(ui_stream_publish(
+            &room,
+            "#summary",
+            "<div id='summary'>old</div>"
+        ));
+        let (_snapshot, receiver) = ui_stream_subscribe(&room).unwrap();
+        assert!(ui_stream_invalidate(&room, "#summary"));
+        let event = receiver.try_recv().unwrap();
+        assert!(matches!(
+            event,
+            nulang_ui_protocol::UiHtmlStreamMessage::Invalidate { .. }
+        ));
+        assert_eq!(event.revision(), nulang_ui_protocol::Revision(2));
+        let (snapshot, _) = ui_stream_subscribe(&room).unwrap();
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["invalidated"][0], "#summary");
+        assert_eq!(json["elements"].as_array().unwrap().len(), 0);
+        assert!(ui_stream_publish(
+            &room,
+            "#summary",
+            "<div id='summary'>new</div>"
+        ));
+        let (snapshot, _) = ui_stream_subscribe(&room).unwrap();
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(
+            json["invalidated"].as_array().map(|v| v.len()).unwrap_or(0),
+            0
+        );
+        assert_eq!(json["elements"][0]["html"], "<div id='summary'>new</div>");
     }
 
     #[test]

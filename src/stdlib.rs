@@ -654,6 +654,14 @@ impl StdLib {
                     description: "Publish bounded, revisioned HTML patches to a realtime room.",
                 },
                 BuiltinOp {
+                    name: "Realtime.invalidate",
+                    effect: "Realtime",
+                    op: "invalidate",
+                    signature: "invalidate(room: String, target: String) -> Bool",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Invalidate a target in a revisioned UI SSE room; clients refresh canonical HTML.",
+                },
+                BuiltinOp {
                     name: "Actor.link",
                     effect: "Actor",
                     op: "link",

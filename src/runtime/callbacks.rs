@@ -129,6 +129,7 @@ fn required_host_authority(
         },
         ("Realtime", Some("broadcast")) => other("Realtime", "Broadcast", Some(string_arg(0)?)),
         ("Realtime", Some("patch")) => other("Realtime", "Patch", Some(string_arg(0)?)),
+        ("Realtime", Some("invalidate")) => other("Realtime", "Invalidate", Some(string_arg(0)?)),
         ("Env", Some("get")) => AuthorityGrant::EnvRead {
             name: string_arg(0)?,
         },
@@ -542,6 +543,13 @@ pub(crate) fn perform_realtime_builtin(
             let html = resolve(constants, *regs.get(2)?);
             Some(crate::vm::Value::bool(
                 crate::runtime::http_server::ui_stream_publish(&room, &target, &html),
+            ))
+        }
+        Some("invalidate") => {
+            let room = resolve(constants, *regs.first()?);
+            let target = resolve(constants, *regs.get(1)?);
+            Some(crate::vm::Value::bool(
+                crate::runtime::http_server::ui_stream_invalidate(&room, &target),
             ))
         }
         _ => None,
@@ -2761,6 +2769,15 @@ mod host_authority_tests {
             Some(AuthorityGrant::Other {
                 namespace: "Realtime".into(),
                 operation: "Patch".into(),
+                argument: Some("tasks".into()),
+            })
+        );
+        let (constants, regs) = string_args(&["tasks", "#items"]);
+        assert_eq!(
+            required_host_authority("Realtime", Some("invalidate"), &constants, &regs).unwrap(),
+            Some(AuthorityGrant::Other {
+                namespace: "Realtime".into(),
+                operation: "Invalidate".into(),
                 argument: Some("tasks".into()),
             })
         );
