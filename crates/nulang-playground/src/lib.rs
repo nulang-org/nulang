@@ -39,6 +39,10 @@ pub mod actor_protocol;
 pub mod effect_checker;
 #[path = "../../../src/prelude_source.rs"]
 pub mod prelude_source;
+// The playground includes the native parser verbatim, so it must also expose
+// the shared stdlib resolver that parser.rs calls during import resolution.
+#[path = "../../../src/stdlib_path.rs"]
+mod stdlib_path;
 #[path = "../../../src/parser.rs"]
 pub mod parser;
 #[path = "../../../src/parallel_analysis.rs"]
