@@ -87,6 +87,20 @@ foreign keys, and consecutive request isolation.
   open an arbitrary production SQL pool. Production authorization, CSRF
   handling, revocation, credential/TLS lifecycle, transaction-to-HTTP failure
   semantics and user-facing Web route binding remain separately blocked.
+- **Durable revocation reference:** `web::tenant_pg_revocation_reference::DisposablePostgresRevocation`
+  checks a protected PostgreSQL `revoked_tokens(issuer,subject,jti)` table
+  using a separate SELECT-only login on every token verification. Revoking a
+  token in PostgreSQL denies the same signed token immediately on subsequent
+  requests, including a newly constructed verifier; another user's token
+  remains valid. Missing SELECT privileges, missing table, bad connection or
+  unavailable PostgreSQL yield `None` and fail closed. The role has no
+  UPDATE/INSERT/DELETE privilege; tests prove denied attempts.
+  Run `bash tests/run_tenant_pg_authority_ci.sh` to exercise a fresh
+  ephemeral PostgreSQL cluster with the additional
+  `tests/tenant_pg_durable_revocation.rs` suite. This is **not** a production
+  revocation service or migration: production requires audited durable
+  provisioning, availability, token cleanup/retention, key rotation, secure
+  TLS, operational logging, revocation writers and race/transaction review.
 - Database memberships and credentials require reviewed provisioning,
   revocation, secret rotation and TLS. There is no pooling here; a future
   pooled adapter needs verified transaction isolation, pool reset, reuse

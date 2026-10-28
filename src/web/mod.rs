@@ -21,4 +21,6 @@ pub mod runtime_bindings;
 pub mod tenant_jwt_reference;
 #[cfg(feature = "postgres")]
 pub mod tenant_pg_reference;
+#[cfg(feature = "postgres")]
+pub mod tenant_pg_revocation_reference;
 pub mod validation;

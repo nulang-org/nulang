@@ -12,6 +12,18 @@ CREATE TABLE tenant_example_private.login_tenants (
 );
 REVOKE ALL ON tenant_example_private.login_tenants FROM PUBLIC;
 
+-- Revoked access-token JTIs are stored independently of transient JWT
+-- verification process memory. Only a distinct SELECT-only verifier login
+-- receives read access; tenant and verifier roles cannot mutate this table.
+-- This is a disposable fixture schema, not a production migration.
+CREATE TABLE tenant_example_private.revoked_tokens (
+    issuer text NOT NULL CHECK (issuer <> ''),
+    subject text NOT NULL CHECK (subject <> ''),
+    jti text NOT NULL CHECK (jti <> ''),
+    PRIMARY KEY (issuer, subject, jti)
+);
+REVOKE ALL ON tenant_example_private.revoked_tokens FROM PUBLIC;
+
 -- SECURITY DEFINER limits the role/tenant lookup to a protected mapping.
 -- Fixed search_path prevents function-name/operator hijacking by untrusted
 -- schemas. session_user does not change across SET ROLE.
