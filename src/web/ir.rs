@@ -284,13 +284,27 @@ fn infer_module_cloud_config(source: &str) -> Vec<CloudConfigEntry> {
     entries
 }
 
+/// Whether the packaged source tree imports the development-only auth module.
+/// An import does not install a production-quality identity middleware.
+/// Deployment must refuse these imports until a verified provider exists.
+pub fn source_tree_uses_development_auth(src_root: &Path) -> bool {
+    collect_nulang_imports(&collect_source_text(src_root))
+        .iter()
+        .any(|name| {
+            name == "@nulang/auth"
+                || name.starts_with("@nulang/auth/")
+                || name.starts_with("@nulang/auth::")
+        })
+}
+
 /// Collect all `@nulang/*` import names from the source text.
 fn collect_nulang_imports(source: &str) -> Vec<String> {
     let mut imports = Vec::new();
     for line in source.lines() {
         let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("import ") {
-            let name = rest.split_whitespace().next().unwrap_or("");
+        let mut words = trimmed.split_whitespace();
+        if words.next() == Some("import") {
+            let name = words.next().unwrap_or("");
             if name.starts_with("@nulang/") && !imports.contains(&name.to_string()) {
                 imports.push(name.to_string());
             }

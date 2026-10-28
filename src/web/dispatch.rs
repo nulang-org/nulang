@@ -18,7 +18,7 @@ use crate::web::runtime_bindings::{
     render_bound_route_handler, RoutePatternRelation, RuntimeRoutePlan, RuntimeRouteSegment,
     RuntimeWebRoute,
 };
-use crate::web::validation::compile_validated_contracts_from_tree;
+use crate::web::validation::{compile_validated_contracts_from_tree, validation_diagnostics};
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::Path;
@@ -49,6 +49,13 @@ pub fn compile_runtime_routes_from_contracts(
     routes: Vec<WebRoute>,
     contracts: &ContractCompilation,
 ) -> Result<Vec<RuntimeWebRoute>, Vec<String>> {
+    // This public entry point also accepts caller-provided best-effort
+    // ContractCompilation values. Validate again before attaching routes:
+    // the package-tree compiler is not the only possible caller.
+    let diagnostics = validation_diagnostics(contracts);
+    if !diagnostics.is_empty() {
+        return Err(diagnostics);
+    }
     let attachment = attach_runtime_route_plans(routes, contracts);
     if attachment.diagnostics.is_empty() {
         Ok(attachment.routes)
@@ -349,6 +356,47 @@ fn show() -> String { "ok" }
             .any(|diagnostic| diagnostic.contains("no same-named typed parameter")));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn direct_attachment_refuses_unvalidated_ambiguous_contracts() {
+        use crate::web::contracts::RouteContract;
+        // Bypasses the package-tree validation entry point on purpose: the
+        // public direct-attachment API must still enforce all diagnostics.
+        let contracts = ContractCompilation {
+            routes: vec![
+                RouteContract {
+                    method: "GET".into(),
+                    path: "/users/:id".into(),
+                    ..RouteContract::default()
+                },
+                RouteContract {
+                    method: "GET".into(),
+                    path: "/users/{username}".into(),
+                    ..RouteContract::default()
+                },
+            ],
+            diagnostics: Vec::new(),
+        };
+        let errors = compile_runtime_routes_from_contracts(Vec::new(), &contracts)
+            .expect_err("ambiguous contracts cannot be used for dispatch");
+        assert!(
+            errors.iter().any(|error| error.contains("ambiguous route")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn direct_attachment_refuses_partial_invalid_contracts() {
+        let contracts = ContractCompilation {
+            routes: Vec::new(),
+            diagnostics: vec!["source parse failure".into()],
+        };
+        let errors = compile_runtime_routes_from_contracts(Vec::new(), &contracts)
+            .expect_err("compiler diagnostics must prevent dispatch");
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("source parse failure")));
     }
 
     #[test]
