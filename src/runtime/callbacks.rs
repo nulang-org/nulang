@@ -416,6 +416,15 @@ pub(crate) fn perform_web_builtin(
             let s = resolve(constants, *regs.first()?);
             Some(callbacks.alloc_string(&s))
         }
+        Some("created_at") => {
+            let location = resolve(constants, *regs.first()?);
+            let body_json = resolve(constants, *regs.get(1)?);
+            let envelope = serde_json::json!({
+                "location": location,
+                "body_json": body_json,
+            });
+            Some(callbacks.alloc_string(&envelope.to_string()))
+        }
         Some("no_content") => Some(callbacks.alloc_string("")),
         Some("problem") => {
             let status = regs.first()?.as_int()?;

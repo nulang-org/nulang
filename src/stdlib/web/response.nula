@@ -29,3 +29,9 @@ pub fn no_content() -> NoContent ! {Web, Respond} {
 pub fn problem(status: Int, title: String, detail: String) -> Problem ! {Web, Respond} {
     perform Web.problem(status, title, detail)
 }
+
+/// Return HTTP 201 with JSON data and a same-origin Location header.
+/// Location must be a root-relative resource URL (no external origins).
+pub fn created_at(location: String, value: JsonValue) -> CreatedAt {
+    perform Web.created_at(location, stringify(value))
+}

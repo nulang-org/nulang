@@ -38,3 +38,6 @@ opaque type NoContent = String
 
 /// RFC-style application/problem+json error result (HTTP 4xx/5xx).
 opaque type Problem = String
+
+/// HTTP 201 JSON creation with a validated same-origin Location header.
+opaque type CreatedAt = String
