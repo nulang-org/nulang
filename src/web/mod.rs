@@ -23,4 +23,6 @@ pub mod tenant_jwt_reference;
 pub mod tenant_pg_reference;
 #[cfg(feature = "postgres")]
 pub mod tenant_pg_revocation_reference;
+#[cfg(feature = "postgres")]
+pub mod tenant_pg_revocation_writer_reference;
 pub mod validation;
