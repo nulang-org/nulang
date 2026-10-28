@@ -39,6 +39,10 @@ pub mod actor_protocol;
 pub mod effect_checker;
 #[path = "../../../src/prelude_source.rs"]
 pub mod prelude_source;
+// The shared parser resolves stdlib imports through this shared helper.
+// Keep the playground's source-included parser and crate module graph aligned.
+#[path = "../../../src/stdlib_path.rs"]
+mod stdlib_path;
 #[path = "../../../src/parser.rs"]
 pub mod parser;
 #[path = "../../../src/parallel_analysis.rs"]
