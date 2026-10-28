@@ -3079,6 +3079,11 @@ signal count: Html = text("0")
 
 fn add() {}
 
+// The supported JSX subset exports a server-side UI template plan.
+fn badge() -> Html {
+    <ul><li key="sample">Sample</li></ul>
+}
+
 fn home() -> Html {
     <div class="card">
         <button action={add}>Add</button>
@@ -3113,6 +3118,22 @@ app "counter" {
             .expect("app.client.js should exist");
         assert!(js.contains("window.nulang"), "nulang global missing");
         assert!(js.contains("hydrate"), "hydrate missing");
+        let ui_manifest: crate::web::ui_template::UiTemplateManifest = serde_json::from_slice(
+            &std::fs::read(dir.join(".nula/app.ui-templates.json"))
+                .expect("web build must export the UI template manifest"),
+        )
+        .expect("valid compiler-owned UI template manifest");
+        assert_eq!(ui_manifest.version, 1);
+        assert!(
+            !dir.join("dist/app.ui-templates.json").exists(),
+            "server-side template metadata must never be public"
+        );
+        // The effectful action/signal route remains on the ordinary HTML path
+        // until there is a compiler-owned action binding for semantic UI.
+        assert_eq!(
+            ui_manifest.templates.keys().cloned().collect::<Vec<_>>(),
+            vec!["badge".to_string()]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
