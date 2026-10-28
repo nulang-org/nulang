@@ -1,0 +1,65 @@
+// HTMX 2/4-compatible helpers for Nulang's built-in Web effect.
+// Import: `import stdlib::web::htmx`
+//
+// HTML attributes are ordinary escaped Html attribute pairs. They work with
+// stock HTMX; no Nulang-specific browser runtime or eval is required.
+
+import stdlib::web::types
+
+/// True for a request initiated by HTMX 2 or 4.
+pub fn is_request() -> Bool ! {Web, Request} {
+    perform Web.header("HX-Request") == "true"
+}
+
+/// Select fragment rendering while preserving full-page navigation/history.
+/// Calling this marks the response as varying by the negotiation headers.
+/// The legacy HX-Boosted navigation path receives a complete page.
+pub fn is_fragment() -> Bool ! {Web, Request, Respond} {
+    perform Web.set_header("Vary", "HX-Request, HX-Request-Type, HX-History-Restore-Request, HX-Boosted")
+    let hx = perform Web.header("HX-Request")
+    let kind = perform Web.header("HX-Request-Type")
+    let history = perform Web.header("HX-History-Restore-Request")
+    let boosted = perform Web.header("HX-Boosted")
+    hx == "true" && kind != "full" && history != "true" && boosted != "true"
+}
+
+/// Target identity is an id in HTMX 2 and normally tagName#id in HTMX 4.
+pub fn request_target() -> String ! {Web, Request} {
+    perform Web.header("HX-Target")
+}
+
+/// HTMX 4 sends HX-Source (tagName#id).
+pub fn request_source() -> String ! {Web, Request} {
+    perform Web.header("HX-Source")
+}
+
+/// Opt-in declarative progressive-enhancement attributes.
+pub fn get(url: String) -> (String, Html) { ("hx-get", perform Web.text(url)) }
+pub fn post(url: String) -> (String, Html) { ("hx-post", perform Web.text(url)) }
+pub fn put(url: String) -> (String, Html) { ("hx-put", perform Web.text(url)) }
+pub fn delete(url: String) -> (String, Html) { ("hx-delete", perform Web.text(url)) }
+pub fn target(selector: String) -> (String, Html) { ("hx-target", perform Web.text(selector)) }
+pub fn trigger(events: String) -> (String, Html) { ("hx-trigger", perform Web.text(events)) }
+pub fn swap(strategy: String) -> (String, Html) { ("hx-swap", perform Web.text(strategy)) }
+pub fn sync(policy: String) -> (String, Html) { ("hx-sync", perform Web.text(policy)) }
+pub fn boost() -> (String, Html) { ("hx-boost", perform Web.text("true")) }
+
+/// Response-control headers. All values pass the host's CRLF checks.
+pub fn trigger_event(name: String) -> Unit ! {Web, Respond} {
+    perform Web.set_header("HX-Trigger", name)
+}
+pub fn client_redirect(url: String) -> Unit ! {Web, Respond} {
+    perform Web.set_header("HX-Redirect", url)
+}
+pub fn retarget(selector: String) -> Unit ! {Web, Respond} {
+    perform Web.set_header("HX-Retarget", selector)
+}
+pub fn reswap(strategy: String) -> Unit ! {Web, Respond} {
+    perform Web.set_header("HX-Reswap", strategy)
+}
+pub fn push_url(url: String) -> Unit ! {Web, Respond} {
+    perform Web.set_header("HX-Push-Url", url)
+}
+pub fn refresh() -> Unit ! {Web, Respond} {
+    perform Web.set_header("HX-Refresh", "true")
+}
