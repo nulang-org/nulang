@@ -76,3 +76,63 @@ acknowledgement precision/compatibility, and atomic validation failures.
   high-water marks in generated patches; add host/server end-to-end tests.
 - Snapshot resynchronization, reconnect semantics, bounded memory, and
   payload/CPU benchmarks under reordered and dropped network responses.
+
+## Opt-in browser DOM host and explicit JSX keys (follow-up)
+
+`crates/nulang-ui-protocol/browser/nulang-ui-dom.js` provides a small,
+dependency-free browser host for **semantic** UI documents. The web build
+includes it in the generated `app.client.js` alongside the existing
+signal/action micro-runtime, exposing `window.nulangUiDom.createHost(root,
+snapshot)`.
+
+```js
+const host = window.nulangUiDom.createHost(
+  document.getElementById("nulang-root"),
+  initialUiDocument
+);
+host.onInput = ({node_id, property, sequence, value}) => {
+  // Send through an authenticated action transport. The sequence alone is
+  // never a credential and the transport must bind it to the live session.
+};
+host.applyMessage({
+  type: "patch",
+  protocol: "nulang-ui-msg/1",
+  patch: serverPatch
+});
+```
+
+The DOM host validates a restricted set of semantic tags and properties,
+uses `createElement` and `textContent` (never `innerHTML`), checks URL
+schemes and document/revision invariants, reconciles keyed nodes by
+`NodeId` without recreating moved nodes, and preserves focus and selection
+when safe. It records local `value` / `checked` edits and honors cumulative
+server acknowledgements. It queues up to 32 patches while an IME composition
+is active, applying them in order when composition ends. A queue overflow
+or gap requires an explicit snapshot resynchronization; the host does not
+silently overwrite edits or fabricate an acknowledgement.
+
+The compiler's experimental web rewrite changes explicit JSX
+`key={expression}` to `data-nulang-key={expression}` so SSR markup retains
+the stable application-provided key. Keys are scoped to the parent list.
+The host's `NodeId` is the canonical identity for protocol patches. **The
+compiler does not yet materialize a full UI tree from JSX or derive a canonical
+NodeId from every keyed comprehension**; the attribute is a marker for the
+future compiler/SSR bridge, not a substitute for a unique protocol identity.
+
+**Browser verification** (real headless Chromium, no JS package dependencies):
+
+```sh
+python3 crates/nulang-ui-protocol/browser/test_dom_host.py
+```
+
+The runner starts an ephemeral localhost server and a headless Chromium
+session, asserts `data-test-status="passed"` and `ALL PASS`, and cleans up
+both resources. Set `NULANG_BROWSER_TEST_TMP` to a short writable directory
+if temporary-file quotas or long Chromium socket paths are an issue.
+A real browser is required because Node alone lacks a DOM implementation.
+
+**Remaining work:** compiler/server generation of matching NodeIds from
+keyed loops; authenticated patch delivery and acknowledgements; snapshot
+recovery/reconnect; full SSR-to-DOM hydration; property/ARIA semantics for
+additional native controls; browser E2E tests with a real Nulang application.
+No transport or server-action authorization is added by this opt-in host.
