@@ -35,6 +35,6 @@ steps:
     commands:
       - set -eu
       - apt-get update
-      - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config clang libclang-dev python3-dev util-linux
+      - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config clang libclang-dev python3-dev util-linux gcc libc6-dev
       - rustup component add rustfmt clippy
       - timeout --signal=TERM --kill-after=30s 2400s bash tools/rusqlite-local-compat/verify.sh
