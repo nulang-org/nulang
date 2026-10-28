@@ -24,6 +24,7 @@ on:
           - core-native
           - default
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
     paths:
       - '.github/workflows/nulang-ab-bench.yml'
       - 'scripts/nulang_ab_bench.py'
@@ -41,6 +42,7 @@ concurrency:
 
 jobs:
   compare:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Exact base vs candidate actor A/B
     runs-on: ubuntu-latest
     timeout-minutes: 90
