@@ -57,6 +57,9 @@ jobs:
       - name: Smoke test Nulang Web patch request ordering
         run: node scripts/tests/web_action_patch_race.mjs
 
+      - name: Smoke test Nulang Web action coordination
+        run: node scripts/tests/web_action_coordination.mjs
+
       - name: Smoke test Nulang Web DOM morph in Chrome
         run: node scripts/tests/web_dom_morph_browser.mjs
 

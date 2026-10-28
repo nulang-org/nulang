@@ -267,10 +267,44 @@ their local values, and a retained focused input keeps its selection.
 
 A missing target, non-HTML response, or unsuccessful HTTP status is reported
 without changing the page. Actions without `data-nulang-target` retain the
-existing reload behavior. For overlapping requests targeting the same element,
-the latest submitted response wins, even when an earlier fetch or streamed
-response body completes later. Superseded requests are aborted when supported,
-and ignored if an abort races with their completion.
+existing reload behavior.
+
+### Action request coordination
+
+For each exact target, `data-nulang-coordination` controls overlapping server
+actions. It may be set on the form or action control:
+
+- **`replace` (default):** submit immediately; abort the older client request
+  when possible and ignore its response. This does **not** cancel the mutation
+  on the server. Appropriate for latest-wins validation and preview requests.
+- **`drop`:** ignore subsequent submissions while the first is pending.
+  Appropriate for preventing repeat submissions of an already-running action.
+- **`queue`:** submit actions one at a time, in interaction order. Each queued
+  action retains the form field values and idempotency key from its original
+  submission. Up to 32 pending actions per target are allowed; additional
+  submissions fail with an explicit error rather than accumulating indefinitely.
+
+```html
+<form data-action="save_message"
+      data-action-placement="server"
+      data-nulang-target="#current-message"
+      data-nulang-coordination="queue">
+  <input name="message">
+  <button type="submit">Save in order</button>
+</form>
+```
+
+All three policies are scoped to an exact target selector. A new policy
+cannot replace an active policy mid-request, and invalid values are rejected.
+Only targeted actions can use `drop` or `queue`. For overlapping requests in
+`replace` mode, the most recent response wins even if earlier responses
+arrive after the latest one.
+
+These are **browser request policies**, not guarantees about database
+transaction ordering or exactly-once server execution. Mutating handlers still
+need authorization, idempotency, and transactional concurrency controls.
+For unsaved input previews use `replace`; for non-idempotent mutations use
+`drop` or `queue` with server-side safeguards.
 
 See [examples/patch-web](https://github.com/nulang-org/nulang/tree/main/examples/patch-web)
 for a standalone sample. Run `nulang nula dev` from that directory.

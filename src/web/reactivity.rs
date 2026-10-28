@@ -788,9 +788,10 @@ pub fn generate_client_runtime() -> String {
   const signals = Object.create(null);
   const signalBindings = Object.create(null);
   const hydratedActions = new WeakSet();
-  // A later submission for the same target supersedes its earlier UI update.
-  // Aborting the fetch is best-effort: server mutations may still complete.
+  // Per-target action coordination. In replace mode, a newer submission
+  // supersedes the older UI update, but cannot undo a server mutation.
   const pendingPatches = new Map();
+  const MAX_QUEUED_ACTIONS_PER_TARGET = 32;
 
   function refreshSignal(name) {
     const bindings = signalBindings[name];
@@ -1024,20 +1025,15 @@ pub fn generate_client_runtime() -> String {
     hydrate();
   }
 
-  async function runServerAction(handler, el) {
-    const form = el.closest('form');
-    const target = el.dataset.nulangTarget || (form && form.dataset.nulangTarget);
-    const body = formBody(form);
-    const message = createActionMessage(handler, 'server', body);
-    body.append('__nulang_action', handler);
-    body.append('__nulang_ui_message', JSON.stringify(message));
-    const previous = target && pendingPatches.get(target);
-    const controller = target && typeof AbortController === 'function'
+  // A target is a coordination lane. The revision (generation) identifies the
+  // one request permitted to patch that lane. Aborting a fetch only cancels
+  // client-side work; the server must still enforce mutation idempotency.
+  async function dispatchServerAction(handler, target, body, lane, generation) {
+    const controller = lane && typeof AbortController === 'function'
       ? new AbortController() : null;
-    const request = target ? { controller } : null;
-    if (target) pendingPatches.set(target, request);
-    if (previous && previous.controller) previous.controller.abort();
-    const isCurrent = () => !target || pendingPatches.get(target) === request;
+    if (lane) lane.controller = controller;
+    const isCurrent = () => !lane ||
+      (pendingPatches.get(target) === lane && lane.generation === generation);
     try {
       const options = { method: 'POST', body: body };
       if (controller) options.signal = controller.signal;
@@ -1052,12 +1048,70 @@ pub fn generate_client_runtime() -> String {
         window.location.reload();
       }
     } catch (error) {
-      // An aborted/superseded request must never replace a newer result or
-      // report an error for an interaction the user has already superseded.
+      // An aborted/superseded request must not update DOM or log an error.
       if (isCurrent()) throw error;
     } finally {
-      if (target && isCurrent()) pendingPatches.delete(target);
+      if (lane && isCurrent()) {
+        if (lane.policy === 'queue' && lane.queue.length) {
+          const next = lane.queue.shift();
+          const nextGeneration = ++lane.generation;
+          dispatchServerAction(next.handler, target, next.body, lane, nextGeneration)
+            .then(next.resolve, next.reject);
+        } else {
+          pendingPatches.delete(target);
+        }
+      }
     }
+  }
+
+  function runServerAction(handler, el) {
+    const form = el.closest('form');
+    const target = el.dataset.nulangTarget || (form && form.dataset.nulangTarget);
+    const policy = el.dataset.nulangCoordination ||
+      (form && form.dataset.nulangCoordination) || 'replace';
+    // Invalid policies are programmer errors. Never silently choose a more
+    // aggressive mutation scheduling policy than the one requested.
+    if (!['replace', 'drop', 'queue'].includes(policy)) {
+      return Promise.reject(new Error('invalid Nulang action coordination policy: ' + policy));
+    }
+    if (!target && policy !== 'replace') {
+      return Promise.reject(new Error('action coordination requires a patch target'));
+    }
+    const previous = target && pendingPatches.get(target);
+    if (previous && previous.policy !== policy) {
+      return Promise.reject(new Error('cannot change coordination policy while target is busy'));
+    }
+    // Drop redundant actions while pending; do not cancel the first request.
+    if (previous && policy === 'drop') return Promise.resolve();
+    // High-frequency inputs must not enqueue unbounded mutation backlogs.
+    if (previous && policy === 'queue' &&
+        previous.queue.length >= MAX_QUEUED_ACTIONS_PER_TARGET) {
+      return Promise.reject(new Error('Nulang action queue is full for target ' + target));
+    }
+
+    // Snapshot the body and idempotency key at the time of submission, not
+    // when an action eventually leaves the queue.
+    const body = formBody(form);
+    const message = createActionMessage(handler, 'server', body);
+    body.append('__nulang_action', handler);
+    body.append('__nulang_ui_message', JSON.stringify(message));
+
+    if (previous && policy === 'queue') {
+      return new Promise(function (resolve, reject) {
+        previous.queue.push({ handler, body, resolve, reject });
+      });
+    }
+
+    const lane = target
+      ? (previous || { policy, controller: null, generation: 0, queue: [] })
+      : null;
+    if (lane) {
+      const oldController = lane.controller;
+      ++lane.generation;
+      pendingPatches.set(target, lane);
+      if (oldController) oldController.abort();
+    }
+    return dispatchServerAction(handler, target, body, lane, lane ? lane.generation : 0);
   }
 
   function hydrate() {
