@@ -76,10 +76,11 @@
   function checkedDocument(document) {
     if (!document || document.protocol !== "nulang-ui/1") fail("unsupported document");
     id(document.document_id); id(document.root); revision(document.revision);
-    if (!Array.isArray(document.nodes)) fail("invalid nodes");
+    if (!Array.isArray(document.nodes) || document.nodes.length > 10000) fail("invalid node count");
     const map = new Map();
     for (const node of document.nodes) {
       id(node.id);
+      if (node.id.length > 1024) fail("node id too long");
       tagFor(node.kind);
       if (map.has(node.id)) fail("duplicate node " + node.id);
       if (!Array.isArray(node.children)) fail("missing children");
@@ -173,14 +174,100 @@
     return next;
   }
 
+  // The SSR bridge derives the same scoped key IDs as the Rust KeyedNode
+  // builder. Text-only leaves become a "text" property; mixed text/element
+  // children are deliberately rejected until compiler-owned text ranges exist.
+  function snapshotFromDom(container, options) {
+    const root = container.firstElementChild;
+    if (!root || [...container.childNodes].some(node =>
+      node !== root && (node.nodeType !== 3 || node.textContent.trim()))) {
+      fail("SSR mount must have one root element");
+    }
+    if (root.hasAttribute("data-nulang-key")) fail("SSR root key is unsupported");
+    if (!options || typeof options.documentId !== "string") fail("missing document id");
+    id(options.documentId);
+    revision(options.revision);
+    const nodes = [];
+    const elements = new Map();
+    const encoder = new TextEncoder();
+    function visit(element, nodeId, depth) {
+      if (depth > 64 || nodeId.length > 1024 || nodes.length >= 10000) {
+        fail("SSR tree budget exceeded");
+      }
+      const kind = element.tagName.toLowerCase();
+      tagFor(kind);
+      const properties = {};
+      for (const attr of element.attributes) {
+        if (["data-nulang-key", "data-nulang-node-id", "data-signal",
+             "data-action", "data-action-placement"].includes(attr.name)) continue;
+        if (attr.name === "value" || attr.name === "checked") continue;
+        const value = booleanProps.has(attr.name) ? {type:"bool",value:true} : {type:"string",value:attr.value};
+        validateProperty(attr.name, value, kind);
+        properties[attr.name] = value;
+      }
+      if (["input", "textarea", "select"].includes(kind)) {
+        if (kind !== "select" || !element.children.length) {
+          properties.value = {type:"string",value:element.value};
+        }
+        if (kind === "input" && ["checkbox", "radio"].includes(element.type)) {
+          properties.checked = {type:"bool",value:element.checked};
+        }
+      }
+      const children = [];
+      const elementChildren = [...element.children];
+      if (elementChildren.length) {
+        if ([...element.childNodes].some(child => child.nodeType === 3 && child.textContent.trim())) {
+          fail("mixed SSR text needs compiled text ranges");
+        }
+      } else if (!["input", "textarea", "select"].includes(kind) && element.textContent) {
+        properties.text = {type:"string",value:element.textContent};
+      }
+      const siblingKeys = new Set();
+      elementChildren.forEach((child,index) => {
+        const key = child.getAttribute("data-nulang-key");
+        let segment;
+        if (key === null) {
+          segment = "p" + index;
+        } else {
+          const bytes = encoder.encode(key);
+          if (!key.trim() || bytes.length > 256 || /[\x00-\x1f\x7f]/.test(key) || siblingKeys.has(key)) {
+            fail("invalid or duplicate sibling key");
+          }
+          siblingKeys.add(key);
+          segment = "k" + [...bytes].map(byte=>byte.toString(16).padStart(2,"0")).join("");
+        }
+        children.push(nodeId + "/" + segment);
+      });
+      nodes.push({id:nodeId,kind,properties,children});
+      elements.set(nodeId,element);
+      elementChildren.forEach((child,index)=>visit(child,children[index],depth+1));
+    }
+    visit(root,"root",0);
+    const document = {
+      protocol:"nulang-ui/1", document_id:options.documentId,
+      revision:options.revision, root:"root", nodes
+    };
+    checkedDocument(document);
+    return {document,elements};
+  }
+
   class DomHost {
-    constructor(container, snapshot) {
+    constructor(container, snapshot, adoptedElements = null) {
       if (!container || !container.ownerDocument) fail("invalid mount");
       this.container = container;
       this.document = structuredClone(snapshot);
       checkedDocument(this.document);
-      this.elements = new Map();
+      this.elements = adoptedElements ? new Map(adoptedElements) : new Map();
       this.renderedProps = new Map();
+      if (adoptedElements) {
+        for (const node of this.document.nodes) {
+          const element = this.elements.get(node.id);
+          if (!element) fail("incomplete SSR adoption");
+          this.renderedProps.set(node.id,structuredClone(node.properties));
+          element.setAttribute("data-nulang-node-id",node.id);
+          this.bindInput(node.id,element);
+        }
+      }
       this.pending = new Map();
       this.sequences = new Map();
       this.composing = new Set();
@@ -248,10 +335,31 @@
       return "applied";
     }
 
+    // Snapshot recovery is explicit. Never silently discard drafts or IME
+    // composition; reconnect callers must make that product-level decision.
+    resync(snapshot, options = {}) {
+      const candidate = structuredClone(snapshot);
+      checkedDocument(candidate);
+      if (candidate.document_id !== this.document.document_id) fail("cross-document snapshot");
+      if (revision(candidate.revision) < revision(this.document.revision)) fail("stale snapshot");
+      if ((this.pending.size || this.composing.size || this.queued.length) && options.discardPending !== true) {
+        fail("snapshot would discard local input; explicit discardPending required");
+      }
+      this.document = candidate;
+      this.pending.clear();
+      this.composing.clear();
+      this.queued = [];
+      // Keep per-input sequence high-water marks across snapshots to avoid
+      // reusing a sequence while the same session still has outstanding acks.
+      this.render();
+      return "resynced";
+    }
+
     applyMessage(message) {
       if (!message || message.protocol !== "nulang-ui-msg/1") fail("unsupported message");
       if (message.type === "patch") return this.applyPatch(message.patch);
-      fail("snapshot replacement requires explicit resync policy");
+      if (message.type === "snapshot") return this.resync(message.document);
+      fail("unsupported runtime message");
     }
 
     bindInput(id, element) {
@@ -369,5 +477,11 @@
     }
   }
 
-  global.nulangUiDom = Object.freeze({createHost:(container,snapshot)=>new DomHost(container,snapshot)});
+  global.nulangUiDom = Object.freeze({
+    createHost:(container,snapshot)=>new DomHost(container,snapshot),
+    createHostFromDom:(container,options)=>{
+      const {document,elements} = snapshotFromDom(container,options);
+      return new DomHost(container,document,elements);
+    }
+  });
 })(globalThis);

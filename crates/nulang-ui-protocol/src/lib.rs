@@ -3,6 +3,9 @@
 //! `nulang-ui/1` defines semantic UI documents and patches.
 //! `nulang-ui-msg/1` defines runtime/host message envelopes.
 
+pub mod keyed;
+pub use keyed::{document_from_keyed_tree, KeyedNode, KeyedTreeError};
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -606,6 +609,40 @@ impl UiHostState {
         &self.document
     }
 
+    /// Replace a missing-revision stream with an explicit trusted snapshot.
+    ///
+    /// Never discard unacknowledged local input implicitly. Callers must
+    /// consciously opt into that destructive recovery policy, and must
+    /// independently verify the authenticated UI session at the transport.
+    /// Per-input sequence high-water marks survive reconnects.
+    pub fn resync(
+        &mut self,
+        snapshot: UiDocument,
+        discard_pending: bool,
+    ) -> Result<(), ProtocolError> {
+        snapshot.validate()?;
+        if snapshot.document_id != self.document.document_id {
+            return Err(ProtocolError::DocumentIdMismatch {
+                expected: self.document.document_id.clone(),
+                found: snapshot.document_id,
+            });
+        }
+        if snapshot.revision < self.document.revision {
+            return Err(ProtocolError::StaleSnapshot {
+                current: self.document.revision,
+                received: snapshot.revision,
+            });
+        }
+        if !discard_pending && !self.pending.is_empty() {
+            return Err(ProtocolError::SnapshotWouldDiscardPending);
+        }
+        self.last_sequence
+            .retain(|(id, _), _| snapshot.nodes.iter().any(|node| &node.id == id));
+        self.document = snapshot;
+        self.pending.clear();
+        Ok(())
+    }
+
     /// Record an input edit immediately. The sequence is monotonic within a
     /// given node/property pair even after a previous edit was acknowledged.
     pub fn record_input(
@@ -837,6 +874,11 @@ pub enum ProtocolError {
         base: Revision,
         next: Revision,
     },
+    StaleSnapshot {
+        current: Revision,
+        received: Revision,
+    },
+    SnapshotWouldDiscardPending,
     DuplicateInputAcknowledgement {
         node_id: NodeId,
         property: String,
@@ -885,6 +927,14 @@ impl fmt::Display for ProtocolError {
                 "patch revision {} must be greater than base revision {}",
                 next.0, base.0
             ),
+            Self::StaleSnapshot { current, received } => write!(
+                f,
+                "snapshot revision {} is older than current revision {}",
+                received.0, current.0
+            ),
+            Self::SnapshotWouldDiscardPending => {
+                f.write_str("snapshot would discard unacknowledged local input")
+            }
             Self::DuplicateInputAcknowledgement { node_id, property } => {
                 write!(
                     f,

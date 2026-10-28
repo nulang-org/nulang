@@ -136,3 +136,81 @@ keyed loops; authenticated patch delivery and acknowledgements; snapshot
 recovery/reconnect; full SSR-to-DOM hydration; property/ARIA semantics for
 additional native controls; browser E2E tests with a real Nulang application.
 No transport or server-action authorization is added by this opt-in host.
+
+## Parent-scoped key/SSR bridge (experimental follow-up)
+
+`document_from_keyed_tree` provides a server-side construction path for a
+UI protocol document whose `NodeId` values match those calculated during
+browser SSR adoption:
+
+- Root is always `root` and cannot have a key.
+- For keyed siblings, append `/k` plus lowercase hex of the raw UTF-8 bytes
+  of the key: `"é"` becomes `root/kc3a9`.
+- For unkeyed siblings, append `/p` and the zero-based position among **all**
+  element children (including keyed ones).
+- The same algorithm applies recursively under each parent's full ID.
+  Keyed moves within a parent preserve identity; moving a keyed row between
+  different parents does not.
+- Duplicate sibling keys, empty/control-character keys, and oversized trees
+  are rejected. Maximum key size: 256 UTF-8 bytes; maximum generated ID:
+  1024 bytes; maximum depth: 64; maximum nodes: 10,000.
+
+Server code can use the new `KeyedNode` builder:
+
+```rust
+use nulang_ui_protocol::{
+    document_from_keyed_tree, KeyedNode, Revision, WireValue
+};
+
+let tree = KeyedNode::new("ul").with_children(vec![
+    KeyedNode::new("li").with_key("task-42")
+        .with_property("text", WireValue::from("Review proposal")),
+]);
+let document = document_from_keyed_tree("tasks", Revision(1), &tree)?;
+```
+
+The browser can adopt a matching **already-rendered** DOM tree, preserving
+the original element objects:
+
+```html
+<div id="mount"><ul><li data-nulang-key="task-42">Review proposal</li></ul></div>
+```
+
+```js
+const host = window.nulangUiDom.createHostFromDom(
+  document.getElementById("mount"),
+  { documentId: "tasks", revision: "1" }
+);
+// host.element("root/k7461736b2d3432") is the original <li>.
+```
+
+This adapter currently supports a strict allowlist of native DOM elements and
+attributes, text-only leaf content, and element-only container children.
+Mixed text with nested elements requires compiler-owned text ranges and is
+rejected rather than silently producing incompatible identities.
+
+The browser also supports explicit same-document snapshot recovery:
+
+```js
+host.resync(trustedSnapshot);                       // allowed if no drafts
+host.resync(trustedSnapshot, {discardPending:true}); // explicit draft loss
+```
+
+`UiHostState::resync(snapshot, discard_pending)` provides matching
+renderer-neutral Rust behavior. Both implementations reject older revisions,
+cross-document snapshots, and implicit loss of unacknowledged local edits.
+Input sequence high-water marks survive same-document snapshots.
+
+These IDs are deterministic—not access-control tokens. The server must still
+verify session/tenant authority, CSRF/Origin policy, action binding, and input
+high-water marks before delivering a patch or an acknowledgement. **No
+authenticated SSE/WebSocket/HTTP patch transport is introduced by this change.**
+The compiler's `key={...}` marker still needs a full JSX-to-`KeyedNode`
+lowering path before this works automatically for arbitrary Nulang views.
+
+Focused regressions:
+
+```sh
+cargo test -p nulang-ui-protocol
+python3 crates/nulang-ui-protocol/browser/test_dom_host.py
+```
