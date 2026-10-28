@@ -25,16 +25,78 @@ pub fn render_bound_handler(
     let entry_offset = executable.instructions.len();
 
     for arg in args {
-        let constant_index = executable.add_constant(arg.value.clone());
-        if constant_index > u16::MAX as usize {
-            return Err("route argument constant pool exceeds 16-bit ConstU index".to_string());
+        if let Some(fields) = &arg.record_fields {
+            if executable.record_field_names.is_empty()
+                && executable
+                    .instructions
+                    .iter()
+                    .any(|instruction| matches!(instruction.opcode, OpCode::RecL | OpCode::RecS))
+            {
+                return Err("compiled record field-layout metadata is missing; refusing unsafe JSON DTO injection".to_string());
+            }
+            // Compiler record fields are indexed module-wide, not in the
+            // source DTO's local declaration order. Preserve those IDs.
+            let mut field_indices = Vec::with_capacity(fields.len());
+            for (name, _) in fields {
+                let index = match executable
+                    .record_field_names
+                    .iter()
+                    .position(|field| field == name)
+                {
+                    Some(index) => index,
+                    None => {
+                        executable.record_field_names.push(name.clone());
+                        executable.record_field_names.len() - 1
+                    }
+                };
+                field_indices.push(index);
+            }
+            let slot_count = executable.record_field_names.len();
+            if slot_count > u8::MAX as usize {
+                return Err("JSON record exceeds the VM's 255-slot record ABI".to_string());
+            }
+            let scratch = handler_param_count
+                .checked_add(1)
+                .filter(|slot| *slot <= u8::MAX as usize)
+                .ok_or("JSON record requires an available scratch VM register")?
+                as u8;
+            executable.emit(Instruction::new2(
+                OpCode::RecMk,
+                slot_count as u8,
+                arg.handler_index as u8,
+            ));
+            for ((_, field_value), field_idx) in fields.iter().zip(field_indices) {
+                let constant_index = executable.add_constant(field_value.clone());
+                if constant_index > u16::MAX as usize {
+                    return Err(
+                        "route argument constant pool exceeds 16-bit ConstU index".to_string()
+                    );
+                }
+                executable.emit(Instruction::new3(
+                    OpCode::ConstU,
+                    ((constant_index >> 8) & 0xFF) as u8,
+                    (constant_index & 0xFF) as u8,
+                    scratch,
+                ));
+                executable.emit(Instruction::new3(
+                    OpCode::RecS,
+                    arg.handler_index as u8,
+                    field_idx as u8,
+                    scratch,
+                ));
+            }
+        } else {
+            let constant_index = executable.add_constant(arg.value.clone());
+            if constant_index > u16::MAX as usize {
+                return Err("route argument constant pool exceeds 16-bit ConstU index".to_string());
+            }
+            executable.emit(Instruction::new3(
+                OpCode::ConstU,
+                ((constant_index >> 8) & 0xFF) as u8,
+                (constant_index & 0xFF) as u8,
+                arg.handler_index as u8,
+            ));
         }
-        executable.emit(Instruction::new3(
-            OpCode::ConstU,
-            ((constant_index >> 8) & 0xFF) as u8,
-            (constant_index & 0xFF) as u8,
-            arg.handler_index as u8,
-        ));
     }
 
     let closure_reg = handler_param_count as u8;
@@ -115,7 +177,24 @@ mod tests {
         BoundRouteArgument {
             handler_index: index,
             value: Constant::Int(index as i64),
+            record_fields: None,
         }
+    }
+
+    #[test]
+    fn legacy_record_bytecode_without_field_layout_fails_closed() {
+        let mut module = CodeModule::new("old-record-bytecode");
+        module.emit(Instruction::new3(OpCode::RecL, 0, 0, 1));
+        let arg = BoundRouteArgument {
+            handler_index: 0,
+            value: Constant::Nil,
+            record_fields: Some(vec![("name".into(), Constant::String("Ada".into()))]),
+        };
+        let error = render_bound_handler(&module, 0, 1, &[arg]).unwrap_err();
+        assert!(
+            error.contains("field-layout metadata is missing"),
+            "{error}"
+        );
     }
 
     #[test]

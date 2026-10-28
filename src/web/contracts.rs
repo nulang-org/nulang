@@ -251,6 +251,35 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
         })
         .collect();
 
+    let named_json_records: HashMap<String, String> = module
+        .decls
+        .iter()
+        .filter_map(|decl| {
+            if let Decl::RecordType {
+                name,
+                type_params,
+                fields,
+                ..
+            } = decl
+            {
+                if type_params.is_empty() {
+                    return Some((
+                        name.clone(),
+                        format!(
+                            "{{ {} }}",
+                            fields
+                                .iter()
+                                .map(|(name, ty)| format!("{name}: {ty}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    ));
+                }
+            }
+            None
+        })
+        .collect();
+
     let mut raw_routes = Vec::new();
     collect_routes_in_module(module, &mut raw_routes);
 
@@ -318,7 +347,22 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
                     m.params
                         .iter()
                         .map(|param| {
-                            handler_param_contract(param, m.request_bindings.get(&param.name))
+                            let mut contract =
+                                handler_param_contract(param, m.request_bindings.get(&param.name));
+                            if contract
+                                .request
+                                .as_ref()
+                                .is_some_and(|request| request.source == RequestParamSource::Json)
+                            {
+                                if let Some(named) = contract
+                                    .ty
+                                    .as_ref()
+                                    .and_then(|ty| named_json_records.get(ty))
+                                {
+                                    contract.ty = Some(named.clone());
+                                }
+                            }
+                            contract
                         })
                         .collect()
                 })

@@ -69,9 +69,14 @@ pub fn compile_route_bindings(contract: &RouteContract) -> BindingCompilation {
                 handler_param.ty.as_deref(),
                 Some("Int" | "Float" | "Bool" | "String")
             )
+            && !handler_param
+                .ty
+                .as_deref()
+                .and_then(crate::web::json_records::parse_flat_record_type)
+                .is_some()
         {
             out.diagnostics.push(format!(
-                "{} {}: JSON binding for '{}' currently requires Int, Float, Bool, or String; aggregate DTO decoding is not supported yet",
+                "{} {}: JSON binding for '{}' currently requires Int, Float, Bool, or String; expected a scalar or flat primitive record DTO; nested or unknown JSON types are rejected",
                 contract.method, contract.path, handler_param.name
             ));
             continue;
@@ -250,7 +255,7 @@ mod tests {
             result
                 .diagnostics
                 .iter()
-                .any(|message| message.contains("aggregate DTO decoding is not supported")),
+                .any(|message| message.contains("unknown JSON types are rejected")),
             "{:?}",
             result.diagnostics
         );

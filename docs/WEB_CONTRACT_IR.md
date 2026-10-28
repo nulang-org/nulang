@@ -311,9 +311,35 @@ successful HTML response containing untrusted markup. OpenAPI emits real
 application/json request/response media types only for these explicit
 contracts, while preserving extensions for opaque/unmodeled body types.
 
-This is intentionally not a generic `Json[T]` serializer. It establishes
-wire semantics before higher-level record types, status variants, or stream
-responses are added.
+### Flat typed JSON record DTOs (experimental follow-up)
+
+For a statically declared record whose fields are only `Int`, `Float`,
+`Bool`, and `String`, the compiler can lower `from json` into a
+typed input schema and a real VM record argument:
+
+```nulang
+type CreateUser = { name: String, age: Int }
+
+fn create_user(input: CreateUser from json) -> String {
+    input.name
+}
+```
+
+Request bodies must be JSON objects with the exact declared field names.
+Missing fields, unknown fields (including privilege-escalation fields), wrong
+scalar types, malformed input, and duplicate root-level keys are rejected
+with a 400 problem response. This deliberately does not implement optional,
+nested, collection, union, or user-defined custom scalar decoding.
+
+The compiler carries record slot IDs into bytecode metadata so the HTTP
+adapter materializes Nulang VM records using the same offsets the compiled
+handler reads. OpenAPI exposes required properties and
+`additionalProperties: false` rather than inventing a permissive schema.
+Existing raw-body and primitive JSON binding behavior remains unchanged.
+
+Typed **response** serialization (`Json[T]`), non-200 result variants,
+nested record support, and streaming are still future work. `Web.json`
+continues to accept *serialized* JSON and the HTTP adapter validates it.
 
 ## Remaining implementation priorities
 
