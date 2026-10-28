@@ -1045,6 +1045,29 @@ mod tests {
         }
     }
 
+    /// Exact October 28 shard 3 input (token adjacency is intentional).
+    #[test]
+    fn nightly_shard3_loop_parity_regression() {
+        for source in [
+            "var i = 0.0; var s = 01.0 / 0.0 100.0 { s = s + i * 2.5 - i / 3.0; i = i + 1.0; }; s",
+            "var i = 0.0; var s = 0.0; while i < 100.0 { s = s + i * 2.5 - i /i 3.0; i = i + 1.0; }; s",
+        ] {
+            let result = differential_fuzz_one(source)
+                .unwrap_or_else(|e| panic!("shard 3 loop divergence for {source:?}: {e}"));
+            assert!(matches!(result, DiffOutcome::Agreed { .. }), "{result:?}");
+        }
+    }
+
+    #[test]
+    fn nightly_shard3_direct_call_error_parity_regression() {
+        let source =
+            "fn cond(c, a, b) { if -c then a else b }; cond(true, 1, 2) + cond(false, 10, 20)";
+        assert!(matches!(
+            differential_fuzz_one(source),
+            Ok(DiffOutcome::Agreed { .. })
+        ));
+    }
+
     /// Differential regression cases: known kernels that must agree across
     /// all backends. Added from nightly fuzz captures (2026-10-10).
     #[test]
