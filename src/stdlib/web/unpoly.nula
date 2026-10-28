@@ -1,0 +1,65 @@
+// Optional Unpoly 3 server-protocol helpers.
+// Import: `import stdlib::web::unpoly`
+// Compatible with Unpoly's stock browser client; no bundled JavaScript.
+// The Web host validates response header names and values.
+
+import stdlib::web::types
+
+/// Unpoly sets X-Up-Version on every enhanced request.
+/// Responses must vary by negotiation headers even for full-page fallbacks.
+/// Call this before choosing between an HTML document and a fragment.
+pub fn is_fragment() -> Bool ! {Web, Request, Respond} {
+    perform Web.set_header("Vary", "X-Up-Version, X-Up-Target, X-Up-Fail-Target, X-Up-Mode, X-Up-Validate")
+    let version = perform Web.header("X-Up-Version")
+    version != nil && version != ""
+}
+
+/// Read the requested selector. The Vary header is set by is_fragment().
+pub fn request_target() -> String ! {Web, Request} {
+    perform Web.header("X-Up-Target")
+}
+
+/// Read the error-response selector. Unpoly can target a different fragment.
+pub fn fail_target() -> String ! {Web, Request} {
+    perform Web.header("X-Up-Fail-Target")
+}
+
+/// Root, modal or drawer, as requested by the client.
+pub fn layer_mode() -> String ! {Web, Request} {
+    perform Web.header("X-Up-Mode")
+}
+
+/// Names of fields for which the client is requesting server validation.
+pub fn validation_fields() -> String ! {Web, Request} {
+    perform Web.header("X-Up-Validate")
+}
+
+/// Progressive-enhancement attributes; HTML values are escaped by Web.text.
+pub fn follow() -> (String, Html) { ("up-follow", perform Web.text("")) }
+pub fn submit() -> (String, Html) { ("up-submit", perform Web.text("")) }
+pub fn target(selector: String) -> (String, Html) { ("up-target", perform Web.text(selector)) }
+pub fn fail_target_attr(selector: String) -> (String, Html) { ("up-fail-target", perform Web.text(selector)) }
+pub fn layer(kind: String) -> (String, Html) { ("up-layer", perform Web.text(kind)) }
+pub fn validate() -> (String, Html) { ("up-validate", perform Web.text("")) }
+pub fn hungry() -> (String, Html) { ("up-hungry", perform Web.text("")) }
+
+/// Response-control headers. The host rejects CRLF and reserved headers.
+pub fn retarget(selector: String) -> Unit ! {Web, Respond} {
+    perform Web.set_header("X-Up-Target", selector)
+}
+pub fn set_title(value: String) -> Unit ! {Web, Respond} {
+    perform Web.set_header("X-Up-Title", value)
+}
+pub fn location(url: String) -> Unit ! {Web, Respond} {
+    perform Web.set_header("X-Up-Location", url)
+    perform Web.set_header("X-Up-Method", "GET")
+}
+pub fn events(json: String) -> Unit ! {Web, Respond} {
+    perform Web.set_header("X-Up-Events", json)
+}
+pub fn accept_layer(value: String) -> Unit ! {Web, Respond} {
+    perform Web.set_header("X-Up-Accept-Layer", value)
+}
+pub fn dismiss_layer(value: String) -> Unit ! {Web, Respond} {
+    perform Web.set_header("X-Up-Dismiss-Layer", value)
+}

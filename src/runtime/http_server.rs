@@ -588,8 +588,28 @@ pub fn set_response_header(name: &str, value: &str) -> bool {
             .iter_mut()
             .find(|(existing, _)| existing.eq_ignore_ascii_case(name))
         {
+            if name.eq_ignore_ascii_case("vary") {
+                // Multiple render adapters may negotiate independent variants.
+                // Replacing Vary would cause shared caches to serve the wrong HTML.
+                let old = old_value.clone();
+                if old.trim() == "*" || value.trim() == "*" {
+                    *old_value = "*".to_string();
+                } else {
+                    let mut fields: Vec<&str> = Vec::new();
+                    for token in old.split(',').chain(value.split(',')) {
+                        let field = token.trim();
+                        if !field.is_empty()
+                            && !fields.iter().any(|previous| previous.eq_ignore_ascii_case(field))
+                        {
+                            fields.push(field);
+                        }
+                    }
+                    *old_value = fields.join(", ");
+                }
+            } else {
+                *old_value = value.to_string();
+            }
             *old_name = name.to_string();
-            *old_value = value.to_string();
         } else if headers.len() < 64 {
             headers.push((name.to_string(), value.to_string()));
         } else {
@@ -1335,6 +1355,30 @@ mod tests {
             );
         });
         assert!(take_response_headers().is_empty());
+    }
+
+    #[test]
+    fn vary_headers_combine_without_losing_cache_partition_keys() {
+        let ctx = RequestContext {
+            request: HttpRequest {
+                method: HttpMethod::Get,
+                path: "/".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+        with_request_context(ctx, || {
+            assert!(set_response_header("Vary", "Accept-Language"));
+            assert!(set_response_header("vary", "X-Up-Version, accept-language, X-Up-Target"));
+            assert_eq!(
+                take_response_headers(),
+                vec![("vary".into(), "Accept-Language, X-Up-Version, X-Up-Target".into())]
+            );
+            assert!(set_response_header("Vary", "*"));
+            assert!(set_response_header("Vary", "X-Up-Mode"));
+            assert_eq!(take_response_headers(), vec![("Vary".into(), "*".into())]);
+        });
     }
 
     // Fail closed on URL parent components and symlinks outside static roots.
