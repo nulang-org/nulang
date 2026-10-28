@@ -28,14 +28,11 @@ Both are visible to the compiler-owned Web Contract IR and work with the current
 
 This is the first additive step toward model-backed typed scaffolding. Future generators should consume the existing validated compiler contracts rather than inventing parallel runtime metadata.
 
-## Source-checkout stdlib path workaround
+## Source-checkout standard-library resolution
 
-On current main, a Nulang binary built from source may fail to resolve standard-library imports during Web Contract IR extraction when run from a generated app outside the compiler checkout. Until issue #2171 is fixed, set NULANG_STDLIB to the absolute path of the compiler checkout's src/stdlib directory before running the web build:
+Generated Web applications use the same source-aware standard-library resolver as compilation and Web Contract IR extraction. A binary built from source can build a generated application **outside the compiler checkout** without a manually configured `NULANG_STDLIB`. An explicit `NULANG_STDLIB` override takes precedence and fails closed if its path is invalid.
 
-    export NULANG_STDLIB=/absolute/path/to/nulang/src/stdlib
-    nulang nula build --web
-
-This issue also reproduces on an unmodified web starter and is not introduced by the generator.
+The external-directory regression covers both `nula generate resource` and `nula generate model`, then checks generated static pages and routes in the Web deployment IR. This requires the separate standard-library resolution fix (#2175), which is included in this integration branch and must be promoted along with it.
 
 
 ## Typed records are a separate, explicit command
