@@ -12,6 +12,7 @@ pub enum ResponseKind {
     NoContent,
     Problem,
     InvalidForm,
+    FormOutcome,
 }
 
 /// Transport-neutral result of executing a compiler-validated route.
@@ -20,6 +21,15 @@ pub struct RenderedResponse {
     pub status: u16,
     pub content_type: Option<&'static str>,
     pub body: Vec<u8>,
+}
+
+// Private wire envelope used only between the Web effect and typed response
+// dispatch. Strict decoding rejects extra, missing and duplicate fields.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FormEnvelope {
+    outcome: String,
+    html: String,
 }
 
 impl ResponseKind {
@@ -32,6 +42,7 @@ impl ResponseKind {
             Some("NoContent") => Some(Self::NoContent),
             Some("Problem") => Some(Self::Problem),
             Some("InvalidForm") => Some(Self::InvalidForm),
+            Some("FormOutcome") => Some(Self::FormOutcome),
             _ => None,
         }
     }
@@ -42,7 +53,7 @@ impl ResponseKind {
 
     pub const fn content_type(self) -> &'static str {
         match self {
-            Self::Html | Self::InvalidForm => "text/html; charset=utf-8",
+            Self::Html | Self::InvalidForm | Self::FormOutcome => "text/html; charset=utf-8",
             Self::Json | Self::Created => "application/json; charset=utf-8",
             Self::Text => "text/plain; charset=utf-8",
             Self::Problem => "application/problem+json",
@@ -52,7 +63,7 @@ impl ResponseKind {
 
     pub const fn openapi_media_type(self) -> &'static str {
         match self {
-            Self::Html | Self::InvalidForm => "text/html",
+            Self::Html | Self::InvalidForm | Self::FormOutcome => "text/html",
             Self::Json | Self::Created => "application/json",
             Self::Text => "text/plain",
             Self::Problem => "application/problem+json",
@@ -71,6 +82,16 @@ impl ResponseKind {
             ),
             Self::Text => (200, rendered.as_bytes().to_vec()),
             Self::InvalidForm => (422, rendered.as_bytes().to_vec()),
+            Self::FormOutcome => {
+                let envelope: FormEnvelope = serde_json::from_str(rendered)
+                    .map_err(|_| "FormOutcome must contain exactly outcome and html")?;
+                let status = match envelope.outcome.as_str() {
+                    "ok" => 200,
+                    "invalid" => 422,
+                    _ => return Err("FormOutcome must be ok or invalid"),
+                };
+                (status, envelope.html.into_bytes())
+            }
             Self::Json | Self::Created => {
                 serde_json::from_str::<serde_json::Value>(rendered)
                     .map_err(|_| "JSON route returned an invalid JSON document")?;
@@ -204,6 +225,48 @@ mod tests {
         assert_eq!(reply.status, 422);
         assert_eq!(reply.content_type, Some("text/html; charset=utf-8"));
         assert_eq!(reply.body, fragment.as_bytes());
+    }
+
+    #[test]
+    fn form_outcome_handles_success_and_validation_error_without_script_injection() {
+        assert_eq!(
+            ResponseKind::from_return_type(Some("FormOutcome")),
+            ResponseKind::FormOutcome
+        );
+        for (variant, status) in [("ok", 200), ("invalid", 422)] {
+            let envelope = serde_json::json!({
+                "outcome": variant,
+                "html": "<form id=\"edit\"><span>Required</span></form>"
+            });
+            let response = ResponseKind::FormOutcome
+                .render(&envelope.to_string())
+                .expect("decode form outcome");
+            assert_eq!(response.status, status);
+            assert_eq!(response.content_type, Some("text/html; charset=utf-8"));
+            assert_eq!(
+                response.body,
+                b"<form id=\"edit\"><span>Required</span></form>"
+            );
+        }
+    }
+
+    #[test]
+    fn form_outcome_rejects_malformed_or_ambiguous_tagged_results() {
+        for raw in [
+            "invalid",
+            "null",
+            "{}",
+            r#"{"outcome":"ok"}"#,
+            r#"{"outcome":"ok","html":42}"#,
+            r#"{"outcome":"unknown","html":"x"}"#,
+            r#"{"outcome":"invalid","html":"x","status":200}"#,
+            r#"{"outcome":"ok","html":"x","html":"y"}"#,
+        ] {
+            assert!(
+                ResponseKind::FormOutcome.render(raw).is_err(),
+                "accepted invalid outcome: {raw}"
+            );
+        }
     }
 
     #[test]

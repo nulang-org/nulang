@@ -275,7 +275,13 @@ the HTML client-runtime script. The additive nominal results `Created`,
 dynamic 4xx/5xx problem JSON, and 422 server-rendered validation HTML.
 `InvalidForm` preserves its provided HTML fragment and does not inject the
 client runtime script. This nominal type always produces 422; a typed union
-for per-request success/validation outcomes is future work.
+for per-request success/validation outcomes is provided by the additive
+`FormOutcome` nominal type: `form_ok(Html)` emits HTTP 200 and
+`form_invalid(Html)` emits HTTP 422. Both preserve HTML without runtime-script
+injection. The internal outcome envelope is strictly decoded and never sent
+as the HTTP entity body; malformed envelopes fail closed with HTTP 500.
+OpenAPI emits both 200 and 422 `text/html` responses. This is not a generic
+`Result` type; automatic validation and CSRF enforcement are not implied.
 HTTP validates the `Problem` document and uses its integer
 `status` for the wire response; error statuses outside 400..599 or missing
 string titles fail closed. OpenAPI only emits representations supported by

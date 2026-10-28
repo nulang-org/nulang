@@ -147,6 +147,29 @@ fn invalid_registration() -> InvalidForm {
 
 `Created` returns **201** with a validated JSON body (no `Location` header yet). `NoContent` returns **204**, with no body or media type. `Problem` returns a serialized `application/problem+json` error: its status must be an integer between 400 and 599, and its body must include a string `title`. The runtime rejects invalid result bodies rather than emitting a misleading success response. `InvalidForm` returns **422** with `text/html` for server-rendered validation errors (including Unpoly fragments). Its argument is typed `Html`; use escaped construction rather than interpolating untrusted input into `Web.raw`. Unlike ordinary full-page HTML, this fragment response does not inject a client script. OpenAPI reflects these result types: 201, 204, 422, or `default` for dynamically selected error codes.
 
+For routes that can either succeed or return field-validation errors, use the
+nominal `FormOutcome` result in both branches:
+
+```nulang
+fn submit_form() -> FormOutcome {
+    if perform Web.form_value("email") != nil then {
+        form_ok(perform Web.text("Saved"))
+    } else {
+        form_invalid(perform Web.text("Email is required"))
+    }
+}
+```
+
+`form_ok(Html)` responds **200**; `form_invalid(Html)` responds **422**.
+Both return HTML without an injected script, and OpenAPI describes both
+responses. The runtime checks the internal tagged response envelope and
+rejects malformed or unexpected outcomes with 500 rather than exposing the
+envelope to browsers. The compiler sees one nominal `FormOutcome` return
+type; this is a focused outcome algebra, **not general-purpose sum types**.
+Validation, authorization, CSRF checks, and target checking remain the
+handler's responsibility. Construct user-controlled markup with escaped HTML
+operations; `Web.raw` remains trusted-only.
+
 This remains experimental. Generic typed JSON results (`Json[T]`), resource locations for created responses, streaming, and content negotiation are not yet implemented.
 
 ### Building HTML
