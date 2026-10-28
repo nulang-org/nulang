@@ -34,6 +34,7 @@ fn native_leaf_dispatch_table_is_cached_sorted_and_module_scoped() {
             ptr: stub,
             return_reg: 3,
             required_args: 2,
+            call_depth: 1,
         },
     );
     jit.native_leaf_calls.insert(
@@ -42,6 +43,7 @@ fn native_leaf_dispatch_table_is_cached_sorted_and_module_scoped() {
             ptr: stub,
             return_reg: 0,
             required_args: 0,
+            call_depth: 1,
         },
     );
     jit.rebuild_native_leaf_table(0);
@@ -63,6 +65,7 @@ fn native_leaf_dispatch_table_is_cached_sorted_and_module_scoped() {
             ptr: stub,
             return_reg: 1,
             required_args: 1,
+            call_depth: 1,
         },
     );
     jit.rebuild_native_leaf_table(1);
@@ -826,6 +829,102 @@ fn test_jit_native_leaf_direct_calls_support_0_1_4_and_8_args() {
         jit_vm.jit_compile_stats().fast_compiles,
         5,
         "the outer loop plus four eligible leaf callees should compile natively"
+    );
+}
+
+#[test]
+fn test_jit_native_leaf_chain_compiles_pure_non_suspending_callees() {
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+    use crate::vm::VM;
+
+    let source = r#"
+        fn increment(x: Int) -> Int { x + 1 }
+        fn twice(x: Int) -> Int { increment(increment(x)) }
+        fn thrice(x: Int) -> Int { twice(increment(x)) }
+        fn main() -> Int {
+            var total = 0;
+            var i = 0;
+            while i < 2000 {
+                total = thrice(total);
+                i = i + 1
+            };
+            total
+        }
+    "#;
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "jit_native_leaf_chain").expect("codegen");
+
+    let mut interp = VM::new_without_jit();
+    interp.load_module(module.clone());
+    let expected = interp.run().expect("interpreter should run");
+
+    let mut jit_vm = VM::new();
+    jit_vm.load_module(module);
+    let actual = jit_vm.run().expect("JIT should run");
+
+    assert_eq!(actual.as_int(), expected.as_int());
+    assert_eq!(actual.as_int(), Some(6000));
+    assert_eq!(
+        jit_vm.jit_compile_stats().fast_compiles,
+        4,
+        "the hot loop and the three acyclic pure callees should each compile natively"
+    );
+}
+
+#[test]
+fn test_jit_native_leaf_chain_rejects_branchy_dependency() {
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+    use crate::vm::VM;
+
+    let source = r#"
+        fn choose(x: Int) -> Int { if x < 0 then { 1 } else { x + 1 } }
+        fn wrapper(x: Int) -> Int { choose(x) }
+        fn main() -> Int {
+            var total = 0;
+            var i = 0;
+            while i < 2000 {
+                total = wrapper(total);
+                i = i + 1
+            };
+            total
+        }
+    "#;
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "jit_native_leaf_branchy_dep").expect("codegen");
+
+    let mut interp = VM::new_without_jit();
+    interp.load_module(module.clone());
+    let expected = interp.run().expect("interpreter");
+    let mut jit_vm = VM::new();
+    jit_vm.load_module(module);
+    let actual = jit_vm.run().expect("JIT");
+
+    assert_eq!(actual.as_int(), expected.as_int());
+    assert_eq!(actual.as_int(), Some(2000));
+    assert_eq!(
+        jit_vm.jit_compile_stats().fast_compiles,
+        1,
+        "a branchy dependency must keep the wrapper on interpreter fallback"
     );
 }
 

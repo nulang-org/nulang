@@ -930,6 +930,12 @@ pub unsafe extern "C" fn nulang_jit_direct_call(
                     set_jit_pending_vm_error(msg);
                     return 1;
                 }
+                // A nested compiled leaf may have called this same helper.
+                // Propagate its failure instead of returning an uninitialized
+                // or partial register as if the parent completed successfully.
+                if JIT_PENDING_VM_ERROR.with(|slot| slot.borrow().is_some()) {
+                    return 1;
+                }
 
                 unsafe {
                     *regs.add(dst) = *callee_ptr.add(leaf.return_reg as usize);

@@ -122,6 +122,8 @@ struct NativeLeafCall {
     ptr: *const u8,
     return_reg: u8,
     required_args: usize,
+    /// Maximum synchronous call-chain depth, counting this leaf itself.
+    call_depth: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -494,13 +496,44 @@ impl JitSession {
         func_idx: usize,
         module: &crate::bytecode::CodeModule,
     ) -> Option<NativeLeafCall> {
+        self.ensure_native_leaf_call_at_depth(module_idx, func_idx, module, 0)
+    }
+
+    fn ensure_native_leaf_call_at_depth(
+        &mut self,
+        module_idx: usize,
+        func_idx: usize,
+        module: &crate::bytecode::CodeModule,
+        depth: usize,
+    ) -> Option<NativeLeafCall> {
+        // Native leaves use host-stack frames. Include the full transitive
+        // depth even when a cached callee was compiled in an earlier plan.
+        const MAX_LEAF_CALL_DEPTH: usize = 8;
+        if depth >= MAX_LEAF_CALL_DEPTH {
+            return None;
+        }
         if let Some(call) = self.native_leaf_calls.get(&(module_idx, func_idx)).copied() {
-            return Some(call);
+            return (depth + call.call_depth <= MAX_LEAF_CALL_DEPTH).then_some(call);
         }
 
-        let plan = native_leaf_plan(module, func_idx)?;
+        let plan = {
+            let (may_suspend, recursive) = self.region_planner.call_safety(module_idx, module);
+            native_leaf_plan(module, func_idx, may_suspend, recursive)?
+        };
+        // Resolve every nested callee before installing its parent; a branchy,
+        // recursive or suspending dependency keeps the parent on the safe VM
+        // fallback rather than creating a partially compiled native call chain.
+        let mut call_depth = 1usize;
+        for &callee in plan.native_calls.values() {
+            let nested =
+                self.ensure_native_leaf_call_at_depth(module_idx, callee, module, depth + 1)?;
+            call_depth = call_depth.max(nested.call_depth + 1);
+        }
+        if depth + call_depth > MAX_LEAF_CALL_DEPTH {
+            return None;
+        }
+
         let symbol = format!("nulang_jit_leaf_{module_idx}_{func_idx}");
-        let native_calls = std::collections::HashMap::new();
         let started = std::time::Instant::now();
         let ptr = self
             .codegen
@@ -511,7 +544,7 @@ impl JitSession {
                 instructions: &module.instructions,
                 optimization: CodegenOptimization::Fast,
                 kind: NativeCompileKind::Scalar {
-                    native_calls: &native_calls,
+                    native_calls: &plan.native_calls,
                 },
             })
             .ok()?;
@@ -526,6 +559,7 @@ impl JitSession {
             ptr,
             return_reg: plan.return_reg,
             required_args: plan.required_args,
+            call_depth,
         };
         self.native_leaf_calls.insert((module_idx, func_idx), call);
         self.rebuild_native_leaf_table(module_idx);
