@@ -16,3 +16,22 @@ The upstream client permits plain HTTP for development; this connector retains t
 - Remote database integration smoke using an authorized HTTPS endpoint
 
 Certificate-chain and hostname tests exercise local TLS handshakes and are not substitutes for real remote-database compatibility testing.
+
+## Authenticated remote read-only smoke
+
+The `remote_turso_authenticated_read_only_smoke` test uses the real libSQL remote client and this repository's certificate-verifying connector. It runs only when explicitly requested and does **not** initialize tables, migrate schemas, or write data. It issues `SELECT 1` using a read-only database token.
+
+Provide the following environment variables through an authorized secrets mechanism (never in shell history, CI logs, or committed files):
+
+- `NULANG_TURSO_SMOKE_URL`: an authorized **test** database, using `libsql://` or `https://` (not `http://`)
+- `NULANG_TURSO_SMOKE_TOKEN`: a short-lived database-scoped **read-only** authentication token
+
+Run:
+
+```sh
+cargo test --locked --no-default-features --features sqlite --lib \
+  runtime::libsql_tls::tests::remote_turso_authenticated_read_only_smoke \
+  -- --ignored --exact --nocapture
+```
+
+The smoke validates scheme, hostname and absence of inline URL credentials before connecting. It requires system certificate roots, authenticates to Turso, executes `SELECT 1`, and asserts the result. Failure to supply credentials is a **blocked gate**, not a successful or skipped remote validation. Run this only against an explicitly authorized disposable/test database; do not create persistent tokens or use production database privileges for convenience.

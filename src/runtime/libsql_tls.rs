@@ -229,4 +229,87 @@ mod tests {
             .is_err());
         task.abort();
     }
+
+    /// A live smoke must never send the authentication token to HTTP or
+    /// accept an endpoint with userinfo embedded in the URL.
+    fn validate_remote_smoke_url(url: &str) -> Result<(), &'static str> {
+        let normalized = if let Some(host) = url.strip_prefix("libsql://") {
+            format!("https://{host}")
+        } else if url.starts_with("https://") {
+            url.to_string()
+        } else {
+            return Err("remote smoke requires HTTPS or libsql URL");
+        };
+        let uri: Uri = normalized.parse().map_err(|_| "invalid remote URL")?;
+        if uri.scheme_str() != Some("https")
+            || uri.host().is_none()
+            || uri.authority().is_some_and(|a| a.as_str().contains('@'))
+        {
+            return Err("remote smoke requires HTTPS host without credentials in URL");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn remote_smoke_endpoint_requires_tls_and_no_inline_credentials() {
+        assert!(validate_remote_smoke_url("libsql://safe-test-db.turso.io").is_ok());
+        assert!(validate_remote_smoke_url("https://safe-test-db.turso.io").is_ok());
+        for url in [
+            "http://safe-test-db.turso.io",
+            "libsql://user:token@safe-test-db.turso.io",
+            "https://user:token@safe-test-db.turso.io",
+            "file:local.db",
+            "https://",
+            "",
+        ] {
+            assert!(
+                validate_remote_smoke_url(url).is_err(),
+                "must reject {url:?}"
+            );
+        }
+    }
+
+    /// Operator-only test: a real authenticated Turso endpoint, a scoped
+    /// read-only token, system TLS roots and the actual libSQL connector.
+    /// Never creates tables, mutates rows, or logs the token or URL.
+    #[tokio::test]
+    #[ignore = "requires NULANG_TURSO_SMOKE_URL and NULANG_TURSO_SMOKE_TOKEN for an authorized test database"]
+    async fn remote_turso_authenticated_read_only_smoke() {
+        let url =
+            std::env::var("NULANG_TURSO_SMOKE_URL").expect("NULANG_TURSO_SMOKE_URL is required");
+        let token = std::env::var("NULANG_TURSO_SMOKE_TOKEN")
+            .expect("NULANG_TURSO_SMOKE_TOKEN is required");
+        validate_remote_smoke_url(&url).expect("TLS-only Turso smoke endpoint required");
+        assert!(!token.trim().is_empty(), "empty Turso token is forbidden");
+
+        let connector = super::connector().expect("system TLS roots are required");
+        let db = timeout(
+            Duration::from_secs(30),
+            libsql::Builder::new_remote(url, token)
+                .connector(connector)
+                .build(),
+        )
+        .await
+        .expect("remote build timed out")
+        .unwrap_or_else(|_| panic!("remote authenticated database build failed"));
+        let conn = db.connect().expect("remote connection unavailable");
+        let mut rows = timeout(
+            Duration::from_secs(30),
+            conn.query("SELECT 1", libsql::params![]),
+        )
+        .await
+        .expect("authenticated read-only query timed out")
+        .unwrap_or_else(|_| panic!("authenticated read-only query failed"));
+        let first = rows
+            .next()
+            .await
+            .expect("read-only response failed")
+            .expect("read-only query returned no rows");
+        assert_eq!(first.get::<i64>(0).expect("invalid SELECT 1 result"), 1);
+        assert!(rows
+            .next()
+            .await
+            .expect("read-only cursor failed")
+            .is_none());
+    }
 }
