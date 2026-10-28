@@ -1,9 +1,12 @@
-//! Read-only compatibility reader for the existing libSQL SQLite file format.
+//! Isolated rusqlite compatibility and experimental atomic-transaction proofs.
 //!
-//! This is intentionally NOT a PersistenceStore. Its read methods return
-//! Results, and there is no path for producing or committing durable writes.
-//! The production LibsqlStore remains the sole local durable writer until
-//! a fully certified rusqlite writer and crash-recovery matrix exist.
+//! This independent test-tool crate is intentionally NOT a Nulang
+//! `PersistenceStore`. Its read-only recovery reader returns Results and
+//! never mutates persisted data; the separate experimental atomic writer can
+//! write only an existing, current-schema SQLite database for verification.
+//! Neither is linked into the production runtime, and the production
+//! `LibsqlStore` remains the selected local durable backend until a fully
+//! certified replacement and crash-recovery matrix exist.
 mod atomic_writer;
 pub use atomic_writer::RusqliteAtomicWriter;
 
