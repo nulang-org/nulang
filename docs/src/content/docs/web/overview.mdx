@@ -258,10 +258,14 @@ fn save_message() -> Html {
 }
 ```
 
-The browser parses the successful `text/html` response and replaces just
-`#current-message`, leaving the form and other page state in place. It also
-accepts a complete rendered HTML page and extracts the target from it. A
-missing target, non-HTML response, or unsuccessful HTTP status is reported
+The browser parses a successful `text/html` response and morphs just
+`#current-message`. It also accepts a complete rendered HTML page and extracts
+the target from it. Matching elements retain their DOM identities and event
+listeners; keyed siblings (`id` or `data-nulang-key`) can move without losing
+their state. User-modified inputs, checkboxes, textareas, and selects retain
+their local values, and a retained focused input keeps its selection.
+
+A missing target, non-HTML response, or unsuccessful HTTP status is reported
 without changing the page. Actions without `data-nulang-target` retain the
 existing reload behavior.
 
@@ -269,9 +273,11 @@ See [examples/patch-web](https://github.com/nulang-org/nulang/tree/main/examples
 for a standalone sample. Run `nulang nula dev` from that directory.
 
 :::caution[Scope of this first slice]
-This is an **opt-in element replacement**, not DOM morphing or an SSE patch
-protocol. Replacing a target discards interactive DOM state *inside* that
-target. Put form controls outside it for now. The response must be generated
+This is an **opt-in, DOM-preserving HTML response**, not an SSE patch
+protocol. The morph algorithm is intentionally small: elements without
+stable IDs/keys can still be replaced, and changing a node's element type
+replaces that node. Forms with in-flight requests are not yet versioned, so
+concurrent mutations can resolve out of order. The response must be generated
 from trusted, properly escaped server-side `Html`; using `raw` with untrusted
 content can introduce XSS. This does not make the experimental HTTP/action
 host production-ready.

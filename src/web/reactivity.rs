@@ -850,6 +850,131 @@ pub fn generate_client_runtime() -> String {
     return body;
   }
 
+  // Reuse matching DOM nodes rather than replacing focused controls, losing
+  // event listeners, or discarding client-owned input state. Keyed siblings
+  // have a stable identity via id or data-nulang-key.
+  function nodeKey(node) {
+    if (node.nodeType !== 1) return null;
+    const key = node.getAttribute('data-nulang-key');
+    if (key !== null) return 'key:' + key;
+    return node.id ? 'id:' + node.id : null;
+  }
+
+  function sameKind(current, incoming) {
+    return current.nodeType === incoming.nodeType &&
+      (current.nodeType !== 1 ||
+       (current.tagName === incoming.tagName &&
+        current.namespaceURI === incoming.namespaceURI));
+  }
+
+  function morphNode(current, incoming) {
+    if (!sameKind(current, incoming) ||
+        (nodeKey(current) !== null && nodeKey(current) !== nodeKey(incoming))) {
+      const replacement = document.importNode(incoming, true);
+      current.replaceWith(replacement);
+      return replacement;
+    }
+    if (current.nodeType !== 1) {
+      if (current.nodeValue !== incoming.nodeValue) {
+        current.nodeValue = incoming.nodeValue;
+      }
+      return current;
+    }
+
+    const focused = document.activeElement === current;
+    const tag = current.tagName;
+    // A user edit is owned by the browser until the application explicitly
+    // resets it. Do not overwrite it with a stale server-rendered default.
+    const dirtyValue = (tag === 'TEXTAREA' ||
+       (tag === 'INPUT' && current.type !== 'file')) &&
+      (focused || current.value !== current.defaultValue);
+    const dirtyChecked = tag === 'INPUT' &&
+      (focused || current.checked !== current.defaultChecked);
+    const dirtySelect = tag === 'SELECT' &&
+      (focused || Array.from(current.options).some(function (option) {
+        return option.selected !== option.defaultSelected;
+      }));
+    const value = dirtyValue ? current.value : null;
+    const checked = dirtyChecked ? current.checked : null;
+    const selected = dirtySelect
+      ? Array.from(current.options).filter(function (option) { return option.selected; })
+          .map(function (option) { return option.value; })
+      : null;
+    const selection = focused && typeof current.selectionStart === 'number'
+      ? [current.selectionStart, current.selectionEnd, current.selectionDirection]
+      : null;
+
+    // Synchronize attributes, including removals, for SSR parity.
+    Array.from(current.attributes).forEach(function (attr) {
+      if (!incoming.hasAttribute(attr.name)) current.removeAttribute(attr.name);
+    });
+    Array.from(incoming.attributes).forEach(function (attr) {
+      if (current.getAttribute(attr.name) !== attr.value) {
+        current.setAttribute(attr.name, attr.value);
+      }
+    });
+
+    const oldChildren = Array.from(current.childNodes);
+    const keyed = new Map();
+    const unkeyed = [];
+    oldChildren.forEach(function (child) {
+      const key = nodeKey(child);
+      if (key === null) {
+        unkeyed.push(child);
+      } else if (!keyed.has(key)) {
+        keyed.set(key, child);
+      }
+    });
+    const reused = new Set();
+    let unkeyedIndex = 0;
+    let position = 0;
+    Array.from(incoming.childNodes).forEach(function (child) {
+      const key = nodeKey(child);
+      let match = null;
+      if (key !== null) {
+        const candidate = keyed.get(key);
+        if (candidate && !reused.has(candidate) && sameKind(candidate, child)) {
+          match = candidate;
+        }
+      } else {
+        while (unkeyedIndex < unkeyed.length) {
+          const candidate = unkeyed[unkeyedIndex++];
+          if (sameKind(candidate, child)) {
+            match = candidate;
+            break;
+          }
+        }
+      }
+      let node;
+      if (match) {
+        reused.add(match);
+        node = morphNode(match, child);
+      } else {
+        node = document.importNode(child, true);
+      }
+      const before = current.childNodes[position] || null;
+      if (node !== before) current.insertBefore(node, before);
+      position++;
+    });
+    oldChildren.forEach(function (child) {
+      if (!reused.has(child) && child.parentNode === current) child.remove();
+    });
+
+    if (dirtyValue) current.value = value;
+    if (dirtyChecked) current.checked = checked;
+    if (dirtySelect) {
+      Array.from(current.options).forEach(function (option) {
+        option.selected = selected.includes(option.value);
+      });
+    }
+    if (selection) {
+      // Selection APIs can throw on unsupported input types.
+      try { current.setSelectionRange(selection[0], selection[1], selection[2]); }
+      catch (_) {}
+    }
+    return current;
+  }
+
   // Progressive HTML updates are opt-in. The response may contain an entire
   // server-rendered page or only the element identified by the target ID.
   // Legacy actions still reload when no target is declared.
@@ -867,7 +992,14 @@ pub fn generate_client_runtime() -> String {
     if (!incoming || !current) {
       throw new Error('Nulang patch target not found: ' + selector);
     }
-    current.replaceWith(document.importNode(incoming, true));
+    // Tiny DOM stubs used by the existing no-dependency regression test do
+    // not implement the Node interface; real browser nodes take the morph path.
+    if (typeof current.nodeType !== 'number' ||
+        typeof incoming.nodeType !== 'number') {
+      current.replaceWith(document.importNode(incoming, true));
+    } else {
+      morphNode(current, incoming);
+    }
     hydrate();
   }
 
@@ -909,9 +1041,12 @@ pub fn generate_client_runtime() -> String {
     document.querySelectorAll('[data-action]').forEach(function (el) {
       if (hydratedActions.has(el)) return;
       hydratedActions.add(el);
-      const handler = el.dataset.action;
-      const placement = el.dataset.actionPlacement;
       const listener = function (e) {
+        // Morphing may change the compiled action on an existing DOM node.
+        // Read the latest binding rather than retaining an obsolete handler.
+        const handler = el.dataset.action;
+        if (!handler) return;
+        const placement = el.dataset.actionPlacement;
         e.preventDefault();
         if (placement === 'server') {
           runServerAction(handler, el).catch(function (err) {
