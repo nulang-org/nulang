@@ -81,7 +81,7 @@ INSERT INTO nulang_example.orders VALUES
  ('tenant-a','order-4','user-a'),('tenant-a','sibling','user-a'),
  ('tenant-b','order-4','user-b'),('tenant-b','only-b','user-b');
 SQL
-export CARGO_TARGET_DIR="/home/davidporkka/nulang/target"
+export CARGO_TARGET_DIR="${NULANG_TEST_CARGO_TARGET_DIR:-$repo/target}"
 # Read-only privilege probes against this newly created disposable cluster.
 # Print only status, never credentials or the random cluster nonce.
 for role in nulang_session_reader nulang_tenant_a nulang_tenant_b; do
@@ -99,6 +99,6 @@ for role in nulang_session_reader nulang_tenant_a nulang_tenant_b; do
   fi
 done
 echo "Testing real disposable PostgreSQL session/RLS adapters (loopback only)"
-cargo test --locked --offline --manifest-path "$repo/Cargo.toml" \
+cargo test --locked --manifest-path "$repo/Cargo.toml" \
  --no-default-features --features postgres \
  --test web_session_postgres_disposable -- --test-threads=1

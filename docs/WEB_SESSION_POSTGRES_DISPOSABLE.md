@@ -23,7 +23,9 @@ Only run on an authorized developer/CI machine with PostgreSQL binaries installe
 bash tests/run_web_session_pg_disposable.sh
 ```
 
-The script is intentionally not connected to a pre-existing DB and **does not** support an override of the test cluster destination. Direct `cargo test --features postgres --test web_session_postgres_disposable` is not a supported validation procedure; the disposable harness provides the necessary isolated cluster and environment guards.
+The script is intentionally not connected to a pre-existing DB and **does not** support an override of the test cluster destination. `NULANG_TEST_CARGO_TARGET_DIR` may be set to reuse a Cargo build cache; it cannot change the database destination. Direct `cargo test --features postgres --test web_session_postgres_disposable` is not a supported validation procedure; the disposable harness provides the necessary isolated cluster and environment guards.
+
+`.github/workflows/web-session-postgres.yml` runs this guarded disposable PostgreSQL proof on changes to the session, preflight, database adapter, harness, or workflow. It installs PostgreSQL 16 binaries on a disposable GitHub-hosted Ubuntu 24.04 runner, runs with read-only repository permissions, and cancels superseded PR runs. Hosted exact-head CI must finish successfully before promotion; local passing tests do not replace it.
 
 ## Limits
 

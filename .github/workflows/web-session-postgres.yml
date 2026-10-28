@@ -1,0 +1,51 @@
+name: Web session PostgreSQL disposable authority
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/web-session-postgres.yml'
+      - 'src/web/session_pg_reference.rs'
+      - 'src/web/session_preflight.rs'
+      - 'src/web/csrf.rs'
+      - 'src/web/http_request.rs'
+      - 'tests/web_session_postgres_disposable.rs'
+      - 'tests/run_web_session_pg_disposable.sh'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-session-pg-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  disposable-postgres:
+    name: Disposable session and tenant RLS
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.95.0'
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: web-session-postgres
+      - name: Install disposable PostgreSQL server binaries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-16 postgresql-client-16
+          echo "/usr/lib/postgresql/16/bin" >> "$GITHUB_PATH"
+      - name: Validate fixture and Rust formatting
+        run: |
+          bash -n tests/run_web_session_pg_disposable.sh
+          cargo fmt --all -- --check
+      - name: Prove isolated session and forced-RLS authority
+        env:
+          NULANG_TEST_CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: bash tests/run_web_session_pg_disposable.sh
