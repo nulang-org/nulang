@@ -242,7 +242,7 @@ fn compile_segments(
         normalized.split('/').collect()
     };
 
-    parts
+    let segments: Vec<RuntimeRouteSegment> = parts
         .into_iter()
         .map(|segment| {
             if let Some(name) = segment.strip_prefix(':') {
@@ -273,7 +273,20 @@ fn compile_segments(
                 crate::web::request_bindings::percent_decode_path(segment),
             ))
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Captures are staged by name into a HashMap. A repeated name would
+    // silently overwrite its previous value, which can select the wrong
+    // resource identifier in a security-sensitive handler.
+    let mut captured = std::collections::HashSet::new();
+    for segment in &segments {
+        if let RuntimeRouteSegment::PathParam(name) = segment {
+            if !captured.insert(name.as_str()) {
+                return Err(format!("duplicate path parameter '{name}'"));
+            }
+        }
+    }
+    Ok(segments)
 }
 
 /// One VM argument produced from a compiler binding.
@@ -470,6 +483,24 @@ mod tests {
             effects: Vec::new(),
             reference_capability: None,
             placement: Some("server".to_string()),
+        }
+    }
+
+    #[test]
+    fn repeated_path_capture_names_fail_before_dispatch() {
+        // A HashMap capture would otherwise silently overwrite the first
+        // account identifier, making route authority ambiguous.
+        for path in [
+            "/accounts/{id}/children/{id}",
+            "/accounts/:id/children/:id",
+            "/accounts/:id/children/{id: String}",
+        ] {
+            let error = compile_route_segments(path)
+                .expect_err("duplicate path capture must not override an earlier value");
+            assert!(
+                error.contains("duplicate path parameter"),
+                "{path}: {error}"
+            );
         }
     }
 
