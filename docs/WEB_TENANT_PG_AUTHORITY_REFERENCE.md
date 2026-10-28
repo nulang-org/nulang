@@ -111,6 +111,19 @@ foreign keys, and consecutive request isolation.
   revocation service or migration: production requires audited durable
   provisioning, availability, token cleanup/retention, key rotation, secure
   TLS, operational logging, revocation writers and race/transaction review.
+- **Separate INSERT-only revocation administrator (fixture):**
+  `DisposablePostgresRevocationWriter` accepts a private server-held
+  `example_token_revoker` credential and writes only parameterized
+  `(issuer,subject,jti)` entries to the persistent revocation table. Its
+  login receives `USAGE` on the private schema and **INSERT only** on that
+  table (no SELECT, UPDATE or DELETE, and no tenant inventory access).
+  Repeated revocations are idempotent. It is not attached to an HTTP route;
+  the caller must already be authorized out of band. Wrong target,
+  disconnected database, missing disposable guard or SQL privileges fail
+  closed. The executable `tests/tenant_pg_revocation_writer.rs` confirms
+  both the grant boundaries and persistent reads through the separate
+  SELECT-only verifier login. These fixture roles/credentials are ephemeral,
+  **not a production administrative provisioning mechanism**.
 - Database memberships and credentials require reviewed provisioning,
   revocation, secret rotation and TLS. There is no pooling here; a future
   pooled adapter needs verified transaction isolation, pool reset, reuse
