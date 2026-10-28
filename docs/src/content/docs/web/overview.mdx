@@ -283,6 +283,14 @@ content can introduce XSS. This does not make the experimental HTTP/action
 host production-ready.
 :::
 
+## Typed HTML over SSE (experimental)
+
+The web runtime now has a separate, revisioned HTML patch stream: `Realtime.patch(room, target, html)` via `stdlib::web::realtime::patch`. In the browser use `window.nulang.stream("tasks")`, which returns a handle with `close()` for cancellation. The native EventSource endpoint is `/__nulang/ui-sse/tasks`.
+
+Every connection receives a current-state snapshot, followed by typed `nulang-ui-html/1` events with decimal-string revisions. Duplicate updates are ignored and revision gaps trigger a fresh snapshot. Limits per development-server process: 32 rooms, 32 targets per room, 8 subscribers per room, 8 queued updates per subscriber, and 64 KiB per update. Falling-behind subscribers are disconnected instead of buffering indefinitely.
+
+**Security and durability:** This experimental endpoint has no subscriber authentication, tenant isolation, persistent history, or cross-process distribution. Do not publish private data into shared rooms or expose the development server to untrusted clients. Actor-backed subscriptions and application authorization are future work.
+
 ## Realtime Broadcast
 
 `Realtime` currently has a single operation:

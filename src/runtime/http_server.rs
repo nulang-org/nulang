@@ -5,14 +5,14 @@
 //! Status is always 200; Content-Type is always text/plain.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::bytecode::CodeModule;
 use crate::value_layout::PAYLOAD_MASK;
@@ -709,6 +709,178 @@ pub fn realtime_subscribe(room: &str) -> (Vec<String>, Receiver<String>) {
 }
 
 // ---------------------------------------------------------------------------
+// Revisioned HTML-over-SSE stream (separate from legacy unbounded broadcast).
+// Room state contains a bounded snapshot, not an unbounded event log.
+// ---------------------------------------------------------------------------
+
+const UI_STREAM_MAX_ROOMS: usize = 32;
+const UI_STREAM_MAX_TARGETS: usize = 32;
+const UI_STREAM_MAX_LISTENERS: usize = 8;
+const UI_STREAM_MAX_HTML_BYTES: usize = 64 * 1024;
+const UI_STREAM_CHANNEL_DEPTH: usize = 8;
+
+struct UiStreamRoom {
+    revision: u64,
+    elements: BTreeMap<String, String>,
+    listeners: Vec<(u64, SyncSender<nulang_ui_protocol::UiHtmlStreamMessage>)>,
+}
+
+struct UiStreamSubscriber {
+    room: String,
+    id: u64,
+    rx: Receiver<nulang_ui_protocol::UiHtmlStreamMessage>,
+}
+
+impl UiStreamSubscriber {
+    fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<nulang_ui_protocol::UiHtmlStreamMessage, std::sync::mpsc::RecvTimeoutError> {
+        self.rx.recv_timeout(timeout)
+    }
+
+    #[cfg(test)]
+    fn try_recv(
+        &self,
+    ) -> Result<nulang_ui_protocol::UiHtmlStreamMessage, std::sync::mpsc::TryRecvError> {
+        self.rx.try_recv()
+    }
+}
+
+impl Drop for UiStreamSubscriber {
+    fn drop(&mut self) {
+        if let Some(entry) = ui_stream_rooms().lock().unwrap().get_mut(&self.room) {
+            entry.listeners.retain(|(id, _)| *id != self.id);
+        }
+    }
+}
+
+static UI_STREAM_LISTENER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+static UI_STREAM_ROOMS: OnceLock<Mutex<HashMap<String, UiStreamRoom>>> = OnceLock::new();
+
+fn ui_stream_rooms() -> &'static Mutex<HashMap<String, UiStreamRoom>> {
+    UI_STREAM_ROOMS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Publish one target update, returning false if room, selector, or bounded
+/// storage cannot admit it. A full per-subscriber channel removes the slow
+/// listener; it must reconnect to recover from the latest snapshot.
+pub fn ui_stream_publish(room: &str, target: &str, html: &str) -> bool {
+    use nulang_ui_protocol::{DocumentId, Revision, UiHtmlElement, UiHtmlStreamMessage};
+    if room.is_empty()
+        || room.len() > 128
+        || !room
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+        || html.len() > UI_STREAM_MAX_HTML_BYTES
+    {
+        return false;
+    }
+    let element = UiHtmlElement {
+        target: target.into(),
+        html: html.into(),
+    };
+    if UiHtmlStreamMessage::patch(
+        DocumentId::from(room),
+        Revision(0),
+        Revision(1),
+        element.clone(),
+    )
+    .validate()
+    .is_err()
+    {
+        return false;
+    }
+    let mut rooms = ui_stream_rooms().lock().unwrap();
+    if !rooms.contains_key(room) && rooms.len() >= UI_STREAM_MAX_ROOMS {
+        return false;
+    }
+    let entry = rooms
+        .entry(room.to_string())
+        .or_insert_with(|| UiStreamRoom {
+            revision: 0,
+            elements: BTreeMap::new(),
+            listeners: Vec::new(),
+        });
+    if !entry.elements.contains_key(target) && entry.elements.len() >= UI_STREAM_MAX_TARGETS {
+        return false;
+    }
+    let Some(next) = entry.revision.checked_add(1) else {
+        return false;
+    };
+    let patch = UiHtmlStreamMessage::patch(
+        DocumentId::from(room),
+        Revision(entry.revision),
+        Revision(next),
+        element,
+    );
+    entry.revision = next;
+    entry.elements.insert(target.into(), html.into());
+    entry
+        .listeners
+        .retain(|(_, sender)| match sender.try_send(patch.clone()) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
+        });
+    true
+}
+
+/// Every subscription begins with an atomic current snapshot. This makes
+/// Last-Event-ID / reconnect gap recovery independent of any event-history
+/// retention and prevents reconnects from replaying stale mutations.
+fn ui_stream_subscribe(
+    room: &str,
+) -> Option<(nulang_ui_protocol::UiHtmlStreamMessage, UiStreamSubscriber)> {
+    use nulang_ui_protocol::{DocumentId, Revision, UiHtmlElement, UiHtmlStreamMessage};
+    if room.is_empty()
+        || room.len() > 128
+        || !room
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+    {
+        return None;
+    }
+    let mut rooms = ui_stream_rooms().lock().unwrap();
+    if !rooms.contains_key(room) && rooms.len() >= UI_STREAM_MAX_ROOMS {
+        return None;
+    }
+    let entry = rooms
+        .entry(room.to_string())
+        .or_insert_with(|| UiStreamRoom {
+            revision: 0,
+            elements: BTreeMap::new(),
+            listeners: Vec::new(),
+        });
+    if entry.listeners.len() >= UI_STREAM_MAX_LISTENERS {
+        return None;
+    }
+    let snapshot = UiHtmlStreamMessage::snapshot(
+        DocumentId::from(room),
+        Revision(entry.revision),
+        entry
+            .elements
+            .iter()
+            .map(|(target, html)| UiHtmlElement {
+                target: target.clone(),
+                html: html.clone(),
+            })
+            .collect(),
+    );
+    let (tx, rx) = sync_channel(UI_STREAM_CHANNEL_DEPTH);
+    let id = UI_STREAM_LISTENER_ID.fetch_add(1, Ordering::Relaxed);
+    entry.listeners.push((id, tx));
+    Some((
+        snapshot,
+        UiStreamSubscriber {
+            room: room.to_string(),
+            id,
+            rx,
+        },
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Middleware
 // ---------------------------------------------------------------------------
 
@@ -896,6 +1068,7 @@ impl Drop for WebDevServer {
 impl WebDevServer {
     const MAX_CONCURRENT_CONNECTIONS: usize = 64;
     const SSE_PATH_PREFIX: &'static str = "/__nulang/sse/";
+    const UI_SSE_PATH_PREFIX: &'static str = "/__nulang/ui-sse/";
 
     pub fn bind(
         port: u16,
@@ -1024,7 +1197,19 @@ impl WebDevServer {
         };
         let path = request.path.clone();
 
-        let mut response = if path.starts_with(Self::SSE_PATH_PREFIX) {
+        let mut response = if path.starts_with(Self::UI_SSE_PATH_PREFIX) {
+            let room = &path[Self::UI_SSE_PATH_PREFIX.len()..];
+            if request.method != HttpMethod::Get {
+                HttpResponse {
+                    status: 405,
+                    headers: vec![("Allow".into(), "GET".into())],
+                    body: b"Method Not Allowed".to_vec(),
+                }
+            } else {
+                Self::serve_ui_sse(room, &mut stream, shutdown.clone());
+                return;
+            }
+        } else if path.starts_with(Self::SSE_PATH_PREFIX) {
             let room = &path[Self::SSE_PATH_PREFIX.len()..];
             Self::serve_sse(room, &mut stream, shutdown.clone());
             return;
@@ -1127,6 +1312,64 @@ impl WebDevServer {
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+    }
+
+    fn serve_ui_sse(room: &str, stream: &mut TcpStream, shutdown: Arc<AtomicBool>) {
+        let Some((snapshot, rx)) = ui_stream_subscribe(room) else {
+            HttpServerState::write_response(
+                stream,
+                &HttpResponse {
+                    status: 503,
+                    headers: vec![("Content-Type".into(), "text/plain".into())],
+                    body: b"UI stream capacity exhausted or invalid room".to_vec(),
+                },
+            );
+            return;
+        };
+        // Slow receivers are disconnected instead of blocking publishers.
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+        if stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache, no-transform\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n"
+        ).is_err() {
+            return;
+        }
+        if Self::write_ui_sse_event(stream, &snapshot).is_err() {
+            return;
+        }
+        let mut last_heartbeat = Instant::now();
+        while !shutdown.load(Ordering::Relaxed) {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(patch) => {
+                    if Self::write_ui_sse_event(stream, &patch).is_err() {
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if last_heartbeat.elapsed() >= Duration::from_secs(15) {
+                if stream.write_all(b": heartbeat\n\n").is_err() {
+                    break;
+                }
+                last_heartbeat = Instant::now();
+            }
+        }
+    }
+
+    fn write_ui_sse_event<W: Write>(
+        writer: &mut W,
+        msg: &nulang_ui_protocol::UiHtmlStreamMessage,
+    ) -> std::io::Result<()> {
+        let event = match msg {
+            nulang_ui_protocol::UiHtmlStreamMessage::Snapshot { .. } => "nulang-ui-snapshot",
+            nulang_ui_protocol::UiHtmlStreamMessage::Patch { .. } => "nulang-ui-patch",
+        };
+        let json = serde_json::to_string(msg).map_err(std::io::Error::other)?;
+        write!(
+            writer,
+            "event: {event}\nid: {}\ndata: {json}\n\n",
+            msg.revision().0
+        )
     }
 
     fn write_sse_event(stream: &mut TcpStream, msg: &str) -> std::io::Result<()> {
@@ -1520,6 +1763,81 @@ mod tests {
         let names: Vec<&str> = response.headers.iter().map(|(k, _)| k.as_str()).collect();
         assert!(names.contains(&"X-Content-Type-Options"));
         assert!(names.contains(&"X-Frame-Options"));
+    }
+
+    #[test]
+    fn ui_stream_starts_with_snapshot_and_revises_patches() {
+        let room = format!("ui-stream-replay-{}", std::process::id());
+        assert!(ui_stream_publish(&room, "#count", "<b id=\"count\">1</b>"));
+        let (snapshot, rx) = ui_stream_subscribe(&room).expect("subscription admitted");
+        assert_eq!(snapshot.revision(), nulang_ui_protocol::Revision(1));
+        assert!(matches!(
+            snapshot,
+            nulang_ui_protocol::UiHtmlStreamMessage::Snapshot { .. }
+        ));
+        assert!(ui_stream_publish(&room, "#count", "<b id=\"count\">2</b>"));
+        let patch = rx.try_recv().unwrap();
+        assert!(matches!(
+            patch,
+            nulang_ui_protocol::UiHtmlStreamMessage::Patch { .. }
+        ));
+        assert_eq!(patch.revision(), nulang_ui_protocol::Revision(2));
+        assert!(patch.validate().is_ok());
+
+        let (snapshot, _rx) = ui_stream_subscribe(&room).unwrap();
+        assert_eq!(snapshot.revision(), nulang_ui_protocol::Revision(2));
+    }
+
+    #[test]
+    fn ui_stream_bounds_and_drops_slow_subscribers() {
+        let room = format!("ui-stream-bounds-{}", std::process::id());
+        let (_snapshot, rx) = ui_stream_subscribe(&room).unwrap();
+        assert!(!ui_stream_publish(&room, "body", "invalid selector"));
+        assert!(!ui_stream_publish(&room, "#count", &"x".repeat(65537)));
+        for n in 0..32 {
+            assert!(ui_stream_publish(&room, &format!("#item-{n}"), "ok"));
+        }
+        assert!(!ui_stream_publish(&room, "#item-overflow", "ok"));
+        for _ in 0..32 {
+            assert!(ui_stream_publish(&room, "#item-0", "ok"));
+        }
+        let mut received = 0;
+        while rx.try_recv().is_ok() {
+            received += 1;
+        }
+        assert!(
+            received <= UI_STREAM_CHANNEL_DEPTH,
+            "queue must stay bounded"
+        );
+    }
+
+    #[test]
+    fn ui_stream_sse_wire_frame_includes_typed_snapshot_and_revision() {
+        let snapshot = nulang_ui_protocol::UiHtmlStreamMessage::snapshot(
+            nulang_ui_protocol::DocumentId::from("room"),
+            nulang_ui_protocol::Revision(42),
+            vec![nulang_ui_protocol::UiHtmlElement {
+                target: "#items".into(),
+                html: "<b>hi\nthere</b>".into(),
+            }],
+        );
+        let mut output = Vec::new();
+        WebDevServer::write_ui_sse_event(&mut output, &snapshot).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.starts_with("event: nulang-ui-snapshot\nid: 42\ndata: "));
+        assert!(text.ends_with("\n\n"));
+        assert!(text.contains("\"nulang-ui-html/1\""));
+        assert!(text.contains("\"revision\":\"42\""));
+    }
+
+    #[test]
+    fn ui_stream_unsubscribes_on_drop() {
+        let room = format!("ui-stream-disconnect-{}", std::process::id());
+        let (snapshot, receiver) = ui_stream_subscribe(&room).unwrap();
+        assert_eq!(snapshot.revision(), nulang_ui_protocol::Revision(0));
+        assert_eq!(ui_stream_rooms().lock().unwrap()[&room].listeners.len(), 1);
+        drop(receiver);
+        assert_eq!(ui_stream_rooms().lock().unwrap()[&room].listeners.len(), 0);
     }
 
     #[test]

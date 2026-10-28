@@ -978,15 +978,11 @@ pub fn generate_client_runtime() -> String {
   // Progressive HTML updates are opt-in. The response may contain an entire
   // server-rendered page or only the element identified by the target ID.
   // Legacy actions still reload when no target is declared.
-  async function patchActionResponse(response, selector) {
+  function applyHtmlUpdate(selector, html) {
     if (!/^#[A-Za-z][A-Za-z0-9_-]*$/.test(selector)) {
       throw new Error('invalid Nulang patch target (expected an element ID)');
     }
-    const contentType = response.headers.get('content-type') || '';
-    if (!/^text\/html(?:\s*;|\s*$)/i.test(contentType.trim())) {
-      throw new Error('Nulang patch response must be text/html');
-    }
-    const page = new DOMParser().parseFromString(await response.text(), 'text/html');
+    const page = new DOMParser().parseFromString(html, 'text/html');
     const incoming = page.querySelector(selector);
     const current = document.querySelector(selector);
     if (!incoming || !current) {
@@ -1015,6 +1011,93 @@ pub fn generate_client_runtime() -> String {
       }
     }
     hydrate();
+  }
+
+  async function patchActionResponse(response, selector) {
+    const contentType = response.headers.get('content-type') || '';
+    if (!/^text\/html(?:\s*;|\s*$)/i.test(contentType.trim())) {
+      throw new Error('Nulang patch response must be text/html');
+    }
+    applyHtmlUpdate(selector, await response.text());
+  }
+
+  // A new subscription always begins with a full current snapshot. Patches
+  // must be contiguous; duplicates are ignored and gaps force a resnapshot.
+  function stream(room) {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(room)) {
+      throw new Error('invalid Nulang UI stream room');
+    }
+    let closed = false;
+    let connection = null;
+    let revision = null;
+
+    function parseEvent(e, kind) {
+      let msg;
+      try { msg = JSON.parse(e.data); }
+      catch (err) { console.error('nulang: invalid UI stream JSON', err); return null; }
+      if (!msg || msg.protocol !== 'nulang-ui-html/1' ||
+          msg.type !== kind || msg.document_id !== room ||
+          typeof msg.revision !== 'string' ||
+          !/^(0|[1-9][0-9]*)$/.test(msg.revision) ||
+          msg.revision.length > 20 ||
+          BigInt(msg.revision) > 18446744073709551615n) {
+        return null;
+      }
+      return msg;
+    }
+
+    function applyElement(element) {
+      if (!element || typeof element.target !== 'string' ||
+          typeof element.html !== 'string') return;
+      // A room may publish targets absent from the current view.
+      if (!/^#[A-Za-z][A-Za-z0-9_-]*$/.test(element.target) ||
+          !document.querySelector(element.target)) return;
+      applyHtmlUpdate(element.target, element.html);
+    }
+
+    function open() {
+      if (closed) return;
+      revision = null;
+      connection = new window.EventSource('/__nulang/ui-sse/' + encodeURIComponent(room));
+      const active = connection;
+      active.addEventListener('nulang-ui-snapshot', function (e) {
+        if (closed || active !== connection) return;
+        const msg = parseEvent(e, 'snapshot');
+        if (!msg || !Array.isArray(msg.elements) || msg.elements.length > 32) return;
+        if (msg.elements.some(function (el) {
+          return !el || typeof el.target !== 'string' ||
+            !/^#[A-Za-z][A-Za-z0-9_-]*$/.test(el.target) ||
+            typeof el.html !== 'string';
+        })) return;
+        msg.elements.forEach(applyElement);
+        revision = BigInt(msg.revision);
+      });
+      active.addEventListener('nulang-ui-patch', function (e) {
+        if (closed || active !== connection) return;
+        const msg = parseEvent(e, 'patch');
+        if (!msg || revision === null ||
+            typeof msg.base_revision !== 'string' ||
+            !/^(0|[1-9][0-9]*)$/.test(msg.base_revision)) return;
+        const incoming = BigInt(msg.revision);
+        const base = BigInt(msg.base_revision);
+        if (incoming <= revision) return;
+        if (base !== revision || incoming !== base + 1n) {
+          active.close();
+          open();
+          return;
+        }
+        if (!msg.element || typeof msg.element.target !== 'string' ||
+            !/^#[A-Za-z][A-Za-z0-9_-]*$/.test(msg.element.target) ||
+            typeof msg.element.html !== 'string') return;
+        applyElement(msg.element);
+        revision = incoming;
+      });
+    }
+    open();
+    return {close: function () {
+      closed = true;
+      if (connection) connection.close();
+    }};
   }
 
   async function runServerAction(handler, el) {
@@ -1077,6 +1160,7 @@ pub fn generate_client_runtime() -> String {
   }
 
   window.nulang = {
+    stream: stream,
     signal: function (name) {
       return {
         get: function () { return signals[name]; },

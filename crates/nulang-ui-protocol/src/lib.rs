@@ -9,6 +9,7 @@ use std::fmt;
 
 pub const UI_PROTOCOL_VERSION: &str = "nulang-ui/1";
 pub const UI_MESSAGE_PROTOCOL_VERSION: &str = "nulang-ui-msg/1";
+pub const UI_HTML_STREAM_PROTOCOL_VERSION: &str = "nulang-ui-html/1";
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -473,6 +474,121 @@ impl ActionRequest {
     }
 }
 
+/// Escaped server-rendered HTML targeted at an element ID. The host must
+/// morph rather than evaluate the fragment as arbitrary JavaScript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiHtmlElement {
+    pub target: String,
+    pub html: String,
+}
+
+/// A separate transport adapter for HTML over SSE. This does not replace the
+/// renderer-neutral nulang-ui/1 patch algebra; revisions use the same exact
+/// decimal-string encoding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UiHtmlStreamMessage {
+    Snapshot {
+        protocol: String,
+        document_id: DocumentId,
+        revision: Revision,
+        elements: Vec<UiHtmlElement>,
+    },
+    Patch {
+        protocol: String,
+        document_id: DocumentId,
+        base_revision: Revision,
+        revision: Revision,
+        element: UiHtmlElement,
+    },
+}
+
+impl UiHtmlStreamMessage {
+    pub fn snapshot(
+        document_id: DocumentId,
+        revision: Revision,
+        elements: Vec<UiHtmlElement>,
+    ) -> Self {
+        Self::Snapshot {
+            protocol: UI_HTML_STREAM_PROTOCOL_VERSION.into(),
+            document_id,
+            revision,
+            elements,
+        }
+    }
+
+    pub fn patch(
+        document_id: DocumentId,
+        base_revision: Revision,
+        revision: Revision,
+        element: UiHtmlElement,
+    ) -> Self {
+        Self::Patch {
+            protocol: UI_HTML_STREAM_PROTOCOL_VERSION.into(),
+            document_id,
+            base_revision,
+            revision,
+            element,
+        }
+    }
+
+    pub fn revision(&self) -> Revision {
+        match self {
+            Self::Snapshot { revision, .. } | Self::Patch { revision, .. } => *revision,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        let (protocol, document_id) = match self {
+            Self::Snapshot {
+                protocol,
+                document_id,
+                ..
+            }
+            | Self::Patch {
+                protocol,
+                document_id,
+                ..
+            } => (protocol, document_id),
+        };
+        require_protocol(UI_HTML_STREAM_PROTOCOL_VERSION, protocol)?;
+        require_id("document_id", document_id.as_str())?;
+        match self {
+            Self::Snapshot { elements, .. } => {
+                for element in elements {
+                    validate_html_element(element)?;
+                }
+            }
+            Self::Patch {
+                base_revision,
+                revision,
+                element,
+                ..
+            } => {
+                if base_revision.0.checked_add(1) != Some(revision.0) {
+                    return Err(ProtocolError::NonIncreasingRevision {
+                        base: *base_revision,
+                        next: *revision,
+                    });
+                }
+                validate_html_element(element)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_html_element(element: &UiHtmlElement) -> Result<(), ProtocolError> {
+    let id = element.target.strip_prefix('#').unwrap_or("");
+    let mut chars = id.chars();
+    let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !valid {
+        return Err(ProtocolError::InvalidHtmlTarget(element.target.clone()));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeToHostMessage {
@@ -565,6 +681,7 @@ pub enum ProtocolError {
         found: String,
     },
     EmptyIdentifier(&'static str),
+    InvalidHtmlTarget(String),
     EmptyNodeKind(NodeId),
     EmptyActionEvent(NodeId),
     DuplicateNode(NodeId),
@@ -601,6 +718,7 @@ impl fmt::Display for ProtocolError {
                 write!(f, "unsupported protocol {found:?}; expected {expected:?}")
             }
             Self::EmptyIdentifier(field) => write!(f, "{field} must not be empty"),
+            Self::InvalidHtmlTarget(target) => write!(f, "invalid HTML target ID: {target}"),
             Self::EmptyNodeKind(node) => write!(f, "node {node} has an empty kind"),
             Self::EmptyActionEvent(node) => write!(f, "node {node} has an empty action event"),
             Self::DuplicateNode(node) => write!(f, "duplicate node id {node}"),
@@ -721,6 +839,69 @@ mod tests {
             NodeId::from("root"),
             vec![root, leaf("task-1", "text")],
         )
+    }
+
+    #[test]
+    fn html_stream_messages_are_revisioned_and_lossless() {
+        let patch = UiHtmlStreamMessage::patch(
+            DocumentId::from("tasks"),
+            Revision(4),
+            Revision(5),
+            UiHtmlElement {
+                target: "#items".into(),
+                html: "<ul id=\"items\">hello 🌍</ul>".into(),
+            },
+        );
+        patch.validate().unwrap();
+        let encoded = serde_json::to_string(&patch).unwrap();
+        assert!(encoded.contains("\"nulang-ui-html/1\""));
+        assert!(encoded.contains("\"revision\":\"5\""));
+        assert_eq!(
+            serde_json::from_str::<UiHtmlStreamMessage>(&encoded).unwrap(),
+            patch
+        );
+
+        let snapshot = UiHtmlStreamMessage::snapshot(
+            DocumentId::from("tasks"),
+            Revision(5),
+            vec![UiHtmlElement {
+                target: "#items".into(),
+                html: "<ul id=\"items\">hello 🌍</ul>".into(),
+            }],
+        );
+        snapshot.validate().unwrap();
+        assert_eq!(
+            serde_json::from_str::<UiHtmlStreamMessage>(&serde_json::to_string(&snapshot).unwrap())
+                .unwrap(),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn html_stream_rejects_invalid_targets_and_revision_gaps() {
+        let patch = UiHtmlStreamMessage::patch(
+            DocumentId::from("tasks"),
+            Revision(1),
+            Revision(3),
+            UiHtmlElement {
+                target: "body > div".into(),
+                html: "hi".into(),
+            },
+        );
+        assert!(patch.validate().is_err());
+        let valid = UiHtmlStreamMessage::patch(
+            DocumentId::from("tasks"),
+            Revision(1),
+            Revision(3),
+            UiHtmlElement {
+                target: "#items".into(),
+                html: "hi".into(),
+            },
+        );
+        assert!(
+            valid.validate().is_err(),
+            "a patch must advance by exactly one revision"
+        );
     }
 
     #[test]
