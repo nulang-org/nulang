@@ -517,6 +517,7 @@ pub fn inject_client_runtime_script(html: &str) -> String {
     if !html.contains("data-signal=")
         && !html.contains("data-action=")
         && !html.contains("data-nulang-nav-target=")
+        && !html.contains("data-nulang-overlay=")
     {
         return html.to_string();
     }
@@ -1286,6 +1287,15 @@ pub fn generate_client_runtime() -> String {
     const requestUrl = window.location.href;
     const form = el.closest('form');
     const target = el.dataset.nulangTarget || (form && form.dataset.nulangTarget);
+    // While a dialog is owned by a Nulang overlay, its server actions can
+    // patch only descendants of that dialog. Parent changes go through the
+    // explicit typed overlay result returned to the caller.
+    const ownerDialog = typeof el.closest === 'function' ? el.closest('dialog') : null;
+    const ownerScope = ownerDialog && overlays.get('#' + ownerDialog.id);
+    if (ownerScope && ownerScope.active &&
+        (!target || !ownerDialog.contains(document.querySelector(target)))) {
+      throw new Error('Nulang overlay scope forbids an external action target');
+    }
     const revalidate = el.dataset.nulangRevalidate !== undefined
       ? el.dataset.nulangRevalidate : (form && form.dataset.nulangRevalidate);
     const body = formBody(form);
@@ -1297,6 +1307,11 @@ pub fn generate_client_runtime() -> String {
     const keys = target ? [target] : [];
     if (target && revalidate !== undefined && revalidate !== null) {
       keys.push(...revalidationTargets(revalidate, target));
+    }
+    if (ownerScope && ownerScope.active && keys.some(function (key) {
+      return !ownerDialog.contains(document.querySelector(key));
+    })) {
+      throw new Error('Nulang overlay scope forbids external revalidation targets');
     }
     const previous = new Set(keys.map(function (key) {
       return pendingPatches.get(key);
@@ -1436,7 +1451,159 @@ pub fn generate_client_runtime() -> String {
     });
   }
 
+  // Scoped overlays have explicit ownership, cancellation, and typed results.
+  // They are browser lifecycles, NOT durable actors or cross-page sessions.
+  const overlays = new Map();
+  const MAX_OVERLAYS = 8;
+
+  function validOverlayValue(value, depth) {
+    if (!value || typeof value !== 'object' || depth > 8) return false;
+    switch (value.type) {
+      case 'null': return !('value' in value);
+      case 'bool': return typeof value.value === 'boolean';
+      case 'string': return typeof value.value === 'string' && value.value.length <= 8192;
+      case 'i64':
+        return typeof value.value === 'string' &&
+          /^-?(0|[1-9][0-9]*)$/.test(value.value) &&
+          (function () {
+            const n = BigInt(value.value);
+            return n >= -9223372036854775808n && n <= 9223372036854775807n;
+          })();
+      case 'f64': return typeof value.value === 'string' && /^[0-9a-fA-F]{16}$/.test(value.value);
+      case 'bytes': return Array.isArray(value.value) && value.value.length <= 8192 &&
+        value.value.every(function (n) {return Number.isInteger(n) && n >= 0 && n <= 255;});
+      case 'array': return Array.isArray(value.value) && value.value.length <= 128 &&
+        value.value.every(function (v) {return validOverlayValue(v, depth + 1);});
+      case 'object':
+        return value.value !== null && typeof value.value === 'object' &&
+          !Array.isArray(value.value) && Object.keys(value.value).length <= 128 &&
+          Object.keys(value.value).every(function (key) {
+            return key.length <= 128 && validOverlayValue(value.value[key], depth + 1);
+          });
+      default: return false;
+    }
+  }
+
+  function settleOverlay(scope, outcome) {
+    if (!scope.active) return;
+    scope.active = false;
+    overlays.delete(scope.target);
+    if (scope.controller) scope.controller.abort();
+    if (scope.dialog) {
+      if (scope.onCancel) scope.dialog.removeEventListener('cancel', scope.onCancel);
+      if (scope.onClose) scope.dialog.removeEventListener('close', scope.onClose);
+      if (scope.dialog.open) scope.dialog.close();
+    }
+    if (scope.previousFocus && scope.previousFocus.isConnected &&
+        typeof scope.previousFocus.focus === 'function') {
+      scope.previousFocus.focus({preventScroll: true});
+    }
+    if (outcome === null) {
+      scope.reject(new Error('Nulang overlay canceled'));
+    } else if (outcome instanceof Error) {
+      scope.reject(outcome);
+    } else {
+      scope.resolve(outcome);
+    }
+  }
+
+  function openOverlay(target, href) {
+    if (typeof target !== 'string' ||
+        !/^#[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(target)) {
+      throw new Error('invalid Nulang overlay target');
+    }
+    const existing = document.querySelector(target);
+    if (!existing || existing.tagName !== 'DIALOG' ||
+        typeof existing.showModal !== 'function') {
+      throw new Error('Nulang overlay target must be an existing dialog');
+    }
+    if (overlays.has(target)) throw new Error('Nulang overlay is already active');
+    if (overlays.size >= MAX_OVERLAYS) throw new Error('Nulang overlay limit reached');
+    let url;
+    try {
+      url = new URL(href, window.location.href);
+      if (!['http:', 'https:'].includes(url.protocol) ||
+          url.origin !== new URL(window.location.href).origin) {
+        throw new Error('cross-origin');
+      }
+    } catch (_) {
+      throw new Error('Nulang overlay requires a same-origin URL');
+    }
+    const controller = typeof AbortController === 'function'
+      ? new AbortController() : null;
+    const scope = {
+      target: target, active: true, dialog: null, controller: controller,
+      previousFocus: document.activeElement, pageUrl: window.location.href,
+      resolve: null, reject: null, onCancel: null, onClose: null, opened: false
+    };
+    const result = new Promise(function (resolve, reject) {
+      scope.resolve = resolve;
+      scope.reject = reject;
+    });
+    overlays.set(target, scope);
+    fetch(url.href, {
+      method: 'GET', headers: {Accept: 'text/html'}, cache: 'no-store',
+      ...(controller ? {signal: controller.signal} : {})
+    }).then(async function (response) {
+      if (!scope.active) return;
+      if (!response.ok || response.redirected) {
+        throw new Error('Nulang overlay GET failed: ' + response.status);
+      }
+      const page = await parseHtmlResponse(response);
+      if (!scope.active) return;
+      if (window.location.href !== scope.pageUrl) {
+        throw new Error('Nulang overlay canceled by navigation');
+      }
+      const incoming = page.querySelector(target);
+      if (!incoming || incoming.tagName !== 'DIALOG') {
+        throw new Error('Nulang overlay response must contain a matching dialog');
+      }
+      applyHtmlTargets([{selector: target, page: page}], null);
+      const dialog = document.querySelector(target);
+      if (!dialog || dialog.tagName !== 'DIALOG' ||
+          typeof dialog.showModal !== 'function') {
+        throw new Error('Nulang overlay must render an existing dialog target');
+      }
+      scope.dialog = dialog;
+      scope.onCancel = function (event) {
+        event.preventDefault();
+        cancelOverlay(target);
+      };
+      scope.onClose = function () {cancelOverlay(target);};
+      dialog.addEventListener('cancel', scope.onCancel);
+      dialog.addEventListener('close', scope.onClose);
+      dialog.showModal();
+      scope.opened = true;
+    }).catch(function (error) {
+      if (scope.active) settleOverlay(scope, error);
+    });
+    return result;
+  }
+
+  function completeOverlay(target, value) {
+    const scope = overlays.get(target);
+    if (!scope || !scope.opened || !scope.active) return false;
+    if (!validOverlayValue(value, 0)) throw new Error('invalid Nulang overlay result value');
+    settleOverlay(scope, {
+      protocol: 'nulang-ui-msg/1', overlay_id: target,
+      status: 'completed', value: value
+    });
+    return true;
+  }
+
+  function cancelOverlay(target) {
+    const scope = overlays.get(target);
+    if (!scope || !scope.active) return false;
+    settleOverlay(scope, null);
+    return true;
+  }
+
   window.nulang = {
+    overlay: {
+      open: openOverlay,
+      complete: completeOverlay,
+      cancel: cancelOverlay
+    },
     stream: stream,
     signal: function (name) {
       return {
@@ -1678,6 +1845,14 @@ fn view() -> Html {
         let html = r#"<button data-action="save">Save</button>"#;
         let out = inject_client_runtime_script(html);
         assert!(out.ends_with(r#"<script src="/app.client.js"></script>"#));
+    }
+
+    #[test]
+    fn test_overlay_only_html_injects_client_runtime() {
+        let html = r#"<html><body><dialog id="editor" data-nulang-overlay="">Empty</dialog></body></html>"#;
+        let out = inject_client_runtime_script(html);
+        assert!(out.contains(r#"<script src="/app.client.js"></script>"#));
+        assert!(out.find("<script").unwrap() < out.find("</body>").unwrap());
     }
 
     #[test]

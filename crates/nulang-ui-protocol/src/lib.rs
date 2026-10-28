@@ -474,6 +474,39 @@ impl ActionRequest {
     }
 }
 
+/// A typed browser overlay completion. The host returns this value to the
+/// caller; cancellation rejects the browser promise rather than committing a
+/// server mutation. This is not a persistent workflow result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiOverlayStatus {
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiOverlayOutcome {
+    pub protocol: String,
+    pub overlay_id: String,
+    pub status: UiOverlayStatus,
+    pub value: WireValue,
+}
+
+impl UiOverlayOutcome {
+    pub fn completed(overlay_id: impl Into<String>, value: WireValue) -> Self {
+        Self {
+            protocol: UI_MESSAGE_PROTOCOL_VERSION.to_owned(),
+            overlay_id: overlay_id.into(),
+            status: UiOverlayStatus::Completed,
+            value,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        require_protocol(UI_MESSAGE_PROTOCOL_VERSION, &self.protocol)?;
+        validate_html_target(&self.overlay_id)
+    }
+}
+
 /// Escaped server-rendered HTML targeted at an element ID. The host must
 /// morph rather than evaluate the fragment as arbitrary JavaScript.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -918,6 +951,28 @@ mod tests {
             NodeId::from("root"),
             vec![root, leaf("task-1", "text")],
         )
+    }
+
+    #[test]
+    fn overlay_completion_has_typed_wire_value_and_scoped_identity() {
+        let outcome = UiOverlayOutcome::completed("#editor", WireValue::from("saved"));
+        outcome.validate().unwrap();
+        let encoded = serde_json::to_string(&outcome).unwrap();
+        assert!(encoded.contains(r##""overlay_id":"#editor""##));
+        assert!(encoded.contains(r#""status":"completed""#));
+        assert_eq!(
+            serde_json::from_str::<UiOverlayOutcome>(&encoded).unwrap(),
+            outcome
+        );
+        // Matches the exact envelope produced by window.nulang.overlay.complete.
+        let browser_wire = r##"{"protocol":"nulang-ui-msg/1","overlay_id":"#editor","status":"completed","value":{"type":"string","value":"saved"}}"##;
+        assert_eq!(
+            serde_json::from_str::<UiOverlayOutcome>(browser_wire).unwrap(),
+            outcome
+        );
+        assert!(UiOverlayOutcome::completed("body", WireValue::Null)
+            .validate()
+            .is_err());
     }
 
     #[test]
