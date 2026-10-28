@@ -242,6 +242,7 @@ mod tests {
             bindings,
             handler_param_count,
             direct_call: false,
+            response_kind: crate::web::response::ResponseKind::Html,
         }
     }
 

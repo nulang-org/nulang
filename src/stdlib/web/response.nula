@@ -1,0 +1,14 @@
+// Explicit Web result types. The runtime dispatches these nominal types using
+// compiler response metadata; JSON is validated again before HTTP emission.
+import stdlib::web::types
+import stdlib::json
+
+/// Return JSON data with the application/json media type.
+pub fn json(value: JsonValue) -> Json ! {Web, Respond} {
+    perform Web.json(stringify(value))
+}
+
+/// Return unescaped UTF-8 text with the text/plain media type.
+pub fn plaintext(value: String) -> Text ! {Web, Respond} {
+    perform Web.plaintext(value)
+}

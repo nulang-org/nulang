@@ -10,6 +10,7 @@ use crate::runtime::WebRoute;
 use crate::vm::VM;
 use crate::web::bindings::{compile_route_bindings, RouteBindingContract, RouteBindingSource};
 use crate::web::contracts::{ContractCompilation, RouteContract};
+use crate::web::response::ResponseKind;
 use std::collections::HashMap;
 
 /// One precompiled route-pattern segment.
@@ -35,6 +36,8 @@ pub struct RuntimeRoutePlan {
     /// route input and every path parameter has a direct binding. Legacy routes
     /// that still rely on ambient `Web.param` access keep this false.
     pub direct_call: bool,
+    /// Response representation selected by the compiler-validated contract.
+    pub response_kind: ResponseKind,
 }
 
 /// A low-level runtime registration paired with optional compiler metadata.
@@ -121,6 +124,7 @@ pub fn compile_runtime_route_plan(
         bindings: binding_compilation.bindings,
         handler_param_count: contract.handler_params.len(),
         direct_call,
+        response_kind: ResponseKind::from_return_type(contract.response_type.as_deref()),
     })
 }
 
@@ -426,6 +430,24 @@ mod tests {
             reference_capability: None,
             placement: Some("server".to_string()),
         }
+    }
+
+    #[test]
+    fn compiler_return_type_selects_response_representation() {
+        let mut route = contract("/users/{id: Int}");
+        route.response_type = Some("Json".into());
+        let plan = compile_runtime_route_plan(&route).unwrap();
+        assert_eq!(plan.response_kind, crate::web::response::ResponseKind::Json);
+        route.response_type = Some("Text".into());
+        assert_eq!(
+            compile_runtime_route_plan(&route).unwrap().response_kind,
+            crate::web::response::ResponseKind::Text
+        );
+        route.response_type = Some("Html".into());
+        assert_eq!(
+            compile_runtime_route_plan(&route).unwrap().response_kind,
+            crate::web::response::ResponseKind::Html
+        );
     }
 
     #[test]

@@ -258,9 +258,26 @@ Nulang source
 
 The runtime should ultimately execute each route under lightweight supervised request execution with structured cancellation and backpressure. Request-scoped dependencies should move from ambient state toward effect handlers. Stateful realtime/domain coordination should continue to use explicit persistent or virtual actors rather than making every model object an actor.
 
+## Explicit response representations (experimental)
+
+A handler returning nominal `Html`, `Json`, or `Text` now selects an explicit
+response representation in the runtime route plan. OpenAPI emits matching
+`text/html`, `application/json`, or `text/plain` content only for these
+known nominal results. Unknown and legacy response types retain the previous
+HTML-oriented behavior; metadata never guesses JSON for a domain type.
+
+Use `stdlib::web::response` for `json(JsonValue) -> Json` and
+`plaintext(String) -> Text`. JSON results are checked as a complete JSON
+document before emission; invalid output fails closed with HTTP 500 rather
+than being mislabeled `application/json`. Neither JSON nor plain text receives
+the HTML client-runtime script. Both types currently represent UTF-8 content;
+generic JSON schemas, custom status codes, binary bodies, streaming, and
+negotiation remain future work. This does **not** change the experimental
+development server into a production-ready HTTP server.
+
 ## Remaining implementation priorities
 
-1. Define an explicit request/response algebra (`Json[T]`, `Html`, bytes, streams, typed bodies/media) so Contract IR and OpenAPI can represent payloads without guessing.
+1. Extend the initial nominal response types into an explicit typed response algebra (`Json[T]`, HTTP status results, bytes, streams, typed bodies/media), including schema and negotiation semantics.
 2. Add richer request decoders for optional/default values, repeated query parameters/collections, binary bodies, transparent aliases, and opaque/domain types.
 3. Execute requests under lightweight supervised request actors with structured cancellation/backpressure.
 4. Replace ambient request-context dependency injection with effect handlers once compatibility coverage is sufficient.
