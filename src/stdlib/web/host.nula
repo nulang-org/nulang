@@ -19,6 +19,17 @@ pub fn route_method(method: String, path: String, h) -> Unit ! {Web, Request} {
     perform Web.route(method, path, h)
 }
 
+/// Register a JSON handler with an explicit JSON response contract.
+pub fn route_json(method: String, path: String, h) -> Unit ! {Web, Request} {
+    perform Web.route_json(method, path, h)
+}
+
+/// Wrap a serialized JSON value in an opaque Json payload.
+/// The HTTP adapter validates JSON before sending a successful response.
+pub fn json(value: String) -> Json ! {Web, Respond} {
+    perform Web.json(value)
+}
+
 /// Construct an HTML element from a tag name, attributes, and children.
 /// Inferred placement: static (because it only performs `Render` or `Web`).
 pub fn element(name: String, attrs, children: [Html]) -> Html ! {Web, Render} {

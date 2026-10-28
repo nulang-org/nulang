@@ -23,3 +23,8 @@ opaque type CssClass = String
 
 /// A path parameter captured from a route.
 opaque type RouteParam = String
+
+
+/// A validated JSON response body. The host validates serialized JSON before
+/// emitting application/json; this is distinct from HTML at compile time.
+opaque type Json = String

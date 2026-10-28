@@ -36,6 +36,7 @@ pub enum RequestParamSource {
     Cookie,
     Body,
     Form,
+    Json,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -254,7 +255,7 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
     collect_routes_in_module(module, &mut raw_routes);
 
     let mut out = ContractCompilation::default();
-    for (method, path, handler) in raw_routes {
+    for (method, path, handler, json_response) in raw_routes {
         let handler_name = match &handler {
             Expr::Var(name, _) => Some(name.clone()),
             _ => None,
@@ -322,7 +323,14 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
                         .collect()
                 })
                 .unwrap_or_default(),
-            response_type: meta.and_then(|m| m.response_type.clone()),
+            // Route registration owns the wire media type even when an
+            // opaque Json return type is erased to its String representation
+            // by frontend type normalization.
+            response_type: if json_response {
+                Some("Json".to_string())
+            } else {
+                meta.and_then(|m| m.response_type.clone())
+            },
             error_type: meta.and_then(|m| m.error_type.clone()),
             effects: meta.map(|m| m.effects.clone()).unwrap_or_default(),
             reference_capability: meta.and_then(|m| m.reference_capability.clone()),
@@ -408,6 +416,7 @@ fn request_source_contract(source: WebRequestParamSource) -> RequestParamSource 
         WebRequestParamSource::Cookie => RequestParamSource::Cookie,
         WebRequestParamSource::Body => RequestParamSource::Body,
         WebRequestParamSource::Form => RequestParamSource::Form,
+        WebRequestParamSource::Json => RequestParamSource::Json,
     }
 }
 
@@ -479,11 +488,11 @@ pub fn parse_path_params(path: &str) -> Result<Vec<RouteParamContract>, String> 
     Ok(params)
 }
 
-fn collect_routes_in_module(module: &AstModule, out: &mut Vec<(String, String, Expr)>) {
+fn collect_routes_in_module(module: &AstModule, out: &mut Vec<(String, String, Expr, bool)>) {
     collect_routes_in_decls(&module.decls, out);
 }
 
-fn collect_routes_in_decls(decls: &[Decl], out: &mut Vec<(String, String, Expr)>) {
+fn collect_routes_in_decls(decls: &[Decl], out: &mut Vec<(String, String, Expr, bool)>) {
     for decl in decls {
         match decl {
             Decl::Function { body, .. }
@@ -507,15 +516,15 @@ fn collect_routes_in_decls(decls: &[Decl], out: &mut Vec<(String, String, Expr)>
     }
 }
 
-fn collect_routes_in_expr(expr: &Expr, out: &mut Vec<(String, String, Expr)>) {
+fn collect_routes_in_expr(expr: &Expr, out: &mut Vec<(String, String, Expr, bool)>) {
     if let Expr::Perform {
         effect, op, args, ..
     } = expr
     {
-        if effect == "Web" && op == "route" && args.len() == 3 {
+        if effect == "Web" && matches!(op.as_str(), "route" | "route_json") && args.len() == 3 {
             if let (Some(method), Some(path)) = (string_literal(&args[0]), string_literal(&args[1]))
             {
-                out.push((method, path, args[2].clone()));
+                out.push((method, path, args[2].clone(), op == "route_json"));
             }
         }
         for arg in args {

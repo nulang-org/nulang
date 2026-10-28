@@ -310,6 +310,7 @@ mod tests {
             ],
             bindings,
             handler_param_count,
+            response_type: None,
             direct_call: false,
         }
     }

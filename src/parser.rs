@@ -6781,10 +6781,11 @@ impl Parser {
             "cookie" => WebRequestParamSource::Cookie,
             "body" => WebRequestParamSource::Body,
             "form" => WebRequestParamSource::Form,
+            "json" => WebRequestParamSource::Json,
             other => {
                 return Err(NuError::parse_error(
                     format!(
-                        "unknown request source '{other}'; expected path, query, header, cookie, body, or form"
+                        "unknown request source '{other}'; expected path, query, header, cookie, body, form, or json"
                     ),
                     self.current_span(),
                 ));
@@ -6798,14 +6799,18 @@ impl Parser {
         } else {
             None
         };
-        if source == WebRequestParamSource::Body && explicit_name.is_some() {
+        if matches!(
+            source,
+            WebRequestParamSource::Body | WebRequestParamSource::Json
+        ) && explicit_name.is_some()
+        {
             return Err(NuError::parse_error(
-                "body bindings do not accept a source name".to_string(),
+                "body and json bindings do not accept a source name".to_string(),
                 self.current_span(),
             ));
         }
         let source_name = match source {
-            WebRequestParamSource::Body => "body".to_string(),
+            WebRequestParamSource::Body | WebRequestParamSource::Json => "body".to_string(),
             _ => explicit_name.unwrap_or_else(|| param_name.to_string()),
         };
         Ok(Some(FunctionAnnotation::RequestBinding {

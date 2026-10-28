@@ -550,6 +550,22 @@ impl StdLib {
                     description: "Register a request handler for the given method and path.",
                 },
                 BuiltinOp {
+                    name: "Web.route_json",
+                    effect: "Web",
+                    op: "route_json",
+                    signature: "route_json(method: String, path: String, handler: fn() -> Json) -> Unit",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Register a JSON response handler for the given HTTP method and path.",
+                },
+                BuiltinOp {
+                    name: "Web.json",
+                    effect: "Web",
+                    op: "json",
+                    signature: "json(body: String) -> Json",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Wrap a serialized JSON value in an opaque Json response type.",
+                },
+                BuiltinOp {
                     name: "Web.html",
                     effect: "Web",
                     op: "html",

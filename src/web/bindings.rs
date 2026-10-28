@@ -50,7 +50,10 @@ pub fn compile_route_bindings(contract: &RouteContract) -> BindingCompilation {
             continue;
         };
 
-        if request.source == RouteBindingSource::Body {
+        if matches!(
+            request.source,
+            RouteBindingSource::Body | RouteBindingSource::Json
+        ) {
             if let Some(first_param) = body_binding {
                 out.diagnostics.push(format!(
                     "{} {}: handler parameters '{}' and '{}' both bind the whole request body",
@@ -59,6 +62,19 @@ pub fn compile_route_bindings(contract: &RouteContract) -> BindingCompilation {
                 continue;
             }
             body_binding = Some(handler_param.name.as_str());
+        }
+
+        if request.source == RouteBindingSource::Json
+            && !matches!(
+                handler_param.ty.as_deref(),
+                Some("Int" | "Float" | "Bool" | "String")
+            )
+        {
+            out.diagnostics.push(format!(
+                "{} {}: JSON binding for '{}' currently requires Int, Float, Bool, or String; aggregate DTO decoding is not supported yet",
+                contract.method, contract.path, handler_param.name
+            ));
+            continue;
         }
 
         let ty = if request.source == RouteBindingSource::Path {
@@ -137,6 +153,24 @@ pub fn compile_route_bindings(contract: &RouteContract) -> BindingCompilation {
         }
     }
 
+    // Preserve the legacy raw-body + form compatibility contract. JSON
+    // decoding, unlike a raw body read, claims a specific media type and
+    // therefore cannot share a request with URL-encoded form decoding.
+    if out
+        .bindings
+        .iter()
+        .any(|b| b.source == RouteBindingSource::Json)
+        && out
+            .bindings
+            .iter()
+            .any(|b| b.source == RouteBindingSource::Form)
+    {
+        out.diagnostics.push(format!(
+            "{} {}: cannot mix form bindings with JSON bindings",
+            contract.method, contract.path
+        ));
+    }
+
     out.bindings.sort_by_key(|binding| binding.handler_index);
     out
 }
@@ -202,6 +236,56 @@ mod tests {
     }
 
     #[test]
+    fn json_bindings_fail_closed_for_aggregate_types() {
+        let mut contract = route("/api");
+        contract.params.clear();
+        contract.handler_params = vec![HandlerParamContract {
+            name: "payload".into(),
+            ty: Some("CreateUser".into()),
+            capability: None,
+            request: Some(request(RouteBindingSource::Json, "body")),
+        }];
+        let result = compile_route_bindings(&contract);
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("aggregate DTO decoding is not supported")),
+            "{:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn json_and_urlencoded_form_cannot_share_one_request_body() {
+        let mut contract = route("/submit");
+        contract.params.clear();
+        contract.handler_params = vec![
+            HandlerParamContract {
+                name: "value".into(),
+                ty: Some("Int".into()),
+                capability: None,
+                request: Some(request(RouteBindingSource::Json, "body")),
+            },
+            HandlerParamContract {
+                name: "title".into(),
+                ty: Some("String".into()),
+                capability: None,
+                request: Some(request(RouteBindingSource::Form, "title")),
+            },
+        ];
+        let result = compile_route_bindings(&contract);
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("cannot mix form bindings")),
+            "{:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
     fn request_binding_sources_have_stable_ir_names() {
         let cases = [
             (RouteBindingSource::Path, "path"),
@@ -210,6 +294,7 @@ mod tests {
             (RouteBindingSource::Cookie, "cookie"),
             (RouteBindingSource::Body, "body"),
             (RouteBindingSource::Form, "form"),
+            (RouteBindingSource::Json, "json"),
         ];
 
         for (source, expected) in cases {
