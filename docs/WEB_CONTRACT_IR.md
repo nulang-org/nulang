@@ -145,6 +145,11 @@ table only from validated contracts. `url_for(name, params)` rejects unknown
 names, missing/extra parameters, empty segments, dot traversal segments, and
 slashes/backslashes in parameter values. Parameter values are percent-encoded
 per path segment, preserving UTF-8 and preventing query/fragment injection.
+For compiler-known primitive route types (`Int`, `Bool`, and `Float`),
+reverse URL construction also uses the same scalar decoder as inbound route
+bindings: invalid or overflowing integers, non-literal booleans, and
+non-finite floats are rejected *before* encoding. Opaque custom identifier
+types remain string-backed until their runtime decoder contracts exist.
 
 This is a Rust compiler/runtime integration API, not a new Nulang-language
 `url_for` builtin or generated client SDK yet. It does not perform authorization.

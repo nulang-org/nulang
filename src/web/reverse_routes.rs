@@ -3,14 +3,22 @@
 //! Matching and URL generation share the same segment parser, so percent
 //! encoding and parameter boundaries cannot silently diverge.
 use crate::web::contracts::ContractCompilation;
+use crate::web::request_bindings::decode_scalar_constant;
 use crate::web::runtime_bindings::{compile_route_segments, RuntimeRouteSegment};
 use crate::web::validation::validate_compilation;
 use std::collections::{HashMap, HashSet};
 
+/// Compiler-derived route segment pattern with typed parameter contracts.
+#[derive(Debug, Clone)]
+struct NamedRoute {
+    segments: Vec<RuntimeRouteSegment>,
+    parameter_types: HashMap<String, String>,
+}
+
 /// Immutable reverse-routing table built at application startup.
 #[derive(Debug, Clone, Default)]
 pub struct NamedRouteIndex {
-    routes: HashMap<String, Vec<RuntimeRouteSegment>>,
+    routes: HashMap<String, NamedRoute>,
 }
 
 impl NamedRouteIndex {
@@ -26,7 +34,20 @@ impl NamedRouteIndex {
                         contract.method, contract.path
                     )]
                 })?;
-                routes.insert(name.clone(), segments);
+                let parameter_types = contract
+                    .params
+                    .iter()
+                    .filter_map(|param| {
+                        param.ty.as_ref().map(|ty| (param.name.clone(), ty.clone()))
+                    })
+                    .collect();
+                routes.insert(
+                    name.clone(),
+                    NamedRoute {
+                        segments,
+                        parameter_types,
+                    },
+                );
             }
         }
         Ok(Self { routes })
@@ -35,10 +56,11 @@ impl NamedRouteIndex {
     /// Generate an absolute-path reference, never an attacker-supplied origin.
     /// Reject missing/extra values and slash/dot segments before encoding.
     pub fn url_for(&self, name: &str, params: &HashMap<String, String>) -> Result<String, String> {
-        let segments = self
+        let route = self
             .routes
             .get(name)
             .ok_or_else(|| format!("unknown route name '{name}'"))?;
+        let segments = &route.segments;
         let expected: HashSet<&str> = segments
             .iter()
             .filter_map(|segment| match segment {
@@ -68,6 +90,17 @@ impl NamedRouteIndex {
                         || value.contains('\\')
                     {
                         return Err(format!("unsafe path segment for parameter '{key}'"));
+                    }
+                    // Reverse routes must produce URLs that the server's own
+                    // typed parameter decoder accepts. Opaque/custom identifier
+                    // types are currently string-backed and are not claimed to
+                    // have richer runtime validation.
+                    if let Some(ty) = route.parameter_types.get(key) {
+                        if decode_scalar_constant(value, Some(ty)).is_err() {
+                            return Err(format!(
+                                "invalid {ty} value for route '{name}' parameter '{key}'"
+                            ));
+                        }
                     }
                     encoded.push(percent_encode_segment(value));
                 }
@@ -167,6 +200,61 @@ mod tests {
             );
         }
         assert_eq!(index.url_for("about", &HashMap::new()).unwrap(), "/about");
+    }
+
+    fn typed_routes(ty: &str) -> ContractCompilation {
+        let mut compilation = routes();
+        compilation.routes[0].path = format!("/users/{{id: {ty}}}");
+        compilation.routes[0].params[0].ty = Some(ty.to_string());
+        compilation.routes[0].handler_params[0].ty = Some(ty.to_string());
+        compilation
+    }
+
+    #[test]
+    fn reverse_urls_reject_invalid_integer_and_overflow() {
+        let index = NamedRouteIndex::compile(&typed_routes("Int")).unwrap();
+        for value in ["not-an-int", "9223372036854775808"] {
+            assert!(
+                index
+                    .url_for("users.show", &HashMap::from([("id".into(), value.into())]))
+                    .is_err(),
+                "must reject typed Int segment {value}"
+            );
+        }
+        assert_eq!(
+            index
+                .url_for("users.show", &HashMap::from([("id".into(), "-42".into())]))
+                .unwrap(),
+            "/users/-42"
+        );
+    }
+
+    #[test]
+    fn reverse_urls_validate_bool_and_finite_float_types() {
+        let bool_index = NamedRouteIndex::compile(&typed_routes("Bool")).unwrap();
+        for value in ["1", "TRUE"] {
+            assert!(bool_index
+                .url_for("users.show", &HashMap::from([("id".into(), value.into())]))
+                .is_err());
+        }
+        assert_eq!(
+            bool_index
+                .url_for("users.show", &HashMap::from([("id".into(), "true".into())]))
+                .unwrap(),
+            "/users/true"
+        );
+        let float_index = NamedRouteIndex::compile(&typed_routes("Float")).unwrap();
+        for value in ["NaN", "Infinity", "1e999"] {
+            assert!(float_index
+                .url_for("users.show", &HashMap::from([("id".into(), value.into())]))
+                .is_err());
+        }
+        assert_eq!(
+            float_index
+                .url_for("users.show", &HashMap::from([("id".into(), "1.5".into())]))
+                .unwrap(),
+            "/users/1.5"
+        );
     }
 
     #[test]
