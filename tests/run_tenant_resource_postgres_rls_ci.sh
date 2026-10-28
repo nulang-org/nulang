@@ -15,7 +15,10 @@ if env -u NULANG_TEST_POSTGRES_DISPOSABLE bash "$proof" >/dev/null 2>&1; then
 fi
 
 # pg_virtualenv destroys its isolated cluster when the child process exits.
-pg_virtualenv bash -euo pipefail -c '
+# Ubuntu's clean CI runner would otherwise select the default port 5432,
+# which the proof correctly rejects. Choose an explicit non-default port
+# *before* creating the isolated cluster; never relax that safety guard.
+PGPORT=15432 pg_virtualenv bash -euo pipefail -c '
     proof="$1"
     if env NULANG_TEST_POSTGRES_DISPOSABLE=1 \
       PG_CLUSTER_CONF_ROOT=/tmp/pg_virtualenv.forged/postgresql \
