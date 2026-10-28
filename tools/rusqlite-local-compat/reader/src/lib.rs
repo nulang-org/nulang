@@ -19,8 +19,13 @@ use std::{
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
-use nulang::runtime::{
-    ActorSnapshot, DurableTailPosition, JournalEntry, PersistedValue, WorkflowEvent,
+use nulang::{
+    durable_effect::DurableEffectId,
+    durable_effect_persistence::DurableEffectPersistenceRecord,
+    runtime::{
+        ActorSnapshot, DurableOutboxMessage, DurableTailPosition, EventEntry, JournalEntry,
+        PersistedValue, WorkflowEvent,
+    },
 };
 
 fn sqlite(error: rusqlite::Error) -> io::Error {
@@ -45,6 +50,14 @@ fn positive(value: i64, label: &str) -> io::Result<u64> {
 
 fn nonnegative(value: i64, label: &str) -> io::Result<u64> {
     u64::try_from(value).map_err(|_| invalid(format!("{label} is negative")))
+}
+
+/// A committed outbound message *staged* atomically for later delivery.
+/// This is NOT a delivery acknowledgement or a cursor/claim state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StagedOutboxEntry {
+    pub sequence: u64,
+    pub message: DurableOutboxMessage,
 }
 
 /// An independent, fail-closed reader of local SQLite databases created by
@@ -215,5 +228,109 @@ impl RusqliteRecoveryReader {
         }
         events.sort_by_key(WorkflowEvent::sequence);
         Ok(events)
+    }
+    /// Recover the newest versioned record for one effect identity.
+    /// A corrupt record cannot be skipped as if the provider never ran.
+    /// This method never dispatches any provider call.
+    pub fn load_durable_effect(
+        &self,
+        actor_id: u64,
+        effect_id: DurableEffectId,
+    ) -> io::Result<Option<DurableEffectPersistenceRecord>> {
+        let actor = i64::try_from(actor_id).map_err(invalid)?;
+        let conn = self.conn()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT record FROM durable_effect_records
+             WHERE actor_id=?1 ORDER BY sequence DESC, ordinal DESC",
+            )
+            .map_err(sqlite)?;
+        let mut rows = statement.query(params![actor]).map_err(sqlite)?;
+        while let Some(row) = rows.next().map_err(sqlite)? {
+            let encoded: String = row.get(0).map_err(sqlite)?;
+            let record =
+                DurableEffectPersistenceRecord::from_json(encoded.as_bytes()).map_err(invalid)?;
+            if record.effect().spec().id == effect_id {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Read committed outbound messages in deterministic sequence/ordinal order.
+    /// No delivery attempts or side effects occur. Invalid payload/IDs are errors.
+    pub fn outbox(&self, actor_id: u64) -> io::Result<Vec<StagedOutboxEntry>> {
+        let actor = i64::try_from(actor_id).map_err(invalid)?;
+        let conn = self.conn()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT sequence,ordinal,destination_actor_id,behavior_id,payload
+             FROM durable_outbox WHERE actor_id=?1 ORDER BY sequence,ordinal",
+            )
+            .map_err(sqlite)?;
+        let mut rows = statement.query(params![actor]).map_err(sqlite)?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().map_err(sqlite)? {
+            let sequence: i64 = row.get(0).map_err(sqlite)?;
+            let ordinal: i64 = row.get(1).map_err(sqlite)?;
+            let destination: i64 = row.get(2).map_err(sqlite)?;
+            let behavior: i64 = row.get(3).map_err(sqlite)?;
+            let payload: String = row.get(4).map_err(sqlite)?;
+            result.push(StagedOutboxEntry {
+                sequence: positive(sequence, "outbox sequence")?,
+                message: DurableOutboxMessage {
+                    destination_actor_id: nonnegative(destination, "outbox destination")?,
+                    ordinal: u32::try_from(ordinal).map_err(invalid)?,
+                    behavior_id: u16::try_from(behavior).map_err(invalid)?,
+                    payload: parsed::<Vec<PersistedValue>>(&payload)?,
+                },
+            });
+        }
+        Ok(result)
+    }
+
+    /// Read both legacy and atomic domain events, rejecting malformed history.
+    pub fn domain_events(&self, actor_id: u64) -> io::Result<Vec<EventEntry>> {
+        let actor = i64::try_from(actor_id).map_err(invalid)?;
+        let conn = self.conn()?;
+        let mut result = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT sequence,field_name,event_name,args,value FROM events
+                 WHERE actor_id=?1 ORDER BY sequence",
+                )
+                .map_err(sqlite)?;
+            let mut rows = stmt.query(params![actor]).map_err(sqlite)?;
+            while let Some(row) = rows.next().map_err(sqlite)? {
+                let seq: i64 = row.get(0).map_err(sqlite)?;
+                let field_name: String = row.get(1).map_err(sqlite)?;
+                let event_name: String = row.get(2).map_err(sqlite)?;
+                let args: String = row.get(3).map_err(sqlite)?;
+                let value: String = row.get(4).map_err(sqlite)?;
+                result.push(EventEntry {
+                    sequence: positive(seq, "domain event sequence")?,
+                    field_name,
+                    event_name,
+                    args: parsed(&args)?,
+                    value: parsed(&value)?,
+                });
+            }
+        }
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT event FROM durable_domain_events WHERE actor_id=?1
+                 ORDER BY sequence,ordinal",
+                )
+                .map_err(sqlite)?;
+            let mut rows = stmt.query(params![actor]).map_err(sqlite)?;
+            while let Some(row) = rows.next().map_err(sqlite)? {
+                let event: String = row.get(0).map_err(sqlite)?;
+                result.push(parsed::<EventEntry>(&event)?);
+            }
+        }
+        result.sort_by_key(|event| event.sequence);
+        Ok(result)
     }
 }

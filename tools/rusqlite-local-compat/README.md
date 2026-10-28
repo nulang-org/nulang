@@ -112,3 +112,45 @@ fsync durability and disk-fault injection, large-actor concurrency,
 rolling upgrades, root release integration, exact-head Woodpecker, and
 operator approval. Never switch the default local backend merely
 because the isolated transaction test is green.
+
+## Staged effect/outbox recovery and ambiguous commit acknowledgement
+
+A further **test-only** compatibility slice extends the separate-process
+`RusqliteRecoveryReader` to recover:
+- The **most recent matching** versioned
+  `DurableEffectPersistenceRecord` by stable `DurableEffectId`.
+  Records are decoded through the official `from_json` versioned
+  format; corrupt newer history returns `InvalidData` instead of silently
+  falling back to an older Prepared state and redispatching an external call.
+- Immutable, committed **staged** `DurableOutboxMessage` entries with
+  exact sequence and ordinal ordering, validated destination/behavior IDs,
+  and typed persisted payloads. Reading these entries does **not** deliver,
+  acknowledge, claim, or deduplicate any external message.
+- Legacy and atomic domain events, without masking malformed JSON.
+
+`tests/effect_outbox.rs` now exercises a **nonempty real**
+Prepared→Completed durable effect sequence through the experimental
+SQLite writer, including recovery of recorded bytes and staged messages
+after closing/reopening the file. Additional negative tests corrupt newer
+versioned records, payload JSON and destination IDs. An SQL-trigger
+failure **after staging a real effect** proves that effect, snapshot,
+journal, tail and outbox are all rolled back together.
+
+The post-commit recovery test runs a **separate process** that calls the
+actual isolated writer's COMMIT, then stops after printing a
+`READY_COMMITTED_UNACKED` barrier. The parent sends SIGKILL *after*
+receiving that barrier and loses the application acknowledgement. A fresh
+process reads the committed tail and outbox, retries the **identical**
+transition digest and verifies no duplicate rows; a different digest
+at that same epoch/sequence is rejected. This is an
+**unknown-acknowledgement reconciliation test**, not proof of external
+provider execution/delivery or physical power-loss durability.
+
+**Not covered:** ENOSPC/disk-full, I/O errors, failing fsync, torn pages,
+power loss, filesystem and hardware-specific flush guarantees, live
+multi-host SQLite sharing, malicious actor schema migrations, or complete
+production `PersistenceStore` API parity. The test-only SQL-trigger
+failures model transactional rollback, **not disk fault injection**. Do not
+represent these isolated checks as production certification or infer
+effectively-once external delivery without a provider-side deduplication
+contract.

@@ -59,6 +59,23 @@ fn main() -> io::Result<()> {
     if a.len() == 3 && a[1] == "--precommit-block" {
         return stage_then_block(std::path::Path::new(&a[2]));
     }
+    // An intentionally unacknowledged *committed* transaction, followed by
+    // SIGKILL from the parent. This simulates lost application ACK, not
+    // physical power loss or incomplete SQLite COMMIT.
+    let postcommit_block = a.len() == 3 && a[1] == "--postcommit-block";
+    let a = if postcommit_block {
+        vec![
+            a[0].clone(),
+            a[2].clone(),
+            "42".into(),
+            "1".into(),
+            "3".into(),
+            "2".into(),
+            "postcommit".into(),
+        ]
+    } else {
+        a
+    };
     if a.len() != 7 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -120,5 +137,11 @@ fn main() -> io::Result<()> {
     };
     let mut writer = RusqliteAtomicWriter::open_existing(db)?;
     writer.commit(&transition)?;
+    if postcommit_block {
+        use std::io::Write;
+        println!("READY_COMMITTED_UNACKED");
+        io::stdout().flush()?;
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
     Ok(())
 }

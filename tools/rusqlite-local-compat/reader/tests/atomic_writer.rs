@@ -115,6 +115,10 @@ fn commit_recovery_and_all_durable_rows_match_existing_file_schema() {
     );
     assert_eq!(reader.journal(42).unwrap().len(), 3);
     assert_eq!(reader.workflow_events(42).unwrap().len(), 3);
+    let domain = reader.domain_events(42).unwrap();
+    assert_eq!(domain.len(), 1);
+    assert_eq!(domain[0].field_name, "tag");
+    assert_eq!(domain[0].value, PersistedValue::String("v3".into()));
     drop(reader);
     let conn = Connection::open(&db).unwrap();
     assert_eq!(count(&conn, "snapshots", 3), 1);
@@ -362,5 +366,52 @@ fn killed_uncommitted_process_leaves_no_durable_rows_and_allows_retry() {
     drop(writer);
     let reader = RusqliteRecoveryReader::open(&db).unwrap();
     assert_eq!(reader.tail(42).unwrap().unwrap().sequence, 3);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn killed_after_commit_but_before_application_ack_recovers_without_duplicate_outbox() {
+    use std::io::BufRead;
+    use std::process::Stdio;
+    let (dir, db) = copied_fixture("postcommit-no-ack");
+    let bin = env!("CARGO_BIN_EXE_rusqlite_atomic_fixture");
+    let mut child = Command::new(bin)
+        .arg("--postcommit-block")
+        .arg(&db)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut read = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut barrier = String::new();
+    read.read_line(&mut barrier).unwrap();
+    assert_eq!(barrier.trim(), "READY_COMMITTED_UNACKED");
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+    let reader = RusqliteRecoveryReader::open(&db).unwrap();
+    assert_eq!(reader.tail(42).unwrap().unwrap().sequence, 3);
+    assert_eq!(reader.outbox(42).unwrap().len(), 1);
+    drop(reader);
+
+    // The reissued exact same durable transition must classify the unknown
+    // acknowledgement as an idempotent replay. A different digest must fail.
+    let mut retry = Command::new(bin)
+        .arg(&db)
+        .args(["42", "1", "3", "2", "postcommit"])
+        .spawn()
+        .unwrap();
+    assert!(
+        retry.wait().unwrap().success(),
+        "unknown ACK must be reconcilable"
+    );
+    let mut conflicting = Command::new(bin)
+        .arg(&db)
+        .args(["42", "1", "3", "2", "different"])
+        .spawn()
+        .unwrap();
+    assert!(!conflicting.wait().unwrap().success());
+    let conn = Connection::open(&db).unwrap();
+    for table in ["durable_transitions", "durable_outbox", "journal"] {
+        assert_eq!(count(&conn, table, 3), 1, "replay duplicated {table}");
+    }
     fs::remove_dir_all(dir).unwrap();
 }
