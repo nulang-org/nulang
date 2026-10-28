@@ -599,7 +599,9 @@ pub fn set_response_header(name: &str, value: &str) -> bool {
                     for token in old.split(',').chain(value.split(',')) {
                         let field = token.trim();
                         if !field.is_empty()
-                            && !fields.iter().any(|previous| previous.eq_ignore_ascii_case(field))
+                            && !fields
+                                .iter()
+                                .any(|previous| previous.eq_ignore_ascii_case(field))
                         {
                             fields.push(field);
                         }
@@ -1370,10 +1372,16 @@ mod tests {
         };
         with_request_context(ctx, || {
             assert!(set_response_header("Vary", "Accept-Language"));
-            assert!(set_response_header("vary", "X-Up-Version, accept-language, X-Up-Target"));
+            assert!(set_response_header(
+                "vary",
+                "X-Up-Version, accept-language, X-Up-Target"
+            ));
             assert_eq!(
                 take_response_headers(),
-                vec![("vary".into(), "Accept-Language, X-Up-Version, X-Up-Target".into())]
+                vec![(
+                    "vary".into(),
+                    "Accept-Language, X-Up-Version, X-Up-Target".into()
+                )]
             );
             assert!(set_response_header("Vary", "*"));
             assert!(set_response_header("Vary", "X-Up-Mode"));

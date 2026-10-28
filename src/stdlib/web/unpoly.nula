@@ -14,6 +14,11 @@ pub fn is_fragment() -> Bool ! {Web, Request, Respond} {
     version != nil && version != ""
 }
 
+/// Optimize only a single exact target; other targets receive a full document.
+pub fn is_target(selector: String) -> Bool ! {Web, Request, Respond} {
+    is_fragment() && perform Web.header("X-Up-Target") == selector
+}
+
 /// Read the requested selector. The Vary header is set by is_fragment().
 pub fn request_target() -> String ! {Web, Request} {
     perform Web.header("X-Up-Target")

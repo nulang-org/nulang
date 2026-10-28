@@ -350,7 +350,7 @@ fn results() -> Html {
 }
 
 fn page() -> Html {
-    if is_fragment() then {
+    if is_target("#results") then {
         results()
     } else {
         document(
@@ -368,9 +368,13 @@ fn page() -> Html {
 
 `is_fragment()` detects `X-Up-Version` and adds
 `Vary: X-Up-Version, X-Up-Target, X-Up-Fail-Target, X-Up-Mode, X-Up-Validate`
-for the full-page and fragment variants. For full-page requests, render the
-complete HTML document; for enhanced requests, respond with the element
-requested by the client. `request_target()`, `fail_target()`,
+for the full-page and fragment variants. `is_fragment()` only identifies
+an Unpoly request; it does not prove the requested selector is supported.
+Use `is_target("#results")` to render just one known fragment when its
+`X-Up-Target` matches exactly. Combined selectors (e.g.
+`#results, #notifications`), missing targets, and other selectors must fall
+back to a complete document containing the requested elements. This keeps
+Unpoly's merged fragment requests correct. `request_target()`, `fail_target()`,
 `layer_mode()`, and `validation_fields()` expose optional request metadata.
 The caller must still validate expected targets and authorize the action.
 

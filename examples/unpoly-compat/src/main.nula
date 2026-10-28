@@ -6,8 +6,12 @@ fn results() -> Html {
     el("main", [("id", text("results"))], [text("Results loaded")])
 }
 
+fn notifications() -> Html {
+    el("aside", [("id", text("notifications"))], [text("No new notifications")])
+}
+
 fn search() -> Html {
-    if is_fragment() then {
+    if is_target("#results") then {
         results()
     } else {
         document(
@@ -27,7 +31,8 @@ fn search() -> Html {
                     follow(),
                     target("#results")
                 ], [text("Load results")]),
-                results()
+                results(),
+                notifications()
             ])
         )
     }
