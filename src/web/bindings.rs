@@ -163,6 +163,7 @@ mod tests {
         RouteContract {
             method: "GET".to_string(),
             path: path.to_string(),
+            name: None,
             handler: Some("show_user".to_string()),
             params: vec![RouteParamContract {
                 name: "id".to_string(),
@@ -315,6 +316,7 @@ mod tests {
         let contract = RouteContract {
             method: "GET".to_string(),
             path: "/orgs/{org}/users/{user}".to_string(),
+            name: None,
             handler: Some("show".to_string()),
             params: vec![
                 RouteParamContract {

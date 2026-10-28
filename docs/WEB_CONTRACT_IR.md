@@ -129,6 +129,26 @@ registrations, including parameterized paths that differ only in capture
 names or source-level parameter types. A route must not win merely
 because it appears first in a compiled package.
 
+## Named routes and reverse URL generation (experimental)
+
+The public `stdlib::web::host` helper can register a name without changing
+the lower-level `Web.route` effect:
+
+```nulang
+route_named("users.show", "GET", "/users/{id: String}", show_user)
+```
+
+The compiler emits an optional per-route `name` in the existing deployment
+IR v1 and rejects malformed or duplicate names, as well as ambiguous routes.
+`web::reverse_routes::NamedRouteIndex::compile` constructs a reverse-routing
+table only from validated contracts. `url_for(name, params)` rejects unknown
+names, missing/extra parameters, empty segments, dot traversal segments, and
+slashes/backslashes in parameter values. Parameter values are percent-encoded
+per path segment, preserving UTF-8 and preventing query/fragment injection.
+
+This is a Rust compiler/runtime integration API, not a new Nulang-language
+`url_for` builtin or generated client SDK yet. It does not perform authorization.
+
 ## Runtime binding and dispatch
 
 Runtime registration remains method/path/module/function. Compiler metadata is attached as a sidecar so the low-level `Web.route` host effect does not need source-level type information.
