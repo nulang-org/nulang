@@ -11,6 +11,11 @@ cargo +1.95.0 run --locked
 
 The test uses the actual production Nulang `LibsqlStore` schema and checks:
 
+- **Schema and authority identity:** synthetic, non-credential authority-token
+  strings, canonical actor schema name and CRDT field identity must survive
+  libSQL -> Turso reads and Turso -> libSQL -> Turso durable transitions.
+  Existing legacy snapshots with no authority remain readable; these
+  sentinels are never interpreted as valid capabilities or production grants.
 - Original Nulang store writes a snapshot and journal; Turso reads state,
   activation epoch, sequence, and payload; Turso writes another journal row;
   Nulang reopens and reads both records.

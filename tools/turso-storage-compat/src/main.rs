@@ -14,6 +14,14 @@ use nulang::runtime::{
 use nulang::semantic_identity::{effect_site_id, EffectSiteOwnerKind};
 use std::{collections::HashMap, error::Error};
 
+// Sentinel strings only: no actual capability credential or signing key.
+fn synthetic_authority() -> std::collections::BTreeSet<String> {
+    ["migration-probe-synthetic:a", "migration-probe-synthetic:z"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("--process-worker") {
@@ -83,6 +91,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             actor_id: durable_actor,
             sequence: 1,
             activation_epoch: 7,
+            schema_name: Some("MigrationProbeV2".to_string()),
+            authority_tokens: synthetic_authority(),
+            crdt_field_map: Some(HashMap::from([("counter".to_string(), 57)])),
             ..ActorSnapshot::default()
         }),
         workflow_events: vec![WorkflowEvent::StepCompleted {
@@ -192,6 +203,25 @@ fn main() -> Result<(), Box<dyn Error>> {
         assert_eq!(digest.len(), 64, "digest must retain full SHA/BLAKE hash");
         assert!(tails.next().await?.is_none(), "one committed tail expected");
         drop(tails);
+
+        // Migration security contract: a driver swap must preserve canonical
+        // actor schema identity and serialized authority, not reset either.
+        let mut authority_rows = conn
+            .query(
+                "SELECT schema_name, authority_tokens, crdt_field_map FROM snapshots WHERE actor_id=29",
+                (),
+            )
+            .await?;
+        let authority = authority_rows.next().await?.ok_or("missing authority snapshot")?;
+        assert_eq!(authority.get::<String>(0)?, "MigrationProbeV2");
+        let tokens: std::collections::BTreeSet<String> =
+            serde_json::from_str(&authority.get::<String>(1)?)?;
+        assert_eq!(tokens, synthetic_authority());
+        let fields: Option<std::collections::HashMap<String, u64>> =
+            serde_json::from_str(&authority.get::<String>(2)?)?;
+        assert_eq!(fields.as_ref().and_then(|value| value.get("counter")), Some(&57));
+        assert!(authority_rows.next().await?.is_none());
+        drop(authority_rows);
 
         let mut transitions = conn
             .query(
@@ -566,6 +596,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         (turso_tail.activation_epoch, turso_tail.sequence),
         (9, 2),
         "legacy reopen lost Turso durable tail"
+    );
+    let migrated = legacy.load_snapshot(41).ok_or("Turso snapshot missing")?;
+    assert_eq!(migrated.schema_name.as_deref(), Some("MigrationProbeV2"));
+    assert_eq!(migrated.authority_tokens, synthetic_authority());
+    assert_eq!(
+        migrated
+            .crdt_field_map
+            .as_ref()
+            .and_then(|v| v.get("counter")),
+        Some(&57)
     );
     assert_eq!(legacy.read_journal(41).len(), 2);
     assert_eq!(legacy.read_workflow_events(41).len(), 2);
