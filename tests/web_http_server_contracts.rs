@@ -168,8 +168,8 @@ fn legacy_route_still_falls_back_over_real_http() {
 
 #[test]
 fn live_web_dev_server_rejects_rebinding_before_routes_and_sse() {
-    let server = WebDevServer::bind(0, None, None, vec![legacy_route()])
-        .expect("bind WebDevServer");
+    let server =
+        WebDevServer::bind(0, None, None, vec![legacy_route()]).expect("bind WebDevServer");
     let forbidden = format!(
         "GET /legacy HTTP/1.1\r\nHost: attacker.example:{}\r\nConnection: close\r\n\r\n",
         server.port
@@ -201,8 +201,7 @@ fn live_web_dev_server_rejects_rebinding_before_routes_and_sse() {
 
 #[test]
 fn live_web_dev_server_rejects_unsafe_provenance_before_dispatch() {
-    let server = WebDevServer::bind(0, None, None, vec![])
-        .expect("bind WebDevServer");
+    let server = WebDevServer::bind(0, None, None, vec![]).expect("bind WebDevServer");
     let host = format!("localhost:{}", server.port);
     for raw in [
         format!(
