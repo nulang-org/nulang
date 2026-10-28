@@ -35,6 +35,7 @@ const page = String.raw`<!doctype html><html><body>
   const originalB = document.querySelector('[data-nulang-key="b"]');
   let clicks = 0;
   let pings = 0;
+  let focusedAtFetch = false;
   originalB.addEventListener('click', function () { clicks++; });
   originalDraft.value = 'edited locally';
   originalDraft.focus();
@@ -44,6 +45,8 @@ const page = String.raw`<!doctype html><html><body>
   originalChoice.value = 'b';
   window.nulangActions = { ping: function () { pings++; } };
   window.fetch = async function () {
+    originalDraft.focus();
+    focusedAtFetch = document.activeElement === originalDraft;
     return {
       ok: true,
       headers: { get: function () { return 'text/html; charset=utf-8'; } },
@@ -60,7 +63,11 @@ const page = String.raw`<!doctype html><html><body>
       }
     };
   };
-  document.querySelector('#save-form').requestSubmit();
+  // The generated runtime wires actions on DOMContentLoaded. Submitting
+  // before that event would trigger native navigation instead of fetch.
+  document.addEventListener('DOMContentLoaded', function () {
+    document.querySelector('#save-form').requestSubmit();
+  });
   setTimeout(function () {
     const root = document.querySelector('#status');
     document.querySelector('[data-nulang-key="b"]').click();
@@ -70,6 +77,7 @@ const page = String.raw`<!doctype html><html><body>
       rootPreserved: root === originalRoot,
       draftPreserved: document.querySelector('#draft') === originalDraft,
       dirtyValue: document.querySelector('#draft').value === 'edited locally',
+      focusAtFetch: focusedAtFetch,
       focus: document.activeElement === originalDraft,
       selection: originalDraft.selectionStart === 3,
       checkbox: document.querySelector('#flag') === originalFlag && !originalFlag.checked,
@@ -100,6 +108,7 @@ try {
   writeFileSync(path, page.replace('__NULANG_RUNTIME__', match[1]));
   const result = spawnSync(chrome, [
     '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
+    '--user-data-dir=' + join(temp, 'chrome-profile'), '--no-first-run',
     '--disable-background-networking', '--virtual-time-budget=1500', '--dump-dom', 'file://' + path
   ], { encoding: 'utf8', timeout: 16000, maxBuffer: 2 * 1024 * 1024 });
   assert.equal(result.status, 0, result.stderr?.slice(-2000) || 'Chrome exited unsuccessfully');

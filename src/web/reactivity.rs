@@ -998,7 +998,21 @@ pub fn generate_client_runtime() -> String {
         typeof incoming.nodeType !== 'number') {
       current.replaceWith(document.importNode(incoming, true));
     } else {
+      // Moving a retained focused node with insertBefore can temporarily
+      // blur it. Restore focus only if that same node survives the morph.
+      const active = document.activeElement;
+      const restoreFocus = active && (active === current || current.contains(active));
+      const selection = restoreFocus && typeof active.selectionStart === 'number'
+        ? [active.selectionStart, active.selectionEnd, active.selectionDirection]
+        : null;
       morphNode(current, incoming);
+      if (restoreFocus && active.isConnected) {
+        active.focus({ preventScroll: true });
+        if (selection) {
+          try { active.setSelectionRange(selection[0], selection[1], selection[2]); }
+          catch (_) {}
+        }
+      }
     }
     hydrate();
   }
