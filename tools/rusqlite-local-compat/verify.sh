@@ -23,6 +23,9 @@ cargo test --locked --manifest-path "$base/reader/Cargo.toml" --test parity
 # Experimental writer controls are exercised only in an independently
 # linked rusqlite process; no root PersistenceStore backend changes.
 cargo test --locked --manifest-path "$base/reader/Cargo.toml" --test atomic_writer
+# Fail-closed typed recovery of versioned durable external effects and
+# staged outbox messages without dispatching or acknowledging delivery.
+cargo test --locked --manifest-path "$base/reader/Cargo.toml" --test effect_outbox
 cargo clippy --locked --manifest-path "$base/writer/Cargo.toml" -- -D clippy::correctness
 cargo clippy --locked --manifest-path "$base/reader/Cargo.toml" --all-targets -- -D clippy::correctness
 echo "PASS separate-process SQLite local recovery and experimental atomic writer for $head"
