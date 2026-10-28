@@ -4,6 +4,9 @@
 //! Results, and there is no path for producing or committing durable writes.
 //! The production LibsqlStore remains the sole local durable writer until
 //! a fully certified rusqlite writer and crash-recovery matrix exist.
+mod atomic_writer;
+pub use atomic_writer::RusqliteAtomicWriter;
+
 use std::{
     collections::{BTreeSet, HashMap},
     io,
