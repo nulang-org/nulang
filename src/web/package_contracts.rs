@@ -15,6 +15,7 @@ use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::types::Span;
 use crate::web::contracts::{compile_module_contracts, ContractCompilation};
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Compile web contracts from every `.nula` file below `src_root` using one
@@ -55,6 +56,17 @@ pub fn compile_modules_contracts(modules: &[AstModule]) -> ContractCompilation {
             .collect(),
     };
 
+    // The Web.route host effect stays unchanged: names are compiler-only
+    // sidecars on statically extracted route registration helpers.
+    let named: HashMap<(String, String), String> = helpers
+        .iter()
+        .filter_map(|helper| {
+            helper
+                .name
+                .as_ref()
+                .map(|name| ((helper.method.clone(), helper.path.clone()), name.clone()))
+        })
+        .collect();
     for (index, helper) in helpers.into_iter().enumerate() {
         combined
             .decls
@@ -62,6 +74,11 @@ pub fn compile_modules_contracts(modules: &[AstModule]) -> ContractCompilation {
     }
 
     let mut compiled = compile_module_contracts(&combined);
+    for route in &mut compiled.routes {
+        if let Some(name) = named.get(&(route.method.clone(), route.path.clone())) {
+            route.name = Some(name.clone());
+        }
+    }
     compiled
         .routes
         .sort_by(|a, b| (&a.method, &a.path).cmp(&(&b.method, &b.path)));
@@ -142,6 +159,7 @@ fn imports_web_route_helpers_in_decls(decls: &[Decl]) -> bool {
 struct HelperRoute {
     method: String,
     path: String,
+    name: Option<String>,
     handler: Expr,
 }
 
@@ -199,6 +217,7 @@ fn collect_helper_routes_in_expr(expr: &Expr, out: &mut Vec<HelperRoute>) {
                         out.push(HelperRoute {
                             method: "GET".to_string(),
                             path,
+                            name: None,
                             handler: handler.clone(),
                         });
                     }
@@ -210,6 +229,21 @@ fn collect_helper_routes_in_expr(expr: &Expr, out: &mut Vec<HelperRoute>) {
                         out.push(HelperRoute {
                             method,
                             path,
+                            name: None,
+                            handler: handler.clone(),
+                        });
+                    }
+                }
+                ("route_named", [name, method, path, handler]) => {
+                    if let (Some(name), Some(method), Some(path)) = (
+                        string_literal(name),
+                        string_literal(method),
+                        string_literal(path),
+                    ) {
+                        out.push(HelperRoute {
+                            method,
+                            path,
+                            name: Some(name),
                             handler: handler.clone(),
                         });
                     }
@@ -425,6 +459,28 @@ fn web_main() {
         assert_eq!(route.handler_params[0].name, "id");
         assert_eq!(route.response_type.as_deref(), Some("String"));
         assert!(route.effects.contains(&"Request".to_string()));
+    }
+
+    #[test]
+    fn named_route_helper_preserves_name_across_compiler_ir() {
+        let module = parse(
+            r#"
+import stdlib::web::host
+fn show(id: String) -> String { "ok" }
+fn web_main() {
+    route_named("users.show", "GET", "/users/{id: String}", show)
+}
+"#,
+        );
+        let compilation = compile_modules_contracts(&[module]);
+        assert!(
+            compilation.diagnostics.is_empty(),
+            "{:?}",
+            compilation.diagnostics
+        );
+        assert_eq!(compilation.routes.len(), 1);
+        assert_eq!(compilation.routes[0].name.as_deref(), Some("users.show"));
+        assert!(crate::web::validation::validate_compilation(compilation).is_ok());
     }
 
     #[test]

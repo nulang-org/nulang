@@ -19,6 +19,12 @@ pub fn route_method(method: String, path: String, h) -> Unit ! {Web, Request} {
     perform Web.route(method, path, h)
 }
 
+/// Register a named route. The name is compiler-owned metadata for URL
+/// generation; HTTP dispatch uses the same Web.route host operation.
+pub fn route_named(name: String, method: String, path: String, h) -> Unit ! {Web, Request} {
+    perform Web.route(method, path, h)
+}
+
 /// Construct an HTML element from a tag name, attributes, and children.
 /// Inferred placement: static (because it only performs `Render` or `Web`).
 pub fn element(name: String, attrs, children: [Html]) -> Html ! {Web, Render} {

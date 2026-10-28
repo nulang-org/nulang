@@ -65,8 +65,23 @@ pub fn validation_diagnostics(compilation: &ContractCompilation) -> Vec<String> 
     // capture names or source-level types differ. Never let source-order or
     // silent contract deduplication decide which handler wins.
     let mut shapes: HashMap<(String, Vec<RuntimeRouteSegment>), &str> = HashMap::new();
+    let mut named: HashMap<&str, (&str, &str)> = HashMap::new();
     for route in &compilation.routes {
         diagnostics.extend(compile_route_bindings(route).diagnostics);
+        if let Some(name) = route.name.as_deref() {
+            if !valid_route_name(name) {
+                diagnostics.push(format!(
+                    "invalid route name '{name}' on {} {}",
+                    route.method, route.path
+                ));
+            }
+            if let Some((method, path)) = named.insert(name, (&route.method, &route.path)) {
+                diagnostics.push(format!(
+                    "duplicate route name '{name}' on {} {} and {} {}",
+                    method, path, route.method, route.path
+                ));
+            }
+        }
         match compile_route_segments(&route.path) {
             Ok(segments) => {
                 let normalized = segments
@@ -100,6 +115,16 @@ pub fn validation_diagnostics(compilation: &ContractCompilation) -> Vec<String> 
     diagnostics
 }
 
+/// Keep route identifiers stable and safe for generated SDKs and IR.
+fn valid_route_name(name: &str) -> bool {
+    name.len() <= 128
+        && name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+        && !name.contains("..")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +134,7 @@ mod tests {
         RouteContract {
             method: "GET".to_string(),
             path: path.to_string(),
+            name: None,
             handler: Some("show_user".to_string()),
             params: vec![RouteParamContract {
                 name: "id".to_string(),
@@ -121,6 +147,33 @@ mod tests {
             reference_capability: None,
             placement: Some("server".to_string()),
         }
+    }
+
+    #[test]
+    fn rejects_duplicate_and_malformed_named_routes() {
+        let mut first = contract("/users/:id", Vec::new());
+        first.name = Some("users.show".to_string());
+        let mut second = contract("/teams/:id", Vec::new());
+        second.name = Some("users.show".to_string());
+        let errors = validate_compilation(ContractCompilation {
+            routes: vec![first, second],
+            diagnostics: Vec::new(),
+        })
+        .unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("duplicate route name")));
+
+        let mut invalid = contract("/users/:id", Vec::new());
+        invalid.name = Some("../danger".to_string());
+        let errors = validate_compilation(ContractCompilation {
+            routes: vec![invalid],
+            diagnostics: Vec::new(),
+        })
+        .unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("invalid route name")));
     }
 
     #[test]

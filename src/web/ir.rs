@@ -22,6 +22,9 @@ pub struct IrRoute {
     pub path: String,
     pub placement: String,
     pub artifact: Option<String>,
+    /// Stable, validated reverse-routing name when supplied by the source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Source-level handler name when the route target can be resolved
     /// statically. Older IR consumers may ignore this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -126,6 +129,7 @@ pub fn generate_deployment_ir(
             path: route.path.clone(),
             placement,
             artifact,
+            name: contract.and_then(|c| c.name.clone()),
             handler: contract.and_then(|c| c.handler.clone()),
             params: contract.map(|c| c.params.clone()).unwrap_or_default(),
             handler_params: contract
@@ -310,6 +314,7 @@ mod tests {
         let contract = RouteContract {
             method: "GET".into(),
             path: "/users/{id: Int}".into(),
+            name: Some("users.show".into()),
             handler: Some("show_user".into()),
             params: vec![RouteParamContract {
                 name: "id".into(),
@@ -353,6 +358,9 @@ mod tests {
         );
 
         assert_eq!(ir.routes.len(), 1);
+        assert_eq!(ir.routes[0].name.as_deref(), Some("users.show"));
+        let serialized = ir.to_json();
+        assert!(serialized.contains("\"name\": \"users.show\""));
         assert_eq!(ir.middleware, vec!["security_headers", "request_log"]);
         assert_eq!(ir.routes[0].handler.as_deref(), Some("show_user"));
         assert_eq!(ir.routes[0].response_type.as_deref(), Some("Html"));

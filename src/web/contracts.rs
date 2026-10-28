@@ -57,6 +57,9 @@ pub struct HandlerParamContract {
 pub struct RouteContract {
     pub method: String,
     pub path: String,
+    /// Optional globally unique reverse-routing name; supplied by route_named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub handler: Option<String>,
     pub params: Vec<RouteParamContract>,
     pub handler_params: Vec<HandlerParamContract>,
@@ -309,6 +312,7 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
         out.routes.push(RouteContract {
             method,
             path,
+            name: None,
             handler: handler_name,
             params,
             handler_params: meta
