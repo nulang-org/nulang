@@ -1,0 +1,9 @@
+[package]
+name = "unpoly-compat"
+version = "0.1.0"
+
+[web]
+port = 0
+static_dir = "static"
+output_dir = "dist"
+version = 1

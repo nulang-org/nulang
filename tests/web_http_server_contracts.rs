@@ -303,6 +303,8 @@ fn status_result_route(path: &str, kind: &str, expression: &str) -> RuntimeWebRo
 opaque type Created = String
 opaque type NoContent = String
 opaque type Problem = String
+opaque type InvalidForm = String
+opaque type FormOutcome = String
 fn endpoint() -> {kind} ! {{Web}} {{ {expression} }}
 fn web_main() {{ perform Web.route("GET", "{path}", endpoint) }}
 "#
@@ -399,6 +401,73 @@ fn problem_result_uses_document_status_and_problem_media_type() {
 }
 
 #[test]
+fn invalid_form_returns_422_html_fragment_over_http() {
+    let route = status_result_route(
+        "/invalid-form",
+        "InvalidForm",
+        r#"perform Web.invalid_form(perform Web.raw("<form id='edit'><p>Required</p></form>"))"#,
+    );
+    let server = WebDevServer::bind_runtime(0, None, None, vec![route]).unwrap();
+    let response = send_raw_request(
+        server.port,
+        "GET /invalid-form HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 422 Unprocessable Entity\r\n"),
+        "{response}"
+    );
+    assert!(
+        response.contains("Content-Type: text/html; charset=utf-8\r\n"),
+        "{response}"
+    );
+    assert_eq!(
+        response_body(&response),
+        "<form id='edit'><p>Required</p></form>"
+    );
+}
+
+#[test]
+fn one_form_handler_returns_200_or_422_from_the_same_route() {
+    let route = status_result_route(
+        "/form-outcome",
+        "FormOutcome",
+        r#"if perform Web.header("X-Form-Valid") == "true" then {
+            perform Web.form_ok(perform Web.raw("<section id='saved'>Saved</section>"))
+        } else {
+            perform Web.form_invalid(perform Web.raw("<form id='edit'><p>Required</p></form>"))
+        }"#,
+    );
+    let server = WebDevServer::bind_runtime(0, None, None, vec![route]).unwrap();
+    let success = send_raw_request(
+        server.port,
+        "GET /form-outcome HTTP/1.1\r\nHost: localhost\r\nX-Form-Valid: true\r\nConnection: close\r\n\r\n",
+    );
+    let invalid = send_raw_request(
+        server.port,
+        "GET /form-outcome HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(success.starts_with("HTTP/1.1 200 OK\r\n"), "{success}");
+    assert!(
+        invalid.starts_with("HTTP/1.1 422 Unprocessable Entity\r\n"),
+        "{invalid}"
+    );
+    for result in [&success, &invalid] {
+        assert!(
+            result.contains("Content-Type: text/html; charset=utf-8\r\n"),
+            "{result}"
+        );
+    }
+    assert_eq!(
+        response_body(&success),
+        "<section id='saved'>Saved</section>"
+    );
+    assert_eq!(
+        response_body(&invalid),
+        "<form id='edit'><p>Required</p></form>"
+    );
+}
+
+#[test]
 fn invalid_problem_status_fails_closed_instead_of_returning_success() {
     let route = status_result_route(
         "/invalid-problem",
@@ -415,4 +484,127 @@ fn invalid_problem_status_fails_closed_instead_of_returning_success() {
         "{response}"
     );
     assert_eq!(response_body(&response), "Internal server error");
+}
+
+#[test]
+fn htmx_response_header_round_trips_over_real_http() {
+    let (module, function_index) = compile_handler(
+        r#"fn endpoint() -> String ! {Web} {
+    perform Web.set_header("HX-Trigger", "saved")
+    "fragment"
+}"#,
+        "endpoint",
+    );
+    let server = WebDevServer::bind(
+        0,
+        None,
+        None,
+        vec![WebRoute {
+            method: HttpMethod::Get,
+            path: "/fragment".to_string(),
+            handler_module: module,
+            handler_func_idx: function_index,
+        }],
+    )
+    .expect("bind WebDevServer");
+
+    let response = send_raw_request(
+        server.port,
+        "GET /fragment HTTP/1.1\r\nHost: localhost\r\nHX-Request: true\r\nConnection: close\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(response.contains("\r\nHX-Trigger: saved\r\n"), "{response}");
+    assert_eq!(response_body(&response), "fragment");
+}
+
+#[test]
+fn htmx_response_header_can_vary_by_request_without_leaking_to_other_requests() {
+    let (module, function_index) = compile_handler(
+        r#"fn endpoint() -> String ! {Web} {
+    let hx = perform Web.header("HX-Request")
+    if hx == "true" then {
+        perform Web.set_header("Vary", "HX-Request")
+        perform Web.set_header("HX-Trigger", "updated")
+        "fragment"
+    } else {
+        "full"
+    }
+}"#,
+        "endpoint",
+    );
+    let server = WebDevServer::bind(
+        0,
+        None,
+        None,
+        vec![WebRoute {
+            method: HttpMethod::Get,
+            path: "/page".to_string(),
+            handler_module: module,
+            handler_func_idx: function_index,
+        }],
+    )
+    .expect("bind WebDevServer");
+
+    let fragment = send_raw_request(
+        server.port,
+        "GET /page HTTP/1.1\r\nHost: localhost\r\nHX-Request: true\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        fragment.contains("\r\nHX-Trigger: updated\r\n"),
+        "{fragment}"
+    );
+    assert!(fragment.contains("\r\nVary: HX-Request\r\n"), "{fragment}");
+    assert_eq!(response_body(&fragment), "fragment");
+
+    let page = send_raw_request(
+        server.port,
+        "GET /page HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(!page.contains("HX-Trigger:"), "{page}");
+    assert!(!page.contains("\r\nVary:"), "{page}");
+    assert_eq!(response_body(&page), "full");
+}
+
+#[test]
+fn response_headers_block_crlf_injection_and_server_owned_fields_over_real_http() {
+    let (module, function_index) = compile_handler(
+        r#"fn endpoint() -> String ! {Web} {
+    perform Web.set_header("HX-Trigger", "ok\r\nX-Injected: true")
+    perform Web.set_header("Content-Length", "1")
+    perform Web.set_header("X-Frame-Options", "ALLOWALL")
+    perform Web.set_header("X-App-Header", "safe")
+    "safe"
+}"#,
+        "endpoint",
+    );
+    let server = WebDevServer::bind(
+        0,
+        None,
+        None,
+        vec![WebRoute {
+            method: HttpMethod::Get,
+            path: "/safe".to_string(),
+            handler_module: module,
+            handler_func_idx: function_index,
+        }],
+    )
+    .expect("bind WebDevServer");
+
+    let response = send_raw_request(
+        server.port,
+        "GET /safe HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(response_body(&response), "safe");
+    assert!(!response.contains("\r\nX-Injected: true\r\n"), "{response}");
+    assert!(!response.contains("\r\nHX-Trigger:"), "{response}");
+    assert!(
+        response.contains("\r\nX-App-Header: safe\r\n"),
+        "{response}"
+    );
+    assert!(response.contains("\r\nContent-Length: 4\r\n"), "{response}");
+    assert_eq!(response.matches("\r\nContent-Length:").count(), 1);
+    assert!(
+        response.contains("\r\nX-Frame-Options: DENY\r\n"),
+        "{response}"
+    );
 }

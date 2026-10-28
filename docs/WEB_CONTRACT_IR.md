@@ -271,11 +271,21 @@ Use `stdlib::web::response` for `json(JsonValue) -> Json` and
 document before emission; invalid output fails closed with HTTP 500 rather
 than being mislabeled `application/json`. Neither JSON nor plain text receives
 the HTML client-runtime script. The additive nominal results `Created`,
-`NoContent`, and `Problem` support 201 JSON, 204 empty, and dynamic 4xx/5xx
-problem JSON. HTTP validates the `Problem` document and uses its integer
+`NoContent`, `Problem`, and `InvalidForm` support 201 JSON, 204 empty,
+dynamic 4xx/5xx problem JSON, and 422 server-rendered validation HTML.
+`InvalidForm` preserves its provided HTML fragment and does not inject the
+client runtime script. This nominal type always produces 422; a typed union
+for per-request success/validation outcomes is provided by the additive
+`FormOutcome` nominal type: `form_ok(Html)` emits HTTP 200 and
+`form_invalid(Html)` emits HTTP 422. Both preserve HTML without runtime-script
+injection. The internal outcome envelope is strictly decoded and never sent
+as the HTTP entity body; malformed envelopes fail closed with HTTP 500.
+OpenAPI emits both 200 and 422 `text/html` responses. This is not a generic
+`Result` type; automatic validation and CSRF enforcement are not implied.
+HTTP validates the `Problem` document and uses its integer
 `status` for the wire response; error statuses outside 400..599 or missing
 string titles fail closed. OpenAPI only emits representations supported by
-runtime: 201 JSON, 204 without content, or a `default` problem response.
+runtime: 201 JSON, 204 without content, 422 HTML, or a `default` problem response.
 All are UTF-8 representations; resource-location headers, generic JSON
 schemas, binary bodies, streaming, and negotiation remain future work. This does **not** change the experimental
 development server into a production-ready HTTP server.
