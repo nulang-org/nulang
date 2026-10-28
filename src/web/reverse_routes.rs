@@ -175,4 +175,51 @@ mod tests {
         invalid.routes[1].name = Some("users.show".into());
         assert!(NamedRouteIndex::compile(&invalid).is_err());
     }
+
+    #[test]
+    fn named_reverse_rejects_crossing_patterns_before_publishing_urls() {
+        let mut compilation = routes();
+        compilation.routes.clear();
+        compilation.routes.push(RouteContract {
+            method: "GET".into(),
+            path: "/{area}/fixed".into(),
+            name: Some("area.fixed".into()),
+            ..RouteContract::default()
+        });
+        compilation.routes.push(RouteContract {
+            method: "GET".into(),
+            path: "/fixed/{user}".into(),
+            name: Some("fixed.user".into()),
+            ..RouteContract::default()
+        });
+        let errors = NamedRouteIndex::compile(&compilation)
+            .expect_err("crossing named route patterns must fail rather than depend on order");
+        assert!(
+            errors.iter().any(|error| error.contains("ambiguous")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn named_reverse_allows_literal_override_with_distinct_names() {
+        let mut compilation = routes();
+        compilation.routes.push(RouteContract {
+            method: "GET".into(),
+            path: "/users/me".into(),
+            name: Some("users.current".into()),
+            ..RouteContract::default()
+        });
+        let index = NamedRouteIndex::compile(&compilation)
+            .expect("literal routes are more specific and should coexist");
+        assert_eq!(
+            index.url_for("users.current", &HashMap::new()).unwrap(),
+            "/users/me"
+        );
+        assert_eq!(
+            index
+                .url_for("users.show", &HashMap::from([("id".into(), "35".into())]))
+                .unwrap(),
+            "/users/35"
+        );
+    }
 }
