@@ -276,19 +276,27 @@ fn infer_module_cloud_config(source: &str) -> Vec<CloudConfigEntry> {
     entries
 }
 
-/// Infer default middleware stack, extending it when imported modules
-/// contribute security concerns (e.g., auth sessions).
-fn infer_middleware(source: &str) -> Vec<String> {
-    let mut stack = vec![
-        "security_headers".to_string(),
-        "request_log".to_string(),
-        "csrf".to_string(),
-    ];
-    let imports = collect_nulang_imports(source);
-    if imports.iter().any(|name| name == "@nulang/auth") {
-        stack.push("auth".to_string());
-    }
-    stack
+/// Report only middleware actually enforced by the bundled HTTP pipeline.
+/// The default request admission layer enforces origin/Host rules, but not
+/// synchronizer-token CSRF or verified application authentication. Neither may
+/// be represented as automatically installed application middleware.
+fn infer_middleware(_source: &str) -> Vec<String> {
+    vec!["security_headers".to_string(), "request_log".to_string()]
+}
+
+/// The bundled auth package uses guessable sequential session tokens and
+/// arbitrary login(user). A module import is not proof of verified identity.
+fn source_uses_development_auth(source: &str) -> bool {
+    collect_nulang_imports(source).iter().any(|name| {
+        name == "@nulang/auth"
+            || name.starts_with("@nulang/auth/")
+            || name.starts_with("@nulang/auth::")
+    })
+}
+
+/// Check every source module before allowing a deployment.
+pub fn source_tree_uses_development_auth(src_root: &Path) -> bool {
+    source_uses_development_auth(&collect_source_text(src_root))
 }
 
 /// Collect all `@nulang/*` import names from the source text.
@@ -444,20 +452,23 @@ mod tests {
     }
 
     #[test]
-    fn test_infer_middleware_adds_auth_when_imported() {
-        let src = r#"
-            import @nulang/auth
-            fn main() {}
-        "#;
-        let stack = infer_middleware(src);
-        assert!(stack.contains(&"auth".to_string()));
-        assert!(stack.contains(&"csrf".to_string()));
-
-        let src_no_auth = r#"
-            import stdlib::web::html
-            fn main() {}
-        "#;
-        let stack_no_auth = infer_middleware(src_no_auth);
-        assert!(!stack_no_auth.contains(&"auth".to_string()));
+    fn test_infer_middleware_does_not_claim_unimplemented_auth_or_csrf() {
+        let demo_auth = "import @nulang/auth\nfn main() {}";
+        assert_eq!(
+            infer_middleware(demo_auth),
+            vec!["security_headers".to_string(), "request_log".to_string()],
+            "deployment IR must never imply automatic authentication or CSRF enforcement"
+        );
+        assert_eq!(
+            infer_middleware("import stdlib::web::html\nfn main() {}"),
+            infer_middleware(demo_auth),
+        );
+        assert!(!source_uses_development_auth(
+            "// import @nulang/auth\nfn main() {}"
+        ));
+        assert!(source_uses_development_auth(demo_auth));
+        assert!(source_uses_development_auth(
+            "import @nulang/auth::session\nfn main() {}"
+        ));
     }
 }

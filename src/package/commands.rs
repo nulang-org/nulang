@@ -2190,6 +2190,24 @@ struct DeployResponse {
     status: String,
 }
 
+/// The bundled development auth package uses arbitrary login(user) and
+/// predictable session-N tokens; neither is a verified identity provider.
+/// Fail before any build, dry-run preview, or deployment request.
+fn validate_deploy_security(root: &Path, manifest: &Manifest) -> NuResult<()> {
+    let demo_dependency = manifest
+        .dependencies
+        .keys()
+        .any(|name| name == "nulang-auth" || name == "@nulang/auth");
+    let demo_import = crate::web::ir::source_tree_uses_development_auth(&root.join("src"));
+    if demo_dependency || demo_import {
+        return Err(NuError::PackageError {
+            msg: "@nulang/auth is development-only: predictable sessions and unverified login(user) cannot be deployed. Configure audited authentication and server-side authorization first.".to_string(),
+            span: Span::default(),
+        });
+    }
+    Ok(())
+}
+
 /// `nula deploy [--wasm] [--url <url>] [--token <token>] [--adapter <kind>] [--dry-run]`
 /// — build and deploy the current package to Nulang Cloud or another adapter.
 #[cfg(feature = "ureq")]
@@ -2214,6 +2232,9 @@ fn cmd_deploy(
     })?;
     let name = manifest.package.name.clone();
     let version = manifest.package.version.clone();
+
+    // Deployment, including dry-run, must reject development-only auth.
+    validate_deploy_security(&root, &manifest)?;
 
     // Build the web output so dist/ contains the IR and static assets.
     cmd_build_web()?;
@@ -2613,6 +2634,58 @@ fn cmd_remove(name: Option<&str>) -> NuResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_deploy_rejects_development_auth_import_and_dependency() {
+        let dir =
+            std::env::temp_dir().join(format!("nulang_audited_auth_deploy_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        scaffold_package(&dir, "demo-auth", "web").expect("web scaffold");
+        let manifest = Manifest::load(&dir).expect("manifest");
+        assert!(validate_deploy_security(&dir, &manifest).is_ok());
+
+        let entry = dir.join("src/main.nula");
+        let original = std::fs::read_to_string(&entry).expect("source");
+        std::fs::write(&entry, format!("import @nulang/auth\n{original}")).unwrap();
+        assert!(
+            validate_deploy_security(&dir, &manifest).is_err(),
+            "demo auth import must block deploy"
+        );
+        // A dry run is still a deployment path: reject before generating an
+        // artifact or making any cloud request, even if caller supplies no URL.
+        #[cfg(feature = "ureq")]
+        {
+            let _root_override = ChangeDir::new(&dir);
+            let error = cmd_deploy(
+                false,
+                None,
+                None,
+                crate::web::adapters::AdapterKind::NulangCloud,
+                true,
+            )
+            .expect_err("a dry-run must not bypass the auth deploy gate");
+            assert!(error.to_string().contains("development-only"));
+        }
+
+        std::fs::write(&entry, original).unwrap();
+        let manifest_path = dir.join("Nulang.toml");
+        let toml = std::fs::read_to_string(&manifest_path).unwrap();
+        std::fs::write(
+            &manifest_path,
+            toml.replacen(
+                "[dependencies]\n",
+                "[dependencies]\nnulang-auth = \"0.1.0\"\n",
+                1,
+            ),
+        )
+        .unwrap();
+        let manifest = Manifest::load(&dir).unwrap();
+        assert!(
+            validate_deploy_security(&dir, &manifest).is_err(),
+            "demo auth dependency must block deploy"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_manifest_language_pin() {
