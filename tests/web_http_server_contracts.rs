@@ -416,3 +416,46 @@ fn invalid_problem_status_fails_closed_instead_of_returning_success() {
     );
     assert_eq!(response_body(&response), "Internal server error");
 }
+
+#[test]
+fn per_route_body_policy_rejects_oversize_before_handler_dispatch() {
+    let source = r#"
+import stdlib::web::types
+@web_policy(body_max_bytes: "4")
+fn upload() -> Text ! {Web} { perform Web.plaintext("accepted") }
+fn web_main() { perform Web.route("POST", "/upload", upload) }
+"#;
+    let (module, handler_func_idx) = compile_handler(source, "upload");
+    let ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_module()
+        .unwrap();
+    let contracts = compile_module_contracts(&ast);
+    assert!(
+        contracts.diagnostics.is_empty(),
+        "{:?}",
+        contracts.diagnostics
+    );
+    let plan = compile_runtime_route_plan(&contracts.routes[0]).unwrap();
+    assert_eq!(plan.body_max_bytes, Some(4));
+    let route = RuntimeWebRoute {
+        route: WebRoute {
+            method: HttpMethod::Post,
+            path: "/upload".into(),
+            handler_module: module,
+            handler_func_idx,
+        },
+        plan: Some(plan),
+    };
+    let server = WebDevServer::bind_runtime(0, None, None, vec![route]).unwrap();
+    let accepted = send_raw_request(server.port,
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nConnection: close\r\n\r\n1234");
+    assert!(accepted.starts_with("HTTP/1.1 200 OK\r\n"), "{accepted}");
+    assert_eq!(response_body(&accepted), "accepted");
+    let rejected = send_raw_request(server.port,
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\n12345");
+    assert!(
+        rejected.starts_with("HTTP/1.1 413 Payload Too Large\r\n"),
+        "{rejected}"
+    );
+    assert_eq!(response_body(&rejected), "Payload too large");
+}

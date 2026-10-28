@@ -68,6 +68,8 @@ pub struct RouteContract {
     /// separate field once capability-parameterized effects land.
     pub reference_capability: Option<String>,
     pub placement: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_max_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +99,7 @@ struct FunctionMeta {
     effects: Vec<String>,
     reference_capability: Option<String>,
     placement: Option<String>,
+    body_max_bytes: Option<usize>,
 }
 
 impl FunctionMeta {
@@ -126,6 +129,14 @@ impl FunctionMeta {
             FunctionAnnotation::Placement(p) => Some(p.to_string()),
             _ => None,
         });
+        // Repeated constraints compose with the strictest byte bound.
+        let body_max_bytes = annotations
+            .iter()
+            .filter_map(|annotation| match annotation {
+                FunctionAnnotation::WebPolicy { body_max_bytes } => Some(*body_max_bytes),
+                _ => None,
+            })
+            .min();
         let request_bindings = annotations
             .iter()
             .filter_map(|annotation| match annotation {
@@ -156,6 +167,7 @@ impl FunctionMeta {
                 effects: effect_names(effect.as_ref()),
                 reference_capability: cap.map(|c| c.to_string()),
                 placement,
+                body_max_bytes,
             },
         ))
     }
@@ -327,6 +339,7 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
             effects: meta.map(|m| m.effects.clone()).unwrap_or_default(),
             reference_capability: meta.and_then(|m| m.reference_capability.clone()),
             placement: meta.and_then(|m| m.placement.clone()),
+            body_max_bytes: meta.and_then(|m| m.body_max_bytes),
         });
     }
 

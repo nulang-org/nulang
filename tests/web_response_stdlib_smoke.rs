@@ -15,6 +15,7 @@ import stdlib::web::types
 import stdlib::web::response
 import stdlib::json
 
+@web_policy(body_max_bytes: "4096")
 fn health() -> Json {
     json(JsonObject([("ok", JsonBool(true))]))
 }

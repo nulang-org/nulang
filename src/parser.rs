@@ -898,6 +898,28 @@ impl Parser {
                         .collect();
                     annotations.push(FunctionAnnotation::Derive(names));
                 }
+                "web_policy" => {
+                    if fields.len() != 1 || !fields.contains_key("body_max_bytes") {
+                        return Err(NuError::parse_error(
+                            r#"@web_policy requires exactly body_max_bytes: "N"; unsupported policies are rejected"#.to_string(),
+                            self.current_span(),
+                        ));
+                    }
+                    let raw = fields.remove("body_max_bytes").unwrap();
+                    let bytes = raw
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|n| (1..=1_048_576).contains(n))
+                        .ok_or_else(|| {
+                            NuError::parse_error(
+                            "@web_policy body_max_bytes must be an integer between 1 and 1048576".to_string(),
+                            self.current_span(),
+                        )
+                        })?;
+                    annotations.push(FunctionAnnotation::WebPolicy {
+                        body_max_bytes: bytes,
+                    });
+                }
                 "placement" => {
                     let value = fields.remove("").unwrap_or_default();
                     let placement = match value.as_str() {
@@ -926,6 +948,9 @@ impl Parser {
                     ));
                 }
             }
+            // Multiple decorator lines compose; a newline is not a new
+            // declaration when the next token is another annotation.
+            self.skip_newlines();
         }
         Ok(annotations)
     }
@@ -7067,6 +7092,22 @@ mod tests {
                 );
             }
             _ => panic!("expected function declaration"),
+        }
+    }
+
+    #[test]
+    fn web_policy_rejects_unsupported_or_unbounded_configuration() {
+        for annotation in [
+            r#"@web_policy(authenticate: "true")"#,
+            r#"@web_policy(body_max_bytes: "0")"#,
+            r#"@web_policy(body_max_bytes: "1048577")"#,
+            r#"@web_policy(body_max_bytes: "not-a-number")"#,
+        ] {
+            let source = format!("{annotation}\nfn f() -> String {{ \"ok\" }}");
+            assert!(
+                parse(&source).is_err(),
+                "unexpectedly accepted {annotation}"
+            );
         }
     }
 

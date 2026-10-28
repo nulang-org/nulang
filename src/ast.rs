@@ -566,6 +566,9 @@ pub enum FunctionAnnotation {
     /// `@placement(static|server|edge|client|actor|workflow)` marks a web
     /// framework function's compile-time execution target.
     Placement(crate::types::Placement),
+    /// `@web_policy(body_max_bytes: "N")` — compile-time limit that the
+    /// compiler-attached HTTP runtime enforces before invoking the handler.
+    WebPolicy { body_max_bytes: usize },
     /// Contextual parameter syntax such as `limit: Int from query`.
     RequestBinding {
         param: String,

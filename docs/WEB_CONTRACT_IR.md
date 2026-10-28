@@ -48,6 +48,7 @@ Route metadata includes the existing method/path/placement/artifact fields plus:
 - `handler_params`: handler parameter names, types, Nulang reference capabilities, and optional request-source metadata.
 - `bindings`: deterministic request-source-to-handler-slot bindings for `path`, `query`, `header`, `cookie`, `body`, and `form`. Each binding records `source_name`, `handler_param`, `handler_index`, and resolved source-level type.
 - `response_type`: declared handler return type.
+- `body_max_bytes`: optional compiler-declared per-endpoint HTTP body size guard (only on validated runtime routes).
 - `error_type`: declared typed-error type.
 - `effects`: declared handler effect row.
 - `reference_capability`: the existing Pony-style handler capability (`iso`, `ref`, `val`, etc.).
@@ -106,6 +107,31 @@ source tree
        -> OpenAPI / client generation
        -> tests / tooling
 ```
+
+## Compile-validated endpoint body policy (experimental)
+
+A handler may opt into a strict per-route body limit:
+
+```nulang
+@web_policy(body_max_bytes: "4096")
+fn upload() -> Text { plaintext("accepted") }
+```
+
+The parser accepts only `body_max_bytes` in the experimental `@web_policy`
+annotation. The size must be a decimal integer between 1 and 1048576. Any
+unsupported policy key, such as `authenticate`, is rejected at parse time;
+there is deliberately no decorative security policy declaration. Repeated
+limits compose by taking the strictest bound. Contract extraction carries
+that policy through validated contracts, runtime plans, deployment metadata,
+and the `x-nulang-body-max-bytes` OpenAPI extension.
+
+`WebDevServer` rejects matching requests with a body exceeding the bound with
+HTTP 413 **before request binding or handler invocation**. The shared HTTP
+request reader still buffers and globally caps bodies at 1 MiB before route
+matching, so this is not an early transport allocation limit. Unvalidated
+legacy routes have no attached policy. This feature does **not** implement
+authentication, authorization, arbitrary endpoint filters, or hierarchical
+route groups; those need a separate fail-closed execution design.
 
 ## Runtime binding and dispatch
 

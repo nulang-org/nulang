@@ -38,6 +38,8 @@ pub struct RuntimeRoutePlan {
     pub direct_call: bool,
     /// Response representation selected by the compiler-validated contract.
     pub response_kind: ResponseKind,
+    /// Per-route body size policy from the compiler contract.
+    pub body_max_bytes: Option<usize>,
 }
 
 /// A low-level runtime registration paired with optional compiler metadata.
@@ -125,6 +127,7 @@ pub fn compile_runtime_route_plan(
         handler_param_count: contract.handler_params.len(),
         direct_call,
         response_kind: ResponseKind::from_return_type(contract.response_type.as_deref()),
+        body_max_bytes: contract.body_max_bytes,
     })
 }
 
@@ -429,6 +432,7 @@ mod tests {
             effects: Vec::new(),
             reference_capability: None,
             placement: Some("server".to_string()),
+            body_max_bytes: None,
         }
     }
 
@@ -447,6 +451,52 @@ mod tests {
         assert_eq!(
             compile_runtime_route_plan(&route).unwrap().response_kind,
             crate::web::response::ResponseKind::Html
+        );
+    }
+
+    #[test]
+    fn web_policy_body_limit_is_compiled_into_route_plan() {
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        use crate::web::contracts::compile_module_contracts;
+        let src = r#"
+@web_policy(body_max_bytes: "8")
+fn upload() -> String { "accepted" }
+fn web_main() { perform Web.route("POST", "/upload", upload) }
+"#;
+        let ast = Parser::new(Lexer::new(src).lex().unwrap())
+            .parse_module()
+            .unwrap();
+        let contracts = compile_module_contracts(&ast);
+        assert!(
+            contracts.diagnostics.is_empty(),
+            "{:?}",
+            contracts.diagnostics
+        );
+        let plan = compile_runtime_route_plan(&contracts.routes[0]).unwrap();
+        assert_eq!(plan.body_max_bytes, Some(8));
+    }
+
+    #[test]
+    fn repeated_web_policy_annotations_compose_to_stricter_limit() {
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        use crate::web::contracts::compile_module_contracts;
+        let src = r#"
+@web_policy(body_max_bytes: "800")
+@web_policy(body_max_bytes: "8")
+fn upload() -> String { "accepted" }
+fn web_main() { perform Web.route("POST", "/upload", upload) }
+"#;
+        let ast = Parser::new(Lexer::new(src).lex().unwrap())
+            .parse_module()
+            .unwrap();
+        let contracts = compile_module_contracts(&ast);
+        assert_eq!(
+            compile_runtime_route_plan(&contracts.routes[0])
+                .unwrap()
+                .body_max_bytes,
+            Some(8)
         );
     }
 
