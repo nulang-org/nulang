@@ -18,6 +18,15 @@ export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
 # Caller may override CARGO_TARGET_DIR to keep large builds off constrained /tmp.
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/nulang-rusqlite-compat-target}"
 echo "LIBSQL_RUSQLITE_PARITY_HEAD=$head"
+if [[ "$(uname -s)" == "Linux" ]]; then
+  # Compile a test-only libc interposer, loaded ONLY into the disposable
+  # rusqlite subprocess; its FD whitelist must match that DB's WAL.
+  command -v cc >/dev/null
+  cc -std=c11 -O2 -Wall -Wextra -Werror -fPIC -shared \
+    "$base/fault_shim/sqlite_errno_faults.c" -ldl \
+    -o "$dir/nulang-sqlite-fault-shim.so"
+  export NULANG_SQLITE_FAULT_SHIM_PATH="$dir/nulang-sqlite-fault-shim.so"
+fi
 cargo run --locked --manifest-path "$base/writer/Cargo.toml" -- "$NULANG_LEGACY_FIXTURE_DB"
 cargo test --locked --manifest-path "$base/reader/Cargo.toml" --test parity
 # Experimental writer controls are exercised only in an independently
