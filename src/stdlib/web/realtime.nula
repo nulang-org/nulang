@@ -9,3 +9,11 @@ import stdlib::web::types
 pub fn broadcast(room: String, message: String) -> Unit ! {Realtime} {
     perform Realtime.broadcast(room, message)
 }
+
+
+// Publish a revisioned HTML update to subscribers of this room.
+// Returns false on invalid selectors or bounded capacity exhaustion.
+// Browsers subscribe with window.nulang.stream(room) from an action-enabled page.
+pub fn patch(room: String, target: String, html: Html) -> Bool ! {Realtime} {
+    perform Realtime.patch(room, target, html)
+}

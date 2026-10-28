@@ -230,6 +230,67 @@ It runs the route registrations, renders every route to `dist/<path>/index.html`
 
 For a pure static response without the `app` machinery, `Web.text`/`Web.raw` are enough on their own — any `fn() -> Html` can be rendered by the same pipeline.
 
+## Progressive HTML action updates (experimental)
+
+Server actions normally submit a form and reload the page after a successful
+response. To update one element instead, add `data-nulang-target` to an
+action-enabled form (or its action control). The target must be a simple
+element ID selector such as `#current-message`.
+
+```html
+<p id="current-message">Nothing submitted yet</p>
+<form method="POST"
+      data-action="save_message"
+      data-action-placement="server"
+      data-nulang-target="#current-message">
+  <input name="message">
+  <button type="submit">Save</button>
+</form>
+```
+
+The `POST` route should return an HTML fragment containing the same ID:
+
+```nulang
+fn save_message() {
+    let msg = form_value("message")
+    kv_set("patch-web-message", msg)
+    el("p", [("id", text("current-message"))], [text(msg)])
+}
+```
+
+The browser parses a successful `text/html` response and morphs just
+`#current-message`. It also accepts a complete rendered HTML page and extracts
+the target from it. Matching elements retain their DOM identities and event
+listeners; keyed siblings (`id` or `data-nulang-key`) can move without losing
+their state. User-modified inputs, checkboxes, textareas, and selects retain
+their local values, and a retained focused input keeps its selection.
+
+A missing target, non-HTML response, or unsuccessful HTTP status is reported
+without changing the page. Actions without `data-nulang-target` retain the
+existing reload behavior.
+
+See [examples/patch-web](https://github.com/nulang-org/nulang/tree/main/examples/patch-web)
+for a standalone sample. Run `nulang nula dev` from that directory.
+
+:::caution[Scope of this first slice]
+This is an **opt-in, DOM-preserving HTML response**, not an SSE patch
+protocol. The morph algorithm is intentionally small: elements without
+stable IDs/keys can still be replaced, and changing a node's element type
+replaces that node. Forms with in-flight requests are not yet versioned, so
+concurrent mutations can resolve out of order. The response must be generated
+from trusted, properly escaped server-side `Html`; using `raw` with untrusted
+content can introduce XSS. This does not make the experimental HTTP/action
+host production-ready.
+:::
+
+## Typed HTML over SSE (experimental)
+
+The web runtime now has a separate, revisioned HTML patch stream: `Realtime.patch(room, target, html)` via `stdlib::web::realtime::patch`. In the browser use `window.nulang.stream("tasks")`, which returns a handle with `close()` for cancellation. The native EventSource endpoint is `/__nulang/ui-sse/tasks`.
+
+Every connection receives a current-state snapshot, followed by typed `nulang-ui-html/1` events with decimal-string revisions. Duplicate updates are ignored and revision gaps trigger a fresh snapshot. Limits per development-server process: 32 rooms, 32 targets per room, 8 subscribers per room, 8 queued updates per subscriber, and 64 KiB per update. Falling-behind subscribers are disconnected instead of buffering indefinitely.
+
+**Security and durability:** Unlike the general dev-server routes, this UI stream accepts **only loopback TCP connections** with a literal local `Host` (`localhost`, `127.0.0.1`, or `[::1]`) and rejects cross-origin browser requests (including DNS-rebinding Host values and cross-site Fetch Metadata). It is **not an authentication system**: local processes and local reverse proxies can still access streams, and the rest of the dev server binds to all interfaces. There is no subscriber identity, tenant isolation, persistent history, or cross-process distribution. Do not publish private data into shared rooms, forward the stream from a publicly reachable proxy, or expose the development server to untrusted clients. Actor-backed subscriptions and application authorization remain future work.
+
 ## Realtime Broadcast
 
 `Realtime` currently has a single operation:
