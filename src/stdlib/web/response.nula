@@ -4,7 +4,7 @@ import stdlib::web::types
 import stdlib::json
 
 /// Return JSON data with the application/json media type.
-pub fn json(value: JsonValue) -> Json ! {Web, Respond} {
+pub fn json(value: JsonValue) -> Json {
     perform Web.json(stringify(value))
 }
 
