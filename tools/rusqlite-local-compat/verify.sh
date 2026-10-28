@@ -20,6 +20,9 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/nul
 echo "LIBSQL_RUSQLITE_PARITY_HEAD=$head"
 cargo run --locked --manifest-path "$base/writer/Cargo.toml" -- "$NULANG_LEGACY_FIXTURE_DB"
 cargo test --locked --manifest-path "$base/reader/Cargo.toml" --test parity
+# Experimental writer controls are exercised only in an independently
+# linked rusqlite process; no root PersistenceStore backend changes.
+cargo test --locked --manifest-path "$base/reader/Cargo.toml" --test atomic_writer
 cargo clippy --locked --manifest-path "$base/writer/Cargo.toml" -- -D clippy::correctness
-cargo clippy --locked --manifest-path "$base/reader/Cargo.toml" -- -D clippy::correctness
-echo "PASS separate-process SQLite local recovery compatibility for $head"
+cargo clippy --locked --manifest-path "$base/reader/Cargo.toml" --all-targets -- -D clippy::correctness
+echo "PASS separate-process SQLite local recovery and experimental atomic writer for $head"

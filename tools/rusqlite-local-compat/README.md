@@ -61,3 +61,54 @@ parity/recovery matrix are required before any storage cutover.
 The security hotfix #2305 already removes the vulnerable libSQL remote
 TLS stack and does not depend on this migration. Do not delay that
 security fix or loosen its security gate to adopt rusqlite.
+
+## Experimental atomic writer slice (separate process only)
+
+The optional `reader/src/atomic_writer.rs` also implements
+`RusqliteAtomicWriter::open_existing` and `commit` **inside the
+separately linked rusqlite test workspace**. It remains deliberately
+outside the Nulang runtime feature graph and **does not implement
+`PersistenceStore`**. It is not enabled in production, included in
+Nulang CLI releases, or a migration from the original local backend.
+
+Unlike a normal SQLite helper, it accepts only a **previously created
+current-schema WAL database**. It enforces `PRAGMA synchronous=FULL`,
+canonical Nulang `DurableTransition::digest()`, bounded SQLite integer
+conversions, and `BEGIN IMMEDIATE` ownership for the entire atomic
+transaction. It checks committed tail/transition-history integrity,
+activation-epoch fencing, predecessor sequence, and exact digest replay.
+It writes the legacy snapshot/journal and all durable workflow, domain,
+effect, and outbox rows in the same transaction as the durable tail CAS.
+The CAS must change **exactly one** row, or the transaction rolls back.
+
+The verifier's additional `atomic_writer` test binary covers:
+- A transition appended to a real file previously produced by the
+  independent libSQL process, with snapshot/journal/outbox/tail parity.
+- Exact digest idempotence, conflicting replay, stale epoch, invalid
+  transition shape, and predecessor mismatch (fail closed).
+- Injected SQL failure at the late outbox stage, with no partial rows
+  left in any durable table.
+- Eight independent OS-process writers racing on the same actor and
+  predecessor: only one distinct digest can commit.
+- Two other actors safely committing through distinct OS processes.
+- Invalid committed tail digest and mismatched transition-history row
+  are **hard failures**, not an invitation to overwrite corrupt state.
+- SIGKILL after staging uncommitted rows across all durable tables,
+  before COMMIT: fresh-connection rollback and successful retry.
+
+These tests use **synthetic data and synthetic subprocesses**, never
+production actor state. The process-kill test shows rollback of an
+uncommitted transaction; it does **not** establish recovery after a
+power loss, after the server has committed but before the response
+arrives, or under disk faults or corruption. The effect record
+serialization code path exists, but there is no nonempty real
+durable-effect fixture yet. A real remote Turso backend has entirely
+different commit/retry semantics and is not certified by these tests.
+
+**Further merge blockers:** full native `PersistenceStore` parity
+(including all read methods and effect recovery), new/legacy filesystem
+lock and migration policies, pre-commit and post-commit crash matrix,
+fsync durability and disk-fault injection, large-actor concurrency,
+rolling upgrades, root release integration, exact-head Woodpecker, and
+operator approval. Never switch the default local backend merely
+because the isolated transaction test is green.
