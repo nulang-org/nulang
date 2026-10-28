@@ -300,6 +300,16 @@ Only targeted actions can use `drop` or `queue`. For overlapping requests in
 `replace` mode, the most recent response wins even if earlier responses
 arrive after the latest one.
 
+For statically recognized `el(...)` actions and compiler-generated JSX
+actions, the compiler also projects `target` and `coordination` as typed
+`ActionBinding` metadata in the `nulang-ui/1` signal graph. The web build
+rejects duplicate attributes, nonliteral or unknown policy values, invalid
+target selectors, and `drop`/`queue` policies without an explicit local
+`data-nulang-target="#id"`. Policy values may be string literals or
+`text("queue")`-style static HTML literals. For dynamically generated HTML
+that the compiler cannot inspect, the browser still enforces request policy
+validation; this compile-time check is **not** a substitute for runtime checks.
+
 These are **browser request policies**, not guarantees about database
 transaction ordering or exactly-once server execution. Mutating handlers still
 need authorization, idempotency, and transactional concurrency controls.

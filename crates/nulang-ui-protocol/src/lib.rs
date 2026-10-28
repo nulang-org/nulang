@@ -195,11 +195,42 @@ pub enum ActionPlacement {
     Server,
 }
 
+/// Compile-time checked browser request scheduling. Ordering controls
+/// client requests, not the commit order of server-side mutations.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionCoordination {
+    #[default]
+    Replace,
+    Drop,
+    Queue,
+}
+
+impl ActionCoordination {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Replace => "replace",
+            Self::Drop => "drop",
+            Self::Queue => "queue",
+        }
+    }
+
+    pub fn is_replace(&self) -> bool {
+        *self == Self::Replace
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionBinding {
     pub event: String,
     pub action_id: ActionId,
     pub placement: ActionPlacement,
+    /// Exact DOM ID selector for this interaction (not an arbitrary selector).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Omitted on the wire for legacy/default latest-wins behavior.
+    #[serde(default, skip_serializing_if = "ActionCoordination::is_replace")]
+    pub coordination: ActionCoordination,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -721,6 +752,32 @@ mod tests {
             NodeId::from("root"),
             vec![root, leaf("task-1", "text")],
         )
+    }
+
+    #[test]
+    fn action_policy_is_typed_and_legacy_bindings_default_to_replace() {
+        let legacy = r#"{"event":"activate","action_id":"save","placement":"server"}"#;
+        let binding: ActionBinding = serde_json::from_str(legacy).unwrap();
+        assert_eq!(binding.coordination, ActionCoordination::Replace);
+        assert_eq!(binding.target, None);
+        assert_eq!(serde_json::to_string(&binding).unwrap(), legacy);
+
+        let queued = ActionBinding {
+            event: "activate".into(),
+            action_id: ActionId::from("save"),
+            placement: ActionPlacement::Server,
+            target: Some("#status".into()),
+            coordination: ActionCoordination::Queue,
+        };
+        let json = serde_json::to_string(&queued).unwrap();
+        assert!(json.contains(r#""coordination":"queue""#));
+        assert_eq!(
+            serde_json::from_str::<ActionBinding>(&json).unwrap(),
+            queued
+        );
+        assert!(serde_json::from_str::<ActionBinding>(
+            r#"{"event":"activate","action_id":"save","placement":"server","coordination":"unknown"}"#
+        ).is_err());
     }
 
     #[test]
