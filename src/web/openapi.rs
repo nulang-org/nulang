@@ -66,42 +66,68 @@ fn operation_for(route: &RouteContract) -> Value {
             .to_string()
     });
 
-    let mut success = Map::new();
-    success.insert(
+    let kind = ResponseKind::explicit(route.response_type.as_deref());
+    let (status, description) = match kind {
+        Some(ResponseKind::Created) => ("201", "Created response"),
+        Some(ResponseKind::NoContent) => ("204", "No content"),
+        Some(ResponseKind::Problem) => ("default", "Problem response"),
+        _ => ("200", "Successful response"),
+    };
+    let mut response = Map::new();
+    response.insert(
         "description".to_string(),
-        Value::String("Successful response".to_string()),
+        Value::String(description.to_string()),
     );
-    if let Some(response_type) = &route.response_type {
-        success.insert(
+    if let Some(ty) = &route.response_type {
+        response.insert(
             "x-nulang-response-type".to_string(),
-            Value::String(response_type.clone()),
+            Value::String(ty.clone()),
         );
     }
-
-    if let Some(kind) = ResponseKind::explicit(route.response_type.as_deref()) {
+    if let Some(kind) = kind {
         let schema = match kind {
-            ResponseKind::Html | ResponseKind::Text => json!({ "type": "string" }),
-            // Json represents arbitrary JsonValue; do not invent object fields.
-            ResponseKind::Json => json!({}),
-        };
-        let mut media = Map::new();
-        media.insert(
-            kind.openapi_media_type().to_string(),
-            json!({ "schema": schema }),
-        );
-        success.insert("content".to_string(), Value::Object(media));
-    }
-
-    let mut responses = Map::new();
-    responses.insert("200".to_string(), Value::Object(success));
-    if let Some(error_type) = &route.error_type {
-        responses.insert(
-            "default".to_string(),
-            json!({
-                "description": "Typed error response",
-                "x-nulang-error-type": error_type,
+            ResponseKind::Html | ResponseKind::Text => json!({"type": "string"}),
+            ResponseKind::Json | ResponseKind::Created => json!({}),
+            ResponseKind::Problem => json!({
+                "type": "object",
+                "required": ["status", "title"],
+                "properties": {
+                    "status": {"type": "integer", "minimum": 400, "maximum": 599},
+                    "title": {"type": "string"},
+                    "detail": {"type": "string"}
+                }
             }),
-        );
+            ResponseKind::NoContent => Value::Null,
+        };
+        if kind != ResponseKind::NoContent {
+            let mut media = Map::new();
+            media.insert(
+                kind.openapi_media_type().to_string(),
+                json!({"schema": schema}),
+            );
+            response.insert("content".to_string(), Value::Object(media));
+        }
+    }
+    let mut responses = Map::new();
+    if status == "default" {
+        if let Some(error_type) = &route.error_type {
+            response.insert(
+                "x-nulang-error-type".into(),
+                Value::String(error_type.clone()),
+            );
+        }
+    }
+    responses.insert(status.to_string(), Value::Object(response));
+    if status != "default" {
+        if let Some(error_type) = &route.error_type {
+            responses.insert(
+                "default".to_string(),
+                json!({
+                    "description": "Typed error response",
+                    "x-nulang-error-type": error_type,
+                }),
+            );
+        }
     }
 
     let mut operation = Map::new();
@@ -373,6 +399,40 @@ mod tests {
                 response["content"].get(mime).is_some(),
                 "missing {mime} for {ty}"
             );
+        }
+    }
+
+    #[test]
+    fn status_results_emit_correct_openapi_status_and_body_contract() {
+        for (kind, status, mime) in [
+            ("Created", "201", Some("application/json")),
+            ("NoContent", "204", None),
+            ("Problem", "default", Some("application/problem+json")),
+        ] {
+            let mut contract = route();
+            contract.response_type = Some(kind.to_string());
+            let json = generate_openapi(
+                &ContractCompilation {
+                    routes: vec![contract],
+                    diagnostics: vec![],
+                },
+                "API",
+                "1.0",
+            );
+            let responses = &json["paths"]["/users/{id}"]["get"]["responses"];
+            assert!(responses.get("200").is_none(), "unexpected 200 for {kind}");
+            let response = &responses[status];
+            if let Some(mime) = mime {
+                assert!(
+                    response["content"].get(mime).is_some(),
+                    "missing {mime} for {kind}"
+                );
+            } else {
+                assert!(
+                    response.get("content").is_none(),
+                    "unexpected body for {kind}"
+                );
+            }
         }
     }
 

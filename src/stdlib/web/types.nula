@@ -29,3 +29,12 @@ opaque type Json = String
 
 /// Plain-text HTTP response body. Construct through `stdlib::web::response.plaintext`.
 opaque type Text = String
+
+/// HTTP 201 JSON creation result. A Location header overload is future work.
+opaque type Created = String
+
+/// HTTP 204 result; carries no response body or content type.
+opaque type NoContent = String
+
+/// RFC-style application/problem+json error result (HTTP 4xx/5xx).
+opaque type Problem = String
