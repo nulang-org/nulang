@@ -73,6 +73,36 @@ pub struct ModernConnector {
     tls: TlsConnector,
 }
 
+/// Reject plaintext transport when a bearer token would be transmitted.
+/// An unauthenticated HTTP URL remains valid for local development, but
+/// authenticated remote sessions require TLS and never accept URL userinfo.
+pub(crate) fn validate_authenticated_remote_transport(url: &str, token: &str) -> io::Result<()> {
+    let normalized = if let Some(tail) = url.strip_prefix("libsql://") {
+        format!("https://{tail}")
+    } else {
+        url.to_string()
+    };
+    let uri: Uri = normalized
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid libSQL remote URL"))?;
+    if uri.host().is_none()
+        || uri.authority().is_some_and(|a| a.as_str().contains('@'))
+        || !matches!(uri.scheme_str(), Some("https" | "http"))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "libSQL remote URL requires an HTTP(S) host without inline credentials",
+        ));
+    }
+    if uri.scheme_str() == Some("http") && !token.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "libSQL authentication token requires encrypted HTTPS transport",
+        ));
+    }
+    Ok(())
+}
+
 /// Requires usable platform roots; no insecure trust-all fallback.
 pub fn connector() -> io::Result<ModernConnector> {
     let certs = rustls_native_certs::load_native_certs();
@@ -158,6 +188,94 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::time::{timeout, Duration};
     use tokio_rustls::TlsAcceptor;
+
+    #[test]
+    fn remote_bearer_token_requires_verified_tls() {
+        assert!(super::validate_authenticated_remote_transport(
+            "http://127.0.0.1:8080",
+            "fake-token"
+        )
+        .is_err());
+        assert!(super::validate_authenticated_remote_transport(
+            "http://example.invalid",
+            "fake-token"
+        )
+        .is_err());
+        assert!(super::validate_authenticated_remote_transport(
+            "https://db.turso.io",
+            "fake-token"
+        )
+        .is_ok());
+        assert!(super::validate_authenticated_remote_transport(
+            "libsql://db.turso.io",
+            "fake-token"
+        )
+        .is_ok());
+        // Preserve unauthenticated HTTP development connections.
+        assert!(
+            super::validate_authenticated_remote_transport("http://127.0.0.1:8080", "").is_ok()
+        );
+        assert!(super::validate_authenticated_remote_transport(
+            "https://user:token@db.turso.io",
+            "fake-token"
+        )
+        .is_err());
+        assert!(
+            super::validate_authenticated_remote_transport("file:secret.db", "fake-token").is_err()
+        );
+        // Exercise the public store boundary, not only its helper, without
+        // opening a network connection or exposing a real credential.
+        let error = crate::runtime::persistence::LibsqlStore::new_remote(
+            "http://127.0.0.1:1",
+            "fake-token",
+        )
+        .err()
+        .expect("plaintext bearer-token transport must fail before IO");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// Optional live compatibility gate. Only an explicitly authorized remote
+    /// endpoint is contacted; the SQL is read-only and no Nulang tables are
+    /// initialized. Credential and endpoint values are never logged.
+    #[tokio::test]
+    #[ignore = "requires NULANG_LIBSQL_SMOKE_URL and NULANG_LIBSQL_SMOKE_TOKEN"]
+    async fn authenticated_remote_https_readonly_smoke() {
+        let url = std::env::var("NULANG_LIBSQL_SMOKE_URL")
+            .expect("set an authorized read-only HTTPS/libsql endpoint");
+        let token = std::env::var("NULANG_LIBSQL_SMOKE_TOKEN")
+            .expect("supply the token securely through the environment");
+        assert!(!token.is_empty(), "live smoke token must be nonempty");
+        validate_authenticated_remote_transport(&url, &token)
+            .expect("authenticated transport must satisfy URL admission");
+        let normalized = if let Some(tail) = url.strip_prefix("libsql://") {
+            format!("https://{tail}")
+        } else {
+            url.clone()
+        };
+        let uri: Uri = normalized.parse().expect("validated remote URI");
+        assert_eq!(uri.scheme_str(), Some("https"), "live smoke requires TLS");
+
+        // Deliberately bypass LibsqlStore::new_remote: its ensure_tables()
+        // executes CREATE TABLE IF NOT EXISTS, which is not read-only.
+        let verified = connector().expect("platform certificate roots required");
+        let db = libsql::Builder::new_remote(url, token)
+            .connector(verified)
+            .build()
+            .await
+            .unwrap_or_else(|_| panic!("authorized remote TLS connection failed"));
+        let conn = db.connect().expect("remote connection handle");
+        let mut rows = conn
+            .query("SELECT 1", ())
+            .await
+            .unwrap_or_else(|_| panic!("read-only remote SELECT failed"));
+        let row = rows
+            .next()
+            .await
+            .unwrap_or_else(|_| panic!("remote SELECT returned an error"))
+            .expect("remote SELECT returned no row");
+        assert_eq!(row.get::<i64>(0).expect("integer result"), 1);
+        assert!(rows.next().await.expect("read trailing rows").is_none());
+    }
 
     #[tokio::test]
     async fn remote_tls_enforces_server_certificate_chain_and_hostname() {
