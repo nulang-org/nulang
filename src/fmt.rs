@@ -108,9 +108,15 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             ret_type,
             body,
             effect,
+            public,
             ..
         } => {
-            out.push_str(&format!("{}fn {}(", sp, name));
+            out.push_str(&format!(
+                "{}{}fn {}(",
+                sp,
+                if *public { "pub " } else { "" },
+                name
+            ));
             for (i, p) in params.iter().enumerate() {
                 let pn = &p.name;
                 let pty = &p.ty;
@@ -1237,6 +1243,17 @@ mod tests {
         assert!(out.contains("effect MyEffect {"), "got: {out}");
         assert!(out.contains("op: Int -> Bool"), "got: {out}");
         assert!(out.contains("op2: (Int, String) -> Bool"), "got: {out}");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn test_fmt_preserves_public_functions() {
+        let src = "pub fn add(a: Int, b: Int) -> Int {\n    a + b\n}\n";
+        let out = format_source(src).expect("public function must remain supported");
+        assert!(
+            out.starts_with("pub fn add("),
+            "formatter stripped visibility: {out}"
+        );
         assert_idempotent(src);
     }
 
