@@ -141,7 +141,7 @@ cranelift-codegen = { version = "0.132", features = ["riscv64"], optional = true
 
 # LSP server (optional, see [features])
 tower-lsp = { version = "0.20", optional = true }
-tokio = { version = "1.37.0", features = ["full", "macros", "net", "rt-multi-thread", "time"], optional = true }
+tokio = { version = "1.53.3", features = ["full", "macros", "net", "rt-multi-thread", "time"], optional = true }
 # Used by the protocol-level LSP tests to drive the server->client
 # notification stream (ClientSocket implements futures::Stream) and to
 # call the LspService's tower::Service impl.
