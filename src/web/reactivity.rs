@@ -514,7 +514,10 @@ fn path_with_tag(path: &[String], tag: &str) -> String {
 /// client-side signal micro-runtime can hydrate the page. The tag is placed
 /// just before `</body>` when present, otherwise appended at the end.
 pub fn inject_client_runtime_script(html: &str) -> String {
-    if !html.contains("data-signal=") && !html.contains("data-action=") {
+    if !html.contains("data-signal=")
+        && !html.contains("data-action=")
+        && !html.contains("data-nulang-key=")
+    {
         return html.to_string();
     }
     let script = r#"<script src="/app.client.js"></script>"#;
@@ -569,6 +572,15 @@ fn rewrite_expr(
                     if let Expr::Tuple(parts, _) = attr {
                         if parts.len() == 2 {
                             if let Some(name) = string_literal(&parts[0]) {
+                                // A JSX key is local to its parent list. Preserve
+                                // its evaluated value as a DOM marker rather than
+                                // using positional indexes as identity.
+                                if name == "key" {
+                                    parts[0] = Expr::Literal(
+                                        Literal::String("data-nulang-key".to_string()),
+                                        *span,
+                                    );
+                                }
                                 if name == "action" {
                                     if let Some(handler) = action_handler_name(&parts[1]) {
                                         let placement = classify_action(&handler, checker);
@@ -782,7 +794,9 @@ fn data_attr(name: &str, value: &str, span: Span) -> Expr {
 /// actions from server-rendered HTML. Bindings are discovered once from
 /// `data-signal` and `data-action` attributes emitted by the compiler.
 pub fn generate_client_runtime() -> String {
-    r#"(function () {
+    format!(
+        "{}\n{}",
+        r#"(function () {
   // Signal names come from compiled bindings; they must never resolve through
   // Object.prototype (e.g. constructor, toString, __proto__).
   const signals = Object.create(null);
@@ -910,8 +924,9 @@ pub fn generate_client_runtime() -> String {
   } else {
     hydrate();
   }
-})();"#
-        .to_string()
+})();"#,
+        include_str!("../../crates/nulang-ui-protocol/browser/nulang-ui-dom.js")
+    )
 }
 
 fn wrap_signal_read(name: &str, span: Span) -> Expr {
@@ -1098,6 +1113,48 @@ fn view() -> Html {
     }
 
     #[test]
+    fn test_explicit_jsx_key_lowers_to_browser_key_marker() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+fn view(item_id: String) -> Html {
+    <ul><li key={item_id}>Row</li></ul>
+}
+"#,
+        );
+        let before = format!("{:?}", find_function_body(&module, "view"));
+        assert!(
+            before.contains(r#"String("key")"#),
+            "parser did not preserve key: {before}"
+        );
+        rewrite_module(&mut module, None);
+        let after = format!("{:?}", find_function_body(&module, "view"));
+        assert!(
+            after.contains("data-nulang-key"),
+            "compiler dropped explicit key: {after}"
+        );
+        assert!(
+            !after.contains(r#"String("key")"#),
+            "untranslated key leaked into browser markup: {after}"
+        );
+    }
+
+    #[test]
+    fn test_generated_client_runtime_exposes_semantic_dom_host() {
+        let js = generate_client_runtime();
+        assert!(
+            js.contains("nulangUiDom"),
+            "DOM host is missing from generated bundle"
+        );
+        assert!(
+            js.contains("data-nulang-node-id"),
+            "keyed identity marker missing"
+        );
+    }
+
+    #[test]
     fn test_client_runtime_contains_hydrate_and_signal_api() {
         let js = generate_client_runtime();
         assert!(js.contains("hydrate"), "hydrate not found");
@@ -1112,6 +1169,13 @@ fn view() -> Html {
             js.contains("window.location.reload"),
             "server actions should reload the page after POST"
         );
+    }
+
+    #[test]
+    fn test_keyed_html_loads_dom_host_without_signals_or_actions() {
+        let html = r#"<ul><li data-nulang-key="row-17">Item</li></ul>"#;
+        let out = inject_client_runtime_script(html);
+        assert!(out.contains(r#"<script src="/app.client.js"></script>"#));
     }
 
     #[test]

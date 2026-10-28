@@ -1,0 +1,92 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Nulang UI DOM host regression tests</title>
+<div id="mount"></div><pre id="results">running</pre>
+<script src="nulang-ui-dom.js"></script>
+<script>
+"use strict";
+const tests = [];
+function test(name, fn) { tests.push({name, fn}); }
+function assert(condition, detail) { if (!condition) throw Error(detail || "assertion failed"); }
+const str = value => ({type:"string", value});
+const bool = value => ({type:"bool", value});
+const entry = (id, kind, properties={}, children=[]) => ({id,kind,properties,children});
+function snapshot(revision, nodes, root="root") {
+  return {protocol:"nulang-ui/1",document_id:"test",revision:String(revision),root,nodes};
+}
+function patch(from,to,operations,acknowledged_inputs=[]) {
+  return {protocol:"nulang-ui/1",document_id:"test",base_revision:String(from),revision:String(to),operations,acknowledged_inputs};
+}
+function setup(nodes) {
+  const container=document.getElementById("mount"); container.replaceChildren();
+  return window.nulangUiDom.createHost(container,snapshot(1,nodes));
+}
+
+test("keyed reorder retains original row nodes and focus", () => {
+  const host=setup([entry("root","div",{},["a","b","c"]),entry("a","button",{text:str("A")}),entry("b","input",{value:str("bbb")}),entry("c","button",{text:str("C")})]);
+  const before=host.element("b"), a=host.element("a"), c=host.element("c");
+  before.focus(); before.setSelectionRange(1,2);
+  host.applyPatch(patch(1,2,[{op:"replace_children",node_id:"root",children:["c","a","b"]}]));
+  assert(host.element("b")===before && host.element("a")===a && host.element("c")===c,"row identity changed");
+  assert(document.activeElement===before,"focus lost");
+  assert(before.selectionStart===1 && before.selectionEnd===2,"selection lost");
+  assert([...document.getElementById("mount").firstElementChild.children].map(n=>n.dataset.nulangNodeId).join(",")==="c,a,b","incorrect keyed order");
+});
+
+test("local typing wins over old patch, then acknowledgement releases ownership", () => {
+  const received=[];
+  const host=setup([entry("root","form",{},["title"]),entry("title","input",{value:str("")})]);
+  host.onInput = detail => received.push(detail);
+  const input=host.element("title");
+  input.value="abc";input.dispatchEvent(new Event("input",{bubbles:true}));
+  assert(received.length===1 && received[0].sequence==="1","input event sequence missing");
+  host.applyPatch(patch(1,2,[{op:"set_property",node_id:"title",name:"value",value:str("old")}]));
+  assert(input.value==="abc","local input overwritten");
+  host.applyPatch(patch(2,3,[{op:"set_property",node_id:"title",name:"value",value:str("ABC")}],[{node_id:"title",property:"value",sequence:"1"}]));
+  assert(input.value==="ABC","acknowledged value not applied");
+});
+
+test("composition defers patches until IME finishes", () => {
+  const host=setup([entry("root","form",{},["title"]),entry("title","input",{value:str("")})]);
+  const input=host.element("title");
+  input.dispatchEvent(new CompositionEvent("compositionstart",{bubbles:true}));
+  assert(host.applyPatch(patch(1,2,[{op:"set_property",node_id:"title",name:"placeholder",value:str("new")}]))==="deferred","composing input patched");
+  assert(!input.placeholder,"composition modified DOM");
+  input.dispatchEvent(new CompositionEvent("compositionend",{bubbles:true}));
+  assert(input.placeholder==="new" && host.document.revision==="2","queued patch not applied");
+});
+
+test("rejects revision gaps, duplicates, malicious URLs and markup without mutation", () => {
+  const host=setup([entry("root","div",{},["link"]),entry("link","a",{href:str("/ok"),text:str("safe")})]);
+  const existing=host.element("link");
+  assert(host.applyPatch(patch(1,2,[]))==="applied","valid patch rejected");
+  assert(host.applyPatch(patch(1,2,[]))==="stale","duplicate patch not ignored");
+  let failed=false;
+  try {host.applyPatch(patch(3,4,[]));} catch(e) {failed=true;}
+  assert(failed && host.document.revision==="2","gap advanced state");
+  failed=false;
+  try {host.applyPatch(patch(2,3,[{op:"set_property",node_id:"link",name:"href",value:str("javascript:alert(1)")}]))} catch(e) {failed=true;}
+  assert(failed && host.document.revision==="2" && existing.getAttribute("href")==="/ok","unsafe URL committed");
+  host.applyPatch(patch(2,3,[{op:"set_property",node_id:"link",name:"text",value:str("<img src=x onerror=alert(1)>")}]));
+  assert(existing.textContent==="<img src=x onerror=alert(1)>" && !existing.querySelector("img"),"markup executed");
+});
+
+test("root replacement and removed inputs do not resurrect removed controls", () => {
+  const host=setup([entry("root","form",{},["title"]),entry("title","input",{value:str("")})]);
+  const original=host.element("title");original.value="local";original.dispatchEvent(new Event("input"));
+  host.applyPatch(patch(1,2,[{op:"replace_children",node_id:"root",children:[]},{op:"remove_node",node_id:"title"}]));
+  assert(host.element("title")===undefined && !original.isConnected,"old input was retained");
+  host.applyPatch(patch(2,3,[{op:"upsert_node",node:entry("title","input",{value:str("server")})},{op:"replace_children",node_id:"root",children:["title"]}]));
+  assert(host.element("title").value==="server","stale local input resurrected");
+});
+
+(async () => {
+ const out=[];
+ for(const {name,fn} of tests) {
+   try {await fn();out.push("PASS "+name)} catch(e){out.push("FAIL "+name+": "+e.message)}
+ }
+ const failed=out.filter(s=>s.startsWith("FAIL")).length;
+ document.getElementById("results").textContent=out.join("\n")+"\n"+(failed?"FAILURES "+failed:"ALL PASS");
+ document.documentElement.setAttribute("data-test-status",failed?"failed":"passed");
+})();
+</script>
