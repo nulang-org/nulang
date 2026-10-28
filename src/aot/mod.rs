@@ -488,7 +488,7 @@ impl AotModule {
         // so they record interpreter-parity runtime errors (48-bit overflow,
         // type errors) in a thread-local. Surface it as the run's error so
         // the AOT backend agrees with the interpreter.
-        if let Some(msg) = crate::jit::runtime::aot_take_pending_error() {
+        if let Some(error) = crate::jit::runtime::aot_take_pending_native_error() {
             // Clean up before returning (mirror the normal path).
             unsafe {
                 crate::jit::runtime::clear_jit_callbacks();
@@ -497,10 +497,7 @@ impl AotModule {
             crate::jit::runtime::aot_clear_constants();
             clear_aot_module_ctx();
             let _ = crate::jit::runtime::aot_take_heap();
-            return Err(crate::types::NuError::runtime_error(
-                msg,
-                crate::types::Span::default(),
-            ));
+            return Err(error.into_nu_error());
         }
 
         // Clean up: reconstruct Box to drop callbacks and free heap/GC.
@@ -586,14 +583,11 @@ impl AotModule {
         // Clear helper context before running the scheduler.
         crate::jit::runtime::clear_jit_callbacks();
         clear_aot_dispatch();
-        if let Some(msg) = crate::jit::runtime::aot_take_pending_error() {
+        if let Some(error) = crate::jit::runtime::aot_take_pending_native_error() {
             crate::jit::runtime::aot_clear_constants();
             clear_aot_module_ctx();
             let _ = crate::jit::runtime::aot_take_heap();
-            return Err(crate::types::NuError::runtime_error(
-                msg,
-                crate::types::Span::default(),
-            ));
+            return Err(error.into_nu_error());
         }
 
         crate::jit::runtime::aot_clear_constants();
@@ -972,7 +966,7 @@ macro_rules! define_aot_perform {
             match handled {
                 Some(v) => v.as_raw(),
                 None => {
-                    crate::jit::runtime::aot_set_pending_error(format!(
+                    crate::jit::runtime::aot_set_pending_effect_error(format!(
                         "Unhandled effect: '{}.{}'",
                         effect, op
                     ));

@@ -1,4 +1,15 @@
 # Nulang Changelog
+### AOT unhandled-effect category and WASM fail-closed parity — 2026-10-28
+- **Native AOT preserves the bytecode interpreter's `EffectError` category for an unhandled non-exhaustive-match effect.** The first pending compiled error retains its runtime/effect kind, with compatibility for existing message-only JIT consumers.
+- **The default WASM backend now rejects MIR containing the reserved non-exhaustive-match fallback effect rather than silently returning `nil`.** This is a restricted-profile rejection, not full WASM effect-error support; the typed WASM error path remains future work.
+- **Deterministic regressions pin both the cross-backend outcome and the WASM unsupported boundary.** Full nightly shards and exact-head CI remain necessary before merging.
+
+### October RustSec dependency remediation (validation pending) — 2026-10-25
+- **Updated Wasmtime 48.0.7, compatible Cranelift/Pulley packages, rustls-webpki 0.103.16, webpki-roots 1.0.10 and ctutils 0.4.4** with Cargo's dependency resolver.
+- **Migrated libSQL remote TLS to a custom connector based on supported rustls 0.23 and tokio-rustls 0.26.** This retains libSQL local/remote behavior, native root certificates, server-name verification and Hyper 0.14 protocol compatibility without pulling unsupported rustls-webpki 0.102.
+- **Release status:** tests of the certificate verifier, local SQLite behavior, full cargo audit and exact-head CI are mandatory before promotion. No security advisory is waived. See #2093.
+
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
