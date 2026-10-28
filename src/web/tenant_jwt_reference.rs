@@ -169,3 +169,82 @@ impl<R: RevocationPolicy> TrustedTokenVerifier for PinnedEd25519Verifier<R> {
         self.verify_at(bearer, now)
     }
 }
+
+/*
+ * Server-controlled Ed25519 verification key rollover. A key-ring update is
+ * an explicit replacement of trusted server configuration; unverified JWT
+ * headers are NEVER used as URLs or sources of new keys.
+ */
+impl<R: RevocationPolicy> RevocationPolicy for std::sync::Arc<R> {
+    fn is_revoked(&self, issuer: &str, subject: &str, jti: &str) -> Option<bool> {
+        (**self).is_revoked(issuer, subject, jti)
+    }
+}
+
+/// Immutable pinned trust bundle for a staged key rollover. Do not generate
+/// or load verification keys from untrusted incoming JWT metadata. No network
+/// discovery or hot reload occurs; a caller must explicitly replace this ring.
+pub struct PinnedEd25519KeyRing<R: RevocationPolicy> {
+    keys: std::collections::HashMap<String, PinnedEd25519Verifier<std::sync::Arc<R>>>,
+}
+
+impl<R: RevocationPolicy> PinnedEd25519KeyRing<R> {
+    pub fn new(
+        issuer: &str,
+        audience: &str,
+        configured_keys: Vec<(String, VerifyingKey)>,
+        revocation: R,
+    ) -> Option<Self> {
+        // Bound the memory/selection surface; don't silently overwrite
+        // duplicate key identifiers during server configuration loading.
+        if configured_keys.is_empty() || configured_keys.len() > 16 {
+            return None;
+        }
+        let revocation = std::sync::Arc::new(revocation);
+        let mut keys = std::collections::HashMap::with_capacity(configured_keys.len());
+        for (kid, public_key) in configured_keys {
+            if keys.contains_key(&kid) {
+                return None;
+            }
+            let verifier = PinnedEd25519Verifier::new(
+                issuer,
+                audience,
+                &kid,
+                public_key,
+                std::sync::Arc::clone(&revocation),
+            )?;
+            keys.insert(kid, verifier);
+        }
+        Some(Self { keys })
+    }
+}
+
+impl<R: RevocationPolicy> TrustedTokenVerifier for PinnedEd25519KeyRing<R> {
+    fn verify(&self, bearer: &str) -> Option<String> {
+        // Inspect ONLY a bounded, structurally strict header to select an
+        // already trusted key. The selected verifier independently rechecks
+        // the entire header, the exact signing bytes, claim semantics and
+        // revocation before supplying a verified principal.
+        if bearer.is_empty() || bearer.len() > MAX_COMPACT_TOKEN || !bearer.is_ascii() {
+            return None;
+        }
+        let mut segments = bearer.split('.');
+        let header = segments.next()?;
+        let payload = segments.next()?;
+        let signature = segments.next()?;
+        if segments.next().is_some()
+            || header.is_empty()
+            || payload.is_empty()
+            || signature.is_empty()
+            || header.len() > 2048
+        {
+            return None;
+        }
+        let decoded = URL_SAFE_NO_PAD.decode(header).ok()?;
+        let protected: Header = serde_json::from_slice(&decoded).ok()?;
+        if protected.alg != "EdDSA" || protected.typ != "at+jwt" {
+            return None;
+        }
+        self.keys.get(&protected.kid)?.verify(bearer)
+    }
+}
