@@ -8,7 +8,9 @@
 use crate::web::bindings::compile_route_bindings;
 use crate::web::contracts::ContractCompilation;
 use crate::web::package_contracts::compile_contracts_from_tree;
-use crate::web::runtime_bindings::{compile_route_segments, RuntimeRouteSegment};
+use crate::web::runtime_bindings::{
+    compare_route_patterns, compile_route_segments, RoutePatternRelation,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -61,10 +63,8 @@ pub fn validate_compilation(
 /// IDE messages, or hard build errors without coupling that policy to IR JSON.
 pub fn validation_diagnostics(compilation: &ContractCompilation) -> Vec<String> {
     let mut diagnostics = compilation.diagnostics.clone();
-    // Identical route shapes are indistinguishable to HTTP dispatch, even when
-    // capture names or source-level types differ. Never let source-order or
-    // silent contract deduplication decide which handler wins.
-    let mut shapes: HashMap<(String, Vec<RuntimeRouteSegment>), &str> = HashMap::new();
+    // Compile from the same parser used by request dispatch. Bad patterns
+    // must be rejected even if they never encounter another route.
     let mut named: HashMap<&str, (&str, &str)> = HashMap::new();
     for route in &compilation.routes {
         diagnostics.extend(compile_route_bindings(route).diagnostics);
@@ -82,29 +82,27 @@ pub fn validation_diagnostics(compilation: &ContractCompilation) -> Vec<String> 
                 ));
             }
         }
-        match compile_route_segments(&route.path) {
-            Ok(segments) => {
-                let normalized = segments
-                    .into_iter()
-                    .map(|segment| match segment {
-                        RuntimeRouteSegment::PathParam(_) => {
-                            RuntimeRouteSegment::PathParam(String::new())
-                        }
-                        literal => literal,
-                    })
-                    .collect();
-                let key = (route.method.to_ascii_uppercase(), normalized);
-                if let Some(first_path) = shapes.get(&key) {
-                    diagnostics.push(format!(
-                        "ambiguous route {} {} conflicts with {} {} (indistinguishable paths)",
-                        route.method, route.path, route.method, first_path
-                    ));
-                } else {
-                    shapes.insert(key, route.path.as_str());
-                }
+        if let Err(error) = compile_route_segments(&route.path) {
+            diagnostics.push(format!("route {} {}: {error}", route.method, route.path));
+        }
+    }
+
+    // Both ambiguous equal shapes (including renamed/typed captures) and
+    // incomparable crossing patterns are rejected using the SAME specificity
+    // comparator that HTTP routing uses. Literal overrides are valid.
+    // Evaluating each pair once avoids double-reporting the same collision.
+    for (index, left) in compilation.routes.iter().enumerate() {
+        for right in compilation.routes.iter().skip(index + 1) {
+            if !left.method.eq_ignore_ascii_case(&right.method) {
+                continue;
             }
-            Err(error) => {
-                diagnostics.push(format!("route {} {}: {error}", route.method, route.path))
+            if let Ok(RoutePatternRelation::Ambiguous) =
+                compare_route_patterns(&left.path, &right.path)
+            {
+                diagnostics.push(format!(
+                    "ambiguous route {} {} conflicts with {} {} (no strict specificity winner)",
+                    left.method, left.path, right.method, right.path,
+                ));
             }
         }
     }
@@ -311,5 +309,47 @@ mod tests {
         let diagnostics = validate_compilation(compilation).unwrap_err();
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].contains("has no same-named parameter"));
+    }
+    #[test]
+    fn ambiguous_path_patterns_fail_validation_before_serving() {
+        let mut first = contract("/users/{first}", Vec::new());
+        first.params.clear();
+        let mut second = contract("/users/{second}", Vec::new());
+        second.params.clear();
+        let diagnostics = validation_diagnostics(&ContractCompilation {
+            routes: vec![first, second],
+            diagnostics: Vec::new(),
+        });
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0].contains("ambiguous"), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn crossing_literal_and_parameter_patterns_are_ambiguous() {
+        let mut first = contract("/{a}/fixed", Vec::new());
+        first.params.clear();
+        let mut second = contract("/fixed/{b}", Vec::new());
+        second.params.clear();
+        let diagnostics = validation_diagnostics(&ContractCompilation {
+            routes: vec![first, second],
+            diagnostics: Vec::new(),
+        });
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0].contains("ambiguous"), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn strict_literal_specificity_and_different_methods_are_allowed() {
+        let mut parameter = contract("/users/{id}", Vec::new());
+        parameter.params.clear();
+        let mut literal = contract("/users/me", Vec::new());
+        literal.params.clear();
+        let mut post = parameter.clone();
+        post.method = "POST".into();
+        let diagnostics = validation_diagnostics(&ContractCompilation {
+            routes: vec![parameter, literal, post],
+            diagnostics: Vec::new(),
+        });
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 }

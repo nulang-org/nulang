@@ -6,7 +6,7 @@
 //! registrations, matching precompiled path segments, and invoking handlers
 //! whose complete argument list is proven by the binding plan.
 
-use crate::runtime::WebRoute;
+use crate::runtime::{HttpMethod, WebRoute};
 use crate::web::bindings::RouteBindingSource;
 use crate::web::contracts::ContractCompilation;
 use crate::web::handler_call::render_bound_handler;
@@ -14,11 +14,12 @@ use crate::web::request_bindings::{
     bind_request_arguments, RequestBindingValues, RequestDecodeError,
 };
 use crate::web::runtime_bindings::{
-    attach_runtime_route_plans, match_attached_route, render_bound_route_handler, RuntimeRoutePlan,
-    RuntimeRouteSegment, RuntimeWebRoute,
+    attach_runtime_route_plans, compare_route_patterns, match_attached_route,
+    render_bound_route_handler, RoutePatternRelation, RuntimeRoutePlan, RuntimeRouteSegment,
+    RuntimeWebRoute,
 };
 use crate::web::validation::compile_validated_contracts_from_tree;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::Path;
 
@@ -70,6 +71,74 @@ pub fn match_route(
 
 fn request_path_only(target: &str) -> &str {
     target.split_once('?').map_or(target, |(path, _)| path)
+}
+
+/// A routing decision, including protocol responses for paths that exist but
+/// do not support the requested method.
+pub enum RouteResolution<'a> {
+    Matched(&'a RuntimeWebRoute, HashMap<String, String>),
+    AutomaticOptions(String),
+    MethodNotAllowed(String),
+    NotFound,
+}
+
+/// Select a matching route independent of registration order when one route
+/// has a strictly more specific pattern. Ambiguous same-method patterns are
+/// rejected by the Web Contract validator before serving.
+pub fn resolve_route<'a>(
+    routes: &'a [RuntimeWebRoute],
+    method: HttpMethod,
+    target: &str,
+) -> RouteResolution<'a> {
+    let mut allowed = BTreeSet::new();
+    let mut exact = None;
+    let mut get_for_head = None;
+
+    for route in routes {
+        let Some(params) = match_route(route, target) else {
+            continue;
+        };
+        allowed.insert(route.route.method.as_str());
+        if route.route.method == method {
+            prefer_more_specific(&mut exact, route, params);
+        } else if method == HttpMethod::Head && route.route.method == HttpMethod::Get {
+            prefer_more_specific(&mut get_for_head, route, params);
+        }
+    }
+
+    if let Some((route, params)) = exact.or(get_for_head) {
+        return RouteResolution::Matched(route, params);
+    }
+    if allowed.is_empty() {
+        return RouteResolution::NotFound;
+    }
+
+    if allowed.contains("GET") {
+        allowed.insert("HEAD");
+    }
+    allowed.insert("OPTIONS");
+    let allow = allowed.into_iter().collect::<Vec<_>>().join(", ");
+    if method == HttpMethod::Options {
+        RouteResolution::AutomaticOptions(allow)
+    } else {
+        RouteResolution::MethodNotAllowed(allow)
+    }
+}
+
+fn prefer_more_specific<'a>(
+    selected: &mut Option<(&'a RuntimeWebRoute, HashMap<String, String>)>,
+    candidate: &'a RuntimeWebRoute,
+    captures: HashMap<String, String>,
+) {
+    let replace = selected.as_ref().is_none_or(|(existing, _)| {
+        matches!(
+            compare_route_patterns(&existing.route.path, &candidate.route.path),
+            Ok(RoutePatternRelation::LessSpecific)
+        )
+    });
+    if replace {
+        *selected = Some((candidate, captures));
+    }
 }
 
 /// Invoke a path-only route directly when the existing runtime plan marks it as
