@@ -179,6 +179,7 @@ mod tests {
             effects: Vec::new(),
             reference_capability: None,
             placement: Some("server".to_string()),
+            body_max_bytes: None,
         }
     }
 
@@ -345,6 +346,7 @@ mod tests {
             effects: Vec::new(),
             reference_capability: None,
             placement: None,
+            body_max_bytes: None,
         };
 
         let compiled = compile_route_bindings(&contract);

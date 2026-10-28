@@ -51,6 +51,9 @@ pub struct IrRoute {
     /// conflated with this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference_capability: Option<String>,
+    /// Explicit validated route body-size policy, in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_max_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -138,6 +141,7 @@ pub fn generate_deployment_ir(
             error_type: contract.and_then(|c| c.error_type.clone()),
             effects: contract.map(|c| c.effects.clone()).unwrap_or_default(),
             reference_capability: contract.and_then(|c| c.reference_capability.clone()),
+            body_max_bytes: contract.and_then(|c| c.body_max_bytes),
         });
     }
 

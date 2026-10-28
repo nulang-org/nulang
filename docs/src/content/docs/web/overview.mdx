@@ -145,6 +145,19 @@ fn conflict() -> Problem {
 
 This remains experimental. Generic typed JSON results (`Json[T]`), resource locations for created responses, streaming, and content negotiation are not yet implemented.
 
+### Per-route request body policy (experimental)
+
+A compiler-validated handler can declare a request-body limit:
+
+```nulang
+@web_policy(body_max_bytes: "4096")
+fn upload() -> Text {
+    plaintext("accepted")
+}
+```
+
+The HTTP dev server returns `413 Payload Too Large` before calling this handler when the incoming body exceeds 4,096 bytes. Limits must be between 1 and 1,048,576 bytes; repeated annotations use the strictest limit. Unsupported `@web_policy` keys fail compilation rather than creating an unenforced authorization requirement. The policy only applies when the compiler's validated route plan is attached (for example, through `nula dev`), not the legacy raw route-registration path. It runs **after** the global HTTP parser has read and capped the body, so it does not lower pre-routing buffering costs. It is not a substitute for authentication, authorization, or production HTTP hardening.
+
 ### Building HTML
 
 The `stdlib::web::types` module defines `Html` as an **opaque type** — a compile-time distinction from `String` that erases at runtime. This is why you can't accidentally splice an unescaped string into a page:

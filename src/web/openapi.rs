@@ -139,6 +139,9 @@ fn operation_for(route: &RouteContract) -> Value {
         operation.insert("requestBody".to_string(), request_body);
     }
     operation.insert("responses".to_string(), Value::Object(responses));
+    if let Some(bytes) = route.body_max_bytes {
+        operation.insert("x-nulang-body-max-bytes".into(), json!(bytes));
+    }
 
     if !binding_compilation.bindings.is_empty() {
         operation.insert(
@@ -355,6 +358,7 @@ mod tests {
             effects: vec!["DB".to_string()],
             reference_capability: None,
             placement: Some("server".to_string()),
+            body_max_bytes: None,
         }
     }
 
@@ -400,6 +404,23 @@ mod tests {
                 "missing {mime} for {ty}"
             );
         }
+    }
+
+    #[test]
+    fn route_body_size_policy_is_advertised_without_claiming_authentication() {
+        let mut contract = route();
+        contract.body_max_bytes = Some(4096);
+        let doc = generate_openapi(
+            &ContractCompilation {
+                routes: vec![contract],
+                diagnostics: vec![],
+            },
+            "API",
+            "1",
+        );
+        let op = &doc["paths"]["/users/{id}"]["get"];
+        assert_eq!(op["x-nulang-body-max-bytes"], 4096);
+        assert!(op.get("security").is_none());
     }
 
     #[test]

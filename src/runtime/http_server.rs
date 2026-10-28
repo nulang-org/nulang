@@ -1036,60 +1036,79 @@ impl WebDevServer {
                 crate::web::dispatch::match_route(r, &request.path).map(|params| (r, params))
             })
         {
-            let captured =
-                HttpRequestBindingInputs::capture(&request.path, &request.headers, &request.body);
-            if let Some(response) = invalid_ui_action_response(&captured) {
-                response
+            // Compiler-attached endpoint policy runs before request binding,
+            // user code and response-cookie effects. Legacy routes have no
+            // policy metadata and retain their existing behavior.
+            if route
+                .plan
+                .as_ref()
+                .and_then(|plan| plan.body_max_bytes)
+                .is_some_and(|max_bytes| request.body.len() > max_bytes)
+            {
+                HttpResponse {
+                    status: 413,
+                    headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+                    body: b"Payload too large".to_vec(),
+                }
             } else {
-                let values = captured.values(&params, &request.headers);
-                let ctx = RequestContext {
-                    request: request.clone(),
-                    params: params.clone(),
-                };
-                let rendered =
-                    with_request_context(ctx, || match render_direct_request(route, &values) {
-                        Ok(Some(rendered)) => Ok(Some(rendered)),
-                        Ok(None) => Ok(render_route_handler(
-                            &route.route.handler_module,
-                            route.route.handler_func_idx,
-                            None,
-                        )),
-                        Err(error) => Err(error),
-                    });
-                match rendered {
-                    Ok(Some(html)) => match Self::render_web_response(route, &html) {
-                        Ok(response) => response,
-                        Err(error) => {
-                            eprintln!("invalid web response: {error}");
-                            HttpResponse {
-                                status: 500,
-                                headers: vec![(
-                                    "Content-Type".into(),
-                                    "text/plain; charset=utf-8".into(),
-                                )],
-                                body: b"Internal server error".to_vec(),
+                let captured = HttpRequestBindingInputs::capture(
+                    &request.path,
+                    &request.headers,
+                    &request.body,
+                );
+                if let Some(response) = invalid_ui_action_response(&captured) {
+                    response
+                } else {
+                    let values = captured.values(&params, &request.headers);
+                    let ctx = RequestContext {
+                        request: request.clone(),
+                        params: params.clone(),
+                    };
+                    let rendered =
+                        with_request_context(ctx, || match render_direct_request(route, &values) {
+                            Ok(Some(rendered)) => Ok(Some(rendered)),
+                            Ok(None) => Ok(render_route_handler(
+                                &route.route.handler_module,
+                                route.route.handler_func_idx,
+                                None,
+                            )),
+                            Err(error) => Err(error),
+                        });
+                    match rendered {
+                        Ok(Some(html)) => match Self::render_web_response(route, &html) {
+                            Ok(response) => response,
+                            Err(error) => {
+                                eprintln!("invalid web response: {error}");
+                                HttpResponse {
+                                    status: 500,
+                                    headers: vec![(
+                                        "Content-Type".into(),
+                                        "text/plain; charset=utf-8".into(),
+                                    )],
+                                    body: b"Internal server error".to_vec(),
+                                }
                             }
-                        }
-                    },
-                    Ok(None) => HttpResponse {
-                        status: 500,
-                        headers: vec![("Content-Type".into(), "text/plain".into())],
-                        body: b"Internal server error".to_vec(),
-                    },
-                    Err(DirectRequestRenderError::Decode(error)) => {
-                        let problem = request_decode_problem_response(&error);
-                        HttpResponse {
-                            status: problem.status,
-                            headers: problem.headers,
-                            body: problem.body,
-                        }
-                    }
-                    Err(DirectRequestRenderError::Execution(error)) => {
-                        eprintln!("typed route dispatch error: {error}");
-                        HttpResponse {
+                        },
+                        Ok(None) => HttpResponse {
                             status: 500,
                             headers: vec![("Content-Type".into(), "text/plain".into())],
                             body: b"Internal server error".to_vec(),
+                        },
+                        Err(DirectRequestRenderError::Decode(error)) => {
+                            let problem = request_decode_problem_response(&error);
+                            HttpResponse {
+                                status: problem.status,
+                                headers: problem.headers,
+                                body: problem.body,
+                            }
+                        }
+                        Err(DirectRequestRenderError::Execution(error)) => {
+                            eprintln!("typed route dispatch error: {error}");
+                            HttpResponse {
+                                status: 500,
+                                headers: vec![("Content-Type".into(), "text/plain".into())],
+                                body: b"Internal server error".to_vec(),
+                            }
                         }
                     }
                 }
