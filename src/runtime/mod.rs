@@ -76,6 +76,7 @@ mod registry;
 pub mod resp;
 pub mod resp_cache;
 mod spawn;
+mod web_signed_auth;
 #[cfg(feature = "native-codegen")]
 pub(crate) use spawn::spawn_from_module_with_authority;
 mod timer;
@@ -132,6 +133,7 @@ pub use resp_cache::*;
 pub use scheduler::*;
 pub use supervisor::*;
 pub use timer::*;
+pub use web_signed_auth::{SignedTenantAuthorizer, WebTenantResolver};
 
 use crate::crdt_peer_sync::PeerCrdtFrontiers;
 use crate::types::{ExitReason, NuError, Span, VmSuspension};

@@ -883,6 +883,30 @@ impl Drop for ConnectionLease {
     }
 }
 
+/// Run a single host-owned capability check. All unconfigured or panicking
+/// verifiers deny; client-declared permission headers are never authoritative.
+fn capability_allowed(
+    request: &HttpRequest,
+    capability: &str,
+    authorizer: Option<&Arc<WebCapabilityAuthorizer>>,
+) -> bool {
+    authorizer.is_some_and(|verify| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| verify(request, capability)))
+            .unwrap_or(false)
+    })
+}
+
+fn denied_capability_response() -> HttpResponse {
+    HttpResponse {
+        status: 403,
+        headers: vec![
+            ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+            ("Cache-Control".into(), "no-store".into()),
+        ],
+        body: b"Forbidden".to_vec(),
+    }
+}
+
 /// Dev server that dispatches registered `Web.route` handlers and falls back
 /// to static files for unmatched paths.
 #[derive(Debug)]
@@ -1067,6 +1091,33 @@ impl WebDevServer {
 
         let mut response = if path.starts_with(Self::SSE_PATH_PREFIX) {
             let room = &path[Self::SSE_PATH_PREFIX.len()..];
+            // The SSE endpoint is reserved and bypasses ordinary route plans.
+            // Require exact room-scoped authority BEFORE subscribing or
+            // emitting replay history. No configured verifier => deny.
+            // Slash, query and control characters cannot affect the scope.
+            let valid_room = !room.is_empty()
+                && room.len() <= 96
+                && room.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'.' | b'-' | b'_')
+                });
+            if !valid_room || request.method != HttpMethod::Get {
+                HttpServerState::write_response(
+                    &mut stream,
+                    &HttpResponse {
+                        status: 400,
+                        headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+                        body: b"Invalid SSE request".to_vec(),
+                    },
+                );
+                return;
+            }
+            let permission = format!("sse.subscribe.{room}");
+            if !capability_allowed(&request, &permission, authorizer.as_ref()) {
+                HttpServerState::write_response(&mut stream, &denied_capability_response());
+                return;
+            }
             Self::serve_sse(room, &mut stream, shutdown.clone());
             return;
         } else if let Some((route, params)) = routes
@@ -1085,23 +1136,11 @@ impl WebDevServer {
             // authorizer cannot grant access, regardless of request headers.
             // Each declared permission is required (logical AND).
             if !required.is_empty()
-                && !required.iter().all(|permission| {
-                    authorizer.as_ref().is_some_and(|verify| {
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            verify(&request, permission)
-                        }))
-                        .unwrap_or(false)
-                    })
-                })
+                && !required
+                    .iter()
+                    .all(|permission| capability_allowed(&request, permission, authorizer.as_ref()))
             {
-                HttpResponse {
-                    status: 403,
-                    headers: vec![
-                        ("Content-Type".into(), "text/plain; charset=utf-8".into()),
-                        ("Cache-Control".into(), "no-store".into()),
-                    ],
-                    body: b"Forbidden".to_vec(),
-                }
+                denied_capability_response()
             } else {
                 // Compiler-attached endpoint policy runs before request binding,
                 // user code and response-cookie effects. Legacy routes have no

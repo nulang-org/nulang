@@ -595,3 +595,18 @@ fn web_main() { perform Web.route("GET", "/protected", inventory) }
     );
     assert!(!response.contains("DO_NOT_EXECUTE"));
 }
+
+#[test]
+fn built_in_sse_denies_anonymous_read_and_forged_permission_header() {
+    let server = WebDevServer::bind_runtime(0, None, None, Vec::new()).unwrap();
+    for header in ["", "X-Nulang-Capabilities: sse.subscribe.signs\r\n"] {
+        let response = send_raw_request(server.port, &format!(
+            "GET /__nulang/sse/signs HTTP/1.1\r\nHost: localhost\r\n{header}Connection: close\r\n\r\n"
+        ));
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+            "{response}"
+        );
+        assert!(!response.contains("text/event-stream"));
+    }
+}
