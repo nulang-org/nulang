@@ -304,6 +304,7 @@ opaque type Created = String
 opaque type NoContent = String
 opaque type Problem = String
 opaque type InvalidForm = String
+opaque type FormOutcome = String
 fn endpoint() -> {kind} ! {{Web}} {{ {expression} }}
 fn web_main() {{ perform Web.route("GET", "{path}", endpoint) }}
 "#
@@ -421,6 +422,47 @@ fn invalid_form_returns_422_html_fragment_over_http() {
     );
     assert_eq!(
         response_body(&response),
+        "<form id='edit'><p>Required</p></form>"
+    );
+}
+
+#[test]
+fn one_form_handler_returns_200_or_422_from_the_same_route() {
+    let route = status_result_route(
+        "/form-outcome",
+        "FormOutcome",
+        r#"if perform Web.header("X-Form-Valid") == "true" then {
+            perform Web.form_ok(perform Web.raw("<section id='saved'>Saved</section>"))
+        } else {
+            perform Web.form_invalid(perform Web.raw("<form id='edit'><p>Required</p></form>"))
+        }"#,
+    );
+    let server = WebDevServer::bind_runtime(0, None, None, vec![route]).unwrap();
+    let success = send_raw_request(
+        server.port,
+        "GET /form-outcome HTTP/1.1\r\nHost: localhost\r\nX-Form-Valid: true\r\nConnection: close\r\n\r\n",
+    );
+    let invalid = send_raw_request(
+        server.port,
+        "GET /form-outcome HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(success.starts_with("HTTP/1.1 200 OK\r\n"), "{success}");
+    assert!(
+        invalid.starts_with("HTTP/1.1 422 Unprocessable Entity\r\n"),
+        "{invalid}"
+    );
+    for result in [&success, &invalid] {
+        assert!(
+            result.contains("Content-Type: text/html; charset=utf-8\r\n"),
+            "{result}"
+        );
+    }
+    assert_eq!(
+        response_body(&success),
+        "<section id='saved'>Saved</section>"
+    );
+    assert_eq!(
+        response_body(&invalid),
         "<form id='edit'><p>Required</p></form>"
     );
 }

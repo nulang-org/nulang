@@ -429,6 +429,16 @@ pub(crate) fn perform_web_builtin(
             });
             Some(callbacks.alloc_string(&document.to_string()))
         }
+        Some("form_ok") | Some("form_invalid") => {
+            let html = resolve(constants, *regs.first()?);
+            let outcome = if op_name == Some("form_ok") {
+                "ok"
+            } else {
+                "invalid"
+            };
+            let envelope = serde_json::json!({ "outcome": outcome, "html": html });
+            Some(callbacks.alloc_string(&envelope.to_string()))
+        }
         Some("json") | Some("plaintext") | Some("created") | Some("invalid_form") => {
             let body = resolve(constants, *regs.first()?);
             Some(callbacks.alloc_string(&body))

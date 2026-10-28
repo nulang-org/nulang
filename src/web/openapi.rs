@@ -72,6 +72,7 @@ fn operation_for(route: &RouteContract) -> Value {
         Some(ResponseKind::NoContent) => ("204", "No content"),
         Some(ResponseKind::Problem) => ("default", "Problem response"),
         Some(ResponseKind::InvalidForm) => ("422", "Invalid form HTML"),
+        Some(ResponseKind::FormOutcome) => ("200", "Successful form HTML"),
         _ => ("200", "Successful response"),
     };
     let mut response = Map::new();
@@ -87,7 +88,10 @@ fn operation_for(route: &RouteContract) -> Value {
     }
     if let Some(kind) = kind {
         let schema = match kind {
-            ResponseKind::Html | ResponseKind::Text | ResponseKind::InvalidForm => {
+            ResponseKind::Html
+            | ResponseKind::Text
+            | ResponseKind::InvalidForm
+            | ResponseKind::FormOutcome => {
                 json!({"type": "string"})
             }
             ResponseKind::Json | ResponseKind::Created => json!({}),
@@ -121,6 +125,16 @@ fn operation_for(route: &RouteContract) -> Value {
         }
     }
     responses.insert(status.to_string(), Value::Object(response));
+    if kind == Some(ResponseKind::FormOutcome) {
+        responses.insert(
+            "422".into(),
+            json!({
+                "description": "Invalid form HTML",
+                "x-nulang-response-type": "FormOutcome",
+                "content": {"text/html": {"schema": {"type": "string"}}}
+            }),
+        );
+    }
     if status != "default" {
         if let Some(error_type) = &route.error_type {
             responses.insert(
@@ -403,6 +417,29 @@ mod tests {
                 "missing {mime} for {ty}"
             );
         }
+    }
+
+    #[test]
+    fn form_outcome_documents_both_success_and_validation_statuses() {
+        let mut contract = route();
+        contract.response_type = Some("FormOutcome".into());
+        contract.error_type = None;
+        let document = generate_openapi(
+            &ContractCompilation {
+                routes: vec![contract],
+                diagnostics: vec![],
+            },
+            "Form API",
+            "1.0",
+        );
+        let responses = &document["paths"]["/users/{id}"]["get"]["responses"];
+        for status in ["200", "422"] {
+            assert_eq!(
+                responses[status]["content"]["text/html"]["schema"]["type"], "string",
+                "missing HTML response for {status}"
+            );
+        }
+        assert!(responses.get("default").is_none());
     }
 
     #[test]

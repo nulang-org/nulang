@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Typed form success/validation outcomes — 2026-10-28
+- **`FormOutcome` allows one handler to return HTML 200 or HTML 422**, with compiler-checked `form_ok(Html)` and `form_invalid(Html)` constructors. A strictly decoded internal envelope separates status from HTML body and rejects ambiguous metadata.
+- **HTTP, OpenAPI and compiler regression coverage** pin the dual-status contract. This does not implement generic algebraic sum types, form validation policies, CSRF, or production-ready Web hosting.
+
 ### Typed HTML validation response — 2026-10-28
 - **`InvalidForm` is an explicit HTTP 422 HTML result**, exposed through `stdlib::web::response.invalid_form(Html)`. It preserves rendered form fragments without injecting the progressive-enhancement script and emits `text/html` in the runtime and OpenAPI.
 - **HTTP, compiler, and response tests pin status/body/media behavior.** The result always emits 422; a per-route typed success/validation union and dynamic response status are future work. The experimental dev server is not production-audited.

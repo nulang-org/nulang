@@ -39,6 +39,14 @@ fn invalid_registration() -> InvalidForm {
     invalid_form(perform Web.text("A required field is missing"))
 }
 
+fn register(valid: Bool) -> FormOutcome {
+    if valid then {
+        form_ok(perform Web.text("Registration saved"))
+    } else {
+        form_invalid(perform Web.text("Required field missing"))
+    }
+}
+
 app "api" {
     route "GET" "/health" -> health
     route "GET" "/robots.txt" -> robots

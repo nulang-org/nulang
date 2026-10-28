@@ -606,6 +606,22 @@ impl StdLib {
                     description: "Return HTTP 204 with an empty response body.",
                 },
                 BuiltinOp {
+                    name: "Web.form_ok",
+                    effect: "Web",
+                    op: "form_ok",
+                    signature: "form_ok(fragment: Html) -> FormOutcome",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Produce a typed HTTP 200 HTML form outcome.",
+                },
+                BuiltinOp {
+                    name: "Web.form_invalid",
+                    effect: "Web",
+                    op: "form_invalid",
+                    signature: "form_invalid(fragment: Html) -> FormOutcome",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Produce a typed HTTP 422 HTML form outcome.",
+                },
+                BuiltinOp {
                     name: "Web.invalid_form",
                     effect: "Web",
                     op: "invalid_form",
