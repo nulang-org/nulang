@@ -20,10 +20,11 @@ use crate::vm::{resolve_value_string, Value, CLOSURE_ENV_FLAG, VM};
 use crate::web::dispatch::{render_direct_request, DirectRequestRenderError};
 use crate::web::http_problem::request_decode_problem_response;
 use crate::web::http_request::HttpRequestBindingInputs;
+use crate::web::origin_admission::validate_mutation_origin;
 use crate::web::reactivity::inject_client_runtime_script;
 use crate::web::request_bindings::percent_decode_form;
 use crate::web::runtime_bindings::RuntimeWebRoute;
-use crate::web::session_preflight::{ReadScopeError, SessionReadGateway};
+use crate::web::session_preflight::{ReadScopeError, SessionMutationGateway, SessionReadGateway};
 
 /// HTTP method — must match the Nulang-level variant type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -882,6 +883,10 @@ impl Drop for ConnectionLease {
 struct SessionReadConfig {
     expected_host: String,
     gateway: Arc<SessionReadGateway>,
+    /// An absent write gateway deliberately disables all unsafe methods.
+    mutations: Option<Arc<SessionMutationGateway>>,
+    /// Audited, host-configured canonical origin for mutation provenance.
+    public_origin: Option<String>,
 }
 
 fn forbidden_read_response(status: u16) -> HttpResponse {
@@ -915,17 +920,33 @@ fn session_read_scope(
             .iter()
             .any(|b| b.source == crate::web::bindings::RouteBindingSource::Scope)
     });
+    // A secure write-mode cannot execute an unscoped mutation. The binding
+    // contract is the prerequisite for trusted identity in the handler.
+    let mutating = matches!(
+        request.method,
+        HttpMethod::Post | HttpMethod::Put | HttpMethod::Patch | HttpMethod::Delete
+    );
+    if mutating && config.is_some_and(|cfg| cfg.mutations.is_some()) && !guarded {
+        return Err(forbidden_read_response(403));
+    }
     if !guarded {
         return Ok(None);
     }
     let Some(config) = config else {
         return Err(forbidden_read_response(401));
     };
-    if request.method != HttpMethod::Get && request.method != HttpMethod::Head {
-        return Err(forbidden_read_response(403));
-    }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        config.gateway.admit(request, captures)
+        if mutating {
+            config
+                .mutations
+                .as_ref()
+                .ok_or(ReadScopeError::Forbidden)?
+                .admit(request, captures, &route.route.path)
+        } else if matches!(request.method, HttpMethod::Get | HttpMethod::Head) {
+            config.gateway.admit(request, captures)
+        } else {
+            Err(ReadScopeError::Forbidden)
+        }
     }));
     match result {
         Ok(Ok(scope)) => Ok(Some(scope)),
@@ -1016,6 +1037,61 @@ impl WebDevServer {
             Some(Arc::new(SessionReadConfig {
                 expected_host: expected_host.to_string(),
                 gateway,
+                mutations: None,
+                public_origin: None,
+            })),
+        )
+    }
+
+    /// Explicit, experimental session-backed mutation dispatch.
+    ///
+    /// No mutation executes without canonical same-origin provenance, a
+    /// compiler scope binding, a freshly loaded session, a session-owned CSRF
+    /// synchronizer and separately granted write permission for this method
+    /// and route. Production handlers must independently enforce transactional
+    /// authorization/idempotency before durable effects.
+    pub fn bind_runtime_with_session_mutations(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        public_origin: &str,
+        reads: Arc<SessionReadGateway>,
+        writes: Arc<SessionMutationGateway>,
+    ) -> std::io::Result<Self> {
+        let expected_host = public_origin
+            .strip_prefix("https://")
+            .or_else(|| public_origin.strip_prefix("http://"))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid trusted public origin",
+                )
+            })?;
+        // Validate the configuration through the same canonical provenance
+        // helper that will guard every live mutation request.
+        let trusted_headers = vec![
+            ("Host".to_string(), expected_host.to_string()),
+            ("Origin".to_string(), public_origin.to_string()),
+        ];
+        if validate_mutation_origin("POST", &trusted_headers, None, Some(public_origin)).is_err()
+            || expected_host.len() > 255
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid trusted public origin",
+            ));
+        }
+        Self::bind_runtime_internal(
+            port,
+            static_dir,
+            output_dir,
+            routes,
+            Some(Arc::new(SessionReadConfig {
+                expected_host: expected_host.to_string(),
+                gateway: reads,
+                mutations: Some(writes),
+                public_origin: Some(public_origin.to_string()),
             })),
         )
     }
@@ -1139,11 +1215,28 @@ impl WebDevServer {
         };
         let path = request.path.clone();
 
-        // The read-only authenticated adapter guards the entire HTTP origin,
-        // including static paths and SSE, before any user code or subscription.
+        // Authenticate provenance before *any* handler, mutation, static
+        // response, or SSE subscription. No untrusted X-Forwarded-* is used.
         if let Some(config) = read_config.as_deref() {
+            let method_allowed = match request.method {
+                HttpMethod::Get | HttpMethod::Head => true,
+                HttpMethod::Post | HttpMethod::Put | HttpMethod::Patch | HttpMethod::Delete => {
+                    config.mutations.is_some()
+                }
+                _ => false,
+            };
+            let origin_allowed = config.public_origin.as_deref().is_none_or(|origin| {
+                validate_mutation_origin(
+                    request.method.as_str(),
+                    &request.headers,
+                    None,
+                    Some(origin),
+                )
+                .is_ok()
+            });
             if !trusted_host_matches(&request.headers, &config.expected_host)
-                || !matches!(request.method, HttpMethod::Get | HttpMethod::Head)
+                || !method_allowed
+                || !origin_allowed
                 || path.starts_with(Self::SSE_PATH_PREFIX)
             {
                 HttpServerState::write_response(&mut stream, &forbidden_read_response(403));

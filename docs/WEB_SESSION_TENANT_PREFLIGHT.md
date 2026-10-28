@@ -107,3 +107,36 @@ independent deployment gates. Crucially, `ResourceAuthorization::can_preflight`
 is NOT reused for ordinary data read authorization; hosts must implement
 `ResourceReadAuthorization::can_read` separately. Unscoped public routes are
 still public and must not be used for tenant-private data.
+
+### Experimental mutation admission (not transactional authorization)
+
+`WebDevServer::bind_runtime_with_session_mutations` explicitly installs both
+`SessionReadGateway` and `SessionMutationGateway`, plus a trusted canonical
+origin (scheme and authority). In this opt-in mode, all requests undergo the
+same audited Host validation, and POST/PUT/PATCH/DELETE additionally require
+a matching Origin or strict Referer and permitted `Sec-Fetch-Site` provenance.
+Missing, duplicate, or mismatched provenance is rejected **before session
+lookup**. SSE remains disabled; unsupported methods are rejected.
+
+For a matched mutation route, admission requires a compiler-bound
+`from scope("principal_id")` or `from scope("tenant_id")` parameter.
+Unscoped and legacy POST routes are denied in this mode. The gateway reloads
+the opaque cookie session (including revocation and expiry), confirms tenant
+identity against the host-selected resource, validates **exactly one**
+synchronizer token gathered from raw headers/form bytes, then calls the
+independent `ResourceWriteAuthorization::can_mutate` policy with the
+principal, tenant, resource, HTTP method and trusted route registration path.
+Only after all gates succeed can typed route binding and handler execution
+begin. Failed admission returns generic 401, 403 or 503 responses without
+disclosing credentials or tenant IDs. Existing development bind methods remain
+unchanged; these new security gates are **never implicitly installed**.
+
+**Crucially, this is a pre-dispatch guard, not transaction-level security.**
+Host applications must repeat tenant membership, per-resource write permission,
+business invariants, optimistic version checks and idempotency inside the
+authoritative database transaction before committing any durable side effects.
+The Nulang host does not provide a production session issuer, TLS/reverse
+proxy validation, session rotation/revocation implementation, transactional
+write adapter, or distributed replay protection here. Protecting ordinary
+mutations does not establish authorization for asynchronous workflows or
+authenticated SSE; those remain separate gates.

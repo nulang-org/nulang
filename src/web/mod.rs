@@ -12,6 +12,7 @@ pub mod http_request;
 pub mod ir;
 pub mod modules;
 pub mod openapi;
+pub mod origin_admission;
 pub mod package_contracts;
 pub mod reactivity;
 pub mod request_bindings;
