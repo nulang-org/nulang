@@ -1860,7 +1860,9 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
         module: &CodeModule,
         regs: &[Value],
     ) -> Option<Value> {
-        if effect_name == "Web" && matches!(op_name, Some("route" | "route_json")) {
+        if effect_name == "Web"
+            && matches!(op_name, Some("route" | "route_json" | "route_json_typed"))
+        {
             let method = regs.get(0).copied();
             let path = regs.get(1).copied();
             let handler = regs.get(2).copied();

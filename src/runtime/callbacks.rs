@@ -416,7 +416,7 @@ pub(crate) fn perform_web_builtin(
             let s = resolve(constants, *regs.first()?);
             Some(callbacks.alloc_string(&s))
         }
-        Some("route" | "route_json") => Some(crate::vm::Value::unit()),
+        Some("route" | "route_json" | "route_json_typed") => Some(crate::vm::Value::unit()),
         Some("redirect") => {
             let url = resolve(constants, *regs.first()?);
             let out = format!(

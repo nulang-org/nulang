@@ -103,7 +103,7 @@ fn collect_routes_in_expr(expr: &Expr, out: &mut Vec<(String, String, Expr)>) {
         Expr::Perform {
             effect, op, args, ..
         } if effect == "Web"
-            && matches!(op.as_str(), "route" | "route_json")
+            && matches!(op.as_str(), "route" | "route_json" | "route_json_typed")
             && args.len() == 3 =>
         {
             let method = string_literal(&args[0]).unwrap_or_else(|| "GET".to_string());

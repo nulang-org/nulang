@@ -1123,7 +1123,7 @@ impl WebDevServer {
                                     .plan
                                     .as_ref()
                                     .and_then(|plan| plan.response_type.as_deref())
-                                    == Some("Json")
+                                    .is_some_and(|ty| ty == "Json" || ty.starts_with("Json["))
                                 {
                                     // Explicit response marker: never send invalid JSON as a
                                     // successful API response or hydrate it as HTML.

@@ -18,6 +18,18 @@ pub fn render_bound_handler(
     handler_param_count: usize,
     args: &[BoundRouteArgument],
 ) -> Result<String, String> {
+    render_bound_handler_with_response_type(module, func_idx, handler_param_count, args, None)
+}
+
+/// Like render_bound_handler, but serializes the VM result when the
+/// compiler explicitly declared a typed JSON response contract.
+pub fn render_bound_handler_with_response_type(
+    module: &CodeModule,
+    func_idx: usize,
+    handler_param_count: usize,
+    args: &[BoundRouteArgument],
+    response_type: Option<&str>,
+) -> Result<String, String> {
     validate_argument_bank(handler_param_count, args)?;
 
     let mut vm = VM::new();
@@ -119,11 +131,80 @@ pub fn render_bound_handler(
     ));
     executable.emit(Instruction::new0(OpCode::Ret));
 
+    let record_field_names = executable.record_field_names.clone();
     vm.load_module(executable);
     let result = vm
         .run_from(0, entry_offset)
         .map_err(|error| format!("route handler execution failed: {error}"))?;
+    if let Some(ty) = response_type
+        .and_then(|ty| ty.strip_prefix("Json["))
+        .and_then(|ty| ty.strip_suffix(']'))
+    {
+        let value = typed_json_value(&vm, result, &record_field_names, ty)?;
+        return serde_json::to_string(&value)
+            .map_err(|_| "failed to serialize JSON response".to_string());
+    }
     Ok(vm.value_to_string(0, result))
+}
+
+/// Convert VM values only through their checked runtime representations.
+/// In particular, a Record pointer must never reach value_to_string, which
+/// treats arbitrary pointers as C strings.
+fn typed_json_value(
+    vm: &VM,
+    value: crate::vm::Value,
+    record_names: &[String],
+    ty: &str,
+) -> Result<serde_json::Value, String> {
+    use serde_json::{Map, Number, Value};
+    match ty {
+        "String" => vm
+            .string_operand(0, value)
+            .map(Value::String)
+            .ok_or_else(|| "typed JSON response expected String".to_string()),
+        "Int" => value
+            .as_int()
+            .map(|number| Value::Number(number.into()))
+            .ok_or_else(|| "typed JSON response expected Int".to_string()),
+        "Float" => value
+            .as_float()
+            .filter(|number| number.is_finite())
+            .and_then(Number::from_f64)
+            .map(Value::Number)
+            .ok_or_else(|| "typed JSON response expected finite Float".to_string()),
+        "Bool" => value
+            .as_bool()
+            .map(Value::Bool)
+            .ok_or_else(|| "typed JSON response expected Bool".to_string()),
+        _ => {
+            let fields = crate::web::json_records::parse_flat_record_type(ty)
+                .ok_or_else(|| "unsupported typed JSON response schema".to_string())?;
+            let values = vm
+                .record_field_values(value)
+                .ok_or_else(|| "typed JSON response expected a VM record".to_string())?;
+            if record_names.is_empty() {
+                return Err("typed JSON response missing compiled record field layout".into());
+            }
+            let mut object = Map::new();
+            for (name, field_ty) in fields {
+                let index = record_names
+                    .iter()
+                    .position(|field| field == &name)
+                    .ok_or_else(|| {
+                        format!("typed JSON response missing field layout for '{name}'")
+                    })?;
+                let slot = values.get(index).ok_or_else(|| {
+                    format!("typed JSON response field '{name}' is out of bounds")
+                })?;
+                object.insert(
+                    name.clone(),
+                    typed_json_value(vm, *slot, record_names, &field_ty)
+                        .map_err(|_| format!("typed JSON response invalid field '{name}'"))?,
+                );
+            }
+            Ok(Value::Object(object))
+        }
+    }
 }
 
 fn validate_argument_bank(

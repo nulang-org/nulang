@@ -594,3 +594,127 @@ fn register() { perform Web.route("POST", "/age", age_only) }
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
     assert_eq!(response_body(&response), "42");
 }
+
+fn typed_json_response_route(source: &str, handler_name: &str, path: &str) -> RuntimeWebRoute {
+    let (module, function_index) = compile_handler(source, handler_name);
+    let ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_module()
+        .unwrap();
+    let compiled = compile_module_contracts(&ast);
+    assert!(
+        compiled.diagnostics.is_empty(),
+        "{:?}",
+        compiled.diagnostics
+    );
+    assert_eq!(compiled.routes.len(), 1);
+    let plan = compile_runtime_route_plan(&compiled.routes[0]).unwrap();
+    RuntimeWebRoute {
+        route: WebRoute {
+            method: HttpMethod::Get,
+            path: path.into(),
+            handler_module: module,
+            handler_func_idx: function_index,
+        },
+        plan: Some(plan),
+    }
+}
+
+#[test]
+fn typed_json_record_response_is_serialized_from_real_vm_value() {
+    let source = r#"
+type UserView = { name: String, age: Int }
+fn show() -> UserView { { name: "Ada \"Lovelace\"", age: 42 } }
+fn register() { perform Web.route_json_typed("GET", "/typed", show) }
+"#;
+    let route = typed_json_response_route(source, "show", "/typed");
+    assert!(route
+        .plan
+        .as_ref()
+        .unwrap()
+        .response_type
+        .as_deref()
+        .is_some_and(|v| v.starts_with("Json[")));
+    let server = WebDevServer::bind_runtime(0, None, None, vec![route]).unwrap();
+    let response = send_raw_request(
+        server.port,
+        "GET /typed HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(
+        response.contains("Content-Type: application/json\r\n"),
+        "{response}"
+    );
+    let body: serde_json::Value = serde_json::from_str(response_body(&response)).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({"name":"Ada \"Lovelace\"","age":42})
+    );
+}
+
+#[test]
+fn typed_json_scalar_response_is_serialized_without_string_coercion() {
+    let source = r#"
+fn show() -> String { "hello \"world\"" }
+fn register() { perform Web.route_json_typed("GET", "/typed-string", show) }
+"#;
+    let route = typed_json_response_route(source, "show", "/typed-string");
+    let server = WebDevServer::bind_runtime(0, None, None, vec![route]).unwrap();
+    let response = send_raw_request(
+        server.port,
+        "GET /typed-string HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(
+        response.contains("Content-Type: application/json\r\n"),
+        "{response}"
+    );
+    let body: serde_json::Value = serde_json::from_str(response_body(&response)).unwrap();
+    assert_eq!(body, serde_json::Value::String("hello \"world\"".into()));
+}
+
+#[test]
+fn typed_json_response_rejects_runtime_representation_mismatch() {
+    let source = r#"
+fn show() -> String { "not an object" }
+fn register() { perform Web.route_json_typed("GET", "/mismatch", show) }
+"#;
+    let mut route = typed_json_response_route(source, "show", "/mismatch");
+    route.plan.as_mut().unwrap().response_type = Some("Json[{ name: String, age: Int }]".into());
+    let server = WebDevServer::bind_runtime(0, None, None, vec![route]).unwrap();
+    let response = send_raw_request(
+        server.port,
+        "GET /mismatch HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+        "{response}"
+    );
+    assert!(!response.contains("not an object"), "{response}");
+}
+
+#[test]
+fn typed_json_output_serializes_real_boolean_and_integer() {
+    for (path, source, expected) in [
+        (
+            "/bool",
+            r#"fn show() -> Bool { true }
+fn register() { perform Web.route_json_typed("GET", "/bool", show) }"#,
+            "true",
+        ),
+        (
+            "/int",
+            r#"fn show() -> Int { 42 }
+fn register() { perform Web.route_json_typed("GET", "/int", show) }"#,
+            "42",
+        ),
+    ] {
+        let route = typed_json_response_route(source, "show", path);
+        let server = WebDevServer::bind_runtime(0, None, None, vec![route]).unwrap();
+        let response = send_raw_request(
+            server.port,
+            &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+        );
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert_eq!(response_body(&response), expected);
+    }
+}

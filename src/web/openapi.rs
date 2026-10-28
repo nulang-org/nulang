@@ -81,7 +81,19 @@ fn operation_for(route: &RouteContract) -> Value {
     // A response marked `Json` has an explicit application/json media type.
     // Its internal schema remains unspecified until the typed Json[T] algebra
     // and record serializers exist; never guess an object shape.
-    if route.response_type.as_deref() == Some("Json") {
+    if let Some(typed_schema) = route
+        .response_type
+        .as_deref()
+        .and_then(|ty| ty.strip_prefix("Json["))
+        .and_then(|ty| ty.strip_suffix(']'))
+    {
+        success.insert(
+            "content".to_string(),
+            json!({
+                "application/json": { "schema": schema_for_type(Some(typed_schema)) }
+            }),
+        );
+    } else if route.response_type.as_deref() == Some("Json") {
         success.insert(
             "content".to_string(),
             json!({
@@ -486,6 +498,48 @@ mod tests {
         assert_eq!(schema["properties"]["age"]["type"], "integer");
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(schema["required"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn typed_json_response_schema_reflects_compiler_declared_return_type() {
+        let mut contract = route();
+        contract.path = "/typed".into();
+        contract.params.clear();
+        contract.handler_params.clear();
+        contract.response_type = Some("Json[{ name: String, age: Int }]".into());
+        let document = generate_openapi(
+            &ContractCompilation {
+                routes: vec![contract],
+                diagnostics: vec![],
+            },
+            "Test",
+            "1.0",
+        );
+        let schema = &document["paths"]["/typed"]["get"]["responses"]["200"]["content"]
+            ["application/json"]["schema"];
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["name"]["type"], "string");
+        assert_eq!(schema["properties"]["age"]["type"], "integer");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"].as_array().unwrap().len(), 2);
+
+        let mut scalar = route();
+        scalar.params.clear();
+        scalar.handler_params.clear();
+        scalar.response_type = Some("Json[String]".into());
+        let document = generate_openapi(
+            &ContractCompilation {
+                routes: vec![scalar],
+                diagnostics: vec![],
+            },
+            "Test",
+            "1.0",
+        );
+        assert_eq!(
+            document["paths"]["/users/{id}"]["get"]["responses"]["200"]["content"]
+                ["application/json"]["schema"]["type"],
+            "string"
+        );
     }
 
     #[test]

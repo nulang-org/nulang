@@ -338,8 +338,8 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
         }
 
         out.routes.push(RouteContract {
-            method,
-            path,
+            method: method.clone(),
+            path: path.clone(),
             handler: handler_name,
             params,
             handler_params: meta
@@ -370,7 +370,23 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
             // Route registration owns the wire media type even when an
             // opaque Json return type is erased to its String representation
             // by frontend type normalization.
-            response_type: if json_response {
+            response_type: if json_response == "route_json_typed" {
+                let source_ty = meta.and_then(|m| m.response_type.as_deref());
+                let ty = source_ty.and_then(|ty| named_json_records.get(ty).map(String::as_str).or(Some(ty)));
+                match ty {
+                    Some(ty) if matches!(ty, "String" | "Int" | "Float" | "Bool")
+                        || crate::web::json_records::parse_flat_record_type(ty).is_some() =>
+                    {
+                        Some(format!("Json[{ty}]"))
+                    }
+                    _ => {
+                        out.diagnostics.push(format!(
+                            "{method} {path}: typed JSON responses require a declared String, Int, Float, Bool, or flat primitive record return type"
+                        ));
+                        None
+                    }
+                }
+            } else if json_response == "route_json" {
                 Some("Json".to_string())
             } else {
                 meta.and_then(|m| m.response_type.clone())
@@ -532,11 +548,11 @@ pub fn parse_path_params(path: &str) -> Result<Vec<RouteParamContract>, String> 
     Ok(params)
 }
 
-fn collect_routes_in_module(module: &AstModule, out: &mut Vec<(String, String, Expr, bool)>) {
+fn collect_routes_in_module(module: &AstModule, out: &mut Vec<(String, String, Expr, String)>) {
     collect_routes_in_decls(&module.decls, out);
 }
 
-fn collect_routes_in_decls(decls: &[Decl], out: &mut Vec<(String, String, Expr, bool)>) {
+fn collect_routes_in_decls(decls: &[Decl], out: &mut Vec<(String, String, Expr, String)>) {
     for decl in decls {
         match decl {
             Decl::Function { body, .. }
@@ -560,15 +576,18 @@ fn collect_routes_in_decls(decls: &[Decl], out: &mut Vec<(String, String, Expr, 
     }
 }
 
-fn collect_routes_in_expr(expr: &Expr, out: &mut Vec<(String, String, Expr, bool)>) {
+fn collect_routes_in_expr(expr: &Expr, out: &mut Vec<(String, String, Expr, String)>) {
     if let Expr::Perform {
         effect, op, args, ..
     } = expr
     {
-        if effect == "Web" && matches!(op.as_str(), "route" | "route_json") && args.len() == 3 {
+        if effect == "Web"
+            && matches!(op.as_str(), "route" | "route_json" | "route_json_typed")
+            && args.len() == 3
+        {
             if let (Some(method), Some(path)) = (string_literal(&args[0]), string_literal(&args[1]))
             {
-                out.push((method, path, args[2].clone(), op == "route_json"));
+                out.push((method, path, args[2].clone(), op.clone()));
             }
         }
         for arg in args {
@@ -747,6 +766,27 @@ mod tests {
         assert_eq!(typed[0].ty.as_deref(), Some("OrgId"));
         assert_eq!(typed[1].name, "member_id");
         assert_eq!(typed[1].ty, None);
+    }
+
+    #[test]
+    fn typed_json_registration_rejects_unsupported_return_shapes() {
+        let module = parse(
+            r#"
+fn show() -> [Int] { [1, 2] }
+fn register() { perform Web.route_json_typed("GET", "/array", show) }
+"#,
+        );
+        let compiled = compile_module_contracts(&module);
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("typed JSON responses require a declared")),
+            "{:?}",
+            compiled.diagnostics
+        );
+        assert_eq!(compiled.routes.len(), 1);
+        assert!(compiled.routes[0].response_type.is_none());
     }
 
     #[test]

@@ -9,7 +9,7 @@
 use crate::runtime::{HttpMethod, WebRoute};
 use crate::web::bindings::RouteBindingSource;
 use crate::web::contracts::ContractCompilation;
-use crate::web::handler_call::render_bound_handler;
+use crate::web::handler_call::render_bound_handler_with_response_type;
 use crate::web::request_bindings::{
     bind_request_arguments, RequestBindingValues, RequestDecodeError,
 };
@@ -217,6 +217,18 @@ pub fn render_direct_request(
         return Ok(None);
     };
     if !has_complete_request_binding_plan(plan) {
+        // A typed JSON response must never fall back to legacy string
+        // rendering: that path can incorrectly interpret VM record pointers.
+        if plan
+            .response_type
+            .as_deref()
+            .is_some_and(|ty| ty.starts_with("Json["))
+        {
+            return Err(DirectRequestRenderError::Execution(format!(
+                "route {} {}: typed JSON response requires a complete compiler binding plan",
+                plan.method, plan.path
+            )));
+        }
         // See render_direct_route: only zero-parameter handlers may fall back
         // to the legacy ambient-request path.
         if plan.handler_param_count > 0 {
@@ -230,11 +242,12 @@ pub fn render_direct_request(
 
     let args = bind_request_arguments(&plan.bindings, plan.handler_param_count, values)
         .map_err(DirectRequestRenderError::Decode)?;
-    render_bound_handler(
+    render_bound_handler_with_response_type(
         &route.route.handler_module,
         route.route.handler_func_idx,
         plan.handler_param_count,
         &args,
+        plan.response_type.as_deref(),
     )
     .map(Some)
     .map_err(DirectRequestRenderError::Execution)
