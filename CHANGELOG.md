@@ -1,4 +1,8 @@
 # Nulang Changelog
+
+### Typed HTML validation response — 2026-10-28
+- **`InvalidForm` is an explicit HTTP 422 HTML result**, exposed through `stdlib::web::response.invalid_form(Html)`. It preserves rendered form fragments without injecting the progressive-enhancement script and emits `text/html` in the runtime and OpenAPI.
+- **HTTP, compiler, and response tests pin status/body/media behavior.** The result always emits 422; a per-route typed success/validation union and dynamic response status are future work. The experimental dev server is not production-audited.
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.

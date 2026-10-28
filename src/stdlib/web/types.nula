@@ -38,3 +38,6 @@ opaque type NoContent = String
 
 /// RFC-style application/problem+json error result (HTTP 4xx/5xx).
 opaque type Problem = String
+
+/// Server-rendered validation-error HTML result (HTTP 422).
+opaque type InvalidForm = String

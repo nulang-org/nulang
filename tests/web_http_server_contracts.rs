@@ -303,6 +303,7 @@ fn status_result_route(path: &str, kind: &str, expression: &str) -> RuntimeWebRo
 opaque type Created = String
 opaque type NoContent = String
 opaque type Problem = String
+opaque type InvalidForm = String
 fn endpoint() -> {kind} ! {{Web}} {{ {expression} }}
 fn web_main() {{ perform Web.route("GET", "{path}", endpoint) }}
 "#
@@ -396,6 +397,32 @@ fn problem_result_uses_document_status_and_problem_media_type() {
     assert_eq!(body["status"], 409);
     assert_eq!(body["title"], "Conflict");
     assert_eq!(body["detail"], "Resource exists");
+}
+
+#[test]
+fn invalid_form_returns_422_html_fragment_over_http() {
+    let route = status_result_route(
+        "/invalid-form",
+        "InvalidForm",
+        r#"perform Web.invalid_form(perform Web.raw("<form id='edit'><p>Required</p></form>"))"#,
+    );
+    let server = WebDevServer::bind_runtime(0, None, None, vec![route]).unwrap();
+    let response = send_raw_request(
+        server.port,
+        "GET /invalid-form HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 422 Unprocessable Entity\r\n"),
+        "{response}"
+    );
+    assert!(
+        response.contains("Content-Type: text/html; charset=utf-8\r\n"),
+        "{response}"
+    );
+    assert_eq!(
+        response_body(&response),
+        "<form id='edit'><p>Required</p></form>"
+    );
 }
 
 #[test]
