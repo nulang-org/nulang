@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os, subprocess, json, sys
+from isolation import run_isolated
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)) + "/..")
 subprocess.run(["cargo", "build", "--quiet"], check=True)
@@ -24,7 +25,9 @@ for file in os.listdir("conformance/behavior"):
     with open(json_path) as f:
         expected = json.load(f)
         
-    res = subprocess.run([nulang_bin, nula_path], capture_output=True, text=True)
+    # Each fixture must start with a fresh durable history, independent of
+    # earlier fixtures and developer-local .nulang/store data.
+    res = run_isolated(nulang_bin, nula_path)
     out = res.stdout.strip()
     err = res.stderr.strip()
     code = res.returncode
