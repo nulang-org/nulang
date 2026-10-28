@@ -1,5 +1,13 @@
 # Nulang Changelog
 
+### Typed form success/validation outcomes — 2026-10-28
+- **`FormOutcome` allows one handler to return HTML 200 or HTML 422**, with compiler-checked `form_ok(Html)` and `form_invalid(Html)` constructors. A strictly decoded internal envelope separates status from HTML body and rejects ambiguous metadata.
+- **HTTP, OpenAPI and compiler regression coverage** pin the dual-status contract. This does not implement generic algebraic sum types, form validation policies, CSRF, or production-ready Web hosting.
+
+### Typed HTML validation response — 2026-10-28
+- **`InvalidForm` is an explicit HTTP 422 HTML result**, exposed through `stdlib::web::response.invalid_form(Html)`. It preserves rendered form fragments without injecting the progressive-enhancement script and emits `text/html` in the runtime and OpenAPI.
+- **HTTP, compiler, and response tests pin status/body/media behavior.** The result always emits 422; the FormOutcome result supports per-route success/validation selection. The experimental dev server is not production-audited.
+
 ### October RustSec dependency remediation (validation pending) — 2026-10-25
 - **Updated Wasmtime 48.0.7, compatible Cranelift/Pulley packages, rustls-webpki 0.103.16, webpki-roots 1.0.10 and ctutils 0.4.4** with Cargo's dependency resolver.
 - **Migrated libSQL remote TLS to a custom connector based on supported rustls 0.23 and tokio-rustls 0.26.** This retains libSQL local/remote behavior, native root certificates, server-name verification and Hyper 0.14 protocol compatibility without pulling unsupported rustls-webpki 0.102.

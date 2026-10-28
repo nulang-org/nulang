@@ -1,0 +1,79 @@
+import stdlib::web::unpoly
+import stdlib::web::response
+import stdlib::web::html
+import stdlib::web::types
+
+fn signup_form(message: String) -> Html {
+    el("form", [
+        ("id", text("signup")),
+        ("method", text("POST")),
+        ("action", text("/signup")),
+        submit(),
+        target("#welcome"),
+        fail_target_attr("#signup")
+    ], [
+        el("label", [("for", text("email"))], [text("Email")]),
+        el("input", [
+            ("id", text("email")),
+            ("name", text("email")),
+            validate()
+        ], []),
+        el("p", [("id", text("error"))], [text(message)]),
+        el("button", [("type", text("submit"))], [text("Sign up")])
+    ])
+}
+
+fn welcome() -> Html {
+    el("section", [("id", text("welcome"))], [text("Signed up")])
+}
+
+fn page(message: String) -> Html {
+    document(
+        head([title("Unpoly form outcomes")]),
+        body([signup_form(message), welcome()])
+    )
+}
+
+fn signup_page() -> Html {
+    page("")
+}
+
+fn save_signup() -> FormOutcome {
+    let email = perform Web.form_value("email")
+    if is_validation() then {
+        // Unpoly X-Up-Validate requests must not commit any writes.
+        if is_target("#signup") then {
+            form_ok(signup_form(""))
+        } else {
+            form_ok(page(""))
+        }
+    } else if email != nil && email != "" then {
+        perform Web.kv_set("signup_committed", "yes")
+        if is_target("#welcome") then {
+            form_ok(welcome())
+        } else {
+            form_ok(page(""))
+        }
+    } else {
+        if is_fail_target("#signup") then {
+            form_invalid(signup_form("Email is required"))
+        } else {
+            form_invalid(page("Email is required"))
+        }
+    }
+}
+
+fn signup_state() -> Html {
+    let committed = perform Web.kv_get("signup_committed")
+    if committed == "yes" then {
+        el("output", [("id", text("state"))], [text("saved")])
+    } else {
+        el("output", [("id", text("state"))], [text("not-saved")])
+    }
+}
+
+app "unpoly-form-outcome" {
+    route "GET" "/" -> signup_page
+    route "POST" "/signup" -> save_signup
+    route "GET" "/state" -> signup_state
+}
