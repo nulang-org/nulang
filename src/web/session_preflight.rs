@@ -120,6 +120,19 @@ pub trait ResourceReadAuthorization {
     fn can_read(&self, principal: &str, tenant: &str, resource: &str) -> Result<bool, ()>;
 }
 
+/// Host-provided permission to execute a mutation for one exact route
+/// pattern and method. Preflight/read authority MUST NOT grant write access.
+pub trait ResourceWriteAuthorization {
+    fn can_mutate(
+        &self,
+        principal: &str,
+        tenant: &str,
+        resource: &str,
+        method: &str,
+        route_pattern: &str,
+    ) -> Result<bool, ()>;
+}
+
 /// Admission outcome for an authenticated, read-only HTTP route.
 /// Internal credentials, principal IDs and tenant IDs must not be reflected
 /// in HTTP responses.
@@ -215,6 +228,121 @@ impl SessionReadGateway {
             now,
             &tenant,
             &resource,
+        )
+    }
+}
+
+/// Authenticate and authorize a single mutation before calling any handler.
+///
+/// Host/Origin/Fetch Metadata validation MUST happen before this method. This
+/// revalidates revocation, expiration, tenant, synchronizer CSRF, and route-
+/// specific write authority on *every* dispatch. The host must re-check
+/// business authorization, versions and idempotency in its durable transaction
+/// before committing state changes; this function is not a DB transaction.
+pub fn authorized_mutation_scope<
+    S: SessionLookup + ?Sized,
+    A: ResourceWriteAuthorization + ?Sized,
+>(
+    sessions: &S,
+    resource_authorizer: &A,
+    headers: &[(String, String)],
+    body: &[u8],
+    now_utc_seconds: u64,
+    resource_tenant: &str,
+    resource_id: &str,
+    method: &str,
+    route_pattern: &str,
+) -> Result<VerifiedRequestScope, ReadScopeError> {
+    if !matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") || route_pattern.is_empty() {
+        return Err(ReadScopeError::Forbidden);
+    }
+    let cookie = session_cookie_handle(headers).map_err(|_| ReadScopeError::Unauthenticated)?;
+    let session = sessions
+        .lookup(cookie)
+        .map_err(|_| ReadScopeError::Unavailable)?
+        .ok_or(ReadScopeError::Unauthenticated)?;
+    if !canonical_id(&session.principal_id)
+        || !canonical_id(&session.tenant_id)
+        || session.expires_at_unix_seconds <= now_utc_seconds
+    {
+        return Err(ReadScopeError::Unauthenticated);
+    }
+    if !canonical_id(resource_tenant)
+        || !canonical_id(resource_id)
+        || session.tenant_id != resource_tenant
+    {
+        return Err(ReadScopeError::Forbidden);
+    }
+
+    // Use original raw bytes rather than a parsed HashMap: repeated/aliased
+    // synchronizer fields must not collapse into one apparently valid token.
+    let candidates =
+        capture_submitted_csrf_tokens(headers, body).map_err(|_| ReadScopeError::Forbidden)?;
+    let candidates: Vec<_> = candidates.iter().map(String::as_str).collect();
+    session
+        .csrf
+        .verify_presented(&candidates)
+        .map_err(|_| ReadScopeError::Forbidden)?;
+
+    match resource_authorizer.can_mutate(
+        &session.principal_id,
+        &session.tenant_id,
+        resource_id,
+        method,
+        route_pattern,
+    ) {
+        Ok(true) => {}
+        Ok(false) => return Err(ReadScopeError::Forbidden),
+        Err(_) => return Err(ReadScopeError::Unavailable),
+    }
+    VerifiedRequestScope::from_verified_identity(session.principal_id, Some(session.tenant_id))
+        .ok_or(ReadScopeError::Unauthenticated)
+}
+
+/// Trusted session resolver for guarded state-changing route handlers.
+/// A host must supply an authoritative, revocation-aware SessionLookup and a
+/// separately audited mutation policy, not user-controlled claims.
+pub struct SessionMutationGateway {
+    sessions: std::sync::Arc<dyn SessionLookup + Send + Sync>,
+    resource_authorizer: std::sync::Arc<dyn ResourceWriteAuthorization + Send + Sync>,
+    select_resource: std::sync::Arc<SessionResourceSelector>,
+}
+
+impl SessionMutationGateway {
+    pub fn new(
+        sessions: std::sync::Arc<dyn SessionLookup + Send + Sync>,
+        resource_authorizer: std::sync::Arc<dyn ResourceWriteAuthorization + Send + Sync>,
+        select_resource: std::sync::Arc<SessionResourceSelector>,
+    ) -> Self {
+        Self {
+            sessions,
+            resource_authorizer,
+            select_resource,
+        }
+    }
+
+    pub fn admit(
+        &self,
+        request: &crate::runtime::HttpRequest,
+        captures: &HashMap<String, String>,
+        route_pattern: &str,
+    ) -> Result<VerifiedRequestScope, ReadScopeError> {
+        let (tenant, resource) =
+            (self.select_resource)(request, captures).ok_or(ReadScopeError::Forbidden)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| ReadScopeError::Unavailable)?
+            .as_secs();
+        authorized_mutation_scope(
+            self.sessions.as_ref(),
+            self.resource_authorizer.as_ref(),
+            &request.headers,
+            &request.body,
+            now,
+            &tenant,
+            &resource,
+            request.method.as_str(),
+            route_pattern,
         )
     }
 }
