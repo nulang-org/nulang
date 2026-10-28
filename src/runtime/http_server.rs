@@ -20,8 +20,8 @@ use crate::vm::{resolve_value_string, Value, CLOSURE_ENV_FLAG, VM};
 use crate::web::dispatch::{render_direct_request, DirectRequestRenderError};
 use crate::web::http_problem::request_decode_problem_response;
 use crate::web::http_request::HttpRequestBindingInputs;
-use crate::web::reactivity::inject_client_runtime_script;
 use crate::web::request_bindings::percent_decode_form;
+use crate::web::response::ResponseKind;
 use crate::web::runtime_bindings::RuntimeWebRoute;
 
 /// HTTP method — must match the Nulang-level variant type.
@@ -1056,10 +1056,19 @@ impl WebDevServer {
                         Err(error) => Err(error),
                     });
                 match rendered {
-                    Ok(Some(html)) => HttpResponse {
-                        status: 200,
-                        headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())],
-                        body: inject_client_runtime_script(&html).into_bytes(),
+                    Ok(Some(html)) => match Self::render_web_response(route, &html) {
+                        Ok(response) => response,
+                        Err(error) => {
+                            eprintln!("invalid web response: {error}");
+                            HttpResponse {
+                                status: 500,
+                                headers: vec![(
+                                    "Content-Type".into(),
+                                    "text/plain; charset=utf-8".into(),
+                                )],
+                                body: b"Internal server error".to_vec(),
+                            }
+                        }
                     },
                     Ok(None) => HttpResponse {
                         status: 500,
@@ -1095,6 +1104,23 @@ impl WebDevServer {
             m.apply(&request, &mut response);
         }
         HttpServerState::write_response(&mut stream, &response);
+    }
+
+    /// Decode a route result according to its compiler-validated response type.
+    /// A legacy route retains HTML behavior without guessing its media type.
+    fn render_web_response(
+        route: &RuntimeWebRoute,
+        rendered: &str,
+    ) -> Result<HttpResponse, &'static str> {
+        let kind = route
+            .plan
+            .as_ref()
+            .map_or(ResponseKind::Html, |plan| plan.response_kind);
+        Ok(HttpResponse {
+            status: 200,
+            headers: vec![("Content-Type".into(), kind.content_type().into())],
+            body: kind.encode(rendered)?,
+        })
     }
 
     fn serve_sse(room: &str, stream: &mut TcpStream, shutdown: Arc<AtomicBool>) {

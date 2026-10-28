@@ -574,6 +574,22 @@ impl StdLib {
                     description: "Wrap a raw string as an Html value without escaping.",
                 },
                 BuiltinOp {
+                    name: "Web.json",
+                    effect: "Web",
+                    op: "json",
+                    signature: "json(value: String) -> Json",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Create a nominal JSON response from a serialized value.",
+                },
+                BuiltinOp {
+                    name: "Web.plaintext",
+                    effect: "Web",
+                    op: "plaintext",
+                    signature: "plaintext(value: String) -> Text",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Create a nominal UTF-8 plain-text response.",
+                },
+                BuiltinOp {
                     name: "Web.redirect",
                     effect: "Web",
                     op: "redirect",
