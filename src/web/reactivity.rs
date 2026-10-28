@@ -788,6 +788,9 @@ pub fn generate_client_runtime() -> String {
   const signals = Object.create(null);
   const signalBindings = Object.create(null);
   const hydratedActions = new WeakSet();
+  // A later submission for the same target supersedes its earlier UI update.
+  // Aborting the fetch is best-effort: server mutations may still complete.
+  const pendingPatches = new Map();
 
   function refreshSignal(name) {
     const bindings = signalBindings[name];
@@ -978,7 +981,7 @@ pub fn generate_client_runtime() -> String {
   // Progressive HTML updates are opt-in. The response may contain an entire
   // server-rendered page or only the element identified by the target ID.
   // Legacy actions still reload when no target is declared.
-  async function patchActionResponse(response, selector) {
+  async function patchActionResponse(response, selector, isCurrent) {
     if (!/^#[A-Za-z][A-Za-z0-9_-]*$/.test(selector)) {
       throw new Error('invalid Nulang patch target (expected an element ID)');
     }
@@ -986,7 +989,11 @@ pub fn generate_client_runtime() -> String {
     if (!/^text\/html(?:\s*;|\s*$)/i.test(contentType.trim())) {
       throw new Error('Nulang patch response must be text/html');
     }
-    const page = new DOMParser().parseFromString(await response.text(), 'text/html');
+    // Check again after reading the response stream: a newer mutation may
+    // have been submitted while this body was still being downloaded.
+    const html = await response.text();
+    if (isCurrent && !isCurrent()) return;
+    const page = new DOMParser().parseFromString(html, 'text/html');
     const incoming = page.querySelector(selector);
     const current = document.querySelector(selector);
     if (!incoming || !current) {
@@ -1024,14 +1031,32 @@ pub fn generate_client_runtime() -> String {
     const message = createActionMessage(handler, 'server', body);
     body.append('__nulang_action', handler);
     body.append('__nulang_ui_message', JSON.stringify(message));
-    const response = await fetch(window.location.href, { method: 'POST', body: body });
-    if (!response.ok) {
-      throw new Error('server action failed: ' + response.status);
-    }
-    if (target) {
-      await patchActionResponse(response, target);
-    } else {
-      window.location.reload();
+    const previous = target && pendingPatches.get(target);
+    const controller = target && typeof AbortController === 'function'
+      ? new AbortController() : null;
+    const request = target ? { controller } : null;
+    if (target) pendingPatches.set(target, request);
+    if (previous && previous.controller) previous.controller.abort();
+    const isCurrent = () => !target || pendingPatches.get(target) === request;
+    try {
+      const options = { method: 'POST', body: body };
+      if (controller) options.signal = controller.signal;
+      const response = await fetch(window.location.href, options);
+      if (!isCurrent()) return;
+      if (!response.ok) {
+        throw new Error('server action failed: ' + response.status);
+      }
+      if (target) {
+        await patchActionResponse(response, target, isCurrent);
+      } else {
+        window.location.reload();
+      }
+    } catch (error) {
+      // An aborted/superseded request must never replace a newer result or
+      // report an error for an interaction the user has already superseded.
+      if (isCurrent()) throw error;
+    } finally {
+      if (target && isCurrent()) pendingPatches.delete(target);
     }
   }
 
