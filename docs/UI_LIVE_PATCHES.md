@@ -208,7 +208,8 @@ authenticated SSE/WebSocket/HTTP patch transport is introduced by this change.**
 The compiler's `key={...}` marker still needs a full JSX-to-`KeyedNode`
 lowering path before this works automatically for arbitrary Nulang views.
 
-Focused regressions:
+Focused regressions (the Chromium test is also run in the existing
+CI **Docs site & browser playground** job):
 
 ```sh
 cargo test -p nulang-ui-protocol
