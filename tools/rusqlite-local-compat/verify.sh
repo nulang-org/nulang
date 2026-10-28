@@ -26,6 +26,9 @@ cargo test --locked --manifest-path "$base/reader/Cargo.toml" --test atomic_writ
 # Fail-closed typed recovery of versioned durable external effects and
 # staged outbox messages without dispatching or acknowledging delivery.
 cargo test --locked --manifest-path "$base/reader/Cargo.toml" --test effect_outbox
+# Real SQLite pager SQLITE_FULL and Linux RLIMIT_FSIZE fault boundaries
+# are scoped to disposable DBs. Neither tests physical power-loss.
+cargo test --locked --manifest-path "$base/reader/Cargo.toml" --test disk_faults
 cargo clippy --locked --manifest-path "$base/writer/Cargo.toml" -- -D clippy::correctness
 cargo clippy --locked --manifest-path "$base/reader/Cargo.toml" --all-targets -- -D clippy::correctness
 echo "PASS separate-process SQLite local recovery and experimental atomic writer for $head"

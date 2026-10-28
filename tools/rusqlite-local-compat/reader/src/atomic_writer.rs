@@ -59,6 +59,31 @@ impl RusqliteAtomicWriter {
         Ok(Self { connection: conn })
     }
 
+    /// Bound the current SQLite pager to its existing page count, for
+    /// *test-only* deterministic SQLITE_FULL injection. This does not fill
+    /// the shared physical filesystem, change a production migration, or
+    /// simulate power loss. It affects this writer connection only.
+    pub fn limit_pages_to_current_for_testing(&mut self) -> io::Result<i64> {
+        let pages: i64 = self
+            .connection
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .map_err(failure)?;
+        if pages <= 0 {
+            return Err(invalid("database must contain existing SQLite pages"));
+        }
+        // Only the SQLite-reported positive integer is interpolated.
+        let effective: i64 = self
+            .connection
+            .query_row(&format!("PRAGMA max_page_count = {pages}"), [], |r| {
+                r.get(0)
+            })
+            .map_err(failure)?;
+        if effective != pages {
+            return Err(invalid("failed to enforce test database page limit"));
+        }
+        Ok(effective)
+    }
+
     /// All eight durable tables plus legacy snapshot/journal are committed
     /// inside one SQLite BEGIN IMMEDIATE transaction. Fail closed on
     /// idempotency conflicts, missing ancestors, stale epochs and CAS races.
