@@ -12,10 +12,10 @@ pub const OPENAPI_VERSION: &str = "3.1.0";
 
 /// Generate an OpenAPI 3.1 document from a validated Web Contract compilation.
 ///
-/// Response media types are intentionally not invented here. The current Web
-/// runtime still has HTML-oriented response behavior and the typed response
-/// algebra (`Json[T]`, `Html`, `Stream[T]`, etc.) has not landed yet. We retain
-/// the Nulang response/error type as extensions until that contract is explicit.
+/// Only an explicit Json response marker supplies application/json media
+/// metadata. Other response types remain Nulang extensions until the full
+/// Json[T]/Html/Stream[T] response algebra and serializers are implemented;
+/// media types and schemas must never be guessed from source-level type names.
 pub fn generate_openapi(contracts: &ContractCompilation, title: &str, version: &str) -> Value {
     let mut paths = Map::new();
 
@@ -78,6 +78,18 @@ fn operation_for(route: &RouteContract) -> Value {
         );
     }
 
+    // A response marked `Json` has an explicit application/json media type.
+    // Its internal schema remains unspecified until the typed Json[T] algebra
+    // and record serializers exist; never guess an object shape.
+    if route.response_type.as_deref() == Some("Json") {
+        success.insert(
+            "content".to_string(),
+            json!({
+                "application/json": { "schema": { "x-nulang-type": "Json" } }
+            }),
+        );
+    }
+
     let mut responses = Map::new();
     responses.insert("200".to_string(), Value::Object(success));
     if let Some(error_type) = &route.error_type {
@@ -95,7 +107,9 @@ fn operation_for(route: &RouteContract) -> Value {
     if !parameters.is_empty() {
         operation.insert("parameters".to_string(), Value::Array(parameters));
     }
-    if let Some(request_body) = form_request_body(&binding_compilation.bindings) {
+    if let Some(request_body) = json_request_body(&binding_compilation.bindings)
+        .or_else(|| form_request_body(&binding_compilation.bindings))
+    {
         operation.insert("requestBody".to_string(), request_body);
     }
     operation.insert("responses".to_string(), Value::Object(responses));
@@ -165,9 +179,10 @@ fn binding_parameter(binding: &RouteBindingContract) -> Option<Value> {
         RouteBindingSource::Query => "query",
         RouteBindingSource::Header => "header",
         RouteBindingSource::Cookie => "cookie",
-        RouteBindingSource::Path | RouteBindingSource::Body | RouteBindingSource::Form => {
-            return None
-        }
+        RouteBindingSource::Path
+        | RouteBindingSource::Body
+        | RouteBindingSource::Form
+        | RouteBindingSource::Json => return None,
     };
 
     Some(json!({
@@ -176,6 +191,22 @@ fn binding_parameter(binding: &RouteBindingContract) -> Option<Value> {
         "required": true,
         "schema": schema_for_type(binding.ty.as_deref()),
         "x-nulang-handler-param": binding.handler_param,
+    }))
+}
+
+/// `from json` carries an explicit scalar JSON media type, unlike the raw
+/// `from body` binding, whose payload representation is intentionally unknown.
+fn json_request_body(bindings: &[RouteBindingContract]) -> Option<Value> {
+    let binding = bindings
+        .iter()
+        .find(|binding| binding.source == RouteBindingSource::Json)?;
+    Some(json!({
+        "required": true,
+        "content": {
+            "application/json": {
+                "schema": schema_for_type(binding.ty.as_deref())
+            }
+        }
     }))
 }
 
@@ -241,6 +272,7 @@ fn binding_source_name(source: RouteBindingSource) -> &'static str {
         RouteBindingSource::Cookie => "cookie",
         RouteBindingSource::Body => "body",
         RouteBindingSource::Form => "form",
+        RouteBindingSource::Json => "json",
     }
 }
 
@@ -416,5 +448,40 @@ mod tests {
         assert_eq!(schema_for_type(Some("Float"))["type"], "number");
         assert_eq!(schema_for_type(Some("Bool"))["type"], "boolean");
         assert_eq!(schema_for_type(Some("String"))["type"], "string");
+    }
+    #[test]
+    fn generates_explicit_json_body_and_response_media_types() {
+        let mut r = route();
+        r.method = "POST".into();
+        r.path = "/api/counter".into();
+        r.params.clear();
+        r.handler_params = vec![HandlerParamContract {
+            name: "count".into(),
+            ty: Some("Int".into()),
+            capability: None,
+            request: Some(crate::web::contracts::RequestParamBindingContract {
+                source: RouteBindingSource::Json,
+                source_name: "body".into(),
+            }),
+        }];
+        r.response_type = Some("Json".into());
+        let document = generate_openapi(
+            &ContractCompilation {
+                routes: vec![r],
+                diagnostics: vec![],
+            },
+            "Test",
+            "1.0",
+        );
+        let op = &document["paths"]["/api/counter"]["post"];
+        assert_eq!(
+            op["requestBody"]["content"]["application/json"]["schema"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            op["responses"]["200"]["content"]["application/json"]["schema"]["x-nulang-type"],
+            "Json"
+        );
+        assert!(op["requestBody"]["required"].as_bool().unwrap());
     }
 }

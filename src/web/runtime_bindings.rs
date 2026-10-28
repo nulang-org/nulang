@@ -31,6 +31,9 @@ pub struct RuntimeRoutePlan {
     pub segments: Vec<RuntimeRouteSegment>,
     pub bindings: Vec<RouteBindingContract>,
     pub handler_param_count: usize,
+    /// Source-level response marker used by the HTTP adapter.
+    /// Only the explicit `Json` marker changes wire semantics in this phase.
+    pub response_type: Option<String>,
     /// True when every declared handler parameter is supplied directly from a
     /// route input and every path parameter has a direct binding. Legacy routes
     /// that still rely on ambient `Web.param` access keep this false.
@@ -120,6 +123,7 @@ pub fn compile_runtime_route_plan(
         segments,
         bindings: binding_compilation.bindings,
         handler_param_count: contract.handler_params.len(),
+        response_type: contract.response_type.clone(),
         direct_call,
     })
 }

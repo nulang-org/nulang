@@ -144,6 +144,7 @@ struct HelperRoute {
     method: String,
     path: String,
     handler: Expr,
+    json_response: bool,
 }
 
 fn synthetic_route_registration(index: usize, helper: HelperRoute) -> Decl {
@@ -153,7 +154,11 @@ fn synthetic_route_registration(index: usize, helper: HelperRoute) -> Decl {
         type_ann: None,
         value: Expr::Perform {
             effect: "Web".to_string(),
-            op: "route".to_string(),
+            op: if helper.json_response {
+                "route_json".to_string()
+            } else {
+                "route".to_string()
+            },
             args: vec![
                 Expr::Literal(Literal::String(helper.method), span),
                 Expr::Literal(Literal::String(helper.path), span),
@@ -201,10 +206,11 @@ fn collect_helper_routes_in_expr(expr: &Expr, out: &mut Vec<HelperRoute>) {
                             method: "GET".to_string(),
                             path,
                             handler: handler.clone(),
+                            json_response: false,
                         });
                     }
                 }
-                ("route_method", [method, path, handler]) => {
+                ("route_method" | "route_json", [method, path, handler]) => {
                     if let (Some(method), Some(path)) =
                         (string_literal(method), string_literal(path))
                     {
@@ -212,6 +218,7 @@ fn collect_helper_routes_in_expr(expr: &Expr, out: &mut Vec<HelperRoute>) {
                             method,
                             path,
                             handler: handler.clone(),
+                            json_response: name == "route_json",
                         });
                     }
                 }

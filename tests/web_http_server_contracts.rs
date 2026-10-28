@@ -309,3 +309,182 @@ fn sse_endpoint_does_not_stream_for_post() {
         "{response}"
     );
 }
+
+fn json_scalar_route() -> RuntimeWebRoute {
+    let (module, function_index) =
+        compile_handler("fn endpoint(value: Int) -> Int { value }", "endpoint");
+    let source = r#"
+fn endpoint(value: Int from json) -> Int { value }
+fn web_main() { perform Web.route("POST", "/json", endpoint) }
+"#;
+    let ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_module()
+        .unwrap();
+    let contract = compile_module_contracts(&ast);
+    assert!(
+        contract.diagnostics.is_empty(),
+        "{:?}",
+        contract.diagnostics
+    );
+    let plan = compile_runtime_route_plan(&contract.routes[0]).unwrap();
+    RuntimeWebRoute {
+        route: WebRoute {
+            method: HttpMethod::Post,
+            path: "/json".into(),
+            handler_module: module,
+            handler_func_idx: function_index,
+        },
+        plan: Some(plan),
+    }
+}
+
+#[test]
+fn typed_json_request_decodes_over_real_http() {
+    let server = WebDevServer::bind_runtime(0, None, None, vec![json_scalar_route()]).unwrap();
+    let response = send_raw_request(
+        server.port,
+        "POST /json HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n42",
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert_eq!(response_body(&response), "42");
+}
+
+#[test]
+fn typed_json_request_rejects_wrong_media_type_and_malformed_json() {
+    let server = WebDevServer::bind_runtime(0, None, None, vec![json_scalar_route()]).unwrap();
+    let wrong_type = send_raw_request(
+        server.port,
+        "POST /json HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\n42",
+    );
+    assert!(wrong_type.starts_with("HTTP/1.1 415"), "{wrong_type}");
+    let invalid = send_raw_request(
+        server.port,
+        "POST /json HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 8\r\n\r\nnot-json",
+    );
+    assert!(invalid.starts_with("HTTP/1.1 400"), "{invalid}");
+}
+
+fn json_response_route(json: &str) -> RuntimeWebRoute {
+    let expression = format!("fn endpoint() -> String {{ {:?} }}", json);
+    let (module, function_index) = compile_handler(&expression, "endpoint");
+    let mut contract = nulang::web::contracts::RouteContract::default();
+    contract.method = "GET".into();
+    contract.path = "/response".into();
+    contract.handler = Some("endpoint".into());
+    contract.response_type = Some("Json".into());
+    RuntimeWebRoute {
+        route: WebRoute {
+            method: HttpMethod::Get,
+            path: "/response".into(),
+            handler_module: module,
+            handler_func_idx: function_index,
+        },
+        plan: Some(compile_runtime_route_plan(&contract).unwrap()),
+    }
+}
+
+#[test]
+fn json_response_contract_controls_content_type_and_body_over_http() {
+    let server =
+        WebDevServer::bind_runtime(0, None, None, vec![json_response_route(r#"{"ok":true}"#)])
+            .unwrap();
+    let response = send_raw_request(
+        server.port,
+        "GET /response HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(
+        response.contains("Content-Type: application/json\r\n"),
+        "{response}"
+    );
+    assert_eq!(response_body(&response), r#"{"ok":true}"#);
+}
+
+#[test]
+fn invalid_json_handler_response_is_not_served_as_success() {
+    let server =
+        WebDevServer::bind_runtime(0, None, None, vec![json_response_route("<not-json>")]).unwrap();
+    let response = send_raw_request(
+        server.port,
+        "GET /response HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+        "{response}"
+    );
+    assert!(!response.contains("<not-json>"));
+}
+
+#[test]
+fn json_request_with_invalid_utf8_is_rejected_before_lossy_decode() {
+    let server = WebDevServer::bind_runtime(0, None, None, vec![json_scalar_route()]).unwrap();
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(b"POST /json HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 3\r\n\r\n\x22\xff\x22").unwrap();
+    stream.shutdown(Shutdown::Write).unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    let response = String::from_utf8(response).unwrap();
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+        "{response}"
+    );
+    assert!(response.contains("application/problem+json"), "{response}");
+}
+
+#[test]
+fn json_response_effect_and_route_registration_are_typechecked() {
+    let source = r#"
+opaque type Json = String
+fn endpoint() -> Json { perform Web.json("{\"ok\":true}") }
+fn register() { perform Web.route_json("GET", "/api", endpoint) }
+"#;
+    let (mut module, func_idx) = compile_handler(source, "register");
+    let ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_module()
+        .unwrap();
+    let contracts = compile_module_contracts(&ast);
+    assert!(
+        contracts.diagnostics.is_empty(),
+        "{:?}",
+        contracts.diagnostics
+    );
+    assert_eq!(contracts.routes.len(), 1);
+    assert_eq!(contracts.routes[0].response_type.as_deref(), Some("Json"));
+
+    // Execute the compiled route-registration function through the real VM
+    // instead of constructing a route manually. The client should then see
+    // the declared Json response media type from compiler route metadata.
+    use nulang::bytecode::{Instruction, OpCode};
+    use nulang::vm::VM;
+    let offset = module.instructions.len();
+    module.emit(Instruction::new3(
+        OpCode::Closure,
+        ((func_idx >> 8) & 0xff) as u8,
+        (func_idx & 0xff) as u8,
+        0,
+    ));
+    module.emit(Instruction::new3(OpCode::ClosureCall, 0, 0, 0));
+    module.emit(Instruction::new0(OpCode::Ret));
+    let mut vm = VM::new();
+    vm.load_module(module);
+    vm.run_from(0, offset).expect("execute JSON registration");
+    let routes = vm.take_web_routes();
+    assert_eq!(routes.len(), 1);
+    let attachment = nulang::web::runtime_bindings::attach_runtime_route_plans(routes, &contracts);
+    assert!(
+        attachment.diagnostics.is_empty(),
+        "{:?}",
+        attachment.diagnostics
+    );
+    let server = WebDevServer::bind_runtime(0, None, None, attachment.routes).unwrap();
+    let response = send_raw_request(server.port, "GET /api HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(
+        response.contains("Content-Type: application/json\r\n"),
+        "{response}"
+    );
+    assert_eq!(response_body(&response), r#"{"ok":true}"#);
+}

@@ -284,9 +284,40 @@ Nulang source
 
 The runtime should ultimately execute each route under lightweight supervised request execution with structured cancellation and backpressure. Request-scoped dependencies should move from ambient state toward effect handlers. Stateful realtime/domain coordination should continue to use explicit persistent or virtual actors rather than making every model object an actor.
 
+## Explicit JSON scalar request and response contracts (experimental)
+
+The compiler accepts a scalar `from json` request binding alongside the
+existing `from body` raw-string and `from form(...)` sources:
+
+```nulang
+fn counter(count: Int from json) -> Int { count }
+```
+
+The JSON binding validates the `Content-Type` header (application/json and
+application/*+json) and parses a *single* JSON value into an exact `Int`,
+`Float`, `Bool`, or `String` VM constant without coercion. Wrong media types
+return HTTP 415; invalid JSON or mismatched scalar types return HTTP 400.
+Aggregate DTO types, JSON arrays, record decoding, `Json[T]` and automatic
+response serialization remain **unsupported** and cause compiler contract
+diagnostics rather than being silently string-backed. JSON bindings cannot
+share a route with form bindings; existing raw-body plus form compatibility
+is preserved.
+
+The explicit `Json` response marker and `Web.json`/`Web.route_json` effect
+operations select application/json responses from compiler-owned route
+metadata. The HTTP transport validates the serialized result before writing
+a successful response. Invalid output returns a generic 500, never a
+successful HTML response containing untrusted markup. OpenAPI emits real
+application/json request/response media types only for these explicit
+contracts, while preserving extensions for opaque/unmodeled body types.
+
+This is intentionally not a generic `Json[T]` serializer. It establishes
+wire semantics before higher-level record types, status variants, or stream
+responses are added.
+
 ## Remaining implementation priorities
 
-1. Define an explicit request/response algebra (`Json[T]`, `Html`, bytes, streams, typed bodies/media) so Contract IR and OpenAPI can represent payloads without guessing.
+1. Extend the experimental scalar JSON binding and `Json` marker into a typed request/response algebra (`Json[T]`, `Html`, bytes, streams, typed record schemas/media) so Contract IR and OpenAPI can represent full payloads without guessing.
 2. Add richer request decoders for optional/default values, repeated query parameters/collections, binary bodies, transparent aliases, and opaque/domain types.
 3. Execute requests under lightweight supervised request actors with structured cancellation/backpressure.
 4. Replace ambient request-context dependency injection with effect handlers once compatibility coverage is sufficient.
