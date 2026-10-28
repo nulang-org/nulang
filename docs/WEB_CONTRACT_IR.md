@@ -110,28 +110,50 @@ source tree
 
 ## Compile-validated endpoint body policy (experimental)
 
-A handler may opt into a strict per-route body limit:
+A handler may opt into a strict per-route body limit or a server-verified permission requirement:
 
 ```nulang
 @web_policy(body_max_bytes: "4096")
+@web_policy(require_capability: "inventory.write")
 fn upload() -> Text { plaintext("accepted") }
 ```
 
-The parser accepts only `body_max_bytes` in the experimental `@web_policy`
-annotation. The size must be a decimal integer between 1 and 1048576. Any
+The parser accepts `body_max_bytes` and `require_capability` in the
+experimental `@web_policy` annotation. The size must be a decimal integer between 1 and 1048576. Any
 unsupported policy key, such as `authenticate`, is rejected at parse time;
 there is deliberately no decorative security policy declaration. Repeated
 limits compose by taking the strictest bound. Contract extraction carries
 that policy through validated contracts, runtime plans, deployment metadata,
 and the `x-nulang-body-max-bytes` OpenAPI extension.
 
+Repeated permissions are sorted, deduplicated and composed with logical AND.
+Canonical permission identifiers are lowercase ASCII 1..96 characters using
+letters, digits, `.`, `_`, `:`, `-`. Validated runtime route plans carry the
+requirements; OpenAPI advertises them as
+`x-nulang-required-capabilities` **without inventing a credential scheme**.
+
+At startup, a trusted host may install a `WebCapabilityAuthorizer` through
+`WebDevServer::bind_runtime_with_authorizer`. This callback receives the
+request and a required permission and must validate the caller's credentials,
+tenant membership and authority using trusted server configuration. **Raw
+HTTP headers, request parameters and cookies are untrusted.** Nulang does not
+provide an implicit bearer-token decoder or a built-in authentication provider
+here; an absent/panicking/denying authorizer produces **403 Forbidden** with
+`Cache-Control: no-store` before the handler executes. Client-declared
+`X-Nulang-Capabilities` grants nothing. A protected contract that fails route
+plan compilation is dropped from route attachment rather than downgraded to
+legacy dispatch. This does not retrofit policy protection into raw legacy
+routes (`WebDevServer::bind`); deploy with validated compiler-attached routes
+and a real credential verifier, not a hard-coded allow-all adapter.
+
 `WebDevServer` rejects matching requests with a body exceeding the bound with
 HTTP 413 **before request binding or handler invocation**. The shared HTTP
 request reader still buffers and globally caps bodies at 1 MiB before route
 matching, so this is not an early transport allocation limit. Unvalidated
-legacy routes have no attached policy. This feature does **not** implement
-authentication, authorization, arbitrary endpoint filters, or hierarchical
-route groups; those need a separate fail-closed execution design.
+legacy routes have no attached policy. This feature adds a *permission enforcement seam*, not a production
+authentication adapter, a managed identity system, general endpoint filters,
+or hierarchical route groups. A runtime authorization callback that simply
+trusts client-supplied permissions would not be secure.
 
 ## Runtime binding and dispatch
 

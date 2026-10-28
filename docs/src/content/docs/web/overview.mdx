@@ -151,12 +151,13 @@ A compiler-validated handler can declare a request-body limit:
 
 ```nulang
 @web_policy(body_max_bytes: "4096")
+@web_policy(require_capability: "inventory.write")
 fn upload() -> Text {
     plaintext("accepted")
 }
 ```
 
-The HTTP dev server returns `413 Payload Too Large` before calling this handler when the incoming body exceeds 4,096 bytes. Limits must be between 1 and 1,048,576 bytes; repeated annotations use the strictest limit. Unsupported `@web_policy` keys fail compilation rather than creating an unenforced authorization requirement. The policy only applies when the compiler's validated route plan is attached (for example, through `nula dev`), not the legacy raw route-registration path. It runs **after** the global HTTP parser has read and capped the body, so it does not lower pre-routing buffering costs. It is not a substitute for authentication, authorization, or production HTTP hardening.
+The HTTP dev server returns `413 Payload Too Large` before calling this handler when the incoming body exceeds 4,096 bytes. Limits must be between 1 and 1,048,576 bytes; repeated annotations use the strictest limit. Required capability names are compile-validated, and **all** declared permissions must be granted by an explicitly installed trusted server-side `WebCapabilityAuthorizer` before handler execution. An absent or failed verifier produces HTTP 403. Caller-supplied permission headers have no special authority. This is a server-side integration seam: callers must verify credentials and tenant ownership using their own trusted authentication provider. It does not automatically secure routes created with legacy raw registration. Unsupported `@web_policy` keys fail compilation rather than creating an unenforced authorization requirement. The policy only applies when the compiler's validated route plan is attached (for example, through `nula dev`), not the legacy raw route-registration path. It runs **after** the global HTTP parser has read and capped the body, so it does not lower pre-routing buffering costs. It is not a substitute for authentication, authorization, or production HTTP hardening.
 
 ### Building HTML
 

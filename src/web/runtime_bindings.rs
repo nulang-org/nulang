@@ -40,6 +40,8 @@ pub struct RuntimeRoutePlan {
     pub response_kind: ResponseKind,
     /// Per-route body size policy from the compiler contract.
     pub body_max_bytes: Option<usize>,
+    /// Conjunctive required server-side permissions; never inferred from headers.
+    pub required_capabilities: Vec<String>,
 }
 
 /// A low-level runtime registration paired with optional compiler metadata.
@@ -77,19 +79,24 @@ pub fn attach_runtime_route_plans(
     let mut diagnostics = compilation.diagnostics.clone();
     let routes = routes
         .into_iter()
-        .map(|route| {
+        .filter_map(|route| {
             let key = (route.method.as_str(), route.path.as_str());
-            let plan =
-                contract_index.get(&key).and_then(|contract| {
-                    match compile_runtime_route_plan(contract) {
-                        Ok(plan) => Some(plan),
-                        Err(mut route_diagnostics) => {
-                            diagnostics.append(&mut route_diagnostics);
-                            None
+            let plan = match contract_index.get(&key) {
+                Some(contract) => match compile_runtime_route_plan(contract) {
+                    Ok(plan) => Some(plan),
+                    Err(mut route_diagnostics) => {
+                        diagnostics.append(&mut route_diagnostics);
+                        // Never turn a known protected route into an
+                        // unprotected legacy route on contract failure.
+                        if !contract.required_capabilities.is_empty() {
+                            return None;
                         }
+                        None
                     }
-                });
-            RuntimeWebRoute { route, plan }
+                },
+                None => None, // Keep genuinely legacy registrations compatible.
+            };
+            Some(RuntimeWebRoute { route, plan })
         })
         .collect();
 
@@ -110,6 +117,31 @@ pub fn compile_runtime_route_plan(
         return Err(binding_compilation.diagnostics);
     }
 
+    // De-serialized IR can bypass the source parser. Validate the permission
+    // identifiers again at this boundary; never trust arbitrary sidecar data.
+    if contract.required_capabilities.iter().any(|permission| {
+        permission.is_empty()
+            || permission.len() > 96
+            || !permission.bytes().all(|c| {
+                c.is_ascii_lowercase()
+                    || c.is_ascii_digit()
+                    || matches!(c, b'.' | b':' | b'-' | b'_')
+            })
+    }) {
+        return Err(vec![format!(
+            "{} {}: invalid required capability identifier",
+            contract.method, contract.path
+        )]);
+    }
+    // These paths are intercepted before user routes. A protected handler
+    // cannot be attached to a reserved transport endpoint.
+    if !contract.required_capabilities.is_empty() && contract.path.starts_with("/__nulang/") {
+        return Err(vec![format!(
+            "{} {}: cannot protect a reserved runtime path with a route policy",
+            contract.method, contract.path
+        )]);
+    }
+
     let segments = compile_route_segments(&contract.path).map_err(|diagnostic| {
         vec![format!(
             "{} {}: {diagnostic}",
@@ -128,6 +160,7 @@ pub fn compile_runtime_route_plan(
         direct_call,
         response_kind: ResponseKind::from_return_type(contract.response_type.as_deref()),
         body_max_bytes: contract.body_max_bytes,
+        required_capabilities: contract.required_capabilities.clone(),
     })
 }
 
@@ -433,7 +466,43 @@ mod tests {
             reference_capability: None,
             placement: Some("server".to_string()),
             body_max_bytes: None,
+            required_capabilities: Vec::new(),
         }
+    }
+
+    #[test]
+    fn invalid_protected_contract_does_not_downgrade_to_legacy_route() {
+        let mut protected = contract("/users/{id: Int}");
+        protected.required_capabilities = vec!["inventory.read".into()];
+        protected.handler_params.clear(); // invalid: path param cannot be bound
+        let route = WebRoute {
+            method: crate::runtime::HttpMethod::Get,
+            path: protected.path.clone(),
+            handler_module: CodeModule::new("invalid-protected"),
+            handler_func_idx: 0,
+        };
+        let attachment = attach_runtime_route_plans(
+            vec![route],
+            &ContractCompilation {
+                routes: vec![protected],
+                diagnostics: vec![],
+            },
+        );
+        assert!(
+            attachment.routes.is_empty(),
+            "protected route exposed as legacy"
+        );
+        assert!(!attachment.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn raw_ir_rejects_invalid_permissions_and_reserved_auth_routes() {
+        let mut protected = contract("/users/{id: Int}");
+        protected.required_capabilities = vec!["inventory,admin".into()];
+        assert!(compile_runtime_route_plan(&protected).is_err());
+        protected.required_capabilities = vec!["inventory.read".into()];
+        protected.path = "/__nulang/sse/room".into();
+        assert!(compile_runtime_route_plan(&protected).is_err());
     }
 
     #[test]

@@ -54,6 +54,9 @@ pub struct IrRoute {
     /// Explicit validated route body-size policy, in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_max_bytes: Option<usize>,
+    /// Web authorization policy; runtime authorizer must enforce this.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -142,6 +145,9 @@ pub fn generate_deployment_ir(
             effects: contract.map(|c| c.effects.clone()).unwrap_or_default(),
             reference_capability: contract.and_then(|c| c.reference_capability.clone()),
             body_max_bytes: contract.and_then(|c| c.body_max_bytes),
+            required_capabilities: contract
+                .map(|c| c.required_capabilities.clone())
+                .unwrap_or_default(),
         });
     }
 

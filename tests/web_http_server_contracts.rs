@@ -459,3 +459,139 @@ fn web_main() { perform Web.route("POST", "/upload", upload) }
     );
     assert_eq!(response_body(&rejected), "Payload too large");
 }
+
+#[test]
+fn required_capability_denies_spoofed_header_without_server_authorizer() {
+    let source = r#"
+@web_policy(require_capability: "inventory.read")
+fn inventory() -> String { "SECRET-INVENTORY" }
+fn web_main() { perform Web.route("GET", "/inventory", inventory) }
+"#;
+    let (module, handler_func_idx) = compile_handler(source, "inventory");
+    let ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_module()
+        .unwrap();
+    let contracts = compile_module_contracts(&ast);
+    let plan = compile_runtime_route_plan(&contracts.routes[0]).unwrap();
+    assert_eq!(plan.required_capabilities, vec!["inventory.read"]);
+    let route = RuntimeWebRoute {
+        route: WebRoute {
+            method: HttpMethod::Get,
+            path: "/inventory".into(),
+            handler_module: module,
+            handler_func_idx,
+        },
+        plan: Some(plan),
+    };
+    let server = WebDevServer::bind_runtime(0, None, None, vec![route]).unwrap();
+    let response = send_raw_request(server.port,
+        "GET /inventory HTTP/1.1\r\nHost: localhost\r\nX-Nulang-Capabilities: inventory.read\r\nConnection: close\r\n\r\n");
+    assert!(
+        response.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+        "{response}"
+    );
+    assert!(!response.contains("SECRET-INVENTORY"));
+}
+
+#[test]
+fn trusted_server_authorizer_grants_only_declared_capability() {
+    use nulang::runtime::{HttpRequest, WebCapabilityAuthorizer};
+    use std::sync::Arc;
+    let source = r#"
+@web_policy(require_capability: "inventory.read")
+@web_policy(require_capability: "tenant.verified")
+fn inventory() -> String { "protected-value" }
+fn web_main() { perform Web.route("GET", "/inventory", inventory) }
+"#;
+    let (module, handler_func_idx) = compile_handler(source, "inventory");
+    let ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_module()
+        .unwrap();
+    let contracts = compile_module_contracts(&ast);
+    let plan = compile_runtime_route_plan(&contracts.routes[0]).unwrap();
+    assert_eq!(
+        plan.required_capabilities,
+        vec!["inventory.read", "tenant.verified"]
+    );
+    let route = RuntimeWebRoute {
+        route: WebRoute {
+            method: HttpMethod::Get,
+            path: "/inventory".into(),
+            handler_module: module,
+            handler_func_idx,
+        },
+        plan: Some(plan),
+    };
+    let deny_partial: Arc<WebCapabilityAuthorizer> =
+        Arc::new(|_req: &HttpRequest, permission: &str| permission == "inventory.read");
+    let server = WebDevServer::bind_runtime_with_authorizer(
+        0,
+        None,
+        None,
+        vec![route.clone()],
+        deny_partial,
+    )
+    .unwrap();
+    let response = send_raw_request(
+        server.port,
+        "GET /inventory HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+        "{response}"
+    );
+    drop(server);
+    let allow_all: Arc<WebCapabilityAuthorizer> =
+        Arc::new(|_req: &HttpRequest, permission: &str| {
+            matches!(permission, "inventory.read" | "tenant.verified")
+        });
+    let server =
+        WebDevServer::bind_runtime_with_authorizer(0, None, None, vec![route], allow_all).unwrap();
+    let response = send_raw_request(
+        server.port,
+        "GET /inventory HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(
+        response_body(&response).contains("protected-value"),
+        "{response}"
+    );
+}
+
+#[test]
+fn panicking_authorizer_fails_closed_without_executing_handler() {
+    use nulang::runtime::{HttpRequest, WebCapabilityAuthorizer};
+    use std::sync::Arc;
+    let source = r#"
+@web_policy(require_capability: "inventory.read")
+fn inventory() -> String { "DO_NOT_EXECUTE" }
+fn web_main() { perform Web.route("GET", "/protected", inventory) }
+"#;
+    let (module, handler_func_idx) = compile_handler(source, "inventory");
+    let ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_module()
+        .unwrap();
+    let contract = compile_module_contracts(&ast).routes.remove(0);
+    let route = RuntimeWebRoute {
+        route: WebRoute {
+            method: HttpMethod::Get,
+            path: "/protected".into(),
+            handler_module: module,
+            handler_func_idx,
+        },
+        plan: Some(compile_runtime_route_plan(&contract).unwrap()),
+    };
+    let verifier: Arc<WebCapabilityAuthorizer> =
+        Arc::new(|_req: &HttpRequest, _: &str| panic!("simulated authorizer failure"));
+    let server =
+        WebDevServer::bind_runtime_with_authorizer(0, None, None, vec![route], verifier).unwrap();
+    let response = send_raw_request(
+        server.port,
+        "GET /protected HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+        "{response}"
+    );
+    assert!(!response.contains("DO_NOT_EXECUTE"));
+}

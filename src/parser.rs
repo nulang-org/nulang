@@ -856,7 +856,12 @@ impl Parser {
                 let field_name = self.expect_ident("annotation field name")?;
                 if self.consume_if(&TokenKind::Colon) {
                     let field_value = self.expect_string("annotation field value")?;
-                    fields.insert(field_name, field_value);
+                    if fields.insert(field_name, field_value).is_some() && name == "web_policy" {
+                        return Err(NuError::parse_error(
+                            "duplicate @web_policy key; use separate annotations for AND requirements".to_string(),
+                            self.current_span(),
+                        ));
+                    }
                 } else {
                     fields.insert(String::new(), field_name);
                 }
@@ -899,26 +904,52 @@ impl Parser {
                     annotations.push(FunctionAnnotation::Derive(names));
                 }
                 "web_policy" => {
-                    if fields.len() != 1 || !fields.contains_key("body_max_bytes") {
+                    if fields.is_empty()
+                        || fields
+                            .keys()
+                            .any(|key| key != "body_max_bytes" && key != "require_capability")
+                    {
                         return Err(NuError::parse_error(
-                            r#"@web_policy requires exactly body_max_bytes: "N"; unsupported policies are rejected"#.to_string(),
+                            "@web_policy supports only body_max_bytes and require_capability"
+                                .to_string(),
                             self.current_span(),
                         ));
                     }
-                    let raw = fields.remove("body_max_bytes").unwrap();
-                    let bytes = raw
-                        .parse::<usize>()
-                        .ok()
-                        .filter(|n| (1..=1_048_576).contains(n))
-                        .ok_or_else(|| {
-                            NuError::parse_error(
-                            "@web_policy body_max_bytes must be an integer between 1 and 1048576".to_string(),
-                            self.current_span(),
-                        )
-                        })?;
-                    annotations.push(FunctionAnnotation::WebPolicy {
-                        body_max_bytes: bytes,
-                    });
+                    if let Some(raw) = fields.remove("body_max_bytes") {
+                        let bytes = raw
+                            .parse::<usize>()
+                            .ok()
+                            .filter(|n| (1..=1_048_576).contains(n))
+                            .ok_or_else(|| {
+                                NuError::parse_error(
+                                    "@web_policy body_max_bytes must be between 1 and 1048576"
+                                        .to_string(),
+                                    self.current_span(),
+                                )
+                            })?;
+                        annotations.push(FunctionAnnotation::WebPolicy {
+                            body_max_bytes: bytes,
+                        });
+                    }
+                    if let Some(name) = fields.remove("require_capability") {
+                        // Canonical permission identifiers: no whitespace,
+                        // separators that could be interpreted as multiple grants,
+                        // or control characters. This is not a credential token.
+                        if name.is_empty()
+                            || name.len() > 96
+                            || !name.bytes().all(|c| {
+                                c.is_ascii_lowercase()
+                                    || c.is_ascii_digit()
+                                    || matches!(c, b'.' | b':' | b'-' | b'_')
+                            })
+                        {
+                            return Err(NuError::parse_error(
+                                "@web_policy require_capability must be a canonical lowercase permission identifier (1..96 ASCII characters)".to_string(),
+                                self.current_span(),
+                            ));
+                        }
+                        annotations.push(FunctionAnnotation::WebRequiredCapability { name });
+                    }
                 }
                 "placement" => {
                     let value = fields.remove("").unwrap_or_default();
@@ -7099,6 +7130,12 @@ mod tests {
     fn web_policy_rejects_unsupported_or_unbounded_configuration() {
         for annotation in [
             r#"@web_policy(authenticate: "true")"#,
+            r#"@web_policy(require_capability: "Inventory.read")"#,
+            r#"@web_policy(require_capability: "")"#,
+            r#"@web_policy(require_capability: "inventory.read,admin")"#,
+            r#"@web_policy(require_capability: "admin read")"#,
+            r#"@web_policy(require_capability: "tenant/read")"#,
+            r#"@web_policy(require_capability: "inventory.read", require_capability: "admin.read")"#,
             r#"@web_policy(body_max_bytes: "0")"#,
             r#"@web_policy(body_max_bytes: "1048577")"#,
             r#"@web_policy(body_max_bytes: "not-a-number")"#,
