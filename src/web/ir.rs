@@ -162,7 +162,11 @@ pub fn generate_deployment_ir(
     };
 
     let cloud_config = infer_module_cloud_config(&source_text);
-    let middleware = infer_middleware(&source_text);
+    // Report only middleware enforced by the built-in HTTP server. Importing
+    // an auth module does not install an authentication guard, and CSRF is not
+    // implemented: advertising either would give deployment consumers a false
+    // security guarantee.
+    let middleware = crate::runtime::default_web_middleware_names();
 
     DeploymentIr {
         // This is an additive v1 extension: every new per-route field is
@@ -276,21 +280,6 @@ fn infer_module_cloud_config(source: &str) -> Vec<CloudConfigEntry> {
     entries
 }
 
-/// Infer default middleware stack, extending it when imported modules
-/// contribute security concerns (e.g., auth sessions).
-fn infer_middleware(source: &str) -> Vec<String> {
-    let mut stack = vec![
-        "security_headers".to_string(),
-        "request_log".to_string(),
-        "csrf".to_string(),
-    ];
-    let imports = collect_nulang_imports(source);
-    if imports.iter().any(|name| name == "@nulang/auth") {
-        stack.push("auth".to_string());
-    }
-    stack
-}
-
 /// Collect all `@nulang/*` import names from the source text.
 fn collect_nulang_imports(source: &str) -> Vec<String> {
     let mut imports = Vec::new();
@@ -364,6 +353,7 @@ mod tests {
         );
 
         assert_eq!(ir.routes.len(), 1);
+        assert_eq!(ir.middleware, vec!["security_headers", "request_log"]);
         assert_eq!(ir.routes[0].handler.as_deref(), Some("show_user"));
         assert_eq!(ir.routes[0].response_type.as_deref(), Some("Html"));
         assert_eq!(ir.routes[0].placement, "server");
@@ -444,20 +434,23 @@ mod tests {
     }
 
     #[test]
-    fn test_infer_middleware_adds_auth_when_imported() {
-        let src = r#"
-            import @nulang/auth
-            fn main() {}
-        "#;
-        let stack = infer_middleware(src);
-        assert!(stack.contains(&"auth".to_string()));
-        assert!(stack.contains(&"csrf".to_string()));
+    fn middleware_ir_does_not_advertise_unenforced_csrf_or_auth() {
+        let actual = crate::runtime::default_web_middleware_names();
+        assert_eq!(
+            actual,
+            vec!["security_headers", "request_log"],
+            "IR may only list installed HTTP middleware, never placeholder protections"
+        );
+    }
 
-        let src_no_auth = r#"
-            import stdlib::web::html
-            fn main() {}
-        "#;
-        let stack_no_auth = infer_middleware(src_no_auth);
-        assert!(!stack_no_auth.contains(&"auth".to_string()));
+    #[test]
+    fn middleware_ir_is_independent_of_unrelated_auth_imports() {
+        let source = "import @nulang/auth\nfn main() {}";
+        assert!(collect_nulang_imports(source).contains(&"@nulang/auth".to_string()));
+        let advertised = crate::runtime::default_web_middleware_names();
+        assert_eq!(advertised, vec!["security_headers", "request_log"]);
+        assert!(!advertised
+            .iter()
+            .any(|name| name == "auth" || name == "csrf"));
     }
 }

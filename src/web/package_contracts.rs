@@ -65,9 +65,8 @@ pub fn compile_modules_contracts(modules: &[AstModule]) -> ContractCompilation {
     compiled
         .routes
         .sort_by(|a, b| (&a.method, &a.path).cmp(&(&b.method, &b.path)));
-    compiled
-        .routes
-        .dedup_by(|a, b| a.method == b.method && a.path == b.path);
+    // Keep duplicates: the validation pass must reject ambiguous dispatch,
+    // not discard one handler based on file/source order.
     compiled
 }
 
@@ -377,6 +376,29 @@ mod tests {
     fn parse(source: &str) -> AstModule {
         let tokens = Lexer::new(source).lex().unwrap();
         Parser::new(tokens).parse_module().unwrap()
+    }
+
+    #[test]
+    fn retains_duplicate_routes_for_fail_closed_validation() {
+        let module = parse(
+            r#"
+fn web_main() {
+    perform Web.route("GET", "/users/:id", show_user)
+    perform Web.route("GET", "/users/:id", show_user)
+}
+fn show_user() -> String { "ok" }
+"#,
+        );
+        let compiled = compile_modules_contracts(&[module]);
+        assert_eq!(
+            compiled.routes.len(),
+            2,
+            "duplicate routes must not silently disappear before validation"
+        );
+        let diagnostics = crate::web::validation::validate_compilation(compiled).unwrap_err();
+        assert!(diagnostics
+            .iter()
+            .any(|message| message.contains("ambiguous route")));
     }
 
     #[test]
