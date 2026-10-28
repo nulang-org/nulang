@@ -154,6 +154,32 @@ Both typed and legacy calls remain inside the existing request context during th
 
 Network-level regression coverage compiles real Nulang handlers and route contracts, starts `WebDevServer` on an ephemeral TCP port, and verifies successful typed query decoding, `400 application/problem+json` decode failures, and legacy route fallback over the wire.
 
+## Route precedence and HTTP method semantics
+
+The contract validator rejects same-method route patterns that can match the
+same request without one being strictly more specific (for example,
+`/users/{first}` vs `/users/{second}`, or `/{a}/fixed` vs `/fixed/{b}`).
+Literal segments narrow a parameter segment, so `/users/me` wins over
+`/users/{id}` independent of registration order. Disjoint methods and
+non-overlapping paths can coexist. Legacy registrations without a compiler
+contract remain supported, but bypass compile-time ambiguity checks.
+
+The development HTTP dispatcher uses the same relation when selecting a route,
+and implements these method behaviors:
+
+- Explicit `HEAD` routes take priority over fallback `GET` handlers.
+- Otherwise `HEAD` invokes the matching `GET` handler but omits response bytes,
+  retaining the representation's `Content-Length`.
+- `OPTIONS` for a routed path without an explicit handler returns `204` with
+  an `Allow` header; other unsupported methods return `405` with `Allow`.
+- The `Allow` list includes implied `HEAD` for `GET` and the automatic
+  `OPTIONS` method. Static files accept GET/HEAD and report other methods.
+- The experimental SSE endpoint permits streaming only on GET, not on HEAD or
+  write methods.
+
+The typed response algebra and supervised request execution are separate
+follow-up work; they are not implied by this protocol-level change.
+
 ## Decode failures and HTTP problems
 
 Request decoding distinguishes client input failures from compiler/runtime invariant failures:
