@@ -25,6 +25,55 @@ fn make_jit() -> JitSession {
 }
 
 #[test]
+fn native_leaf_dispatch_table_is_cached_sorted_and_module_scoped() {
+    let mut jit = make_jit();
+    let stub = noop_jit_region as *const u8;
+    jit.native_leaf_calls.insert(
+        (0, 9),
+        NativeLeafCall {
+            ptr: stub,
+            return_reg: 3,
+            required_args: 2,
+        },
+    );
+    jit.native_leaf_calls.insert(
+        (0, 2),
+        NativeLeafCall {
+            ptr: stub,
+            return_reg: 0,
+            required_args: 0,
+        },
+    );
+    jit.rebuild_native_leaf_table(0);
+
+    let first = jit.native_leaf_tables.get(&0).unwrap().clone();
+    assert_eq!(
+        first.iter().map(|entry| entry.func_idx).collect::<Vec<_>>(),
+        vec![2, 9]
+    );
+    assert!(jit.native_leaf_tables.get(&1).is_none());
+    assert!(std::sync::Arc::ptr_eq(
+        &first,
+        jit.native_leaf_tables.get(&0).unwrap()
+    ));
+
+    jit.native_leaf_calls.insert(
+        (1, 4),
+        NativeLeafCall {
+            ptr: stub,
+            return_reg: 1,
+            required_args: 1,
+        },
+    );
+    jit.rebuild_native_leaf_table(1);
+    assert!(std::sync::Arc::ptr_eq(
+        &first,
+        jit.native_leaf_tables.get(&0).unwrap()
+    ));
+    assert_eq!(jit.native_leaf_tables.get(&1).unwrap()[0].func_idx, 4);
+}
+
+#[test]
 fn test_jit_session_creation() {
     let jit = JitSession::new().expect("JIT must be available");
     assert_eq!(jit.compiled_count(), 0);
