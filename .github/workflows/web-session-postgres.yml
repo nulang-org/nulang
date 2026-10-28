@@ -6,6 +6,8 @@ on:
       - '.github/workflows/web-session-postgres.yml'
       - 'src/web/session_pg_reference.rs'
       - 'src/web/origin_admission.rs'
+      - 'src/runtime/http_server.rs'
+      - 'tests/web_http_server_contracts.rs'
       - 'src/web/session_preflight.rs'
       - 'src/web/csrf.rs'
       - 'src/web/http_request.rs'

@@ -20,6 +20,7 @@ use crate::vm::{resolve_value_string, Value, CLOSURE_ENV_FLAG, VM};
 use crate::web::dispatch::{render_direct_request, DirectRequestRenderError};
 use crate::web::http_problem::request_decode_problem_response;
 use crate::web::http_request::HttpRequestBindingInputs;
+use crate::web::origin_admission::validate_mutation_origin;
 use crate::web::reactivity::inject_client_runtime_script;
 use crate::web::request_bindings::percent_decode_form;
 use crate::web::runtime_bindings::RuntimeWebRoute;
@@ -1024,7 +1025,30 @@ impl WebDevServer {
         };
         let path = request.path.clone();
 
-        let mut response = if path.starts_with(Self::SSE_PATH_PREFIX) {
+        // One canonical provenance policy, shared with the disposable HTTP
+        // session/RLS reference. Admission happens before SSE subscriptions,
+        // static reads, and both legacy and typed route dispatch.
+        // A trusted reverse proxy must configure its actual public origin;
+        // untrusted X-Forwarded-* headers never choose the trusted authority.
+        let public_origin = std::env::var("NULANG_WEB_PUBLIC_ORIGIN").ok();
+        let origin_denied = validate_mutation_origin(
+            request.method.as_str(),
+            &request.headers,
+            stream.local_addr().ok(),
+            public_origin.as_deref(),
+        )
+        .is_err();
+
+        let mut response = if origin_denied {
+            HttpResponse {
+                status: 403,
+                headers: vec![
+                    ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+                    ("Cache-Control".into(), "no-store".into()),
+                ],
+                body: b"Forbidden".to_vec(),
+            }
+        } else if path.starts_with(Self::SSE_PATH_PREFIX) {
             let room = &path[Self::SSE_PATH_PREFIX.len()..];
             Self::serve_sse(room, &mut stream, shutdown.clone());
             return;

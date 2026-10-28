@@ -12,13 +12,24 @@ The parallel session-token stack in PR #2340 already defines `web::csrf`
 for server-owned synchronizer tokens. This name collision MUST be reconciled
 before any integration into production.
 
-For isolated interoperability testing, `web::origin_admission` is a
-**verbatim algorithmic copy** of the audited candidate's implementation,
-with its public API preserved and its origin regression contract tested in
-`tests/web_origin_admission_reference.rs`. It has not replaced the audited
-implementation in production. A future integration MUST consolidate these
-into ONE authoritative Origin admission policy and ONE session CSRF policy
-without retaining two independently drifting origin implementations.
+The canonical implementation now lives at `web::origin_admission`, with
+the audited candidate's original decision rules and a matching contract test.
+`web::csrf` retains ONLY a `pub use` compatibility facade to the same
+function/type, alongside its independent session synchronizer primitive;
+there is no second provenance decision tree in this branch.
+
+`WebDevServer::handle_connection` calls this canonical policy before
+static files, typed or legacy route dispatch, and SSE subscriptions.
+The error is mapped to a generic 403 + `Cache-Control: no-store`,
+without logging credential or handler details. This applies to the
+experimental development listener; it is NOT a production session-authorization
+integration.
+
+**PR #2185 remains a separate draft** containing its old `web::csrf`
+origin implementation. Before merging its other security work, replace
+that duplicate with a re-export or remove it, retaining this canonical
+`web::origin_admission` module. The two branches have not been merged,
+and a code conflict in the audited candidate still needs review.
 
 ## Real network witness
 
@@ -48,6 +59,16 @@ The test proves only the exact positive and negative request cases defined
 by the fixture; no claim is made about network-level readiness, OAuth/OIDC,
 session issuance, token rotation, proxy headers, browser cookie attributes,
 transactional mutation security, concurrency or complete attack coverage.
+
+## Live development-server regression tests
+
+`tests/web_http_server_contracts.rs` now checks actual
+`WebDevServer` wire behavior: invalid read Host names and SSE rebinding
+are rejected before routing; POST requests with missing/foreign/duplicate
+Origin, or cross-site Fetch Metadata, are denied. Valid same-origin POST
+reaches ordinary routing and the old localhost GET fixture remains working.
+The `web::csrf` alias is checked against the canonical function for parity.
+The tests do not enable a public authenticated mutation or a production server.
 
 ## Running
 

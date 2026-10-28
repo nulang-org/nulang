@@ -165,3 +165,68 @@ fn legacy_route_still_falls_back_over_real_http() {
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
     assert!(response_body(&response).starts_with("legacy"), "{response}");
 }
+
+#[test]
+fn live_web_dev_server_rejects_rebinding_before_routes_and_sse() {
+    let server =
+        WebDevServer::bind(0, None, None, vec![legacy_route()]).expect("bind WebDevServer");
+    let forbidden = format!(
+        "GET /legacy HTTP/1.1\r\nHost: attacker.example:{}\r\nConnection: close\r\n\r\n",
+        server.port
+    );
+    let denied = send_raw_request(server.port, &forbidden);
+    assert!(denied.starts_with("HTTP/1.1 403 Forbidden"), "{denied}");
+    assert!(!denied.contains("legacy"));
+
+    let sse = format!(
+        "GET /__nulang/sse/private HTTP/1.1\r\nHost: attacker.example:{}\r\nConnection: close\r\n\r\n",
+        server.port
+    );
+    let denied_sse = send_raw_request(server.port, &sse);
+    assert!(
+        denied_sse.starts_with("HTTP/1.1 403 Forbidden"),
+        "{denied_sse}"
+    );
+
+    let trusted = send_raw_request(
+        server.port,
+        &format!(
+            "GET /legacy HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
+            server.port
+        ),
+    );
+    assert!(trusted.starts_with("HTTP/1.1 200 OK"), "{trusted}");
+    assert!(response_body(&trusted).contains("legacy"));
+}
+
+#[test]
+fn live_web_dev_server_rejects_unsafe_provenance_before_dispatch() {
+    let server = WebDevServer::bind(0, None, None, vec![]).expect("bind WebDevServer");
+    let host = format!("localhost:{}", server.port);
+    for raw in [
+        format!(
+            "POST /mutation HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\n\r\n"
+        ),
+        format!(
+            "POST /mutation HTTP/1.1\r\nHost: {host}\r\nOrigin: https://attacker.example\r\nContent-Length: 0\r\n\r\n"
+        ),
+        format!(
+            "POST /mutation HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nSec-Fetch-Site: cross-site\r\nContent-Length: 0\r\n\r\n"
+        ),
+        format!(
+            "POST /mutation HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nOrigin: https://attacker.example\r\nContent-Length: 0\r\n\r\n"
+        ),
+    ] {
+        let denied = send_raw_request(server.port, &raw);
+        assert!(denied.starts_with("HTTP/1.1 403 Forbidden"), "{denied}");
+        assert!(!denied.contains("private_server_slot"));
+    }
+
+    let trusted = send_raw_request(
+        server.port,
+        &format!(
+            "POST /mutation HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nSec-Fetch-Site: same-origin\r\nContent-Length: 0\r\n\r\n"
+        ),
+    );
+    assert!(trusted.starts_with("HTTP/1.1 404 Not Found"), "{trusted}");
+}
