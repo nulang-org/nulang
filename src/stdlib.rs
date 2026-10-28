@@ -622,6 +622,14 @@ impl StdLib {
                     description: "Get a cookie value from the current HTTP request by name.",
                 },
                 BuiltinOp {
+                    name: "Web.set_header",
+                    effect: "Web",
+                    op: "set_header",
+                    signature: "set_header(name: String, value: String) -> Unit",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Set a safe request-scoped HTTP response header.",
+                },
+                BuiltinOp {
                     name: "Web.set_cookie",
                     effect: "Web",
                     op: "set_cookie",
