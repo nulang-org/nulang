@@ -51,6 +51,9 @@ jobs:
       - name: Smoke test Nulang Web action events
         run: node scripts/tests/web_action_events.mjs
 
+      - name: Test keyed UI DOM host in Chromium
+        run: python3 crates/nulang-ui-protocol/browser/test_dom_host.py
+
       - name: Install docs dependencies
         run: |
           cd docs

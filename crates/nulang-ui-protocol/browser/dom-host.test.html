@@ -80,6 +80,74 @@ test("root replacement and removed inputs do not resurrect removed controls", ()
   assert(host.element("title").value==="server","stale local input resurrected");
 });
 
+test("SSR hydration adopts keyed markup with the same scoped NodeIds as Rust", () => {
+  const container=document.getElementById("mount");
+  container.innerHTML='<div><ul data-nulang-key="left"><li data-nulang-key="é">Unicode</li><li data-nulang-key="same">One</li></ul><ul data-nulang-key="right"><li data-nulang-key="same">Two</li></ul></div>';
+  const original=container.querySelector("li");
+  const host=window.nulangUiDom.createHostFromDom(container,{documentId:"test",revision:"1"});
+  assert(host.element("root/k6c656674/kc3a9")===original,"SSR node was recreated");
+  assert(host.element("root/k7269676874/k73616d65").textContent==="Two","key scope not respected");
+  assert(host.element("root/k6c656674/k73616d65").textContent==="One","wrong sibling identity");
+  assert(host.document.nodes.some(n=>n.id==="root/k6c656674/kc3a9" && n.properties.text.value==="Unicode"),"missing SSR snapshot property");
+  assert(container.querySelector("[data-nulang-node-id='root/k6c656674/kc3a9']")===original,"missing adoption marker");
+});
+
+test("SSR hydration refuses duplicate or unsafe keyed nodes atomically", () => {
+  const container=document.getElementById("mount");
+  container.innerHTML='<ul><li data-nulang-key="duplicate">A</li><li data-nulang-key="duplicate">B</li></ul>';
+  const before=container.firstElementChild;
+  let rejected=false;
+  try { window.nulangUiDom.createHostFromDom(container,{documentId:"test",revision:"1"}); } catch (_) {rejected=true}
+  assert(rejected && container.firstElementChild===before,"duplicate sibling keys accepted or DOM mutated");
+
+  container.innerHTML='<ul><a data-nulang-key="ok" href="javascript:alert(1)">Bad</a></ul>';
+  rejected=false;
+  try { window.nulangUiDom.createHostFromDom(container,{documentId:"test",revision:"1"}); } catch (_) {rejected=true}
+  assert(rejected,"unsafe SSR URL accepted");
+
+  container.innerHTML='<ul data-nulang-key="ignored"><li>A</li></ul>';
+  rejected=false;
+  try { window.nulangUiDom.createHostFromDom(container,{documentId:"test",revision:"1"}); } catch (_) {rejected=true}
+  assert(rejected,"root key silently ignored");
+
+  container.innerHTML='<ul><li data-nulang-key="x&#10;y">Invalid</li></ul>';
+  rejected=false;
+  try { window.nulangUiDom.createHostFromDom(container,{documentId:"test",revision:"1"}); } catch (_) {rejected=true}
+  assert(rejected,"control-character key accepted");
+});
+
+test("explicit resync rejects drafts and wrong-document or older snapshots", () => {
+  const host=setup([entry("root","div",{},["a"]),entry("a","input",{value:str("")})]);
+  const input=host.element("a");
+  input.value="draft";input.dispatchEvent(new Event("input"));
+  const next=snapshot(3,[entry("root","div",{},["a"]),entry("a","input",{value:str("server")})]);
+  let rejected=false;
+  try {host.resync(next)} catch (_) {rejected=true}
+  assert(rejected && input.value==="draft","unacknowledged edit silently discarded");
+  const other={...next,document_id:"other"};
+  rejected=false;
+  try {host.resync(other,{discardPending:true})} catch (_) {rejected=true}
+  assert(rejected && host.document.revision==="1","cross-document snapshot accepted");
+  const stale={...next,revision:"0"};
+  rejected=false;
+  try {host.resync(stale,{discardPending:true})} catch (_) {rejected=true}
+  assert(rejected,"old snapshot accepted");
+  assert(host.resync(next,{discardPending:true})==="resynced","explicit resync failed");
+  assert(host.element("a").value==="server","stale draft survived explicit replacement");
+  host.applyPatch(patch(3,4,[{op:"set_property",node_id:"a",name:"value",value:str("new")}]));
+  assert(host.element("a").value==="new","state was not reset after resync");
+});
+
+test("SSR hydrated keyed reorder applies server patches without replacing nodes", () => {
+  const container=document.getElementById("mount");
+  container.innerHTML='<ul><li data-nulang-key="a">A</li><li data-nulang-key="b">B</li></ul>';
+  const oldB=container.querySelectorAll("li")[1];
+  const host=window.nulangUiDom.createHostFromDom(container,{documentId:"test",revision:"1"});
+  assert(host.applyMessage({protocol:"nulang-ui-msg/1",type:"patch",
+    patch:patch(1,2,[{op:"replace_children",node_id:"root",children:["root/k62","root/k61"]}])})==="applied","patch not applied");
+  assert(container.firstElementChild.firstElementChild===oldB,"keyed SSR element replaced");
+});
+
 (async () => {
  const out=[];
  for(const {name,fn} of tests) {
