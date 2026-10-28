@@ -1,0 +1,33 @@
+name: Web Tenant PostgreSQL RLS (disposable)
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/web-tenant-postgres-rls.yml'
+      - 'tests/run_tenant_resource_postgres_rls_ci.sh'
+      - 'tests/tenant_resource_postgres_rls.sh'
+      - 'examples/tenant-resources/**'
+      - 'src/runtime/http_server.rs'
+      - 'src/runtime/callbacks.rs'
+      - 'src/web/**'
+      - 'src/stdlib/web/**'
+      - 'src/package/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tenant-rls-disposable:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install local PostgreSQL test-cluster utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql postgresql-common
+          command -v pg_virtualenv
+          command -v psql
+      - name: Verify disposable-only guard and tenant RLS behavior
+        run: bash tests/run_tenant_resource_postgres_rls_ci.sh
