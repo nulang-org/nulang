@@ -171,8 +171,7 @@ pub fn compile_contracts_from_tree(src_root: &Path) -> ContractCompilation {
     collect_contracts_recursive(src_root, &mut out);
     out.routes
         .sort_by(|a, b| (&a.method, &a.path).cmp(&(&b.method, &b.path)));
-    out.routes
-        .dedup_by(|a, b| a.method == b.method && a.path == b.path);
+    // Preserve duplicates for validation instead of silently choosing a handler.
     out
 }
 
