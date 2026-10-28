@@ -117,6 +117,8 @@ native-tls = { version = "0.2", optional = true }
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# RFC 7515 URL-safe compact token encoding (already present in Cargo.lock).
+base64 = "0.22.1"
 
 # Manifest/lockfile parsing for the `nula` package manager
 toml = "1"

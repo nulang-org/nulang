@@ -197,3 +197,105 @@ fn denied_foreign_write_and_failed_transaction_never_commit() {
     assert!(matches!(rollback, Err(TenantAuthorityError::Database)));
     assert_eq!(authority.execute(&alice, face_names).unwrap(), before);
 }
+
+#[test]
+fn signed_eddsa_access_token_reaches_only_pinned_tenant_postgres_login() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use ed25519_dalek::{Signer, SigningKey};
+    use nulang::web::tenant_jwt_reference::{PinnedEd25519Verifier, RevocationPolicy};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct NeverRevokedInTest;
+    impl RevocationPolicy for NeverRevokedInTest {
+        fn is_revoked(&self, _issuer: &str, _subject: &str, _jti: &str) -> Option<bool> {
+            Some(false) // only in the disposable, non-production fixture
+        }
+    }
+    let signer = SigningKey::from_bytes(&[31_u8; 32]); // deterministic test fixture
+    let pinned_verifier = PinnedEd25519Verifier::new(
+        "issuer-a",
+        "nulang-tenant-api",
+        "disposable-test-key",
+        signer.verifying_key(),
+        NeverRevokedInTest,
+    )
+    .expect("valid pinned verifier config");
+
+    let port = std::env::var("PGPORT").unwrap().parse::<u16>().unwrap();
+    let members = HashMap::from([
+        (
+            "issuer-a|alice".to_string(),
+            TenantRoleBinding::new(
+                "tenant-a",
+                "example_tenant_a",
+                std::env::var("NULANG_TENANT_TEST_PASSWORD_A").unwrap(),
+            ),
+        ),
+        (
+            "issuer-a|bob".to_string(),
+            TenantRoleBinding::new(
+                "tenant-b",
+                "example_tenant_b",
+                std::env::var("NULANG_TENANT_TEST_PASSWORD_B").unwrap(),
+            ),
+        ),
+    ]);
+    let authority =
+        TenantPostgresAuthority::new("127.0.0.1", port, pinned_verifier, members).unwrap();
+
+    let now = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap();
+    let sign_for = |subject: &str, audience: &str| {
+        let header = serde_json::json!({
+            "alg": "EdDSA", "kid": "disposable-test-key", "typ": "at+jwt",
+        });
+        let claims = serde_json::json!({
+            "iss": "issuer-a", "sub": subject, "aud": audience, "jti": format!("jwt-{subject}"),
+            "iat": now-1, "nbf": now-1, "exp": now+120,
+        });
+        let input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap()),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap()),
+        );
+        let signature = signer.sign(input.as_bytes());
+        format!("{}.{}", input, URL_SAFE_NO_PAD.encode(signature.to_bytes()))
+    };
+    let alice = sign_for("alice", "nulang-tenant-api");
+    let bob = sign_for("bob", "nulang-tenant-api");
+    assert_eq!(
+        authority
+            .execute(&request(Some(&alice), Some("tenant-b")), face_names)
+            .unwrap(),
+        vec!["New face", "Face A"],
+    );
+    assert_eq!(
+        authority
+            .execute(&request(Some(&bob), Some("tenant-a")), face_names)
+            .unwrap(),
+        vec!["Foreign Face", "Face B"],
+    );
+    let wrong_audience = sign_for("alice", "some-other-api");
+    assert!(matches!(
+        authority.execute(
+            &request(Some(&wrong_audience), Some("tenant-a")),
+            |_tx| -> Result<(), postgres::Error> { panic!("invalid audience reached SQL") }
+        ),
+        Err(TenantAuthorityError::Unauthorized),
+    ));
+    let mut forged = alice.clone();
+    forged.pop();
+    forged.push(if alice.ends_with('A') { 'B' } else { 'A' });
+    assert!(matches!(
+        authority.execute(
+            &request(Some(&forged), Some("tenant-a")),
+            |_tx| -> Result<(), postgres::Error> { panic!("forged signature reached SQL") }
+        ),
+        Err(TenantAuthorityError::Unauthorized),
+    ));
+}

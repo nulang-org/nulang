@@ -5,8 +5,12 @@ on:
     paths:
       - '.github/workflows/web-tenant-authority.yml'
       - 'tests/tenant_pg_request_authority.rs'
+      - 'tests/tenant_jwt_verifier.rs'
       - 'tests/run_tenant_pg_authority_ci.sh'
       - 'src/web/tenant_pg_reference.rs'
+      - 'src/web/tenant_jwt_reference.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'src/web/mod.rs'
       - 'src/runtime/http_server.rs'
       - 'src/runtime/mod.rs'
@@ -32,5 +36,7 @@ jobs:
           sudo apt-get install -y -qq postgresql postgresql-common openssl
           command -v pg_virtualenv
           command -v cargo
-      - name: Verify HTTP request authority to isolated tenant SQL
+      - name: Verify pinned Ed25519 JWT access-token contract
+        run: cargo test --locked --no-default-features --features postgres --test tenant_jwt_verifier
+      - name: Verify signed request authority to disposable tenant SQL
         run: bash tests/run_tenant_pg_authority_ci.sh
