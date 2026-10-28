@@ -51,6 +51,22 @@ impl SessionCsrfToken {
         hex::encode(self.0)
     }
 
+    /// Restore a synchronizer token from an authenticated, server-owned
+    /// session store. Never call this with an untrusted browser-supplied value.
+    /// Malformed persistence data must fail closed; no random replacement.
+    pub fn from_server_storage_hex(encoded: &str) -> Result<Self, CsrfTokenError> {
+        if encoded.len() != ENCODED_BYTES
+            || !encoded
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(CsrfTokenError::Malformed);
+        }
+        let mut bytes = [0u8; TOKEN_BYTES];
+        hex::decode_to_slice(encoded, &mut bytes).map_err(|_| CsrfTokenError::Malformed)?;
+        Ok(Self(bytes))
+    }
+
     /// Verify exactly one token from *all* submitted sources (header and form).
     /// Callers must preserve duplicates before parsing request fields into a
     /// map: otherwise two tokens can become one through parameter pollution.

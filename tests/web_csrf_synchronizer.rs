@@ -3,6 +3,26 @@
 use nulang::web::csrf::{CsrfTokenError, SessionCsrfToken};
 
 #[test]
+fn server_stored_csrf_hex_round_trips_and_rejects_corrupt_state() {
+    let original = SessionCsrfToken::generate().unwrap();
+    let saved = original.encode();
+    let recovered = SessionCsrfToken::from_server_storage_hex(&saved).unwrap();
+    assert_eq!(recovered.verify_presented(&[saved.as_str()]), Ok(()));
+    assert_eq!(
+        SessionCsrfToken::from_server_storage_hex("invalid").unwrap_err(),
+        CsrfTokenError::Malformed
+    );
+    assert_eq!(
+        SessionCsrfToken::from_server_storage_hex(&saved.to_ascii_uppercase()).err(),
+        if saved != saved.to_ascii_uppercase() {
+            Some(CsrfTokenError::Malformed)
+        } else {
+            None
+        }
+    );
+}
+
+#[test]
 fn random_token_is_canonical_and_verifies_only_for_own_session() {
     let session_a = SessionCsrfToken::generate().unwrap();
     let session_b = SessionCsrfToken::generate().unwrap();
