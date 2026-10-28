@@ -116,6 +116,8 @@ pub use foreign_executor::*;
 pub use gc::{ForeignRefOp, GcStats, OrcaCoordinator, OrcaGc, OrcaHeap};
 pub use grain::*;
 pub use heap::*;
+#[cfg(feature = "postgres")]
+pub use http_server::HttpRequest;
 pub use http_server::{render_route_handler, HttpMethod, HttpServerState, WebDevServer, WebRoute};
 pub use mailbox::*;
 pub use network::NetworkTransport;

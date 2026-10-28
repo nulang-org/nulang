@@ -17,4 +17,6 @@ pub mod reactivity;
 pub mod request_bindings;
 pub mod route_check;
 pub mod runtime_bindings;
+#[cfg(feature = "postgres")]
+pub mod tenant_pg_reference;
 pub mod validation;
