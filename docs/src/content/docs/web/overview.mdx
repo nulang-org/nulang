@@ -251,7 +251,7 @@ element ID selector such as `#current-message`.
 The `POST` route should return an HTML fragment containing the same ID:
 
 ```nulang
-fn save_message() -> Html {
+fn save_message() {
     let msg = form_value("message")
     kv_set("patch-web-message", msg)
     el("p", [("id", text("current-message"))], [text(msg)])

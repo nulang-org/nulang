@@ -4,13 +4,13 @@ import stdlib::web::html
 import stdlib::web::types
 import stdlib::web::host
 
-fn current_message() -> Html {
+fn current_message() {
     let value = kv_get("patch-web-message")
     let display = if value == "" then { "Nothing submitted yet" } else { value }
     el("p", [("id", text("current-message"))], [text(display)])
 }
 
-fn home() -> Html {
+fn home() {
     document(
         head([title("Progressive HTML patches — Nulang")]),
         body([
@@ -32,7 +32,7 @@ fn home() -> Html {
     )
 }
 
-fn save_message() -> Html {
+fn save_message() {
     let msg = form_value("message")
     kv_set("patch-web-message", msg)
     // The target ID must occur in both the displayed page and the response.
