@@ -1,4 +1,9 @@
 # Nulang Changelog
+### AOT unhandled-effect category and WASM fail-closed parity — 2026-10-28
+- **Native AOT preserves the bytecode interpreter's `EffectError` category for an unhandled non-exhaustive-match effect.** The first pending compiled error retains its runtime/effect kind, with compatibility for existing message-only JIT consumers.
+- **The default WASM backend now rejects MIR containing the reserved non-exhaustive-match fallback effect rather than silently returning `nil`.** This is a restricted-profile rejection, not full WASM effect-error support; the typed WASM error path remains future work.
+- **Deterministic regressions pin both the cross-backend outcome and the WASM unsupported boundary.** Full nightly shards and exact-head CI remain necessary before merging.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.

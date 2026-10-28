@@ -1013,6 +1013,26 @@ mod tests {
         );
     }
 
+    /// Until WASM has typed unhandled-effect propagation, compilation must
+    /// reject the compiler-generated match fallback rather than return nil.
+    #[cfg(feature = "wasm-backend")]
+    #[test]
+    fn wasm_rejects_non_exhaustive_match_effect_without_error_support() {
+        use crate::backends::WasmBackend;
+        let mutant = compile_for_diff_verbose("let x = 42; match x { 0 => (fn(x) { x + 1 })(41)}")
+            .expect("regression must compile to MIR");
+        let mut wasm = crate::backends::DefaultWasmBackend;
+        let error = wasm
+            .compile(&mutant.mir_module, "main")
+            .expect_err("unhandled match effect must fail closed in WASM");
+        assert!(
+            error
+                .to_string()
+                .contains("WASM backend restricted profile"),
+            "unexpected WASM rejection: {error}"
+        );
+    }
+
     /// Differential regression cases: known kernels that must agree across
     /// all backends. Added from nightly fuzz captures (2026-10-10).
     #[test]
