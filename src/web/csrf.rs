@@ -9,12 +9,12 @@
 
 use rand_core::{OsRng, RngCore};
 use std::fmt;
+use subtle::ConstantTimeEq;
 
 // Compatibility facade for the audited pre-consolidation Web security API.
 // Provenance rules live ONLY in web::origin_admission. Session synchronizer
 // token handling stays below and contains no second Origin decision tree.
 pub use crate::web::origin_admission::{validate_mutation_origin, OriginCheckError};
-use subtle::ConstantTimeEq;
 
 const TOKEN_BYTES: usize = 32;
 const ENCODED_BYTES: usize = TOKEN_BYTES * 2;
