@@ -324,7 +324,8 @@ headers on successful route responses. `Web.set_header` also supports
 `Vary` and other safe application headers; it drops invalid names/values,
 CRLF injection, framing overrides, and server-owned security headers.
 A later write replaces an earlier header with the same case-insensitive
-name. Use `Web.set_cookie` for cookies. The HTTP server automatically sets
+name, except `Vary`, which combines unique case-insensitive field names and
+preserves `Vary: *`. Use `Web.set_cookie` for cookies. The HTTP server automatically sets
 `Content-Type: text/html; charset=utf-8`.
 
 The helpers intentionally do **not** ship a second reactive runtime. Use
@@ -332,3 +333,63 @@ HTMX/Alpine.js for progressive enhancement, or Nulang's existing compiled
 signals and actor-backed SSE for more complex interactions. Browser request
 coordination (`hx-sync`) runs on the HTMX client; it does not cancel server-side
 work automatically.
+
+## Unpoly-compatible partial HTML (optional)
+
+Import `stdlib::web::unpoly` to respond to stock Unpoly 3 clients without
+shipping a second Nulang JavaScript runtime. The full example is in
+[`examples/unpoly-compat/src/main.nula`](https://github.com/nulang-org/nulang/tree/main/examples/unpoly-compat).
+
+```nulang
+import stdlib::web::unpoly
+import stdlib::web::html
+import stdlib::web::types
+
+fn results() -> Html {
+    el("main", [("id", text("results"))], [text("Updated")])
+}
+
+fn page() -> Html {
+    if is_target("#results") then {
+        results()
+    } else {
+        document(
+            head([title("Results")]),
+            body([
+                el("a", [
+                    ("href", text("/results")), follow(), target("#results")
+                ], [text("Refresh")]),
+                results()
+            ])
+        )
+    }
+}
+```
+
+`is_fragment()` detects `X-Up-Version` and adds
+`Vary: X-Up-Version, X-Up-Target, X-Up-Fail-Target, X-Up-Mode, X-Up-Validate`
+for the full-page and fragment variants. `is_fragment()` only identifies
+an Unpoly request; it does not prove the requested selector is supported.
+Use `is_target("#results")` to render just one known fragment when its
+`X-Up-Target` matches exactly. Combined selectors (e.g.
+`#results, #notifications`), missing targets, and other selectors must fall
+back to a complete document containing the requested elements. This keeps
+Unpoly's merged fragment requests correct. `request_target()`, `fail_target()`,
+`layer_mode()`, and `validation_fields()` expose optional request metadata.
+The caller must still validate expected targets and authorize the action.
+
+Attribute helpers include `follow()`, `submit()`, `target(selector)`,
+`fail_target_attr(selector)`, `layer(kind)`, `validate()` and `hungry()`.
+Response helpers include `retarget(selector)`, `set_title(value)`,
+`location(url)`, `events(json)`, `accept_layer(value)` and
+`dismiss_layer(value)`. All user-controlled attribute values pass through
+the HTML escaping constructor, and response headers pass the host's
+CRLF/forbidden-field checks.
+
+Unpoly must be loaded separately by the application. Ordinary links and forms
+retain their native `href`, `action`, and `method` for no-JavaScript
+navigation. The `X-Up-*` headers are not authentication or CSRF signals.
+Use standards-compliant HTTP 422 responses for invalid forms **only where
+an actual status-bearing response API is available**; this adapter does not
+add response status control. Likewise, ETag/304 and typed fragments are
+separate future work, not implied by this compatibility module.
