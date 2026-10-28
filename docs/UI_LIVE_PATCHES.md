@@ -215,3 +215,41 @@ CI **Docs site & browser playground** job):
 cargo test -p nulang-ui-protocol
 python3 crates/nulang-ui-protocol/browser/test_dom_host.py
 ```
+
+## Compiler-owned UI template plan (experimental)
+
+The Nulang web frontend now provides
+`nulang::web::ui_template::UiTemplate::compile(&ast, "view")`.
+This lowers a **restricted, effect-free subset** of the existing parsed JSX
+`el(tag, attrs, children)` tree into a serializable `UiTemplate` plan.
+No second JSX parser or virtual DOM was introduced.
+
+The supported subset includes literal string/boolean/integer values, variable
+and record-field paths, ordinary nested elements, text-only leaves, and keyed
+`for item in rows { <li key={item.id}>{item.label}</li> }` comprehensions.
+All loop-produced elements must have an explicit key. Browser-unsafe tags
+or attributes, scriptable URL schemes, effectful expressions, arbitrary
+function calls, and mixed text/element children are unsupported and fail
+closed when explicitly compiled.
+
+`UiTemplate::render(document_id, revision, &bindings)` binds server-supplied
+`WireValue` objects and arrays into a `KeyedNode` tree, which passes through
+the same `document_from_keyed_tree` builder as SSR. This produces the stable
+parent-scoped IDs used by the browser host, allowing
+`UiDocument::diff` to emit a `ReplaceChildren` instead of recreating rows.
+
+When compiling a web source with `--rewrite-signals` (including `nula
+build --web`), the CLI writes `.nula/app.ui-templates.json` beside
+the compiled `.nula/build.nbc` artifact, **not** alongside public
+`app.client.js`. The versioned manifest contains only functions whose JSX
+root can be conservatively lowered; unsupported functions remain on the
+existing HTML renderer. It contains **no bound request/user data, authorization
+tokens, or executable handlers**. The server decides whether to use a plan,
+binds validated values, and authenticates any resulting action independently.
+
+The generated template manifest is an experimental sidecar, not yet an
+automatic runtime route. It does not authenticate sessions, emit live patches,
+or stream updates. A following integration should consume the manifest in a
+session-authorized server renderer and pair it with the existing action
+contract and verified SSE/HTTP transport. Do not allow a client to select
+arbitrary templates or bind privileged values without server-side policy.
