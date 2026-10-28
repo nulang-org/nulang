@@ -272,6 +272,40 @@ the latest submitted response wins, even when an earlier fetch or streamed
 response body completes later. Superseded requests are aborted when supported,
 and ignored if an abort races with their completion.
 
+### Explicit selective revalidation (experimental)
+
+A progressive action can refresh related regions after its POST without
+reloading the full page. Declare **one primary patch target** and up to eight
+additional IDs to revalidate from the route's canonical GET representation:
+
+```html
+<div id="detail">Current item</div>
+<div id="summary">Current summary</div>
+<div id="notifications">Current notifications</div>
+<form method="POST" data-action="save_item" data-action-placement="server"
+      data-nulang-target="#detail"
+      data-nulang-revalidate="#summary, #notifications">
+  <button type="submit">Save</button>
+</form>
+```
+
+The POST must return `text/html` containing `#detail`. After a successful
+POST, the browser performs one same-origin, uncached GET of the current route;
+that HTML must contain both `#summary` and `#notifications`. Nulang validates
+**every** requested region before morphing the primary and related regions.
+Duplicate, overlapping, missing, or arbitrary CSS targets are rejected. Invalid
+revalidation declarations fail **before** the POST is submitted. Non-HTML,
+failed, or redirected GET responses leave the displayed regions unchanged.
+
+The latest submission wins across all claimed regions, including when two
+different actions both revalidate the same summary. Fetch cancellation is
+best-effort and cannot roll back server-side mutations. This is **explicit
+DOM-region revalidation**, not automatic typed loader dependency inference:
+Web Contract IR does not yet validate these region names or derive database
+read dependencies. To avoid redundant work, declare only regions that actually
+depend on the mutated data. An application must still enforce idempotency,
+authorization, and transactional consistency on the server.
+
 See [examples/patch-web](https://github.com/nulang-org/nulang/tree/main/examples/patch-web)
 for a standalone sample. Run `nulang nula dev` from that directory.
 
@@ -279,8 +313,8 @@ for a standalone sample. Run `nulang nula dev` from that directory.
 This is an **opt-in, DOM-preserving HTML response**, not an SSE patch
 protocol. The morph algorithm is intentionally small: elements without
 stable IDs/keys can still be replaced, and changing a node's element type
-replaces that node. Request ordering protects the **client DOM for each exact
-target selector**, but cannot undo or order server-side mutation side effects,
+replaces that node. Request ordering protects the **client DOM for claimed
+target selectors**, but cannot undo or order server-side mutation side effects,
 guarantee exactly-once execution, or coordinate overlapping ancestor/descendant
 targets. Use idempotency and server-side concurrency controls for those cases.
 The response must be generated from trusted, properly escaped server-side

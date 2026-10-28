@@ -60,6 +60,9 @@ jobs:
       - name: Smoke test Nulang Web patch request ordering
         run: node scripts/tests/web_action_patch_race.mjs
 
+      - name: Smoke test Nulang Web selective revalidation
+        run: node scripts/tests/web_action_revalidation.mjs
+
       - name: Smoke test Nulang Web Navigation API enhancement
         run: node scripts/tests/web_navigation_api.mjs
 

@@ -1020,14 +1020,113 @@ pub fn generate_client_runtime() -> String {
     hydrate();
   }
 
-  async function patchActionResponse(response, selector, isCurrent, updateTitle) {
+  // Validate the media type and parse the response before touching the DOM.
+  // This does not sanitize HTML: server-rendered content must be escaped.
+  async function parseHtmlResponse(response) {
     const contentType = response.headers.get('content-type') || '';
     if (!/^text\/html(?:\s*;|\s*$)/i.test(contentType.trim())) {
       throw new Error('Nulang patch response must be text/html');
     }
-    const html = await response.text();
+    return new DOMParser().parseFromString(await response.text(), 'text/html');
+  }
+
+  // Explicit, bounded IDs, not inferred storage dependencies or arbitrary CSS.
+  function revalidationTargets(raw, primary) {
+    if (raw.length > 512) throw new Error('Nulang revalidation list is too long');
+    const selectors = raw.split(/[\s,]+/).filter(Boolean);
+    if (!selectors.length || selectors.length > 8) {
+      throw new Error('Nulang revalidation requires 1-8 targets');
+    }
+    const used = new Set([primary]);
+    selectors.forEach(function (selector) {
+      if (!/^#[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(selector) || used.has(selector)) {
+        throw new Error('Nulang revalidation requires distinct element ID targets');
+      }
+      used.add(selector);
+    });
+    return selectors;
+  }
+
+  // Preflight every target before ANY DOM mutation, including overlap checks.
+  // This is validation-atomic, not rollback if DOM APIs themselves throw.
+  function applyHtmlTargets(patches, updateTitle) {
+    const planned = patches.map(function (patch) {
+      const selector = patch.selector;
+      if (!/^#[A-Za-z][A-Za-z0-9_-]*$/.test(selector)) {
+        throw new Error('invalid Nulang patch target (expected an element ID)');
+      }
+      const incoming = patch.page.querySelector(selector);
+      const current = document.querySelector(selector);
+      if (!incoming || !current) {
+        throw new Error('Nulang patch target not found: ' + selector);
+      }
+      return { current, incoming };
+    });
+    planned.forEach(function (item, index) {
+      planned.slice(index + 1).forEach(function (other) {
+        if ((typeof item.current.contains === 'function' &&
+             item.current.contains(other.current)) ||
+            (typeof other.current.contains === 'function' &&
+             other.current.contains(item.current))) {
+          throw new Error('Nulang revalidation targets must not overlap');
+        }
+      });
+    });
+    planned.forEach(function (item) {
+      const current = item.current;
+      const incoming = item.incoming;
+      // No Node interface in tiny test stubs; real browsers use DOM morph.
+      if (typeof current.nodeType !== 'number' ||
+          typeof incoming.nodeType !== 'number') {
+        current.replaceWith(document.importNode(incoming, true));
+      } else {
+        const active = document.activeElement;
+        const restoreFocus = active && (active === current || current.contains(active));
+        const selection = restoreFocus && typeof active.selectionStart === 'number'
+          ? [active.selectionStart, active.selectionEnd, active.selectionDirection]
+          : null;
+        morphNode(current, incoming);
+        if (restoreFocus && active.isConnected) {
+          active.focus({ preventScroll: true });
+          if (selection) {
+            try { active.setSelectionRange(selection[0], selection[1], selection[2]); }
+            catch (_) {}
+          }
+        }
+      }
+    });
+    if (updateTitle && updateTitle.title) document.title = updateTitle.title;
+    hydrate();
+  }
+
+  // Progressive HTML updates are opt-in. Legacy actions still reload.
+  async function patchActionResponse(response, selector, isCurrent, updateTitle) {
+    const page = await parseHtmlResponse(response);
     if (isCurrent && !isCurrent()) return;
-    applyHtmlUpdate(selector, html, updateTitle);
+    applyHtmlTargets([{ selector: selector, page: page }], updateTitle ? page : null);
+  }
+
+  // After successful POST, refresh explicit sibling regions from the route's
+  // canonical GET representation in a single conditional DOM update.
+  async function patchActionWithRevalidation(response, selector, selectors, isCurrent, controller, requestUrl) {
+    const refreshed = await fetch(requestUrl, {
+      method: 'GET', headers: { Accept: 'text/html' }, cache: 'no-store',
+      ...(controller ? { signal: controller.signal } : {})
+    });
+    if (!isCurrent()) return;
+    if (!refreshed.ok || refreshed.redirected) {
+      throw new Error('Nulang revalidation GET failed: ' + refreshed.status);
+    }
+    const [postPage, getPage] = await Promise.all([
+      parseHtmlResponse(response), parseHtmlResponse(refreshed)
+    ]);
+    if (!isCurrent()) return;
+    applyHtmlTargets(
+      [{ selector: selector, page: postPage }].concat(
+        selectors.map(function (id) { return { selector: id, page: getPage }; })
+      ),
+      null
+    );
   }
 
   // A new subscription always begins with a full current snapshot. Patches
@@ -1110,29 +1209,49 @@ pub fn generate_client_runtime() -> String {
   }
 
   async function runServerAction(handler, el) {
+    const requestUrl = window.location.href;
     const form = el.closest('form');
     const target = el.dataset.nulangTarget || (form && form.dataset.nulangTarget);
+    const revalidate = el.dataset.nulangRevalidate !== undefined
+      ? el.dataset.nulangRevalidate : (form && form.dataset.nulangRevalidate);
     const body = formBody(form);
     const message = createActionMessage(handler, 'server', body);
     body.append('__nulang_action', handler);
     body.append('__nulang_ui_message', JSON.stringify(message));
-    const previous = target && pendingPatches.get(target);
+    // A mutation claims both its primary patch and any related revalidation
+    // regions. Different actions sharing a region must not race to overwrite it.
+    const keys = target ? [target] : [];
+    if (target && revalidate !== undefined && revalidate !== null) {
+      keys.push(...revalidationTargets(revalidate, target));
+    }
+    const previous = new Set(keys.map(function (key) {
+      return pendingPatches.get(key);
+    }).filter(Boolean));
     const controller = target && typeof AbortController === 'function'
       ? new AbortController() : null;
     const request = target ? { controller } : null;
-    if (target) pendingPatches.set(target, request);
-    if (previous && previous.controller) previous.controller.abort();
-    const isCurrent = () => !target || pendingPatches.get(target) === request;
+    keys.forEach(function (key) { pendingPatches.set(key, request); });
+    previous.forEach(function (pending) {
+      if (pending.controller) pending.controller.abort();
+    });
+    const isCurrent = () => window.location.href === requestUrl &&
+      keys.every(function (key) {
+        return pendingPatches.get(key) === request;
+      });
     try {
       const options = { method: 'POST', body: body };
       if (controller) options.signal = controller.signal;
-      const response = await fetch(window.location.href, options);
+      const response = await fetch(requestUrl, options);
       if (!isCurrent()) return;
       if (!response.ok) {
         throw new Error('server action failed: ' + response.status);
       }
       if (target) {
-        await patchActionResponse(response, target, isCurrent);
+        if (revalidate !== undefined && revalidate !== null) {
+          await patchActionWithRevalidation(response, target, keys.slice(1), isCurrent, controller, requestUrl);
+        } else {
+          await patchActionResponse(response, target, isCurrent);
+        }
       } else {
         window.location.reload();
       }
@@ -1141,7 +1260,9 @@ pub fn generate_client_runtime() -> String {
       // report an error for an interaction the user has already superseded.
       if (isCurrent()) throw error;
     } finally {
-      if (target && isCurrent()) pendingPatches.delete(target);
+      keys.forEach(function (key) {
+        if (pendingPatches.get(key) === request) pendingPatches.delete(key);
+      });
     }
   }
 
