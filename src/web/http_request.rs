@@ -104,6 +104,7 @@ impl HttpRequestBindingInputs {
             cookies: &self.cookies,
             body: self.body.as_deref(),
             form: &self.form,
+            scope: None, // No trusted identity provider is installed in the dev server.
         }
     }
 }
