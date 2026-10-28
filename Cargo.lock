@@ -2950,6 +2950,7 @@ dependencies = [
  "serde_json",
  "tar",
  "target-lexicon",
+ "tempfile",
  "tokio",
  "toml 1.1.4+spec-1.1.0",
  "tower-lsp",
