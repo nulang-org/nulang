@@ -317,11 +317,15 @@ jobs:
       - name: Check zero warnings (tests)
         run: cargo check --locked --tests
 
-      # Security audit of dependency tree.
+      # Security audit of dependency tree. Retry only transient RustSec
+      # database transport errors; vulnerability findings remain blocking.
+      - name: Audit wrapper regression tests
+        run: python3 -m unittest scripts/tests/test_cargo_audit_network_retry.py
+
       - name: Audit (cargo-audit)
         run: |
           cargo install cargo-audit --locked
-          cargo audit
+          python3 scripts/ci/cargo-audit-network-retry.py
 
       # Named batteries-included compatibility profile. Run it with
       # defaults disabled so CI proves the aggregate is self-contained.
