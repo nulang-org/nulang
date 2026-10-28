@@ -136,11 +136,100 @@ impl fmt::Display for RequestDecodeError {
 
 impl std::error::Error for RequestDecodeError {}
 
+/// Read-only, transport-neutral validation of a compiled route's request inputs.
+///
+/// This is the input-decoding stage of a Precognition-style preflight, not
+/// application authorization, CSRF validation, or a public HTTP endpoint.
+/// Hosts must perform the same security checks as ordinary mutations before
+/// exposing preflight results. No user handler or effect is executed here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestPreflight {
+    /// Request-originated decoding failures in compiled binding order.
+    pub errors: Vec<RequestDecodeError>,
+}
+
+impl RequestPreflight {
+    pub fn valid(&self) -> bool {
+        self.errors.is_empty()
+    }
+
+    /// Client-safe field diagnostics; never serialize handler names, ABI slots,
+    /// raw inputs, or internal compiler errors into the browser response.
+    pub fn to_json(&self) -> Value {
+        let errors: Vec<Value> = self
+            .errors
+            .iter()
+            .map(|error| {
+                if !error.is_client_error() {
+                    return json!({
+                        "code": "validation_unavailable",
+                        "message": "Validation unavailable",
+                    });
+                }
+                let message = match error.kind {
+                    RequestDecodeErrorKind::Missing => "Required field is missing",
+                    RequestDecodeErrorKind::InvalidType => "Invalid field value",
+                    _ => unreachable!("client errors have only two variants"),
+                };
+                json!({
+                    "code": error.code(),
+                    "source": error.source.map(source_name),
+                    "source_name": error.source_name,
+                    "expected_type": error.expected_type,
+                    "message": message,
+                })
+            })
+            .collect();
+        json!({"valid": self.valid(), "errors": errors})
+    }
+}
+
+/// Decode every request field without executing the target handler.
+///
+/// All plan faults fail closed before inspecting request values. Missing and
+/// ill-typed inputs are collected rather than stopping at the first field so
+/// forms can report multiple errors in one preflight. Full business validation
+/// and final-submission revalidation belong to the application/action layer.
+pub fn preflight_request_arguments(
+    bindings: &[RouteBindingContract],
+    handler_param_count: usize,
+    values: &RequestBindingValues<'_>,
+) -> Result<RequestPreflight, RequestDecodeError> {
+    validate_binding_plan(bindings, handler_param_count)?;
+
+    let errors = bindings
+        .iter()
+        .filter_map(|binding| decode_binding(binding, values).err())
+        .collect();
+    Ok(RequestPreflight { errors })
+}
+
 pub fn bind_request_arguments(
     bindings: &[RouteBindingContract],
     handler_param_count: usize,
     values: &RequestBindingValues<'_>,
 ) -> Result<Vec<BoundRouteArgument>, RequestDecodeError> {
+    validate_binding_plan(bindings, handler_param_count)?;
+    let mut slots = vec![None; handler_param_count];
+
+    for binding in bindings {
+        let value = decode_binding(binding, values)?;
+        slots[binding.handler_index] = Some(BoundRouteArgument {
+            handler_index: binding.handler_index,
+            value,
+        });
+    }
+
+    // The shared plan validator proved exactly one binding for every slot.
+    Ok(slots.into_iter().flatten().collect())
+}
+
+/// Reject compiler/runtime plan defects before reading any untrusted values,
+/// even if an invalid input appears before a malformed slot in binding order.
+fn validate_binding_plan(
+    bindings: &[RouteBindingContract],
+    handler_param_count: usize,
+) -> Result<(), RequestDecodeError> {
     if handler_param_count > u8::MAX as usize {
         return Err(RequestDecodeError {
             kind: RequestDecodeErrorKind::InvalidHandlerSlot,
@@ -156,7 +245,7 @@ pub fn bind_request_arguments(
         });
     }
 
-    let mut slots = vec![None; handler_param_count];
+    let mut seen = vec![false; handler_param_count];
     for binding in bindings {
         if binding.handler_index >= handler_param_count {
             return Err(error(
@@ -168,7 +257,7 @@ pub fn bind_request_arguments(
                 ),
             ));
         }
-        if slots[binding.handler_index].is_some() {
+        if seen[binding.handler_index] {
             return Err(error(
                 binding,
                 RequestDecodeErrorKind::DuplicateHandlerSlot,
@@ -178,52 +267,51 @@ pub fn bind_request_arguments(
                 ),
             ));
         }
-
-        let raw = lookup(binding, values).ok_or_else(|| {
-            error(
-                binding,
-                RequestDecodeErrorKind::Missing,
-                format!(
-                    "missing {} input '{}' for handler parameter '{}'",
-                    source_name(binding.source),
-                    binding.source_name,
-                    binding.handler_param
-                ),
-            )
-        })?;
-        let value = decode_scalar_constant(raw, binding.ty.as_deref()).map_err(|message| {
-            error(
-                binding,
-                RequestDecodeErrorKind::InvalidType,
-                format!(
-                    "{} input '{}' for handler parameter '{}': {message}",
-                    source_name(binding.source),
-                    binding.source_name,
-                    binding.handler_param
-                ),
-            )
-        })?;
-        slots[binding.handler_index] = Some(BoundRouteArgument {
-            handler_index: binding.handler_index,
-            value,
+        seen[binding.handler_index] = true;
+    }
+    if let Some(index) = seen.iter().position(|bound| !bound) {
+        return Err(RequestDecodeError {
+            kind: RequestDecodeErrorKind::IncompleteBindingPlan,
+            source: None,
+            source_name: None,
+            handler_param: None,
+            handler_index: Some(index),
+            expected_type: None,
+            message: format!("handler parameter slot {index} has no request binding"),
         });
     }
+    Ok(())
+}
 
-    slots
-        .into_iter()
-        .enumerate()
-        .map(|(index, slot)| {
-            slot.ok_or_else(|| RequestDecodeError {
-                kind: RequestDecodeErrorKind::IncompleteBindingPlan,
-                source: None,
-                source_name: None,
-                handler_param: None,
-                handler_index: Some(index),
-                expected_type: None,
-                message: format!("handler parameter slot {index} has no request binding"),
-            })
-        })
-        .collect()
+/// One shared scalar decoder for regular submissions and dry-run preflight.
+fn decode_binding(
+    binding: &RouteBindingContract,
+    values: &RequestBindingValues<'_>,
+) -> Result<Constant, RequestDecodeError> {
+    let raw = lookup(binding, values).ok_or_else(|| {
+        error(
+            binding,
+            RequestDecodeErrorKind::Missing,
+            format!(
+                "missing {} input '{}' for handler parameter '{}'",
+                source_name(binding.source),
+                binding.source_name,
+                binding.handler_param
+            ),
+        )
+    })?;
+    decode_scalar_constant(raw, binding.ty.as_deref()).map_err(|message| {
+        error(
+            binding,
+            RequestDecodeErrorKind::InvalidType,
+            format!(
+                "{} input '{}' for handler parameter '{}': {message}",
+                source_name(binding.source),
+                binding.source_name,
+                binding.handler_param
+            ),
+        )
+    })
 }
 
 fn error(
