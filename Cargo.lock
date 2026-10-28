@@ -2468,6 +2468,7 @@ dependencies = [
  "rustyline",
  "serde",
  "serde_json",
+ "subtle",
  "tar",
  "target-lexicon",
  "tokio",

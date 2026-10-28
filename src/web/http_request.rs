@@ -142,6 +142,67 @@ fn capture_ui_action_message(
     (Some(message), None)
 }
 
+/// CSRF submission extraction errors. HTTP adapters must use one generic
+/// denial response, never echo these details to a browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CsrfCaptureError {
+    AmbiguousContentType,
+    BodyTooLarge,
+    MalformedForm,
+}
+
+/// Extract all candidate synchronizer tokens without collapsing duplicate keys.
+///
+/// This intentionally operates on the original header list and raw form bytes.
+/// A parsed form HashMap is NOT suitable for CSRF admission because duplicate
+/// keys and percent-encoded aliases can become indistinguishable. Pass every
+/// returned candidate to SessionCsrfToken::verify_presented, which requires
+/// exactly one. Ignore query parameters and non-form bodies as CSRF sources.
+///
+/// No HTTP route invokes this helper yet. Session authentication, Host/Origin,
+/// tenant authorization and final-submission revalidation are separate gates.
+pub fn capture_submitted_csrf_tokens(
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<Vec<String>, CsrfCaptureError> {
+    const MAX_SCAN_BODY_BYTES: usize = 1024 * 1024;
+
+    let content_types: Vec<_> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .collect();
+    if content_types.len() > 1 {
+        return Err(CsrfCaptureError::AmbiguousContentType);
+    }
+    let mut submitted: Vec<String> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("x-csrf-token"))
+        .map(|(_, value)| value.clone())
+        .collect();
+
+    let is_form = content_types.first().is_some_and(|(_, value)| {
+        value.split(';').next().is_some_and(|media_type| {
+            media_type
+                .trim()
+                .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        })
+    });
+    if !is_form {
+        return Ok(submitted);
+    }
+    if body.len() > MAX_SCAN_BODY_BYTES {
+        return Err(CsrfCaptureError::BodyTooLarge);
+    }
+    let raw = std::str::from_utf8(body).map_err(|_| CsrfCaptureError::MalformedForm)?;
+    for pair in raw.split('&') {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if crate::web::request_bindings::percent_decode_form(name) == "__nulang_csrf" {
+            submitted.push(crate::web::request_bindings::percent_decode_form(value));
+        }
+    }
+    Ok(submitted)
+}
+
 fn is_urlencoded_form(headers: &[(String, String)]) -> bool {
     headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("content-type")
