@@ -23,6 +23,20 @@ CREATE ROLE example_tenant_a LOGIN NOINHERIT;
 CREATE ROLE example_tenant_b LOGIN NOINHERIT;
 CREATE ROLE example_unmapped LOGIN NOINHERIT;
 SQL
+# Passwords exist only for the lifetime of this throwaway local cluster.
+# Separate randomly generated role credentials exercise actual PostgreSQL logins.
+command -v openssl >/dev/null || { echo 'openssl required for disposable test credentials' >&2; exit 2; }
+tenant_a_password="$(openssl rand -hex 24)"
+tenant_b_password="$(openssl rand -hex 24)"
+tenant_unmapped_password="$(openssl rand -hex 24)"
+"${pg[@]}" \
+    -v a_password="$tenant_a_password" \
+    -v b_password="$tenant_b_password" \
+    -v unmapped_password="$tenant_unmapped_password" <<'SQL'
+ALTER ROLE example_tenant_a PASSWORD :'a_password';
+ALTER ROLE example_tenant_b PASSWORD :'b_password';
+ALTER ROLE example_unmapped PASSWORD :'unmapped_password';
+SQL
 "${pg[@]}" -f "$root/examples/tenant-resources/sql/001_tenant_rls.sql"
 "${pg[@]}" <<'SQL'
 GRANT USAGE ON SCHEMA tenant_example, tenant_example_private TO example_tenant_a, example_tenant_b, example_unmapped;
@@ -44,6 +58,67 @@ INSERT INTO tenant_example.billboard_faces(tenant_id,id,name) VALUES
 INSERT INTO tenant_example.campaigns(tenant_id,id,face_id,title) VALUES
     ('tenant-a','shared','shared','Campaign A'),('tenant-b','shared','shared','Campaign B');
 SQL
+
+# Exercise genuine, separate PostgreSQL LOGIN sessions, not only superuser
+# SET SESSION AUTHORIZATION. The disposable cluster uses ephemeral randomly
+# generated passwords; this is not a production OIDC or pooling design.
+tenant_login() {
+    local role="$1" password
+    shift
+    case "$role" in
+        example_tenant_a) password="$tenant_a_password" ;;
+        example_tenant_b) password="$tenant_b_password" ;;
+        example_unmapped) password="$tenant_unmapped_password" ;;
+        *) echo 'Unknown disposable test role' >&2; return 2 ;;
+    esac
+    env -u PGSERVICE -u PGHOSTADDR PGPASSWORD="$password" \
+        psql -w -X -v ON_ERROR_STOP=1 -A -t -d postgres -U "$role" "$@"
+}
+# A tenant's credential must not authenticate as a different tenant role.
+if env -u PGHOSTADDR -u PGSERVICE PGPASSWORD="$tenant_a_password" \
+    psql -w -X -v ON_ERROR_STOP=1 -A -t -d postgres -U example_tenant_b \
+    -c 'SELECT 1' >/dev/null 2>&1; then
+    echo 'Tenant A credentials authenticated as tenant B' >&2
+    exit 1
+fi
+real_login_a="$(tenant_login example_tenant_a -c "
+    SELECT session_user || '|' || current_user || '|' ||
+        tenant_example_private.current_tenant() || '|' ||
+        (SELECT name FROM tenant_example.billboard_faces WHERE id = 'shared') || '|' ||
+        (SELECT title FROM tenant_example.campaigns WHERE id = 'shared')")"
+[[ "$real_login_a" == 'example_tenant_a|example_tenant_a|tenant-a|Face A|Campaign A' ]] || {
+    echo 'Real tenant A login could not read its own tenant-scoped rows' >&2
+    exit 1
+}
+real_login_b="$(tenant_login example_tenant_b -c "
+    SELECT session_user || '|' || current_user || '|' ||
+        tenant_example_private.current_tenant() || '|' ||
+        (SELECT name FROM tenant_example.billboard_faces WHERE id = 'shared') || '|' ||
+        (SELECT title FROM tenant_example.campaigns WHERE id = 'shared')")"
+[[ "$real_login_b" == 'example_tenant_b|example_tenant_b|tenant-b|Face B|Campaign B' ]] || {
+    echo 'Real tenant B login could not read its own tenant-scoped rows' >&2
+    exit 1
+}
+[[ "$(tenant_login example_tenant_a -c "
+    SELECT count(*) FROM tenant_example.billboard_faces WHERE tenant_id = 'tenant-b'")" == 0 ]] || {
+    echo 'Real tenant A login can see tenant B records' >&2
+    exit 1
+}
+[[ "$(tenant_login example_unmapped -c "
+    SELECT count(*) FROM tenant_example.billboard_faces")" == 0 ]] || {
+    echo 'Unmapped login can see tenant records' >&2
+    exit 1
+}
+if tenant_login example_tenant_a -c "
+    INSERT INTO tenant_example.billboard_faces (tenant_id, id, name)
+    VALUES ('tenant-b', 'forged-from-login', 'Foreign write')" >/dev/null 2>&1; then
+    echo 'Real tenant A login wrote tenant B data' >&2
+    exit 1
+fi
+if tenant_login example_tenant_a -c 'SET ROLE example_tenant_b' >/dev/null 2>&1; then
+    echo 'Real tenant A login assumed tenant B role' >&2
+    exit 1
+fi
 
 "${pg[@]}" <<'SQL'
 SET SESSION AUTHORIZATION example_tenant_a;
