@@ -8,16 +8,28 @@ pub enum ResponseKind {
     Html,
     Json,
     Text,
+    Created,
+    NoContent,
+    Problem,
+}
+
+/// Transport-neutral result of executing a compiler-validated route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedResponse {
+    pub status: u16,
+    pub content_type: Option<&'static str>,
+    pub body: Vec<u8>,
 }
 
 impl ResponseKind {
-    /// A type is an explicit media contract only for one of these nominal
-    /// result types; arbitrary domain return types do not imply JSON.
     pub fn explicit(ty: Option<&str>) -> Option<Self> {
         match ty {
             Some("Html") => Some(Self::Html),
             Some("Json") => Some(Self::Json),
             Some("Text") => Some(Self::Text),
+            Some("Created") => Some(Self::Created),
+            Some("NoContent") => Some(Self::NoContent),
+            Some("Problem") => Some(Self::Problem),
             _ => None,
         }
     }
@@ -29,33 +41,84 @@ impl ResponseKind {
     pub const fn content_type(self) -> &'static str {
         match self {
             Self::Html => "text/html; charset=utf-8",
-            Self::Json => "application/json; charset=utf-8",
+            Self::Json | Self::Created => "application/json; charset=utf-8",
             Self::Text => "text/plain; charset=utf-8",
+            Self::Problem => "application/problem+json",
+            Self::NoContent => "",
         }
     }
 
     pub const fn openapi_media_type(self) -> &'static str {
         match self {
             Self::Html => "text/html",
-            Self::Json => "application/json",
+            Self::Json | Self::Created => "application/json",
             Self::Text => "text/plain",
+            Self::Problem => "application/problem+json",
+            Self::NoContent => "",
         }
     }
 
-    /// Validate JSON before sending it with a JSON content type. Only HTML
-    /// responses receive the browser's progressive-enhancement script.
-    pub fn encode(self, rendered: &str) -> Result<Vec<u8>, &'static str> {
-        match self {
-            Self::Html => {
-                Ok(crate::web::reactivity::inject_client_runtime_script(rendered).into_bytes())
-            }
-            Self::Text => Ok(rendered.as_bytes().to_vec()),
-            Self::Json => {
+    /// HTTP response semantics are determined from the statically resolved
+    /// nominal handler return type. Problem is the sole dynamic status result:
+    /// its RFC-style JSON status must be an integer error code (400..=599).
+    pub fn render(self, rendered: &str) -> Result<RenderedResponse, &'static str> {
+        let (status, body) = match self {
+            Self::Html => (
+                200,
+                crate::web::reactivity::inject_client_runtime_script(rendered).into_bytes(),
+            ),
+            Self::Text => (200, rendered.as_bytes().to_vec()),
+            Self::Json | Self::Created => {
                 serde_json::from_str::<serde_json::Value>(rendered)
                     .map_err(|_| "JSON route returned an invalid JSON document")?;
-                Ok(rendered.as_bytes().to_vec())
+                (
+                    if self == Self::Created { 201 } else { 200 },
+                    rendered.as_bytes().to_vec(),
+                )
             }
-        }
+            Self::NoContent => {
+                if !rendered.is_empty() {
+                    return Err("NoContent handler returned a nonempty body");
+                }
+                (204, Vec::new())
+            }
+            Self::Problem => {
+                let document: serde_json::Value = serde_json::from_str(rendered)
+                    .map_err(|_| "Problem handler returned invalid JSON")?;
+                let object = document
+                    .as_object()
+                    .ok_or("Problem must be a JSON object")?;
+                let status = object
+                    .get("status")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or("Problem status must be an integer")?;
+                if !(400..=599).contains(&status) {
+                    return Err("Problem status must be in the HTTP error range");
+                }
+                if !object
+                    .get("title")
+                    .is_some_and(serde_json::Value::is_string)
+                {
+                    return Err("Problem title must be a string");
+                }
+                if let Some(detail) = object.get("detail") {
+                    if !detail.is_string() {
+                        return Err("Problem detail must be a string");
+                    }
+                }
+                (status as u16, rendered.as_bytes().to_vec())
+            }
+        };
+        Ok(RenderedResponse {
+            status,
+            content_type: (self != Self::NoContent).then(|| self.content_type()),
+            body,
+        })
+    }
+
+    /// Retain the earlier body-only API for existing callers and tests.
+    pub fn encode(self, rendered: &str) -> Result<Vec<u8>, &'static str> {
+        self.render(rendered).map(|response| response.body)
     }
 }
 
@@ -89,6 +152,40 @@ mod tests {
         );
         assert!(ResponseKind::Json.encode("{bad}").is_err());
         assert!(ResponseKind::Json.encode("true false").is_err());
+    }
+
+    #[test]
+    fn created_and_no_content_have_correct_wire_semantics() {
+        let created = ResponseKind::Created.render(r#"{"id":7}"#).unwrap();
+        assert_eq!(created.status, 201);
+        assert_eq!(
+            created.content_type,
+            Some("application/json; charset=utf-8")
+        );
+        assert_eq!(created.body, br#"{"id":7}"#);
+        let empty = ResponseKind::NoContent.render("").unwrap();
+        assert_eq!(empty.status, 204);
+        assert!(empty.body.is_empty());
+        assert_eq!(empty.content_type, None);
+        assert!(ResponseKind::NoContent.render("unexpected").is_err());
+        assert!(ResponseKind::Created.render("not json").is_err());
+    }
+
+    #[test]
+    fn problem_status_is_validated_and_bound_to_document() {
+        let problem = ResponseKind::Problem
+            .render(r#"{"status":409,"title":"Conflict","detail":"already exists"}"#)
+            .unwrap();
+        assert_eq!(problem.status, 409);
+        assert_eq!(problem.content_type, Some("application/problem+json"));
+        for raw in [
+            r#"{"status":200,"title":"ok"}"#,
+            r#"{"status":409.3,"title":"bad"}"#,
+            r#"{"status":409}"#,
+            "not json",
+        ] {
+            assert!(ResponseKind::Problem.render(raw).is_err(), "accepted {raw}");
+        }
     }
 
     #[test]

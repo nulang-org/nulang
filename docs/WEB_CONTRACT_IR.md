@@ -270,14 +270,19 @@ Use `stdlib::web::response` for `json(JsonValue) -> Json` and
 `plaintext(String) -> Text`. JSON results are checked as a complete JSON
 document before emission; invalid output fails closed with HTTP 500 rather
 than being mislabeled `application/json`. Neither JSON nor plain text receives
-the HTML client-runtime script. Both types currently represent UTF-8 content;
-generic JSON schemas, custom status codes, binary bodies, streaming, and
-negotiation remain future work. This does **not** change the experimental
+the HTML client-runtime script. The additive nominal results `Created`,
+`NoContent`, and `Problem` support 201 JSON, 204 empty, and dynamic 4xx/5xx
+problem JSON. HTTP validates the `Problem` document and uses its integer
+`status` for the wire response; error statuses outside 400..599 or missing
+string titles fail closed. OpenAPI only emits representations supported by
+runtime: 201 JSON, 204 without content, or a `default` problem response.
+All are UTF-8 representations; resource-location headers, generic JSON
+schemas, binary bodies, streaming, and negotiation remain future work. This does **not** change the experimental
 development server into a production-ready HTTP server.
 
 ## Remaining implementation priorities
 
-1. Extend the initial nominal response types into an explicit typed response algebra (`Json[T]`, HTTP status results, bytes, streams, typed bodies/media), including schema and negotiation semantics.
+1. Extend nominal response/status types into a typed response algebra (`Json[T]`, resource-location results, bytes, streams, typed bodies/media), including schema and negotiation semantics.
 2. Add richer request decoders for optional/default values, repeated query parameters/collections, binary bodies, transparent aliases, and opaque/domain types.
 3. Execute requests under lightweight supervised request actors with structured cancellation/backpressure.
 4. Replace ambient request-context dependency injection with effect handlers once compatibility coverage is sufficient.

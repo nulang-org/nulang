@@ -23,9 +23,24 @@ fn robots() -> Text {
     plaintext("User-agent: *\nDisallow: /private")
 }
 
+fn created_user() -> Created {
+    created(JsonObject([("id", JsonNumber(42.0))]))
+}
+
+fn nothing() -> NoContent {
+    no_content()
+}
+
+fn conflict() -> Problem {
+    problem(409, "Conflict", "Already exists")
+}
+
 app "api" {
     route "GET" "/health" -> health
     route "GET" "/robots.txt" -> robots
+    route "POST" "/users" -> created_user
+    route "DELETE" "/users" -> nothing
+    route "GET" "/conflict" -> conflict
 }
 "#;
     std::fs::write(&path, program).expect("write isolated Nulang smoke program");

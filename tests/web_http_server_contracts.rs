@@ -296,3 +296,123 @@ fn web_main() { perform Web.route("GET", "/health", endpoint) }
         true
     );
 }
+
+fn status_result_route(path: &str, kind: &str, expression: &str) -> RuntimeWebRoute {
+    let source = format!(
+        r#"
+opaque type Created = String
+opaque type NoContent = String
+opaque type Problem = String
+fn endpoint() -> {kind} ! {{Web}} {{ {expression} }}
+fn web_main() {{ perform Web.route("GET", "{path}", endpoint) }}
+"#
+    );
+    let (module, handler_func_idx) = compile_handler(&source, "endpoint");
+    let ast = Parser::new(Lexer::new(&source).lex().unwrap())
+        .parse_module()
+        .unwrap();
+    let contracts = compile_module_contracts(&ast);
+    assert!(
+        contracts.diagnostics.is_empty(),
+        "{:?}",
+        contracts.diagnostics
+    );
+    assert_eq!(contracts.routes[0].response_type.as_deref(), Some(kind));
+    RuntimeWebRoute {
+        route: WebRoute {
+            method: HttpMethod::Get,
+            path: path.into(),
+            handler_module: module,
+            handler_func_idx,
+        },
+        plan: Some(compile_runtime_route_plan(&contracts.routes[0]).unwrap()),
+    }
+}
+
+#[test]
+fn created_response_is_201_json_over_real_http() {
+    let route = status_result_route(
+        "/created",
+        "Created",
+        r#"perform Web.created("{\"id\":42}")"#,
+    );
+    let server = WebDevServer::bind_runtime(0, None, None, vec![route]).unwrap();
+    let response = send_raw_request(
+        server.port,
+        "GET /created HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 201 Created\r\n"),
+        "{response}"
+    );
+    assert!(
+        response.contains("Content-Type: application/json; charset=utf-8\r\n"),
+        "{response}"
+    );
+    assert_eq!(response_body(&response), r#"{"id":42}"#);
+}
+
+#[test]
+fn no_content_response_is_204_with_no_body_or_media_type() {
+    let route = status_result_route("/empty", "NoContent", "perform Web.no_content()");
+    let server = WebDevServer::bind_runtime(0, None, None, vec![route]).unwrap();
+    let response = send_raw_request(
+        server.port,
+        "GET /empty HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 204 No Content\r\n"),
+        "{response}"
+    );
+    assert!(
+        !response.to_ascii_lowercase().contains("content-type:"),
+        "{response}"
+    );
+    assert!(response.contains("Content-Length: 0\r\n"), "{response}");
+    assert_eq!(response_body(&response), "");
+}
+
+#[test]
+fn problem_result_uses_document_status_and_problem_media_type() {
+    let route = status_result_route(
+        "/problem",
+        "Problem",
+        r#"perform Web.problem(409, "Conflict", "Resource exists")"#,
+    );
+    let server = WebDevServer::bind_runtime(0, None, None, vec![route]).unwrap();
+    let response = send_raw_request(
+        server.port,
+        "GET /problem HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 409 Conflict\r\n"),
+        "{response}"
+    );
+    assert!(
+        response.contains("Content-Type: application/problem+json\r\n"),
+        "{response}"
+    );
+    let body: serde_json::Value = serde_json::from_str(response_body(&response)).unwrap();
+    assert_eq!(body["status"], 409);
+    assert_eq!(body["title"], "Conflict");
+    assert_eq!(body["detail"], "Resource exists");
+}
+
+#[test]
+fn invalid_problem_status_fails_closed_instead_of_returning_success() {
+    let route = status_result_route(
+        "/invalid-problem",
+        "Problem",
+        r#"perform Web.problem(200, "OK", "Not an error")"#,
+    );
+    let server = WebDevServer::bind_runtime(0, None, None, vec![route]).unwrap();
+    let response = send_raw_request(
+        server.port,
+        "GET /invalid-problem HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+        "{response}"
+    );
+    assert_eq!(response_body(&response), "Internal server error");
+}

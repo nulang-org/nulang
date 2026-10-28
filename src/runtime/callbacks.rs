@@ -416,7 +416,20 @@ pub(crate) fn perform_web_builtin(
             let s = resolve(constants, *regs.first()?);
             Some(callbacks.alloc_string(&s))
         }
-        Some("json") | Some("plaintext") => {
+        Some("no_content") => Some(callbacks.alloc_string("")),
+        Some("problem") => {
+            let status = regs.first()?.as_int()?;
+            let title = resolve(constants, *regs.get(1)?);
+            let detail = resolve(constants, *regs.get(2)?);
+            let document = serde_json::json!({
+                "type": "about:blank",
+                "status": status,
+                "title": title,
+                "detail": detail,
+            });
+            Some(callbacks.alloc_string(&document.to_string()))
+        }
+        Some("json") | Some("plaintext") | Some("created") => {
             let body = resolve(constants, *regs.first()?);
             Some(callbacks.alloc_string(&body))
         }
