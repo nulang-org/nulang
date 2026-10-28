@@ -493,6 +493,8 @@ pub enum UiHtmlStreamMessage {
         document_id: DocumentId,
         revision: Revision,
         elements: Vec<UiHtmlElement>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        invalidated: Vec<String>,
     },
     Patch {
         protocol: String,
@@ -500,6 +502,13 @@ pub enum UiHtmlStreamMessage {
         base_revision: Revision,
         revision: Revision,
         element: UiHtmlElement,
+    },
+    Invalidate {
+        protocol: String,
+        document_id: DocumentId,
+        base_revision: Revision,
+        revision: Revision,
+        target: String,
     },
 }
 
@@ -509,11 +518,36 @@ impl UiHtmlStreamMessage {
         revision: Revision,
         elements: Vec<UiHtmlElement>,
     ) -> Self {
+        Self::snapshot_with_invalidated(document_id, revision, elements, Vec::new())
+    }
+
+    pub fn snapshot_with_invalidated(
+        document_id: DocumentId,
+        revision: Revision,
+        elements: Vec<UiHtmlElement>,
+        invalidated: Vec<String>,
+    ) -> Self {
         Self::Snapshot {
             protocol: UI_HTML_STREAM_PROTOCOL_VERSION.into(),
             document_id,
             revision,
             elements,
+            invalidated,
+        }
+    }
+
+    pub fn invalidate(
+        document_id: DocumentId,
+        base_revision: Revision,
+        revision: Revision,
+        target: String,
+    ) -> Self {
+        Self::Invalidate {
+            protocol: UI_HTML_STREAM_PROTOCOL_VERSION.into(),
+            document_id,
+            base_revision,
+            revision,
+            target,
         }
     }
 
@@ -534,7 +568,9 @@ impl UiHtmlStreamMessage {
 
     pub fn revision(&self) -> Revision {
         match self {
-            Self::Snapshot { revision, .. } | Self::Patch { revision, .. } => *revision,
+            Self::Snapshot { revision, .. }
+            | Self::Patch { revision, .. }
+            | Self::Invalidate { revision, .. } => *revision,
         }
     }
 
@@ -549,14 +585,38 @@ impl UiHtmlStreamMessage {
                 protocol,
                 document_id,
                 ..
+            }
+            | Self::Invalidate {
+                protocol,
+                document_id,
+                ..
             } => (protocol, document_id),
         };
         require_protocol(UI_HTML_STREAM_PROTOCOL_VERSION, protocol)?;
         require_id("document_id", document_id.as_str())?;
         match self {
-            Self::Snapshot { elements, .. } => {
+            Self::Snapshot {
+                elements,
+                invalidated,
+                ..
+            } => {
+                if elements.len() + invalidated.len() > 32 {
+                    return Err(ProtocolError::InvalidHtmlTarget(
+                        "too many UI targets".into(),
+                    ));
+                }
+                let mut seen = BTreeSet::new();
                 for element in elements {
                     validate_html_element(element)?;
+                    if !seen.insert(element.target.as_str()) {
+                        return Err(ProtocolError::InvalidHtmlTarget(element.target.clone()));
+                    }
+                }
+                for target in invalidated {
+                    validate_html_target(target)?;
+                    if !seen.insert(target.as_str()) {
+                        return Err(ProtocolError::InvalidHtmlTarget(target.clone()));
+                    }
                 }
             }
             Self::Patch {
@@ -573,18 +633,37 @@ impl UiHtmlStreamMessage {
                 }
                 validate_html_element(element)?;
             }
+            Self::Invalidate {
+                base_revision,
+                revision,
+                target,
+                ..
+            } => {
+                if base_revision.0.checked_add(1) != Some(revision.0) {
+                    return Err(ProtocolError::NonIncreasingRevision {
+                        base: *base_revision,
+                        next: *revision,
+                    });
+                }
+                validate_html_target(target)?;
+            }
         }
         Ok(())
     }
 }
 
 fn validate_html_element(element: &UiHtmlElement) -> Result<(), ProtocolError> {
-    let id = element.target.strip_prefix('#').unwrap_or("");
+    validate_html_target(&element.target)
+}
+
+fn validate_html_target(target: &str) -> Result<(), ProtocolError> {
+    let id = target.strip_prefix('#').unwrap_or("");
     let mut chars = id.chars();
-    let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+    let valid = id.len() <= 64
+        && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
     if !valid {
-        return Err(ProtocolError::InvalidHtmlTarget(element.target.clone()));
+        return Err(ProtocolError::InvalidHtmlTarget(target.to_owned()));
     }
     Ok(())
 }
@@ -839,6 +918,51 @@ mod tests {
             NodeId::from("root"),
             vec![root, leaf("task-1", "text")],
         )
+    }
+
+    #[test]
+    fn html_stream_invalidation_is_revisioned_and_snapshots_recover_it() {
+        let event = UiHtmlStreamMessage::invalidate(
+            DocumentId::from("tasks"),
+            Revision(4),
+            Revision(5),
+            "#summary".into(),
+        );
+        event.validate().unwrap();
+        let serialized = serde_json::to_string(&event).unwrap();
+        assert!(serialized.contains(r#""type":"invalidate""#));
+        assert_eq!(
+            serde_json::from_str::<UiHtmlStreamMessage>(&serialized).unwrap(),
+            event
+        );
+        assert!(UiHtmlStreamMessage::invalidate(
+            DocumentId::from("tasks"),
+            Revision(4),
+            Revision(6),
+            "#summary".into()
+        )
+        .validate()
+        .is_err());
+        assert!(UiHtmlStreamMessage::invalidate(
+            DocumentId::from("tasks"),
+            Revision(4),
+            Revision(5),
+            "body > div".into()
+        )
+        .validate()
+        .is_err());
+        let snapshot = UiHtmlStreamMessage::snapshot_with_invalidated(
+            DocumentId::from("tasks"),
+            Revision(5),
+            vec![],
+            vec!["#summary".into()],
+        );
+        snapshot.validate().unwrap();
+        assert_eq!(
+            serde_json::from_str::<UiHtmlStreamMessage>(&serde_json::to_string(&snapshot).unwrap())
+                .unwrap(),
+            snapshot
+        );
     }
 
     #[test]

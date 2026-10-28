@@ -17,3 +17,10 @@ pub fn broadcast(room: String, message: String) -> Unit ! {Realtime} {
 pub fn patch(room: String, target: String, html: Html) -> Bool ! {Realtime} {
     perform Realtime.patch(room, target, html)
 }
+
+/// Publish an invalidation to subscribed views. Browsers refresh the target
+/// from their canonical same-origin GET route, preserving cache correctness
+/// through stream reconnects. Dev-server only; no production tenant auth.
+pub fn invalidate(room: String, target: String) -> Bool ! {Realtime} {
+    perform Realtime.invalidate(room, target)
+}

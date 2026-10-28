@@ -794,6 +794,14 @@ pub fn generate_client_runtime() -> String {
   // A later submission for the same target supersedes its earlier UI update.
   // Aborting the fetch is best-effort: server mutations may still complete.
   const pendingPatches = new Map();
+  // Shared by streamed invalidations and local actions, so a stale GET cannot
+  // overwrite a newer local mutation (or any newer streamed fragment).
+  const targetGenerations = new Map();
+  function touchTarget(target) {
+    const next = (targetGenerations.get(target) || 0) + 1;
+    targetGenerations.set(target, next);
+    return next;
+  }
 
   function refreshSignal(name) {
     const bindings = signalBindings[name];
@@ -1072,7 +1080,8 @@ pub fn generate_client_runtime() -> String {
         }
       });
     });
-    planned.forEach(function (item) {
+    planned.forEach(function (item, index) {
+      touchTarget(patches[index].selector);
       const current = item.current;
       const incoming = item.incoming;
       // No Node interface in tiny test stubs; real browsers use DOM morph.
@@ -1138,6 +1147,38 @@ pub fn generate_client_runtime() -> String {
     let closed = false;
     let connection = null;
     let revision = null;
+    // Each target has a local generation so a stale GET cannot undo a later
+    // HTML patch or a newer invalidation.
+    function refreshInvalidated(targets, active) {
+      const planned = targets.filter(function (target) {
+        return typeof target === 'string' &&
+          /^#[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(target) &&
+          document.querySelector(target);
+      }).map(function (selector) {
+        return {selector: selector, generation: touchTarget(selector)};
+      });
+      if (!planned.length) return;
+      const requestUrl = window.location.href;
+      fetch(requestUrl, {
+        method: 'GET', headers: {Accept: 'text/html'}, cache: 'no-store'
+      }).then(async function (response) {
+        if (!response.ok || response.redirected) {
+          throw new Error('Nulang UI invalidation GET failed: ' + response.status);
+        }
+        const page = await parseHtmlResponse(response);
+        if (closed || active !== connection || window.location.href !== requestUrl) return;
+        const current = planned.filter(function (item) {
+          return targetGenerations.get(item.selector) === item.generation;
+        });
+        if (current.length) applyHtmlTargets(current.map(function (item) {
+          return {selector: item.selector, page: page};
+        }), null);
+      }).catch(function (error) {
+        if (!closed && active === connection && window.location.href === requestUrl) {
+          console.error('nulang: UI invalidation refresh failed', error);
+        }
+      });
+    }
 
     function parseEvent(e, kind) {
       let msg;
@@ -1160,6 +1201,7 @@ pub fn generate_client_runtime() -> String {
       // A room may publish targets absent from the current view.
       if (!/^#[A-Za-z][A-Za-z0-9_-]*$/.test(element.target) ||
           !document.querySelector(element.target)) return;
+      touchTarget(element.target);
       applyHtmlUpdate(element.target, element.html);
     }
 
@@ -1177,8 +1219,19 @@ pub fn generate_client_runtime() -> String {
             !/^#[A-Za-z][A-Za-z0-9_-]*$/.test(el.target) ||
             typeof el.html !== 'string';
         })) return;
+        if (msg.invalidated !== undefined && (
+          !Array.isArray(msg.invalidated) || msg.invalidated.length > 32 ||
+          msg.invalidated.some(function (target) {
+            return typeof target !== 'string' ||
+              !/^#[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(target);
+          }) || msg.invalidated.length + msg.elements.length > 32
+        )) return;
+        const invalidated = msg.invalidated || [];
+        if (new Set(invalidated.concat(msg.elements.map(function (el) {return el.target;}))).size
+            !== invalidated.length + msg.elements.length) return;
         msg.elements.forEach(applyElement);
         revision = BigInt(msg.revision);
+        refreshInvalidated(invalidated, active);
       });
       active.addEventListener('nulang-ui-patch', function (e) {
         if (closed || active !== connection) return;
@@ -1199,6 +1252,27 @@ pub fn generate_client_runtime() -> String {
             typeof msg.element.html !== 'string') return;
         applyElement(msg.element);
         revision = incoming;
+      });
+      active.addEventListener('nulang-ui-invalidate', function (e) {
+        if (closed || active !== connection) return;
+        const msg = parseEvent(e, 'invalidate');
+        if (!msg || revision === null ||
+            typeof msg.base_revision !== 'string' ||
+            !/^(0|[1-9][0-9]*)$/.test(msg.base_revision) ||
+            msg.base_revision.length > 20 ||
+            BigInt(msg.base_revision) > 18446744073709551615n ||
+            typeof msg.target !== 'string' ||
+            !/^#[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(msg.target)) return;
+        const incoming = BigInt(msg.revision);
+        const base = BigInt(msg.base_revision);
+        if (incoming <= revision) return;
+        if (base !== revision || incoming !== base + 1n) {
+          active.close();
+          open();
+          return;
+        }
+        revision = incoming;
+        refreshInvalidated([msg.target], active);
       });
     }
     open();
@@ -1230,7 +1304,10 @@ pub fn generate_client_runtime() -> String {
     const controller = target && typeof AbortController === 'function'
       ? new AbortController() : null;
     const request = target ? { controller } : null;
-    keys.forEach(function (key) { pendingPatches.set(key, request); });
+    keys.forEach(function (key) {
+      pendingPatches.set(key, request);
+      touchTarget(key);
+    });
     previous.forEach(function (pending) {
       if (pending.controller) pending.controller.abort();
     });
