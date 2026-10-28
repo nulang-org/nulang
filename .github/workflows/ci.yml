@@ -51,6 +51,9 @@ jobs:
       - name: Smoke test Nulang Web action events
         run: node scripts/tests/web_action_events.mjs
 
+      - name: Smoke test Nulang Web progressive action patches
+        run: node scripts/tests/web_action_patch.mjs
+
       - name: Install docs dependencies
         run: |
           cd docs

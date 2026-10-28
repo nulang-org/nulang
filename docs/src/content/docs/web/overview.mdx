@@ -230,6 +230,53 @@ It runs the route registrations, renders every route to `dist/<path>/index.html`
 
 For a pure static response without the `app` machinery, `Web.text`/`Web.raw` are enough on their own — any `fn() -> Html` can be rendered by the same pipeline.
 
+## Progressive HTML action updates (experimental)
+
+Server actions normally submit a form and reload the page after a successful
+response. To update one element instead, add `data-nulang-target` to an
+action-enabled form (or its action control). The target must be a simple
+element ID selector such as `#current-message`.
+
+```html
+<p id="current-message">Nothing submitted yet</p>
+<form method="POST"
+      data-action="save_message"
+      data-action-placement="server"
+      data-nulang-target="#current-message">
+  <input name="message">
+  <button type="submit">Save</button>
+</form>
+```
+
+The `POST` route should return an HTML fragment containing the same ID:
+
+```nulang
+fn save_message() -> Html {
+    let msg = form_value("message")
+    kv_set("patch-web-message", msg)
+    el("p", [("id", text("current-message"))], [text(msg)])
+}
+```
+
+The browser parses the successful `text/html` response and replaces just
+`#current-message`, leaving the form and other page state in place. It also
+accepts a complete rendered HTML page and extracts the target from it. A
+missing target, non-HTML response, or unsuccessful HTTP status is reported
+without changing the page. Actions without `data-nulang-target` retain the
+existing reload behavior.
+
+See [examples/patch-web](https://github.com/nulang-org/nulang/tree/main/examples/patch-web)
+for a standalone sample. Run `nulang nula dev` from that directory.
+
+:::caution[Scope of this first slice]
+This is an **opt-in element replacement**, not DOM morphing or an SSE patch
+protocol. Replacing a target discards interactive DOM state *inside* that
+target. Put form controls outside it for now. The response must be generated
+from trusted, properly escaped server-side `Html`; using `raw` with untrusted
+content can introduce XSS. This does not make the experimental HTTP/action
+host production-ready.
+:::
+
 ## Realtime Broadcast
 
 `Realtime` currently has a single operation:

@@ -787,6 +787,7 @@ pub fn generate_client_runtime() -> String {
   // Object.prototype (e.g. constructor, toString, __proto__).
   const signals = Object.create(null);
   const signalBindings = Object.create(null);
+  const hydratedActions = new WeakSet();
 
   function refreshSignal(name) {
     const bindings = signalBindings[name];
@@ -849,8 +850,30 @@ pub fn generate_client_runtime() -> String {
     return body;
   }
 
+  // Progressive HTML updates are opt-in. The response may contain an entire
+  // server-rendered page or only the element identified by the target ID.
+  // Legacy actions still reload when no target is declared.
+  async function patchActionResponse(response, selector) {
+    if (!/^#[A-Za-z][A-Za-z0-9_-]*$/.test(selector)) {
+      throw new Error('invalid Nulang patch target (expected an element ID)');
+    }
+    const contentType = response.headers.get('content-type') || '';
+    if (!/^text\/html(?:\s*;|\s*$)/i.test(contentType.trim())) {
+      throw new Error('Nulang patch response must be text/html');
+    }
+    const page = new DOMParser().parseFromString(await response.text(), 'text/html');
+    const incoming = page.querySelector(selector);
+    const current = document.querySelector(selector);
+    if (!incoming || !current) {
+      throw new Error('Nulang patch target not found: ' + selector);
+    }
+    current.replaceWith(document.importNode(incoming, true));
+    hydrate();
+  }
+
   async function runServerAction(handler, el) {
     const form = el.closest('form');
+    const target = el.dataset.nulangTarget || (form && form.dataset.nulangTarget);
     const body = formBody(form);
     const message = createActionMessage(handler, 'server', body);
     body.append('__nulang_action', handler);
@@ -859,10 +882,19 @@ pub fn generate_client_runtime() -> String {
     if (!response.ok) {
       throw new Error('server action failed: ' + response.status);
     }
-    window.location.reload();
+    if (target) {
+      await patchActionResponse(response, target);
+    } else {
+      window.location.reload();
+    }
   }
 
   function hydrate() {
+    // Rebuild the signal index after patches; detached elements must not stay
+    // subscribed. Preserve signal values instead of reinitializing them.
+    Object.keys(signalBindings).forEach(function (name) {
+      signalBindings[name] = [];
+    });
     document.querySelectorAll('[data-signal]').forEach(function (el) {
       const name = el.dataset.signal;
       if (!(name in signals)) {
@@ -875,6 +907,8 @@ pub fn generate_client_runtime() -> String {
     });
 
     document.querySelectorAll('[data-action]').forEach(function (el) {
+      if (hydratedActions.has(el)) return;
+      hydratedActions.add(el);
       const handler = el.dataset.action;
       const placement = el.dataset.actionPlacement;
       const listener = function (e) {
