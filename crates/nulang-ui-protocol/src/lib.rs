@@ -314,6 +314,92 @@ impl UiDocument {
         Ok(())
     }
 
+    /// Derive a deterministic identity-preserving patch between valid UI documents.
+    ///
+    /// Node IDs are the keys: moving an existing child only updates its parent's
+    /// children list, and changing a property does not replace the node.
+    /// Consumers must reconcile `ReplaceChildren` by NodeId, not by position.
+    pub fn diff(&self, next: &Self) -> Result<UiPatch, ProtocolError> {
+        self.validate()?;
+        next.validate()?;
+        if self.document_id != next.document_id {
+            return Err(ProtocolError::DocumentIdMismatch {
+                expected: self.document_id.clone(),
+                found: next.document_id.clone(),
+            });
+        }
+        if next.revision <= self.revision {
+            return Err(ProtocolError::NonIncreasingRevision {
+                base: self.revision,
+                next: next.revision,
+            });
+        }
+
+        let previous: BTreeMap<_, _> = self.nodes.iter().map(|node| (&node.id, node)).collect();
+        let following: BTreeMap<_, _> = next.nodes.iter().map(|node| (&node.id, node)).collect();
+        let mut operations = Vec::new();
+
+        // Add or update nodes before fixing parent references. The complete
+        // resulting document is validated atomically by apply_patch.
+        for (id, target) in &following {
+            match previous.get(id) {
+                Some(source) if source.kind == target.kind => {
+                    for name in source.properties.keys() {
+                        if !target.properties.contains_key(name) {
+                            operations.push(PatchOperation::RemoveProperty {
+                                node_id: (*id).clone(),
+                                name: name.clone(),
+                            });
+                        }
+                    }
+                    for (name, value) in &target.properties {
+                        if source.properties.get(name) != Some(value) {
+                            operations.push(PatchOperation::SetProperty {
+                                node_id: (*id).clone(),
+                                name: name.clone(),
+                                value: value.clone(),
+                            });
+                        }
+                    }
+                    if source.children != target.children {
+                        operations.push(PatchOperation::ReplaceChildren {
+                            node_id: (*id).clone(),
+                            children: target.children.clone(),
+                        });
+                    }
+                    if source.actions != target.actions {
+                        operations.push(PatchOperation::ReplaceActions {
+                            node_id: (*id).clone(),
+                            actions: target.actions.clone(),
+                        });
+                    }
+                }
+                _ => operations.push(PatchOperation::UpsertNode {
+                    node: (*target).clone(),
+                }),
+            }
+        }
+
+        if self.root != next.root {
+            operations.push(PatchOperation::SetRoot {
+                node_id: next.root.clone(),
+            });
+        }
+        for id in previous.keys() {
+            if !following.contains_key(id) {
+                operations.push(PatchOperation::RemoveNode {
+                    node_id: (*id).clone(),
+                });
+            }
+        }
+        Ok(UiPatch::new(
+            self.document_id.clone(),
+            self.revision,
+            next.revision,
+            operations,
+        ))
+    }
+
     /// Apply an ordered patch atomically. `self` is unchanged if any operation
     /// or the final document violates a protocol invariant.
     pub fn apply_patch(&mut self, patch: &UiPatch) -> Result<(), ProtocolError> {
@@ -344,6 +430,15 @@ impl UiDocument {
     }
 }
 
+/// An acknowledgement identifies the latest input edit incorporated into a
+/// server revision. Inputs use independent per-(node, property) sequences.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputAcknowledgement {
+    pub node_id: NodeId,
+    pub property: String,
+    pub sequence: Revision,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiPatch {
     pub protocol: String,
@@ -351,6 +446,10 @@ pub struct UiPatch {
     pub base_revision: Revision,
     pub revision: Revision,
     pub operations: Vec<PatchOperation>,
+    /// Optional for backwards compatibility with existing nulang-ui/1 hosts.
+    /// A missing acknowledgement never implicitly releases a pending edit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acknowledged_inputs: Vec<InputAcknowledgement>,
 }
 
 impl UiPatch {
@@ -366,7 +465,16 @@ impl UiPatch {
             base_revision,
             revision,
             operations,
+            acknowledged_inputs: Vec::new(),
         }
+    }
+
+    pub fn with_input_acknowledgements(
+        mut self,
+        acknowledgements: Vec<InputAcknowledgement>,
+    ) -> Self {
+        self.acknowledged_inputs = acknowledgements;
+        self
     }
 
     pub fn validate(&self) -> Result<(), ProtocolError> {
@@ -377,6 +485,17 @@ impl UiPatch {
                 base: self.base_revision,
                 next: self.revision,
             });
+        }
+        let mut seen = BTreeSet::new();
+        for acknowledgement in &self.acknowledged_inputs {
+            require_id("input_ack_node_id", acknowledgement.node_id.as_str())?;
+            require_input_property(&acknowledgement.property)?;
+            if !seen.insert((&acknowledgement.node_id, &acknowledgement.property)) {
+                return Err(ProtocolError::DuplicateInputAcknowledgement {
+                    node_id: acknowledgement.node_id.clone(),
+                    property: acknowledgement.property.clone(),
+                });
+            }
         }
         Ok(())
     }
@@ -450,6 +569,132 @@ impl PatchOperation {
             }
         }
         Ok(())
+    }
+}
+
+/// Whether an incoming server patch advanced the host document.
+/// Stale patches are harmless duplicates; gaps require a new snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchApplyOutcome {
+    Applied,
+    IgnoredStale,
+}
+
+/// Host-side view of server state plus unacknowledged local control edits.
+///
+/// This is a renderer-neutral state reducer, not a DOM implementation. Hosts
+/// must separately preserve focus, selection and composition state around
+/// keyed DOM reconciliation.
+#[derive(Debug, Clone)]
+pub struct UiHostState {
+    document: UiDocument,
+    pending: BTreeMap<(NodeId, String), (Revision, WireValue)>,
+    last_sequence: BTreeMap<(NodeId, String), Revision>,
+}
+
+impl UiHostState {
+    pub fn new(document: UiDocument) -> Result<Self, ProtocolError> {
+        document.validate()?;
+        Ok(Self {
+            document,
+            pending: BTreeMap::new(),
+            last_sequence: BTreeMap::new(),
+        })
+    }
+
+    pub fn document(&self) -> &UiDocument {
+        &self.document
+    }
+
+    /// Record an input edit immediately. The sequence is monotonic within a
+    /// given node/property pair even after a previous edit was acknowledged.
+    pub fn record_input(
+        &mut self,
+        node_id: &NodeId,
+        property: &str,
+        sequence: Revision,
+        value: WireValue,
+    ) -> Result<(), ProtocolError> {
+        require_input_property(property)?;
+        let key = (node_id.clone(), property.to_owned());
+        if let Some(previous) = self.last_sequence.get(&key) {
+            if sequence <= *previous {
+                return Err(ProtocolError::NonIncreasingInputSequence {
+                    node_id: node_id.clone(),
+                    property: property.to_owned(),
+                    previous: *previous,
+                    next: sequence,
+                });
+            }
+        }
+        node_mut(&mut self.document, node_id)?
+            .properties
+            .insert(property.to_owned(), value.clone());
+        self.last_sequence.insert(key.clone(), sequence);
+        self.pending.insert(key, (sequence, value));
+        Ok(())
+    }
+
+    /// Apply a server patch and reapply newer local input edits atomically.
+    ///
+    /// Only an explicit acknowledgement of an equal or newer sequence
+    /// relinquishes local input ownership. A patch with a missing base revision
+    /// is an error (the host must request a snapshot), not an implicit rebase.
+    pub fn apply_server_patch(
+        &mut self,
+        patch: &UiPatch,
+    ) -> Result<PatchApplyOutcome, ProtocolError> {
+        patch.validate()?;
+        if self.document.document_id != patch.document_id {
+            return Err(ProtocolError::DocumentIdMismatch {
+                expected: self.document.document_id.clone(),
+                found: patch.document_id.clone(),
+            });
+        }
+        if patch.revision <= self.document.revision {
+            return Ok(PatchApplyOutcome::IgnoredStale);
+        }
+
+        let mut next_document = self.document.clone();
+        next_document.apply_patch(patch)?;
+        let mut next_pending = self.pending.clone();
+        let mut next_sequences = self.last_sequence.clone();
+
+        for ack in &patch.acknowledged_inputs {
+            let key = (ack.node_id.clone(), ack.property.clone());
+            if let Some((sequence, _)) = next_pending.get(&key) {
+                if ack.sequence >= *sequence {
+                    next_pending.remove(&key);
+                }
+            }
+        }
+
+        // Preserve the value of each outstanding local edit without
+        // overwriting unrelated server updates. A removed/retyped node loses
+        // its pending edit rather than resurrecting stale control state.
+        next_pending.retain(|(id, property), (_, value)| {
+            let old_kind = self
+                .document
+                .nodes
+                .iter()
+                .find(|node| &node.id == id)
+                .map(|node| &node.kind);
+            let Some(node) = next_document.nodes.iter_mut().find(|node| &node.id == id) else {
+                return false;
+            };
+            if old_kind != Some(&node.kind) {
+                return false;
+            }
+            node.properties.insert(property.clone(), value.clone());
+            true
+        });
+        // Keep sequence high-water marks only for nodes still present.
+        next_sequences.retain(|(id, _), _| next_document.nodes.iter().any(|node| &node.id == id));
+        next_document.validate()?;
+        self.document = next_document;
+        self.pending = next_pending;
+        self.last_sequence = next_sequences;
+        Ok(PatchApplyOutcome::Applied)
     }
 }
 
@@ -592,6 +837,17 @@ pub enum ProtocolError {
         base: Revision,
         next: Revision,
     },
+    DuplicateInputAcknowledgement {
+        node_id: NodeId,
+        property: String,
+    },
+    UnsupportedLocalInputProperty(String),
+    NonIncreasingInputSequence {
+        node_id: NodeId,
+        property: String,
+        previous: Revision,
+        next: Revision,
+    },
 }
 
 impl fmt::Display for ProtocolError {
@@ -629,6 +885,30 @@ impl fmt::Display for ProtocolError {
                 "patch revision {} must be greater than base revision {}",
                 next.0, base.0
             ),
+            Self::DuplicateInputAcknowledgement { node_id, property } => {
+                write!(
+                    f,
+                    "duplicate input acknowledgement for {node_id}.{property}"
+                )
+            }
+            Self::UnsupportedLocalInputProperty(property) => {
+                write!(
+                    f,
+                    "local input property {property:?} is not value or checked"
+                )
+            }
+            Self::NonIncreasingInputSequence {
+                node_id,
+                property,
+                previous,
+                next,
+            } => {
+                write!(
+                    f,
+                    "input sequence for {node_id}.{property} must increase: {} <= {}",
+                    next.0, previous.0
+                )
+            }
         }
     }
 }
@@ -651,6 +931,15 @@ fn require_id(field: &'static str, value: &str) -> Result<(), ProtocolError> {
         Err(ProtocolError::EmptyIdentifier(field))
     } else {
         Ok(())
+    }
+}
+
+fn require_input_property(property: &str) -> Result<(), ProtocolError> {
+    match property {
+        "value" | "checked" => Ok(()),
+        _ => Err(ProtocolError::UnsupportedLocalInputProperty(
+            property.to_owned(),
+        )),
     }
 }
 
