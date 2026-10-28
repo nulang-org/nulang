@@ -11,6 +11,7 @@
 //!   sim.run_until_quiescence();
 //!   assert!(!sim.has_deadlock());
 
+pub mod generate;
 pub mod shrink;
 
 use std::collections::{HashMap, VecDeque};
@@ -109,6 +110,10 @@ pub enum SimValue {
     Float(f64),
     Bool(bool),
     String(String),
+    Tuple(Vec<SimValue>),
+    Array(Vec<SimValue>),
+    Record(Vec<(String, SimValue)>),
+    Variant(String, Option<Box<SimValue>>),
     Nil,
     Unit,
 }
