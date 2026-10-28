@@ -5,10 +5,13 @@ on:
     paths:
       - '.github/workflows/web-session-postgres.yml'
       - 'src/web/session_pg_reference.rs'
+      - 'src/web/origin_admission.rs'
       - 'src/web/session_preflight.rs'
       - 'src/web/csrf.rs'
       - 'src/web/http_request.rs'
       - 'tests/web_session_postgres_disposable.rs'
+      - 'tests/web_session_http_disposable.rs'
+      - 'tests/web_origin_admission_reference.rs'
       - 'tests/run_web_session_pg_disposable.sh'
       - 'Cargo.toml'
       - 'Cargo.lock'

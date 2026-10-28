@@ -101,4 +101,4 @@ done
 echo "Testing real disposable PostgreSQL session/RLS adapters (loopback only)"
 cargo test --locked --manifest-path "$repo/Cargo.toml" \
  --no-default-features --features postgres \
- --test web_session_postgres_disposable -- --test-threads=1
+ --test web_session_postgres_disposable --test web_session_http_disposable --test web_origin_admission_reference -- --test-threads=1
