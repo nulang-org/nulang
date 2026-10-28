@@ -66,3 +66,39 @@ fn reject_host_rebinding_even_on_read_only_get() {
         Err(OriginCheckError::UntrustedHost)
     );
 }
+
+#[test]
+fn audited_legacy_api_reuses_canonical_policy_without_forking_rules() {
+    use nulang::web::csrf::validate_mutation_origin as audited_legacy_origin_check;
+    let bound = Some("127.0.0.1:8443".parse().unwrap());
+    for (method, request) in [
+        ("GET", headers(&[("Host", "127.0.0.1:8443")])),
+        (
+            "POST",
+            headers(&[
+                ("Host", "127.0.0.1:8443"),
+                ("Origin", "http://127.0.0.1:8443"),
+                ("Sec-Fetch-Site", "same-origin"),
+            ]),
+        ),
+        (
+            "POST",
+            headers(&[
+                ("Host", "attacker.example"),
+                ("X-Forwarded-Host", "127.0.0.1:8443"),
+                ("Origin", "http://127.0.0.1:8443"),
+            ]),
+        ),
+        (
+            "POST",
+            headers(&[
+                ("Host", "127.0.0.1:8443"),
+                ("Origin", "https://attacker.example"),
+            ]),
+        ),
+    ] {
+        let canonical = validate_mutation_origin(method, &request, bound, None);
+        let compatibility = audited_legacy_origin_check(method, &request, bound, None);
+        assert_eq!(canonical, compatibility);
+    }
+}
