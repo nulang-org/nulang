@@ -9,9 +9,14 @@ ignore = [
     # Legacy rustls 0.22 / hyper-rustls 0.25 advisories are no longer
     # ignored. The native TLS connector removes those crates from Cargo.lock;
     # any reintroduction must fail cargo audit instead of being suppressed.
-    # h2 "unbounded empty DATA frames" DoS (RUSTSEC-2026-0258). Nulang does not
-    # expose an HTTP/2 server; h2 is a transitive dependency of HTTP clients.
-    # Upgrading requires hyper/reqwest ecosystem updates.
+    # Existing risk exception: RUSTSEC-2026-0258 still applies to legacy h2
+    # 0.3.27 via libsql 0.10.0 -> Hyper 0.14 HTTP/2. The advisory has no
+    # patched 0.3 release. Nulang does not expose an HTTP/2 server, but this
+    # is NOT a remediation: migrate the legacy libsql/Hyper transport, tracked
+    # by issue #2293, then remove the exception. Cargo-audit ignores by
+    # advisory ID (not package version), so the modern h2 0.4 branch MUST
+    # remain guarded separately by tests/security_h2_lockfile.rs, which
+    # requires >=0.4.16 and prevents silently regressing to a vulnerable 0.4.
     "RUSTSEC-2026-0258",
     # rustls-pemfile is unmaintained (RUSTSEC-2025-0134). Transitive through
     # libsql/hyper-rustls; no actionable upgrade path until upstream moves.
