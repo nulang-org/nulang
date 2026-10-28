@@ -13,6 +13,12 @@ production actor admission check, or replacement for existing DST.
 - `check_property(&Type, seed, trials, &GenerationLimits, predicate)` evaluates
   a pure predicate on deterministic samples, returning the first counterexample
   with its seed and zero-based trial index.
+- `dst::contract::run_typed_contract(&TypedPropertyContract, predicate)` adds a
+  name, compiler type, seed, case count and shrink budget to the existing
+  generator/shrinker, returning `Passed` or a `Failed` outcome with both the
+  original and reduced counterexample. Non-reproducing predicates report
+  `ContractError::NotReproducible` rather than claiming a valid minimization.
+- `dst::value_shrink::shrink_failing_value(&Type, &SimValue, &GenerationLimits, max_replays, still_fails)` minimizes an individual typed failing sample, with strict replay accounting and explicit `NotFailing`, `LocallyMinimal`, or `BudgetExhausted` statuses.
 - Existing `dst::shrink::minimize_failing_trace` minimizes a generated
   *sequence of messages* when the caller provides a deterministic failure
   predicate replaying the sequence on a fresh simulator.
@@ -42,6 +48,30 @@ assert_eq!(test_message.payload.len(), 1);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+## Typed contract example
+
+```rust
+use nulang::dst::contract::{run_typed_contract, ContractOutcome, TypedPropertyContract};
+use nulang::dst::generate::GenerationLimits;
+use nulang::dst::SimValue;
+use nulang::types::{PrimitiveType, Type};
+
+let contract = TypedPropertyContract {
+    name: "account.balance.is_integer".into(),
+    input_type: Type::Primitive(PrimitiveType::Int),
+    seed: 42,
+    trials: 100,
+    limits: GenerationLimits::default(),
+    shrink_replay_budget: 200,
+};
+let report = run_typed_contract(&contract, |input| matches!(input, SimValue::Int(_)))?;
+assert!(matches!(report, ContractOutcome::Passed { .. }));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The contract predicate is ordinary Rust and must be pure. The descriptor
+records the compiler input type, not a runtime effect/capability proof.
+
 ## Semantics and safety
 
 - Supported: `Int`, `Float`, `Bool`, `String`, `Nil`, `Unit`,
@@ -62,14 +92,20 @@ assert_eq!(test_message.payload.len(), 1);
   compiler language semantics or durable event storage.
 - An invariant callback must be pure, or (for DST message traces) replay
   against a fresh deterministic simulator for every minimization attempt.
+- The value-level shrinker preserves supported type shapes and only tests
+  deterministic simplifications (zero/halving, shorter strings, array removals,
+  and nested field/payload reductions). Its `LocallyMinimal` result means no
+  enumerated one-step reduction reproduced the failure, **not** a proof of
+  globally minimal counterexample. Capped search reports `BudgetExhausted`.
 - A passing property check means only that the sampled cases passed. It is
   not a proof of the invariant.
 
 ## Next steps
 
 1. Add compiler-produced testable protocol signatures with full type resolution.
-2. Add shrinkers for individual scalar/record/variant values; the existing
-   trace minimizer only removes **messages** from a sequence.
+2. Extend value shrinking to optional variant-tag simplification, context-aware
+   constrained values, and property-level shrink integration. The existing
+   trace minimizer removes **messages** from a sequence.
 3. Expose optional typed contract declarations in the language only after
    the Rust-level generator and backend parity are stable.
 4. Add a capability-authorized read-only actor introspection API separately.

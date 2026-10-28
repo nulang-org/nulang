@@ -283,6 +283,7 @@ impl Default for GenerationLimits {
 pub enum GenerationError {
     InvalidLimits,
     InvalidTrials,
+    InvalidValue,
     ValueBudget,
     DepthLimit,
     Uninhabited,
@@ -318,7 +319,7 @@ pub struct PropertyCounterexample {
     pub value: SimValue,
 }
 
-fn validate_limits(limits: &GenerationLimits) -> Result<(), GenerationError> {
+pub(super) fn validate_limits(limits: &GenerationLimits) -> Result<(), GenerationError> {
     // Cap both recursion and allocations. A zero collection/string limit
     // intentionally permits only empty values.
     if limits.max_depth == 0
@@ -408,7 +409,10 @@ fn worst_case_nodes(ty: &Type, max_len: usize) -> usize {
     }
 }
 
-fn preflight_type(ty: &Type, limits: &GenerationLimits) -> Result<usize, GenerationError> {
+pub(super) fn preflight_type(
+    ty: &Type,
+    limits: &GenerationLimits,
+) -> Result<usize, GenerationError> {
     validate_type(ty, 0, limits.max_depth)?;
     let nodes = worst_case_nodes(ty, limits.max_collection_len);
     if nodes > MAX_GENERATED_NODES {

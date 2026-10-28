@@ -2,7 +2,8 @@
 
 ### Experimental typed DST generators — 2026-10-28
 - **Added an opt-in Rust-level typed test-data generator for DST.** It samples supported compiler types deterministically, constructs typed simulator messages, and reports reproducible property counterexamples without changing Nulang source or wire semantics.
-- **Generation fails closed on unsupported/uninhabited types and oversized composite shapes.** A conservative value-node budget prevents exponential nested collection allocation; 10 focused tests cover determinism, typing, boundaries, budget enforcement, and existing trace-shrinking compatibility. Full library CI remains required before promotion.
+- **Generation fails closed on unsupported/uninhabited types and oversized composite shapes.** A conservative value-node budget prevents exponential nested collection allocation; 10 focused tests cover determinism, typing, boundaries, budget enforcement, and existing trace-shrinking compatibility.
+- **Added typed value-level counterexample shrinking and a named Rust-side property-contract descriptor.** Seven shrinker tests and five contract tests cover deterministic reductions, type preservation, replay budgets, non-reproducing predicates, and invalid contract metadata. These do not introduce source-level contract syntax, production actor introspection, or contract enforcement. Full library CI remains required before promotion.
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
