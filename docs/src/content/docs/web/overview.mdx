@@ -296,6 +296,40 @@ Every connection receives a current-state snapshot, followed by typed `nulang-ui
 
 **Security and durability:** Unlike the general dev-server routes, this UI stream accepts **only loopback TCP connections** with a literal local `Host` (`localhost`, `127.0.0.1`, or `[::1]`) and rejects cross-origin browser requests (including DNS-rebinding Host values and cross-site Fetch Metadata). It is **not an authentication system**: local processes and local reverse proxies can still access streams, and the rest of the dev server binds to all interfaces. There is no subscriber identity, tenant isolation, persistent history, or cross-process distribution. Do not publish private data into shared rooms, forward the stream from a publicly reachable proxy, or expose the development server to untrusted clients. Actor-backed subscriptions and application authorization remain future work.
 
+## Progressive navigation with the Navigation API (experimental)
+
+Opt in individual same-origin links using `data-nulang-nav-target` and a stable
+ID present in both the current page and the destination's server-rendered HTML:
+
+```html
+<main id="page-content"><h1>Current page</h1></main>
+<a href="/next" data-nulang-nav-target="#page-content">Next</a>
+```
+
+When the browser supports the Navigation API, Nulang intercepts eligible link
+navigations, fetches the destination's HTML with `GET`, and morphs only the
+specified region. If the response is a full document, its title is updated.
+The browser manages URL and history entries; Nulang does **not** ship a
+second client-side router or `pushState` implementation. The client script is
+injected even when these links are the page's only enhanced feature.
+
+All other links remain ordinary browser navigations. Downloads, forms,
+fragment-only navigation, cross-origin links, reloads, and Back/Forward
+traversals are intentionally not intercepted by this first slice. Browsers
+without the Navigation API navigate normally. For an intercepted link, an
+HTTP error, redirect, non-HTML response, or missing target triggers a full
+browser navigation rather than updating an unrelated region. Canceled
+navigations cannot patch stale HTML. No extra JavaScript dependency is needed.
+
+:::caution[Current limitations]
+Back/Forward traversal performs a native document navigation rather than an
+in-place restoration. This implementation does not provide route loaders,
+client-side prefetch, View Transitions, nested target coordination, or an
+end-to-end browser/HTTP production security guarantee. Navigation should be
+used only with trusted server-rendered HTML and stable, explicitly selected
+regions. HTTP request admission and response safety remain separately gated.
+:::
+
 ## Realtime Broadcast
 
 `Realtime` currently has a single operation:

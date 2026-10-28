@@ -514,7 +514,10 @@ fn path_with_tag(path: &[String], tag: &str) -> String {
 /// client-side signal micro-runtime can hydrate the page. The tag is placed
 /// just before `</body>` when present, otherwise appended at the end.
 pub fn inject_client_runtime_script(html: &str) -> String {
-    if !html.contains("data-signal=") && !html.contains("data-action=") {
+    if !html.contains("data-signal=")
+        && !html.contains("data-action=")
+        && !html.contains("data-nulang-nav-target=")
+    {
         return html.to_string();
     }
     let script = r#"<script src="/app.client.js"></script>"#;
@@ -981,7 +984,7 @@ pub fn generate_client_runtime() -> String {
   // Progressive HTML updates are opt-in. The response may contain an entire
   // server-rendered page or only the element identified by the target ID.
   // Legacy actions still reload when no target is declared.
-  function applyHtmlUpdate(selector, html) {
+  function applyHtmlUpdate(selector, html, updateTitle) {
     if (!/^#[A-Za-z][A-Za-z0-9_-]*$/.test(selector)) {
       throw new Error('invalid Nulang patch target (expected an element ID)');
     }
@@ -1013,17 +1016,18 @@ pub fn generate_client_runtime() -> String {
         }
       }
     }
+    if (updateTitle && page.title) document.title = page.title;
     hydrate();
   }
 
-  async function patchActionResponse(response, selector, isCurrent) {
+  async function patchActionResponse(response, selector, isCurrent, updateTitle) {
     const contentType = response.headers.get('content-type') || '';
     if (!/^text\/html(?:\s*;|\s*$)/i.test(contentType.trim())) {
       throw new Error('Nulang patch response must be text/html');
     }
     const html = await response.text();
     if (isCurrent && !isCurrent()) return;
-    applyHtmlUpdate(selector, html);
+    applyHtmlUpdate(selector, html, updateTitle);
   }
 
   // A new subscription always begins with a full current snapshot. Patches
@@ -1141,6 +1145,58 @@ pub fn generate_client_runtime() -> String {
     }
   }
 
+  // Only explicitly enhanced links use the Navigation API. Unsupported
+  // browsers, reloads, history traversal, downloads and forms retain native
+  // navigation; Nulang does not maintain a competing history/router stack.
+  function installNavigation() {
+    if (!window.navigation || typeof window.navigation.addEventListener !== 'function') return;
+    window.navigation.addEventListener('navigate', function (event) {
+      if (!event.canIntercept || event.hashChange || event.downloadRequest != null ||
+          event.formData != null ||
+          (event.navigationType !== 'push' && event.navigationType !== 'replace')) return;
+      const source = event.sourceElement;
+      const link = source && typeof source.closest === 'function'
+        ? source.closest('a[data-nulang-nav-target]') : null;
+      if (!link || link.hasAttribute('download') ||
+          (link.target && link.target !== '_self') ||
+          /(?:^|\s)external(?:\s|$)/i.test(link.getAttribute('rel') || '')) return;
+      const selector = link.dataset.nulangNavTarget;
+      if (!selector || !/^#[A-Za-z][A-Za-z0-9_-]*$/.test(selector) ||
+          !document.querySelector(selector)) return;
+      let url;
+      try {
+        url = new URL(event.destination.url);
+        if (url.origin !== window.location.origin ||
+            (url.protocol !== 'http:' && url.protocol !== 'https:') ||
+            new URL(link.href, window.location.href).href !== url.href) return;
+      } catch (_) { return; }
+      event.intercept({
+        async handler() {
+          const active = () => !event.signal || !event.signal.aborted;
+          try {
+            if (!active()) return;
+            const response = await fetch(url.href, {
+              method: 'GET', headers: { Accept: 'text/html' }, signal: event.signal
+            });
+            if (!active()) return;
+            // A redirect or failure may require a completely different page.
+            // Restore ordinary document navigation instead of patching HTML.
+            if (!response.ok || response.redirected) {
+              throw new Error('navigation requires document fallback: ' + response.status);
+            }
+            await patchActionResponse(response, selector, active, true);
+          } catch (error) {
+            if (!active()) return;
+            console.error('nulang: navigation patch failed', error);
+            // The Navigation API has already committed its history entry.
+            // Replace rather than pushing a duplicate history entry.
+            window.location.replace(url.href);
+          }
+        }
+      });
+    });
+  }
+
   function hydrate() {
     // Rebuild the signal index after patches; detached elements must not stay
     // subscribed. Preserve signal values instead of reinitializing them.
@@ -1195,6 +1251,7 @@ pub fn generate_client_runtime() -> String {
     }
   };
 
+  installNavigation();
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', hydrate);
   } else {
@@ -1423,6 +1480,14 @@ fn view() -> Html {
         let html = r#"<button data-action="save">Save</button>"#;
         let out = inject_client_runtime_script(html);
         assert!(out.ends_with(r#"<script src="/app.client.js"></script>"#));
+    }
+
+    #[test]
+    fn test_navigation_only_html_injects_client_runtime() {
+        let html = r##"<html><body><main id="page">Old</main><a href="/next" data-nulang-nav-target="#page">Next</a></body></html>"##;
+        let out = inject_client_runtime_script(html);
+        assert!(out.contains(r#"<script src="/app.client.js"></script>"#));
+        assert!(out.find("<script").unwrap() < out.find("</body>").unwrap());
     }
 
     #[test]
