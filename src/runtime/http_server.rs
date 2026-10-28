@@ -719,6 +719,7 @@ const UI_STREAM_MAX_LISTENERS: usize = 8;
 const UI_STREAM_MAX_HTML_BYTES: usize = 64 * 1024;
 const UI_STREAM_CHANNEL_DEPTH: usize = 8;
 
+#[derive(Debug)]
 struct UiStreamRoom {
     revision: u64,
     elements: BTreeMap<String, String>,
@@ -949,6 +950,149 @@ fn ui_stream_subscribe(
     ))
 }
 
+// Authenticated application streams have a separate per-server registry.
+// Only a trusted host may supply the authorizer and publishing handle.
+pub type UiStreamAuthorizer = Arc<dyn Fn(&HttpRequest, &str, &str) -> bool + Send + Sync + 'static>;
+
+#[derive(Debug, Default)]
+struct ScopedUiStreams {
+    rooms: Mutex<HashMap<(String, String), UiStreamRoom>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScopedUiPublisher {
+    streams: Arc<ScopedUiStreams>,
+}
+
+impl ScopedUiPublisher {
+    /// Publish already escaped HTML to a private room. This handle is
+    /// privileged: callers must independently authorize publishing.
+    pub fn publish(&self, app: &str, room: &str, target: &str, html: &str) -> bool {
+        use nulang_ui_protocol::{DocumentId, Revision, UiHtmlElement, UiHtmlStreamMessage};
+        if !valid_scoped_ui_id(app)
+            || !valid_scoped_ui_id(room)
+            || html.len() > UI_STREAM_MAX_HTML_BYTES
+        {
+            return false;
+        }
+        let document_id = DocumentId::from(format!("{app}/{room}"));
+        let element = UiHtmlElement {
+            target: target.to_string(),
+            html: html.to_string(),
+        };
+        if UiHtmlStreamMessage::patch(
+            document_id.clone(),
+            Revision(0),
+            Revision(1),
+            element.clone(),
+        )
+        .validate()
+        .is_err()
+        {
+            return false;
+        }
+        let mut rooms = self.streams.rooms.lock().unwrap();
+        let key = (app.to_string(), room.to_string());
+        if !rooms.contains_key(&key) && rooms.len() >= UI_STREAM_MAX_ROOMS {
+            return false;
+        }
+        let entry = rooms.entry(key).or_insert_with(|| UiStreamRoom {
+            revision: 0,
+            elements: BTreeMap::new(),
+            listeners: Vec::new(),
+        });
+        if !entry.elements.contains_key(target) && entry.elements.len() >= UI_STREAM_MAX_TARGETS {
+            return false;
+        }
+        let Some(next) = entry.revision.checked_add(1) else {
+            return false;
+        };
+        let message = UiHtmlStreamMessage::patch(
+            document_id,
+            Revision(entry.revision),
+            Revision(next),
+            element,
+        );
+        entry.revision = next;
+        entry.elements.insert(target.to_string(), html.to_string());
+        entry
+            .listeners
+            .retain(|(_, sender)| sender.try_send(message.clone()).is_ok());
+        true
+    }
+}
+
+fn valid_scoped_ui_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 48
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+}
+
+struct ScopedUiSubscriber {
+    key: (String, String),
+    id: u64,
+    rx: Receiver<nulang_ui_protocol::UiHtmlStreamMessage>,
+    streams: Arc<ScopedUiStreams>,
+}
+
+impl Drop for ScopedUiSubscriber {
+    fn drop(&mut self) {
+        if let Some(room) = self.streams.rooms.lock().unwrap().get_mut(&self.key) {
+            room.listeners.retain(|(id, _)| *id != self.id);
+        }
+    }
+}
+
+fn subscribe_scoped_ui(
+    streams: Arc<ScopedUiStreams>,
+    app: &str,
+    room: &str,
+) -> Option<(nulang_ui_protocol::UiHtmlStreamMessage, ScopedUiSubscriber)> {
+    use nulang_ui_protocol::{DocumentId, Revision, UiHtmlElement, UiHtmlStreamMessage};
+    if !valid_scoped_ui_id(app) || !valid_scoped_ui_id(room) {
+        return None;
+    }
+    let key = (app.to_owned(), room.to_owned());
+    let mut rooms = streams.rooms.lock().unwrap();
+    if !rooms.contains_key(&key) && rooms.len() >= UI_STREAM_MAX_ROOMS {
+        return None;
+    }
+    let entry = rooms.entry(key.clone()).or_insert_with(|| UiStreamRoom {
+        revision: 0,
+        elements: BTreeMap::new(),
+        listeners: Vec::new(),
+    });
+    if entry.listeners.len() >= UI_STREAM_MAX_LISTENERS {
+        return None;
+    }
+    let snapshot = UiHtmlStreamMessage::snapshot(
+        DocumentId::from(format!("{app}/{room}")),
+        Revision(entry.revision),
+        entry
+            .elements
+            .iter()
+            .map(|(target, html)| UiHtmlElement {
+                target: target.clone(),
+                html: html.clone(),
+            })
+            .collect(),
+    );
+    let (tx, rx) = sync_channel(UI_STREAM_CHANNEL_DEPTH);
+    let id = UI_STREAM_LISTENER_ID.fetch_add(1, Ordering::Relaxed);
+    entry.listeners.push((id, tx));
+    Some((
+        snapshot,
+        ScopedUiSubscriber {
+            key,
+            id,
+            rx,
+            streams: Arc::clone(&streams),
+        },
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Middleware
 // ---------------------------------------------------------------------------
@@ -1123,6 +1267,7 @@ pub struct WebDevServer {
     pub port: u16,
     shutdown_flag: Arc<AtomicBool>,
     listener_thread: Option<std::thread::JoinHandle<()>>,
+    scoped_streams: Arc<ScopedUiStreams>,
 }
 
 impl Drop for WebDevServer {
@@ -1138,6 +1283,34 @@ impl WebDevServer {
     const MAX_CONCURRENT_CONNECTIONS: usize = 64;
     const SSE_PATH_PREFIX: &'static str = "/__nulang/sse/";
     const UI_SSE_PATH_PREFIX: &'static str = "/__nulang/ui-sse/";
+    const SCOPED_UI_SSE_PATH_PREFIX: &'static str = "/__nulang/scoped-ui-sse/";
+
+    pub fn scoped_ui_publisher(&self) -> ScopedUiPublisher {
+        ScopedUiPublisher {
+            streams: Arc::clone(&self.scoped_streams),
+        }
+    }
+
+    /// Hosts must provide a verifier for authenticated session and room access.
+    pub fn bind_with_ui_authorizer(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<WebRoute>,
+        authorizer: UiStreamAuthorizer,
+    ) -> std::io::Result<Self> {
+        let routes = routes
+            .into_iter()
+            .map(|route| RuntimeWebRoute { route, plan: None })
+            .collect();
+        Self::bind_runtime_with_ui_authorizer(
+            port,
+            static_dir,
+            output_dir,
+            routes,
+            Some(authorizer),
+        )
+    }
 
     pub fn bind(
         port: u16,
@@ -1163,6 +1336,16 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
     ) -> std::io::Result<Self> {
+        Self::bind_runtime_with_ui_authorizer(port, static_dir, output_dir, routes, None)
+    }
+
+    pub fn bind_runtime_with_ui_authorizer(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        authorizer: Option<UiStreamAuthorizer>,
+    ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(("0.0.0.0", port))?;
         let actual_port = listener.local_addr()?.port();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1170,6 +1353,8 @@ impl WebDevServer {
         let routes_clone = routes;
         let static_dir_clone = static_dir.clone();
         let output_dir_clone = output_dir.clone();
+        let scoped_streams = Arc::new(ScopedUiStreams::default());
+        let shared_scoped = Arc::clone(&scoped_streams);
 
         let handle = std::thread::Builder::new()
             .name("nulang-web-dev-listener".into())
@@ -1180,6 +1365,8 @@ impl WebDevServer {
                     output_dir_clone,
                     routes_clone,
                     shutdown_clone,
+                    shared_scoped,
+                    authorizer,
                 );
             })?;
 
@@ -1187,6 +1374,7 @@ impl WebDevServer {
             port: actual_port,
             shutdown_flag: shutdown,
             listener_thread: Some(handle),
+            scoped_streams,
         })
     }
 
@@ -1196,6 +1384,8 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
         shutdown: Arc<AtomicBool>,
+        scoped_streams: Arc<ScopedUiStreams>,
+        authorizer: Option<UiStreamAuthorizer>,
     ) {
         listener.set_nonblocking(true).ok();
         let slots = Arc::new(ConnectionSlots::new(Self::MAX_CONCURRENT_CONNECTIONS));
@@ -1228,13 +1418,21 @@ impl WebDevServer {
                     let output_dir = output_dir.clone();
                     let routes = Arc::clone(&routes);
                     let shutdown = Arc::clone(&shutdown);
+                    let scoped_streams = Arc::clone(&scoped_streams);
+                    let authorizer = authorizer.clone();
                     // A failed spawn drops the closure and lease, returning capacity.
                     if let Err(error) = std::thread::Builder::new()
                         .name("nulang-web-dev-connection".into())
                         .spawn(move || {
                             let _lease = lease;
                             Self::handle_connection(
-                                stream, static_dir, output_dir, routes, shutdown,
+                                stream,
+                                static_dir,
+                                output_dir,
+                                routes,
+                                shutdown,
+                                scoped_streams,
+                                authorizer,
                             );
                         })
                     {
@@ -1255,6 +1453,8 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Arc<Vec<RuntimeWebRoute>>,
         shutdown: Arc<AtomicBool>,
+        scoped_streams: Arc<ScopedUiStreams>,
+        authorizer: Option<UiStreamAuthorizer>,
     ) {
         let request = match read_http_request(&mut stream) {
             Ok(Some(request)) => request,
@@ -1266,7 +1466,51 @@ impl WebDevServer {
         };
         let path = request.path.clone();
 
-        let mut response = if path.starts_with(Self::UI_SSE_PATH_PREFIX) {
+        let mut response = if path.starts_with(Self::SCOPED_UI_SSE_PATH_PREFIX) {
+            let suffix = &path[Self::SCOPED_UI_SSE_PATH_PREFIX.len()..];
+            let scope = suffix
+                .split_once('/')
+                .filter(|(app, room)| valid_scoped_ui_id(app) && valid_scoped_ui_id(room));
+            // A valid local Host and Origin are necessary, but never sufficient
+            // to authorize a private app/room.
+            let allowed_local = stream
+                .peer_addr()
+                .ok()
+                .is_some_and(|peer| ui_stream_local_request_allowed(&request, peer.ip()));
+            let permitted = scope.as_ref().is_some_and(|(app, room)| {
+                authorizer
+                    .as_ref()
+                    .is_some_and(|verify| verify(&request, app, room))
+            });
+            if !allowed_local || !permitted {
+                HttpResponse {
+                    status: 403,
+                    headers: vec![
+                        ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+                        ("Cache-Control".into(), "no-store".into()),
+                    ],
+                    body: b"Scoped UI stream access denied".to_vec(),
+                }
+            } else if request.method != HttpMethod::Get {
+                HttpResponse {
+                    status: 405,
+                    headers: vec![("Allow".into(), "GET".into())],
+                    body: b"Method Not Allowed".to_vec(),
+                }
+            } else {
+                let (app, room) = scope.expect("validated private room");
+                Self::serve_scoped_ui_sse(
+                    Arc::clone(&scoped_streams),
+                    app,
+                    room,
+                    &request,
+                    authorizer.as_ref().expect("authorized callback"),
+                    &mut stream,
+                    Arc::clone(&shutdown),
+                );
+                return;
+            }
+        } else if path.starts_with(Self::UI_SSE_PATH_PREFIX) {
             let room = &path[Self::UI_SSE_PATH_PREFIX.len()..];
             if !stream
                 .peer_addr()
@@ -1392,6 +1636,72 @@ impl WebDevServer {
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
+
+    fn serve_scoped_ui_sse(
+        streams: Arc<ScopedUiStreams>,
+        app: &str,
+        room: &str,
+        request: &HttpRequest,
+        verify: &UiStreamAuthorizer,
+        stream: &mut TcpStream,
+        shutdown: Arc<AtomicBool>,
+    ) {
+        let Some((snapshot, subscriber)) = subscribe_scoped_ui(streams, app, room) else {
+            HttpServerState::write_response(
+                stream,
+                &HttpResponse {
+                    status: 503,
+                    headers: vec![
+                        ("Content-Type".into(), "text/plain".into()),
+                        ("Cache-Control".into(), "no-store".into()),
+                    ],
+                    body: b"Scoped UI stream capacity exhausted".to_vec(),
+                },
+            );
+            return;
+        };
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+        if !(verify)(request, app, room) {
+            return;
+        }
+        if stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store, no-transform\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n"
+        ).is_err() {
+            return;
+        }
+        if Self::write_ui_sse_event(stream, &snapshot).is_err() {
+            return;
+        }
+        let mut last_check = Instant::now();
+        let mut last_heartbeat = Instant::now();
+        while !shutdown.load(Ordering::Relaxed) {
+            match subscriber.rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(patch) => {
+                    // Verify current membership before writing any next update.
+                    if !(verify)(request, app, room)
+                        || Self::write_ui_sse_event(stream, &patch).is_err()
+                    {
+                        break;
+                    }
+                    last_check = Instant::now();
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if last_check.elapsed() >= Duration::from_secs(1) {
+                if !(verify)(request, app, room) {
+                    break;
+                }
+                last_check = Instant::now();
+            }
+            if last_heartbeat.elapsed() >= Duration::from_secs(15) {
+                if stream.write_all(b": heartbeat\n\n").is_err() {
+                    break;
+                }
+                last_heartbeat = Instant::now();
             }
         }
     }
@@ -1878,6 +2188,143 @@ mod tests {
             frame.push_str(&line);
         }
         panic!("SSE frame exceeded the configured line limit");
+    }
+
+    fn scoped_tcp_connect(
+        port: u16,
+        app: &str,
+        room: &str,
+        extra_headers: &str,
+    ) -> std::io::BufReader<TcpStream> {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        write!(
+            stream,
+            "GET /__nulang/scoped-ui-sse/{app}/{room} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: text/event-stream\r\n{extra_headers}\r\n"
+        ).unwrap();
+        std::io::BufReader::new(stream)
+    }
+
+    #[test]
+    fn scoped_ui_sse_denies_when_host_has_no_authorizer() {
+        let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
+        let mut client = scoped_tcp_connect(server.port, "billing", "invoices", "");
+        assert!(sse_tcp_frame(&mut client).starts_with("HTTP/1.1 403 Forbidden"));
+    }
+
+    #[test]
+    fn scoped_ui_sse_requires_verified_membership_and_separates_instances() {
+        let authorize: UiStreamAuthorizer = Arc::new(|request, app, room| {
+            app == "billing"
+                && room == "invoices"
+                && request.headers.iter().any(|(name, value)| {
+                    name.eq_ignore_ascii_case("cookie") && value == "session=test-verified"
+                })
+        });
+        let server =
+            WebDevServer::bind_with_ui_authorizer(0, None, None, vec![], Arc::clone(&authorize))
+                .unwrap();
+        let publisher = server.scoped_ui_publisher();
+        assert!(publisher.publish(
+            "billing",
+            "invoices",
+            "#status",
+            "<div id=\"status\">private</div>"
+        ));
+        assert!(!publisher.publish("billing/other", "invoices", "#status", "bad"));
+        assert!(!publisher.publish("billing", "invoices", "body", "bad"));
+
+        let mut absent = scoped_tcp_connect(server.port, "billing", "invoices", "");
+        assert!(sse_tcp_frame(&mut absent).starts_with("HTTP/1.1 403 Forbidden"));
+        let mut wrong_app = scoped_tcp_connect(
+            server.port,
+            "other",
+            "invoices",
+            "Cookie: session=test-verified\r\n",
+        );
+        assert!(sse_tcp_frame(&mut wrong_app).starts_with("HTTP/1.1 403 Forbidden"));
+        let mut wrong_room = scoped_tcp_connect(
+            server.port,
+            "billing",
+            "other",
+            "Cookie: session=test-verified\r\n",
+        );
+        assert!(sse_tcp_frame(&mut wrong_room).starts_with("HTTP/1.1 403 Forbidden"));
+        let mut invalid = scoped_tcp_connect(
+            server.port,
+            "billing",
+            "invoices/extra",
+            "Cookie: session=test-verified\r\n",
+        );
+        assert!(sse_tcp_frame(&mut invalid).starts_with("HTTP/1.1 403 Forbidden"));
+
+        let mut allowed = scoped_tcp_connect(
+            server.port,
+            "billing",
+            "invoices",
+            "Cookie: session=test-verified\r\n",
+        );
+        assert!(sse_tcp_frame(&mut allowed).starts_with("HTTP/1.1 200 OK"));
+        let snapshot = sse_tcp_frame(&mut allowed);
+        assert!(snapshot.contains("event: nulang-ui-snapshot"), "{snapshot}");
+        assert!(snapshot.contains("private"), "{snapshot}");
+        assert!(snapshot.contains("billing/invoices"), "{snapshot}");
+        assert!(publisher.publish(
+            "billing",
+            "invoices",
+            "#status",
+            "<div id=\"status\">updated</div>"
+        ));
+        let patch = sse_tcp_frame(&mut allowed);
+        assert!(patch.contains("event: nulang-ui-patch"), "{patch}");
+        assert!(patch.contains("updated"), "{patch}");
+        drop(allowed);
+
+        // A second, independently bound app host must not reuse the room.
+        let second =
+            WebDevServer::bind_with_ui_authorizer(0, None, None, vec![], authorize).unwrap();
+        let mut fresh = scoped_tcp_connect(
+            second.port,
+            "billing",
+            "invoices",
+            "Cookie: session=test-verified\r\n",
+        );
+        assert!(sse_tcp_frame(&mut fresh).starts_with("HTTP/1.1 200 OK"));
+        let isolated = sse_tcp_frame(&mut fresh);
+        assert!(isolated.contains(r#""elements":[]"#), "{isolated}");
+        drop(fresh);
+
+        // Legacy public endpoint is a separate in-memory registry.
+        let mut public = sse_tcp_connect(server.port, "billing", "");
+        assert!(sse_tcp_frame(&mut public).starts_with("HTTP/1.1 200 OK"));
+        let public_snapshot = sse_tcp_frame(&mut public);
+        assert!(!public_snapshot.contains("private"), "{public_snapshot}");
+        drop(public);
+    }
+
+    #[test]
+    fn scoped_ui_sse_revocation_stops_live_delivery() {
+        let active = Arc::new(AtomicBool::new(true));
+        let control = Arc::clone(&active);
+        let auth: UiStreamAuthorizer = Arc::new(move |_request, app, room| {
+            control.load(Ordering::SeqCst) && app == "billing" && room == "invoices"
+        });
+        let server = WebDevServer::bind_with_ui_authorizer(0, None, None, vec![], auth).unwrap();
+        let publisher = server.scoped_ui_publisher();
+        let mut client = scoped_tcp_connect(server.port, "billing", "invoices", "");
+        assert!(sse_tcp_frame(&mut client).starts_with("HTTP/1.1 200 OK"));
+        assert!(sse_tcp_frame(&mut client).contains("event: nulang-ui-snapshot"));
+        active.store(false, Ordering::SeqCst);
+        assert!(publisher.publish("billing", "invoices", "#status", "<p>must-not-leak</p>"));
+        let mut remaining = String::new();
+        let bytes = std::io::BufRead::read_line(&mut client, &mut remaining).unwrap();
+        assert_eq!(
+            bytes, 0,
+            "revoked SSE must close before writing: {remaining}"
+        );
+        assert!(!remaining.contains("must-not-leak"));
     }
 
     #[test]

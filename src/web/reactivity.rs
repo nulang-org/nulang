@@ -1023,10 +1023,12 @@ pub fn generate_client_runtime() -> String {
 
   // A new subscription always begins with a full current snapshot. Patches
   // must be contiguous; duplicates are ignored and gaps force a resnapshot.
-  function stream(room) {
+  function stream(room, sourcePath, documentId) {
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(room)) {
       throw new Error('invalid Nulang UI stream room');
     }
+    sourcePath = sourcePath || '/__nulang/ui-sse/' + encodeURIComponent(room);
+    documentId = documentId || room;
     let closed = false;
     let connection = null;
     let revision = null;
@@ -1036,7 +1038,7 @@ pub fn generate_client_runtime() -> String {
       try { msg = JSON.parse(e.data); }
       catch (err) { console.error('nulang: invalid UI stream JSON', err); return null; }
       if (!msg || msg.protocol !== 'nulang-ui-html/1' ||
-          msg.type !== kind || msg.document_id !== room ||
+          msg.type !== kind || msg.document_id !== documentId ||
           typeof msg.revision !== 'string' ||
           !/^(0|[1-9][0-9]*)$/.test(msg.revision) ||
           msg.revision.length > 20 ||
@@ -1058,7 +1060,7 @@ pub fn generate_client_runtime() -> String {
     function open() {
       if (closed) return;
       revision = null;
-      connection = new window.EventSource('/__nulang/ui-sse/' + encodeURIComponent(room));
+      connection = new window.EventSource(sourcePath);
       const active = connection;
       active.addEventListener('nulang-ui-snapshot', function (e) {
         if (closed || active !== connection) return;
@@ -1099,6 +1101,18 @@ pub fn generate_client_runtime() -> String {
       if (connection) connection.close();
     }};
   }
+
+// Private scoped streams are optional. The application host must validate
+// the current request's session AND room membership before each subscription.
+function streamScoped(app, room) {
+  if (!/^[A-Za-z0-9_-]{1,48}$/.test(app) ||
+      !/^[A-Za-z0-9_-]{1,48}$/.test(room)) {
+    throw new Error('invalid Nulang scoped UI stream identifier');
+  }
+  return stream(room, '/__nulang/scoped-ui-sse/' +
+    encodeURIComponent(app) + '/' + encodeURIComponent(room),
+    app + '/' + room);
+}
 
   async function runServerAction(handler, el) {
     const form = el.closest('form');
@@ -1161,6 +1175,7 @@ pub fn generate_client_runtime() -> String {
 
   window.nulang = {
     stream: stream,
+    streamScoped: streamScoped,
     signal: function (name) {
       return {
         get: function () { return signals[name]; },

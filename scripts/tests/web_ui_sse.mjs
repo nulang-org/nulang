@@ -68,4 +68,21 @@ instances[1].emit('nulang-ui-patch',{...patch('7','8','spoof'),document_id:'othe
 assert.equal(status.textContent,'seven','reject cross-room event');
 handle.close();
 assert.equal(instances[1].closed,true);
+// Scoped streams must be distinct from public subscriptions and bind
+// document identity to both the application and the room.
+assert.equal(typeof window.nulang.streamScoped, 'function');
+const scoped = window.nulang.streamScoped('billing', 'invoices');
+assert.equal(instances[2].url, '/__nulang/scoped-ui-sse/billing/invoices');
+instances[2].emit('nulang-ui-snapshot', {
+  ...snapshot('1', 'private'), document_id: 'billing/invoices'
+});
+assert.equal(status.textContent, 'private');
+instances[2].emit('nulang-ui-patch', {
+  ...patch('1', '2', 'wrong-app'), document_id: 'other/invoices'
+});
+assert.equal(status.textContent, 'private', 'scoped subscriber must reject another application');
+scoped.close();
+assert.equal(instances[2].closed, true);
+assert.throws(() => window.nulang.streamScoped('billing/../admin', 'invoices'));
+assert.throws(() => window.nulang.streamScoped('billing', 'invoices?q=1'));
 console.log('Nulang Web: SSE revisions, duplicate handling, gap resnapshot, and cancellation pass');

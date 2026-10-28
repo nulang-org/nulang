@@ -291,6 +291,18 @@ Every connection receives a current-state snapshot, followed by typed `nulang-ui
 
 **Security and durability:** Unlike the general dev-server routes, this UI stream accepts **only loopback TCP connections** with a literal local `Host` (`localhost`, `127.0.0.1`, or `[::1]`) and rejects cross-origin browser requests (including DNS-rebinding Host values and cross-site Fetch Metadata). It is **not an authentication system**: local processes and local reverse proxies can still access streams, and the rest of the dev server binds to all interfaces. There is no subscriber identity, tenant isolation, persistent history, or cross-process distribution. Do not publish private data into shared rooms, forward the stream from a publicly reachable proxy, or expose the development server to untrusted clients. Actor-backed subscriptions and application authorization remain future work.
 
+### Application-scoped SSE for authenticated Rust hosts (experimental)
+
+Nulang provides a **separate private UI stream** at `/__nulang/scoped-ui-sse/{app}/{room}`. This endpoint does not read from the public `/__nulang/ui-sse/{room}` registry. Scoped room state is kept **per bound server instance**, keyed by the exact application and room names.
+
+A Rust embedding host may call `WebDevServer::bind_with_ui_authorizer(..., authorizer)` or `bind_runtime_with_ui_authorizer(..., Some(authorizer))`. The `UiStreamAuthorizer` callback receives `(&HttpRequest, app, room)` and must verify the **real authenticated session and membership in that exact room** against the application's trusted session/permission store. The default constructor has **no authorizer and denies all private subscriptions** (403).
+
+After binding, the trusted host can obtain `server.scoped_ui_publisher()` and call `publisher.publish(app, room, target, escaped_html)`. The publisher handle is privileged; applications must enforce write authorization before handing it to any untrusted code. The frontend uses `window.nulang.streamScoped("billing", "invoices")` and calls `close()` on teardown. The browser uses a same-origin EventSource request (normal session cookies); credentials are never accepted in a room path or query string.
+
+The authorization callback is run before subscription and rechecked before **each patch delivery** and during idle connections (about once per second). If membership is revoked, the connection closes without delivering new patches. This does not implement session verification, durable state, or distributed revocation: the host supplies those policies. Identifiers are restricted to ASCII letters/digits, underscore, and hyphen (1–48 bytes each), and all updates retain the same bounded channel/snapshot semantics as the public stream.
+
+**Important:** Scoped streams remain loopback-only, and reverse proxies that make a loopback request can bypass network isolation. Do not expose this development server to untrusted networks. Application authorization is mandatory, but authenticated production hosting still requires a production server, verified identity provider, reverse-proxy security audit, and cross-process delivery.
+
 ## Realtime Broadcast
 
 `Realtime` currently has a single operation:
