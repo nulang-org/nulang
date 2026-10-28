@@ -1,0 +1,11 @@
+[package]
+name = "nulang-libsql-file-fixture"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Separate process and feature resolution from the rusqlite reader.
+[workspace]
+
+[dependencies]
+nulang = { path = "../../..", default-features = false, features = ["sqlite"] }
