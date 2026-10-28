@@ -1,0 +1,43 @@
+import stdlib::web::unpoly
+import stdlib::web::html
+import stdlib::web::types
+
+fn results() -> Html {
+    el("main", [("id", text("results"))], [text("Results loaded")])
+}
+
+fn notifications() -> Html {
+    el("aside", [("id", text("notifications"))], [text("No new notifications")])
+}
+
+fn search() -> Html {
+    if is_target("#results") then {
+        results()
+    } else {
+        document(
+            head([title("Unpoly search")]),
+            body([
+                el("form", [
+                    ("method", text("GET")),
+                    ("action", text("/search")),
+                    submit(),
+                    target("#results")
+                ], [
+                    el("input", [("name", text("q"))], []),
+                    el("button", [("type", text("submit"))], [text("Find")])
+                ]),
+                el("a", [
+                    ("href", text("/search")),
+                    follow(),
+                    target("#results")
+                ], [text("Load results")]),
+                results(),
+                notifications()
+            ])
+        )
+    }
+}
+
+app "unpoly-compat" {
+    route "GET" "/search" -> search
+}

@@ -528,6 +528,12 @@ pub(crate) fn perform_web_builtin(
             }
             Some(alloc_array(callbacks, tuples))
         }
+        Some("set_header") => {
+            let name = resolve(constants, *regs.first()?);
+            let value = resolve(constants, *regs.get(1)?);
+            crate::runtime::http_server::set_response_header(&name, &value);
+            Some(crate::vm::Value::unit())
+        }
         Some("set_cookie") => {
             let name = resolve(constants, *regs.first()?);
             let value = resolve(constants, *regs.get(1)?);
