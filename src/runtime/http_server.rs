@@ -368,6 +368,7 @@ impl HttpServerState {
             403 => "Forbidden",
             404 => "Not Found",
             405 => "Method Not Allowed",
+            409 => "Conflict",
             408 => "Request Timeout",
             413 => "Payload Too Large",
             417 => "Expectation Failed",
@@ -1116,10 +1117,13 @@ impl WebDevServer {
             .plan
             .as_ref()
             .map_or(ResponseKind::Html, |plan| plan.response_kind);
+        let result = kind.render(rendered)?;
         Ok(HttpResponse {
-            status: 200,
-            headers: vec![("Content-Type".into(), kind.content_type().into())],
-            body: kind.encode(rendered)?,
+            status: result.status,
+            headers: result
+                .content_type
+                .map_or_else(Vec::new, |mime| vec![("Content-Type".into(), mime.into())]),
+            body: result.body,
         })
     }
 

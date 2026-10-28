@@ -12,3 +12,20 @@ pub fn json(value: JsonValue) -> Json {
 pub fn plaintext(value: String) -> Text ! {Web, Respond} {
     perform Web.plaintext(value)
 }
+
+/// Return an HTTP 201 response with a JSON body.
+/// This initial variant does not emit a Location header.
+pub fn created(value: JsonValue) -> Created {
+    perform Web.created(stringify(value))
+}
+
+/// Return HTTP 204 with no body or Content-Type.
+pub fn no_content() -> NoContent ! {Web, Respond} {
+    perform Web.no_content()
+}
+
+/// Return an RFC-style problem document. Status must be 400..599;
+/// invalid statuses fail closed at the HTTP response boundary.
+pub fn problem(status: Int, title: String, detail: String) -> Problem ! {Web, Respond} {
+    perform Web.problem(status, title, detail)
+}
