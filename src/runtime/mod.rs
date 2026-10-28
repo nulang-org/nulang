@@ -116,7 +116,10 @@ pub use foreign_executor::*;
 pub use gc::{ForeignRefOp, GcStats, OrcaCoordinator, OrcaGc, OrcaHeap};
 pub use grain::*;
 pub use heap::*;
-pub use http_server::{render_route_handler, HttpMethod, HttpServerState, WebDevServer, WebRoute};
+pub use http_server::{
+    render_route_handler, HttpMethod, HttpRequest, HttpServerState, ScopedUiActorBinding,
+    ScopedUiPublisher, UiStreamAuthorizer, WebDevServer, WebRoute,
+};
 pub use mailbox::*;
 pub use network::NetworkTransport;
 pub use network::*;
@@ -574,6 +577,12 @@ pub struct Runtime {
     pub idle_callback: Option<Box<dyn FnMut()>>,
     // HTTP server state (v0.7+).
     pub http_server: Option<HttpServerState>,
+    /// Weak lifecycle references to application UI stream bindings owned by
+    /// local actors. Never keeps the browser broker or an actor alive.
+    /// Exact runtime instance identity; actor numbers are not global.
+    pub(crate) actor_ui_stream_token: Arc<()>,
+    pub(crate) actor_ui_stream_bindings:
+        HashMap<u64, Vec<std::sync::Weak<http_server::UiActorStreamBindingInner>>>,
     // Test effect interception is deliberately absent from production builds:
     // privileged host effects must not have a pre-authority dispatch hook.
     #[cfg(test)]
@@ -721,6 +730,8 @@ impl Runtime {
             spawn_translations: HashMap::new(),
             dlq_actor_id: None,
             http_server: None,
+            actor_ui_stream_token: Arc::new(()),
+            actor_ui_stream_bindings: HashMap::new(),
             #[cfg(test)]
             test_handlers: HashMap::new(),
             shard_idx: 0,
@@ -6571,6 +6582,17 @@ impl Runtime {
 
     pub fn kill_actor(&mut self, actor_id: u64) {
         exit::kill_actor(self, actor_id)
+    }
+
+    /// Called by the shared actor reaping path, including supervised exits.
+    pub(crate) fn cancel_actor_ui_stream_bindings(&mut self, actor_id: u64) {
+        if let Some(bindings) = self.actor_ui_stream_bindings.remove(&actor_id) {
+            for binding in bindings {
+                if let Some(binding) = binding.upgrade() {
+                    binding.cancel();
+                }
+            }
+        }
     }
 
     pub fn handle_actor_exit(&mut self, actor_id: u64, reason: ExitReason) {
