@@ -6,12 +6,12 @@ for executable in initdb pg_ctl postgres psql openssl python3; do
 done
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 umask 077
-root="$(mktemp -d /tmp/nulang-web-session-pg.XXXXXXXX)"
-[[ "$root" == /tmp/nulang-web-session-pg.* ]] || exit 2
+root="$(mktemp -d /var/tmp/nulang-web-session-pg.XXXXXXXX)"
+[[ "$root" == /var/tmp/nulang-web-session-pg.* ]] || exit 2
 running=0
 cleanup() {
   if ((running)); then pg_ctl -D "$root/data" -m immediate -w stop >/dev/null 2>&1 || :; fi
-  if [[ "$root" == /tmp/nulang-web-session-pg.* ]] && [[ -d "$root" ]]; then
+  if [[ "$root" == /var/tmp/nulang-web-session-pg.* ]] && [[ -d "$root" ]]; then
     rm -rf -- "$root"
   fi
 }
@@ -82,6 +82,22 @@ INSERT INTO nulang_example.orders VALUES
  ('tenant-b','order-4','user-b'),('tenant-b','only-b','user-b');
 SQL
 export CARGO_TARGET_DIR="/home/davidporkka/nulang/target"
+# Read-only privilege probes against this newly created disposable cluster.
+# Print only status, never credentials or the random cluster nonce.
+for role in nulang_session_reader nulang_tenant_a nulang_tenant_b; do
+  case "$role" in
+    nulang_session_reader) role_pw="$NULANG_PG_SESSION_PASSWORD" ;;
+    nulang_tenant_a) role_pw="$NULANG_PG_TENANT_PASSWORD_A" ;;
+    nulang_tenant_b) role_pw="$NULANG_PG_TENANT_PASSWORD_B" ;;
+  esac
+  if PGPASSWORD="$role_pw" psql -w -X -A -t -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$PGPORT" \
+    -U "$role" -d postgres -c "SELECT count(*) FROM nulang_private.cluster_identity" > /dev/null; then
+    echo "Disposable role probe: $role SELECT identity OK"
+  else
+    echo "Disposable role probe: $role SELECT identity FAIL" >&2
+    exit 2
+  fi
+done
 echo "Testing real disposable PostgreSQL session/RLS adapters (loopback only)"
 cargo test --locked --offline --manifest-path "$repo/Cargo.toml" \
  --no-default-features --features postgres \

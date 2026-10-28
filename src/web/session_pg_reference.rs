@@ -46,7 +46,7 @@ fn test_cluster_guard() -> Result<(), ()> {
         return Err(());
     }
     let root = std::env::var("NULANG_TEST_POSTGRES_DATA_DIR").map_err(|_| ())?;
-    if !root.starts_with("/tmp/nulang-web-session-pg.")
+    if !root.starts_with("/var/tmp/nulang-web-session-pg.")
         || !root.ends_with("/data")
         || !std::path::Path::new(&root).is_dir()
     {
@@ -55,8 +55,19 @@ fn test_cluster_guard() -> Result<(), ()> {
     Ok(())
 }
 
+// Non-secret diagnostics are opt-in and only available to disposable fixtures.
+fn test_diagnostic(stage: &'static str) {
+    if std::env::var("NULANG_TEST_POSTGRES_DISPOSABLE").as_deref() == Ok("1")
+        && std::env::var("NULANG_TEST_PG_DIAG").as_deref() == Ok("1")
+    {
+        eprintln!("disposable PostgreSQL admission rejected at: {stage}");
+    }
+}
+
 fn connect(port: u16, role: &str, password: &str) -> Result<Client, ()> {
-    test_cluster_guard()?;
+    test_cluster_guard().map_err(|_| {
+        test_diagnostic("cluster guard");
+    })?;
     let mut config = Config::new();
     config
         .host("127.0.0.1")
@@ -65,30 +76,41 @@ fn connect(port: u16, role: &str, password: &str) -> Result<Client, ()> {
         .password(password)
         .dbname("postgres")
         .connect_timeout(Duration::from_secs(3));
-    let mut client = config.connect(NoTls).map_err(|_| ())?;
+    let mut client = config.connect(NoTls).map_err(|_| {
+        test_diagnostic("connect");
+    })?;
 
     let row = client
         .query_one(
-            "SELECT inet_server_addr()::text, inet_server_port(), \
+            "SELECT pg_catalog.host(inet_server_addr()), inet_server_port(), \
                     current_user::text, session_user::text, \
                     rolsuper, rolbypassrls \
                FROM pg_catalog.pg_roles WHERE rolname = current_user::name",
             &[],
         )
-        .map_err(|_| ())?;
+        .map_err(|_| {
+            test_diagnostic("role query");
+        })?;
     let host: Option<String> = row.get(0);
     let connected_port: Option<i32> = row.get(1);
     let current_user: String = row.get(2);
     let session_user: String = row.get(3);
     let superuser: bool = row.get(4);
     let bypass_rls: bool = row.get(5);
-    if host.as_deref() != Some("127.0.0.1")
-        || connected_port != Some(i32::from(port))
-        || current_user != role
-        || session_user != role
-        || superuser
-        || bypass_rls
-    {
+    if host.as_deref() != Some("127.0.0.1") {
+        test_diagnostic("server address mismatch");
+        return Err(());
+    }
+    if connected_port != Some(i32::from(port)) {
+        test_diagnostic("server port mismatch");
+        return Err(());
+    }
+    if current_user != role || session_user != role {
+        test_diagnostic("login role mismatch");
+        return Err(());
+    }
+    if superuser || bypass_rls {
+        test_diagnostic("privileged database role");
         return Err(());
     }
 
@@ -97,10 +119,13 @@ fn connect(port: u16, role: &str, password: &str) -> Result<Client, ()> {
     // pg_read_all_settings privileges.
     let actual: String = client
         .query_one("SELECT nonce FROM nulang_private.cluster_identity", &[])
-        .map_err(|_| ())?
+        .map_err(|_| {
+            test_diagnostic("nonce query");
+        })?
         .get(0);
     let expected = std::env::var("NULANG_TEST_POSTGRES_NONCE").map_err(|_| ())?;
     if actual != expected || expected.len() != 64 {
+        test_diagnostic("nonce mismatch");
         return Err(());
     }
     Ok(client)
