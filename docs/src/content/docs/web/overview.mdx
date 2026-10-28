@@ -296,9 +296,11 @@ For a pure static response without the `app` machinery, `Web.text`/`Web.raw` are
 Subscribers connect to the built-in Server-Sent Events endpoint `/<room-prefix>/sse/<room>` — in the dev server that is `GET /__nulang/sse/<room>`. In the server above, `perform Realtime.broadcast("signs", msg)` in the `sign` handler pushes `data: "<msg>"` events to every open SSE connection:
 
 ```bash
-curl -N http://127.0.0.1:8080/__nulang/sse/signs   # in one terminal
-curl -X POST -d 'msg=live' http://127.0.0.1:8080/sign   # in another → SSE client receives it
+curl -N -H "Authorization: Bearer $SIGNED_TENANT_TOKEN" http://127.0.0.1:8080/__nulang/sse/signs
+curl -X POST -d 'msg=live' http://127.0.0.1:8080/sign
 ```
+
+**Security:** the built-in SSE transport now requires a trusted installed `WebCapabilityAuthorizer` granting the exact room capability `sse.subscribe.<room>`; anonymous connections and spoofed capability headers receive HTTP 403. Room identifiers use 1–96 lowercase ASCII letters, digits, `.`, `_`, `-` only. The signed tenant-token verifier is one experimental host integration; browsers using `EventSource` cannot set arbitrary Authorization headers, so production browser applications need a trusted same-origin credential adapter (such as an authenticated reverse proxy) rather than putting bearer credentials in URLs. This protects SSE **reads**, not broadcasts from independently unprotected write handlers.
 
 The `examples/chat-web` package shows the full pattern: an SSE `<script>` in the page, a POST handler that stores and broadcasts, and a `redirect` back. Treat this layer as minimal — one broadcast op, one SSE transport, in-process delivery.
 

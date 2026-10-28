@@ -146,6 +146,41 @@ legacy dispatch. This does not retrofit policy protection into raw legacy
 routes (`WebDevServer::bind`); deploy with validated compiler-attached routes
 and a real credential verifier, not a hard-coded allow-all adapter.
 
+### Experimental signed tenant credentials and SSE subscription policy
+
+`SignedTenantAuthorizer` is a concrete **Ed25519 verifier**, not a new
+identity provider and **not** JWT/OAuth. It is installed as the trusted
+`WebCapabilityAuthorizer` using `into_authorizer()` and
+`WebDevServer::bind_runtime_with_authorizer(...)`. Configuration requires a
+trusted Ed25519 **public** key, exact audience, and a host-provided
+`WebTenantResolver` that resolves the *requested resource tenant* from a
+validated route/host context. The resolver must **never** take its authority
+from an untrusted `X-Tenant` header. In particular, a route path tenant is a
+resource scope to compare against the signed principal's tenant, not proof of
+identity. Failure to resolve a tenant denies access.
+
+Tokens use `Authorization: Bearer nula1.<hex JSON>.<hex Ed25519 signature>`.
+The signed bytes are the ASCII literal `nulang-web-capability-v1\0` followed
+by the exact UTF-8 JSON payload bytes. Required JSON fields are `sub`,
+`tenant`, `aud`, `iat` (Unix seconds), `exp` and `permissions` (string array).
+Keys and supported algorithm come solely from trusted server configuration,
+never from the token. Duplicate/ambiguous Authorization headers, invalid
+signatures, wrong audience/tenant/permissions, future issue times, expired or
+longer-than-one-hour tokens, and malformed payloads fail closed. This is a
+bearer mechanism with no built-in revocation, nonce/replay detection, OIDC
+identity federation or key rotation: production hosts must manage those
+controls and secure token issuance/storage. Do not hardcode signing keys.
+
+The reserved `GET /__nulang/sse/<room>` transport bypasses ordinary route
+plans. Before subscribing or emitting replay history it now requires
+`sse.subscribe.<room>` from the same host-installed authorizer. Rooms must be
+1–96 lowercase ASCII characters using letters/digits/`.`/`-`/`_`.
+Anonymous, forged and cross-room subscriptions are rejected. Native browser
+`EventSource` cannot set an Authorization header: use a vetted same-origin
+session/auth proxy, never a bearer token embedded in a URL. **Broadcast write
+permissions are not covered by this read-side guard**; caller route policies
+must separately protect the write endpoints.
+
 `WebDevServer` rejects matching requests with a body exceeding the bound with
 HTTP 413 **before request binding or handler invocation**. The shared HTTP
 request reader still buffers and globally caps bodies at 1 MiB before route
