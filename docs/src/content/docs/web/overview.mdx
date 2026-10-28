@@ -125,7 +125,29 @@ app "api" {
 }
 ```
 
-This is an experimental, status-200 result surface. Generic typed JSON results (`Json[T]`), custom status codes, streaming, and content negotiation are not yet implemented.
+The response helpers also expose **experimental typed HTTP status results**. Each documented example is independently type-checked, so the required imports are repeated here:
+
+```nulang
+import stdlib::web::types
+import stdlib::web::response
+import stdlib::json
+
+fn create_user() -> Created {
+    created(JsonObject([("id", JsonNumber(42.0))]))
+}
+
+fn delete_user() -> NoContent {
+    no_content()
+}
+
+fn conflict() -> Problem {
+    problem(409, "Conflict", "User already exists")
+}
+```
+
+`Created` returns **201** with a validated JSON body (no `Location` header yet). `NoContent` returns **204**, with no body or media type. `Problem` returns a serialized `application/problem+json` error: its status must be an integer between 400 and 599, and its body must include a string `title`. The runtime rejects invalid result bodies rather than emitting a misleading success response. OpenAPI reflects these result types: 201, 204, or `default` for dynamically selected error codes.
+
+This remains experimental. Generic typed JSON results (`Json[T]`), resource locations for created responses, streaming, and content negotiation are not yet implemented.
 
 ### Building HTML
 
