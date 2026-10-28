@@ -1117,6 +1117,11 @@ impl Drop for ConnectionLease {
     }
 }
 
+#[cfg(feature = "postgres")]
+type DisposableReferenceHandler = Arc<dyn Fn(&HttpRequest) -> Option<HttpResponse> + Send + Sync>;
+#[cfg(not(feature = "postgres"))]
+type DisposableReferenceHandler = ();
+
 /// Dev server that dispatches registered `Web.route` handlers and falls back
 /// to static files for unmatched paths.
 #[derive(Debug)]
@@ -1164,25 +1169,91 @@ impl WebDevServer {
         routes: Vec<RuntimeWebRoute>,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(("0.0.0.0", port))?;
+        Self::bind_on_listener(listener, static_dir, output_dir, routes, None)
+    }
+
+    /// Loopback-only reference HTTP -> SQL harness, never installed by nula
+    /// dev, regular Web.route or nula deploy. No browser mutations permitted.
+    #[cfg(feature = "postgres")]
+    pub fn bind_disposable_tenant_authority<V>(
+        authority: crate::web::tenant_pg_reference::TenantPostgresAuthority<V>,
+    ) -> std::io::Result<Self>
+    where
+        V: crate::web::tenant_pg_reference::TrustedTokenVerifier + 'static,
+    {
+        let guard = std::env::var("NULANG_TEST_POSTGRES_DISPOSABLE").as_deref() == Ok("1")
+            && std::env::var("PG_CLUSTER_CONF_ROOT").is_ok_and(|root| {
+                root.starts_with("/tmp/pg_virtualenv.") && root.ends_with("/postgresql")
+            });
+        if !guard {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "disposable PostgreSQL test cluster required",
+            ));
+        }
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let handler: DisposableReferenceHandler = Arc::new(move |request| {
+            let respond = |status, body: Vec<u8>| HttpResponse {
+                status,
+                headers: vec![
+                    (
+                        "Content-Type".into(),
+                        "application/json; charset=utf-8".into(),
+                    ),
+                    ("Cache-Control".into(), "no-store".into()),
+                ],
+                body,
+            };
+            if request.method != HttpMethod::Get {
+                // Valid Origin is NOT sufficient without synchronizer CSRF.
+                return Some(respond(405, b"[]".to_vec()));
+            }
+            let result = authority.execute(request, |tx| {
+                let rows = tx.query(
+                    "SELECT name FROM tenant_example.billboard_faces ORDER BY name",
+                    &[],
+                )?;
+                Ok(rows
+                    .into_iter()
+                    .map(|row| row.get::<_, String>(0))
+                    .collect::<Vec<_>>())
+            });
+            Some(match result {
+                Ok(names) => match serde_json::to_vec(&names) {
+                    Ok(body) => respond(200, body),
+                    Err(_) => respond(503, b"[]".to_vec()),
+                },
+                Err(crate::web::tenant_pg_reference::TenantAuthorityError::Unauthorized) => {
+                    respond(401, b"[]".to_vec())
+                }
+                Err(_) => respond(503, b"[]".to_vec()),
+            })
+        });
+        Self::bind_on_listener(listener, None, None, Vec::new(), Some(handler))
+    }
+
+    fn bind_on_listener(
+        listener: TcpListener,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        reference: Option<DisposableReferenceHandler>,
+    ) -> std::io::Result<Self> {
         let actual_port = listener.local_addr()?.port();
         let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown_clone = shutdown.clone();
-        let routes_clone = routes;
-        let static_dir_clone = static_dir.clone();
-        let output_dir_clone = output_dir.clone();
-
+        let shutdown_clone = Arc::clone(&shutdown);
         let handle = std::thread::Builder::new()
             .name("nulang-web-dev-listener".into())
             .spawn(move || {
                 Self::listener_loop(
                     listener,
-                    static_dir_clone,
-                    output_dir_clone,
-                    routes_clone,
+                    static_dir,
+                    output_dir,
+                    routes,
                     shutdown_clone,
+                    reference,
                 );
             })?;
-
         Ok(WebDevServer {
             port: actual_port,
             shutdown_flag: shutdown,
@@ -1196,6 +1267,7 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
         shutdown: Arc<AtomicBool>,
+        reference: Option<DisposableReferenceHandler>,
     ) {
         listener.set_nonblocking(true).ok();
         let slots = Arc::new(ConnectionSlots::new(Self::MAX_CONCURRENT_CONNECTIONS));
@@ -1228,13 +1300,14 @@ impl WebDevServer {
                     let output_dir = output_dir.clone();
                     let routes = Arc::clone(&routes);
                     let shutdown = Arc::clone(&shutdown);
+                    let reference = reference.clone();
                     // A failed spawn drops the closure and lease, returning capacity.
                     if let Err(error) = std::thread::Builder::new()
                         .name("nulang-web-dev-connection".into())
                         .spawn(move || {
                             let _lease = lease;
                             Self::handle_connection(
-                                stream, static_dir, output_dir, routes, shutdown,
+                                stream, static_dir, output_dir, routes, shutdown, reference,
                             );
                         })
                     {
@@ -1255,6 +1328,7 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Arc<Vec<RuntimeWebRoute>>,
         shutdown: Arc<AtomicBool>,
+        reference: Option<DisposableReferenceHandler>,
     ) {
         let request = match read_http_request(&mut stream) {
             Ok(Some(request)) => request,
@@ -1273,6 +1347,20 @@ impl WebDevServer {
             unsafe_origin_response(&request, stream.local_addr().ok(), public_origin.as_deref())
         {
             forbidden
+        } else if path.split('?').next() == Some("/__nulang_test/tenant-faces")
+            && reference.is_some()
+        {
+            #[cfg(feature = "postgres")]
+            {
+                reference
+                    .as_ref()
+                    .and_then(|handler| handler(&request))
+                    .unwrap_or_else(|| Self::serve_static(None, None, &path))
+            }
+            #[cfg(not(feature = "postgres"))]
+            {
+                Self::serve_static(None, None, &path)
+            }
         } else if path.starts_with(Self::SSE_PATH_PREFIX) {
             let room = &path[Self::SSE_PATH_PREFIX.len()..];
             Self::serve_sse(room, &mut stream, shutdown.clone());

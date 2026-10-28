@@ -68,11 +68,25 @@ foreign keys, and consecutive request isolation.
   session logout, and incident rekeying remain **unimplemented and
   independently reviewable**; a dummy revocation implementation is only
   used in disposable tests.
-- The adapter currently accepts a parsed `HttpRequest` object in Rust tests,
-  **not a socket-level HTTP request through WebDevServer**. It is not wired
-  into route dispatch. A future integration must prove real network HTTP →
-  verified principal → scoped database → HTTP status and protect all unsafe
-  methods with Host/Origin plus synchronizer-CSRF safeguards.
+- A new **loopback-only, disposable-only** `WebDevServer::bind_disposable_tenant_authority`
+  reference listener now proves the actual TCP HTTP reader, Host/Origin admission,
+  pinned signed-token verification, server-owned tenant/PostgreSQL login,
+  forced RLS and JSON response over socket. Run via
+  `bash tests/run_tenant_pg_authority_ci.sh`, which also exercises
+  `tests/tenant_http_socket_authority.rs`. It is **not installed** by
+  normal `WebDevServer::bind_runtime`, `nula dev`, production `Web.route`
+  or `nula deploy`; it is gated to a local `pg_virtualenv` cluster and
+  binds only `127.0.0.1`.
+- The reference endpoint `/__nulang_test/tenant-faces` is intentionally
+  **GET-only**. Untrusted Host fails before handler execution, mutations
+  with missing/foreign Origin fail HTTP 403, and even same-origin mutations
+  fail HTTP 405. This avoids implying synchronizer-CSRF authorization or
+  deploying unsafe mutation handlers; **no production CSRF token system is
+  implemented**.
+- The integration is *not* a full general-purpose Nulang VM route that can
+  open an arbitrary production SQL pool. Production authorization, CSRF
+  handling, revocation, credential/TLS lifecycle, transaction-to-HTTP failure
+  semantics and user-facing Web route binding remain separately blocked.
 - Database memberships and credentials require reviewed provisioning,
   revocation, secret rotation and TLS. There is no pooling here; a future
   pooled adapter needs verified transaction isolation, pool reset, reuse

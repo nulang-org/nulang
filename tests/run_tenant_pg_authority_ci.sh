@@ -45,4 +45,7 @@ SQL
     cargo test --locked --manifest-path "$root/Cargo.toml" \
         --no-default-features --features postgres \
         --test tenant_pg_request_authority -- --test-threads=1
+    cargo test --locked --manifest-path "$root/Cargo.toml" \
+        --no-default-features --features postgres \
+        --test tenant_http_socket_authority -- --test-threads=1
 ' bash "$root"
