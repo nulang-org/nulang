@@ -79,3 +79,31 @@ handler execution path. No production session backend, login flow, cookie
 issuer, revocation integration, or tenant database RLS is supplied by this
 change. The built-in development HTTP listener continues to deny scoped
 handler execution without a verified host provider.
+
+### Experimental read-only HTTP dispatch adapter
+
+`WebDevServer::bind_runtime_with_session_reads` is an explicitly configured
+host integration for ordinary **GET/HEAD** handlers that declare
+`from scope("principal_id")` or `from scope("tenant_id")`. It requires a
+server-configured expected `Host` and a `SessionReadGateway`, backed by
+`SessionLookup` and a separate `ResourceReadAuthorization::can_read` policy.
+The resource/tenant selector identifies the *requested* resource; the store
+still validates session expiry/revocation, membership to the target tenant,
+and the independent resource read authorization on every guarded request.
+
+No verified session yields HTTP 401; a denied resource/tenant yields HTTP 403;
+a failed store or policy backend yields HTTP 503. The error body does not expose
+principal, tenant, or other identity details. Request headers, cookies, form,
+path, and query cannot supply the trusted scope values after authorization.
+The existing `bind_runtime` / `nula dev` entry points install **no**
+credential verifier; guarded routes continue to fail closed.
+
+This is a **read-only integration slice, not production web authentication**:
+when the adapter is installed, all HTTP mutations and all SSE subscriptions are
+blocked before handlers run. Origin/Fetch Metadata, CSRF enforcement for
+ordinary mutations, signed-token authorization integration, production session
+issuance/revocation, external ingress/TLS, and full tenant-level RLS remain
+independent deployment gates. Crucially, `ResourceAuthorization::can_preflight`
+is NOT reused for ordinary data read authorization; hosts must implement
+`ResourceReadAuthorization::can_read` separately. Unscoped public routes are
+still public and must not be used for tenant-private data.
