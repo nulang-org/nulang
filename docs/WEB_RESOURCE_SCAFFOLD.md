@@ -101,8 +101,20 @@ The reference under
 [`examples/tenant-resources/sql/001_tenant_rls.sql`](../examples/tenant-resources/sql/001_tenant_rls.sql)
 adds a **separate PostgreSQL fixture** with role-bound tenants, forced RLS,
 composite keys, tenant-preserving campaign-to-face foreign keys, and a
-transactional negative-access regression. Run with
-`pg_virtualenv env NULANG_TEST_POSTGRES_DISPOSABLE=1 bash tests/tenant_resource_postgres_rls.sh`
-from the repository root. It refuses non-disposable databases. It does **not**
-change the Web dev server's in-memory KV persistence or provide verified user
-identity and must not be treated as production CRUD wiring.
+transactional negative-access regression. To execute the same **fail-closed**
+acceptance harness used by the `Web Tenant PostgreSQL RLS (disposable)` GitHub
+check, run `bash tests/run_tenant_resource_postgres_rls_ci.sh` from the repository
+root with `pg_virtualenv` and PostgreSQL installed. The harness first proves
+unguarded execution, forged cluster provenance, and default-port substitution
+are rejected; it then creates a throwaway cluster and runs cross-tenant and
+transaction assertions. It also uses distinct, randomly generated passwords
+to test independent PostgreSQL LOGIN sessions (including rejection of tenant A
+credentials for tenant B). These disposable PostgreSQL credentials do not
+establish external application identity. The cluster is destroyed on completion.
+
+This is a **targeted supplemental check** for changes to the tenant-resource
+example, SQL, Web runtime, and relevant generators; it is not evidence of
+production authentication or a real HTTP → PostgreSQL integration. The Web
+dev server still uses in-memory KV in the example. No production database,
+OIDC identities, tenant-to-login provisioning, trusted connection pool,
+or durable application handler is configured by this test.
