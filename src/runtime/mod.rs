@@ -71,6 +71,10 @@ mod http_server;
 mod llm;
 mod metrics;
 mod persistence;
+#[cfg(feature = "turso-local-probe")]
+mod turso_local_probe;
+#[cfg(feature = "turso-local-probe")]
+pub use turso_local_probe::TursoLocalProbeStore;
 mod process_groups;
 mod registry;
 pub mod resp;

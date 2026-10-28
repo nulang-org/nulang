@@ -1,0 +1,46 @@
+# Experimental local Turso adapter validation; no cloud credentials are used.
+# This does not replace root security/release CI or prove production readiness.
+# Require operator approval for untrusted/fork pull requests on the runner.
+labels:
+  platform: linux/amd64
+  pool: bootstrap-ci
+
+when:
+  - event: pull_request
+    path:
+      include:
+        - "src/runtime/turso_local_probe.rs"
+        - "tests/turso_local_store_optin.rs"
+        - "Cargo.toml"
+        - ".woodpecker/turso-local-probe.yml"
+  - event: push
+    branch: main
+    path:
+      include:
+        - "src/runtime/turso_local_probe.rs"
+        - "tests/turso_local_store_optin.rs"
+        - "Cargo.toml"
+        - ".woodpecker/turso-local-probe.yml"
+  - event: manual
+
+concurrency:
+  limit: 1
+  group: turso-local-probe-${CI_COMMIT_PULL_REQUEST}
+
+steps:
+  - name: disposable-turso-local-probe
+    image: rust:1.95-bookworm
+    environment:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_TARGET_DIR: /tmp/nulang-turso-local-probe-target
+    commands:
+      - set -eu
+      - echo "Turso local adapter exact head $(git rev-parse HEAD)"
+      - apt-get update
+      - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-dev pkg-config clang libclang-dev
+      - rustup component add rustfmt clippy
+      - timeout --signal=TERM --kill-after=30s 2400s bash -c 'cargo fmt --all -- --check && cargo test --locked --no-default-features --features turso-local-probe --test turso_local_store_optin && cargo clippy --locked --no-default-features --features turso-local-probe --test turso_local_store_optin -- -D warnings'
+      - git diff --check
