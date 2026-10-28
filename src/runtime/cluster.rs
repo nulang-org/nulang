@@ -1228,29 +1228,43 @@ impl ClusterState {
                     if entry.incarnation > stored_incarnation || authoritative_self {
                         let old_status = existing.status;
                         let old_addr = existing.address;
+                        // A sender's self-entry may be older than a version
+                        // relayed by another peer. Trust its own status and
+                        // listen address, but never roll back the local
+                        // incarnation. When that authoritative observation
+                        // changes either field, bump beyond the highest
+                        // observed version so third parties can learn it.
+                        // In particular, a simultaneous Joining -> Healthy
+                        // transition and source-port correction must not
+                        // skip the bump (the previous else-if did).
+                        let corrected_self = authoritative_self
+                            && (old_status != entry.status || old_addr != entry.address);
+                        let mut incarnation = if authoritative_self {
+                            stored_incarnation.max(entry.incarnation)
+                        } else {
+                            entry.incarnation
+                        };
+                        if corrected_self {
+                            incarnation = incarnation.saturating_add(1);
+                        }
                         existing.last_heartbeat = now;
                         existing.status = entry.status;
                         existing.address = entry.address;
                         existing
                             .metadata
-                            .insert("_incarnation".to_string(), entry.incarnation.to_string());
+                            .insert("_incarnation".to_string(), incarnation.to_string());
 
                         if old_status != entry.status {
                             changed = true;
                             if entry.status == NodeStatus::Failed {
                                 self.failed_nodes.insert(entry.node_id, now);
                             }
-                        } else if authoritative_self && old_addr != entry.address {
-                            // A sender self-correction of its own listen
-                            // address is a real table mutation even when
-                            // the status is unchanged. Bump the entry past
-                            // the sender's baseline incarnation so the
-                            // corrected address PROPAGATES: peers that
-                            // learned the stale address via relayed gossip
-                            // (equal incarnation) must accept the fix when
-                            // we re-gossip it.
+                        }
+                        // A newer relayed incarnation may correct an address
+                        // without a status transition. The return value must
+                        // report that mutation so callers can propagate it.
+                        if old_addr != entry.address {
                             changed = true;
-                            Self::bump_entry_incarnation(existing);
                         }
                     } else if !self.active_view.contains(&entry.node_id)
                         && matches!(existing.status, NodeStatus::Healthy | NodeStatus::Joining)
@@ -1813,6 +1827,88 @@ mod tests {
         let changed = cs.merge_membership(gossip);
         assert!(changed);
         assert_eq!(cs.get_node(pid).unwrap().status, NodeStatus::Leaving);
+    }
+
+    // A self-authored change from Joining + an ephemeral source port to
+    // Healthy + the real listen port must outrank equal-version gossip at
+    // third parties that cannot directly contact the peer.
+    #[test]
+    fn test_authoritative_self_gossip_propagates_simultaneous_status_address_correction() {
+        let peer = NodeId(77);
+        let stale_addr = addr(9777);
+        let listen = addr(9900);
+        let mut relay = ClusterState::new(NodeId(1), addr(9001));
+        let mut downstream = ClusterState::new(NodeId(2), addr(9002));
+        let stale = NodeGossip {
+            node_id: peer,
+            address: stale_addr,
+            status: NodeStatus::Joining,
+            incarnation: 1,
+        };
+        relay.merge_membership(vec![stale.clone()]);
+        downstream.merge_membership(vec![stale]);
+        assert!(relay.merge_membership_from_sender(
+            vec![NodeGossip {
+                node_id: peer,
+                address: listen,
+                status: NodeStatus::Healthy,
+                incarnation: 1,
+            }],
+            peer,
+        ));
+        let corrected = relay
+            .gossip_payload(16)
+            .into_iter()
+            .find(|entry| entry.node_id == peer)
+            .unwrap();
+        assert!(
+            corrected.incarnation > 1,
+            "a simultaneous authoritative status/address change must bump its incarnation"
+        );
+        assert!(downstream.merge_membership(vec![corrected]));
+        let result = downstream.get_node(peer).unwrap();
+        assert_eq!(result.status, NodeStatus::Healthy);
+        assert_eq!(result.address, listen);
+    }
+
+    // A peer's self-entry can have an older incarnation than the relay's
+    // retained gossip: accepting the authoritative address must still
+    // propagate at a strictly greater version than what observers hold.
+    #[test]
+    fn test_authoritative_self_gossip_address_correction_keeps_monotonic_incarnation() {
+        let peer = NodeId(77);
+        let stale_addr = addr(9777);
+        let listen = addr(9900);
+        let mut relay = ClusterState::new(NodeId(1), addr(9001));
+        let mut downstream = ClusterState::new(NodeId(2), addr(9002));
+        let stale = NodeGossip {
+            node_id: peer,
+            address: stale_addr,
+            status: NodeStatus::Healthy,
+            incarnation: 40,
+        };
+        relay.merge_membership(vec![stale.clone()]);
+        downstream.merge_membership(vec![stale]);
+        assert!(relay.merge_membership_from_sender(
+            vec![NodeGossip {
+                node_id: peer,
+                address: listen,
+                status: NodeStatus::Healthy,
+                incarnation: 1,
+            }],
+            peer,
+        ));
+        let corrected = relay
+            .gossip_payload(16)
+            .into_iter()
+            .find(|entry| entry.node_id == peer)
+            .unwrap();
+        assert!(
+            corrected.incarnation > 40,
+            "authoritative correction must dominate the highest observed version"
+        );
+        assert!(downstream.merge_membership(vec![corrected]));
+        assert_eq!(downstream.get_node(peer).unwrap().address, listen);
     }
 
     // -- 12b. Sender self-entry is authoritative over a discovered address --
