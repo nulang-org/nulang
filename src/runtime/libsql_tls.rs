@@ -234,6 +234,49 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
+    /// Optional live compatibility gate. Only an explicitly authorized remote
+    /// endpoint is contacted; the SQL is read-only and no Nulang tables are
+    /// initialized. Credential and endpoint values are never logged.
+    #[tokio::test]
+    #[ignore = "requires NULANG_LIBSQL_SMOKE_URL and NULANG_LIBSQL_SMOKE_TOKEN"]
+    async fn authenticated_remote_https_readonly_smoke() {
+        let url = std::env::var("NULANG_LIBSQL_SMOKE_URL")
+            .expect("set an authorized read-only HTTPS/libsql endpoint");
+        let token = std::env::var("NULANG_LIBSQL_SMOKE_TOKEN")
+            .expect("supply the token securely through the environment");
+        assert!(!token.is_empty(), "live smoke token must be nonempty");
+        validate_authenticated_remote_transport(&url, &token)
+            .expect("authenticated transport must satisfy URL admission");
+        let normalized = if let Some(tail) = url.strip_prefix("libsql://") {
+            format!("https://{tail}")
+        } else {
+            url.clone()
+        };
+        let uri: Uri = normalized.parse().expect("validated remote URI");
+        assert_eq!(uri.scheme_str(), Some("https"), "live smoke requires TLS");
+
+        // Deliberately bypass LibsqlStore::new_remote: its ensure_tables()
+        // executes CREATE TABLE IF NOT EXISTS, which is not read-only.
+        let verified = connector().expect("platform certificate roots required");
+        let db = libsql::Builder::new_remote(url, token)
+            .connector(verified)
+            .build()
+            .await
+            .unwrap_or_else(|_| panic!("authorized remote TLS connection failed"));
+        let conn = db.connect().expect("remote connection handle");
+        let mut rows = conn
+            .query("SELECT 1", ())
+            .await
+            .unwrap_or_else(|_| panic!("read-only remote SELECT failed"));
+        let row = rows
+            .next()
+            .await
+            .unwrap_or_else(|_| panic!("remote SELECT returned an error"))
+            .expect("remote SELECT returned no row");
+        assert_eq!(row.get::<i64>(0).expect("integer result"), 1);
+        assert!(rows.next().await.expect("read trailing rows").is_none());
+    }
+
     #[tokio::test]
     async fn remote_tls_enforces_server_certificate_chain_and_hostname() {
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
