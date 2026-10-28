@@ -154,3 +154,39 @@ failures model transactional rollback, **not disk fault injection**. Do not
 represent these isolated checks as production certification or infer
 effectively-once external delivery without a provider-side deduplication
 contract.
+
+## Disposable SQLite write-fault matrix
+
+`reader/tests/disk_faults.rs` exercises two different failure boundaries
+against **copies** of a real database created by the separate legacy
+libSQL process:
+
+1. `PRAGMA max_page_count` is set to the *current* page count on the
+   experimental writer's own SQLite connection before attempting an
+   oversized atomic transition. The SQLite pager must return
+   `SQLITE_FULL` and the existing tail, snapshot, journal, and staged
+   outbox must remain unchanged. A new writer then reopens the same file
+   and commits a normal transition. This tests a real SQLite page
+   allocation limit, but does **not** mean the host filesystem was
+   exhausted.
+2. On Linux, `prlimit --fsize=8192` applies a **kernel-enforced file-size
+   limit to one subprocess**. A large synthetic transition attempts to
+   grow SQLite's WAL beyond that limit; the subprocess may be terminated
+   by SIGXFSZ or return a write error. A separate process then verifies
+   no partial transition, snapshot, journal, or outbox rows were
+   committed and that an ordinary retry can succeed. This is an
+   operating-system write-failure test, **not** the same as ENOSPC from
+   a physically full disk.
+
+The test harness never fills the shared host, deletes unrelated files,
+changes a mounted filesystem, modifies actual actor state, or uses
+production credentials. The self-hosted Woodpecker job explicitly
+installs `util-linux` for the Linux-only `prlimit` fixture.
+
+**Unproven failure modes:** actual ENOSPC on a dedicated filesystem,
+OS-level EIO / failing `fsync`, torn sectors, hardware power loss, WAL
+checkpoint failures, multi-host file sharing, and external exactly-once
+delivery. Such tests require a dedicated constrained mount or a
+fault-injecting SQLite VFS and must not run against shared production
+volumes. The test-only SQL page limit also cannot certify the behavior
+of all SQLite implementations, platforms, or file systems.
