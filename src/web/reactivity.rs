@@ -788,6 +788,9 @@ pub fn generate_client_runtime() -> String {
   const signals = Object.create(null);
   const signalBindings = Object.create(null);
   const hydratedActions = new WeakSet();
+  // A later submission for the same target supersedes its earlier UI update.
+  // Aborting the fetch is best-effort: server mutations may still complete.
+  const pendingPatches = new Map();
 
   function refreshSignal(name) {
     const bindings = signalBindings[name];
@@ -1013,12 +1016,14 @@ pub fn generate_client_runtime() -> String {
     hydrate();
   }
 
-  async function patchActionResponse(response, selector) {
+  async function patchActionResponse(response, selector, isCurrent) {
     const contentType = response.headers.get('content-type') || '';
     if (!/^text\/html(?:\s*;|\s*$)/i.test(contentType.trim())) {
       throw new Error('Nulang patch response must be text/html');
     }
-    applyHtmlUpdate(selector, await response.text());
+    const html = await response.text();
+    if (isCurrent && !isCurrent()) return;
+    applyHtmlUpdate(selector, html);
   }
 
   // A new subscription always begins with a full current snapshot. Patches
@@ -1107,14 +1112,32 @@ pub fn generate_client_runtime() -> String {
     const message = createActionMessage(handler, 'server', body);
     body.append('__nulang_action', handler);
     body.append('__nulang_ui_message', JSON.stringify(message));
-    const response = await fetch(window.location.href, { method: 'POST', body: body });
-    if (!response.ok) {
-      throw new Error('server action failed: ' + response.status);
-    }
-    if (target) {
-      await patchActionResponse(response, target);
-    } else {
-      window.location.reload();
+    const previous = target && pendingPatches.get(target);
+    const controller = target && typeof AbortController === 'function'
+      ? new AbortController() : null;
+    const request = target ? { controller } : null;
+    if (target) pendingPatches.set(target, request);
+    if (previous && previous.controller) previous.controller.abort();
+    const isCurrent = () => !target || pendingPatches.get(target) === request;
+    try {
+      const options = { method: 'POST', body: body };
+      if (controller) options.signal = controller.signal;
+      const response = await fetch(window.location.href, options);
+      if (!isCurrent()) return;
+      if (!response.ok) {
+        throw new Error('server action failed: ' + response.status);
+      }
+      if (target) {
+        await patchActionResponse(response, target, isCurrent);
+      } else {
+        window.location.reload();
+      }
+    } catch (error) {
+      // An aborted/superseded request must never replace a newer result or
+      // report an error for an interaction the user has already superseded.
+      if (isCurrent()) throw error;
+    } finally {
+      if (target && isCurrent()) pendingPatches.delete(target);
     }
   }
 

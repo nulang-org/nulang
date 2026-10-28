@@ -267,7 +267,10 @@ their local values, and a retained focused input keeps its selection.
 
 A missing target, non-HTML response, or unsuccessful HTTP status is reported
 without changing the page. Actions without `data-nulang-target` retain the
-existing reload behavior.
+existing reload behavior. For overlapping requests targeting the same element,
+the latest submitted response wins, even when an earlier fetch or streamed
+response body completes later. Superseded requests are aborted when supported,
+and ignored if an abort races with their completion.
 
 See [examples/patch-web](https://github.com/nulang-org/nulang/tree/main/examples/patch-web)
 for a standalone sample. Run `nulang nula dev` from that directory.
@@ -276,11 +279,13 @@ for a standalone sample. Run `nulang nula dev` from that directory.
 This is an **opt-in, DOM-preserving HTML response**, not an SSE patch
 protocol. The morph algorithm is intentionally small: elements without
 stable IDs/keys can still be replaced, and changing a node's element type
-replaces that node. Forms with in-flight requests are not yet versioned, so
-concurrent mutations can resolve out of order. The response must be generated
-from trusted, properly escaped server-side `Html`; using `raw` with untrusted
-content can introduce XSS. This does not make the experimental HTTP/action
-host production-ready.
+replaces that node. Request ordering protects the **client DOM for each exact
+target selector**, but cannot undo or order server-side mutation side effects,
+guarantee exactly-once execution, or coordinate overlapping ancestor/descendant
+targets. Use idempotency and server-side concurrency controls for those cases.
+The response must be generated from trusted, properly escaped server-side
+`Html`; using `raw` with untrusted content can introduce XSS. This does not
+make the experimental HTTP/action host production-ready.
 :::
 
 ## Typed HTML over SSE (experimental)
