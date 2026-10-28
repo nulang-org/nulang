@@ -416,3 +416,39 @@ fn invalid_problem_status_fails_closed_instead_of_returning_success() {
     );
     assert_eq!(response_body(&response), "Internal server error");
 }
+
+#[test]
+fn created_at_writes_validated_location_header_without_envelope_leak() {
+    let source = r#"
+import stdlib::web::types
+fn endpoint() -> CreatedAt ! {Web} {
+    perform Web.created_at("/users/42", "{\"id\":42}")
+}
+fn web_main() { perform Web.route("POST", "/users", endpoint) }
+"#;
+    let (module, handler_func_idx) = compile_handler(source, "endpoint");
+    let ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_module()
+        .unwrap();
+    let contracts = compile_module_contracts(&ast);
+    let route = RuntimeWebRoute {
+        route: WebRoute {
+            method: HttpMethod::Post,
+            path: "/users".into(),
+            handler_module: module,
+            handler_func_idx,
+        },
+        plan: Some(compile_runtime_route_plan(&contracts.routes[0]).unwrap()),
+    };
+    let server = WebDevServer::bind_runtime(0, None, None, vec![route]).unwrap();
+    let response = send_raw_request(
+        server.port,
+        "POST /users HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 201 Created\r\n"),
+        "{response}"
+    );
+    assert!(response.contains("Location: /users/42\r\n"), "{response}");
+    assert_eq!(response_body(&response), r#"{"id":42}"#);
+}

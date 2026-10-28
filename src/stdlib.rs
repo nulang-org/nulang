@@ -598,6 +598,14 @@ impl StdLib {
                     description: "Return an HTTP 201 created response with a JSON body.",
                 },
                 BuiltinOp {
+                    name: "Web.created_at",
+                    effect: "Web",
+                    op: "created_at",
+                    signature: "created_at(location: String, body: String) -> CreatedAt",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Return HTTP 201 with a validated same-origin Location and JSON body.",
+                },
+                BuiltinOp {
                     name: "Web.no_content",
                     effect: "Web",
                     op: "no_content",

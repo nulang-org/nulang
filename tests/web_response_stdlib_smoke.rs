@@ -27,6 +27,10 @@ fn created_user() -> Created {
     created(JsonObject([("id", JsonNumber(42.0))]))
 }
 
+fn created_at_user() -> CreatedAt {
+    created_at("/users/42", JsonObject([("id", JsonNumber(42.0))]))
+}
+
 fn nothing() -> NoContent {
     no_content()
 }
@@ -39,6 +43,7 @@ app "api" {
     route "GET" "/health" -> health
     route "GET" "/robots.txt" -> robots
     route "POST" "/users" -> created_user
+    route "POST" "/users/location" -> created_at_user
     route "DELETE" "/users" -> nothing
     route "GET" "/conflict" -> conflict
 }

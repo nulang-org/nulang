@@ -68,7 +68,7 @@ fn operation_for(route: &RouteContract) -> Value {
 
     let kind = ResponseKind::explicit(route.response_type.as_deref());
     let (status, description) = match kind {
-        Some(ResponseKind::Created) => ("201", "Created response"),
+        Some(ResponseKind::Created) | Some(ResponseKind::CreatedAt) => ("201", "Created response"),
         Some(ResponseKind::NoContent) => ("204", "No content"),
         Some(ResponseKind::Problem) => ("default", "Problem response"),
         _ => ("200", "Successful response"),
@@ -87,7 +87,7 @@ fn operation_for(route: &RouteContract) -> Value {
     if let Some(kind) = kind {
         let schema = match kind {
             ResponseKind::Html | ResponseKind::Text => json!({"type": "string"}),
-            ResponseKind::Json | ResponseKind::Created => json!({}),
+            ResponseKind::Json | ResponseKind::Created | ResponseKind::CreatedAt => json!({}),
             ResponseKind::Problem => json!({
                 "type": "object",
                 "required": ["status", "title"],
@@ -107,6 +107,17 @@ fn operation_for(route: &RouteContract) -> Value {
             );
             response.insert("content".to_string(), Value::Object(media));
         }
+    }
+    if kind == Some(ResponseKind::CreatedAt) {
+        response.insert(
+            "headers".to_string(),
+            json!({
+                "Location": {
+                    "description": "Same-origin path of the created resource",
+                    "schema": {"type": "string"}
+                }
+            }),
+        );
     }
     let mut responses = Map::new();
     if status == "default" {
@@ -400,6 +411,29 @@ mod tests {
                 "missing {mime} for {ty}"
             );
         }
+    }
+
+    #[test]
+    fn created_at_declares_201_resource_location_header() {
+        let mut contract = route();
+        contract.response_type = Some("CreatedAt".to_string());
+        let doc = generate_openapi(
+            &ContractCompilation {
+                routes: vec![contract],
+                diagnostics: vec![],
+            },
+            "API",
+            "1",
+        );
+        let responses = &doc["paths"]["/users/{id}"]["get"]["responses"];
+        assert!(responses.get("200").is_none());
+        assert_eq!(
+            responses["201"]["headers"]["Location"]["schema"]["type"],
+            "string"
+        );
+        assert!(responses["201"]["content"]
+            .get("application/json")
+            .is_some());
     }
 
     #[test]

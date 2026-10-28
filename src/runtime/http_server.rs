@@ -1118,11 +1118,15 @@ impl WebDevServer {
             .as_ref()
             .map_or(ResponseKind::Html, |plan| plan.response_kind);
         let result = kind.render(rendered)?;
+        let mut headers = result
+            .content_type
+            .map_or_else(Vec::new, |mime| vec![("Content-Type".into(), mime.into())]);
+        if let Some(location) = result.location {
+            headers.push(("Location".into(), location));
+        }
         Ok(HttpResponse {
             status: result.status,
-            headers: result
-                .content_type
-                .map_or_else(Vec::new, |mime| vec![("Content-Type".into(), mime.into())]),
+            headers,
             body: result.body,
         })
     }

@@ -132,6 +132,10 @@ fn create_user() -> Created {
     created(JsonObject([("id", JsonNumber(42.0))]))
 }
 
+fn create_user_at() -> CreatedAt {
+    created_at("/users/42", JsonObject([("id", JsonNumber(42.0))]))
+}
+
 fn delete_user() -> NoContent {
     no_content()
 }
@@ -141,9 +145,9 @@ fn conflict() -> Problem {
 }
 ```
 
-`Created` returns **201** with a validated JSON body (no `Location` header yet). `NoContent` returns **204**, with no body or media type. `Problem` returns a serialized `application/problem+json` error: its status must be an integer between 400 and 599, and its body must include a string `title`. The runtime rejects invalid result bodies rather than emitting a misleading success response. OpenAPI reflects these result types: 201, 204, or `default` for dynamically selected error codes.
+`Created` returns **201** with a validated JSON body and no `Location`. `CreatedAt` also returns **201**, adding a validated same-origin `Location` header while sending only the supplied JSON body (not the internal result envelope). Locations must start with exactly one slash, must not contain controls, encoded separators, dot-segment traversal or an external origin. Invalid locations or JSON fail closed as HTTP 500. `NoContent` returns **204**, with no body or media type. `Problem` returns a serialized `application/problem+json` error: its status must be an integer between 400 and 599, and its body must include a string `title`. The runtime rejects invalid result bodies rather than emitting a misleading success response. OpenAPI reflects these result types: 201, 204, or `default` for dynamically selected error codes.
 
-This remains experimental. Generic typed JSON results (`Json[T]`), resource locations for created responses, streaming, and content negotiation are not yet implemented.
+This remains experimental. Generic typed JSON results (`Json[T]`), absolute/cross-origin resource locations, streaming, and content negotiation are not yet implemented.
 
 ### Building HTML
 
