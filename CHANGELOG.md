@@ -1,4 +1,9 @@
 # Nulang Changelog
+
+### Local-only libSQL security remediation — 2026-10-27
+- **Removed the vulnerable legacy libSQL remote/TLS dependency path** from the SQLite persistence feature. Patched the supported Wasmtime, rustls-webpki, webpki-roots and ctutils dependencies; the complete lockfile now passes unmodified `cargo audit` with zero vulnerability findings.
+- **Breaking API change:** `LibsqlStore::new_remote` is no longer available. Existing local SQLite/libSQL files, WAL and `synchronous=FULL` durability, actor/workflow replay and store constructors remain supported; remote clients must migrate explicitly rather than silently degrading transport security or falling back to local storage. The experimental Turso HTTPS preflight is not a replacement production persistence adapter.
+- **Fail-closed regression guard** prevents the obsolete libSQL TLS dependency chain from returning. This change does not migrate database formats, deploy a cloud driver or modify running services.
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.

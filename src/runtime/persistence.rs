@@ -1364,31 +1364,12 @@ impl LibsqlStore {
         Self::new(":memory:")
     }
 
-    /// Connect to a remote Turso database.
-    ///
-    /// Journal pragmas (`journal_mode`, `synchronous`) are deliberately
-    /// skipped: a Turso server manages its own journal and durability
-    /// policy.
-    pub fn new_remote(url: &str, auth_token: &str) -> io::Result<Self> {
-        let rt =
-            tokio::runtime::Runtime::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        let db = rt.block_on(async {
-            libsql::Builder::new_remote(url.to_string(), auth_token.to_string())
-                .build()
-                .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
-        })?;
-        let conn = db
-            .connect()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        let store = LibsqlStore {
-            conn: std::sync::Mutex::new(conn),
-            rt,
-            path: PathBuf::from(url),
-        };
-        store.ensure_tables()?;
-        Ok(store)
-    }
+    // Legacy LibsqlStore::new_remote has been intentionally removed.
+    // Supported local storage continues to use the exact same durable
+    // SQLite format and synchronous=FULL contract. Any external callers
+    // of the obsolete remote constructor must migrate explicitly to the
+    // opt-in modern Turso SQL-over-HTTPS client; failing at compile time
+    // prevents silently disabling durability or TLS verification.
     pub fn path(&self) -> &Path {
         &self.path
     }
