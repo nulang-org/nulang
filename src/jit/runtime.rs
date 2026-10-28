@@ -318,19 +318,22 @@ pub extern "C" fn nulang_icmp_ge(a: u64, b: u64) -> u64 {
     }
 }
 
+// JIT fallback arithmetic must use the same tagged-value coercion as
+// VM::run_from: a nil or other non-float operand contributes 0.0.
+// The typed CLIF fast path is unchanged for statically known float inputs.
 #[no_mangle]
 pub extern "C" fn nulang_fadd(a: u64, b: u64) -> u64 {
-    Value::float(f64::from_bits(a) + f64::from_bits(b)).as_raw()
+    Value::float(fval(a) + fval(b)).as_raw()
 }
 
 #[no_mangle]
 pub extern "C" fn nulang_fsub(a: u64, b: u64) -> u64 {
-    Value::float(f64::from_bits(a) - f64::from_bits(b)).as_raw()
+    Value::float(fval(a) - fval(b)).as_raw()
 }
 
 #[no_mangle]
 pub extern "C" fn nulang_fmul(a: u64, b: u64) -> u64 {
-    Value::float(f64::from_bits(a) * f64::from_bits(b)).as_raw()
+    Value::float(fval(a) * fval(b)).as_raw()
 }
 
 /// Float arithmetic that coerces a non-float (nil) operand to 0.0, matching
@@ -2161,6 +2164,25 @@ pub unsafe extern "C" fn nulang_aot_receive_pop() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_jit_float_arithmetic_coerces_tagged_values_like_interpreter() {
+        use crate::vm::Value;
+
+        let nil = Value::nil().as_raw();
+        let zero = Value::float(0.0).as_raw();
+        let two_point_five = Value::float(2.5).as_raw();
+
+        assert_eq!(super::nulang_fadd(nil, two_point_five), two_point_five);
+        assert_eq!(super::nulang_fadd(two_point_five, nil), two_point_five);
+        assert_eq!(super::nulang_fsub(two_point_five, nil), two_point_five);
+        assert_eq!(
+            super::nulang_fsub(nil, two_point_five),
+            Value::float(-2.5).as_raw()
+        );
+        assert_eq!(super::nulang_fmul(nil, two_point_five), zero);
+        assert_eq!(super::nulang_fmul(two_point_five, nil), zero);
+    }
 
     #[test]
     fn test_native_float_division_coerces_nil_like_interpreter() {
