@@ -1000,6 +1000,19 @@ mod tests {
         }
     }
 
+    /// October 27/28 shard 3: AOT must preserve the interpreter's unhandled
+    /// effect category; merely returning a generic runtime error is divergent.
+    #[test]
+    fn differential_fuzz_oct28_aot_unhandled_effect_category_agrees() {
+        let source = "let x = 42; match x { 0 => (fn(x) { x + 1 })(41)}";
+        let outcome = differential_fuzz_one(source)
+            .expect("unhandled effect kind must match across interpreter and AOT");
+        assert!(
+            matches!(outcome, DiffOutcome::Agreed { aot: true, .. }),
+            "AOT must execute and preserve the effect error category: {outcome:?}"
+        );
+    }
+
     /// Differential regression cases: known kernels that must agree across
     /// all backends. Added from nightly fuzz captures (2026-10-10).
     #[test]
