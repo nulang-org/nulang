@@ -114,6 +114,111 @@ fn canonical_id(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
 }
 
+/// Ordinary GET/HEAD handler execution requires explicit *read* authority,
+/// which can be stronger than permission to see preflight field diagnostics.
+pub trait ResourceReadAuthorization {
+    fn can_read(&self, principal: &str, tenant: &str, resource: &str) -> Result<bool, ()>;
+}
+
+/// Admission outcome for an authenticated, read-only HTTP route.
+/// Internal credentials, principal IDs and tenant IDs must not be reflected
+/// in HTTP responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadScopeError {
+    Unauthenticated,
+    Forbidden,
+    Unavailable,
+}
+
+/// Read-only session admission is intentionally independent from form/CSRF
+/// preflight. POST/PUT/PATCH/DELETE execution is *not* permitted by this API.
+/// The host MUST validate request Host before invoking this function.
+pub fn authorized_read_scope<S: SessionLookup + ?Sized, A: ResourceReadAuthorization + ?Sized>(
+    sessions: &S,
+    resource_authorizer: &A,
+    headers: &[(String, String)],
+    now_utc_seconds: u64,
+    resource_tenant: &str,
+    resource_id: &str,
+) -> Result<VerifiedRequestScope, ReadScopeError> {
+    let cookie = session_cookie_handle(headers).map_err(|_| ReadScopeError::Unauthenticated)?;
+    let session = sessions
+        .lookup(cookie)
+        .map_err(|_| ReadScopeError::Unavailable)?
+        .ok_or(ReadScopeError::Unauthenticated)?;
+    if !canonical_id(&session.principal_id)
+        || !canonical_id(&session.tenant_id)
+        || session.expires_at_unix_seconds <= now_utc_seconds
+    {
+        return Err(ReadScopeError::Unauthenticated);
+    }
+    if !canonical_id(resource_tenant)
+        || !canonical_id(resource_id)
+        || session.tenant_id != resource_tenant
+    {
+        return Err(ReadScopeError::Forbidden);
+    }
+    match resource_authorizer.can_read(&session.principal_id, &session.tenant_id, resource_id) {
+        Ok(true) => {}
+        Ok(false) => return Err(ReadScopeError::Forbidden),
+        Err(_) => return Err(ReadScopeError::Unavailable),
+    }
+    VerifiedRequestScope::from_verified_identity(session.principal_id, Some(session.tenant_id))
+        .ok_or(ReadScopeError::Unauthenticated)
+}
+
+/// Host-controlled selector maps route captures to a resource and its tenant.
+/// This selects *what is being requested*, not proof of ownership; a separately
+/// trusted ResourceAuthorization implementation must grant the resource.
+pub type SessionResourceSelector = dyn Fn(&crate::runtime::HttpRequest, &HashMap<String, String>) -> Option<(String, String)>
+    + Send
+    + Sync
+    + 'static;
+
+/// Optional explicitly installed read-only session adapter. The session
+/// provider must verify revocation on each lookup; no cache is assumed here.
+/// The built-in development listener installs no adapter by default.
+pub struct SessionReadGateway {
+    sessions: std::sync::Arc<dyn SessionLookup + Send + Sync>,
+    resource_authorizer: std::sync::Arc<dyn ResourceReadAuthorization + Send + Sync>,
+    select_resource: std::sync::Arc<SessionResourceSelector>,
+}
+
+impl SessionReadGateway {
+    pub fn new(
+        sessions: std::sync::Arc<dyn SessionLookup + Send + Sync>,
+        resource_authorizer: std::sync::Arc<dyn ResourceReadAuthorization + Send + Sync>,
+        select_resource: std::sync::Arc<SessionResourceSelector>,
+    ) -> Self {
+        Self {
+            sessions,
+            resource_authorizer,
+            select_resource,
+        }
+    }
+
+    pub fn admit(
+        &self,
+        request: &crate::runtime::HttpRequest,
+        captures: &HashMap<String, String>,
+    ) -> Result<VerifiedRequestScope, ReadScopeError> {
+        let (tenant, resource) =
+            (self.select_resource)(request, captures).ok_or(ReadScopeError::Forbidden)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| ReadScopeError::Unavailable)?
+            .as_secs();
+        authorized_read_scope(
+            self.sessions.as_ref(),
+            self.resource_authorizer.as_ref(),
+            &request.headers,
+            now,
+            &tenant,
+            &resource,
+        )
+    }
+}
+
 /// Compose a *server-owned authenticated session* with CSRF and a separate
 /// resource authorization decision before any field diagnostics are returned.
 ///

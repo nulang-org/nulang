@@ -23,6 +23,7 @@ use crate::web::http_request::HttpRequestBindingInputs;
 use crate::web::reactivity::inject_client_runtime_script;
 use crate::web::request_bindings::percent_decode_form;
 use crate::web::runtime_bindings::RuntimeWebRoute;
+use crate::web::session_preflight::{ReadScopeError, SessionReadGateway};
 
 /// HTTP method — must match the Nulang-level variant type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +73,7 @@ pub struct HttpRequest {
     pub body: Vec<u8>,
 }
 
+#[derive(Debug)]
 pub struct HttpResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -875,6 +877,64 @@ impl Drop for ConnectionLease {
     }
 }
 
+/// Explicit, *read-only* authenticated host mode. The allowed Host is a
+/// server-configured literal, not a client-supplied forwarding header.
+struct SessionReadConfig {
+    expected_host: String,
+    gateway: Arc<SessionReadGateway>,
+}
+
+fn forbidden_read_response(status: u16) -> HttpResponse {
+    HttpResponse {
+        status,
+        headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+        body: match status {
+            401 => b"Authentication required".to_vec(),
+            503 => b"Authentication service unavailable".to_vec(),
+            _ => b"Forbidden".to_vec(),
+        },
+    }
+}
+
+fn trusted_host_matches(headers: &[(String, String)], expected_host: &str) -> bool {
+    let mut hosts = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("Host"));
+    matches!(hosts.next(), Some((_, host)) if host.eq_ignore_ascii_case(expected_host))
+        && hosts.next().is_none()
+}
+
+fn session_read_scope(
+    request: &HttpRequest,
+    route: &RuntimeWebRoute,
+    captures: &HashMap<String, String>,
+    config: Option<&SessionReadConfig>,
+) -> Result<Option<crate::web::request_bindings::VerifiedRequestScope>, HttpResponse> {
+    let guarded = route.plan.as_ref().is_some_and(|plan| {
+        plan.bindings
+            .iter()
+            .any(|b| b.source == crate::web::bindings::RouteBindingSource::Scope)
+    });
+    if !guarded {
+        return Ok(None);
+    }
+    let Some(config) = config else {
+        return Err(forbidden_read_response(401));
+    };
+    if request.method != HttpMethod::Get && request.method != HttpMethod::Head {
+        return Err(forbidden_read_response(403));
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        config.gateway.admit(request, captures)
+    }));
+    match result {
+        Ok(Ok(scope)) => Ok(Some(scope)),
+        Ok(Err(ReadScopeError::Unauthenticated)) => Err(forbidden_read_response(401)),
+        Ok(Err(ReadScopeError::Forbidden)) => Err(forbidden_read_response(403)),
+        Ok(Err(ReadScopeError::Unavailable)) | Err(_) => Err(forbidden_read_response(503)),
+    }
+}
+
 /// Dev server that dispatches registered `Web.route` handlers and falls back
 /// to static files for unmatched paths.
 #[derive(Debug)]
@@ -921,6 +981,52 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
     ) -> std::io::Result<Self> {
+        Self::bind_runtime_internal(port, static_dir, output_dir, routes, None)
+    }
+
+    /// Experimental *read-only* host integration for server-authenticated
+    /// scope-bearing GET/HEAD handlers. Non-GET/HEAD requests and SSE are
+    /// denied in this mode until independent origin/CSRF and stream admission
+    /// gates have been integrated. This does not issue sessions or implement
+    /// login; the provided gateway must use a revocation-aware session store.
+    pub fn bind_runtime_with_session_reads(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        expected_host: &str,
+        gateway: Arc<SessionReadGateway>,
+    ) -> std::io::Result<Self> {
+        if expected_host.is_empty()
+            || expected_host.len() > 255
+            || !expected_host
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b':' | b'[' | b']'))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid trusted HTTP Host",
+            ));
+        }
+        Self::bind_runtime_internal(
+            port,
+            static_dir,
+            output_dir,
+            routes,
+            Some(Arc::new(SessionReadConfig {
+                expected_host: expected_host.to_string(),
+                gateway,
+            })),
+        )
+    }
+
+    fn bind_runtime_internal(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        read_config: Option<Arc<SessionReadConfig>>,
+    ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(("0.0.0.0", port))?;
         let actual_port = listener.local_addr()?.port();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -938,6 +1044,7 @@ impl WebDevServer {
                     output_dir_clone,
                     routes_clone,
                     shutdown_clone,
+                    read_config,
                 );
             })?;
 
@@ -954,6 +1061,7 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
         shutdown: Arc<AtomicBool>,
+        read_config: Option<Arc<SessionReadConfig>>,
     ) {
         listener.set_nonblocking(true).ok();
         let slots = Arc::new(ConnectionSlots::new(Self::MAX_CONCURRENT_CONNECTIONS));
@@ -986,13 +1094,19 @@ impl WebDevServer {
                     let output_dir = output_dir.clone();
                     let routes = Arc::clone(&routes);
                     let shutdown = Arc::clone(&shutdown);
+                    let read_config = read_config.clone();
                     // A failed spawn drops the closure and lease, returning capacity.
                     if let Err(error) = std::thread::Builder::new()
                         .name("nulang-web-dev-connection".into())
                         .spawn(move || {
                             let _lease = lease;
                             Self::handle_connection(
-                                stream, static_dir, output_dir, routes, shutdown,
+                                stream,
+                                static_dir,
+                                output_dir,
+                                routes,
+                                shutdown,
+                                read_config,
                             );
                         })
                     {
@@ -1013,6 +1127,7 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Arc<Vec<RuntimeWebRoute>>,
         shutdown: Arc<AtomicBool>,
+        read_config: Option<Arc<SessionReadConfig>>,
     ) {
         let request = match read_http_request(&mut stream) {
             Ok(Some(request)) => request,
@@ -1023,6 +1138,18 @@ impl WebDevServer {
             }
         };
         let path = request.path.clone();
+
+        // The read-only authenticated adapter guards the entire HTTP origin,
+        // including static paths and SSE, before any user code or subscription.
+        if let Some(config) = read_config.as_deref() {
+            if !trusted_host_matches(&request.headers, &config.expected_host)
+                || !matches!(request.method, HttpMethod::Get | HttpMethod::Head)
+                || path.starts_with(Self::SSE_PATH_PREFIX)
+            {
+                HttpServerState::write_response(&mut stream, &forbidden_read_response(403));
+                return;
+            }
+        }
 
         let mut response = if path.starts_with(Self::SSE_PATH_PREFIX) {
             let room = &path[Self::SSE_PATH_PREFIX.len()..];
@@ -1037,10 +1164,15 @@ impl WebDevServer {
         {
             let captured =
                 HttpRequestBindingInputs::capture(&request.path, &request.headers, &request.body);
-            if let Some(response) = invalid_ui_action_response(&captured) {
+            let scope = session_read_scope(&request, route, &params, read_config.as_deref());
+            if let Err(response) = scope {
+                response
+            } else if let Some(response) = invalid_ui_action_response(&captured) {
                 response
             } else {
-                let values = captured.values(&params, &request.headers);
+                let scope = scope.expect("already checked");
+                let mut values = captured.values(&params, &request.headers);
+                values.scope = scope.as_ref();
                 let ctx = RequestContext {
                     request: request.clone(),
                     params: params.clone(),
