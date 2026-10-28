@@ -18,7 +18,7 @@ const flush = async () => {
 };
 
 function harness({ revalidate = '#summary, #notifications', get = null, post = null,
-    overlap = false } = {}) {
+    overlap = false, compiledData = null } = {}) {
   const nodes = new Map();
   const updates = [];
   const listeners = new Map();
@@ -84,10 +84,11 @@ function harness({ revalidate = '#summary, #notifications', get = null, post = n
     throw new Error('unexpected HTTP method');
   };
   const window = {
-    location: { href: 'https://example.test/tasks', reload() { reloads++; } }
+    location: { href: 'https://example.test/tasks', reload() { reloads++; } },
+    ...(compiledData ? { nulangCompiledData: compiledData } : {})
   };
   runInNewContext(match[1], {
-    document, window, DOMParser, FormData, URLSearchParams, fetch, AbortController,
+    document, window, DOMParser, FormData, URLSearchParams, URL, fetch, AbortController,
     console: { error(...a) { errors.push(a.map(String).join(' ')); }, warn() {} }
   });
   return {
@@ -261,4 +262,25 @@ assert.equal(racing.errors.length, 0, 'superseded revalidation does not log erro
   assert.equal(requests[1].signal?.aborted, true, 'shared-target supersession aborts old GET');
 }
 
-console.log('Nulang Web: explicit selective revalidation is atomic, bounded and race-safe');
+const compiledData = {
+  mutations: [{ path: '/tasks', invalidates: ['tasks'],
+    targets: ['#summary', '#notifications'] }]
+};
+const automatic = harness({ revalidate: null, compiledData });
+automatic.submit();
+await flush();
+assert.equal(automatic.text('detail'), 'Saved');
+assert.equal(automatic.text('summary'), 'Fresh summary',
+  'compiler-validated mutation metadata triggers sibling refresh');
+assert.equal(automatic.text('notifications'), 'Fresh notifications');
+assert.deepEqual(automatic.fetches.map(f => f.options.method), ['POST', 'GET']);
+
+const undeclared = harness({ revalidate: '#untouched', compiledData });
+undeclared.submit();
+await flush();
+assert.equal(undeclared.fetches.length, 0,
+  'explicit selectors outside compiled dependency mapping reject before POST');
+assert.equal(undeclared.text('detail'), 'Old detail');
+assert.equal(undeclared.errors.length, 1);
+
+console.log('Nulang Web: explicit and compiler-validated revalidation is race-safe');

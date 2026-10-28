@@ -1406,6 +1406,21 @@ fn cmd_build_web() -> NuResult<()> {
         msg: format!("invalid web route contract:\n{}", diagnostics.join("\n")),
         span: Span::default(),
     })?;
+    let data_contracts =
+        crate::web::data_contracts::compile_web_data_contracts(&manifest.web, &validated_contracts)
+            .map_err(|diagnostics| NuError::PackageError {
+                msg: format!("invalid web loader contract:\n{}", diagnostics.join("\n")),
+                span: Span::default(),
+            })?;
+    data_contracts
+        .append_to_client_script(&client_js_path)
+        .map_err(|error| NuError::PackageError {
+            msg: format!(
+                "cannot append Web data contracts to {}: {error}",
+                client_js_path.display()
+            ),
+            span: Span::default(),
+        })?;
     crate::web::dispatch::compile_runtime_routes_from_contracts(
         routes.clone(),
         &validated_contracts,
@@ -1458,6 +1473,7 @@ fn cmd_build_web() -> NuResult<()> {
         &src_root,
         &manifest.budgets,
         &validated_contracts,
+        &data_contracts,
     );
     let ir_path = output_dir.join("nulang-app.ir.json");
     let ir_json = ir.to_json();
@@ -1592,13 +1608,34 @@ fn cmd_dev(port_override: Option<u16>) -> NuResult<()> {
     })?;
     let routes = vm.take_web_routes();
     let src_root = root.join("src");
-    let runtime_routes =
-        crate::web::dispatch::compile_runtime_routes(routes, &src_root).map_err(|diagnostics| {
-            NuError::PackageError {
-                msg: format!("invalid web route contract:\n{}", diagnostics.join("\n")),
-                span: Span::default(),
-            }
+    let validated = crate::web::validation::compile_validated_contracts_from_tree(&src_root)
+        .map_err(|diagnostics| NuError::PackageError {
+            msg: format!("invalid web route contract:\n{}", diagnostics.join("\n")),
+            span: Span::default(),
         })?;
+    let data_contracts =
+        crate::web::data_contracts::compile_web_data_contracts(&manifest.web, &validated).map_err(
+            |diagnostics| NuError::PackageError {
+                msg: format!("invalid web loader contract:\n{}", diagnostics.join("\n")),
+                span: Span::default(),
+            },
+        )?;
+    data_contracts
+        .append_to_client_script(&client_js_path)
+        .map_err(|error| NuError::PackageError {
+            msg: format!(
+                "cannot append Web data contracts to {}: {error}",
+                client_js_path.display()
+            ),
+            span: Span::default(),
+        })?;
+    let runtime_routes = crate::web::dispatch::compile_runtime_routes_from_contracts(
+        routes, &validated,
+    )
+    .map_err(|diagnostics| NuError::PackageError {
+        msg: format!("invalid web route contract:\n{}", diagnostics.join("\n")),
+        span: Span::default(),
+    })?;
 
     nulang_exe(&[
         "--emit-signals",
@@ -2232,6 +2269,7 @@ fn cmd_deploy(
         crate::web::ir::DeploymentIr {
             version: 1,
             routes: Vec::new(),
+            data_contracts: Default::default(),
             signals: serde_json::Value::Object(Default::default()),
             capabilities: Vec::new(),
             budgets: Default::default(),

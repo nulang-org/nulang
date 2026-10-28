@@ -1212,8 +1212,30 @@ pub fn generate_client_runtime() -> String {
     const requestUrl = window.location.href;
     const form = el.closest('form');
     const target = el.dataset.nulangTarget || (form && form.dataset.nulangTarget);
-    const revalidate = el.dataset.nulangRevalidate !== undefined
+    let revalidate = el.dataset.nulangRevalidate !== undefined
       ? el.dataset.nulangRevalidate : (form && form.dataset.nulangRevalidate);
+    // The compiler emits a bounded mutation-to-target map when the package
+    // declares named Web loader dependencies. A plain form can rely on that
+    // mapping instead of duplicating its list of selectors in HTML.
+    const compiled = window.nulangCompiledData;
+    const pathname = compiled && typeof URL === 'function'
+      ? new URL(requestUrl).pathname : null;
+    const route = pathname && Array.isArray(compiled.mutations)
+      ? compiled.mutations.find(function (entry) { return entry.path === pathname; }) : null;
+    if (route) {
+      if (!Array.isArray(route.targets)) {
+        throw new Error('invalid compiler-owned revalidation mapping');
+      }
+      const allowed = route.targets.filter(function (selector) { return selector !== target; });
+      if (revalidate !== undefined && revalidate !== null) {
+        const declared = revalidationTargets(revalidate, target);
+        if (declared.some(function (selector) { return !allowed.includes(selector); })) {
+          throw new Error('revalidation target is not declared by Web loader contracts');
+        }
+      } else if (allowed.length) {
+        revalidate = allowed.join(', ');
+      }
+    }
     const body = formBody(form);
     const message = createActionMessage(handler, 'server', body);
     body.append('__nulang_action', handler);

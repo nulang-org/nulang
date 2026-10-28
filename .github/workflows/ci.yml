@@ -70,6 +70,9 @@ jobs:
       - name: Smoke test Nulang Web DOM morph in Chrome
         run: node scripts/tests/web_dom_morph_browser.mjs
 
+      - name: Smoke test Nulang Web HTTP revalidation and navigation in Chrome
+        run: node scripts/tests/web_revalidation_browser.mjs
+
       - name: Install docs dependencies
         run: |
           cd docs

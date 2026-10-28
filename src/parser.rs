@@ -5712,7 +5712,7 @@ impl Parser {
             self.pos += 1; // also skip 'type' after 'opaque'
         }
         self.skip_newlines();
-        let decl_result = if self.peek_kind() == &TokenKind::Alias {
+        let decl_result = if is_opaque || self.peek_kind() == &TokenKind::Alias {
             self.parse_type_alias(false, is_opaque)
         } else {
             self.parse_type_decl_variant_or_record(false, vec![])
@@ -6223,6 +6223,20 @@ impl Parser {
                     .join(format!("{}.nula", module_path));
                 if dev_path.exists() {
                     return Some(dev_path);
+                }
+            }
+            // Development binaries are often built into target/debug and
+            // invoked from an unrelated package directory. Preserve import
+            // type metadata for Web contract extraction by checking the
+            // compiler source tree when it is still present. Installed
+            // toolchains continue using NULANG_STDLIB or bundled stdlib.
+            if let Some(root) = option_env!("CARGO_MANIFEST_DIR") {
+                let candidate = std::path::Path::new(root)
+                    .join("src")
+                    .join("stdlib")
+                    .join(format!("{}.nula", module_path));
+                if candidate.is_file() {
+                    return Some(candidate);
                 }
             }
             // Last resort.
@@ -7024,6 +7038,21 @@ mod tests {
             }
             _ => panic!("Expected annotated function declaration"),
         }
+    }
+
+    #[test]
+    fn imported_opaque_html_type_keeps_nominal_identity() {
+        let src = "import stdlib::web::types\nfn render() -> Html { \"ok\" }\n";
+        let tokens = crate::lexer::Lexer::new(src).lex().unwrap();
+        let module = Parser::new(tokens).parse_module().unwrap();
+        let ret = module.decls.iter().find_map(|decl| match decl {
+            Decl::Function { name, ret_type, .. } if name == "render" => ret_type.as_ref(),
+            _ => None,
+        });
+        assert!(
+            matches!(ret, Some(Type::Nominal { name, .. }) if name == "Html"),
+            "imported opaque Html must not collapse to String: {ret:?}"
+        );
     }
 
     #[test]

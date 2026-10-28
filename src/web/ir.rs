@@ -11,6 +11,7 @@ use crate::web::bindings::{compile_route_bindings, RouteBindingContract};
 use crate::web::contracts::{
     ContractCompilation, HandlerParamContract, RouteContract, RouteParamContract,
 };
+use crate::web::data_contracts::WebDataContracts;
 use crate::web::modules::ModuleRegistry;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -70,6 +71,9 @@ pub struct CloudConfigEntry {
 pub struct DeploymentIr {
     pub version: u32,
     pub routes: Vec<IrRoute>,
+    /// Validated, explicit GET loader and POST dependency invalidation graph.
+    #[serde(default, skip_serializing_if = "WebDataContracts::is_empty")]
+    pub data_contracts: WebDataContracts,
     pub signals: serde_json::Value,
     pub capabilities: Vec<String>,
     pub budgets: BudgetsIr,
@@ -98,6 +102,7 @@ pub fn generate_deployment_ir(
     src_root: &Path,
     budgets: &BudgetsSection,
     contracts: &ContractCompilation,
+    data_contracts: &WebDataContracts,
 ) -> DeploymentIr {
     let contract_index: HashMap<(String, String), &RouteContract> = contracts
         .routes
@@ -170,6 +175,7 @@ pub fn generate_deployment_ir(
         // may ignore the additional contract metadata.
         version: 1,
         routes: ir_routes,
+        data_contracts: data_contracts.clone(),
         signals,
         capabilities,
         budgets: budgets_ir,
@@ -361,6 +367,7 @@ mod tests {
             &missing_source,
             &BudgetsSection::default(),
             &validated,
+            &WebDataContracts::default(),
         );
 
         assert_eq!(ir.routes.len(), 1);
@@ -374,6 +381,34 @@ mod tests {
         assert_eq!(ir.routes[0].bindings.len(), 1);
         assert_eq!(ir.routes[0].bindings[0].handler_index, 0);
         assert_eq!(ir.routes[0].bindings[0].ty.as_deref(), Some("Int"));
+    }
+
+    #[test]
+    fn loader_contract_metadata_is_additive_to_ir_v1() {
+        let legacy = r#"{"version":1,"routes":[],"signals":{},"capabilities":[],"budgets":{},"middleware":[],"cloud_config":[]}"#;
+        let decoded: DeploymentIr = serde_json::from_str(legacy).unwrap();
+        assert!(decoded.data_contracts.is_empty());
+        assert!(!decoded.to_json().contains("data_contracts"));
+
+        let mut with_loaders = decoded;
+        with_loaders.data_contracts = WebDataContracts {
+            loaders: vec![crate::web::data_contracts::LoaderContract {
+                id: "summary".into(),
+                path: "/tasks".into(),
+                target: "#summary".into(),
+                reads: vec!["tasks".into()],
+            }],
+            mutations: vec![crate::web::data_contracts::MutationContract {
+                path: "/tasks".into(),
+                invalidates: vec!["tasks".into()],
+                targets: vec!["#summary".into()],
+            }],
+        };
+        let json = with_loaders.to_json();
+        assert!(json.contains("data_contracts"));
+        let restored: DeploymentIr = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.version, 1);
+        assert_eq!(restored.data_contracts, with_loaders.data_contracts);
     }
 
     #[test]

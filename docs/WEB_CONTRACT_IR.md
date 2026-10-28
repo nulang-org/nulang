@@ -37,6 +37,64 @@ Supported sources are:
 
 This Web surface is experimental and is intentionally documented here rather than by modifying the Frozen Core parameter production in `spec/grammar.ebnf`. Promoting request-source syntax into a stable language tier requires the corresponding RFC/stability process.
 
+## Validated GET loader / POST invalidation identities (experimental)
+
+A package may declare **named HTML GET loaders** and explicit data dependency
+identities in `Nulang.toml`. The compiler validates the declarations against
+its existing typed route contracts. This introduces no new Nulang grammar and
+is optional for existing Web packages.
+
+```toml
+[[web.loaders]]
+id = "summary"
+path = "/tasks"
+target = "#summary"
+reads = ["tasks", "notifications"]
+
+[[web.loaders]]
+id = "alerts"
+path = "/tasks"
+target = "#alerts"
+reads = ["notifications"]
+
+[[web.mutations]]
+path = "/tasks"
+invalidates = ["tasks"]
+```
+
+Validation requires an exact `GET /tasks` route whose statically resolved
+handler returns `Html`, and an exact `POST /tasks` route returning `Html`.
+Loader IDs must be unique; each route's target ID must be unique. Names and
+dependency identities use bounded ASCII forms. Every mutation dependency must
+appear in a loader on its own GET route, and the resolved distinct target count
+must be between one and eight. Unknown, duplicate or ambiguous declarations
+are **hard errors** at both `nula build --web` and `nula dev` boundaries.
+The compiler does **not** infer reads from effect rows, SQL, or HTTP calls.
+Dynamic path templates and cross-route invalidation are excluded from this
+first version.
+
+Deployment IR v1 gains optional `data_contracts` containing sorted `loaders`
+and resolved `mutations` (paths, invalidated dependencies and target IDs).
+This field is omitted for legacy packages, and old IR v1 documents still
+round-trip. The compiler also appends the validated mapping to the already
+emitted `app.client.js`, with no extra network request or client dependency.
+A progressive POST form can therefore provide only
+`data-nulang-target="#detail"`: Nulang resolves its sibling refresh targets
+from the matching compiled mutation path and issues a single GET. If a form
+instead supplies `data-nulang-revalidate`, every explicitly selected target
+must be in the compiler-provided set when that path has a compiled contract;
+an undeclared selector fails before the POST. Without compiler metadata,
+existing explicit selector behavior remains backward compatible.
+
+**Boundaries:** The GET page must actually contain all referenced DOM IDs, and
+the POST response must contain its primary target. These are checked by the
+browser on response consumption, not proven statically in this version.
+Invalidation identities are *developer-declared*, not database provenance or
+strongly typed function references. Browser metadata is never an authorization
+boundary. POST handlers must enforce authentication, CSRF, idempotency, and
+transaction consistency independently. Nulang's Web development host remains
+experimental and is not Internet-facing production certified.
+
 ## Additive Deployment IR v1 contract metadata
 
 `nula build --web` keeps the deployment document at schema version 1 and adds optional/defaulted per-route metadata. Existing v1 consumers can ignore unknown fields, so a schema-version bump would create incompatibility without strengthening the current contract.
