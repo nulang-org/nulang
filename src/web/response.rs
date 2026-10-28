@@ -11,6 +11,7 @@ pub enum ResponseKind {
     Created,
     NoContent,
     Problem,
+    InvalidForm,
 }
 
 /// Transport-neutral result of executing a compiler-validated route.
@@ -30,6 +31,7 @@ impl ResponseKind {
             Some("Created") => Some(Self::Created),
             Some("NoContent") => Some(Self::NoContent),
             Some("Problem") => Some(Self::Problem),
+            Some("InvalidForm") => Some(Self::InvalidForm),
             _ => None,
         }
     }
@@ -40,7 +42,7 @@ impl ResponseKind {
 
     pub const fn content_type(self) -> &'static str {
         match self {
-            Self::Html => "text/html; charset=utf-8",
+            Self::Html | Self::InvalidForm => "text/html; charset=utf-8",
             Self::Json | Self::Created => "application/json; charset=utf-8",
             Self::Text => "text/plain; charset=utf-8",
             Self::Problem => "application/problem+json",
@@ -50,7 +52,7 @@ impl ResponseKind {
 
     pub const fn openapi_media_type(self) -> &'static str {
         match self {
-            Self::Html => "text/html",
+            Self::Html | Self::InvalidForm => "text/html",
             Self::Json | Self::Created => "application/json",
             Self::Text => "text/plain",
             Self::Problem => "application/problem+json",
@@ -68,6 +70,7 @@ impl ResponseKind {
                 crate::web::reactivity::inject_client_runtime_script(rendered).into_bytes(),
             ),
             Self::Text => (200, rendered.as_bytes().to_vec()),
+            Self::InvalidForm => (422, rendered.as_bytes().to_vec()),
             Self::Json | Self::Created => {
                 serde_json::from_str::<serde_json::Value>(rendered)
                     .map_err(|_| "JSON route returned an invalid JSON document")?;
@@ -186,6 +189,21 @@ mod tests {
         ] {
             assert!(ResponseKind::Problem.render(raw).is_err(), "accepted {raw}");
         }
+    }
+
+    #[test]
+    fn invalid_form_result_is_exact_html_with_http_422_and_no_script_injection() {
+        assert_eq!(
+            ResponseKind::from_return_type(Some("InvalidForm")),
+            ResponseKind::InvalidForm
+        );
+        let fragment = "<form id=\"edit\"><span>Required</span></form>";
+        let reply = ResponseKind::InvalidForm
+            .render(fragment)
+            .expect("render form error");
+        assert_eq!(reply.status, 422);
+        assert_eq!(reply.content_type, Some("text/html; charset=utf-8"));
+        assert_eq!(reply.body, fragment.as_bytes());
     }
 
     #[test]

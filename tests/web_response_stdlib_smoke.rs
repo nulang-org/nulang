@@ -35,12 +35,17 @@ fn conflict() -> Problem {
     problem(409, "Conflict", "Already exists")
 }
 
+fn invalid_registration() -> InvalidForm {
+    invalid_form(perform Web.text("A required field is missing"))
+}
+
 app "api" {
     route "GET" "/health" -> health
     route "GET" "/robots.txt" -> robots
     route "POST" "/users" -> created_user
     route "DELETE" "/users" -> nothing
     route "GET" "/conflict" -> conflict
+    route "POST" "/registrations" -> invalid_registration
 }
 "#;
     std::fs::write(&path, program).expect("write isolated Nulang smoke program");

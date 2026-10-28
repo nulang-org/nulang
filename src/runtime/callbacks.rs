@@ -429,7 +429,7 @@ pub(crate) fn perform_web_builtin(
             });
             Some(callbacks.alloc_string(&document.to_string()))
         }
-        Some("json") | Some("plaintext") | Some("created") => {
+        Some("json") | Some("plaintext") | Some("created") | Some("invalid_form") => {
             let body = resolve(constants, *regs.first()?);
             Some(callbacks.alloc_string(&body))
         }

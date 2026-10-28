@@ -71,6 +71,7 @@ fn operation_for(route: &RouteContract) -> Value {
         Some(ResponseKind::Created) => ("201", "Created response"),
         Some(ResponseKind::NoContent) => ("204", "No content"),
         Some(ResponseKind::Problem) => ("default", "Problem response"),
+        Some(ResponseKind::InvalidForm) => ("422", "Invalid form HTML"),
         _ => ("200", "Successful response"),
     };
     let mut response = Map::new();
@@ -86,7 +87,9 @@ fn operation_for(route: &RouteContract) -> Value {
     }
     if let Some(kind) = kind {
         let schema = match kind {
-            ResponseKind::Html | ResponseKind::Text => json!({"type": "string"}),
+            ResponseKind::Html | ResponseKind::Text | ResponseKind::InvalidForm => {
+                json!({"type": "string"})
+            }
             ResponseKind::Json | ResponseKind::Created => json!({}),
             ResponseKind::Problem => json!({
                 "type": "object",
@@ -408,6 +411,7 @@ mod tests {
             ("Created", "201", Some("application/json")),
             ("NoContent", "204", None),
             ("Problem", "default", Some("application/problem+json")),
+            ("InvalidForm", "422", Some("text/html")),
         ] {
             let mut contract = route();
             contract.response_type = Some(kind.to_string());

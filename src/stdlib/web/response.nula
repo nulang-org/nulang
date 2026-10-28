@@ -24,6 +24,12 @@ pub fn no_content() -> NoContent ! {Web, Respond} {
     perform Web.no_content()
 }
 
+/// Return HTTP 422 with a rendered HTML form or fragment after failed validation.
+/// Use Web.text and Web.html to construct escaped markup; no script is injected.
+pub fn invalid_form(fragment: Html) -> InvalidForm ! {Web, Respond} {
+    perform Web.invalid_form(fragment)
+}
+
 /// Return an RFC-style problem document. Status must be 400..599;
 /// invalid statuses fail closed at the HTTP response boundary.
 pub fn problem(status: Int, title: String, detail: String) -> Problem ! {Web, Respond} {
