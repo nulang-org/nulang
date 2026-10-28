@@ -724,6 +724,11 @@ struct UiStreamRoom {
     revision: u64,
     elements: BTreeMap<String, String>,
     listeners: Vec<(u64, SyncSender<nulang_ui_protocol::UiHtmlStreamMessage>)>,
+    /// Actor-owned private rooms require an alive actor binding to publish.
+    owner_actor: Option<u64>,
+    /// A room's unique ownership epoch prevents late writes from an old
+    /// handle after cancellation followed by rebinding the same actor.
+    owner_lease: Option<u64>,
 }
 
 struct UiStreamSubscriber {
@@ -803,6 +808,8 @@ pub fn ui_stream_publish(room: &str, target: &str, html: &str) -> bool {
             revision: 0,
             elements: BTreeMap::new(),
             listeners: Vec::new(),
+            owner_actor: None,
+            owner_lease: None,
         });
     if !entry.elements.contains_key(target) && entry.elements.len() >= UI_STREAM_MAX_TARGETS {
         return false;
@@ -921,6 +928,8 @@ fn ui_stream_subscribe(
             revision: 0,
             elements: BTreeMap::new(),
             listeners: Vec::new(),
+            owner_actor: None,
+            owner_lease: None,
         });
     if entry.listeners.len() >= UI_STREAM_MAX_LISTENERS {
         return None;
@@ -965,9 +974,86 @@ pub struct ScopedUiPublisher {
 }
 
 impl ScopedUiPublisher {
-    /// Publish already escaped HTML to a private room. This handle is
-    /// privileged: callers must independently authorize publishing.
+    /// Bind an existing local Nulang actor to a private room, exclusively.
+    /// Actor exit, cancellation, or dropping the last handle disconnects
+    /// subscribers and clears the old HTML snapshot.
+    pub fn bind_actor(
+        &self,
+        runtime: &mut super::Runtime,
+        actor_id: u64,
+        app: &str,
+        room: &str,
+    ) -> Option<ScopedUiActorBinding> {
+        if !valid_scoped_ui_id(app)
+            || !valid_scoped_ui_id(room)
+            || actor_id == 0
+            || !runtime
+                .actors
+                .get(&actor_id)
+                .is_some_and(|actor| actor.state != super::ActorState::Terminated)
+        {
+            return None;
+        }
+        let alive = runtime
+            .actor_ui_stream_bindings
+            .entry(actor_id)
+            .or_default();
+        alive.retain(|weak| {
+            weak.upgrade()
+                .is_some_and(|binding| binding.active.load(Ordering::Acquire))
+        });
+        if alive.len() >= UI_STREAM_MAX_ROOMS {
+            return None;
+        }
+        let key = (app.to_string(), room.to_string());
+        let lease_id = UI_STREAM_LISTENER_ID.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut rooms = self.streams.rooms.lock().unwrap();
+            if !rooms.contains_key(&key) && rooms.len() >= UI_STREAM_MAX_ROOMS {
+                return None;
+            }
+            let entry = rooms.entry(key.clone()).or_insert_with(|| UiStreamRoom {
+                revision: 0,
+                elements: BTreeMap::new(),
+                listeners: Vec::new(),
+                owner_actor: None,
+                owner_lease: None,
+            });
+            if entry.owner_actor.is_some()
+                || entry.revision != 0
+                || !entry.elements.is_empty()
+                || !entry.listeners.is_empty()
+            {
+                return None;
+            }
+            entry.owner_actor = Some(actor_id);
+            entry.owner_lease = Some(lease_id);
+        }
+        let inner = Arc::new(UiActorStreamBindingInner {
+            actor_id,
+            lease_id,
+            runtime_token: Arc::downgrade(&runtime.actor_ui_stream_token),
+            key,
+            streams: Arc::clone(&self.streams),
+            active: AtomicBool::new(true),
+        });
+        alive.push(Arc::downgrade(&inner));
+        Some(ScopedUiActorBinding { inner })
+    }
+
+    /// The trusted host publisher deliberately cannot overwrite actor rooms.
     pub fn publish(&self, app: &str, room: &str, target: &str, html: &str) -> bool {
+        self.publish_for_owner(None, app, room, target, html)
+    }
+
+    fn publish_for_owner(
+        &self,
+        owner: Option<(u64, u64)>,
+        app: &str,
+        room: &str,
+        target: &str,
+        html: &str,
+    ) -> bool {
         use nulang_ui_protocol::{DocumentId, Revision, UiHtmlElement, UiHtmlStreamMessage};
         if !valid_scoped_ui_id(app)
             || !valid_scoped_ui_id(room)
@@ -1000,7 +1086,14 @@ impl ScopedUiPublisher {
             revision: 0,
             elements: BTreeMap::new(),
             listeners: Vec::new(),
+            owner_actor: None,
+            owner_lease: None,
         });
+        if entry.owner_actor != owner.map(|(actor, _)| actor)
+            || entry.owner_lease != owner.map(|(_, lease)| lease)
+        {
+            return false;
+        }
         if !entry.elements.contains_key(target) && entry.elements.len() >= UI_STREAM_MAX_TARGETS {
             return false;
         }
@@ -1030,11 +1123,105 @@ fn valid_scoped_ui_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
 }
 
+/// A room capability bound to one local Nulang actor. Host code must
+/// dispatch calls from its receiving actor behavior, not forged identities.
+pub struct ScopedUiActorBinding {
+    inner: Arc<UiActorStreamBindingInner>,
+}
+
+pub(crate) struct UiActorStreamBindingInner {
+    actor_id: u64,
+    lease_id: u64,
+    runtime_token: std::sync::Weak<()>,
+    key: (String, String),
+    streams: Arc<ScopedUiStreams>,
+    active: AtomicBool,
+}
+
+impl UiActorStreamBindingInner {
+    pub(crate) fn cancel(&self) {
+        if !self.active.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let mut rooms = self.streams.rooms.lock().unwrap();
+        if rooms.get(&self.key).is_some_and(|room| {
+            room.owner_actor == Some(self.actor_id) && room.owner_lease == Some(self.lease_id)
+        }) {
+            // Dropping senders disconnects clients and discards stale state.
+            rooms.remove(&self.key);
+        }
+    }
+}
+
+impl Drop for UiActorStreamBindingInner {
+    fn drop(&mut self) {
+        self.cancel()
+    }
+}
+
+impl ScopedUiActorBinding {
+    /// Requires the exact owner and live runtime actor.
+    pub fn publish(
+        &self,
+        runtime: &super::Runtime,
+        sender_actor: u64,
+        target: &str,
+        html: &str,
+    ) -> bool {
+        if !self.inner.active.load(Ordering::Acquire)
+            || sender_actor != self.inner.actor_id
+            || runtime.current_actor != Some(sender_actor)
+            || !self
+                .inner
+                .runtime_token
+                .upgrade()
+                .is_some_and(|token| Arc::ptr_eq(&token, &runtime.actor_ui_stream_token))
+            || !runtime
+                .actors
+                .get(&sender_actor)
+                .is_some_and(|actor| actor.state != super::ActorState::Terminated)
+        {
+            return false;
+        }
+        ScopedUiPublisher {
+            streams: Arc::clone(&self.inner.streams),
+        }
+        .publish_for_owner(
+            Some((sender_actor, self.inner.lease_id)),
+            &self.inner.key.0,
+            &self.inner.key.1,
+            target,
+            html,
+        )
+    }
+
+    pub fn cancel(&self) {
+        self.inner.cancel()
+    }
+}
+
 struct ScopedUiSubscriber {
     key: (String, String),
     id: u64,
+    owner_lease: Option<u64>,
     rx: Receiver<nulang_ui_protocol::UiHtmlStreamMessage>,
     streams: Arc<ScopedUiStreams>,
+}
+
+impl ScopedUiSubscriber {
+    /// A cancelled actor binding cannot replay old queued patches into a
+    /// replacement room, even when the actor number and room key are reused.
+    fn still_current(&self) -> bool {
+        self.streams
+            .rooms
+            .lock()
+            .unwrap()
+            .get(&self.key)
+            .is_some_and(|room| {
+                room.owner_lease == self.owner_lease
+                    && room.listeners.iter().any(|(id, _)| *id == self.id)
+            })
+    }
 }
 
 impl Drop for ScopedUiSubscriber {
@@ -1063,6 +1250,8 @@ fn subscribe_scoped_ui(
         revision: 0,
         elements: BTreeMap::new(),
         listeners: Vec::new(),
+        owner_actor: None,
+        owner_lease: None,
     });
     if entry.listeners.len() >= UI_STREAM_MAX_LISTENERS {
         return None;
@@ -1079,6 +1268,7 @@ fn subscribe_scoped_ui(
             })
             .collect(),
     );
+    let owner_lease = entry.owner_lease;
     let (tx, rx) = sync_channel(UI_STREAM_CHANNEL_DEPTH);
     let id = UI_STREAM_LISTENER_ID.fetch_add(1, Ordering::Relaxed);
     entry.listeners.push((id, tx));
@@ -1087,6 +1277,7 @@ fn subscribe_scoped_ui(
         ScopedUiSubscriber {
             key,
             id,
+            owner_lease,
             rx,
             streams: Arc::clone(&streams),
         },
@@ -1664,7 +1855,7 @@ impl WebDevServer {
             return;
         };
         let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-        if !(verify)(request, app, room) {
+        if !(verify)(request, app, room) || !subscriber.still_current() {
             return;
         }
         if stream.write_all(
@@ -1682,7 +1873,10 @@ impl WebDevServer {
                 Ok(patch) => {
                     // Verify current membership before writing any next update.
                     if !(verify)(request, app, room)
-                        || Self::write_ui_sse_event(stream, &patch).is_err()
+                        || !matches!(
+                            Self::write_scoped_ui_patch(&subscriber, stream, &patch),
+                            Ok(true)
+                        )
                     {
                         break;
                     }
@@ -1692,7 +1886,7 @@ impl WebDevServer {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
             if last_check.elapsed() >= Duration::from_secs(1) {
-                if !(verify)(request, app, room) {
+                if !(verify)(request, app, room) || !subscriber.still_current() {
                     break;
                 }
                 last_check = Instant::now();
@@ -1704,6 +1898,21 @@ impl WebDevServer {
                 last_heartbeat = Instant::now();
             }
         }
+    }
+
+    /// The exact wire-delivery boundary checks room ownership at delivery
+    /// time, so queued messages from a canceled actor room cannot be written
+    /// even when a new actor reuses the same application/room path.
+    fn write_scoped_ui_patch<W: Write>(
+        subscriber: &ScopedUiSubscriber,
+        writer: &mut W,
+        patch: &nulang_ui_protocol::UiHtmlStreamMessage,
+    ) -> std::io::Result<bool> {
+        if !subscriber.still_current() {
+            return Ok(false);
+        }
+        Self::write_ui_sse_event(writer, patch)?;
+        Ok(true)
     }
 
     fn serve_ui_sse(room: &str, stream: &mut TcpStream, shutdown: Arc<AtomicBool>) {
@@ -2302,6 +2511,130 @@ mod tests {
         let public_snapshot = sse_tcp_frame(&mut public);
         assert!(!public_snapshot.contains("private"), "{public_snapshot}");
         drop(public);
+    }
+
+    #[test]
+    fn actor_scoped_ui_mailbox_delivery_cancels_on_exit() {
+        use crate::runtime::{ExitReason, Runtime};
+        use crate::vm::Value;
+        let mut runtime = Runtime::new();
+        let sender = runtime.spawn_actor(Box::new(|| vec![]));
+        let owner = runtime.spawn_actor(Box::new(|| vec![]));
+        runtime
+            .actors
+            .get_mut(&owner)
+            .unwrap()
+            .register_behavior("render", |_actor, _args| {});
+        let verifier: UiStreamAuthorizer =
+            Arc::new(|_request, app, room| app == "billing" && room == "invoices");
+        let server =
+            WebDevServer::bind_with_ui_authorizer(0, None, None, vec![], verifier).unwrap();
+        let publisher = server.scoped_ui_publisher();
+        let binding = publisher
+            .bind_actor(&mut runtime, owner, "billing", "invoices")
+            .expect("alive actor can own private stream");
+        assert!(
+            publisher
+                .bind_actor(&mut runtime, sender, "billing", "invoices")
+                .is_none(),
+            "other actors cannot seize an owned room"
+        );
+        assert!(
+            publisher
+                .bind_actor(&mut runtime, 999999, "billing", "forged")
+                .is_none(),
+            "unknown actors cannot own rooms"
+        );
+
+        let mut client = scoped_tcp_connect(server.port, "billing", "invoices", "");
+        assert!(sse_tcp_frame(&mut client).starts_with("HTTP/1.1 200 OK"));
+        assert!(sse_tcp_frame(&mut client).contains("nulang-ui-snapshot"));
+
+        // The actual Nulang mailbox carries the event across actors.
+        runtime.current_actor = Some(sender);
+        runtime.send_message(owner, "render", &[Value::int(73)]);
+        runtime.current_actor = None;
+        let message = runtime.actors.get_mut(&owner).unwrap().receive().unwrap();
+        assert_eq!(message.sender, sender);
+        assert_eq!(message.payload.as_slice(), &[Value::int(73)]);
+        runtime.current_actor = Some(sender);
+        assert!(!binding.publish(&runtime, sender, "#status", "<p>spoof</p>"));
+        assert!(
+            !publisher.publish("billing", "invoices", "#status", "<p>bypass</p>"),
+            "plain host publisher must not overwrite an actor-owned room"
+        );
+        runtime.current_actor = Some(owner);
+        assert!(binding.publish(&runtime, owner, "#status", "<p>73</p>"));
+        let patch = sse_tcp_frame(&mut client);
+        assert!(patch.contains("event: nulang-ui-patch"), "{patch}");
+        assert!(patch.contains("<p>73</p>"), "{patch}");
+
+        // A different runtime can have the same local numeric actor ID;
+        // its messages must not acquire the original runtime's capability.
+        let mut imposter = Runtime::new();
+        imposter.current_actor = Some(owner);
+        imposter
+            .actors
+            .insert(owner, super::super::Actor::new(owner, "imposter", 8));
+        assert!(!binding.publish(&imposter, owner, "#status", "<p>imposter</p>"));
+        // Hold a real subscriber's patch queue while the actor exits.
+        // The network worker may legally write a patch BEFORE exit, so
+        // exercise the exact post-exit write boundary deterministically.
+        let (_snapshot, paused) =
+            subscribe_scoped_ui(Arc::clone(&publisher.streams), "billing", "invoices")
+                .expect("independent bounded private subscriber");
+        assert!(binding.publish(&runtime, owner, "#status", "<p>queued</p>"));
+        runtime.current_actor = None;
+        runtime.exit_actor(owner, ExitReason::Normal);
+        assert!(!binding.publish(&runtime, owner, "#status", "<p>stale</p>"));
+        let queued = paused.rx.try_recv().expect("queued while actor was alive");
+        assert!(
+            !paused.still_current(),
+            "terminated actor lease is no longer current"
+        );
+        let mut writer = Vec::new();
+        assert!(!WebDevServer::write_scoped_ui_patch(&paused, &mut writer, &queued).unwrap());
+        assert!(
+            writer.is_empty(),
+            "old queued HTML must never cross a canceled room boundary"
+        );
+        assert!(
+            matches!(
+                paused.rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected)
+            ),
+            "actor exit must disconnect its remaining subscribers"
+        );
+        drop(client);
+    }
+
+    #[test]
+    fn actor_scoped_ui_cancel_is_idempotent_and_releases_room() {
+        use crate::runtime::Runtime;
+        let mut runtime = Runtime::new();
+        let actor = runtime.spawn_actor(Box::new(|| vec![]));
+        let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
+        let publisher = server.scoped_ui_publisher();
+        let binding = publisher
+            .bind_actor(&mut runtime, actor, "app", "room")
+            .unwrap();
+        runtime.current_actor = Some(actor);
+        assert!(!binding.publish(&runtime, actor + 1, "#status", "<p>other</p>"));
+        assert!(binding.publish(&runtime, actor, "#status", "<p>one</p>"));
+        binding.cancel();
+        binding.cancel();
+        assert!(!binding.publish(&runtime, actor, "#status", "<p>after</p>"));
+        let replacement = publisher
+            .bind_actor(&mut runtime, actor, "app", "room")
+            .expect("cancellation frees the room");
+        assert!(replacement.publish(&runtime, actor, "#status", "<p>new</p>"));
+        drop(replacement);
+        assert!(
+            publisher
+                .bind_actor(&mut runtime, actor, "app", "room")
+                .is_some(),
+            "dropping a binding must automatically cancel"
+        );
     }
 
     #[test]

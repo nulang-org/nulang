@@ -94,6 +94,9 @@ pub(crate) fn reap_living_actor(rt: &mut Runtime, actor_id: u64, reason: ExitRea
     rt.registry.unregister_by_actor(actor_id);
     rt.process_groups.leave_all(actor_id);
     rt.fabric_unsubscribe_actor(actor_id);
+    // Cut off private actor-owned browser streams during the same exit
+    // protocol as mailbox/Fabric cleanup, including supervisor mass-reaping.
+    rt.cancel_actor_ui_stream_bindings(actor_id);
 
     for watcher_id in monitors {
         send_down_message(rt, watcher_id, actor_id, &reason);
