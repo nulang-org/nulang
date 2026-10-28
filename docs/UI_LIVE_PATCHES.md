@@ -253,3 +253,72 @@ or stream updates. A following integration should consume the manifest in a
 session-authorized server renderer and pair it with the existing action
 contract and verified SSE/HTTP transport. Do not allow a client to select
 arbitrary templates or bind privileged values without server-side policy.
+
+## Scoped server sessions and authoritative input acknowledgement (follow-up)
+
+`nulang::web::ui_live_session::UiLiveSession` binds a compiler-owned template
+to a **single, server-owned** tenant, subject, session, and document. Unlike
+a general public page renderer, its `snapshot` and `commit` methods require
+the host application's trusted authorization callback **on each invocation**.
+
+```rust
+use nulang::web::ui_live_session::{UiLiveSession, UiSessionScope};
+use std::path::Path;
+
+let scope = UiSessionScope::new(
+    trusted_tenant, trusted_subject, trusted_session, "task-list"
+);
+let session = UiLiveSession::open_compiled_manifest(
+    Path::new(".nula/app.ui-templates.json"),
+    "tasks",
+    scope,
+    &trusted_bindings,
+    &|expected| verify_current_request_and_view_permission(expected),
+)?;
+let snapshot = session.snapshot(&|expected| verify_current_request_and_view_permission(expected))?;
+```
+
+`verify_current_request_and_view_permission` represents an application
+function, **not a built-in authentication mechanism**. It must validate the
+current request's actual signed credential (or another trusted, non-forgeable
+identity), session and revocation status, tenant, subject, specific document
+and compiled view name. Never authorize based only on client-supplied
+`document_id`, session IDs, headers, input sequences, or path strings.
+
+`UiLiveSession::commit(&bindings, &inputs, authorize, server_accepted)`:
+
+- Rejects revoked/unauthorized sessions before rendering or publishing.
+- Renders the next authoritative document with a checked revision increment.
+- Diffs against the last document to emit a `RuntimeToHostMessage::Patch`.
+- Checks every proposed input acknowledgement against both the previous and
+  new DOM node, control type, property/value and per-input sequence history.
+- Calls `server_accepted(&inputs)` only after these checks. An acknowledgement
+  is emitted **only when the trusted application handler confirms incorporation
+  of the input into authoritative state**. The application's database write
+  and acceptance check must themselves be transactional and idempotent.
+- Commits the new document, acknowledgement high-water marks and revision
+  together only after successful validation and acceptance. Failed commits do
+  not mutate the UI session.
+- Has a bounded number of tracked input identities and an explicit
+  `revoke()` operation.
+
+The server loader reads at most 1 MiB from the private compiled manifest.
+Authorization happens **before** reading the file. Runtime rendering
+revalidates the tag and attribute allowlist even for deserialized plans.
+
+**Security/deployment boundary:** this coordinator does not start an
+HTTP endpoint, allocate an SSE room, automatically connect a browser,
+create an identity token, or attest server transaction success. Existing
+draft PRs #2367 (signed tenant/SSE authorization) and #2364 (targeted-action
+response concurrency) overlap in the HTTP server. Review their exact-head
+CI and consolidate them before wiring this coordinator to a transport.
+In particular, the currently unprotected legacy `/__nulang/sse/` route
+must not be used for private UI patches. EventSource reconnect must
+reauthorize every subscription, not replay cross-session history.
+
+Focused integration tests in `tests/web_ui_live_session.rs` cover the
+full compiler template → server session snapshot → ordered patch → Rust
+host reducer path, denied/revoked access, failed renders, input acceptance
+and replay rejection, private manifest loading, malformed/oversized
+artifacts and corrupted template content. Browser reconciliation is tested
+separately by the Chromium suite.

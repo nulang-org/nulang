@@ -324,11 +324,19 @@ fn render_element(
         ));
     }
     *remaining -= 1;
+    // Plans on disk can be stale or tampered with. Revalidate the tag and
+    // attribute allowlist at render time, not just at compile time.
+    if !allowed_tag(&template.kind) {
+        return Err(TemplateError::UnsupportedExpression);
+    }
     let mut node = KeyedNode::new(template.kind.clone());
     if let Some(key) = &template.key {
         node = node.with_key(into_string(resolve_value(key, env)?)?);
     }
     for (name, expr) in &template.attrs {
+        if !allowed_attr(name) {
+            return Err(TemplateError::UnsupportedAttribute(name.clone()));
+        }
         let value = resolve_value(expr, env)?;
         if matches!(name.as_str(), "href" | "src") {
             let WireValue::String(ref text) = value else {
@@ -589,6 +597,31 @@ fn view() -> Html { <a key={entry.id} href={entry.url}>{entry.title}</a> }
         assert!(matches!(
             plan.render("doc", Revision(1), &bad),
             Err(TemplateError::InvalidValue(_))
+        ));
+    }
+
+    #[test]
+    fn deserialized_plan_cannot_bypass_tag_and_attribute_allowlist() {
+        let module = parse(
+            r#"
+import stdlib::web::types
+fn view() -> Html { <div>Hello</div> }
+"#,
+        );
+        let mut plan = UiTemplate::compile(&module, "view").unwrap();
+        plan.root.kind = "script".into();
+        assert!(matches!(
+            plan.render("doc", Revision(1), &BTreeMap::new()),
+            Err(TemplateError::UnsupportedExpression)
+        ));
+        plan.root.kind = "div".into();
+        plan.root.attrs.insert(
+            "onclick".into(),
+            ValueExpr::Literal(WireValue::from("alert(1)")),
+        );
+        assert!(matches!(
+            plan.render("doc", Revision(1), &BTreeMap::new()),
+            Err(TemplateError::UnsupportedAttribute(_))
         ));
     }
 
