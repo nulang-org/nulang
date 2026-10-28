@@ -339,29 +339,29 @@ f(10).1              // → 11
 
 Stdlib `list` functions fall into two categories:
 
-- **Polymorphic** (no `[Int]` annotation): `map`, `filter`, `reverse`,
-  `take`, `drop`, `range` — work with any element type (strings,
-  records, tuples, etc.).
+- **Polymorphic**: `length`, `contains`, `index_of`, `find`,
+  `any`, `all`, `map`, `filter`, `filter_map`, `flat_map`,
+  `partition`, `fold`, `reverse`, `take`, `drop`, and `range`
+  accept compatible element and accumulator types.
 
-- **Int-only** (annotated `[Int]`): `length`, `sum`, `contains`,
-  `index_of`, `find`, `any`, `all`, `fold`, `max_of`, `min_of`,
-  `sort`, `append`, `zip`, `enumerate` — produce a type error when
-  passed non-Int arrays.
+- **Int-only** (annotated `[Int]`): `sum`, `max_of`, `min_of`,
+  `sort`, `append`, `zip`, `enumerate`, and `uniq`
+  require integer arrays.
 
 ```nula
 import stdlib::list
 
-// ❌ length expects [Int]
-let n = length(["x", "y", "z"])
-// Error: Type mismatch: expected Int, found String
+// ✅ length, fold, map, and filter work with strings and records
+let n = length(["x", "y", "z"]) // 3
+let joined = fold(fn(acc, s) { acc + s }, "hello", ["world"])
+let excited = map(fn(s) { s + "!" }, ["a", "b", "c"])
+let pos = filter(fn(r) { r.x > 0 }, [{x: 1}, {x: -1}, {x: 2}])
 
-// ❌ fold expects init: Int, xs: [Int]
-let r = fold(fn(acc, s) { acc + " " + s }, "hello", ["world"])
-// Error: Type mismatch: expected Int, found String
-
-// ✅ polymorphic functions work with any type
-let excited = map(fn(s) { s + "!" }, ["a", "b", "c"])  // ["a!", "b!", "c!"]
-let pos = filter(fn(r) { r.x > 0 }, [{x: 1}, {x: -1}, {x: 2}])  // [{x:1}, {x:2}]
+// ✅ filter_map eliminates a separate map/filter pass
+let evens = filter_map(
+    fn(x) { if x % 2 == 0 then Some(x * 10) else None },
+    [1, 2, 3, 4]
+)
 ```
 
 ---

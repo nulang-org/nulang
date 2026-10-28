@@ -1,0 +1,5 @@
+{
+  "exit_code": 0,
+  "stdout": "filter_map_len=2\nfilter_map_first=even\nfilter_map_last=even\nfilter_map_none=0\nfilter_map_empty=0\nflat_map_len=6\nflat_map_first=1\nflat_map_middle=20\nflat_map_last=30\nflat_map_empty=0\npartition_yes=2\npartition_no=3\npartition_yes_first=2\npartition_no_last=5\npartition_empty=0\nfold_string=Nulang\nfold_mixed=12\nfold_empty=seed",
+  "stderr": ""
+}
