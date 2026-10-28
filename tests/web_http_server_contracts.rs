@@ -488,3 +488,109 @@ fn register() { perform Web.route_json("GET", "/api", endpoint) }
     );
     assert_eq!(response_body(&response), r#"{"ok":true}"#);
 }
+
+fn typed_record_json_route() -> RuntimeWebRoute {
+    let source = r#"
+type CreateUser = { name: String, age: Int }
+fn create_user(input: CreateUser from json) -> String { input.name }
+fn register() { perform Web.route("POST", "/users", create_user) }
+"#;
+    let (module, function_index) = compile_handler(source, "create_user");
+    let ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_module()
+        .unwrap();
+    let compilation = compile_module_contracts(&ast);
+    assert!(
+        compilation.diagnostics.is_empty(),
+        "{:?}",
+        compilation.diagnostics
+    );
+    let plan =
+        compile_runtime_route_plan(&compilation.routes[0]).expect("compile JSON record binding");
+    RuntimeWebRoute {
+        route: WebRoute {
+            method: HttpMethod::Post,
+            path: "/users".to_string(),
+            handler_module: module,
+            handler_func_idx: function_index,
+        },
+        plan: Some(plan),
+    }
+}
+
+#[test]
+fn typed_json_record_is_materialized_for_real_vm_handler() {
+    let server = WebDevServer::bind_runtime(0, None, None, vec![typed_record_json_route()])
+        .expect("bind record route");
+    let body = r#"{"name":"Ada","age":42}"#;
+    let request = format!(
+        "POST /users HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(), body
+    );
+    let response = send_raw_request(server.port, &request);
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert_eq!(response_body(&response), "Ada");
+}
+
+#[test]
+fn typed_json_record_rejects_missing_wrong_typed_and_extra_fields() {
+    let server = WebDevServer::bind_runtime(0, None, None, vec![typed_record_json_route()])
+        .expect("bind record route");
+    for body in [
+        r#"{"name":"Ada"}"#,
+        r#"{"name":123,"age":42}"#,
+        r#"{"name":"Ada","age":"42"}"#,
+        r#"{"name":"Ada","age":42,"is_admin":true}"#,
+        r#"["Ada",42]"#,
+        r#"{"name":"Ada","age":42,"age":30}"#,
+    ] {
+        let request = format!(
+            "POST /users HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(), body
+        );
+        let response = send_raw_request(server.port, &request);
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "body={body}, response={response}"
+        );
+        assert!(response.contains("application/problem+json"), "{response}");
+    }
+}
+
+#[test]
+fn typed_record_json_respects_non_declaration_field_ids() {
+    let source = r#"
+type CreateUser = { name: String, age: Int }
+fn age_only(input: CreateUser from json) -> Int { input.age }
+fn register() { perform Web.route("POST", "/age", age_only) }
+"#;
+    let (module, index) = compile_handler(source, "age_only");
+    let ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_module()
+        .unwrap();
+    let compilation = compile_module_contracts(&ast);
+    let plan = compile_runtime_route_plan(&compilation.routes[0]).unwrap();
+    let server = WebDevServer::bind_runtime(
+        0,
+        None,
+        None,
+        vec![RuntimeWebRoute {
+            route: WebRoute {
+                method: HttpMethod::Post,
+                path: "/age".into(),
+                handler_module: module,
+                handler_func_idx: index,
+            },
+            plan: Some(plan),
+        }],
+    )
+    .unwrap();
+    let body = r#"{"name":"Ada","age":42}"#;
+    let request = format!(
+        "POST /age HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(), body
+    );
+    let response = send_raw_request(server.port, &request);
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert_eq!(response_body(&response), "42");
+}

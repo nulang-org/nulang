@@ -285,6 +285,9 @@ fn compile_segments(
 pub struct BoundRouteArgument {
     pub handler_index: usize,
     pub value: Constant,
+    /// Typed JSON record values are injected as VM records, never as a
+    /// string pretending to satisfy a source-level record type.
+    pub record_fields: Option<Vec<(String, Constant)>>,
 }
 
 /// Convert captured path values into a complete handler argument vector.
@@ -340,6 +343,7 @@ pub fn bind_path_arguments(
         slots[binding.handler_index] = Some(BoundRouteArgument {
             handler_index: binding.handler_index,
             value,
+            record_fields: None,
         });
     }
 

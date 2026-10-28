@@ -277,6 +277,20 @@ fn binding_source_name(source: RouteBindingSource) -> &'static str {
 }
 
 fn schema_for_type(ty: Option<&str>) -> Value {
+    if let Some(fields) = ty.and_then(crate::web::json_records::parse_flat_record_type) {
+        let mut properties = Map::new();
+        let mut required = Vec::new();
+        for (name, field_type) in fields {
+            properties.insert(name.clone(), schema_for_type(Some(&field_type)));
+            required.push(name);
+        }
+        return json!({
+            "type": "object",
+            "properties": Value::Object(properties),
+            "required": required,
+            "additionalProperties": false,
+        });
+    }
     match ty.map(str::trim) {
         Some("Int") => json!({ "type": "integer", "format": "int64" }),
         Some("Float") => json!({ "type": "number", "format": "double" }),
@@ -440,6 +454,38 @@ mod tests {
     fn raw_body_does_not_invent_an_openapi_media_type() {
         let body = binding(RouteBindingSource::Body, "body", "Payload");
         assert!(form_request_body(&[body]).is_none());
+    }
+
+    #[test]
+    fn json_record_body_emits_exact_object_schema() {
+        let mut contract = route();
+        contract.path = "/users".into();
+        contract.method = "POST".into();
+        contract.params.clear();
+        contract.handler_params = vec![HandlerParamContract {
+            name: "input".into(),
+            ty: Some("{ name: String, age: Int }".into()),
+            capability: None,
+            request: Some(crate::web::contracts::RequestParamBindingContract {
+                source: RouteBindingSource::Json,
+                source_name: "body".into(),
+            }),
+        }];
+        let document = generate_openapi(
+            &ContractCompilation {
+                routes: vec![contract],
+                diagnostics: vec![],
+            },
+            "Test",
+            "1.0",
+        );
+        let schema = &document["paths"]["/users"]["post"]["requestBody"]["content"]
+            ["application/json"]["schema"];
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["name"]["type"], "string");
+        assert_eq!(schema["properties"]["age"]["type"], "integer");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"].as_array().unwrap().len(), 2);
     }
 
     #[test]

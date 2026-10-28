@@ -729,6 +729,10 @@ pub struct CodeModule {
     /// server. Includes actor behaviors (compiled as functions).
     #[serde(default)]
     pub debug_functions: Vec<DebugFunctionInfo>,
+    /// Module-wide bytecode record-slot names, in field ID order. Used by
+    /// typed HTTP record injection; preserves RecL/RecS positional semantics.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub record_field_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub export_table: Vec<ExportTableEntry>,
     /// Exact bytecode effect-opcode PC -> compiler-owned semantic site ID.
@@ -760,6 +764,7 @@ impl CodeModule {
             tools: Vec::new(),
             line_table: Vec::new(),
             debug_functions: Vec::new(),
+            record_field_names: Vec::new(),
             export_table: Vec::new(),
             effect_sites: Vec::new(),
         }

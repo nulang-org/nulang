@@ -202,7 +202,20 @@ pub fn bind_request_arguments(
                 ),
             )
         })?;
-        let value = (if binding.source == RouteBindingSource::Json {
+        let record_fields = if binding.source == RouteBindingSource::Json {
+            binding
+                .ty
+                .as_deref()
+                .and_then(crate::web::json_records::parse_flat_record_type)
+                .map(|fields| crate::web::json_records::decode_flat_record(raw, &fields))
+                .transpose()
+                .map_err(|message| error(binding, RequestDecodeErrorKind::InvalidType, message))?
+        } else {
+            None
+        };
+        let value = (if record_fields.is_some() {
+            Ok(Constant::Nil)
+        } else if binding.source == RouteBindingSource::Json {
             decode_json_scalar_constant(raw, binding.ty.as_deref())
         } else {
             decode_scalar_constant(raw, binding.ty.as_deref())
@@ -222,6 +235,7 @@ pub fn bind_request_arguments(
         slots[binding.handler_index] = Some(BoundRouteArgument {
             handler_index: binding.handler_index,
             value,
+            record_fields,
         });
     }
 
