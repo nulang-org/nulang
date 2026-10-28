@@ -87,6 +87,16 @@ foreign keys, and consecutive request isolation.
   open an arbitrary production SQL pool. Production authorization, CSRF
   handling, revocation, credential/TLS lifecycle, transaction-to-HTTP failure
   semantics and user-facing Web route binding remain separately blocked.
+- **Server-controlled verification key rollover:**
+  `PinnedEd25519KeyRing` holds at most 16 uniquely identified, server-pinned
+  Ed25519 public keys with a shared fail-closed revocation policy. It rejects
+  duplicate, malformed and unknown `kid` values, unsigned/alternate-algorithm
+  tokens and token-supplied key URLs. Overlapping old/new keys can validate
+  during a deliberate rotation window; replacing the immutable server trust
+  bundle without the old key immediately rejects its tokens. This is a
+  **testable trust configuration contract, not production JWKS discovery,
+  distribution, key management, automatic refresh or emergency rotation**.
+  CI runs `tests/tenant_jwt_keyring.rs` as a separate regression suite.
 - **Durable revocation reference:** `web::tenant_pg_revocation_reference::DisposablePostgresRevocation`
   checks a protected PostgreSQL `revoked_tokens(issuer,subject,jti)` table
   using a separate SELECT-only login on every token verification. Revoking a

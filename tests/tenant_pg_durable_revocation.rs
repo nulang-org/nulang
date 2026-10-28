@@ -265,3 +265,59 @@ fn live_loopback_http_denies_after_durable_token_revocation() {
     let restored = get(&bob);
     assert!(restored.starts_with("HTTP/1.1 200 OK"), "{restored}");
 }
+
+#[test]
+fn staged_pinned_key_rotation_respects_persisted_postgres_revocation() {
+    use nulang::web::tenant_jwt_reference::PinnedEd25519KeyRing;
+
+    let old = signed("alice", "rotate-old-jti");
+    let new_signer = SigningKey::from_bytes(&[72u8; 32]); // test fixture only
+    let t = now_for_rotation_test();
+    let header = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({
+            "alg":"EdDSA","kid":"new-key","typ":"at+jwt"
+        }))
+        .unwrap(),
+    );
+    let claims = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({
+            "iss":"issuer-a","sub":"alice","aud":"nulang-tenant-api",
+            "exp":t+120,"iat":t-2,"nbf":t-2,"jti":"rotate-new-jti"
+        }))
+        .unwrap(),
+    );
+    let input = format!("{header}.{claims}");
+    let newer = format!(
+        "{input}.{}",
+        URL_SAFE_NO_PAD.encode(new_signer.sign(input.as_bytes()).to_bytes())
+    );
+
+    let build = |include_old| {
+        let mut keys = vec![("new-key".into(), new_signer.verifying_key())];
+        if include_old {
+            keys.push(("revocation-test-key".into(), signer().verifying_key()));
+        }
+        PinnedEd25519KeyRing::new("issuer-a", "nulang-tenant-api", keys, revocations()).unwrap()
+    };
+    let overlapping = build(true);
+    assert_eq!(overlapping.verify(&old), Some("issuer-a|alice".into()));
+    assert_eq!(overlapping.verify(&newer), Some("issuer-a|alice".into()));
+    privileged_sql("INSERT INTO tenant_example_private.revoked_tokens(issuer,subject,jti) VALUES ('issuer-a','alice','rotate-old-jti')");
+    assert_eq!(overlapping.verify(&old), None);
+    assert_eq!(overlapping.verify(&newer), Some("issuer-a|alice".into()));
+    let retired = build(false);
+    assert_eq!(retired.verify(&old), None);
+    assert_eq!(retired.verify(&newer), Some("issuer-a|alice".into()));
+    privileged_sql("INSERT INTO tenant_example_private.revoked_tokens(issuer,subject,jti) VALUES ('issuer-a','alice','rotate-new-jti')");
+    assert_eq!(retired.verify(&newer), None);
+}
+
+fn now_for_rotation_test() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
+}
