@@ -1,6 +1,7 @@
 """Guard the GitHub Actions CI admission and validation contract."""
 
 import pathlib
+import re
 import unittest
 
 
@@ -8,22 +9,13 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKFLOW_DIR = ROOT / ".github" / "workflows"
 CI = WORKFLOW_DIR / "ci.yml"
 RELEASE = WORKFLOW_DIR / "release.yml"
-PR_WORKFLOWS = (
-    "actor-density-ab.yml",
-    "capacity.yml",
-    "changelog.yml",
-    "ci.yml",
-    "cluster-gossip-throttle-pr.yml",
-    "codeql.yml",
-    "cross-runtime-bench.yml",
-    "jit-codegen-bench.yml",
-    "nulang-ab-bench.yml",
-    "pr-title.yml",
-    "release.yml",
-    "remote-rtt-stage-profile-pr.yml",
-    "shard-scaling-bench.yml",
-    "vscode-extension.yml",
-)
+def pull_request_workflows():
+    """Discover every PR workflow so newly added expensive lanes cannot evade admission."""
+    return sorted(
+        path for path in WORKFLOW_DIR.iterdir()
+        if path.suffix in {".yaml", ".yml"}
+        and re.search(r"^  pull_request\s*:", path.read_text(encoding="utf-8"), re.MULTILINE)
+    )
 
 
 class GitHubActionsCIContractTests(unittest.TestCase):
@@ -60,8 +52,9 @@ class GitHubActionsCIContractTests(unittest.TestCase):
                 self.assertIn(command, source)
 
     def test_pull_request_workflows_skip_drafts_and_resume_when_ready(self):
-        for filename in PR_WORKFLOWS:
-            source = (WORKFLOW_DIR / filename).read_text(encoding="utf-8")
+        for workflow in pull_request_workflows():
+            filename = workflow.name
+            source = workflow.read_text(encoding="utf-8")
             with self.subTest(workflow=filename):
                 self.assertIn("ready_for_review", source)
                 self.assertIn("converted_to_draft", source)

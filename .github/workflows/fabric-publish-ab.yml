@@ -1,0 +1,58 @@
+name: Fabric publication exact-base A/B
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+    paths:
+      - '.github/workflows/fabric-publish-ab.yml'
+      - 'scripts/fabric_publish_ab_bench.py'
+      - 'scripts/tests/test_fabric_publish_ab_bench.py'
+      - 'benches/actor_bench.rs'
+      - 'src/runtime/distributed_context.rs'
+
+concurrency:
+  group: fabric-publish-ab-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  paired:
+    if: github.event.pull_request.draft == false
+    name: Matched-fixture Fabric A/B
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify harness contracts
+        run: python3 -m unittest scripts/tests/test_fabric_publish_ab_bench.py
+
+      - name: Compare exact-base same-host Criterion samples
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python3 scripts/fabric_publish_ab_bench.py \
+            --base-ref "$BASE_SHA" --runs 8 --warmup 1 \
+            --output fabric-publish-ab.json
+
+      - name: Publish measurement and provenance
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          report = json.loads(Path("fabric-publish-ab.json").read_text())
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("## Exact-base sparse Fabric A/B\n\n")
+              f.write(f"Base: `{report['base_sha']}` · Candidate: `{report['candidate_sha']}`\n\n")
+              f.write("| Idle actors | Base ns | Candidate ns | Paired speedup |\n")
+              f.write("| ---: | ---: | ---: | ---: |\n")
+              for count, row in report["comparison"].items():
+                  f.write(f"| {count} | {row['median_base_ns']:.1f} | {row['median_candidate_ns']:.1f} | {row['median_speedup_x']:.3f}x |\n")
+              f.write("\nCriterion group: unmatched publication; does not measure real delivery.\n")
+          PY
