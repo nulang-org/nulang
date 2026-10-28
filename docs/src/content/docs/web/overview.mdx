@@ -299,12 +299,25 @@ failed, or redirected GET responses leave the displayed regions unchanged.
 
 The latest submission wins across all claimed regions, including when two
 different actions both revalidate the same summary. Fetch cancellation is
-best-effort and cannot roll back server-side mutations. This is **explicit
-DOM-region revalidation**, not automatic typed loader dependency inference:
-Web Contract IR does not yet validate these region names or derive database
-read dependencies. To avoid redundant work, declare only regions that actually
-depend on the mutated data. An application must still enforce idempotency,
-authorization, and transactional consistency on the server.
+best-effort and cannot roll back server-side mutations.
+
+For **compiler-validated loader identities**, declare `[[web.loaders]]` and
+`[[web.mutations]]` in `Nulang.toml` (see the
+[Web Contract IR](https://github.com/nulang-org/nulang/blob/main/docs/WEB_CONTRACT_IR.md)
+design). Each named loader is associated with a typed `GET` route, a DOM ID,
+and developer-declared data dependency names. A typed `POST` route lists the
+dependencies it invalidates. Compilation checks the route types, IDs,
+dependencies, and maximum target count, and embeds the resulting mapping in
+the existing `app.client.js`. With that mapping, the form can **omit**
+`data-nulang-revalidate`: only its `data-nulang-target` is needed, and the
+compiled mutation contract selects related regions. If the form still names
+explicit targets, those must be within its compiled allowed set. Packages
+without this optional configuration retain their existing manual behavior.
+
+This is not automatic database dependency inference or a typed function
+reference: read/invalidation identities are explicitly declared. The
+application must still enforce idempotency, authorization, CSRF protection,
+and transactional consistency on the server.
 
 See [examples/patch-web](https://github.com/nulang-org/nulang/tree/main/examples/patch-web)
 for a standalone sample. Run `nulang nula dev` from that directory.

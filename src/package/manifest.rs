@@ -44,6 +44,8 @@ impl Default for WebSection {
             port: default_web_port(),
             static_dir: default_static_dir(),
             output_dir: default_output_dir(),
+            loaders: Vec::new(),
+            mutations: Vec::new(),
         }
     }
 }
@@ -98,6 +100,28 @@ pub struct WebSection {
     /// Directory where `nula build --web` emits the static site.
     #[serde(default = "default_output_dir")]
     pub output_dir: String,
+    /// Explicit GET loader identities, DOM targets, and data dependency keys.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loaders: Vec<WebLoaderSection>,
+    /// Explicit POST mutation dependency invalidations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mutations: Vec<WebMutationSection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct WebLoaderSection {
+    pub id: String,
+    pub path: String,
+    pub target: String,
+    #[serde(default)]
+    pub reads: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct WebMutationSection {
+    pub path: String,
+    #[serde(default)]
+    pub invalidates: Vec<String>,
 }
 
 fn default_web_port() -> u16 {
@@ -301,6 +325,31 @@ mod tests {
         assert_eq!(manifest.web.port, 8080);
         assert_eq!(manifest.web.static_dir, "static");
         assert_eq!(manifest.web.output_dir, "dist");
+    }
+
+    #[test]
+    fn web_loader_and_mutation_manifest_round_trip() {
+        let source = r##"
+            [package]
+            name = "loader-demo"
+            version = "0.1.0"
+
+            [[web.loaders]]
+            id = "task_summary"
+            path = "/tasks"
+            target = "#summary"
+            reads = ["tasks", "notifications"]
+
+            [[web.mutations]]
+            path = "/tasks"
+            invalidates = ["tasks"]
+        "##;
+        let manifest = Manifest::parse(source).unwrap();
+        assert_eq!(manifest.web.loaders.len(), 1);
+        assert_eq!(manifest.web.loaders[0].id, "task_summary");
+        assert_eq!(manifest.web.mutations[0].invalidates, vec!["tasks"]);
+        let round_trip = Manifest::parse(&manifest.to_toml().unwrap()).unwrap();
+        assert_eq!(manifest, round_trip);
     }
 
     #[test]

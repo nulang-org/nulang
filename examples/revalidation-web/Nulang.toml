@@ -1,0 +1,17 @@
+[package]
+name = "revalidation-web"
+version = "0.1.0"
+entry = "src/main.nula"
+
+[web]
+port = 8080
+
+[[web.loaders]]
+id = "message_summary"
+path = "/"
+target = "#summary"
+reads = ["message"]
+
+[[web.mutations]]
+path = "/"
+invalidates = ["message"]
