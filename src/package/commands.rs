@@ -2190,6 +2190,23 @@ struct DeployResponse {
     status: String,
 }
 
+/// A build that uses development-only auth is never a production deployment,
+/// even when a cloud adapter or dry-run would otherwise accept the package.
+fn validate_deploy_security(root: &Path, manifest: &Manifest) -> NuResult<()> {
+    let example_dependency = manifest
+        .dependencies
+        .keys()
+        .any(|name| name == "nulang-auth" || name == "@nulang/auth");
+    let example_import = crate::web::ir::source_tree_uses_development_auth(&root.join("src"));
+    if example_dependency || example_import {
+        return Err(NuError::PackageError {
+            msg: "@nulang/auth is development-only: it lacks verified identity and production session/tenant authorization. Configure an audited identity and authorization provider before deploying.".to_string(),
+            span: Span::default(),
+        });
+    }
+    Ok(())
+}
+
 /// `nula deploy [--wasm] [--url <url>] [--token <token>] [--adapter <kind>] [--dry-run]`
 /// — build and deploy the current package to Nulang Cloud or another adapter.
 #[cfg(feature = "ureq")]
@@ -2214,6 +2231,9 @@ fn cmd_deploy(
     })?;
     let name = manifest.package.name.clone();
     let version = manifest.package.version.clone();
+
+    // Enforce for all adapters, including --dry-run, before building artifacts.
+    validate_deploy_security(&root, &manifest)?;
 
     // Build the web output so dist/ contains the IR and static assets.
     cmd_build_web()?;
@@ -2606,6 +2626,74 @@ fn cmd_remove(name: Option<&str>) -> NuResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_deploy_rejects_development_auth_in_imports_and_dependencies() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_web_deploy_security_{}_{}",
+            std::process::id(),
+            std::thread::current()
+                .name()
+                .unwrap_or("test")
+                .replace(':', "_")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        scaffold_package(&dir, "demo-auth", "web").expect("web scaffold");
+        let manifest = Manifest::load(&dir).expect("manifest");
+        assert!(validate_deploy_security(&dir, &manifest).is_ok());
+
+        let main = dir.join("src/main.nula");
+        let original = std::fs::read_to_string(&main).unwrap();
+        std::fs::write(&main, format!("import @nulang/auth\n{original}")).unwrap();
+        assert!(validate_deploy_security(&dir, &manifest)
+            .unwrap_err()
+            .to_string()
+            .contains("development-only"));
+        // Verify the real CLI denies even dry runs before artifact generation.
+        #[cfg(feature = "ureq")]
+        {
+            let _guard = ChangeDir::new(&dir);
+            let err = cmd_deploy(
+                false,
+                None,
+                None,
+                crate::web::adapters::AdapterKind::NulangCloud,
+                true,
+            )
+            .expect_err("dry-run deploy must not bypass auth gate");
+            assert!(err.to_string().contains("development-only"));
+        }
+
+        std::fs::write(&main, format!("// import @nulang/auth\n{original}")).unwrap();
+        assert!(
+            validate_deploy_security(&dir, &manifest).is_ok(),
+            "comments must not be treated as security dependency"
+        );
+
+        std::fs::write(&main, original).unwrap();
+        let manifest_path = dir.join("Nulang.toml");
+        let text = std::fs::read_to_string(&manifest_path).unwrap();
+        assert!(
+            text.contains("[dependencies]"),
+            "web scaffold needs dependency section"
+        );
+        std::fs::write(
+            &manifest_path,
+            text.replacen(
+                "[dependencies]",
+                "[dependencies]\nnulang-auth = \"0.1.0\"",
+                1,
+            ),
+        )
+        .unwrap();
+        let declared = Manifest::load(&dir).unwrap();
+        assert!(validate_deploy_security(&dir, &declared)
+            .unwrap_err()
+            .to_string()
+            .contains("development-only"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn test_manifest_language_pin() {
