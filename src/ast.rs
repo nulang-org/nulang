@@ -569,6 +569,9 @@ pub enum FunctionAnnotation {
     /// `@web_policy(body_max_bytes: "N")` — compile-time limit that the
     /// compiler-attached HTTP runtime enforces before invoking the handler.
     WebPolicy { body_max_bytes: usize },
+    /// Required server-authorized permission (not a Nulang reference cap).
+    /// Repeated declarations are conjunctive.
+    WebRequiredCapability { name: String },
     /// Contextual parameter syntax such as `limit: Int from query`.
     RequestBinding {
         param: String,

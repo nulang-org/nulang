@@ -244,6 +244,7 @@ mod tests {
             direct_call: false,
             response_kind: crate::web::response::ResponseKind::Html,
             body_max_bytes: None,
+            required_capabilities: Vec::new(),
         }
     }
 

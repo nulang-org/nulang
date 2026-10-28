@@ -142,6 +142,14 @@ fn operation_for(route: &RouteContract) -> Value {
     if let Some(bytes) = route.body_max_bytes {
         operation.insert("x-nulang-body-max-bytes".into(), json!(bytes));
     }
+    if !route.required_capabilities.is_empty() {
+        // No OpenAPI security scheme is invented: credential verification is
+        // delegated to a server-installed authorizer, not an implicit header.
+        operation.insert(
+            "x-nulang-required-capabilities".into(),
+            json!(route.required_capabilities),
+        );
+    }
 
     if !binding_compilation.bindings.is_empty() {
         operation.insert(
@@ -359,6 +367,7 @@ mod tests {
             reference_capability: None,
             placement: Some("server".to_string()),
             body_max_bytes: None,
+            required_capabilities: Vec::new(),
         }
     }
 
@@ -404,6 +413,26 @@ mod tests {
                 "missing {mime} for {ty}"
             );
         }
+    }
+
+    #[test]
+    fn required_capabilities_are_visible_without_inventing_credential_scheme() {
+        let mut contract = route();
+        contract.required_capabilities = vec!["inventory.read".into(), "tenant.verified".into()];
+        let doc = generate_openapi(
+            &ContractCompilation {
+                routes: vec![contract],
+                diagnostics: vec![],
+            },
+            "API",
+            "1",
+        );
+        let operation = &doc["paths"]["/users/{id}"]["get"];
+        assert_eq!(
+            operation["x-nulang-required-capabilities"],
+            serde_json::json!(["inventory.read", "tenant.verified"])
+        );
+        assert!(operation.get("security").is_none());
     }
 
     #[test]

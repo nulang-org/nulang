@@ -72,6 +72,13 @@ pub struct HttpRequest {
     pub body: Vec<u8>,
 }
 
+/// Trusted, host-installed callback that verifies caller authority for a Web
+/// permission. `HttpRequest` headers/cookies are untrusted inputs: the callback
+/// MUST authenticate credentials before granting anything. No callback means
+/// all protected routes deny. Avoid trusting X-Capability-like client headers.
+/// A panic inside the callback also denies the request.
+pub type WebCapabilityAuthorizer = dyn Fn(&HttpRequest, &str) -> bool + Send + Sync + 'static;
+
 pub struct HttpResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -922,6 +929,35 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
     ) -> std::io::Result<Self> {
+        Self::bind_runtime_with_optional_authorizer(port, static_dir, output_dir, routes, None)
+    }
+
+    /// Install a trusted, per-request permission verifier for annotated routes.
+    /// All required permissions must pass; missing or panicking providers deny.
+    /// Verification of credentials and tenant identity remains the host's job.
+    pub fn bind_runtime_with_authorizer(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        authorizer: Arc<WebCapabilityAuthorizer>,
+    ) -> std::io::Result<Self> {
+        Self::bind_runtime_with_optional_authorizer(
+            port,
+            static_dir,
+            output_dir,
+            routes,
+            Some(authorizer),
+        )
+    }
+
+    fn bind_runtime_with_optional_authorizer(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        authorizer: Option<Arc<WebCapabilityAuthorizer>>,
+    ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(("0.0.0.0", port))?;
         let actual_port = listener.local_addr()?.port();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -939,6 +975,7 @@ impl WebDevServer {
                     output_dir_clone,
                     routes_clone,
                     shutdown_clone,
+                    authorizer,
                 );
             })?;
 
@@ -955,6 +992,7 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
         shutdown: Arc<AtomicBool>,
+        authorizer: Option<Arc<WebCapabilityAuthorizer>>,
     ) {
         listener.set_nonblocking(true).ok();
         let slots = Arc::new(ConnectionSlots::new(Self::MAX_CONCURRENT_CONNECTIONS));
@@ -987,13 +1025,14 @@ impl WebDevServer {
                     let output_dir = output_dir.clone();
                     let routes = Arc::clone(&routes);
                     let shutdown = Arc::clone(&shutdown);
+                    let authorizer = authorizer.clone();
                     // A failed spawn drops the closure and lease, returning capacity.
                     if let Err(error) = std::thread::Builder::new()
                         .name("nulang-web-dev-connection".into())
                         .spawn(move || {
                             let _lease = lease;
                             Self::handle_connection(
-                                stream, static_dir, output_dir, routes, shutdown,
+                                stream, static_dir, output_dir, routes, shutdown, authorizer,
                             );
                         })
                     {
@@ -1014,6 +1053,7 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Arc<Vec<RuntimeWebRoute>>,
         shutdown: Arc<AtomicBool>,
+        authorizer: Option<Arc<WebCapabilityAuthorizer>>,
     ) {
         let request = match read_http_request(&mut stream) {
             Ok(Some(request)) => request,
@@ -1036,78 +1076,107 @@ impl WebDevServer {
                 crate::web::dispatch::match_route(r, &request.path).map(|params| (r, params))
             })
         {
-            // Compiler-attached endpoint policy runs before request binding,
-            // user code and response-cookie effects. Legacy routes have no
-            // policy metadata and retain their existing behavior.
-            if route
+            let required = route
                 .plan
                 .as_ref()
-                .and_then(|plan| plan.body_max_bytes)
-                .is_some_and(|max_bytes| request.body.len() > max_bytes)
+                .map(|plan| plan.required_capabilities.as_slice())
+                .unwrap_or_default();
+            // Authorization is an explicit server-side gate. An unconfigured
+            // authorizer cannot grant access, regardless of request headers.
+            // Each declared permission is required (logical AND).
+            if !required.is_empty()
+                && !required.iter().all(|permission| {
+                    authorizer.as_ref().is_some_and(|verify| {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            verify(&request, permission)
+                        }))
+                        .unwrap_or(false)
+                    })
+                })
             {
                 HttpResponse {
-                    status: 413,
-                    headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
-                    body: b"Payload too large".to_vec(),
+                    status: 403,
+                    headers: vec![
+                        ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+                        ("Cache-Control".into(), "no-store".into()),
+                    ],
+                    body: b"Forbidden".to_vec(),
                 }
             } else {
-                let captured = HttpRequestBindingInputs::capture(
-                    &request.path,
-                    &request.headers,
-                    &request.body,
-                );
-                if let Some(response) = invalid_ui_action_response(&captured) {
-                    response
+                // Compiler-attached endpoint policy runs before request binding,
+                // user code and response-cookie effects. Legacy routes have no
+                // policy metadata and retain their existing behavior.
+                if route
+                    .plan
+                    .as_ref()
+                    .and_then(|plan| plan.body_max_bytes)
+                    .is_some_and(|max_bytes| request.body.len() > max_bytes)
+                {
+                    HttpResponse {
+                        status: 413,
+                        headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+                        body: b"Payload too large".to_vec(),
+                    }
                 } else {
-                    let values = captured.values(&params, &request.headers);
-                    let ctx = RequestContext {
-                        request: request.clone(),
-                        params: params.clone(),
-                    };
-                    let rendered =
-                        with_request_context(ctx, || match render_direct_request(route, &values) {
-                            Ok(Some(rendered)) => Ok(Some(rendered)),
-                            Ok(None) => Ok(render_route_handler(
-                                &route.route.handler_module,
-                                route.route.handler_func_idx,
-                                None,
-                            )),
-                            Err(error) => Err(error),
+                    let captured = HttpRequestBindingInputs::capture(
+                        &request.path,
+                        &request.headers,
+                        &request.body,
+                    );
+                    if let Some(response) = invalid_ui_action_response(&captured) {
+                        response
+                    } else {
+                        let values = captured.values(&params, &request.headers);
+                        let ctx = RequestContext {
+                            request: request.clone(),
+                            params: params.clone(),
+                        };
+                        let rendered = with_request_context(ctx, || {
+                            match render_direct_request(route, &values) {
+                                Ok(Some(rendered)) => Ok(Some(rendered)),
+                                Ok(None) => Ok(render_route_handler(
+                                    &route.route.handler_module,
+                                    route.route.handler_func_idx,
+                                    None,
+                                )),
+                                Err(error) => Err(error),
+                            }
                         });
-                    match rendered {
-                        Ok(Some(html)) => match Self::render_web_response(route, &html) {
-                            Ok(response) => response,
-                            Err(error) => {
-                                eprintln!("invalid web response: {error}");
-                                HttpResponse {
-                                    status: 500,
-                                    headers: vec![(
-                                        "Content-Type".into(),
-                                        "text/plain; charset=utf-8".into(),
-                                    )],
-                                    body: b"Internal server error".to_vec(),
+                        match rendered {
+                            Ok(Some(html)) => match Self::render_web_response(route, &html) {
+                                Ok(response) => response,
+                                Err(error) => {
+                                    eprintln!("invalid web response: {error}");
+                                    HttpResponse {
+                                        status: 500,
+                                        headers: vec![(
+                                            "Content-Type".into(),
+                                            "text/plain; charset=utf-8".into(),
+                                        )],
+                                        body: b"Internal server error".to_vec(),
+                                    }
                                 }
-                            }
-                        },
-                        Ok(None) => HttpResponse {
-                            status: 500,
-                            headers: vec![("Content-Type".into(), "text/plain".into())],
-                            body: b"Internal server error".to_vec(),
-                        },
-                        Err(DirectRequestRenderError::Decode(error)) => {
-                            let problem = request_decode_problem_response(&error);
-                            HttpResponse {
-                                status: problem.status,
-                                headers: problem.headers,
-                                body: problem.body,
-                            }
-                        }
-                        Err(DirectRequestRenderError::Execution(error)) => {
-                            eprintln!("typed route dispatch error: {error}");
-                            HttpResponse {
+                            },
+                            Ok(None) => HttpResponse {
                                 status: 500,
                                 headers: vec![("Content-Type".into(), "text/plain".into())],
                                 body: b"Internal server error".to_vec(),
+                            },
+                            Err(DirectRequestRenderError::Decode(error)) => {
+                                let problem = request_decode_problem_response(&error);
+                                HttpResponse {
+                                    status: problem.status,
+                                    headers: problem.headers,
+                                    body: problem.body,
+                                }
+                            }
+                            Err(DirectRequestRenderError::Execution(error)) => {
+                                eprintln!("typed route dispatch error: {error}");
+                                HttpResponse {
+                                    status: 500,
+                                    headers: vec![("Content-Type".into(), "text/plain".into())],
+                                    body: b"Internal server error".to_vec(),
+                                }
                             }
                         }
                     }

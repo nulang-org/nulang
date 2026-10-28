@@ -91,6 +91,7 @@ mod tests {
             reference_capability: None,
             placement: Some("server".to_string()),
             body_max_bytes: None,
+            required_capabilities: Vec::new(),
         }
     }
 

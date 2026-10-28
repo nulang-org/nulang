@@ -70,6 +70,9 @@ pub struct RouteContract {
     pub placement: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_max_bytes: Option<usize>,
+    /// Web-level permissions checked by a trusted server-side authorizer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +103,7 @@ struct FunctionMeta {
     reference_capability: Option<String>,
     placement: Option<String>,
     body_max_bytes: Option<usize>,
+    required_capabilities: Vec<String>,
 }
 
 impl FunctionMeta {
@@ -137,6 +141,15 @@ impl FunctionMeta {
                 _ => None,
             })
             .min();
+        let required_capabilities: Vec<String> = annotations
+            .iter()
+            .filter_map(|annotation| match annotation {
+                FunctionAnnotation::WebRequiredCapability { name } => Some(name.clone()),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
         let request_bindings = annotations
             .iter()
             .filter_map(|annotation| match annotation {
@@ -168,6 +181,7 @@ impl FunctionMeta {
                 reference_capability: cap.map(|c| c.to_string()),
                 placement,
                 body_max_bytes,
+                required_capabilities,
             },
         ))
     }
@@ -340,6 +354,9 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
             reference_capability: meta.and_then(|m| m.reference_capability.clone()),
             placement: meta.and_then(|m| m.placement.clone()),
             body_max_bytes: meta.and_then(|m| m.body_max_bytes),
+            required_capabilities: meta
+                .map(|m| m.required_capabilities.clone())
+                .unwrap_or_default(),
         });
     }
 

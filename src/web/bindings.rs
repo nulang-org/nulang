@@ -180,6 +180,7 @@ mod tests {
             reference_capability: None,
             placement: Some("server".to_string()),
             body_max_bytes: None,
+            required_capabilities: Vec::new(),
         }
     }
 
@@ -347,6 +348,7 @@ mod tests {
             reference_capability: None,
             placement: None,
             body_max_bytes: None,
+            required_capabilities: Vec::new(),
         };
 
         let compiled = compile_route_bindings(&contract);
