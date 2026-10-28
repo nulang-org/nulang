@@ -361,6 +361,52 @@ log, an authentication mechanism, or an exactly-once mutation guarantee.
 
 **Security and durability:** Unlike the general dev-server routes, this UI stream accepts **only loopback TCP connections** with a literal local `Host` (`localhost`, `127.0.0.1`, or `[::1]`) and rejects cross-origin browser requests (including DNS-rebinding Host values and cross-site Fetch Metadata). It is **not an authentication system**: local processes and local reverse proxies can still access streams, and the rest of the dev server binds to all interfaces. There is no subscriber identity, tenant isolation, persistent history, or cross-process distribution. Do not publish private data into shared rooms, forward the stream from a publicly reachable proxy, or expose the development server to untrusted clients. Actor-backed subscriptions and application authorization remain future work.
 
+## Scoped overlays (experimental)
+
+Pages can opt into a small browser-owned dialog lifecycle without adopting a
+SPA router. Render a stable placeholder and mark it for client-runtime
+injection, even if the page has no other reactive features:
+
+```html
+<dialog id="editor" data-nulang-overlay=""></dialog>
+```
+
+`window.nulang.overlay.open("#editor", "/edit-fragment")` fetches a
+**same-origin** GET response, validates that it contains a matching
+`<dialog id="editor">`, morphs that region, and calls the native
+`showModal()` API. It returns a promise that resolves only when an action
+explicitly completes the overlay:
+
+```js
+const pending = window.nulang.overlay.open("#editor", "/edit-fragment");
+// Later, from a client action inside the dialog:
+window.nulang.overlay.complete("#editor", {type: "string", value: "saved"});
+const outcome = await pending;
+// {protocol: "nulang-ui-msg/1", overlay_id: "#editor",
+//  status: "completed", value: {type: "string", value: "saved"}}
+```
+
+The result uses the renderer-neutral `WireValue` envelope and corresponds to
+`UiOverlayOutcome` in the Rust UI protocol. Supported value types include
+null, bool, string, lossless i64, f64 bits, bytes, arrays, and objects;
+unrecognized or unbounded values are rejected by the client. Calling
+`window.nulang.overlay.cancel("#editor")`, pressing Escape, or closing a
+native dialog rejects the pending promise and cleans up event listeners.
+Previously focused controls regain focus. Navigation during loading also
+settles the promise instead of leaving a stale overlay active.
+
+Server actions submitted from an active overlay may update **only elements
+within that overlay**, including secondary revalidation targets. Parent-view
+updates should be derived from the returned typed result and a fresh,
+authorized read—not from hidden cross-scope DOM mutations. Up to eight overlay
+lifecycles may be active concurrently; duplicate opens for a target fail.
+
+This is **browser-scoped** interaction state, not an actor-backed or durable
+workflow. It does not provide compiler-checked application result types, parent
+route coordination, authorization, or automatic actor supervision. Its HTML
+content must come from trusted, escaped rendering. The development-server
+security limitations above still apply.
+
 ## Progressive navigation with the Navigation API (experimental)
 
 Opt in individual same-origin links using `data-nulang-nav-target` and a stable

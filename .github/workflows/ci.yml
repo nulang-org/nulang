@@ -63,6 +63,9 @@ jobs:
       - name: Smoke test Nulang Web selective revalidation
         run: node scripts/tests/web_action_revalidation.mjs
 
+      - name: Smoke test Nulang Web scoped overlay lifecycles
+        run: node scripts/tests/web_overlay_lifecycle.mjs
+
       - name: Smoke test Nulang Web Navigation API enhancement
         run: node scripts/tests/web_navigation_api.mjs
 
