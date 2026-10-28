@@ -609,7 +609,7 @@ fn template_files(name: &str) -> Vec<(&'static str, &'static str)> {
     match name {
         "default" => vec![(
             "src/main.nula",
-            "fn main() {\n  perform IO.print(\"Hello from Nulang!\")\n}\n",
+            "fn main() {\n    perform IO.print(\"Hello from Nulang!\")\n}\n",
         )],
         "cli" => vec![(
             "src/main.nula",
@@ -2899,6 +2899,31 @@ mod tests {
         assert_eq!(resolution.root().name, "my-app");
         assert!(resolution.to_lockfile().package.is_empty());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_default_scaffold_is_formatter_clean() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_default_fmt_scaffold_{}_{}",
+            std::process::id(),
+            std::thread::current()
+                .name()
+                .unwrap_or("unnamed")
+                .replace(':', "_")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        scaffold_package(&dir, "formatter-fixture", "default").expect("scaffold must succeed");
+        let path = dir.join("src/main.nula");
+        let original = std::fs::read_to_string(&path).unwrap();
+        let formatted = crate::fmt::format_source(&original)
+            .expect("default generated code must parse in the formatter");
+        assert_eq!(
+            original, formatted,
+            "fresh default scaffold must pass nula ci --fmt without edits"
+        );
+        crate::fmt::format_directory(&dir.join("src"), true)
+            .expect("default scaffold must pass the actual directory formatter gate");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
