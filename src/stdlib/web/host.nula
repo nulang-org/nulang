@@ -24,6 +24,12 @@ pub fn route_json(method: String, path: String, h) -> Unit ! {Web, Request} {
     perform Web.route_json(method, path, h)
 }
 
+/// Register a typed scalar/flat-record handler; the runtime serializes
+/// the returned Nulang value using the compiler's response schema.
+pub fn route_json_typed(method: String, path: String, h) -> Unit ! {Web, Request} {
+    perform Web.route_json_typed(method, path, h)
+}
+
 /// Wrap a serialized JSON value in an opaque Json payload.
 /// The HTTP adapter validates JSON before sending a successful response.
 pub fn json(value: String) -> Json ! {Web, Respond} {

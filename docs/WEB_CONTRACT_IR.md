@@ -337,9 +337,38 @@ handler reads. OpenAPI exposes required properties and
 `additionalProperties: false` rather than inventing a permissive schema.
 Existing raw-body and primitive JSON binding behavior remains unchanged.
 
-Typed **response** serialization (`Json[T]`), non-200 result variants,
-nested record support, and streaming are still future work. `Web.json`
-continues to accept *serialized* JSON and the HTTP adapter validates it.
+### Compiler-backed typed JSON responses (experimental)
+
+Typed response serialization is opt-in via `Web.route_json_typed`:
+
+```nulang
+type UserView = { name: String, age: Int }
+
+fn show() -> UserView {
+    { name: "Ada", age: 42 }
+}
+
+fn register() {
+    perform Web.route_json_typed("GET", "/user", show)
+}
+```
+
+The compiler projects the handler's declared result into a `Json[T]`
+**route contract**, where `T` is `Int`, `Float`, `Bool`, `String`,
+or a flat record composed entirely of those primitives. The HTTP adapter
+serializes the *actual* VM value; record fields use compiler-owned field IDs,
+strings are JSON-escaped, and numeric/boolean values retain their JSON types.
+The response is `application/json` and the OpenAPI response schema reflects
+the same declared `T`. An unsupported return type is a compiler diagnostic;
+mismatched runtime values fail closed with HTTP 500.
+
+This route-contract notation does **not** add a generic source-level
+`Json[T]` type or automatic DTO derivation across arbitrary Nulang types.
+The original `Web.route_json`/`Web.json` path remains compatible: it still
+expects already-serialized JSON and validates the resulting bytes.
+
+Nested/optional records, arrays, user-defined custom scalars, statuses other
+than 200, streaming, and response envelopes remain separate follow-up work.
 
 ## Remaining implementation priorities
 
