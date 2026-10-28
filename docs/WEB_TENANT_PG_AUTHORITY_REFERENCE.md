@@ -41,9 +41,12 @@ bash tests/run_tenant_pg_authority_ci.sh
 The wrapper launches a throwaway local PostgreSQL cluster and reads the actual
 server's `SHOW config_file` before provisioning any test roles or tables.
 It generates random role credentials, creates a forced-RLS schema, tests two
-separate login identities, and destroys the cluster at exit. The Rust test
-uses a **fake server-owned token map** to isolate the authorization-to-SQL
-boundary. This does not demonstrate cryptographic token verification.
+separate login identities, and destroys the cluster at exit. The original
+Rust tests use a **fake server-owned token map** to isolate authorization.
+An additional integration check now signs a short-lived access token with a
+deterministic **test-only** Ed25519 key, verifies its signature and audience
+through the pinned verifier, and proves A/B SQL isolation. No production
+private key or external identity provider is involved.
 
 Acceptance checks include valid A/B identities, forged tenant headers and URL
 params, rejected missing/invalid/duplicate/unmapped credentials, server
@@ -52,9 +55,19 @@ foreign keys, and consecutive request isolation.
 
 ## Outstanding hard gates
 
-- An independently audited identity verifier must enforce signature/JWKS,
-  issuer, audience, expiration, key rotation, subject binding and revocation.
-  This reference deliberately implements **no** token cryptography.
+- `web::tenant_jwt_reference::PinnedEd25519Verifier` now checks EdDSA
+  signatures using a server-pinned public key, exact `kid`, `typ=at+jwt`,
+  issuer/audience, signed subject, bounded `iat`/`exp`/`nbf`, and `jti`
+  against an injected revocation policy. Test with
+  `cargo test --locked --no-default-features --features postgres --test tenant_jwt_verifier`.
+  The code does **not** fetch untrusted JWT `jku`/JWKS header URLs or accept
+  unsigned/other-algorithm tokens. An unavailable revocation response is
+  fail-closed (`None`); only explicit `Some(false)` allows a token. It is
+  not an OIDC provider or discovery client. Production issuer trust,
+  public-key distribution and rotation, durable revocation data/availability,
+  session logout, and incident rekeying remain **unimplemented and
+  independently reviewable**; a dummy revocation implementation is only
+  used in disposable tests.
 - The adapter currently accepts a parsed `HttpRequest` object in Rust tests,
   **not a socket-level HTTP request through WebDevServer**. It is not wired
   into route dispatch. A future integration must prove real network HTTP →
