@@ -258,6 +258,27 @@ Nulang source
 
 The runtime should ultimately execute each route under lightweight supervised request execution with structured cancellation and backpressure. Request-scoped dependencies should move from ambient state toward effect handlers. Stateful realtime/domain coordination should continue to use explicit persistent or virtual actors rather than making every model object an actor.
 
+## Read-only Web Contract preflight
+
+Run `nulang web check [--json] [PACKAGE_DIR]` to inspect the package's `src/`
+directory without compiling a binary, running application handlers, or starting
+a server. The command reuses the same package-wide contract extraction and
+binding diagnostics as `nula build --web` and the development server.
+
+Human-readable output reports the validated route count or diagnostics.
+`--json` emits an object with `schema_version: 1`, `ok`, `route_count`,
+and a deterministically sorted, deduplicated `diagnostics` array.
+Exit statuses are `0` for valid contracts, `1` for validation failures
+(including a missing source directory), and `2` for invalid CLI arguments.
+The JSON is intended for CI and coding agents; consumers should inspect the
+exit code and `ok` field rather than requiring particular diagnostic prose.
+
+**Scope:** this is a route-contract and request-binding check only. It does
+not typecheck entire applications, inspect deployment secrets, assess
+authorization, or establish production HTTP safety. `route_count: 0` does
+not prove that a runnable web app exists; use a full Web build and integration
+tests for that guarantee.
+
 ## Remaining implementation priorities
 
 1. Define an explicit request/response algebra (`Json[T]`, `Html`, bytes, streams, typed bodies/media) so Contract IR and OpenAPI can represent payloads without guessing.
