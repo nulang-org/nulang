@@ -103,6 +103,25 @@ fn send_raw_request(port: u16, request: &str) -> String {
     String::from_utf8(response).expect("HTTP response is UTF-8")
 }
 
+/// JSON responses may omit or explicitly declare the UTF-8 charset.
+/// Check the media type exactly without rejecting a valid charset parameter.
+fn assert_json_response_media_type(response: &str) {
+    let content_types: Vec<&str> = response
+        .split("\r\n")
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("Content-Type").then_some(value.trim())
+        })
+        .collect();
+    assert_eq!(content_types.len(), 1, "{response}");
+    let value = content_types[0];
+    assert!(
+        value.eq_ignore_ascii_case("application/json")
+            || value.eq_ignore_ascii_case("application/json; charset=utf-8"),
+        "unexpected JSON content type {value:?}: {response}"
+    );
+}
+
 fn response_body(response: &str) -> &str {
     response
         .split_once("\r\n\r\n")
@@ -836,10 +855,7 @@ fn json_response_contract_controls_content_type_and_body_over_http() {
         "GET /response HTTP/1.1\r\nHost: localhost\r\n\r\n",
     );
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
-    assert!(
-        response.contains("Content-Type: application/json\r\n"),
-        "{response}"
-    );
+    assert_json_response_media_type(&response);
     assert_eq!(response_body(&response), r#"{"ok":true}"#);
 }
 
@@ -925,10 +941,7 @@ fn register() { perform Web.route_json("GET", "/api", endpoint) }
     let server = WebDevServer::bind_runtime(0, None, None, attachment.routes).unwrap();
     let response = send_raw_request(server.port, "GET /api HTTP/1.1\r\nHost: localhost\r\n\r\n");
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
-    assert!(
-        response.contains("Content-Type: application/json\r\n"),
-        "{response}"
-    );
+    assert_json_response_media_type(&response);
     assert_eq!(response_body(&response), r#"{"ok":true}"#);
 }
 
@@ -1083,10 +1096,7 @@ fn register() { perform Web.route_json_typed("GET", "/typed", show) }
         "GET /typed HTTP/1.1\r\nHost: localhost\r\n\r\n",
     );
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
-    assert!(
-        response.contains("Content-Type: application/json\r\n"),
-        "{response}"
-    );
+    assert_json_response_media_type(&response);
     let body: serde_json::Value = serde_json::from_str(response_body(&response)).unwrap();
     assert_eq!(
         body,
@@ -1107,10 +1117,7 @@ fn register() { perform Web.route_json_typed("GET", "/typed-string", show) }
         "GET /typed-string HTTP/1.1\r\nHost: localhost\r\n\r\n",
     );
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
-    assert!(
-        response.contains("Content-Type: application/json\r\n"),
-        "{response}"
-    );
+    assert_json_response_media_type(&response);
     let body: serde_json::Value = serde_json::from_str(response_body(&response)).unwrap();
     assert_eq!(body, serde_json::Value::String("hello \"world\"".into()));
 }
