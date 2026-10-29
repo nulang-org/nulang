@@ -8,6 +8,9 @@ use std::{
 };
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
+// File descriptors can be briefly inherited between fork and exec, even with CLOEXEC.
+// Coordinate tests that spawn child processes with tests asserting immediate lock release.
+static SINK_OWNER_PROCESS_BARRIER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 struct Sandbox(PathBuf);
 impl Sandbox {
     fn new() -> Self {
@@ -44,6 +47,7 @@ fn count_effect_files(s: &Sandbox) -> usize {
 }
 #[test]
 fn committed_file_effect_and_receipt_survive_restart_without_duplicate_side_effect() {
+    let _process_barrier = SINK_OWNER_PROCESS_BARRIER.lock().unwrap();
     let s = Sandbox::new();
     {
         let mut r = reg(&s);
@@ -131,6 +135,7 @@ fn conflicting_replay_fails_before_advancing_pin() {
 }
 #[test]
 fn corrupt_immutable_sink_record_blocks_acknowledgment() {
+    let _process_barrier = SINK_OWNER_PROCESS_BARRIER.lock().unwrap();
     let s = Sandbox::new();
     let mut r = reg(&s);
     r.register_receipt_managed(RetentionClass::Backup, "archive", 2)
@@ -232,6 +237,7 @@ fn invalid_effect_is_rejected_before_persisting_any_delivery_intent() {
 
 #[test]
 fn sibling_sink_owner_excluded_and_reacquired_after_drop() {
+    let _process_barrier = SINK_OWNER_PROCESS_BARRIER.lock().unwrap();
     let s = Sandbox::new();
     let sink = DurableFileSink::open(s.sink()).unwrap();
     assert!(matches!(
@@ -287,6 +293,7 @@ fn subprocess_sink_owner_lock_fixture() {
 #[cfg(unix)]
 #[test]
 fn cross_process_sink_owner_lock_is_exclusive_and_released_after_exit() {
+    let _process_barrier = SINK_OWNER_PROCESS_BARRIER.lock().unwrap();
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Command, Stdio};
 
@@ -353,6 +360,7 @@ fn subprocess_fault_fixture() {
 }
 #[test]
 fn crash_after_intent_or_after_effect_replays_without_advancing_early() {
+    let _process_barrier = SINK_OWNER_PROCESS_BARRIER.lock().unwrap();
     use std::process::Command;
     for (stage, code) in [("intent", 31), ("effect", 32)] {
         let s = Sandbox::new();
