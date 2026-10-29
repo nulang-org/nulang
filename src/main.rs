@@ -182,15 +182,20 @@ fn main() {
     // start the experimental HTTP development host or execute user code.
     if args[1] == "web" {
         if args.get(2).map(String::as_str) != Some("check") {
-            eprintln!("Usage: nulang web check [--json] [PACKAGE_DIR]");
+            eprintln!("Usage: nulang web check [--json] [--require-routes] [PACKAGE_DIR]");
             std::process::exit(2);
         }
         let options =
             nulang::web::preflight::parse_check_args(&args[3..]).unwrap_or_else(|error| {
-                eprintln!("{error}\nUsage: nulang web check [--json] [PACKAGE_DIR]");
+                eprintln!(
+                    "{error}\nUsage: nulang web check [--json] [--require-routes] [PACKAGE_DIR]"
+                );
                 std::process::exit(2);
             });
-        let report = nulang::web::preflight::check_web_package(&options.root);
+        let report = nulang::web::preflight::check_web_package_with_options(
+            &options.root,
+            options.require_routes,
+        );
         if options.json {
             println!(
                 "{}",

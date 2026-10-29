@@ -260,7 +260,7 @@ The runtime should ultimately execute each route under lightweight supervised re
 
 ## Read-only Web Contract preflight
 
-Run `nulang web check [--json] [PACKAGE_DIR]` to inspect the package's `src/`
+Run `nulang web check [--json] [--require-routes] [PACKAGE_DIR]` to inspect the package's `src/`
 directory without compiling a binary, running application handlers, or starting
 a server. The command reuses the same package-wide contract extraction and
 binding diagnostics as `nula build --web` and the development server.
@@ -272,6 +272,17 @@ Exit statuses are `0` for valid contracts, `1` for validation failures
 (including a missing source directory), and `2` for invalid CLI arguments.
 The JSON is intended for CI and coding agents; consumers should inspect the
 exit code and `ok` field rather than requiring particular diagnostic prose.
+
+The optional `--require-routes` flag also fails when the source tree
+contains zero routes. Without the flag, empty packages remain valid (they may
+not be Web applications). Combine `--require-routes --json` in web-app CI.
+
+JSON schema v1 additionally includes an additive `issues` array of
+`{code, severity, message}` records. Codes are stable: `WEB_SOURCE_MISSING`,
+`WEB_CONTRACT_INVALID`, and `WEB_ROUTES_REQUIRED`. Their `severity` is
+`error` for now; messages are not stable APIs. Existing `diagnostics` and
+exit status meanings are preserved. This is a structural contract check, not
+an authentication, authorization, origin/CSRF, or production readiness audit.
 
 **Scope:** this is a route-contract and request-binding check only. It does
 not typecheck entire applications, inspect deployment secrets, assess
