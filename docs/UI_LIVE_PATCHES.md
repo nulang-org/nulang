@@ -322,3 +322,87 @@ host reducer path, denied/revoked access, failed renders, input acceptance
 and replay rejection, private manifest loading, malformed/oversized
 artifacts and corrupted template content. Browser reconciliation is tested
 separately by the Chromium suite.
+
+## Authenticated stream framing and browser reconnection (experimental)
+
+`nulang::web::ui_live_stream::UiStreamDelivery` is a small, **opt-in
+transport adapter**, not a route registration or anonymous broadcast bus.
+It produces SSE frames carrying the existing typed `nulang-ui-msg/1`
+messages. Each event has `event: nulang-ui`, decimal `id: <revision>`,
+and JSON `data:` for a server-authored snapshot or patch.
+
+A host-owned HTTP adapter can use this sequence, **only after** verifying
+its signed tenant, subject, session, view and document context, applying
+the required CSRF/Origin/session/cookie policy and setting
+`Content-Type: text/event-stream` with `Cache-Control: no-store`:
+
+```rust
+use nulang::web::ui_live_stream::UiStreamDelivery;
+
+// Each new connection starts with a fresh, scope-authorized snapshot.
+// Last-Event-ID is only a revision hint, NOT proof of identity.
+let first_frame = UiStreamDelivery::subscribe(
+    &server_session,
+    last_event_id_from_request,
+    &verify_current_principal,
+)?;
+
+// After an application commit, send only the exact event produced by
+// this session, never a client-supplied or guessed patch.
+let event = server_session.commit(
+    &new_authoritative_bindings, &accepted_inputs,
+    &verify_current_principal, &server_confirmed_transaction,
+)?;
+let next_frame = UiStreamDelivery::publish(
+    &server_session, &event, &verify_current_principal,
+)?;
+```
+
+`publish` checks current session authority and verifies that the patch
+exactly matches the last committed server event. Forged patches with valid
+document IDs/revision numbers are rejected. Authentication is rechecked
+after framing, before a frame is returned to the HTTP writer. The
+application must still enforce revocation until connection close, reserve
+a private namespace, and never use legacy public SSE rooms for private UI.
+
+The opt-in browser adapter `window.nulangUiStream` ships in generated
+`app.client.js` alongside `window.nulangUiDom`:
+
+```js
+const host = window.nulangUiDom.createHostFromDom(
+  document.getElementById("ui-root"),
+  {documentId: "task-list", revision: "1"}
+);
+const stream = window.nulangUiStream.createClient(host, {
+  url: "/app/private-ui-stream", // server-defined, authorized route
+  getHeaders: () => ({ /* short-lived server-issued Authorization header */ }),
+  onRecoveryNeeded: reason => console.warn("Snapshot reconciliation:", reason),
+  onUnauthorized: () => { /* invalidate UI session */ }
+});
+stream.start();
+// stream.stop() on navigation or logout.
+```
+
+The client uses same-origin credentialed `fetch`, not EventSource, so a
+host can supply an Authorization header; neither bearer tokens nor
+session secrets belong in the URL/query. The adapter forbids cross-origin
+paths, redirects, and query-token URLs, and treats HTTP 401/403 as terminal.
+It checks the typed message, SSE event ID and revision against the current
+document. **Every connection must start with an authoritative snapshot**;
+patch-only replays are rejected. Missing revision gaps force an authorized
+reconnect/snapshot rather than best-effort reordering, and pending input
+drafts must never be implicitly discarded.
+
+Verification includes Rust SSE framing/provenance/revocation/reconnect
+regressions and Chromium tests for fragmented SSE reads, real loopback
+HTTP credential checks, keyed DOM identity, snapshot gaps and draft
+preservation. The loopback Python HTTP fixture is *test-only* and must
+never be deployed as a production Nulang session endpoint.
+
+**Integration boundary remains:** draft PR #2367 owns signed tenant
+authorization and SSE admission, and draft PR #2364 owns targeted-action
+response concurrency. The two have overlapping `http_server.rs` changes.
+This PR does not cherry-pick those branches or expose an unaudited HTTP
+route. After they pass exact-head CI and are consolidated, the host can
+connect these adapters to the verified server route, enforce per-event
+revocation, and run a complete Nulang application E2E with real sessions.

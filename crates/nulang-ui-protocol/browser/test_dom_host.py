@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import http.server
+import json
 import os
 from pathlib import Path
 import shutil
@@ -21,6 +22,46 @@ def main() -> int:
         return 2
 
     class Handler(http.server.SimpleHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/__test__/live":
+                # Real browser fetch -> real loopback HTTP -> framed SSE,
+                # with a test-only credential gate. Not a production endpoint.
+                if self.headers.get("Authorization") != "Bearer test-token":
+                    self.send_response(403)
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    return
+                nodes = [
+                    {"id":"root","kind":"div","properties":{},"children":["a","b"]},
+                    {"id":"a","kind":"span","properties":{"text":{"type":"string","value":"A"}},"children":[]},
+                    {"id":"b","kind":"span","properties":{"text":{"type":"string","value":"B"}},"children":[]}
+                ]
+                messages = [
+                    {"protocol":"nulang-ui-msg/1","type":"snapshot","document":{
+                        "protocol":"nulang-ui/1","document_id":"test","revision":"1","root":"root","nodes":nodes
+                    }},
+                    {"protocol":"nulang-ui-msg/1","type":"patch","patch":{
+                        "protocol":"nulang-ui/1","document_id":"test","base_revision":"1","revision":"2",
+                        "operations":[{"op":"replace_children","node_id":"root","children":["b","a"]}]
+                    }}
+                ]
+                frames = "".join(
+                    "event: nulang-ui\nid: {}\ndata: {}\n\n".format(
+                        i, json.dumps(msg, separators=(",",":"))
+                    ) for i,msg in enumerate(messages,start=1)
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type","text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control","no-store")
+                self.send_header("Content-Length",str(len(frames)))
+                self.end_headers()
+                midpoint=len(frames)//2
+                for chunk in (frames[:midpoint],frames[midpoint:]):
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                return
+            return super().do_GET()
+
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=str(ROOT), **kwargs)
 

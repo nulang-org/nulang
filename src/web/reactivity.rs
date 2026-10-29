@@ -795,7 +795,7 @@ fn data_attr(name: &str, value: &str, span: Span) -> Expr {
 /// `data-signal` and `data-action` attributes emitted by the compiler.
 pub fn generate_client_runtime() -> String {
     format!(
-        "{}\n{}",
+        "{}\n{}\n{}",
         r#"(function () {
   // Signal names come from compiled bindings; they must never resolve through
   // Object.prototype (e.g. constructor, toString, __proto__).
@@ -925,7 +925,8 @@ pub fn generate_client_runtime() -> String {
     hydrate();
   }
 })();"#,
-        include_str!("../../crates/nulang-ui-protocol/browser/nulang-ui-dom.js")
+        include_str!("../../crates/nulang-ui-protocol/browser/nulang-ui-dom.js"),
+        include_str!("../../crates/nulang-ui-protocol/browser/nulang-ui-stream.js")
     )
 }
 
@@ -1151,6 +1152,10 @@ fn view(item_id: String) -> Html {
         assert!(
             js.contains("data-nulang-node-id"),
             "keyed identity marker missing"
+        );
+        assert!(
+            js.contains("nulangUiStream"),
+            "authenticated fetch/SSE adapter missing from generated bundle"
         );
     }
 

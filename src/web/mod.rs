@@ -17,5 +17,6 @@ pub mod request_bindings;
 pub mod route_check;
 pub mod runtime_bindings;
 pub mod ui_live_session;
+pub mod ui_live_stream;
 pub mod ui_template;
 pub mod validation;
