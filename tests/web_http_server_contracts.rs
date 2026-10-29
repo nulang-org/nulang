@@ -110,7 +110,8 @@ fn assert_json_response_media_type(response: &str) {
         .split("\r\n")
         .filter_map(|line| {
             let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("Content-Type").then_some(value.trim())
+            name.eq_ignore_ascii_case("Content-Type")
+                .then_some(value.trim())
         })
         .collect();
     assert_eq!(content_types.len(), 1, "{response}");
