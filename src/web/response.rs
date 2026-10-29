@@ -37,6 +37,14 @@ impl ResponseKind {
         match ty {
             Some("Html") => Some(Self::Html),
             Some("Json") => Some(Self::Json),
+            Some(ty)
+                if ty
+                    .strip_prefix("Json[")
+                    .and_then(|inner| inner.strip_suffix(']'))
+                    .is_some_and(|inner| !inner.trim().is_empty()) =>
+            {
+                Some(Self::Json)
+            }
             Some("Text") => Some(Self::Text),
             Some("Created") => Some(Self::Created),
             Some("NoContent") => Some(Self::NoContent),
@@ -149,6 +157,19 @@ impl ResponseKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_json_contract_uses_validated_json_response_instead_of_html() {
+        for ty in [
+            "Json[Int]",
+            "Json[String]",
+            "Json[{name: String, age: Int}]",
+        ] {
+            assert_eq!(ResponseKind::explicit(Some(ty)), Some(ResponseKind::Json));
+            assert_eq!(ResponseKind::from_return_type(Some(ty)), ResponseKind::Json);
+        }
+        assert!(ResponseKind::Json.render("{invalid}").is_err());
+    }
 
     #[test]
     fn legacy_types_remain_html_while_explicit_types_choose_content_type() {

@@ -298,3 +298,252 @@ development server into a production-ready HTTP server.
 4. Replace ambient request-context dependency injection with effect handlers once compatibility coverage is sufficient.
 5. Introduce authorization/resource capabilities separately from Nulang reference capabilities, including attenuation and capability-parameterized effects.
 6. Unify HTTP, SSE, and WebSocket entry points over the same actor/effect/capability execution model.
+
+## Compiler-backed typed JSON and method-aware routing (integration)
+
+## Route precedence and HTTP method semantics
+
+The contract validator rejects same-method route patterns that can match the
+same request without one being strictly more specific (for example,
+`/users/{first}` vs `/users/{second}`, or `/{a}/fixed` vs `/fixed/{b}`).
+Literal segments narrow a parameter segment, so `/users/me` wins over
+`/users/{id}` independent of registration order. Disjoint methods and
+non-overlapping paths can coexist. Legacy registrations without a compiler
+contract remain supported, but bypass compile-time ambiguity checks.
+
+The development HTTP dispatcher uses the same relation when selecting a route,
+and implements these method behaviors:
+
+- Explicit `HEAD` routes take priority over fallback `GET` handlers.
+- Otherwise `HEAD` invokes the matching `GET` handler but omits response bytes,
+  retaining the representation's `Content-Length`.
+- `OPTIONS` for a routed path without an explicit handler returns `204` with
+  an `Allow` header; other unsupported methods return `405` with `Allow`.
+- The `Allow` list includes implied `HEAD` for `GET` and the automatic
+  `OPTIONS` method. Static files accept GET/HEAD and report other methods.
+- The experimental SSE endpoint permits streaming only on GET, not on HEAD or
+  write methods.
+
+The typed response algebra and supervised request execution are separate
+follow-up work; they are not implied by this protocol-level change.
+
+## Decode failures and HTTP problems
+
+Request decoding distinguishes client input failures from compiler/runtime invariant failures:
+
+- missing required request input -> HTTP `400`
+- invalid scalar request input -> HTTP `400`
+- duplicate handler slots -> HTTP `500`
+- invalid handler slots -> HTTP `500`
+- incomplete binding plans -> HTTP `500`
+
+The transport-neutral `RequestDecodeError` exposes stable machine-readable codes and an RFC-style problem document. HTTP adapts it to `application/problem+json`; transport-independent code does not parse display strings to classify errors.
+
+Compiler/runtime binding defects deliberately remain server errors. They must not be presented as mistakes made by the caller.
+
+## OpenAPI
+
+OpenAPI 3.1 generation consumes the same `ContractCompilation` and binding IR; it does not reparse Nulang source.
+
+- path bindings become required path parameters.
+- query bindings become query parameters.
+- header bindings become header parameters.
+- cookie bindings become cookie parameters.
+- all request bindings are retained in `x-nulang-request-bindings`.
+- form bindings become an `application/x-www-form-urlencoded` OpenAPI `requestBody`, because the HTTP transport now defines that media type explicitly.
+- raw whole-body bindings remain Nulang extensions until the request algebra defines their media type/schema semantics without guessing.
+- Nulang response/error types, effects, placement, and reference capabilities remain extensions where OpenAPI has no exact equivalent yet.
+
+This keeps runtime dispatch and generated API metadata on the same compiler-owned contract.
+
+## Binding example
+
+For:
+
+```nulang
+fn show(
+    user: UserId from path,
+    org: OrgId from path,
+    expand: Bool from query,
+    trace: String from header("X-Trace")
+) -> Html { ... }
+```
+
+with route:
+
+```text
+GET /orgs/{org: OrgId}/users/{user: UserId}
+```
+
+the binding plan is equivalent to:
+
+```json
+[
+  {
+    "source": "path",
+    "source_name": "user",
+    "handler_param": "user",
+    "handler_index": 0,
+    "ty": "UserId"
+  },
+  {
+    "source": "path",
+    "source_name": "org",
+    "handler_param": "org",
+    "handler_index": 1,
+    "ty": "OrgId"
+  },
+  {
+    "source": "query",
+    "source_name": "expand",
+    "handler_param": "expand",
+    "handler_index": 2,
+    "ty": "Bool"
+  },
+  {
+    "source": "header",
+    "source_name": "X-Trace",
+    "handler_param": "trace",
+    "handler_index": 3,
+    "ty": "String"
+  }
+]
+```
+
+## Architectural direction
+
+The Web Contract IR is intended to be the stable seam between language semantics and transports:
+
+```text
+Nulang source
+    -> typed/effect/capability analysis
+    -> Web Contract IR
+       -> authoritative validation
+       -> runtime route plan
+          -> HTTP runtime
+          -> future request actor runtime
+       -> deployment IR
+       -> OpenAPI / client generation
+       -> tests / tooling
+       -> Nulang Cloud deployment metadata
+       -> observability metadata
+```
+
+The runtime should ultimately execute each route under lightweight supervised request execution with structured cancellation and backpressure. Request-scoped dependencies should move from ambient state toward effect handlers. Stateful realtime/domain coordination should continue to use explicit persistent or virtual actors rather than making every model object an actor.
+
+## Explicit JSON scalar request and response contracts (experimental)
+
+The compiler accepts a scalar `from json` request binding alongside the
+existing `from body` raw-string and `from form(...)` sources:
+
+```nulang
+fn counter(count: Int from json) -> Int { count }
+```
+
+The JSON binding validates the `Content-Type` header (application/json and
+application/*+json) and parses a *single* JSON value into an exact `Int`,
+`Float`, `Bool`, or `String` VM constant without coercion. Wrong media types
+return HTTP 415; invalid JSON or mismatched scalar types return HTTP 400.
+Aggregate DTO types, JSON arrays, record decoding, `Json[T]` and automatic
+response serialization remain **unsupported** and cause compiler contract
+diagnostics rather than being silently string-backed. JSON bindings cannot
+share a route with form bindings; existing raw-body plus form compatibility
+is preserved.
+
+The explicit `Json` response marker and `Web.json`/`Web.route_json` effect
+operations select application/json responses from compiler-owned route
+metadata. The HTTP transport validates the serialized result before writing
+a successful response. Invalid output returns a generic 500, never a
+successful HTML response containing untrusted markup. OpenAPI emits real
+application/json request/response media types only for these explicit
+contracts, while preserving extensions for opaque/unmodeled body types.
+
+### Flat typed JSON record DTOs (experimental follow-up)
+
+For a statically declared record whose leaf fields are `Int`, `Float`,
+`Bool`, or `String`, the compiler can lower `from json` into a
+typed input schema and a real VM record argument:
+
+```nulang
+type CreateUser = { name: String, age: Int }
+
+fn create_user(input: CreateUser from json) -> String {
+    input.name
+}
+```
+
+Request bodies must be JSON objects with the exact declared field names.
+Missing fields, unknown fields (including privilege-escalation fields), wrong
+scalar types, malformed input, and duplicate root-level keys are rejected
+with a 400 problem response. This deliberately does not implement optional,
+nested, collection, union, or user-defined custom scalar decoding.
+
+The compiler carries record slot IDs into bytecode metadata so the HTTP
+adapter materializes Nulang VM records using the same offsets the compiled
+handler reads. OpenAPI exposes required properties and
+`additionalProperties: false` rather than inventing a permissive schema.
+Existing raw-body and primitive JSON binding behavior remains unchanged.
+
+### Compiler-backed typed JSON responses (experimental)
+
+Typed response serialization is opt-in via `Web.route_json_typed`:
+
+```nulang
+type UserView = { name: String, age: Int }
+
+fn show() -> UserView {
+    { name: "Ada", age: 42 }
+}
+
+fn register() {
+    perform Web.route_json_typed("GET", "/user", show)
+}
+```
+
+The compiler projects the handler's declared result into a `Json[T]`
+**route contract**, where `T` is `Int`, `Float`, `Bool`, `String`,
+or a flat record composed entirely of those primitives. The HTTP adapter
+serializes the *actual* VM value; record fields use compiler-owned field IDs,
+strings are JSON-escaped, and numeric/boolean values retain their JSON types.
+The response is `application/json` and the OpenAPI response schema reflects
+the same declared `T`. An unsupported return type is a compiler diagnostic;
+mismatched runtime values fail closed with HTTP 500.
+
+This route-contract notation does **not** add a generic source-level
+`Json[T]` type or automatic DTO derivation across arbitrary Nulang types.
+The original `Web.route_json`/`Web.json` path remains compatible: it still
+expects already-serialized JSON and validates the resulting bytes.
+
+Nested inline closed records are supported in a subsequent experimental
+compiler/VM contract slice. JSON request objects are decoded recursively into
+real VM records using the shared module field-layout ABI; typed JSON results
+serialize embedded VM records recursively. Every level uses exact declared
+fields, rejects unknown or missing fields, validates primitive scalar types
+without coercion, and rejects duplicate keys. The compiler schema parser is
+bounded to eight levels and 255 field occurrences. OpenAPI describes nested
+objects with required properties and `additionalProperties: false` at each
+level.
+
+For example, use a compiler-supported inline nested type:
+
+```nulang
+type UserView = {
+    name: String,
+    address: { city: String, zip: Int }
+}
+```
+
+Option/nullable fields, arrays, named nested type aliases that do not
+currently typecheck as nested structural records, custom scalars,
+non-200 status variants, streaming, and response envelopes remain separate
+work. In particular, the HTTP adapter must not invent an `Option[T]` VM
+representation by interpreting null or missing JSON as `nil`.
+
+## Remaining implementation priorities
+
+1. Extend the experimental scalar JSON binding and `Json` marker into a typed request/response algebra (`Json[T]`, `Html`, bytes, streams, typed record schemas/media) so Contract IR and OpenAPI can represent full payloads without guessing.
+2. Add richer request decoders for optional/default values, repeated query parameters/collections, binary bodies, transparent aliases, and opaque/domain types.
+3. Execute requests under lightweight supervised request actors with structured cancellation/backpressure.
+4. Replace ambient request-context dependency injection with effect handlers once compatibility coverage is sufficient.
+5. Introduce authorization/resource capabilities separately from Nulang reference capabilities, including attenuation and capability-parameterized effects.
+6. Unify HTTP, SSE, and WebSocket entry points over the same actor/effect/capability execution model.

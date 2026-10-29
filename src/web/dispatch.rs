@@ -6,19 +6,20 @@
 //! registrations, matching precompiled path segments, and invoking handlers
 //! whose complete argument list is proven by the binding plan.
 
-use crate::runtime::WebRoute;
+use crate::runtime::{HttpMethod, WebRoute};
 use crate::web::bindings::RouteBindingSource;
 use crate::web::contracts::ContractCompilation;
-use crate::web::handler_call::render_bound_handler;
+use crate::web::handler_call::render_bound_handler_with_response_type;
 use crate::web::request_bindings::{
     bind_request_arguments, RequestBindingValues, RequestDecodeError,
 };
 use crate::web::runtime_bindings::{
-    attach_runtime_route_plans, match_attached_route, render_bound_route_handler, RuntimeRoutePlan,
-    RuntimeRouteSegment, RuntimeWebRoute,
+    attach_runtime_route_plans, compare_route_patterns, match_attached_route,
+    render_bound_route_handler, RoutePatternRelation, RuntimeRoutePlan, RuntimeRouteSegment,
+    RuntimeWebRoute,
 };
 use crate::web::validation::compile_validated_contracts_from_tree;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::Path;
 
@@ -70,6 +71,74 @@ pub fn match_route(
 
 fn request_path_only(target: &str) -> &str {
     target.split_once('?').map_or(target, |(path, _)| path)
+}
+
+/// A routing decision, including protocol responses for paths that exist but
+/// do not support the requested method.
+pub enum RouteResolution<'a> {
+    Matched(&'a RuntimeWebRoute, HashMap<String, String>),
+    AutomaticOptions(String),
+    MethodNotAllowed(String),
+    NotFound,
+}
+
+/// Select a matching route independent of registration order when one route
+/// has a strictly more specific pattern. Ambiguous same-method patterns are
+/// rejected by the Web Contract validator before serving.
+pub fn resolve_route<'a>(
+    routes: &'a [RuntimeWebRoute],
+    method: HttpMethod,
+    target: &str,
+) -> RouteResolution<'a> {
+    let mut allowed = BTreeSet::new();
+    let mut exact = None;
+    let mut get_for_head = None;
+
+    for route in routes {
+        let Some(params) = match_route(route, target) else {
+            continue;
+        };
+        allowed.insert(route.route.method.as_str());
+        if route.route.method == method {
+            prefer_more_specific(&mut exact, route, params);
+        } else if method == HttpMethod::Head && route.route.method == HttpMethod::Get {
+            prefer_more_specific(&mut get_for_head, route, params);
+        }
+    }
+
+    if let Some((route, params)) = exact.or(get_for_head) {
+        return RouteResolution::Matched(route, params);
+    }
+    if allowed.is_empty() {
+        return RouteResolution::NotFound;
+    }
+
+    if allowed.contains("GET") {
+        allowed.insert("HEAD");
+    }
+    allowed.insert("OPTIONS");
+    let allow = allowed.into_iter().collect::<Vec<_>>().join(", ");
+    if method == HttpMethod::Options {
+        RouteResolution::AutomaticOptions(allow)
+    } else {
+        RouteResolution::MethodNotAllowed(allow)
+    }
+}
+
+fn prefer_more_specific<'a>(
+    selected: &mut Option<(&'a RuntimeWebRoute, HashMap<String, String>)>,
+    candidate: &'a RuntimeWebRoute,
+    captures: HashMap<String, String>,
+) {
+    let replace = selected.as_ref().is_none_or(|(existing, _)| {
+        matches!(
+            compare_route_patterns(&existing.route.path, &candidate.route.path),
+            Ok(RoutePatternRelation::LessSpecific)
+        )
+    });
+    if replace {
+        *selected = Some((candidate, captures));
+    }
 }
 
 /// Invoke a path-only route directly when the existing runtime plan marks it as
@@ -148,6 +217,18 @@ pub fn render_direct_request(
         return Ok(None);
     };
     if !has_complete_request_binding_plan(plan) {
+        // A typed JSON response must never fall back to legacy string
+        // rendering: that path can incorrectly interpret VM record pointers.
+        if plan
+            .response_type
+            .as_deref()
+            .is_some_and(|ty| ty.starts_with("Json["))
+        {
+            return Err(DirectRequestRenderError::Execution(format!(
+                "route {} {}: typed JSON response requires a complete compiler binding plan",
+                plan.method, plan.path
+            )));
+        }
         // See render_direct_route: only zero-parameter handlers may fall back
         // to the legacy ambient-request path.
         if plan.handler_param_count > 0 {
@@ -161,11 +242,12 @@ pub fn render_direct_request(
 
     let args = bind_request_arguments(&plan.bindings, plan.handler_param_count, values)
         .map_err(DirectRequestRenderError::Decode)?;
-    render_bound_handler(
+    render_bound_handler_with_response_type(
         &route.route.handler_module,
         route.route.handler_func_idx,
         plan.handler_param_count,
         &args,
+        plan.response_type.as_deref(),
     )
     .map(Some)
     .map_err(DirectRequestRenderError::Execution)
@@ -241,6 +323,7 @@ mod tests {
             ],
             bindings,
             handler_param_count,
+            response_type: None,
             direct_call: false,
             response_kind: crate::web::response::ResponseKind::Html,
         }

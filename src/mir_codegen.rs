@@ -1504,7 +1504,12 @@ impl MirCodegen {
         self.module.instructions.len()
     }
 
-    pub fn finish(self) -> CodeModule {
+    pub fn finish(mut self) -> CodeModule {
+        let mut names = vec![String::new(); self.field_map.len()];
+        for (name, index) in self.field_map {
+            names[index as usize] = name;
+        }
+        self.module.record_field_names = names;
         self.module
     }
 }

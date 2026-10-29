@@ -553,6 +553,7 @@ pub enum WebRequestParamSource {
     Cookie,
     Body,
     Form,
+    Json,
 }
 
 #[derive(Debug, Clone, PartialEq)]

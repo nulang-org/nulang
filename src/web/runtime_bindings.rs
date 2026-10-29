@@ -32,6 +32,9 @@ pub struct RuntimeRoutePlan {
     pub segments: Vec<RuntimeRouteSegment>,
     pub bindings: Vec<RouteBindingContract>,
     pub handler_param_count: usize,
+    /// Source-level response marker used by the HTTP adapter.
+    /// Only the explicit `Json` marker changes wire semantics in this phase.
+    pub response_type: Option<String>,
     /// True when every declared handler parameter is supplied directly from a
     /// route input and every path parameter has a direct binding. Legacy routes
     /// that still rely on ambient `Web.param` access keep this false.
@@ -123,6 +126,7 @@ pub fn compile_runtime_route_plan(
         segments,
         bindings: binding_compilation.bindings,
         handler_param_count: contract.handler_params.len(),
+        response_type: contract.response_type.clone(),
         direct_call,
         response_kind: ResponseKind::from_return_type(contract.response_type.as_deref()),
     })
@@ -183,6 +187,50 @@ fn match_segments(
     Some(params)
 }
 
+/// Relationship between two route patterns for the same HTTP method.
+///
+/// Overlapping patterns are ordered only when one matches a strict subset of
+/// the requests matched by the other. Crossed literal/parameter positions are
+/// ambiguous rather than resolved by a fragile numeric specificity score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutePatternRelation {
+    Disjoint,
+    MoreSpecific,
+    LessSpecific,
+    Ambiguous,
+}
+
+pub fn compare_route_patterns(left: &str, right: &str) -> Result<RoutePatternRelation, String> {
+    let left = compile_route_segments(left)?;
+    let right = compile_route_segments(right)?;
+    if left.len() != right.len() {
+        return Ok(RoutePatternRelation::Disjoint);
+    }
+    let mut left_specific = false;
+    let mut right_specific = false;
+    for (a, b) in left.iter().zip(right.iter()) {
+        match (a, b) {
+            (RuntimeRouteSegment::Literal(a), RuntimeRouteSegment::Literal(b)) if a != b => {
+                return Ok(RoutePatternRelation::Disjoint);
+            }
+            (RuntimeRouteSegment::Literal(_), RuntimeRouteSegment::PathParam(_)) => {
+                left_specific = true;
+            }
+            (RuntimeRouteSegment::PathParam(_), RuntimeRouteSegment::Literal(_)) => {
+                right_specific = true;
+            }
+            _ => {}
+        }
+    }
+    Ok(match (left_specific, right_specific) {
+        (true, false) => RoutePatternRelation::MoreSpecific,
+        (false, true) => RoutePatternRelation::LessSpecific,
+        // Identical patterns and crossing specificity both overlap without
+        // either route being strictly more specific.
+        _ => RoutePatternRelation::Ambiguous,
+    })
+}
+
 fn compile_route_segments(path: &str) -> Result<Vec<RuntimeRouteSegment>, String> {
     compile_segments(path, true)
 }
@@ -241,6 +289,9 @@ fn compile_segments(
 pub struct BoundRouteArgument {
     pub handler_index: usize,
     pub value: Constant,
+    /// Typed JSON record values are injected as VM records, never as a
+    /// string pretending to satisfy a source-level record type.
+    pub record_fields: Option<Vec<(String, crate::web::json_records::JsonBoundValue)>>,
 }
 
 /// Convert captured path values into a complete handler argument vector.
@@ -296,6 +347,7 @@ pub fn bind_path_arguments(
         slots[binding.handler_index] = Some(BoundRouteArgument {
             handler_index: binding.handler_index,
             value,
+            record_fields: None,
         });
     }
 
