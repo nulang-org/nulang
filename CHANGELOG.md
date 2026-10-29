@@ -1,5 +1,11 @@
 # Nulang Changelog
 
+### Ureq 3 Rustls and HTTP client compatibility — 2026-10-29
+- **Upgrade the opt-in synchronous HTTP client from ureq 2.12.1 to ureq 3.5.0**, using its maintained Rustls 0.23 backend and patched WebPKI 1.0.x trust roots. Cargo's dependency resolver removes the obsolete `webpki-roots 0.26.11` tree; no direct checksum edits or audit exclusions.
+- **Preserve registry publish/fetch/list, VM Http.get/Http.post and cloud deploy behavior** across the ureq 3 request and response API changes. Deploy explicitly returns the 401 authentication hint and readable error bodies for non-2xx HTTP responses, while transport failures remain errors. Rustls still authenticates server certificates and hostnames.
+- **Security acceptance remains exact-head dependent:** local HTTP/HTTPS regressions, full-feature tests, and a complete non-bypassed cargo-audit must all pass before this stacked PR or upstream security changes are merge-ready.
+
+
 ### Remote libsql connector migration off obsolete Rustls 0.22 — 2026-10-29
 - **Removed libsql's built-in `tls` feature** (which locked `hyper-rustls 0.25`, `rustls 0.22`, and vulnerable `rustls-webpki 0.102.8`). The remote Turso/HTTP protocol and local SQLite backend remain enabled; the host now supplies libsql's supported Hyper 0.14 `connector` extension point with modern `tokio-rustls 0.26` / Rustls 0.23.
 - **Preserved certificate and hostname verification**, loading native OS trust anchors and negotiating HTTP/1.1 without a plaintext fallback. Invalid remote URL schemes and userinfo fail closed; missing CA roots abort remote connection setup. Local loopback tests exercise rejection of HTTP and an untrusted self-signed TLS server.

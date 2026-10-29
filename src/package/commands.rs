@@ -2190,6 +2190,17 @@ struct DeployResponse {
     status: String,
 }
 
+/// Keep cloud deployment diagnostics unchanged when migrating ureq's HTTP
+/// status handling. A rejected request is never treated as a successful deploy.
+#[cfg(feature = "ureq")]
+fn deploy_http_error_message(status: u16, body: &str) -> String {
+    if status == 401 {
+        "Authentication failed. Check your NULANG_CLOUD_TOKEN.".to_string()
+    } else {
+        format!("Deploy failed: {} — {}", status, body)
+    }
+}
+
 /// `nula deploy [--wasm] [--url <url>] [--token <token>] [--adapter <kind>] [--dry-run]`
 /// — build and deploy the current package to Nulang Cloud or another adapter.
 #[cfg(feature = "ureq")]
@@ -2377,32 +2388,37 @@ fn cmd_deploy(
     eprintln!("Deploying {} to {} ...", name, cloud_url);
 
     let url = format!("{}/api/v1/deploy", cloud_url.trim_end_matches('/'));
-    let response: ureq::Response = ureq::post(&url)
-        .set("Authorization", &format!("Bearer {}", token))
-        .set("Content-Type", "application/gzip")
-        .send_bytes(&tarball)
-        .map_err(|e| match e {
-            ureq::Error::Transport(inner) => NuError::PackageError {
-                msg: format!("Failed to connect to {}: {}", cloud_url, inner),
-                span: Span::default(),
-            },
-            ureq::Error::Status(code, resp) => {
-                let body = resp.into_string().unwrap_or_default();
-                NuError::PackageError {
-                    msg: if code == 401 {
-                        "Authentication failed. Check your NULANG_CLOUD_TOKEN.".to_string()
-                    } else {
-                        format!("Deploy failed: {} — {}", code, body)
-                    },
-                    span: Span::default(),
-                }
-            }
+    // ureq 3 returns only the status code on 4xx/5xx errors. Disable that
+    // conversion for this one request so cloud diagnostic bodies and the
+    // special 401 guidance remain available without weakening TLS.
+    let agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+    let mut response = agent
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Content-Type", "application/gzip")
+        .send(&tarball)
+        .map_err(|e| NuError::PackageError {
+            msg: format!("Failed to connect to {}: {}", cloud_url, e),
+            span: Span::default(),
         })?;
-
-    let body = response.into_string().map_err(|e| NuError::PackageError {
-        msg: format!("failed to read response: {}", e),
-        span: Span::default(),
-    })?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        let diagnostic = response.body_mut().read_to_string().unwrap_or_default();
+        return Err(NuError::PackageError {
+            msg: deploy_http_error_message(status, &diagnostic),
+            span: Span::default(),
+        });
+    }
+    let body = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| NuError::PackageError {
+            msg: format!("failed to read response: {}", e),
+            span: Span::default(),
+        })?;
     let deploy: DeployResponse =
         serde_json::from_str(&body).map_err(|e| NuError::PackageError {
             msg: format!("invalid response from cloud: {}", e),
@@ -2606,6 +2622,23 @@ fn cmd_remove(name: Option<&str>) -> NuResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "ureq")]
+    #[test]
+    fn cloud_deploy_http_errors_preserve_auth_hint_and_server_body() {
+        assert_eq!(
+            deploy_http_error_message(401, "bad-token"),
+            "Authentication failed. Check your NULANG_CLOUD_TOKEN."
+        );
+        assert_eq!(
+            deploy_http_error_message(409, "existing-deployment"),
+            "Deploy failed: 409 — existing-deployment"
+        );
+        assert_eq!(
+            deploy_http_error_message(503, "maintenance"),
+            "Deploy failed: 503 — maintenance"
+        );
+    }
 
     #[test]
     fn test_manifest_language_pin() {

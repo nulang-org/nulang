@@ -107,7 +107,7 @@ mio = { version = "1.2", features = ["os-poll", "net"], optional = true }
 libc = "0.2"
 httparse = "1"
 # HTTP client (synchronous, for standalone VM)
-ureq = { version = "2", optional = true }
+ureq = { version = "3.5.0", default-features = false, features = ["rustls", "gzip"], optional = true }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
