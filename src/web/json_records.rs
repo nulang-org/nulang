@@ -15,12 +15,16 @@ use std::fmt;
 pub enum JsonType {
     Scalar(String),
     Record(Vec<(String, JsonType)>),
+    /// Existing Nulang Option[T] variant ABI: None is the bare "None"
+    /// string tag; Some(value) is a { ctor: "Some", payload: value } record.
+    Optional(Box<JsonType>),
 }
 
 impl JsonType {
     pub fn wire_name(&self) -> String {
         match self {
             Self::Scalar(name) => name.clone(),
+            Self::Optional(inner) => format!("Option[{}]", inner.wire_name()),
             Self::Record(fields) => format!(
                 "{{ {} }}",
                 fields
@@ -103,8 +107,27 @@ pub fn parse_json_type(ty: &str) -> Option<JsonType> {
             Some(JsonType::Record(fields))
         } else {
             let name = ident(text, pos)?;
-            matches!(name, "String" | "Int" | "Float" | "Bool")
-                .then(|| JsonType::Scalar(name.to_string()))
+            if name == "Option" {
+                whitespace(bytes, pos);
+                if bytes.get(*pos) != Some(&b'[') {
+                    return None;
+                }
+                *pos += 1;
+                let inner = parse(text, pos, depth + 1, count)?;
+                // Option[Option[T]] would not round-trip through JSON null.
+                if matches!(inner, JsonType::Optional(_)) {
+                    return None;
+                }
+                whitespace(bytes, pos);
+                if bytes.get(*pos) != Some(&b']') {
+                    return None;
+                }
+                *pos += 1;
+                Some(JsonType::Optional(Box::new(inner)))
+            } else {
+                matches!(name, "String" | "Int" | "Float" | "Bool")
+                    .then(|| JsonType::Scalar(name.to_string()))
+            }
         }
     }
     let mut pos = 0;
@@ -135,6 +158,7 @@ pub fn parse_flat_record_type(ty: &str) -> Option<Vec<(String, String)>> {
 pub enum JsonBoundValue {
     Scalar(Constant),
     Record(Vec<(String, JsonBoundValue)>),
+    Optional(Option<Box<JsonBoundValue>>),
 }
 
 // Deserialize keys without losing duplicate-key evidence. serde_json::Value
@@ -271,21 +295,30 @@ pub fn decode_nested_record(
     fn decode(value: StrictJsonValue, schema: &JsonType) -> Result<JsonBoundValue, String> {
         match (value, schema) {
             (StrictJsonValue::Object(mut fields), JsonType::Record(expected)) => {
-                if fields.len() != expected.len() {
-                    return Err("JSON object fields do not match declared request type".into());
+                if fields
+                    .keys()
+                    .any(|key| !expected.iter().any(|(name, _)| name == key))
+                {
+                    return Err("JSON object has undeclared field".into());
                 }
                 let mut result = Vec::with_capacity(expected.len());
                 for (name, ty) in expected {
-                    let value = fields
-                        .remove(name)
-                        .ok_or_else(|| format!("missing JSON field '{name}'"))?;
-                    result.push((
-                        name.clone(),
-                        decode(value, ty).map_err(|why| format!("JSON field '{name}': {why}"))?,
-                    ));
+                    let field = match fields.remove(name) {
+                        Some(value) => decode(value, ty),
+                        None if matches!(ty, JsonType::Optional(_)) => {
+                            Ok(JsonBoundValue::Optional(None))
+                        }
+                        None => Err(format!("missing JSON field '{name}'")),
+                    }
+                    .map_err(|why| format!("JSON field '{name}': {why}"))?;
+                    result.push((name.clone(), field));
                 }
                 Ok(JsonBoundValue::Record(result))
             }
+            (StrictJsonValue::Null, JsonType::Optional(_)) => Ok(JsonBoundValue::Optional(None)),
+            (value, JsonType::Optional(inner)) => Ok(JsonBoundValue::Optional(Some(Box::new(
+                decode(value, inner)?,
+            )))),
             (StrictJsonValue::String(s), JsonType::Scalar(ty)) if ty == "String" => {
                 Ok(JsonBoundValue::Scalar(Constant::String(s)))
             }
@@ -306,7 +339,9 @@ pub fn decode_nested_record(
     }
     match decode(json, schema)? {
         JsonBoundValue::Record(fields) => Ok(fields),
-        JsonBoundValue::Scalar(_) => Err("expected JSON object".into()),
+        JsonBoundValue::Scalar(_) | JsonBoundValue::Optional(_) => {
+            Err("expected JSON object".into())
+        }
     }
 }
 
@@ -324,7 +359,7 @@ mod tests {
             "{ name: String, address: { city: String, zip: Int }, active: Bool }"
         );
         for bad in [
-            "{ name: Option[String] }",
+            "{ name: Option[Option[String]] }",
             "{ name: String, address: { city: String, city: String } }",
             "{ items: [Int] }",
             "{ nested: { bad: Unknown } }",
@@ -333,6 +368,14 @@ mod tests {
         ] {
             assert!(parse_json_type(bad).is_none(), "{bad}");
         }
+        let optional = parse_json_type(
+            "{ name: String, nickname: Option[String], address: Option[{ city: String }] }",
+        )
+        .expect("option field");
+        assert_eq!(
+            optional.wire_name(),
+            "{ name: String, nickname: Option[String], address: Option[{ city: String }] }"
+        );
         let mut nested = "Int".to_string();
         for _ in 0..10 {
             nested = format!("{{ child: {nested} }}");
@@ -359,6 +402,31 @@ mod tests {
             r#"{"name":"Ada","address":[]}"#,
         ] {
             assert!(decode_nested_record(bad, &shape).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn optional_fields_decode_missing_null_some_and_reject_wrong_types() {
+        let ty = parse_json_type("{ age: Int, nickname: Option[String] }").unwrap();
+        for body in [r#"{"age":5}"#, r#"{"age":5,"nickname":null}"#] {
+            let fields = decode_nested_record(body, &ty).unwrap();
+            assert!(
+                matches!(&fields[1].1, JsonBoundValue::Optional(None)),
+                "{body}"
+            );
+        }
+        let fields = decode_nested_record(r#"{"age":5,"nickname":"None"}"#, &ty).unwrap();
+        assert!(matches!(&fields[1].1,
+            JsonBoundValue::Optional(Some(value))
+            if matches!(value.as_ref(), JsonBoundValue::Scalar(Constant::String(s)) if s == "None")
+        ));
+        for invalid in [
+            r#"{"age":5,"nickname":42}"#,
+            r#"{"age":5,"nickname":null,"nickname":"Ada"}"#,
+            r#"{"age":5,"nickname":null,"admin":true}"#,
+            r#"{"nickname":null}"#,
+        ] {
+            assert!(decode_nested_record(invalid, &ty).is_err(), "{invalid}");
         }
     }
 

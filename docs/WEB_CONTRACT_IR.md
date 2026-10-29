@@ -328,8 +328,9 @@ fn create_user(input: CreateUser from json) -> String {
 Request bodies must be JSON objects with the exact declared field names.
 Missing fields, unknown fields (including privilege-escalation fields), wrong
 scalar types, malformed input, and duplicate root-level keys are rejected
-with a 400 problem response. This deliberately does not implement optional,
-nested, collection, union, or user-defined custom scalar decoding.
+with a 400 problem response. Later experimental extensions support nested
+records and optional Option[T] fields; collection, arbitrary union, and
+user-defined custom scalar decoding remain unsupported.
 
 The compiler carries record slot IDs into bytecode metadata so the HTTP
 adapter materializes Nulang VM records using the same offsets the compiled
@@ -386,11 +387,37 @@ type UserView = {
 }
 ```
 
-Option/nullable fields, arrays, named nested type aliases that do not
-currently typecheck as nested structural records, custom scalars,
-non-200 status variants, streaming, and response envelopes remain separate
-work. In particular, the HTTP adapter must not invent an `Option[T]` VM
-representation by interpreting null or missing JSON as `nil`.
+### Optional JSON fields (existing Option[T] ABI)
+
+The compiler-backed request/response path supports `Option[T]` as a field in
+closed record DTOs when T is a supported primitive or inline nested record:
+
+```nulang
+type Option[T] = Some(T) | None
+type Edit = { nickname: Option[String], age: Int }
+```
+
+At the HTTP boundary, both a missing optional property and explicit JSON
+`null` decode to Nulang's existing nullary `None` variant (the literal
+`"None"` tag). A present, correctly typed JSON value becomes the existing
+payload-carrying `Some(value)` variant, represented in the VM as a record
+with `ctor: "Some"` and `payload: value`. In particular, a present JSON
+string `"None"` remains `Some("None")`, not `None`. There is no silent
+conversion to VM `nil`.
+
+Typed JSON responses serialize `Some(value)` as the JSON value and `None`
+as JSON `null`. Fields are included as null even though they may be omitted
+in requests. OpenAPI marks `Option[T]` properties as non-required and gives
+them a nullable schema (`anyOf` with `type: "null"`).
+Ordinary nonoptional fields remain required and reject JSON `null`.
+
+This is a deliberately bounded adapter, not general automatic Option
+derivation: `Option[Option[T]]` (ambiguous null round-tripping), arrays,
+named nested type aliases that do not typecheck as structural records,
+custom scalar decoders, non-200 status variants, and streaming are excluded.
+Optional top-level request bodies (`from json` directly on `Option[T]`)
+are not supported; the nullable contract is for fields in closed records.
+
 
 ## Remaining implementation priorities
 

@@ -292,12 +292,17 @@ fn schema_for_type(ty: Option<&str>) -> Value {
     fn record_schema(ty: &crate::web::json_records::JsonType) -> Value {
         match ty {
             crate::web::json_records::JsonType::Scalar(name) => schema_for_type(Some(name)),
+            crate::web::json_records::JsonType::Optional(inner) => json!({
+                "anyOf": [record_schema(inner), { "type": "null" }]
+            }),
             crate::web::json_records::JsonType::Record(fields) => {
                 let mut properties = Map::new();
                 let mut required = Vec::new();
                 for (name, field_ty) in fields {
                     properties.insert(name.clone(), record_schema(field_ty));
-                    required.push(name.clone());
+                    if !matches!(field_ty, crate::web::json_records::JsonType::Optional(_)) {
+                        required.push(name.clone());
+                    }
                 }
                 json!({
                     "type": "object", "properties": Value::Object(properties),
@@ -306,10 +311,10 @@ fn schema_for_type(ty: Option<&str>) -> Value {
             }
         }
     }
-    if let Some(crate::web::json_records::JsonType::Record(fields)) =
-        ty.and_then(crate::web::json_records::parse_json_type)
-    {
-        return record_schema(&crate::web::json_records::JsonType::Record(fields));
+    if let Some(schema) = ty.and_then(crate::web::json_records::parse_json_type) {
+        if !matches!(schema, crate::web::json_records::JsonType::Scalar(_)) {
+            return record_schema(&schema);
+        }
     }
     match ty.map(str::trim) {
         Some("Int") => json!({ "type": "integer", "format": "int64" }),
@@ -474,6 +479,34 @@ mod tests {
     fn raw_body_does_not_invent_an_openapi_media_type() {
         let body = binding(RouteBindingSource::Body, "body", "Payload");
         assert!(form_request_body(&[body]).is_none());
+    }
+
+    #[test]
+    fn option_record_fields_are_nullable_and_not_required() {
+        let schema = schema_for_type(Some(
+            "{ age: Int, nickname: Option[String], address: Option[{ city: String }] }",
+        ));
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"], serde_json::json!(["age"]));
+        assert_eq!(
+            schema["properties"]["nickname"]["anyOf"][0]["type"],
+            "string"
+        );
+        assert_eq!(schema["properties"]["nickname"]["anyOf"][1]["type"], "null");
+        assert_eq!(
+            schema["properties"]["address"]["anyOf"][0]["type"],
+            "object"
+        );
+        assert_eq!(
+            schema["properties"]["address"]["anyOf"][0]["properties"]["city"]["type"],
+            "string"
+        );
+        assert_eq!(schema["properties"]["address"]["anyOf"][1]["type"], "null");
+        assert_eq!(
+            schema_for_type(Some("Option[Int]"))["anyOf"][0]["type"],
+            "integer"
+        );
     }
 
     #[test]
