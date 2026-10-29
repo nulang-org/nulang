@@ -583,6 +583,9 @@ pub struct Runtime {
     pub(crate) actor_ui_stream_token: Arc<()>,
     pub(crate) actor_ui_stream_bindings:
         HashMap<u64, Vec<std::sync::Weak<http_server::UiActorStreamBindingInner>>>,
+    /// Native scoped effects require explicit trusted server attachment.
+    native_ui_publisher: Option<http_server::ScopedUiPublisher>,
+    native_ui_bindings: HashMap<(u64, String, String), http_server::ScopedUiActorBinding>,
     // Test effect interception is deliberately absent from production builds:
     // privileged host effects must not have a pre-authority dispatch hook.
     #[cfg(test)]
@@ -732,6 +735,8 @@ impl Runtime {
             http_server: None,
             actor_ui_stream_token: Arc::new(()),
             actor_ui_stream_bindings: HashMap::new(),
+            native_ui_publisher: None,
+            native_ui_bindings: HashMap::new(),
             #[cfg(test)]
             test_handlers: HashMap::new(),
             shard_idx: 0,
@@ -6584,8 +6589,82 @@ impl Runtime {
         exit::kill_actor(self, actor_id)
     }
 
+    /// The trusted embedding server may enable the native scoped UI effects.
+    /// Without an attached server all language-level operations fail closed.
+    pub fn attach_scoped_ui_publisher(&mut self, publisher: http_server::ScopedUiPublisher) {
+        for binding in self.native_ui_bindings.values() {
+            binding.cancel();
+        }
+        self.native_ui_bindings.clear();
+        self.native_ui_publisher = Some(publisher);
+    }
+
+    /// Remove the host capability and cancel all native stream owners.
+    pub fn detach_scoped_ui_publisher(&mut self) {
+        for binding in self.native_ui_bindings.values() {
+            binding.cancel();
+        }
+        self.native_ui_bindings.clear();
+        self.native_ui_publisher = None;
+    }
+
+    /// Actor identity is never supplied by bytecode, only by this runtime.
+    pub(crate) fn native_scoped_ui_bind(&mut self, app: &str, room: &str) -> bool {
+        let Some(owner) = self.current_actor else {
+            return false;
+        };
+        let Some(publisher) = self.native_ui_publisher.clone() else {
+            return false;
+        };
+        let key = (owner, app.to_string(), room.to_string());
+        if self.native_ui_bindings.contains_key(&key) {
+            return false;
+        }
+        let Some(binding) = publisher.bind_actor(self, owner, app, room) else {
+            return false;
+        };
+        self.native_ui_bindings.insert(key, binding);
+        true
+    }
+
+    pub(crate) fn native_scoped_ui_patch(
+        &self,
+        app: &str,
+        room: &str,
+        target: &str,
+        html: &str,
+    ) -> bool {
+        let Some(owner) = self.current_actor else {
+            return false;
+        };
+        self.native_ui_bindings
+            .get(&(owner, app.to_string(), room.to_string()))
+            .is_some_and(|binding| binding.publish(self, owner, target, html))
+    }
+
+    pub(crate) fn native_scoped_ui_cancel(&mut self, app: &str, room: &str) -> bool {
+        let Some(owner) = self.current_actor else {
+            return false;
+        };
+        let Some(binding) =
+            self.native_ui_bindings
+                .remove(&(owner, app.to_string(), room.to_string()))
+        else {
+            return false;
+        };
+        binding.cancel();
+        true
+    }
+
     /// Called by the shared actor reaping path, including supervised exits.
     pub(crate) fn cancel_actor_ui_stream_bindings(&mut self, actor_id: u64) {
+        self.native_ui_bindings.retain(|(owner, _, _), binding| {
+            if *owner != actor_id {
+                return true;
+            }
+            binding.cancel();
+            false
+        });
         if let Some(bindings) = self.actor_ui_stream_bindings.remove(&actor_id) {
             for binding in bindings {
                 if let Some(binding) = binding.upgrade() {

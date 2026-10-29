@@ -1482,6 +1482,12 @@ impl WebDevServer {
         }
     }
 
+    /// Explicitly enable native Nulang actor-scoped UI effects for this
+    /// server. The configured host authorizer still gates subscriptions.
+    pub fn attach_scoped_ui_to_runtime(&self, runtime: &mut super::Runtime) {
+        runtime.attach_scoped_ui_publisher(self.scoped_ui_publisher());
+    }
+
     /// Hosts must provide a verifier for authenticated session and room access.
     pub fn bind_with_ui_authorizer(
         port: u16,
@@ -2511,6 +2517,58 @@ mod tests {
         let public_snapshot = sse_tcp_frame(&mut public);
         assert!(!public_snapshot.contains("private"), "{public_snapshot}");
         drop(public);
+    }
+
+    #[test]
+    fn native_scoped_realtime_actor_effects_fail_closed_and_deliver() {
+        use crate::runtime::{ExitReason, Runtime};
+        let mut runtime = Runtime::new();
+        let owner = runtime.spawn_actor(Box::new(|| vec![]));
+        let other = runtime.spawn_actor(Box::new(|| vec![]));
+
+        // No Rust host opt-in must mean no access to the private broker.
+        runtime.current_actor = Some(owner);
+        assert!(!runtime.native_scoped_ui_bind("billing", "invoices"));
+
+        let auth: UiStreamAuthorizer =
+            Arc::new(|_, app, room| app == "billing" && room == "invoices");
+        let server = WebDevServer::bind_with_ui_authorizer(0, None, None, vec![], auth).unwrap();
+        server.attach_scoped_ui_to_runtime(&mut runtime);
+
+        runtime.current_actor = None;
+        assert!(!runtime.native_scoped_ui_bind("billing", "invoices"));
+        runtime.current_actor = Some(owner);
+        assert!(runtime.native_scoped_ui_bind("billing", "invoices"));
+        assert!(!runtime.native_scoped_ui_bind("billing", "invoices"));
+        assert!(!runtime.native_scoped_ui_bind("../billing", "invoices"));
+
+        let mut client = scoped_tcp_connect(server.port, "billing", "invoices", "");
+        assert!(sse_tcp_frame(&mut client).starts_with("HTTP/1.1 200 OK"));
+        assert!(sse_tcp_frame(&mut client).contains("nulang-ui-snapshot"));
+
+        runtime.current_actor = Some(other);
+        assert!(!runtime.native_scoped_ui_patch("billing", "invoices", "#status", "<p>forged</p>"));
+        assert!(!runtime.native_scoped_ui_cancel("billing", "invoices"));
+        runtime.current_actor = Some(owner);
+        assert!(runtime.native_scoped_ui_patch("billing", "invoices", "#status", "<p>private</p>"));
+        let patch = sse_tcp_frame(&mut client);
+        assert!(patch.contains("event: nulang-ui-patch"), "{patch}");
+        assert!(patch.contains("private"), "{patch}");
+
+        runtime.current_actor = None;
+        assert!(!runtime.native_scoped_ui_patch("billing", "invoices", "#status", "<p>bad</p>"));
+        runtime.current_actor = Some(owner);
+        assert!(runtime.native_scoped_ui_cancel("billing", "invoices"));
+        assert!(!runtime.native_scoped_ui_cancel("billing", "invoices"));
+        assert!(!runtime.native_scoped_ui_patch("billing", "invoices", "#status", "<p>after</p>"));
+        assert!(
+            runtime.native_scoped_ui_bind("billing", "invoices"),
+            "cancel frees room for a fresh binding"
+        );
+        runtime.exit_actor(owner, ExitReason::Normal);
+        runtime.current_actor = Some(owner);
+        assert!(!runtime.native_scoped_ui_patch("billing", "invoices", "#status", "<p>dead</p>"));
+        assert!(!runtime.native_scoped_ui_bind("billing", "invoices"));
     }
 
     #[test]
