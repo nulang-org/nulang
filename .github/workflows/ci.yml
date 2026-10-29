@@ -60,8 +60,14 @@ jobs:
       - name: Smoke test Nulang Web patch request ordering
         run: node scripts/tests/web_action_patch_race.mjs
 
+      - name: Smoke test Nulang Web action scheduling and combined revalidation
+        run: node scripts/tests/web_action_coordination.mjs
+
       - name: Smoke test Nulang Web selective revalidation
         run: node scripts/tests/web_action_revalidation.mjs
+
+      - name: Smoke test Nulang Web action versus SSE race
+        run: node scripts/tests/web_action_sse_race.mjs
 
       - name: Smoke test Nulang Web scoped overlay lifecycles
         run: node scripts/tests/web_overlay_lifecycle.mjs
@@ -72,6 +78,9 @@ jobs:
 
       - name: Smoke test Nulang Web DOM morph in Chrome
         run: node scripts/tests/web_dom_morph_browser.mjs
+
+      - name: Smoke test Nulang Web native overlays in Chrome
+        run: node scripts/tests/web_overlay_chromium.mjs
 
       - name: Install docs dependencies
         run: |

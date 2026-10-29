@@ -43,18 +43,20 @@ function setup(policy) {
   class FormData {
     forEach(callback) { callback(field, 'name'); }
   }
+  const window = { location: { href: 'https://example.test/', reload() { throw Error('unexpected reload'); } } };
   const fetch = (_url, options) => new Promise((resolve, reject) => {
     requests.push({ resolve, reject, options });
   });
   runInNewContext(match[1], {
     document, DOMParser, FormData, URLSearchParams, fetch, AbortController,
-    window: { location: { href: 'https://example.test/', reload() { throw Error('unexpected reload'); } } },
+    window,
     console: { error(...args) { errors.push(args.join(' ')); }, warn() {} }
   }, { timeout: 1000 });
   const submit = () => listeners.get('submit')({ preventDefault() {} });
   return {
     requests, errors, form, submit,
     setField(v) { field = v; },
+    navigateTo(url) { window.location.href = url; },
     getText() { return text; },
     getReplacements() { return replaceCount; }
   };
@@ -152,4 +154,16 @@ const flush = async () => {
   await flush();
   assert.equal(h.getText(), 'original');
 }
+{
+  const h = setup('queue');
+  h.submit();
+  h.submit();
+  h.navigateTo('https://example.test/other-route');
+  h.requests[0].resolve(html('obsolete'));
+  await flush();
+  assert.equal(h.requests.length, 1,
+    'queued mutations must not post to a previous route after navigation');
+  assert.equal(h.getText(), 'Initial');
+}
+
 console.log('Nulang Web: drop/queue/replace action coordination verified');

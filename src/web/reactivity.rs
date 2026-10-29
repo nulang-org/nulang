@@ -1430,7 +1430,8 @@ pub fn generate_client_runtime() -> String {
     const lane = target ? (policy === 'replace' || !activeLane
       ? {policy: policy, queue: []} : activeLane) : null;
     const job = {handler: handler, target: target, keys: keys, body: body,
-      revalidate: revalidate, requestUrl: requestUrl, lane: lane};
+      revalidate: revalidate, requestUrl: requestUrl, lane: lane,
+      ownerScope: ownerScope};
     if (activeLane && policy === 'queue') {
       return new Promise(function (resolve, reject) {
         activeLane.queue.push({job: job, resolve: resolve, reject: reject});
@@ -1448,16 +1449,19 @@ pub fn generate_client_runtime() -> String {
     const controller = target && typeof AbortController === 'function'
       ? new AbortController() : null;
     const request = target ? {controller: controller, lane: lane} : null;
-    keys.forEach(function (key) {
+    const claims = keys.map(function (key) {
       pendingPatches.set(key, request);
-      touchTarget(key);
+      return {key: key, generation: touchTarget(key)};
     });
     previous.forEach(function (pending) {
       if (pending.controller) pending.controller.abort();
     });
     const isCurrent = () => window.location.href === requestUrl &&
       (!target || actionLanes.get(target) === lane) &&
-      keys.every(function (key) { return pendingPatches.get(key) === request; });
+      claims.every(function (claim) {
+        return pendingPatches.get(claim.key) === request &&
+          targetGenerations.get(claim.key) === claim.generation;
+      });
     try {
       const options = {method: 'POST', body: body};
       if (controller) options.signal = controller.signal;
@@ -1481,12 +1485,20 @@ pub fn generate_client_runtime() -> String {
         if (pendingPatches.get(key) === request) pendingPatches.delete(key);
       });
       if (target && actionLanes.get(target) === lane) {
-        if (lane.policy === 'queue' && lane.queue.length) {
+        let started = false;
+        // Cancel every queued mutation whose original page or overlay scope
+        // disappeared. Never issue a POST against a route the user left.
+        while (lane.policy === 'queue' && lane.queue.length && !started) {
           const next = lane.queue.shift();
-          executeServerAction(next.job).then(next.resolve, next.reject);
-        } else {
-          actionLanes.delete(target);
+          if (window.location.href !== next.job.requestUrl ||
+              (next.job.ownerScope && !next.job.ownerScope.active)) {
+            next.reject(new Error('Nulang queued action canceled by navigation or overlay close'));
+          } else {
+            started = true;
+            executeServerAction(next.job).then(next.resolve, next.reject);
+          }
         }
+        if (!started) actionLanes.delete(target);
       }
     }
   }
@@ -1622,6 +1634,7 @@ pub fn generate_client_runtime() -> String {
     scope.active = false;
     overlays.delete(scope.target);
     if (scope.controller) scope.controller.abort();
+    if (scope.observer) scope.observer.disconnect();
     if (scope.dialog) {
       if (scope.onCancel) scope.dialog.removeEventListener('cancel', scope.onCancel);
       if (scope.onClose) scope.dialog.removeEventListener('close', scope.onClose);
@@ -1667,7 +1680,8 @@ pub fn generate_client_runtime() -> String {
     const scope = {
       target: target, active: true, dialog: null, controller: controller,
       previousFocus: document.activeElement, pageUrl: window.location.href,
-      resolve: null, reject: null, onCancel: null, onClose: null, opened: false
+      resolve: null, reject: null, onCancel: null, onClose: null, observer: null,
+      opened: false
     };
     const result = new Promise(function (resolve, reject) {
       scope.resolve = resolve;
@@ -1707,6 +1721,14 @@ pub fn generate_client_runtime() -> String {
       dialog.addEventListener('close', scope.onClose);
       dialog.showModal();
       scope.opened = true;
+      // Some hosts defer or omit the native close event. Observe the actual
+      // dialog state so a closed scope never retains an unresolved promise.
+      if (typeof MutationObserver === 'function') {
+        scope.observer = new MutationObserver(function () {
+          if (scope.active && scope.opened && !dialog.open) cancelOverlay(target);
+        });
+        scope.observer.observe(dialog, {attributes: true, attributeFilter: ['open']});
+      }
     }).catch(function (error) {
       if (scope.active) settleOverlay(scope, error);
     });

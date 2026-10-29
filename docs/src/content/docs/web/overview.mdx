@@ -297,14 +297,34 @@ Duplicate, overlapping, missing, or arbitrary CSS targets are rejected. Invalid
 revalidation declarations fail **before** the POST is submitted. Non-HTML,
 failed, or redirected GET responses leave the displayed regions unchanged.
 
-The latest submission wins across all claimed regions, including when two
-different actions both revalidate the same summary. Fetch cancellation is
-best-effort and cannot roll back server-side mutations. This is **explicit
+By default (`replace`), the latest submission wins across all claimed
+regions, including when two actions revalidate the same summary. Actions may
+instead opt into `drop` to suppress overlapping submissions or `queue` to run
+up to 32 pending actions sequentially **through their revalidation GET**.
+Queued submissions snapshot the form payload and idempotency key at submission
+time. Switching policy mid-request, using a policy without a patch target, or
+colliding with another active non-replace lane fails closed. No client policy
+can undo a server mutation, and overlapping ancestor/descendant selectors
+remain outside this contract. Fetch cancellation is best-effort and cannot
+roll back server-side mutations. This is **explicit
 DOM-region revalidation**, not automatic typed loader dependency inference:
 Web Contract IR does not yet validate these region names or derive database
 read dependencies. To avoid redundant work, declare only regions that actually
 depend on the mutated data. An application must still enforce idempotency,
 authorization, and transactional consistency on the server.
+
+### Action scheduling (experimental)
+
+On a form or action control, use `data-nulang-coordination="replace"` (default),
+`"drop"`, or `"queue"` with an exact `data-nulang-target="#id"`.
+`drop` ignores duplicate clicks while a request is pending; `queue` runs
+requests in interaction order, including the authoritative multi-region GET.
+The browser rejects invalid policies and enforces a maximum of 32 queued
+actions. Apply server-side idempotency and transaction ordering separately;
+client-side cancellation is never a server rollback. Queued mutations are
+canceled rather than sent after navigation or an owning overlay closes.
+In-flight multi-region GET responses are discarded when a newer SSE patch
+updates a claimed region, so stale canonical HTML cannot roll that patch back.
 
 For statically recognized `el(...)` actions and compiler-generated JSX
 actions, the compiler also projects `target` and `coordination` as typed
@@ -404,7 +424,9 @@ unrecognized or unbounded values are rejected by the client. Calling
 `window.nulang.overlay.cancel("#editor")`, pressing Escape, or closing a
 native dialog rejects the pending promise and cleans up event listeners.
 Previously focused controls regain focus. Navigation during loading also
-settles the promise instead of leaving a stale overlay active.
+settles the promise instead of leaving a stale overlay active. Native dialog
+closure is also detected by observing the `open` state in case a host
+delays or omits the `close` event.
 
 Server actions submitted from an active overlay may update **only elements
 within that overlay**, including secondary revalidation targets. Parent-view
