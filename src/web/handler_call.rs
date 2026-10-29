@@ -46,57 +46,23 @@ pub fn render_bound_handler_with_response_type(
             {
                 return Err("compiled record field-layout metadata is missing; refusing unsafe JSON DTO injection".to_string());
             }
-            // Compiler record fields are indexed module-wide, not in the
-            // source DTO's local declaration order. Preserve those IDs.
-            let mut field_indices = Vec::with_capacity(fields.len());
-            for (name, _) in fields {
-                let index = match executable
-                    .record_field_names
-                    .iter()
-                    .position(|field| field == name)
-                {
-                    Some(index) => index,
-                    None => {
-                        executable.record_field_names.push(name.clone());
-                        executable.record_field_names.len() - 1
-                    }
-                };
-                field_indices.push(index);
-            }
-            let slot_count = executable.record_field_names.len();
-            if slot_count > u8::MAX as usize {
-                return Err("JSON record exceeds the VM's 255-slot record ABI".to_string());
-            }
-            let scratch = handler_param_count
-                .checked_add(1)
+            let root = crate::web::json_records::JsonBoundValue::Record(fields.clone());
+            // Collect all names first: every nested RecMk needs a record
+            // large enough for *module-wide* field IDs (not field order).
+            register_json_record_fields(&mut executable, &root)?;
+            let scalar_scratch = handler_param_count
+                .checked_add(10)
                 .filter(|slot| *slot <= u8::MAX as usize)
-                .ok_or("JSON record requires an available scratch VM register")?
+                .ok_or("JSON record staging requires ten available VM registers")?
                 as u8;
-            executable.emit(Instruction::new2(
-                OpCode::RecMk,
-                slot_count as u8,
+            emit_json_argument(
+                &mut executable,
+                &root,
                 arg.handler_index as u8,
-            ));
-            for ((_, field_value), field_idx) in fields.iter().zip(field_indices) {
-                let constant_index = executable.add_constant(field_value.clone());
-                if constant_index > u16::MAX as usize {
-                    return Err(
-                        "route argument constant pool exceeds 16-bit ConstU index".to_string()
-                    );
-                }
-                executable.emit(Instruction::new3(
-                    OpCode::ConstU,
-                    ((constant_index >> 8) & 0xFF) as u8,
-                    (constant_index & 0xFF) as u8,
-                    scratch,
-                ));
-                executable.emit(Instruction::new3(
-                    OpCode::RecS,
-                    arg.handler_index as u8,
-                    field_idx as u8,
-                    scratch,
-                ));
-            }
+                handler_param_count,
+                0,
+                scalar_scratch,
+            )?;
         } else {
             let constant_index = executable.add_constant(arg.value.clone());
             if constant_index > u16::MAX as usize {
@@ -147,6 +113,98 @@ pub fn render_bound_handler_with_response_type(
     Ok(vm.value_to_string(0, result))
 }
 
+/// Register all field names before any RecMk, preserving compiler-assigned
+/// IDs and ensuring records share the same module-global slot count.
+fn register_json_record_fields(
+    module: &mut CodeModule,
+    value: &crate::web::json_records::JsonBoundValue,
+) -> Result<(), String> {
+    use crate::web::json_records::JsonBoundValue;
+    if module.record_field_names.len() > u8::MAX as usize {
+        return Err("JSON record field layout exceeds 255 slots".into());
+    }
+    if let JsonBoundValue::Record(fields) = value {
+        for (name, nested) in fields {
+            if !module
+                .record_field_names
+                .iter()
+                .any(|existing| existing == name)
+            {
+                if module.record_field_names.len() >= u8::MAX as usize {
+                    return Err("JSON record field layout exceeds 255 slots".into());
+                }
+                module.record_field_names.push(name.clone());
+            }
+            register_json_record_fields(module, nested)?;
+        }
+    }
+    Ok(())
+}
+
+/// Materialize a tree into Nulang's record ABI before calling the handler.
+/// Each recursion level owns its scratch register; the leaf scalar register
+/// is separate, so a child cannot overwrite its parent before RecS.
+fn emit_json_argument(
+    module: &mut CodeModule,
+    value: &crate::web::json_records::JsonBoundValue,
+    dst: u8,
+    param_count: usize,
+    depth: usize,
+    scalar_scratch: u8,
+) -> Result<(), String> {
+    use crate::web::json_records::JsonBoundValue;
+    match value {
+        JsonBoundValue::Scalar(constant) => {
+            let index = module.add_constant(constant.clone());
+            if index > u16::MAX as usize {
+                return Err("JSON constant pool exceeds VM 16-bit index".into());
+            }
+            module.emit(Instruction::new3(
+                OpCode::ConstU,
+                (index >> 8) as u8,
+                (index & 255) as u8,
+                dst,
+            ));
+        }
+        JsonBoundValue::Record(fields) => {
+            if depth > 8 {
+                return Err("nested JSON record exceeds depth limit".into());
+            }
+            module.emit(Instruction::new2(
+                OpCode::RecMk,
+                module.record_field_names.len() as u8,
+                dst,
+            ));
+            for (name, child) in fields {
+                let fid = module
+                    .record_field_names
+                    .iter()
+                    .position(|field| field == name)
+                    .ok_or("unregistered JSON record field")? as u8;
+                let target = if matches!(child, JsonBoundValue::Scalar(_)) {
+                    scalar_scratch
+                } else {
+                    param_count
+                        .checked_add(depth + 1)
+                        .filter(|index| *index < scalar_scratch as usize)
+                        .ok_or("nested JSON record scratch register overflow")?
+                        as u8
+                };
+                emit_json_argument(
+                    module,
+                    child,
+                    target,
+                    param_count,
+                    depth + 1,
+                    scalar_scratch,
+                )?;
+                module.emit(Instruction::new3(OpCode::RecS, dst, fid, target));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Convert VM values only through their checked runtime representations.
 /// In particular, a Record pointer must never reach value_to_string, which
 /// treats arbitrary pointers as C strings.
@@ -177,8 +235,12 @@ fn typed_json_value(
             .map(Value::Bool)
             .ok_or_else(|| "typed JSON response expected Bool".to_string()),
         _ => {
-            let fields = crate::web::json_records::parse_flat_record_type(ty)
-                .ok_or_else(|| "unsupported typed JSON response schema".to_string())?;
+            let crate::web::json_records::JsonType::Record(fields) =
+                crate::web::json_records::parse_json_type(ty)
+                    .ok_or_else(|| "unsupported typed JSON response schema".to_string())?
+            else {
+                return Err("expected typed JSON record schema".into());
+            };
             let values = vm
                 .record_field_values(value)
                 .ok_or_else(|| "typed JSON response expected a VM record".to_string())?;
@@ -198,7 +260,7 @@ fn typed_json_value(
                 })?;
                 object.insert(
                     name.clone(),
-                    typed_json_value(vm, *slot, record_names, &field_ty)
+                    typed_json_value(vm, *slot, record_names, &field_ty.wire_name())
                         .map_err(|_| format!("typed JSON response invalid field '{name}'"))?,
                 );
             }
@@ -269,7 +331,10 @@ mod tests {
         let arg = BoundRouteArgument {
             handler_index: 0,
             value: Constant::Nil,
-            record_fields: Some(vec![("name".into(), Constant::String("Ada".into()))]),
+            record_fields: Some(vec![(
+                "name".into(),
+                crate::web::json_records::JsonBoundValue::Scalar(Constant::String("Ada".into())),
+            )]),
         };
         let error = render_bound_handler(&module, 0, 1, &[arg]).unwrap_err();
         assert!(
