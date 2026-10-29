@@ -231,7 +231,7 @@ fn invalid_effect_is_rejected_before_persisting_any_delivery_intent() {
 }
 
 #[test]
-fn sibling_sink_owner_excluded_and_symlinked_effect_rejected() {
+fn sibling_sink_owner_excluded_and_reacquired_after_drop() {
     let s = Sandbox::new();
     let sink = DurableFileSink::open(s.sink()).unwrap();
     assert!(matches!(
@@ -239,21 +239,98 @@ fn sibling_sink_owner_excluded_and_symlinked_effect_rejected() {
         Err(SinkError::WriterLocked)
     ));
     drop(sink);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::symlink;
-        let outside = s.0.join("outside");
-        fs::write(&outside, b"unchanged").unwrap();
-        let effect_dir = s.sink();
-        let record_name = DurableFileSink::record_name(RetentionClass::Replica, "replica", "evil");
-        symlink(&outside, effect_dir.join(record_name)).unwrap();
-        let sink = DurableFileSink::open(s.sink()).unwrap();
-        assert!(sink
-            .apply(RetentionClass::Replica, "replica", 5, "evil", b"data")
-            .is_err());
-        assert_eq!(fs::read(outside).unwrap(), b"unchanged");
-    }
+    // Do not retry or sleep: a dropped cooperative owner must release the lock.
+    let reopened = DurableFileSink::open(s.sink()).unwrap();
+    assert!(matches!(
+        DurableFileSink::open(s.sink()),
+        Err(SinkError::WriterLocked)
+    ));
+    drop(reopened);
 }
+
+#[cfg(unix)]
+#[test]
+fn symlinked_effect_is_rejected_without_modifying_target() {
+    use std::os::unix::fs::symlink;
+
+    let s = Sandbox::new();
+    let outside = s.0.join("outside");
+    fs::write(&outside, b"unchanged").unwrap();
+    let record_name = DurableFileSink::record_name(RetentionClass::Replica, "replica", "evil");
+    symlink(&outside, s.sink().join(record_name)).unwrap();
+
+    let sink = DurableFileSink::open(s.sink()).unwrap();
+    assert!(sink
+        .apply(RetentionClass::Replica, "replica", 5, "evil", b"data")
+        .is_err());
+    assert_eq!(fs::read(outside).unwrap(), b"unchanged");
+}
+#[cfg(unix)]
+#[test]
+fn subprocess_sink_owner_lock_fixture() {
+    use std::io::{Read, Write};
+
+    let Ok(root) = std::env::var("NUDB_SINK_OWNER_LOCK_ROOT") else {
+        return;
+    };
+    let sink = DurableFileSink::open(PathBuf::from(root).join("effects")).unwrap();
+    println!("NUDB_SINK_LOCK_READY");
+    std::io::stdout().flush().unwrap();
+
+    // Parent releases this process through a pipe, not a timing-based sleep.
+    let mut release = [0_u8; 1];
+    std::io::stdin().read_exact(&mut release).unwrap();
+    assert_eq!(release, [b'R']);
+    drop(sink);
+}
+
+#[cfg(unix)]
+#[test]
+fn cross_process_sink_owner_lock_is_exclusive_and_released_after_exit() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+
+    let s = Sandbox::new();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "subprocess_sink_owner_lock_fixture",
+            "--nocapture",
+        ])
+        .env("NUDB_SINK_OWNER_LOCK_ROOT", &s.0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    let mut acquired = false;
+    while stdout.read_line(&mut line).unwrap() != 0 {
+        if line.contains("NUDB_SINK_LOCK_READY") {
+            acquired = true;
+            break;
+        }
+        line.clear();
+    }
+    assert!(acquired, "child exited before acquiring its sink lock");
+    assert!(matches!(
+        DurableFileSink::open(s.sink()),
+        Err(SinkError::WriterLocked)
+    ));
+
+    child.stdin.take().unwrap().write_all(b"R").unwrap();
+    assert!(child.wait().unwrap().success());
+
+    // The child has exited and released its OS lock; fail rather than retry.
+    let reopened = DurableFileSink::open(s.sink()).unwrap();
+    assert!(matches!(
+        DurableFileSink::open(s.sink()),
+        Err(SinkError::WriterLocked)
+    ));
+    drop(reopened);
+}
+
 #[test]
 fn subprocess_fault_fixture() {
     let Ok(parent) = std::env::var("NUDB_SINK_CRASH_ROOT") else {
