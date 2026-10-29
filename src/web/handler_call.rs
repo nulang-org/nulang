@@ -123,6 +123,21 @@ fn register_json_record_fields(
     if module.record_field_names.len() > u8::MAX as usize {
         return Err("JSON record field layout exceeds 255 slots".into());
     }
+    if let JsonBoundValue::Optional(Some(payload)) = value {
+        for name in ["ctor", "payload"] {
+            if !module
+                .record_field_names
+                .iter()
+                .any(|existing| existing == name)
+            {
+                if module.record_field_names.len() >= u8::MAX as usize {
+                    return Err("JSON option field layout exceeds 255 slots".into());
+                }
+                module.record_field_names.push(name.to_string());
+            }
+        }
+        register_json_record_fields(module, payload)?;
+    }
     if let JsonBoundValue::Record(fields) = value {
         for (name, nested) in fields {
             if !module
@@ -165,6 +180,70 @@ fn emit_json_argument(
                 (index & 255) as u8,
                 dst,
             ));
+        }
+        JsonBoundValue::Optional(None) => {
+            emit_json_argument(
+                module,
+                &JsonBoundValue::Scalar(crate::bytecode::Constant::String("None".into())),
+                dst,
+                param_count,
+                depth,
+                scalar_scratch,
+            )?;
+        }
+        JsonBoundValue::Optional(Some(payload)) => {
+            if depth > 8 {
+                return Err("nested JSON option exceeds depth limit".into());
+            }
+            let ctor_id = module
+                .record_field_names
+                .iter()
+                .position(|field| field == "ctor")
+                .ok_or("unregistered option ctor field")? as u8;
+            let payload_id = module
+                .record_field_names
+                .iter()
+                .position(|field| field == "payload")
+                .ok_or("unregistered option payload field")? as u8;
+            module.emit(Instruction::new2(
+                OpCode::RecMk,
+                module.record_field_names.len() as u8,
+                dst,
+            ));
+            emit_json_argument(
+                module,
+                &JsonBoundValue::Scalar(crate::bytecode::Constant::String("Some".into())),
+                scalar_scratch,
+                param_count,
+                depth + 1,
+                scalar_scratch,
+            )?;
+            module.emit(Instruction::new3(
+                OpCode::RecS,
+                dst,
+                ctor_id,
+                scalar_scratch,
+            ));
+            let target = if matches!(
+                payload.as_ref(),
+                JsonBoundValue::Scalar(_) | JsonBoundValue::Optional(None)
+            ) {
+                scalar_scratch
+            } else {
+                param_count
+                    .checked_add(depth + 1)
+                    .filter(|index| *index < scalar_scratch as usize)
+                    .ok_or("nested JSON option scratch register overflow")? as u8
+            };
+            emit_json_argument(
+                module,
+                payload,
+                target,
+                param_count,
+                depth + 1,
+                scalar_scratch,
+            )?;
+            module.emit(Instruction::new3(OpCode::RecS, dst, payload_id, target));
         }
         JsonBoundValue::Record(fields) => {
             if depth > 8 {
@@ -215,6 +294,30 @@ fn typed_json_value(
     ty: &str,
 ) -> Result<serde_json::Value, String> {
     use serde_json::{Map, Number, Value};
+    if let Some(crate::web::json_records::JsonType::Optional(inner)) =
+        crate::web::json_records::parse_json_type(ty)
+    {
+        if vm.string_operand(0, value).as_deref() == Some("None") {
+            return Ok(Value::Null);
+        }
+        let slots = vm
+            .record_field_values(value)
+            .ok_or_else(|| "typed JSON Option expected Some record or None tag".to_string())?;
+        let ctor = record_names
+            .iter()
+            .position(|field| field == "ctor")
+            .and_then(|index| slots.get(index))
+            .ok_or("typed JSON Option missing ctor slot")?;
+        let payload = record_names
+            .iter()
+            .position(|field| field == "payload")
+            .and_then(|index| slots.get(index))
+            .ok_or("typed JSON Option missing payload slot")?;
+        if vm.string_operand(0, *ctor).as_deref() != Some("Some") {
+            return Err("typed JSON Option received unexpected variant tag".into());
+        }
+        return typed_json_value(vm, *payload, record_names, &inner.wire_name());
+    }
     match ty {
         "String" => vm
             .string_operand(0, value)

@@ -813,3 +813,242 @@ fn register() { perform Web.route("POST", "/nested", create_user) }
         }
     }
 }
+
+#[test]
+fn optional_json_request_fields_materialize_actual_option_variants() {
+    let source = r#"
+type Option[T] = Some(T) | None
+type Edit = { nickname: Option[String], age: Int }
+fn edit(input: Edit from json) -> String {
+    match input.nickname with {
+        | Some(name) => name
+        | None => "anonymous"
+    }
+}
+fn register() { perform Web.route("POST", "/optional", edit) }
+"#;
+    let (module, function_index) = compile_handler(source, "edit");
+    let ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_module()
+        .unwrap();
+    let compilation = compile_module_contracts(&ast);
+    assert!(
+        compilation.diagnostics.is_empty(),
+        "{:?}",
+        compilation.diagnostics
+    );
+    let plan = compile_runtime_route_plan(&compilation.routes[0]).unwrap();
+    let server = WebDevServer::bind_runtime(
+        0,
+        None,
+        None,
+        vec![RuntimeWebRoute {
+            route: WebRoute {
+                method: HttpMethod::Post,
+                path: "/optional".into(),
+                handler_module: module,
+                handler_func_idx: function_index,
+            },
+            plan: Some(plan),
+        }],
+    )
+    .unwrap();
+    for (body, expected_code, expected_body) in [
+        (r#"{"age":12}"#, 200, "anonymous"),
+        (r#"{"age":12,"nickname":null}"#, 200, "anonymous"),
+        (r#"{"age":12,"nickname":"Ada"}"#, 200, "Ada"),
+        (r#"{"age":12,"nickname":42}"#, 400, ""),
+        (r#"{"age":12,"nickname":false}"#, 400, ""),
+        (r#"{"age":12,"nickname":"Ada","admin":true}"#, 400, ""),
+        (r#"{"age":12,"nickname":"Ada","nickname":null}"#, 400, ""),
+    ] {
+        let request = format!(
+            "POST /optional HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(), body,
+        );
+        let response = send_raw_request(server.port, &request);
+        let got_code = if response.starts_with("HTTP/1.1 200") {
+            200
+        } else if response.starts_with("HTTP/1.1 400") {
+            400
+        } else {
+            0
+        };
+        assert_eq!(got_code, expected_code, "body={body}; response={response}");
+        if got_code == 200 {
+            assert_eq!(response_body(&response), expected_body);
+        }
+    }
+}
+
+#[test]
+fn optional_json_response_values_serialize_from_option_variants() {
+    for (path, value, expected) in [
+        (
+            "/present",
+            "Some(\"Ada\")",
+            serde_json::json!({"nickname":"Ada","age":12}),
+        ),
+        (
+            "/absent",
+            "None",
+            serde_json::json!({"nickname":null,"age":12}),
+        ),
+    ] {
+        let source = format!(
+            r#"
+type Option[T] = Some(T) | None
+type View = {{ nickname: Option[String], age: Int }}
+fn show() -> View {{ {{ nickname: {value}, age: 12 }} }}
+fn register() {{ perform Web.route_json_typed("GET", "{path}", show) }}
+"#
+        );
+        let route = typed_json_response_route(&source, "show", path);
+        let server = WebDevServer::bind_runtime(0, None, None, vec![route]).unwrap();
+        let response = send_raw_request(
+            server.port,
+            &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let actual: serde_json::Value = serde_json::from_str(response_body(&response)).unwrap();
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn nested_optional_json_records_round_trip_via_vm_variants() {
+    let source = r#"
+type Option[T] = Some(T) | None
+type Edit = { profile: Option[{ city: String, zip: Int }], age: Int }
+fn edit(input: Edit from json) -> String {
+    match input.profile with {
+        | Some(profile) => profile.city
+        | None => "unknown"
+    }
+}
+fn register() { perform Web.route("POST", "/optional-profile", edit) }
+"#;
+    let (module, function_index) = compile_handler(source, "edit");
+    let ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_module()
+        .unwrap();
+    let compilation = compile_module_contracts(&ast);
+    assert!(
+        compilation.diagnostics.is_empty(),
+        "{:?}",
+        compilation.diagnostics
+    );
+    let plan = compile_runtime_route_plan(&compilation.routes[0]).unwrap();
+    let server = WebDevServer::bind_runtime(
+        0,
+        None,
+        None,
+        vec![RuntimeWebRoute {
+            route: WebRoute {
+                method: HttpMethod::Post,
+                path: "/optional-profile".into(),
+                handler_module: module,
+                handler_func_idx: function_index,
+            },
+            plan: Some(plan),
+        }],
+    )
+    .unwrap();
+    for (body, status, expected) in [
+        (r#"{"age":5}"#, 200, "unknown"),
+        (r#"{"age":5,"profile":null}"#, 200, "unknown"),
+        (
+            r#"{"age":5,"profile":{"city":"Oslo","zip":51}}"#,
+            200,
+            "Oslo",
+        ),
+        (r#"{"age":5,"profile":{"city":"Oslo","zip":"51"}}"#, 400, ""),
+        (
+            r#"{"age":5,"profile":{"city":"Oslo","zip":51,"admin":true}}"#,
+            400,
+            "",
+        ),
+        (
+            r#"{"age":5,"profile":{"city":"Oslo","zip":51,"zip":52}}"#,
+            400,
+            "",
+        ),
+    ] {
+        let request = format!(
+            "POST /optional-profile HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(), body
+        );
+        let response = send_raw_request(server.port, &request);
+        let got_status = if response.starts_with("HTTP/1.1 200") {
+            200
+        } else if response.starts_with("HTTP/1.1 400") {
+            400
+        } else {
+            0
+        };
+        assert_eq!(got_status, status, "{body}: {response}");
+        if got_status == 200 {
+            assert_eq!(response_body(&response), expected);
+        }
+    }
+
+    for (path, field_expr, expected) in [
+        (
+            "/some-profile",
+            "Some({ city: \"Oslo\", zip: 51 })",
+            serde_json::json!({"profile":{"city":"Oslo","zip":51},"age":5}),
+        ),
+        (
+            "/none-profile",
+            "None",
+            serde_json::json!({"profile":null,"age":5}),
+        ),
+    ] {
+        let source = format!(
+            r#"
+type Option[T] = Some(T) | None
+type View = {{ profile: Option[{{ city: String, zip: Int }}], age: Int }}
+fn show() -> View {{ {{ profile: {field_expr}, age: 5 }} }}
+fn register() {{ perform Web.route_json_typed("GET", "{path}", show) }}
+"#
+        );
+        let route = typed_json_response_route(&source, "show", path);
+        let server = WebDevServer::bind_runtime(0, None, None, vec![route]).unwrap();
+        let response = send_raw_request(
+            server.port,
+            &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let body: serde_json::Value = serde_json::from_str(response_body(&response)).unwrap();
+        assert_eq!(body, expected);
+    }
+}
+
+#[test]
+fn optional_top_level_response_uses_json_null_or_value() {
+    for (path, expr, expected) in [
+        ("/maybe-name", r#"Some("Ada")"#, serde_json::json!("Ada")),
+        ("/no-name", "None", serde_json::Value::Null),
+    ] {
+        let source = format!(
+            r#"
+type Option[T] = Some(T) | None
+fn show() -> Option[String] {{ {expr} }}
+fn register() {{ perform Web.route_json_typed("GET", "{path}", show) }}
+"#
+        );
+        let route = typed_json_response_route(&source, "show", path);
+        assert_eq!(
+            route.plan.as_ref().unwrap().response_type.as_deref(),
+            Some("Json[Option[String]]")
+        );
+        let server = WebDevServer::bind_runtime(0, None, None, vec![route]).unwrap();
+        let response = send_raw_request(
+            server.port,
+            &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let body: serde_json::Value = serde_json::from_str(response_body(&response)).unwrap();
+        assert_eq!(body, expected);
+    }
+}

@@ -14,7 +14,7 @@ use crate::ast::{
 };
 use crate::lexer::Lexer;
 use crate::parser::Parser;
-use crate::types::EffectRow;
+use crate::types::{EffectRow, Type};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -100,6 +100,43 @@ struct FunctionMeta {
     placement: Option<String>,
 }
 
+/// Preserve the compiler's existing Option variant representation in Web
+/// contracts. The frontend expands Option[T] to the structural variant
+/// Some(T) | None; the wire contract needs an unambiguous nullable shape.
+/// Other variants retain their original names and fail JSON validation.
+fn web_wire_type(ty: &Type) -> String {
+    match ty {
+        Type::Record(fields) => format!(
+            "{{ {} }}",
+            fields
+                .iter()
+                .map(|(name, field)| format!("{name}: {}", web_wire_type(field)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Type::Variant(variants) if variants.len() == 2 => {
+            let payload = variants.iter().find_map(
+                |(name, ty)| {
+                    if name == "Some" {
+                        ty.as_ref()
+                    } else {
+                        None
+                    }
+                },
+            );
+            let has_none = variants
+                .iter()
+                .any(|(name, ty)| name == "None" && ty.is_none());
+            if let (Some(inner), true) = (payload, has_none) {
+                format!("Option[{}]", web_wire_type(inner))
+            } else {
+                ty.to_string()
+            }
+        }
+        _ => ty.to_string(),
+    }
+}
+
 impl FunctionMeta {
     fn from_decl(decl: &Decl) -> Option<(String, Self)> {
         let Decl::Function {
@@ -152,7 +189,7 @@ impl FunctionMeta {
                 using_params: using_params.clone(),
                 dict_param_count,
                 request_bindings,
-                response_type: ret_type.as_ref().map(ToString::to_string),
+                response_type: ret_type.as_ref().map(web_wire_type),
                 error_type: error_type.as_ref().map(ToString::to_string),
                 effects: effect_names(effect.as_ref()),
                 reference_capability: cap.map(|c| c.to_string()),
@@ -269,7 +306,7 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
                             "{{ {} }}",
                             fields
                                 .iter()
-                                .map(|(name, ty)| format!("{name}: {ty}"))
+                                .map(|(name, ty)| format!("{name}: {}", web_wire_type(ty)))
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         ),
@@ -486,7 +523,7 @@ fn handler_param_contract(
 ) -> HandlerParamContract {
     HandlerParamContract {
         name: param.name.clone(),
-        ty: param.ty.as_ref().map(ToString::to_string),
+        ty: param.ty.as_ref().map(web_wire_type),
         capability: param.cap.map(|cap| cap.to_string()),
         request: request.cloned(),
     }

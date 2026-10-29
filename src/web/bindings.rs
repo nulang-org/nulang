@@ -73,7 +73,7 @@ pub fn compile_route_bindings(contract: &RouteContract) -> BindingCompilation {
                 .ty
                 .as_deref()
                 .and_then(crate::web::json_records::parse_json_type)
-                .is_some()
+                .is_some_and(|shape| matches!(shape, crate::web::json_records::JsonType::Record(_)))
         {
             out.diagnostics.push(format!(
                 "{} {}: JSON binding for '{}' currently requires Int, Float, Bool, or String; expected a scalar or supported nested primitive record DTO; nested or unknown JSON types are rejected",
@@ -238,6 +238,27 @@ mod tests {
         assert_eq!(compiled.bindings[0].handler_param, "id");
         assert_eq!(compiled.bindings[0].handler_index, 0);
         assert_eq!(compiled.bindings[0].ty.as_deref(), Some("UserId"));
+    }
+
+    #[test]
+    fn optional_top_level_json_body_is_not_treated_as_record_binding() {
+        let mut contract = route("/api");
+        contract.params.clear();
+        contract.handler_params = vec![HandlerParamContract {
+            name: "payload".into(),
+            ty: Some("Option[String]".into()),
+            capability: None,
+            request: Some(request(RouteBindingSource::Json, "body")),
+        }];
+        let compiled = compile_route_bindings(&contract);
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("unknown JSON types are rejected")),
+            "{:?}",
+            compiled.diagnostics
+        );
     }
 
     #[test]
