@@ -306,6 +306,17 @@ read dependencies. To avoid redundant work, declare only regions that actually
 depend on the mutated data. An application must still enforce idempotency,
 authorization, and transactional consistency on the server.
 
+For statically recognized `el(...)` actions and compiler-generated JSX
+actions, the compiler also projects `target` and `coordination` as typed
+`ActionBinding` metadata in the `nulang-ui/1` signal graph. The web build
+rejects duplicate attributes, nonliteral or unknown policy values, invalid
+target selectors, and `drop`/`queue` policies without an explicit local
+`data-nulang-target="#id"`. Policy values may be string literals or
+`text("queue")`-style static HTML literals. For dynamically generated HTML
+that the compiler cannot inspect, the browser still enforces request policy
+validation; this compile-time check is **not** a substitute for runtime checks.
+
+
 See [examples/patch-web](https://github.com/nulang-org/nulang/tree/main/examples/patch-web)
 for a standalone sample. Run `nulang nula dev` from that directory.
 

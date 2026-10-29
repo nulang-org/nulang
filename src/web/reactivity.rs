@@ -12,7 +12,7 @@
 use crate::ast::{AstModule, Decl, Expr, Literal};
 use crate::effect_checker::EffectChecker;
 use crate::types::{Effect, EffectRow, Span};
-pub use nulang_ui_protocol::ActionPlacement;
+pub use nulang_ui_protocol::{ActionCoordination, ActionPlacement};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -29,6 +29,10 @@ pub enum GraphNode {
         handler: String,
         path: String,
         placement: ActionPlacement,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+        #[serde(default, skip_serializing_if = "ActionCoordination::is_replace")]
+        coordination: ActionCoordination,
     },
 }
 
@@ -36,6 +40,9 @@ pub enum GraphNode {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SignalGraph {
     pub nodes: Vec<GraphNode>,
+    /// Diagnostics stay compiler-local, never emitted into deployment artifacts.
+    #[serde(skip)]
+    pub errors: Vec<String>,
 }
 
 impl SignalGraph {
@@ -93,6 +100,8 @@ impl SignalGraph {
                     handler,
                     path,
                     placement,
+                    target,
+                    coordination,
                 } => {
                     let id = NodeId::new(format!("action:{action_index}:{handler}"));
                     action_index += 1;
@@ -105,6 +114,8 @@ impl SignalGraph {
                         event: "activate".to_string(),
                         action_id: ActionId::new(handler.clone()),
                         placement: *placement,
+                        target: target.clone(),
+                        coordination: *coordination,
                     });
                     root.children.push(id);
                     node
@@ -212,16 +223,73 @@ fn scan_expr(
             let attrs = array_tuples(&args[1]);
             let children = array_elements(&args[2]);
 
-            for (name, value) in &attrs {
-                if name == "action" {
-                    if let Some(handler) = action_handler_name(value) {
-                        graph.push(GraphNode::Action {
-                            handler: handler.clone(),
-                            path: path_with_tag(path, &tag),
-                            placement: classify_action(&handler, checker),
-                        });
-                    }
+            // Policy and target are compiler-owned fields, not arbitrary
+            // runtime strings. Only static values are permitted for actions.
+            let action = attrs.iter().find_map(|(name, value)| {
+                (name == "action" || name == "data-action")
+                    .then(|| action_handler_name(value))
+                    .flatten()
+            });
+            if let Some(handler) = action {
+                let action_path = path_with_tag(path, &tag);
+                let target_attrs: Vec<_> = attrs
+                    .iter()
+                    .filter(|(name, _)| name == "data-nulang-target")
+                    .collect();
+                let policy_attrs: Vec<_> = attrs
+                    .iter()
+                    .filter(|(name, _)| name == "data-nulang-coordination")
+                    .collect();
+                if target_attrs.len() > 1 || policy_attrs.len() > 1 {
+                    graph.errors.push(format!(
+                        "web action at {} has duplicate target or coordination attributes",
+                        action_path
+                    ));
                 }
+                let target = target_attrs.first().and_then(|(_, value)| {
+                    let result = static_html_attr_value(value);
+                    if result
+                        .as_deref()
+                        .is_none_or(|value| !valid_action_target(value))
+                    {
+                        graph.errors.push(format!(
+                            "web action at {} requires a static #id data-nulang-target",
+                            action_path
+                        ));
+                    }
+                    result.filter(|value| valid_action_target(value))
+                });
+                let coordination = match policy_attrs.first() {
+                    None => ActionCoordination::Replace,
+                    Some((_, value)) => match static_html_attr_value(value).as_deref() {
+                        Some("replace") => ActionCoordination::Replace,
+                        Some("drop") => ActionCoordination::Drop,
+                        Some("queue") => ActionCoordination::Queue,
+                        _ => {
+                            graph.errors.push(format!(
+                                "web action at {} requires a static data-nulang-coordination: replace, drop, or queue",
+                                action_path
+                            ));
+                            ActionCoordination::Replace
+                        }
+                    },
+                };
+                if coordination != ActionCoordination::Replace && target.is_none() {
+                    graph.errors.push(format!(
+                        "web action at {} needs data-nulang-target for {} coordination",
+                        action_path,
+                        coordination.as_str()
+                    ));
+                }
+                graph.push(GraphNode::Action {
+                    handler: handler.clone(),
+                    path: action_path,
+                    placement: classify_action(&handler, checker),
+                    target,
+                    coordination,
+                });
+            }
+            for (_, value) in &attrs {
                 scan_expr(
                     value,
                     &mut path_with(path, &tag),
@@ -484,11 +552,29 @@ fn array_tuples(expr: &Expr) -> Vec<(String, &Expr)> {
     out
 }
 
+fn static_html_attr_value(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Literal(Literal::String(value), ..) => Some(value.clone()),
+        Expr::App { func, args, .. } if is_var(func, "text") && args.len() == 1 => {
+            string_literal(&args[0])
+        }
+        _ => None,
+    }
+}
+
+fn valid_action_target(target: &str) -> bool {
+    let Some(id) = target.strip_prefix('#') else {
+        return false;
+    };
+    let mut chars = id.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_alphabetic())
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
 fn action_handler_name(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Var(name, ..) => Some(name.clone()),
-        Expr::Literal(Literal::String(s), ..) => Some(s.clone()),
-        _ => None,
+        _ => static_html_attr_value(expr),
     }
 }
 
@@ -1735,6 +1821,86 @@ fn badge() -> Html {
     }
 
     #[test]
+    fn test_action_coordination_projects_to_typed_protocol() {
+        let module = parse(
+            r##"
+fn save() {}
+fn view() {
+    el("form", [
+        ("action", save),
+        ("data-nulang-target", text("#status")),
+        ("data-nulang-coordination", text("queue"))
+    ], [])
+}
+"##,
+        );
+        let graph = analyze_module(&module, None);
+        assert!(graph.errors.is_empty(), "{:?}", graph.errors);
+        let action = graph
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                GraphNode::Action {
+                    target,
+                    coordination,
+                    ..
+                } => Some((target, coordination)),
+                _ => None,
+            })
+            .expect("form action");
+        assert_eq!(action.0.as_deref(), Some("#status"));
+        assert_eq!(*action.1, nulang_ui_protocol::ActionCoordination::Queue);
+        let document = graph.to_ui_document("app", nulang_ui_protocol::Revision(1));
+        assert_eq!(
+            document
+                .nodes
+                .iter()
+                .find(|n| n.kind == "action")
+                .unwrap()
+                .actions[0]
+                .coordination,
+            nulang_ui_protocol::ActionCoordination::Queue
+        );
+        assert_eq!(
+            document
+                .nodes
+                .iter()
+                .find(|n| n.kind == "action")
+                .unwrap()
+                .actions[0]
+                .target
+                .as_deref(),
+            Some("#status")
+        );
+    }
+
+    #[test]
+    fn test_action_coordination_fails_closed_on_invalid_or_dynamic_policy() {
+        for policy in ["text(\"unknown\")", "text(input)"] {
+            let module = parse(&format!(
+                "fn save() {{}}\nfn view() {{ el(\"form\", [(\"action\", save), (\"data-nulang-target\", text(\"#status\")), (\"data-nulang-coordination\", {})], []) }}",
+                policy
+            ));
+            let graph = analyze_module(&module, None);
+            assert!(
+                !graph.errors.is_empty(),
+                "invalid or dynamic policy accepted: {}",
+                policy
+            );
+        }
+        let module = parse(
+            r#"
+fn save() {}
+fn view() {
+    el("form", [("action", save), ("data-nulang-coordination", text("drop"))], [])
+}
+"#,
+        );
+        let graph = analyze_module(&module, None);
+        assert!(graph.errors.iter().any(|e| e.contains("target")));
+    }
+
+    #[test]
     fn test_action_attribute() {
         let module = parse(
             r#"
@@ -1753,6 +1919,8 @@ fn button() -> Html {
             handler: "add".to_string(),
             path: "button".to_string(),
             placement: ActionPlacement::Server,
+            target: None,
+            coordination: ActionCoordination::Replace,
         }));
     }
 
@@ -1785,11 +1953,15 @@ fn view() -> Html {
             handler: "add".to_string(),
             path: "div > button".to_string(),
             placement: ActionPlacement::Client,
+            target: None,
+            coordination: ActionCoordination::Replace,
         }));
         assert!(graph.nodes.contains(&GraphNode::Action {
             handler: "submit".to_string(),
             path: "div > form".to_string(),
             placement: ActionPlacement::Server,
+            target: None,
+            coordination: ActionCoordination::Replace,
         }));
     }
 
