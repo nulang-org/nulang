@@ -3,6 +3,7 @@
 <title>Nulang UI DOM host regression tests</title>
 <div id="mount"></div><pre id="results">running</pre>
 <script src="nulang-ui-dom.js"></script>
+<script src="nulang-ui-stream.js"></script>
 <script>
 "use strict";
 const tests = [];
@@ -146,6 +147,111 @@ test("SSR hydrated keyed reorder applies server patches without replacing nodes"
   assert(host.applyMessage({protocol:"nulang-ui-msg/1",type:"patch",
     patch:patch(1,2,[{op:"replace_children",node_id:"root",children:["root/k62","root/k61"]}])})==="applied","patch not applied");
   assert(container.firstElementChild.firstElementChild===oldB,"keyed SSR element replaced");
+});
+
+test("fetch SSE stream accepts typed snapshot and patch with same-origin credentials", async () => {
+  const host=setup([entry("root","div",{},[ "a","b" ]),entry("a","span",{text:str("A")}),entry("b","span",{text:str("B")})]);
+  const original=host.element("b");
+  const messages=[
+    {protocol:"nulang-ui-msg/1",type:"snapshot",document:snapshot(1,[entry("root","div",{},["a","b"]),entry("a","span",{text:str("A")}),entry("b","span",{text:str("B")})])},
+    {protocol:"nulang-ui-msg/1",type:"patch",patch:patch(1,2,[{op:"replace_children",node_id:"root",children:["b","a"]}])}
+  ];
+  const frames=messages.map((m,i)=>"event: nulang-ui\nid: "+(i+1)+"\ndata: "+JSON.stringify(m)+"\n\n").join("");
+  const chunks=[frames.slice(0,17),frames.slice(17,83),frames.slice(83)];
+  const encoder=new TextEncoder();const requests=[];
+  const client=window.nulangUiStream.createClient(host,{
+    url:"/private/live",
+    fetch:async (url,opts)=>{
+      requests.push({url,opts});
+      return {ok:true,status:200,body:new ReadableStream({
+        start(controller){chunks.forEach(s=>controller.enqueue(encoder.encode(s)));controller.close()}
+      })};
+    }
+  });
+  assert(await client.connectOnce()==="closed","stream did not complete");
+  assert(host.document.revision==="2" && host.element("b")===original,"patch lost node identity");
+  assert(requests.length===1 && requests[0].url==="/private/live","incorrect endpoint");
+  assert(requests[0].opts.credentials==="same-origin" && requests[0].opts.method==="GET","insecure fetch defaults");
+});
+
+test("SSE parser rejects missing event IDs, cross-document messages and revision gaps", async () => {
+  const host=setup([entry("root","div",{},[])]);
+  const encoder=new TextEncoder();
+  const frame=(id,message)=>"event: nulang-ui\nid: "+id+"\ndata: "+JSON.stringify(message)+"\n\n";
+  const data=frame("1",{protocol:"nulang-ui-msg/1",type:"snapshot",document:snapshot(1,[entry("root","div",{},[])])})
+    +frame("4",{protocol:"nulang-ui-msg/1",type:"patch",patch:patch(3,4,[])});
+  let called=0,reason;
+  const client=window.nulangUiStream.createClient(host,{
+    url:"/private/live",
+    fetch:async()=>({ok:true,status:200,body:new ReadableStream({start(c){c.enqueue(encoder.encode(data));c.close()}})}),
+    onRecoveryNeeded:(error)=>{called++;reason=error;}
+  });
+  assert(await client.connectOnce()==="recover","revision gap not detected");
+  assert(called===1 && host.document.revision==="1","gap improperly advanced revision");
+  assert(reason && reason.includes("revision"),"no recovery reason");
+});
+
+test("reconnecting streams require snapshots before any patch", async () => {
+  const host=setup([entry("root","div",{},["a","b"]),entry("a","span",{text:str("A")}),entry("b","span",{text:str("B")})]);
+  const encoder=new TextEncoder();
+  const value={protocol:"nulang-ui-msg/1",type:"patch",patch:patch(1,2,[{op:"replace_children",node_id:"root",children:["b","a"]}])};
+  const frame="event: nulang-ui\nid: 2\ndata: "+JSON.stringify(value)+"\n\n";
+  let reason="";
+  const client=window.nulangUiStream.createClient(host,{
+    url:"/ui/live",
+    fetch:async()=>({ok:true,status:200,body:new ReadableStream({start(c){c.enqueue(encoder.encode(frame));c.close()}})}),
+    onRecoveryNeeded:message=>{reason=message;}
+  });
+  assert(await client.connectOnce()==="recover","patch-only stream must not advance the document");
+  assert(host.document.revision==="1" && reason.includes("snapshot"),"missing reconnect recovery");
+});
+
+test("recovery preserves unacknowledged local input rather than dropping drafts", async () => {
+  const host=setup([entry("root","form",{},["a"]),entry("a","input",{value:str("")})]);
+  const input=host.element("a");
+  input.value="draft";input.dispatchEvent(new Event("input"));
+  const msg={protocol:"nulang-ui-msg/1",type:"snapshot",document:snapshot(2,[entry("root","form",{},["a"]),entry("a","input",{value:str("server")})])};
+  const frame="event: nulang-ui\nid: 2\ndata: "+JSON.stringify(msg)+"\n\n";
+  let recovered=false;
+  const client=window.nulangUiStream.createClient(host,{
+    url:"/ui/live",
+    fetch:async()=>({ok:true,status:200,body:new ReadableStream({start(c){c.enqueue(new TextEncoder().encode(frame));c.close()}})}),
+    onRecoveryNeeded:()=>{recovered=true;}
+  });
+  assert(await client.connectOnce()==="recover" && recovered,"pending draft not protected");
+  assert(input.value==="draft" && host.document.revision==="1","draft lost during snapshot");
+});
+
+test("real loopback HTTP SSE requires credentials and preserves keyed identity", async () => {
+  const response=await fetch("/__test__/live",{cache:"no-store",credentials:"same-origin"});
+  assert(response.status===403,"real HTTP SSE accepted unauthenticated request");
+  const host=setup([entry("root","div",{},["a","b"]),entry("a","span",{text:str("A")}),entry("b","span",{text:str("B")})]);
+  const previous=host.element("b");
+  const client=window.nulangUiStream.createClient(host,{
+    url:"/__test__/live",
+    getHeaders:()=>({Authorization:"Bearer test-token"})
+  });
+  assert(await client.connectOnce()==="closed","real network stream did not close");
+  assert(host.document.revision==="2" && host.element("b")===previous,"HTTP SSE did not reconcile keyed identity");
+  assert(host.element("root").firstElementChild===previous,"SSE patch ordering incorrect");
+});
+
+test("SSE auth failures do not reconnect or leak bearer credentials into URLs", async () => {
+  const host=setup([entry("root","div",{},[])]);
+  let count=0;
+  const client=window.nulangUiStream.createClient(host,{
+    url:"/private/live",
+    getHeaders:()=>({"Authorization":"Bearer session-secret"}),
+    fetch:async (_url,opts)=>{count++;assert(opts.headers.Authorization==="Bearer session-secret");return {ok:false,status:403}}
+  });
+  assert(await client.connectOnce()==="unauthorized","denied request retried");
+  assert(count===1,"authorization failure fetched repeatedly");
+  let rejected=false;
+  try{window.nulangUiStream.createClient(host,{url:"https://example.org/private"})}catch(_){rejected=true}
+  assert(rejected,"cross-origin stream accepted");
+  rejected=false;
+  try{window.nulangUiStream.createClient(host,{url:"/private?token=secret"})}catch(_){rejected=true}
+  assert(rejected,"query token accepted");
 });
 
 (async () => {
