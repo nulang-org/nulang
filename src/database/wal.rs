@@ -19,10 +19,32 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use super::tablet::{MemoryTablet, TabletDescriptor, TabletId, TabletMutation, TabletWrite};
+use super::retention_admission;
+use super::retention_store::DurableRetentionRegistry;
+use super::tablet::{
+    transaction_digest, MemoryTablet, TabletDescriptor, TabletId, TabletMutation, TabletWrite,
+    TransactionIdentity,
+};
 
 const WAL_MAGIC: &[u8; 8] = b"NUDBWAL3";
+const WAL_QUOTA_MAGIC: &[u8; 8] = b"NUDBQOT1";
+const WAL_QUOTA_DATA_BYTES: usize = 8 + 8 + 8 + 8;
+const WAL_QUOTA_BYTES: usize = WAL_QUOTA_DATA_BYTES + 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DurableWalQuota {
+    tablet_id: u64,
+    ownership_epoch: u64,
+    max_bytes: u64,
+}
+
+impl DurableWalQuota {
+    fn accepts(self, tablet_id: TabletId, epoch: u64) -> bool {
+        self.tablet_id == tablet_id.get() && self.ownership_epoch == epoch
+    }
+}
 const WAL_HEADER_PREFIX_BYTES: usize = 8 + 8 + 8 + 8;
 const WAL_HEADER_BYTES: usize = WAL_HEADER_PREFIX_BYTES + 32;
 const WAL_FRAME_MAGIC: &[u8; 4] = b"NREC";
@@ -31,6 +53,9 @@ const WAL_RECORD_VERSION: u16 = 1;
 const WAL_FRAME_PREFIX_BYTES: usize = 4 + 2 + 4;
 const WAL_FRAME_HEADER_BYTES: usize = WAL_FRAME_PREFIX_BYTES + 32;
 const MAX_WAL_RECORD_BYTES: usize = 64 * 1024 * 1024;
+// Hard ceilings on the direct group-commit API, independent of owner scheduling.
+const MAX_WAL_BATCH_RECORDS: usize = 4096;
+const MAX_WAL_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +74,25 @@ struct DiskWalRecord {
     sequence: u64,
     expected_previous_sequence: u64,
     mutations: Vec<TabletMutation>,
+    // Optional in version-1 WAL records for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity: Option<TransactionIdentity>,
+}
+
+/// Serialize from the retained WAL record without cloning its mutations again.
+///
+/// Field names and ordering intentionally match `DiskWalRecord` so legacy
+/// NUDBWAL3 JSON frames remain byte-for-byte compatible.
+#[derive(serde::Serialize)]
+struct DiskWalRecordRef<'a> {
+    version: u16,
+    tablet_id: u64,
+    ownership_epoch: u64,
+    sequence: u64,
+    expected_previous_sequence: u64,
+    mutations: &'a [TabletMutation],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity: Option<TransactionIdentity>,
 }
 
 /// One validated record recovered from or appended to a tablet WAL.
@@ -59,6 +103,7 @@ pub struct WalRecord {
     sequence: u64,
     expected_previous_sequence: u64,
     mutations: Vec<TabletMutation>,
+    identity: Option<TransactionIdentity>,
 }
 
 impl WalRecord {
@@ -69,6 +114,7 @@ impl WalRecord {
             sequence: write.sequence(),
             expected_previous_sequence: write.expected_previous_sequence(),
             mutations: write.mutations().to_vec(),
+            identity: write.identity(),
         }
     }
 
@@ -90,15 +136,26 @@ impl WalRecord {
             });
         }
 
+        if let Some(identity) = disk.identity {
+            if transaction_digest(&disk.mutations) != identity.digest {
+                return Err(WalError::InvalidRecord {
+                    offset,
+                    reason: "transaction digest does not match WAL mutations".to_string(),
+                });
+            }
+        }
+
         Ok(Self {
             tablet_id,
             ownership_epoch: disk.ownership_epoch,
             sequence: disk.sequence,
             expected_previous_sequence: disk.expected_previous_sequence,
             mutations: disk.mutations,
+            identity: disk.identity,
         })
     }
 
+    #[cfg(test)]
     fn to_disk(&self) -> DiskWalRecord {
         DiskWalRecord {
             version: WAL_RECORD_VERSION,
@@ -107,6 +164,7 @@ impl WalRecord {
             sequence: self.sequence,
             expected_previous_sequence: self.expected_previous_sequence,
             mutations: self.mutations.clone(),
+            identity: self.identity,
         }
     }
 
@@ -129,9 +187,32 @@ impl WalRecord {
     pub fn mutations(&self) -> &[TabletMutation] {
         &self.mutations
     }
+
+    pub(crate) fn identity(&self) -> Option<TransactionIdentity> {
+        self.identity
+    }
+}
+
+impl<'a> From<&'a WalRecord> for DiskWalRecordRef<'a> {
+    fn from(record: &'a WalRecord) -> Self {
+        Self {
+            version: WAL_RECORD_VERSION,
+            tablet_id: record.tablet_id.get(),
+            ownership_epoch: record.ownership_epoch,
+            sequence: record.sequence,
+            expected_previous_sequence: record.expected_previous_sequence,
+            mutations: &record.mutations,
+            identity: record.identity,
+        }
+    }
 }
 
 /// File-backed, per-tablet append-only WAL.
+///
+/// Opening requires an OS-exclusive `<wal>.lock` sidecar. This protects
+/// cooperative single-host writers sharing a canonical WAL path; it is not
+/// quorum fencing and cannot protect against paths aliasing through hardlinks,
+/// deletion of a live sidecar, or filesystems with unreliable lock semantics.
 ///
 /// A WAL starts at tablet sequence 1 and requires each new record to name the
 /// current tail as its predecessor. Ownership epochs may advance over time,
@@ -140,27 +221,158 @@ impl WalRecord {
 pub struct FileWal {
     path: PathBuf,
     file: File,
+    // Stable sidecar ownership survives WAL rename and replacement.
+    writer_lock: Arc<File>,
     records: Vec<WalRecord>,
     record_end_offsets: Vec<u64>,
     base_sequence: u64,
     tablet_id: Option<TabletId>,
     latest_ownership_epoch: Option<u64>,
     poisoned: bool,
+    durable_quota: Option<DurableWalQuota>,
     #[cfg(test)]
     append_failpoint: Option<AppendFailPoint>,
 }
 
+/// Metadata-only result of a non-mutating sequential WAL audit.
+/// Values, mutation contents, and authentication material are never returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalReadOnlyReport {
+    pub base_sequence: u64,
+    pub last_sequence: u64,
+    pub record_count: u64,
+    pub tablet_id: Option<TabletId>,
+    pub last_ownership_epoch: Option<u64>,
+    pub bytes_checked: u64,
+}
+
 impl FileWal {
+    /// Verify the complete on-disk NUDBWAL3 chain without modifying the file.
+    ///
+    /// Unlike `open`, this never creates a WAL/lockfile, acquires a writer
+    /// lock, truncates torn crash tails, or changes the source bytes.
+    /// Run on an immutable copy or a quiescent WAL: a concurrent writer can
+    /// otherwise expose a transient, incomplete frame to this diagnostic.
+    /// Memory use is bounded by a single maximum-sized WAL payload.
+    ///
+    /// This audits WAL structure and transaction digests, not checkpoints,
+    /// disk snapshots, application-level invariants, or external effects.
+    pub fn verify_read_only(path: impl AsRef<Path>) -> Result<WalReadOnlyReport, WalError> {
+        let path = path.as_ref();
+        reject_path_aliases(path)?;
+        let mut file = File::open(path)?;
+
+        let mut wal_header = [0_u8; WAL_HEADER_BYTES];
+        if read_up_to(&mut file, &mut wal_header)? != wal_header.len() {
+            return Err(WalError::InvalidHeader);
+        }
+        let (base_sequence, mut tablet_id, mut latest_ownership_epoch) =
+            decode_wal_header(&wal_header)?;
+
+        let mut last_sequence = base_sequence;
+        let mut record_count = 0_u64;
+
+        loop {
+            let offset = file.stream_position()?;
+            let mut frame_header = [0_u8; WAL_FRAME_HEADER_BYTES];
+            let read = read_up_to(&mut file, &mut frame_header)?;
+            if read == 0 {
+                break;
+            }
+            if read != frame_header.len() {
+                return Err(WalError::IncompleteFrame { offset });
+            }
+            let payload_len = decode_frame_header(&frame_header, offset)?;
+            let mut payload = vec![0_u8; payload_len];
+            if read_up_to(&mut file, &mut payload)? != payload_len {
+                return Err(WalError::IncompleteFrame { offset });
+            }
+
+            let mut checksum = [0_u8; 32];
+            if read_up_to(&mut file, &mut checksum)? != checksum.len() {
+                return Err(WalError::IncompleteFrame { offset });
+            }
+            if checksum != *blake3::hash(&payload).as_bytes() {
+                return Err(WalError::ChecksumMismatch { offset });
+            }
+
+            let disk: DiskWalRecord =
+                serde_json::from_slice(&payload).map_err(|error| WalError::InvalidRecord {
+                    offset,
+                    reason: error.to_string(),
+                })?;
+            let record = WalRecord::from_disk(disk, offset)?;
+            validate_record_chain(
+                &record,
+                tablet_id,
+                latest_ownership_epoch,
+                last_sequence,
+                offset,
+            )?;
+            tablet_id = Some(record.tablet_id);
+            latest_ownership_epoch = Some(record.ownership_epoch);
+            last_sequence = record.sequence;
+            record_count = record_count
+                .checked_add(1)
+                .ok_or(WalError::SequenceOverflow)?;
+        }
+        Ok(WalReadOnlyReport {
+            base_sequence,
+            last_sequence,
+            record_count,
+            tablet_id,
+            last_ownership_epoch: latest_ownership_epoch,
+            bytes_checked: file.stream_position()?,
+        })
+    }
+
+    /// Acquire a nonblocking, single-host exclusive writer lock before WAL
+    /// creation, replay, repair, or crash-tail truncation. Keep the sidecar
+    /// file permanently: unlinking it while locked breaks exclusion.
+    ///
+    /// This requires a trusted local filesystem and operator-controlled
+    /// directory; it does not implement distributed fencing.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WalError> {
-        let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path
+        let requested = path.as_ref();
+        let parent = requested
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent)?;
-        }
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
 
+        // Resolve relative and symlinked parent directories to one lock.
+        // Reject WAL/lockfile symlinks and hardlinks that could alias the
+        // same inode under an independently locked filename.
+        let name = requested.file_name().ok_or(WalError::AliasedWalPath)?;
+        let path = fs::canonicalize(parent)?.join(name);
+        reject_path_aliases(&path)?;
+        let lock_path = writer_lock_path(&path);
+        reject_path_aliases(&lock_path)?;
+
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        lock.try_lock().map_err(|error| match error {
+            fs::TryLockError::WouldBlock => WalError::WriterLocked,
+            fs::TryLockError::Error(error) => WalError::from(error),
+        })?;
+        Self::open_locked(path, Arc::new(lock))
+    }
+
+    fn open_locked(path: PathBuf, writer_lock: Arc<File>) -> Result<Self, WalError> {
+        // Fail before WAL creation or crash-tail recovery if a quota is torn,
+        // corrupt or aliased; silently dropping quota protection is forbidden.
+        let durable_quota = load_durable_quota(&path)?;
+        // Called only while already holding the sidecar lock, also during
+        // checkpoint reclaim. Never acquire a second lock on this path.
         let file_existed = path.exists();
+        // A persisted quota proves this WAL had an acknowledged owner.
+        // Missing storage must not be silently recreated as an empty tablet.
+        if durable_quota.is_some() && !file_existed {
+            return Err(WalError::QuotaWalMissing);
+        }
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -169,6 +381,11 @@ impl FileWal {
             .open(&path)?;
 
         if file.metadata()?.len() == 0 {
+            // A durable quota is evidence of previously initialized storage;
+            // a zero-length WAL must never be rewritten as a fresh database.
+            if durable_quota.is_some() {
+                return Err(WalError::QuotaWalEmpty);
+            }
             let header = encode_wal_header(0, None, None);
             file.write_all(&header)?;
             file.sync_data()?;
@@ -184,6 +401,13 @@ impl FileWal {
         }
         let (base_sequence, mut tablet_id, mut latest_ownership_epoch) =
             decode_wal_header(&wal_header)?;
+        if let Some(quota) = durable_quota {
+            if tablet_id.is_some_and(|id| id.get() != quota.tablet_id)
+                || latest_ownership_epoch.is_some_and(|epoch| epoch != quota.ownership_epoch)
+            {
+                return Err(WalError::QuotaOwnerMismatch);
+            }
+        }
 
         file.seek(SeekFrom::Start(WAL_HEADER_BYTES as u64))?;
 
@@ -230,6 +454,11 @@ impl FileWal {
                     reason: error.to_string(),
                 })?;
             let record = WalRecord::from_disk(disk, record_start)?;
+            if durable_quota
+                .is_some_and(|quota| !quota.accepts(record.tablet_id, record.ownership_epoch))
+            {
+                return Err(WalError::QuotaOwnerMismatch);
+            }
             validate_record_chain(
                 &record,
                 tablet_id,
@@ -250,12 +479,14 @@ impl FileWal {
         Ok(Self {
             path,
             file,
+            writer_lock,
             records,
             record_end_offsets,
             base_sequence,
             tablet_id,
             latest_ownership_epoch,
             poisoned: false,
+            durable_quota,
             #[cfg(test)]
             append_failpoint: None,
         })
@@ -263,6 +494,11 @@ impl FileWal {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// An ambiguous append or reclaim must never be exported as a clean backup.
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 
     pub fn records(&self) -> &[WalRecord] {
@@ -285,12 +521,6 @@ impl FileWal {
         self.record_end_offsets.get(index).copied()
     }
 
-    /// Rebuild the single-node MVCC tablet from the durable WAL prefix.
-    ///
-    /// Historical ownership epochs are retained as log metadata but are not
-    /// compared with the descriptor's current owner epoch during replay.
-    /// Tablet identity, sequence order, and key-range membership remain
-    /// fail-closed.
     pub fn recover_memory_tablet(
         &self,
         descriptor: TabletDescriptor,
@@ -321,10 +551,11 @@ impl FileWal {
         let mut tablet = MemoryTablet::new(descriptor);
         for record in &self.records {
             tablet
-                .replay_committed(
+                .replay_committed_with_identity(
                     record.sequence,
                     record.expected_previous_sequence,
                     record.mutations.clone(),
+                    record.identity(),
                 )
                 .map_err(|error| WalError::ReplayRejected {
                     sequence: record.sequence,
@@ -334,7 +565,6 @@ impl FileWal {
         Ok(tablet)
     }
 
-    /// Replay records newer than an already restored checkpoint.
     pub fn replay_after_checkpoint(&self, tablet: &mut MemoryTablet) -> Result<(), WalError> {
         if tablet.current_sequence() < self.base_sequence {
             return Err(WalError::CheckpointTooOld {
@@ -372,10 +602,11 @@ impl FileWal {
             .filter(|record| record.sequence > checkpoint_sequence)
         {
             tablet
-                .replay_committed(
+                .replay_committed_with_identity(
                     record.sequence,
                     record.expected_previous_sequence,
                     record.mutations.clone(),
+                    record.identity(),
                 )
                 .map_err(|error| WalError::ReplayRejected {
                     sequence: record.sequence,
@@ -385,11 +616,61 @@ impl FileWal {
         Ok(())
     }
 
-    /// Atomically replace the WAL with an empty log whose durable predecessor
-    /// is `base_sequence`. Initial reclamation is intentionally tail-only:
-    /// checkpoints are taken at the current committed sequence, so no retained
-    /// post-checkpoint records need to be copied during the rewrite.
+    /// Unmanaged WAL reclaim refuses any registered retention owner.
+    /// Admission is exclusive with retention registry initialization, so a
+    /// racing registry cannot activate between the safety check and rename.
     pub fn reclaim_through(&mut self, base_sequence: u64) -> Result<(), WalError> {
+        let registry_path = retention_admission::registry_path_for_wal(&self.path);
+        let _admission =
+            retention_admission::acquire(&registry_path).map_err(Self::admission_error)?;
+        if retention_admission::managed_artifact_exists(&registry_path)? {
+            return Err(WalError::RetentionManaged);
+        }
+        self.reclaim_unchecked(base_sequence)
+    }
+
+    /// Called ONLY after the tablet coordinator has verified the exact
+    /// checkpoint and persistently reserved the WAL floor. Re-check at the
+    /// actual mutation boundary, under the same admission lock used when
+    /// the registry is initialized. The registry owner lock must remain live.
+    pub(crate) fn reclaim_through_managed(
+        &mut self,
+        base_sequence: u64,
+        registry: &DurableRetentionRegistry,
+        tablet_id: u64,
+        epoch: u64,
+    ) -> Result<(), WalError> {
+        let registry_path = retention_admission::registry_path_for_wal(&self.path);
+        let _admission =
+            retention_admission::acquire(&registry_path).map_err(Self::admission_error)?;
+        if !registry.matches_owner(&registry_path, tablet_id, epoch)
+            || self
+                .tablet_id
+                .map(|id| id.get())
+                .is_some_and(|id| id != tablet_id)
+            || self
+                .latest_ownership_epoch
+                .is_some_and(|durable| durable > epoch)
+            || registry.minimum_wal_cursor() <= base_sequence
+            || registry
+                .policy()
+                .wal_reclaim_bound(Some(base_sequence), base_sequence)
+                != Ok(base_sequence)
+        {
+            return Err(WalError::RetentionManaged);
+        }
+        self.reclaim_unchecked(base_sequence)
+    }
+
+    fn admission_error(error: io::Error) -> WalError {
+        match error.kind() {
+            io::ErrorKind::WouldBlock => WalError::WriterLocked,
+            io::ErrorKind::InvalidInput => WalError::AliasedWalPath,
+            _ => error.into(),
+        }
+    }
+
+    fn reclaim_unchecked(&mut self, base_sequence: u64) -> Result<(), WalError> {
         if self.poisoned {
             return Err(WalError::Poisoned);
         }
@@ -401,11 +682,6 @@ impl FileWal {
             });
         }
 
-        // Reclamation can replace the canonical WAL path while `self.file`
-        // still references the old inode. From the first fallible mutation
-        // onward, any error therefore requires reopening the WAL before another
-        // append is allowed. A successful reopen below replaces `self` and
-        // clears the poison state.
         self.poisoned = true;
 
         let temp = reclaim_temp_path(&self.path);
@@ -440,21 +716,124 @@ impl FileWal {
             super::interruption::StorageInterruptionPoint::WalReclaimAfterDirectorySync,
         )?;
 
-        *self = Self::open(&self.path)?;
+        // The cloned guard remains live while the replacement is verified.
+        // No other process can acquire ownership between rename and reopen.
+        *self = Self::open_locked(self.path.clone(), Arc::clone(&self.writer_lock))?;
         Ok(())
     }
 
-    /// Durably append one prepared tablet write.
+    /// Returns the immutable quota installed for this canonical WAL owner.
+    pub fn durable_quota_bytes(&self) -> Option<u64> {
+        self.durable_quota.map(|quota| quota.max_bytes)
+    }
+
+    /// Install an immutable, owner/epoch-scoped physical WAL ceiling. The
+    /// exclusive WAL writer lock must remain held for activation and all
+    /// writes. The sidecar is create-new, checksummed, fsynced and directory-
+    /// synced before returning success; never unlink or reset it on failure.
     ///
-    /// The in-memory tail advances only after the complete record and checksum
-    /// have been written and `sync_data` succeeds. If an I/O failure leaves a
-    /// partial physical append, reopening the WAL truncates that crash tail.
+    /// Trusted local directories only: external file deletion/path replacement,
+    /// network FS locks, and distributed ownership are outside this protocol.
+    pub fn activate_durable_quota(
+        &mut self,
+        tablet_id: TabletId,
+        ownership_epoch: u64,
+        max_bytes: u64,
+    ) -> Result<(), WalError> {
+        if self.poisoned {
+            return Err(WalError::Poisoned);
+        }
+        if ownership_epoch == 0
+            || self.tablet_id.is_some_and(|id| id != tablet_id)
+            || self
+                .latest_ownership_epoch
+                .is_some_and(|epoch| epoch != ownership_epoch)
+        {
+            return Err(WalError::QuotaOwnerMismatch);
+        }
+        let requested = DurableWalQuota {
+            tablet_id: tablet_id.get(),
+            ownership_epoch,
+            max_bytes,
+        };
+        if let Some(existing) = self.durable_quota {
+            if existing == requested {
+                return Ok(());
+            }
+            return Err(WalError::QuotaAlreadySet {
+                existing: existing.max_bytes,
+                requested: max_bytes,
+            });
+        }
+
+        let quota_path = wal_quota_path(&self.path);
+        reject_path_aliases(&quota_path)?;
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&quota_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                self.poisoned = true;
+                return Err(WalError::QuotaCorrupt);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        // A crash or I/O error after creation may leave a partial sidecar.
+        // Keep the live writer poisoned and the sidecar in place for repair.
+        self.poisoned = true;
+        let bytes = encode_durable_quota(requested);
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        sync_parent_directory(&quota_path)?;
+        self.durable_quota = Some(requested);
+        self.poisoned = false;
+        Ok(())
+    }
+
+    fn effective_wal_limit(&self, requested: Option<u64>) -> Option<u64> {
+        match (requested, self.durable_quota) {
+            (Some(a), Some(quota)) => Some(a.min(quota.max_bytes)),
+            (None, Some(quota)) => Some(quota.max_bytes),
+            (other, None) => other,
+        }
+    }
+
     pub fn append_write(&mut self, write: &TabletWrite) -> Result<(), WalError> {
+        self.append_write_internal(write, None)
+    }
+
+    /// Opt-in WAL size admission for one standalone append. The full encoded
+    /// frame must fit the caller-supplied physical byte budget *before* bytes
+    /// are written. Rejection leaves the writer usable and never reclaims
+    /// history or advances the tablet. Callers must apply the same admission
+    /// to ALL their write paths; this is not a persistent database-wide quota.
+    pub fn append_write_with_budget(
+        &mut self,
+        write: &TabletWrite,
+        max_wal_bytes: u64,
+    ) -> Result<(), WalError> {
+        self.append_write_internal(write, Some(max_wal_bytes))
+    }
+
+    fn append_write_internal(
+        &mut self,
+        write: &TabletWrite,
+        max_wal_bytes: Option<u64>,
+    ) -> Result<(), WalError> {
         if self.poisoned {
             return Err(WalError::Poisoned);
         }
 
         let record = WalRecord::from_write(write);
+        if self
+            .durable_quota
+            .is_some_and(|quota| !quota.accepts(record.tablet_id, record.ownership_epoch))
+        {
+            return Err(WalError::QuotaOwnerMismatch);
+        }
         let last_sequence = self.last_sequence();
 
         if record.expected_previous_sequence != last_sequence {
@@ -492,10 +871,11 @@ impl FileWal {
             }
         }
 
-        let payload =
-            serde_json::to_vec(&record.to_disk()).map_err(|error| WalError::Serialization {
+        let payload = serde_json::to_vec(&DiskWalRecordRef::from(&record)).map_err(|error| {
+            WalError::Serialization {
                 message: error.to_string(),
-            })?;
+            }
+        })?;
         if payload.len() > MAX_WAL_RECORD_BYTES {
             return Err(WalError::RecordTooLarge {
                 offset: self.file.stream_position()?,
@@ -510,10 +890,24 @@ impl FileWal {
         let checksum = blake3::hash(&payload);
         let header = encode_frame_header(payload_len);
 
-        // Seeking does not mutate the file. Once the first frame byte may have
-        // been emitted, every early return leaves this handle poisoned. The
-        // only safe way to continue is to reopen, which validates/truncates the
-        // physical tail before accepting another append.
+        if let Some(max_bytes) = self.effective_wal_limit(max_wal_bytes) {
+            let current_bytes = self.file.metadata()?.len();
+            let projected_bytes = current_bytes
+                .checked_add(header.len() as u64)
+                .and_then(|bytes| bytes.checked_add(payload.len() as u64))
+                .and_then(|bytes| bytes.checked_add(checksum.as_bytes().len() as u64))
+                .ok_or(WalError::BudgetExceeded {
+                    max_bytes,
+                    projected_bytes: u64::MAX,
+                })?;
+            if projected_bytes > max_bytes {
+                return Err(WalError::BudgetExceeded {
+                    max_bytes,
+                    projected_bytes,
+                });
+            }
+        }
+
         self.file.seek(SeekFrom::End(0))?;
         self.poisoned = true;
 
@@ -556,6 +950,173 @@ impl FileWal {
         self.latest_ownership_epoch = Some(record.ownership_epoch);
         self.records.push(record);
         self.record_end_offsets.push(end);
+        self.poisoned = false;
+        Ok(())
+    }
+
+    /// Durably append a consecutive group of prepared writes with one sync.
+    ///
+    /// Every record is validated and serialized before the first file mutation.
+    /// The on-disk format remains the existing self-validating `NUDBWAL3`
+    /// record stream, so restart and checkpoint compatibility are unchanged.
+    /// If an I/O error occurs after bytes begin to be emitted, the live handle
+    /// remains poisoned and callers must reopen to resolve the durable prefix.
+    pub fn append_batch(&mut self, writes: &[TabletWrite]) -> Result<(), WalError> {
+        self.append_batch_internal(writes, None)
+    }
+
+    /// Opt-in physical WAL limit for a complete group: refuse every frame
+    /// before the first file mutation if their aggregate encoding exceeds
+    /// this caller-supplied budget. Never silently split a group to fit.
+    pub fn append_batch_with_budget(
+        &mut self,
+        writes: &[TabletWrite],
+        max_wal_bytes: u64,
+    ) -> Result<(), WalError> {
+        self.append_batch_internal(writes, Some(max_wal_bytes))
+    }
+
+    fn append_batch_internal(
+        &mut self,
+        writes: &[TabletWrite],
+        max_wal_bytes: Option<u64>,
+    ) -> Result<(), WalError> {
+        if self.poisoned {
+            return Err(WalError::Poisoned);
+        }
+        if writes.is_empty() {
+            return Ok(());
+        }
+        // Preflight count before cloning, serializing, or writing anything.
+        if writes.len() > MAX_WAL_BATCH_RECORDS {
+            return Err(WalError::BatchTooManyRecords(writes.len()));
+        }
+
+        let start_offset = self.file.seek(SeekFrom::End(0))?;
+        let mut next_offset = start_offset;
+        let mut expected_tablet = self.tablet_id;
+        let mut latest_epoch = self.latest_ownership_epoch;
+        let mut last_sequence = self.last_sequence();
+        let mut prepared = Vec::with_capacity(writes.len());
+        let mut total_frame_bytes = 0_usize;
+
+        for write in writes {
+            let record = WalRecord::from_write(write);
+            if self
+                .durable_quota
+                .is_some_and(|quota| !quota.accepts(record.tablet_id, record.ownership_epoch))
+            {
+                return Err(WalError::QuotaOwnerMismatch);
+            }
+            validate_record_chain(
+                &record,
+                expected_tablet,
+                latest_epoch,
+                last_sequence,
+                next_offset,
+            )?;
+
+            let payload =
+                serde_json::to_vec(&DiskWalRecordRef::from(&record)).map_err(|error| {
+                    WalError::Serialization {
+                        message: error.to_string(),
+                    }
+                })?;
+            if payload.len() > MAX_WAL_RECORD_BYTES {
+                return Err(WalError::RecordTooLarge {
+                    offset: next_offset,
+                    length: payload.len(),
+                });
+            }
+            let payload_len =
+                u32::try_from(payload.len()).map_err(|_| WalError::RecordTooLarge {
+                    offset: next_offset,
+                    length: payload.len(),
+                })?;
+            let header = encode_frame_header(payload_len);
+            let checksum = *blake3::hash(&payload).as_bytes();
+            let frame_len = header
+                .len()
+                .checked_add(payload.len())
+                .and_then(|len| len.checked_add(checksum.len()))
+                .ok_or_else(|| WalError::InvalidRecord {
+                    offset: next_offset,
+                    reason: "encoded WAL frame length overflow".to_string(),
+                })?;
+            // Bound aggregate staged frames even for direct append_batch callers.
+            // This runs before the first mutation of the file; failures remain
+            // retryable and do not poison the live handle.
+            total_frame_bytes = total_frame_bytes
+                .checked_add(frame_len)
+                .ok_or(WalError::BatchTooLarge(usize::MAX))?;
+            if total_frame_bytes > MAX_WAL_BATCH_BYTES {
+                return Err(WalError::BatchTooLarge(total_frame_bytes));
+            }
+            let end_offset = next_offset.checked_add(frame_len as u64).ok_or_else(|| {
+                WalError::InvalidRecord {
+                    offset: next_offset,
+                    reason: "WAL file offset overflow".to_string(),
+                }
+            })?;
+
+            expected_tablet = Some(record.tablet_id);
+            latest_epoch = Some(record.ownership_epoch);
+            last_sequence = record.sequence;
+            prepared.push((record, header, payload, checksum, end_offset));
+            next_offset = end_offset;
+        }
+
+        if let Some(max_bytes) = self.effective_wal_limit(max_wal_bytes) {
+            if next_offset > max_bytes {
+                return Err(WalError::BudgetExceeded {
+                    max_bytes,
+                    projected_bytes: next_offset,
+                });
+            }
+        }
+
+        self.file.seek(SeekFrom::End(0))?;
+        self.poisoned = true;
+        for (_index, (_, header, payload, checksum, _)) in prepared.iter().enumerate() {
+            self.file.write_all(header)?;
+            #[cfg(test)]
+            if _index == 0 {
+                super::interruption::hit(
+                    super::interruption::StorageInterruptionPoint::WalBatchAfterHeader,
+                )?;
+            }
+
+            self.file.write_all(payload)?;
+            #[cfg(test)]
+            if _index == 0 {
+                super::interruption::hit(
+                    super::interruption::StorageInterruptionPoint::WalBatchAfterPayload,
+                )?;
+            }
+
+            self.file.write_all(checksum)?;
+            #[cfg(test)]
+            if _index == 0 {
+                super::interruption::hit(
+                    super::interruption::StorageInterruptionPoint::WalBatchAfterChecksum,
+                )?;
+            }
+        }
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::WalBatchAfterFrames,
+        )?;
+
+        self.file.sync_data()?;
+        #[cfg(test)]
+        super::interruption::hit(super::interruption::StorageInterruptionPoint::WalBatchAfterSync)?;
+
+        for (record, _, _, _, end_offset) in prepared {
+            self.records.push(record);
+            self.record_end_offsets.push(end_offset);
+        }
+        self.tablet_id = expected_tablet;
+        self.latest_ownership_epoch = latest_epoch;
         self.poisoned = false;
         Ok(())
     }
@@ -712,6 +1273,82 @@ fn validate_record_chain(
     Ok(())
 }
 
+fn wal_quota_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".quota");
+    PathBuf::from(name)
+}
+
+fn encode_durable_quota(quota: DurableWalQuota) -> [u8; WAL_QUOTA_BYTES] {
+    let mut encoded = [0_u8; WAL_QUOTA_BYTES];
+    encoded[..8].copy_from_slice(WAL_QUOTA_MAGIC);
+    encoded[8..16].copy_from_slice(&quota.tablet_id.to_le_bytes());
+    encoded[16..24].copy_from_slice(&quota.ownership_epoch.to_le_bytes());
+    encoded[24..32].copy_from_slice(&quota.max_bytes.to_le_bytes());
+    let checksum = *blake3::hash(&encoded[..WAL_QUOTA_DATA_BYTES]).as_bytes();
+    encoded[WAL_QUOTA_DATA_BYTES..].copy_from_slice(&checksum);
+    encoded
+}
+
+fn load_durable_quota(wal_path: &Path) -> Result<Option<DurableWalQuota>, WalError> {
+    let path = wal_quota_path(wal_path);
+    reject_path_aliases(&path)?;
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if file.metadata()?.len() != WAL_QUOTA_BYTES as u64 {
+        return Err(WalError::QuotaCorrupt);
+    }
+    let mut encoded = [0_u8; WAL_QUOTA_BYTES];
+    file.read_exact(&mut encoded)?;
+    if &encoded[..8] != WAL_QUOTA_MAGIC
+        || &encoded[WAL_QUOTA_DATA_BYTES..]
+            != blake3::hash(&encoded[..WAL_QUOTA_DATA_BYTES]).as_bytes()
+    {
+        return Err(WalError::QuotaCorrupt);
+    }
+    let quota = DurableWalQuota {
+        tablet_id: u64::from_le_bytes(encoded[8..16].try_into().unwrap()),
+        ownership_epoch: u64::from_le_bytes(encoded[16..24].try_into().unwrap()),
+        max_bytes: u64::from_le_bytes(encoded[24..32].try_into().unwrap()),
+    };
+    if quota.tablet_id == 0 || quota.ownership_epoch == 0 {
+        return Err(WalError::QuotaCorrupt);
+    }
+    Ok(Some(quota))
+}
+
+fn writer_lock_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Path aliases can evade sidecar locks; reject symlinks and hardlinks.
+/// Directories must be trusted: concurrent external path replacement and
+/// network-filesystem lock semantics are deliberately unsupported.
+fn reject_path_aliases(path: &Path) -> Result<(), WalError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(WalError::AliasedWalPath);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.nlink() > 1 {
+                    return Err(WalError::AliasedWalPath);
+                }
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn reclaim_temp_path(path: &Path) -> PathBuf {
     let mut temp = path.as_os_str().to_os_string();
     temp.push(".reclaim.tmp");
@@ -752,7 +1389,6 @@ fn read_up_to(file: &mut File, buffer: &mut [u8]) -> io::Result<usize> {
     Ok(total)
 }
 
-/// WAL validation or I/O failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalError {
     Io {
@@ -760,7 +1396,13 @@ pub enum WalError {
         message: String,
     },
     InvalidHeader,
+    WriterLocked,
+    AliasedWalPath,
     WalHeaderChecksumMismatch,
+    /// Read-only audit detected a torn frame and deliberately did not repair it.
+    IncompleteFrame {
+        offset: u64,
+    },
     InvalidFrameHeader {
         offset: u64,
         reason: String,
@@ -783,6 +1425,20 @@ pub enum WalError {
     RecordTooLarge {
         offset: u64,
         length: usize,
+    },
+    BatchTooManyRecords(usize),
+    BatchTooLarge(usize),
+    BudgetExceeded {
+        max_bytes: u64,
+        projected_bytes: u64,
+    },
+    QuotaCorrupt,
+    QuotaWalMissing,
+    QuotaWalEmpty,
+    QuotaOwnerMismatch,
+    QuotaAlreadySet {
+        existing: u64,
+        requested: u64,
     },
     ChecksumMismatch {
         offset: u64,
@@ -819,6 +1475,7 @@ pub enum WalError {
         current: u64,
         requested: u64,
     },
+    RetentionManaged,
     Serialization {
         message: String,
     },
@@ -839,7 +1496,15 @@ impl fmt::Display for WalError {
         match self {
             Self::Io { message, .. } => write!(f, "WAL I/O error: {message}"),
             Self::InvalidHeader => f.write_str("invalid NuDB WAL header"),
+            Self::WriterLocked => f.write_str("NuDB WAL already has an exclusive writer"),
+            Self::AliasedWalPath => {
+                f.write_str("NuDB WAL or lock path must not be a symlink or hardlink")
+            }
             Self::WalHeaderChecksumMismatch => f.write_str("NuDB WAL header checksum mismatch"),
+            Self::IncompleteFrame { offset } => write!(
+                f,
+                "incomplete WAL frame at byte offset {offset}; read-only audit did not truncate"
+            ),
             Self::InvalidFrameHeader { offset, reason } => {
                 write!(
                     f,
@@ -866,6 +1531,27 @@ impl fmt::Display for WalError {
             Self::RecordTooLarge { offset, length } => write!(
                 f,
                 "WAL record at byte offset {offset} is too large ({length} bytes)"
+            ),
+            Self::BatchTooManyRecords(count) => {
+                write!(f, "WAL group commit has too many records ({count})")
+            }
+            Self::BatchTooLarge(bytes) => {
+                write!(f, "WAL group commit exceeds staged byte limit ({bytes} bytes)")
+            }
+            Self::BudgetExceeded {
+                max_bytes,
+                projected_bytes,
+            } => write!(
+                f,
+                "NuDB WAL append requires {projected_bytes} bytes, above caller budget of {max_bytes} bytes"
+            ),
+            Self::QuotaCorrupt => f.write_str("NuDB durable WAL quota sidecar is torn or corrupt"),
+            Self::QuotaWalMissing => f.write_str("NuDB quota-protected WAL is missing; refusing to recreate empty storage"),
+            Self::QuotaWalEmpty => f.write_str("NuDB quota-protected WAL is empty; refusing to reinitialize lost storage"),
+            Self::QuotaOwnerMismatch => f.write_str("NuDB WAL owner/epoch differs from durable quota owner"),
+            Self::QuotaAlreadySet { existing, requested } => write!(
+                f,
+                "NuDB durable WAL quota is immutable: current {existing} bytes, requested {requested} bytes"
             ),
             Self::ChecksumMismatch { offset } => {
                 write!(f, "WAL checksum mismatch at byte offset {offset}")
@@ -916,6 +1602,7 @@ impl fmt::Display for WalError {
                 f,
                 "cannot reclaim WAL through sequence {requested}; current tail is {current}"
             ),
+            Self::RetentionManaged => f.write_str("retention-managed WAL must use verified guarded reclamation"),
             Self::Serialization { message } => {
                 write!(f, "WAL serialization error: {message}")
             }
@@ -969,6 +1656,38 @@ mod hardening_tests {
     }
 
     #[test]
+    fn borrowed_wal_encoding_preserves_legacy_json_bytes() {
+        let descriptor = descriptor();
+        let write = TabletWrite::prepare(
+            &descriptor,
+            1,
+            0,
+            0,
+            vec![
+                TabletMutation::Put {
+                    key: b"escaped".to_vec(),
+                    value: b"quoted \"value\" with newline\\n".to_vec(),
+                },
+                TabletMutation::Delete {
+                    key: b"gone".to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+        let record = WalRecord::from_write(&write);
+        let legacy = record.to_disk();
+        let borrowed = DiskWalRecordRef::from(&record);
+
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+        let borrowed_bytes = serde_json::to_vec(&borrowed).unwrap();
+        assert_eq!(borrowed_bytes, legacy_bytes);
+
+        let decoded: DiskWalRecord = serde_json::from_slice(&borrowed_bytes).unwrap();
+        assert_eq!(decoded.sequence, write.sequence());
+        assert_eq!(decoded.mutations, write.mutations());
+    }
+
+    #[test]
     fn corrupted_record_header_is_not_treated_as_a_torn_tail() {
         let path = temp_wal("header_corruption");
         let _ = fs::remove_file(&path);
@@ -984,7 +1703,6 @@ mod hardening_tests {
                 .write(true)
                 .open(&path)
                 .unwrap();
-            // WAL header (64) + record magic (4) + frame version (2) => payload length.
             file.seek(SeekFrom::Start(70)).unwrap();
             let mut length = [0_u8; 4];
             std::io::Read::read_exact(&mut file, &mut length).unwrap();
@@ -1051,9 +1769,6 @@ mod hardening_tests {
 
         drop(wal);
 
-        // A complete frame can be visible on reopen even though no durability
-        // acknowledgement was returned. Recovery, not an in-process retry,
-        // resolves that ambiguous outcome.
         let reopened = FileWal::open(&path).unwrap();
         assert_eq!(reopened.last_sequence(), 1);
 
@@ -1079,8 +1794,6 @@ mod hardening_tests {
 
         drop(wal);
 
-        // The injected failure happens after sync_data: reopening resolves the
-        // ambiguous outcome by recovering the durable record.
         let reopened = FileWal::open(&path).unwrap();
         assert_eq!(reopened.last_sequence(), 1);
         assert_eq!(reopened.records().len(), 1);

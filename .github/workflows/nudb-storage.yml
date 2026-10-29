@@ -1,0 +1,110 @@
+name: NulangDB Storage
+
+# Superseded PR commits should not consume scarce CI runner capacity.
+concurrency:
+  group: nudb-storage-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    paths:
+      - "src/database/**"
+      - "tests/nudb_*.rs"
+      - "tests/tablet_owner_admission.rs"
+      - "benches/database_bench.rs"
+      - "benches/bench_main.rs"
+      - ".github/workflows/nudb-storage.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/database/**"
+      - "tests/nudb_*.rs"
+      - "tests/tablet_owner_admission.rs"
+      - "benches/database_bench.rs"
+      - "benches/bench_main.rs"
+      - ".github/workflows/nudb-storage.yml"
+
+jobs:
+  storage:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: nudb
+          POSTGRES_USER: nudb
+          POSTGRES_PASSWORD: nudbtest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nudb -d nudb"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: WAL budget and durable quota admission
+        run: |
+          cargo test --locked --no-default-features --test nudb_wal_budget
+          cargo test --locked --no-default-features --test nudb_durable_wal_quota
+      # The capacity profile is an intentionally ignored, load-sensitive
+      # diagnostic benchmark; do not treat its opt-in timing as a CI gate.
+      - name: Batch WAL contract
+        run: |
+          cargo test --locked --no-default-features --test nudb_wal_batch
+          cargo test --locked --no-default-features --test nudb_wal_batch_recovery
+          cargo test --locked --no-default-features --test nudb_wal_batch_decoder_hardening
+          cargo test --locked --no-default-features --test nudb_batch_safety
+      - name: Read-only WAL, checkpoint consistency, and local backup capture
+        run: |
+          cargo test --locked --no-default-features --test nudb_wal_read_only_audit
+          cargo test --locked --no-default-features --test nudb_checkpoint_pair_verify
+          cargo test --locked --no-default-features --test nudb_owner_backup_capture
+          cargo test --locked --no-default-features --test nudb_backup_manifest_audit
+          cargo test --locked --no-default-features --lib database::backup::tests
+      - name: Conservative retention decision contract
+        run: |
+          cargo test --locked --no-default-features --test nudb_retention_policy
+          cargo test --locked --no-default-features --test nudb_durable_retention
+          cargo test --locked --no-default-features --test nudb_reclaim_watermark
+          cargo test --locked --no-default-features --test nudb_guarded_checkpoint
+          cargo test --locked --no-default-features --test nudb_wal_admission_fence
+          cargo test --locked --no-default-features --test nudb_compacted_retention_bootstrap
+          cargo test --locked --no-default-features --test nudb_consumer_ack_receipts
+          cargo test --locked --no-default-features --test nudb_durable_file_sink
+          cargo test --locked --no-default-features --test nudb_consumer_retirement
+      - name: Transactional PostgreSQL consumer effect/receipt contract
+        env:
+          NUDB_POSTGRES_TEST_URL: "host=127.0.0.1 port=5432 user=nudb password=nudbtest dbname=nudb"
+        run: cargo test --locked --no-default-features --features postgres --test nudb_postgres_sink
+      - name: Group commit contract
+        run: cargo test --locked --no-default-features --test nudb_group_commit
+      - name: Durable transaction receipts, retries and recovery
+        run: |
+          cargo test --locked --no-default-features --lib database::receipt_tests
+          cargo test --locked --no-default-features --test nudb_idempotent_group_receipts
+          cargo test --locked --no-default-features --test nudb_idempotent_group_limits
+          cargo test --locked --no-default-features --test nudb_receipt_digest_integrity
+      - name: Tablet owner admission and coalescing
+        run: |
+          cargo test --locked --no-default-features --lib database::owner::tests
+          cargo test --locked --no-default-features --test tablet_owner_admission
+      - name: Storage interruption matrix
+        run: cargo test --locked --no-default-features --lib database::interruption::tests
+      - name: Existing NulangDB storage contracts
+        run: |
+          cargo test --locked --no-default-features --test tablet_foundation
+          cargo test --locked --no-default-features --test tablet_mvcc
+          cargo test --locked --no-default-features --test tablet_wal
+          cargo test --locked --no-default-features --test wal_backed_tablet
+          cargo test --locked --no-default-features --test checkpoint_reclamation
+          cargo test --locked --no-default-features --test nudb_single_node_safety
+          cargo test --locked --no-default-features --test nudb_legacy_checkpoint
+          cargo test --locked --no-default-features --test nudb_crash_recovery
+      - name: Benchmark harness compiles
+        run: cargo bench --locked --no-default-features --bench bench_main --no-run
