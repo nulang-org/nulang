@@ -49,8 +49,15 @@ payload JSON, run timestamp and maximum attempts. Jobs eventually reach
 - Multiple workers can contend over the shared SQLite database.
 - Execution is **at least once**, not exactly once. External providers must
   honor idempotency keys or be duplicate-safe.
-- Worker claims have fixed leases: there is currently no heartbeat/renewal.
-  Long tasks need a lease longer than their execution or subsequent renewal.
+- Workers may extend a live lease with `DurableSqlJobs::renew`, using the
+  original attempt token. A stale or expired attempt cannot renew; a renewal
+  never shortens the lease. A worker must call this explicitly for long tasks.
+- When the `ai-runtime` feature is also enabled, `nulang-ai-local` now links
+  against host-provided system SQLite rather than bundling a second copy. This
+  avoids duplicate `sqlite3_*` C symbols, but changes native packaging:
+  clean-machine release checks must verify the required system SQLite library
+  exists and remains compatible. A future shared-backend migration is preferable
+  if a completely self-contained single executable is required.
 - The caller supplies clock values, enabling deterministic testing but also
   requiring a consistent wall-clock source in production.
 - The SQL schema and operations are currently tested only against local SQLite,

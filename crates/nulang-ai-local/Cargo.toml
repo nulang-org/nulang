@@ -12,7 +12,11 @@ nulang-ai-director = { path = "../nulang-ai-director" }
 nulang-ai-manager = { path = "../nulang-ai-manager" }
 nulang-ai-worker = { path = "../nulang-ai-worker" }
 chrono = { version = "0.4", features = ["serde"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+# Do not bundle a second sqlite3 C implementation: the host CLI also links
+# libsql-ffi, which bundles SQLite itself. Double-bundling makes default
+# feature binaries fail with duplicate sqlite3_* symbols at native link time.
+# Use the host-provided SQLite library for the local agent store.
+rusqlite = "0.32"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

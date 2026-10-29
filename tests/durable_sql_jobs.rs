@@ -191,3 +191,88 @@ async fn queued_job_survives_database_reopen() {
     let _ = std::fs::remove_file(format!("{path_text}-wal"));
     let _ = std::fs::remove_file(format!("{path_text}-shm"));
 }
+
+#[tokio::test]
+async fn second_connection_cannot_steal_or_acknowledge_an_active_lease() {
+    // Separate SQLite connections to an in-memory DB have independent schemas,
+    // so contention must be exercised against the same on-disk database.
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "nulang-job-contention-{}-{unique}.sqlite",
+        std::process::id()
+    ));
+    let path_text = path.to_string_lossy().into_owned();
+    let db = Builder::new_local(&path_text).build().await.unwrap();
+    let first_conn = db.connect().unwrap();
+    let second_conn = db.connect().unwrap();
+    DurableSqlJobs::install(&first_conn).await.unwrap();
+    DurableSqlJobs::enqueue(&first_conn, JobRequest::new("work", "Process", "{}", 0))
+        .await
+        .unwrap();
+
+    let first = DurableSqlJobs::claim(&first_conn, "work", 0, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(DurableSqlJobs::claim(&second_conn, "work", 50, 100)
+        .await
+        .unwrap()
+        .is_none());
+
+    // Lease extension must not shorten an active lease.
+    assert!(
+        DurableSqlJobs::renew(&first_conn, first.id, first.attempt, 50, 150)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !DurableSqlJobs::renew(&first_conn, first.id, first.attempt, 51, 1)
+            .await
+            .unwrap()
+    );
+    assert!(DurableSqlJobs::claim(&second_conn, "work", 101, 100)
+        .await
+        .unwrap()
+        .is_none());
+
+    // When the renewed lease expires, a new owner supersedes the first claim.
+    let second = DurableSqlJobs::claim(&second_conn, "work", 201, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.id, first.id);
+    assert_eq!(second.attempt, first.attempt + 1);
+    assert!(
+        !DurableSqlJobs::renew(&first_conn, first.id, first.attempt, 202, 100)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !DurableSqlJobs::complete(&first_conn, first.id, first.attempt, 202)
+            .await
+            .unwrap()
+    );
+    assert!(
+        DurableSqlJobs::complete(&second_conn, second.id, second.attempt, 202)
+            .await
+            .unwrap()
+    );
+    drop(second_conn);
+    drop(first_conn);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path_text}-wal"));
+    let _ = std::fs::remove_file(format!("{path_text}-shm"));
+}
+
+#[tokio::test]
+async fn lease_renewal_rejects_invalid_parameters() {
+    let conn = memory_db().await;
+    assert!(DurableSqlJobs::renew(&conn, 1, 1, 0, 0).await.is_err());
+    assert!(DurableSqlJobs::renew(&conn, 1, 1, i64::MAX, 1)
+        .await
+        .is_err());
+}

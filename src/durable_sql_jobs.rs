@@ -243,6 +243,42 @@ impl DurableSqlJobs {
         Ok(claim)
     }
 
+    /// Extend a live claim's lease without ever shortening it.
+    ///
+    /// Returns false when the claim is expired, superseded, terminal, or the
+    /// requested new expiry would not extend the current lease. A renewed
+    /// claim still requires its original attempt token when completed.
+    pub async fn renew(
+        conn: &libsql::Connection,
+        id: i64,
+        attempt: i64,
+        now_ms: i64,
+        lease_ms: i64,
+    ) -> JobResult<bool> {
+        if id <= 0
+            || attempt <= 0
+            || now_ms < 0
+            || lease_ms <= 0
+            || now_ms.checked_add(lease_ms).is_none()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid job lease renewal parameters",
+            )
+            .into());
+        }
+        let new_expiry = now_ms + lease_ms;
+        let changed = conn
+            .execute(
+                "UPDATE nulang_jobs SET lease_until_ms = ?4
+             WHERE id = ?1 AND attempts = ?2 AND state = 'running'
+               AND lease_until_ms > ?3 AND lease_until_ms < ?4",
+                libsql::params![id, attempt, now_ms, new_expiry],
+            )
+            .await?;
+        Ok(changed == 1)
+    }
+
     /// Returns false for duplicate, expired, or stale acknowledgments.
     pub async fn complete(
         conn: &libsql::Connection,
