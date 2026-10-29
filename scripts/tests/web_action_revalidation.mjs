@@ -18,7 +18,7 @@ const flush = async () => {
 };
 
 function harness({ revalidate = '#summary, #notifications', get = null, post = null,
-    overlap = false } = {}) {
+    overlap = false, coordination = null } = {}) {
   const nodes = new Map();
   const updates = [];
   const listeners = new Map();
@@ -42,7 +42,8 @@ function harness({ revalidate = '#summary, #notifications', get = null, post = n
   const form = {
     tagName: 'FORM',
     dataset: { action: 'save', actionPlacement: 'server', nulangTarget: '#detail',
-      ...(revalidate === null ? {} : { nulangRevalidate: revalidate }) },
+      ...(revalidate === null ? {} : { nulangRevalidate: revalidate }),
+      ...(coordination ? { nulangCoordination: coordination } : {}) },
     closest(name) { return name === 'form' ? form : null; },
     addEventListener(name, fn) { listeners.set(name, fn); }
   };
@@ -259,6 +260,28 @@ assert.equal(racing.errors.length, 0, 'superseded revalidation does not log erro
     'superseded action does not apply a stale primary fragment');
   assert.equal(errors.length, 0);
   assert.equal(requests[1].signal?.aborted, true, 'shared-target supersession aborts old GET');
+}
+
+
+// A queued submission cannot start until both the prior POST and its canonical
+// GET finish. A drop policy suppresses duplicate POSTs during that GET.
+for (const policy of ['queue', 'drop']) {
+  let releaseGet;
+  const flow = harness({ coordination: policy, get() {
+    return new Promise(resolve => { releaseGet = resolve; });
+  }});
+  flow.submit();
+  await flush();
+  assert.deepEqual(flow.fetches.map(f => f.options.method), ['POST', 'GET']);
+  flow.submit();
+  await flush();
+  assert.equal(flow.fetches.length, 2, policy + ' must not post while GET pending');
+  releaseGet(htmlResponse('<div id="summary">Fresh</div><div id="notifications">Fresh</div>'));
+  await flush();
+  assert.equal(flow.text('summary'), 'Fresh');
+  assert.deepEqual(flow.fetches.map(f => f.options.method),
+    policy === 'queue' ? ['POST', 'GET', 'POST', 'GET'] : ['POST', 'GET'],
+    policy + ' scheduling must wait until refresh finished');
 }
 
 console.log('Nulang Web: explicit selective revalidation is atomic, bounded and race-safe');

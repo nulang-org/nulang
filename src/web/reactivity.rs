@@ -795,6 +795,8 @@ pub fn generate_client_runtime() -> String {
   // A later submission for the same target supersedes its earlier UI update.
   // Aborting the fetch is best-effort: server mutations may still complete.
   const pendingPatches = new Map();
+  const actionLanes = new Map();
+  const MAX_QUEUED_ACTIONS_PER_TARGET = 32;
   // Shared by streamed invalidations and local actions, so a stale GET cannot
   // overwrite a newer local mutation (or any newer streamed fragment).
   const targetGenerations = new Map();
@@ -1283,13 +1285,21 @@ pub fn generate_client_runtime() -> String {
     }};
   }
 
+  // Coordination lanes are per primary #id. Secondary regions are claimed
+  // by each in-flight request and can supersede old replace-only requests.
+  // Client-side abort never implies that a server mutation was rolled back.
   async function runServerAction(handler, el) {
     const requestUrl = window.location.href;
     const form = el.closest('form');
     const target = el.dataset.nulangTarget || (form && form.dataset.nulangTarget);
-    // While a dialog is owned by a Nulang overlay, its server actions can
-    // patch only descendants of that dialog. Parent changes go through the
-    // explicit typed overlay result returned to the caller.
+    const policy = el.dataset.nulangCoordination ||
+      (form && form.dataset.nulangCoordination) || 'replace';
+    if (!['replace', 'drop', 'queue'].includes(policy)) {
+      throw new Error('invalid Nulang action coordination policy: ' + policy);
+    }
+    if (!target && policy !== 'replace') {
+      throw new Error('Nulang action coordination requires a target');
+    }
     const ownerDialog = typeof el.closest === 'function' ? el.closest('dialog') : null;
     const ownerScope = ownerDialog && overlays.get('#' + ownerDialog.id);
     if (ownerScope && ownerScope.active &&
@@ -1298,12 +1308,6 @@ pub fn generate_client_runtime() -> String {
     }
     const revalidate = el.dataset.nulangRevalidate !== undefined
       ? el.dataset.nulangRevalidate : (form && form.dataset.nulangRevalidate);
-    const body = formBody(form);
-    const message = createActionMessage(handler, 'server', body);
-    body.append('__nulang_action', handler);
-    body.append('__nulang_ui_message', JSON.stringify(message));
-    // A mutation claims both its primary patch and any related revalidation
-    // regions. Different actions sharing a region must not race to overwrite it.
     const keys = target ? [target] : [];
     if (target && revalidate !== undefined && revalidate !== null) {
       keys.push(...revalidationTargets(revalidate, target));
@@ -1313,12 +1317,51 @@ pub fn generate_client_runtime() -> String {
     })) {
       throw new Error('Nulang overlay scope forbids external revalidation targets');
     }
+    const activeLane = target && actionLanes.get(target);
+    if (activeLane && activeLane.policy !== policy) {
+      throw new Error('cannot change coordination policy while target is busy');
+    }
+    // Never overwrite an in-flight drop or queue action through a secondary
+    // region claimed by another primary action.
+    if (keys.some(function (key) {
+      const owner = pendingPatches.get(key);
+      return owner && owner.lane && owner.lane !== activeLane &&
+        owner.lane.policy !== 'replace';
+    })) {
+      throw new Error('Nulang action coordination conflict with an active target');
+    }
+    if (activeLane && policy === 'drop') return Promise.resolve();
+    if (activeLane && policy === 'queue' &&
+        activeLane.queue.length >= MAX_QUEUED_ACTIONS_PER_TARGET) {
+      throw new Error('Nulang action queue is full for target ' + target);
+    }
+
+    // Snapshot the mutable form and idempotency key at the interaction time.
+    const body = formBody(form);
+    const message = createActionMessage(handler, 'server', body);
+    body.append('__nulang_action', handler);
+    body.append('__nulang_ui_message', JSON.stringify(message));
+    const lane = target ? (policy === 'replace' || !activeLane
+      ? {policy: policy, queue: []} : activeLane) : null;
+    const job = {handler: handler, target: target, keys: keys, body: body,
+      revalidate: revalidate, requestUrl: requestUrl, lane: lane};
+    if (activeLane && policy === 'queue') {
+      return new Promise(function (resolve, reject) {
+        activeLane.queue.push({job: job, resolve: resolve, reject: reject});
+      });
+    }
+    if (target) actionLanes.set(target, lane);
+    return executeServerAction(job);
+  }
+
+  async function executeServerAction(job) {
+    const {target, keys, body, revalidate, requestUrl, lane} = job;
     const previous = new Set(keys.map(function (key) {
       return pendingPatches.get(key);
     }).filter(Boolean));
     const controller = target && typeof AbortController === 'function'
       ? new AbortController() : null;
-    const request = target ? { controller } : null;
+    const request = target ? {controller: controller, lane: lane} : null;
     keys.forEach(function (key) {
       pendingPatches.set(key, request);
       touchTarget(key);
@@ -1327,20 +1370,18 @@ pub fn generate_client_runtime() -> String {
       if (pending.controller) pending.controller.abort();
     });
     const isCurrent = () => window.location.href === requestUrl &&
-      keys.every(function (key) {
-        return pendingPatches.get(key) === request;
-      });
+      (!target || actionLanes.get(target) === lane) &&
+      keys.every(function (key) { return pendingPatches.get(key) === request; });
     try {
-      const options = { method: 'POST', body: body };
+      const options = {method: 'POST', body: body};
       if (controller) options.signal = controller.signal;
       const response = await fetch(requestUrl, options);
       if (!isCurrent()) return;
-      if (!response.ok) {
-        throw new Error('server action failed: ' + response.status);
-      }
+      if (!response.ok) throw new Error('server action failed: ' + response.status);
       if (target) {
         if (revalidate !== undefined && revalidate !== null) {
-          await patchActionWithRevalidation(response, target, keys.slice(1), isCurrent, controller, requestUrl);
+          await patchActionWithRevalidation(response, target, keys.slice(1),
+            isCurrent, controller, requestUrl);
         } else {
           await patchActionResponse(response, target, isCurrent);
         }
@@ -1348,13 +1389,19 @@ pub fn generate_client_runtime() -> String {
         window.location.reload();
       }
     } catch (error) {
-      // An aborted/superseded request must never replace a newer result or
-      // report an error for an interaction the user has already superseded.
       if (isCurrent()) throw error;
     } finally {
       keys.forEach(function (key) {
         if (pendingPatches.get(key) === request) pendingPatches.delete(key);
       });
+      if (target && actionLanes.get(target) === lane) {
+        if (lane.policy === 'queue' && lane.queue.length) {
+          const next = lane.queue.shift();
+          executeServerAction(next.job).then(next.resolve, next.reject);
+        } else {
+          actionLanes.delete(target);
+        }
+      }
     }
   }
 
