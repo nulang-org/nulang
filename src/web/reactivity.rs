@@ -12,7 +12,7 @@
 use crate::ast::{AstModule, Decl, Expr, Literal};
 use crate::effect_checker::EffectChecker;
 use crate::types::{Effect, EffectRow, Span};
-pub use nulang_ui_protocol::ActionPlacement;
+pub use nulang_ui_protocol::{ActionCoordination, ActionPlacement};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -29,6 +29,10 @@ pub enum GraphNode {
         handler: String,
         path: String,
         placement: ActionPlacement,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+        #[serde(default, skip_serializing_if = "ActionCoordination::is_replace")]
+        coordination: ActionCoordination,
     },
 }
 
@@ -36,6 +40,9 @@ pub enum GraphNode {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SignalGraph {
     pub nodes: Vec<GraphNode>,
+    /// Diagnostics stay compiler-local, never emitted into deployment artifacts.
+    #[serde(skip)]
+    pub errors: Vec<String>,
 }
 
 impl SignalGraph {
@@ -93,6 +100,8 @@ impl SignalGraph {
                     handler,
                     path,
                     placement,
+                    target,
+                    coordination,
                 } => {
                     let id = NodeId::new(format!("action:{action_index}:{handler}"));
                     action_index += 1;
@@ -105,6 +114,8 @@ impl SignalGraph {
                         event: "activate".to_string(),
                         action_id: ActionId::new(handler.clone()),
                         placement: *placement,
+                        target: target.clone(),
+                        coordination: *coordination,
                     });
                     root.children.push(id);
                     node
@@ -212,16 +223,73 @@ fn scan_expr(
             let attrs = array_tuples(&args[1]);
             let children = array_elements(&args[2]);
 
-            for (name, value) in &attrs {
-                if name == "action" {
-                    if let Some(handler) = action_handler_name(value) {
-                        graph.push(GraphNode::Action {
-                            handler: handler.clone(),
-                            path: path_with_tag(path, &tag),
-                            placement: classify_action(&handler, checker),
-                        });
-                    }
+            // Policy and target are compiler-owned fields, not arbitrary
+            // runtime strings. Only static values are permitted for actions.
+            let action = attrs.iter().find_map(|(name, value)| {
+                (name == "action" || name == "data-action")
+                    .then(|| action_handler_name(value))
+                    .flatten()
+            });
+            if let Some(handler) = action {
+                let action_path = path_with_tag(path, &tag);
+                let target_attrs: Vec<_> = attrs
+                    .iter()
+                    .filter(|(name, _)| name == "data-nulang-target")
+                    .collect();
+                let policy_attrs: Vec<_> = attrs
+                    .iter()
+                    .filter(|(name, _)| name == "data-nulang-coordination")
+                    .collect();
+                if target_attrs.len() > 1 || policy_attrs.len() > 1 {
+                    graph.errors.push(format!(
+                        "web action at {} has duplicate target or coordination attributes",
+                        action_path
+                    ));
                 }
+                let target = target_attrs.first().and_then(|(_, value)| {
+                    let result = static_html_attr_value(value);
+                    if result
+                        .as_deref()
+                        .is_none_or(|value| !valid_action_target(value))
+                    {
+                        graph.errors.push(format!(
+                            "web action at {} requires a static #id data-nulang-target",
+                            action_path
+                        ));
+                    }
+                    result.filter(|value| valid_action_target(value))
+                });
+                let coordination = match policy_attrs.first() {
+                    None => ActionCoordination::Replace,
+                    Some((_, value)) => match static_html_attr_value(value).as_deref() {
+                        Some("replace") => ActionCoordination::Replace,
+                        Some("drop") => ActionCoordination::Drop,
+                        Some("queue") => ActionCoordination::Queue,
+                        _ => {
+                            graph.errors.push(format!(
+                                "web action at {} requires a static data-nulang-coordination: replace, drop, or queue",
+                                action_path
+                            ));
+                            ActionCoordination::Replace
+                        }
+                    },
+                };
+                if coordination != ActionCoordination::Replace && target.is_none() {
+                    graph.errors.push(format!(
+                        "web action at {} needs data-nulang-target for {} coordination",
+                        action_path,
+                        coordination.as_str()
+                    ));
+                }
+                graph.push(GraphNode::Action {
+                    handler: handler.clone(),
+                    path: action_path,
+                    placement: classify_action(&handler, checker),
+                    target,
+                    coordination,
+                });
+            }
+            for (_, value) in &attrs {
                 scan_expr(
                     value,
                     &mut path_with(path, &tag),
@@ -484,11 +552,29 @@ fn array_tuples(expr: &Expr) -> Vec<(String, &Expr)> {
     out
 }
 
+fn static_html_attr_value(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Literal(Literal::String(value), ..) => Some(value.clone()),
+        Expr::App { func, args, .. } if is_var(func, "text") && args.len() == 1 => {
+            string_literal(&args[0])
+        }
+        _ => None,
+    }
+}
+
+fn valid_action_target(target: &str) -> bool {
+    let Some(id) = target.strip_prefix('#') else {
+        return false;
+    };
+    let mut chars = id.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_alphabetic())
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
 fn action_handler_name(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Var(name, ..) => Some(name.clone()),
-        Expr::Literal(Literal::String(s), ..) => Some(s.clone()),
-        _ => None,
+        _ => static_html_attr_value(expr),
     }
 }
 
@@ -514,7 +600,11 @@ fn path_with_tag(path: &[String], tag: &str) -> String {
 /// client-side signal micro-runtime can hydrate the page. The tag is placed
 /// just before `</body>` when present, otherwise appended at the end.
 pub fn inject_client_runtime_script(html: &str) -> String {
-    if !html.contains("data-signal=") && !html.contains("data-action=") {
+    if !html.contains("data-signal=")
+        && !html.contains("data-action=")
+        && !html.contains("data-nulang-nav-target=")
+        && !html.contains("data-nulang-overlay=")
+    {
         return html.to_string();
     }
     let script = r#"<script src="/app.client.js"></script>"#;
@@ -787,6 +877,20 @@ pub fn generate_client_runtime() -> String {
   // Object.prototype (e.g. constructor, toString, __proto__).
   const signals = Object.create(null);
   const signalBindings = Object.create(null);
+  const hydratedActions = new WeakSet();
+  // A later submission for the same target supersedes its earlier UI update.
+  // Aborting the fetch is best-effort: server mutations may still complete.
+  const pendingPatches = new Map();
+  const actionLanes = new Map();
+  const MAX_QUEUED_ACTIONS_PER_TARGET = 32;
+  // Shared by streamed invalidations and local actions, so a stale GET cannot
+  // overwrite a newer local mutation (or any newer streamed fragment).
+  const targetGenerations = new Map();
+  function touchTarget(target) {
+    const next = (targetGenerations.get(target) || 0) + 1;
+    targetGenerations.set(target, next);
+    return next;
+  }
 
   function refreshSignal(name) {
     const bindings = signalBindings[name];
@@ -849,20 +953,614 @@ pub fn generate_client_runtime() -> String {
     return body;
   }
 
+  // Reuse matching DOM nodes rather than replacing focused controls, losing
+  // event listeners, or discarding client-owned input state. Keyed siblings
+  // have a stable identity via id or data-nulang-key.
+  function nodeKey(node) {
+    if (node.nodeType !== 1) return null;
+    const key = node.getAttribute('data-nulang-key');
+    if (key !== null) return 'key:' + key;
+    return node.id ? 'id:' + node.id : null;
+  }
+
+  function sameKind(current, incoming) {
+    return current.nodeType === incoming.nodeType &&
+      (current.nodeType !== 1 ||
+       (current.tagName === incoming.tagName &&
+        current.namespaceURI === incoming.namespaceURI));
+  }
+
+  function morphNode(current, incoming) {
+    if (!sameKind(current, incoming) ||
+        (nodeKey(current) !== null && nodeKey(current) !== nodeKey(incoming))) {
+      const replacement = document.importNode(incoming, true);
+      current.replaceWith(replacement);
+      return replacement;
+    }
+    if (current.nodeType !== 1) {
+      if (current.nodeValue !== incoming.nodeValue) {
+        current.nodeValue = incoming.nodeValue;
+      }
+      return current;
+    }
+
+    const focused = document.activeElement === current;
+    const tag = current.tagName;
+    // A user edit is owned by the browser until the application explicitly
+    // resets it. Do not overwrite it with a stale server-rendered default.
+    const dirtyValue = (tag === 'TEXTAREA' ||
+       (tag === 'INPUT' && current.type !== 'file')) &&
+      (focused || current.value !== current.defaultValue);
+    const dirtyChecked = tag === 'INPUT' &&
+      (focused || current.checked !== current.defaultChecked);
+    const dirtySelect = tag === 'SELECT' &&
+      (focused || Array.from(current.options).some(function (option) {
+        return option.selected !== option.defaultSelected;
+      }));
+    const value = dirtyValue ? current.value : null;
+    const checked = dirtyChecked ? current.checked : null;
+    const selected = dirtySelect
+      ? Array.from(current.options).filter(function (option) { return option.selected; })
+          .map(function (option) { return option.value; })
+      : null;
+    const selection = focused && typeof current.selectionStart === 'number'
+      ? [current.selectionStart, current.selectionEnd, current.selectionDirection]
+      : null;
+
+    // Synchronize attributes, including removals, for SSR parity.
+    Array.from(current.attributes).forEach(function (attr) {
+      if (!incoming.hasAttribute(attr.name)) current.removeAttribute(attr.name);
+    });
+    Array.from(incoming.attributes).forEach(function (attr) {
+      if (current.getAttribute(attr.name) !== attr.value) {
+        current.setAttribute(attr.name, attr.value);
+      }
+    });
+
+    const oldChildren = Array.from(current.childNodes);
+    const keyed = new Map();
+    const unkeyed = [];
+    oldChildren.forEach(function (child) {
+      const key = nodeKey(child);
+      if (key === null) {
+        unkeyed.push(child);
+      } else if (!keyed.has(key)) {
+        keyed.set(key, child);
+      }
+    });
+    const reused = new Set();
+    let unkeyedIndex = 0;
+    let position = 0;
+    Array.from(incoming.childNodes).forEach(function (child) {
+      const key = nodeKey(child);
+      let match = null;
+      if (key !== null) {
+        const candidate = keyed.get(key);
+        if (candidate && !reused.has(candidate) && sameKind(candidate, child)) {
+          match = candidate;
+        }
+      } else {
+        while (unkeyedIndex < unkeyed.length) {
+          const candidate = unkeyed[unkeyedIndex++];
+          if (sameKind(candidate, child)) {
+            match = candidate;
+            break;
+          }
+        }
+      }
+      let node;
+      if (match) {
+        reused.add(match);
+        node = morphNode(match, child);
+      } else {
+        node = document.importNode(child, true);
+      }
+      const before = current.childNodes[position] || null;
+      if (node !== before) current.insertBefore(node, before);
+      position++;
+    });
+    oldChildren.forEach(function (child) {
+      if (!reused.has(child) && child.parentNode === current) child.remove();
+    });
+
+    if (dirtyValue) current.value = value;
+    if (dirtyChecked) current.checked = checked;
+    if (dirtySelect) {
+      Array.from(current.options).forEach(function (option) {
+        option.selected = selected.includes(option.value);
+      });
+    }
+    if (selection) {
+      // Selection APIs can throw on unsupported input types.
+      try { current.setSelectionRange(selection[0], selection[1], selection[2]); }
+      catch (_) {}
+    }
+    return current;
+  }
+
+  // Progressive HTML updates are opt-in. The response may contain an entire
+  // server-rendered page or only the element identified by the target ID.
+  // Legacy actions still reload when no target is declared.
+  function applyHtmlUpdate(selector, html, updateTitle) {
+    if (!/^#[A-Za-z][A-Za-z0-9_-]*$/.test(selector)) {
+      throw new Error('invalid Nulang patch target (expected an element ID)');
+    }
+    const page = new DOMParser().parseFromString(html, 'text/html');
+    const incoming = page.querySelector(selector);
+    const current = document.querySelector(selector);
+    if (!incoming || !current) {
+      throw new Error('Nulang patch target not found: ' + selector);
+    }
+    // Tiny DOM stubs used by the existing no-dependency regression test do
+    // not implement the Node interface; real browser nodes take the morph path.
+    if (typeof current.nodeType !== 'number' ||
+        typeof incoming.nodeType !== 'number') {
+      current.replaceWith(document.importNode(incoming, true));
+    } else {
+      // Moving a retained focused node with insertBefore can temporarily
+      // blur it. Restore focus only if that same node survives the morph.
+      const active = document.activeElement;
+      const restoreFocus = active && (active === current || current.contains(active));
+      const selection = restoreFocus && typeof active.selectionStart === 'number'
+        ? [active.selectionStart, active.selectionEnd, active.selectionDirection]
+        : null;
+      morphNode(current, incoming);
+      if (restoreFocus && active.isConnected) {
+        active.focus({ preventScroll: true });
+        if (selection) {
+          try { active.setSelectionRange(selection[0], selection[1], selection[2]); }
+          catch (_) {}
+        }
+      }
+    }
+    if (updateTitle && page.title) document.title = page.title;
+    hydrate();
+  }
+
+  // Validate the media type and parse the response before touching the DOM.
+  // This does not sanitize HTML: server-rendered content must be escaped.
+  async function parseHtmlResponse(response) {
+    const contentType = response.headers.get('content-type') || '';
+    if (!/^text\/html(?:\s*;|\s*$)/i.test(contentType.trim())) {
+      throw new Error('Nulang patch response must be text/html');
+    }
+    return new DOMParser().parseFromString(await response.text(), 'text/html');
+  }
+
+  // Explicit, bounded IDs, not inferred storage dependencies or arbitrary CSS.
+  function revalidationTargets(raw, primary) {
+    if (raw.length > 512) throw new Error('Nulang revalidation list is too long');
+    const selectors = raw.split(/[\s,]+/).filter(Boolean);
+    if (!selectors.length || selectors.length > 8) {
+      throw new Error('Nulang revalidation requires 1-8 targets');
+    }
+    const used = new Set([primary]);
+    selectors.forEach(function (selector) {
+      if (!/^#[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(selector) || used.has(selector)) {
+        throw new Error('Nulang revalidation requires distinct element ID targets');
+      }
+      used.add(selector);
+    });
+    return selectors;
+  }
+
+  // Preflight every target before ANY DOM mutation, including overlap checks.
+  // This is validation-atomic, not rollback if DOM APIs themselves throw.
+  function applyHtmlTargets(patches, updateTitle) {
+    const planned = patches.map(function (patch) {
+      const selector = patch.selector;
+      if (!/^#[A-Za-z][A-Za-z0-9_-]*$/.test(selector)) {
+        throw new Error('invalid Nulang patch target (expected an element ID)');
+      }
+      const incoming = patch.page.querySelector(selector);
+      const current = document.querySelector(selector);
+      if (!incoming || !current) {
+        throw new Error('Nulang patch target not found: ' + selector);
+      }
+      return { current, incoming };
+    });
+    planned.forEach(function (item, index) {
+      planned.slice(index + 1).forEach(function (other) {
+        if ((typeof item.current.contains === 'function' &&
+             item.current.contains(other.current)) ||
+            (typeof other.current.contains === 'function' &&
+             other.current.contains(item.current))) {
+          throw new Error('Nulang revalidation targets must not overlap');
+        }
+      });
+    });
+    planned.forEach(function (item, index) {
+      touchTarget(patches[index].selector);
+      const current = item.current;
+      const incoming = item.incoming;
+      // No Node interface in tiny test stubs; real browsers use DOM morph.
+      if (typeof current.nodeType !== 'number' ||
+          typeof incoming.nodeType !== 'number') {
+        current.replaceWith(document.importNode(incoming, true));
+      } else {
+        const active = document.activeElement;
+        const restoreFocus = active && (active === current || current.contains(active));
+        const selection = restoreFocus && typeof active.selectionStart === 'number'
+          ? [active.selectionStart, active.selectionEnd, active.selectionDirection]
+          : null;
+        morphNode(current, incoming);
+        if (restoreFocus && active.isConnected) {
+          active.focus({ preventScroll: true });
+          if (selection) {
+            try { active.setSelectionRange(selection[0], selection[1], selection[2]); }
+            catch (_) {}
+          }
+        }
+      }
+    });
+    if (updateTitle && updateTitle.title) document.title = updateTitle.title;
+    hydrate();
+  }
+
+  // Progressive HTML updates are opt-in. Legacy actions still reload.
+  async function patchActionResponse(response, selector, isCurrent, updateTitle) {
+    const page = await parseHtmlResponse(response);
+    if (isCurrent && !isCurrent()) return;
+    applyHtmlTargets([{ selector: selector, page: page }], updateTitle ? page : null);
+  }
+
+  // After successful POST, refresh explicit sibling regions from the route's
+  // canonical GET representation in a single conditional DOM update.
+  async function patchActionWithRevalidation(response, selector, selectors, isCurrent, controller, requestUrl) {
+    const refreshed = await fetch(requestUrl, {
+      method: 'GET', headers: { Accept: 'text/html' }, cache: 'no-store',
+      ...(controller ? { signal: controller.signal } : {})
+    });
+    if (!isCurrent()) return;
+    if (!refreshed.ok || refreshed.redirected) {
+      throw new Error('Nulang revalidation GET failed: ' + refreshed.status);
+    }
+    const [postPage, getPage] = await Promise.all([
+      parseHtmlResponse(response), parseHtmlResponse(refreshed)
+    ]);
+    if (!isCurrent()) return;
+    applyHtmlTargets(
+      [{ selector: selector, page: postPage }].concat(
+        selectors.map(function (id) { return { selector: id, page: getPage }; })
+      ),
+      null
+    );
+  }
+
+  // A new subscription always begins with a full current snapshot. Patches
+  // must be contiguous; duplicates are ignored and gaps force a resnapshot.
+  function stream(room) {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(room)) {
+      throw new Error('invalid Nulang UI stream room');
+    }
+    let closed = false;
+    let connection = null;
+    let revision = null;
+    // Each target has a local generation so a stale GET cannot undo a later
+    // HTML patch or a newer invalidation.
+    function refreshInvalidated(targets, active) {
+      const planned = targets.filter(function (target) {
+        return typeof target === 'string' &&
+          /^#[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(target) &&
+          document.querySelector(target);
+      }).map(function (selector) {
+        return {selector: selector, generation: touchTarget(selector)};
+      });
+      if (!planned.length) return;
+      const requestUrl = window.location.href;
+      fetch(requestUrl, {
+        method: 'GET', headers: {Accept: 'text/html'}, cache: 'no-store'
+      }).then(async function (response) {
+        if (!response.ok || response.redirected) {
+          throw new Error('Nulang UI invalidation GET failed: ' + response.status);
+        }
+        const page = await parseHtmlResponse(response);
+        if (closed || active !== connection || window.location.href !== requestUrl) return;
+        const current = planned.filter(function (item) {
+          return targetGenerations.get(item.selector) === item.generation;
+        });
+        if (current.length) applyHtmlTargets(current.map(function (item) {
+          return {selector: item.selector, page: page};
+        }), null);
+      }).catch(function (error) {
+        if (!closed && active === connection && window.location.href === requestUrl) {
+          console.error('nulang: UI invalidation refresh failed', error);
+        }
+      });
+    }
+
+    function parseEvent(e, kind) {
+      let msg;
+      try { msg = JSON.parse(e.data); }
+      catch (err) { console.error('nulang: invalid UI stream JSON', err); return null; }
+      if (!msg || msg.protocol !== 'nulang-ui-html/1' ||
+          msg.type !== kind || msg.document_id !== room ||
+          typeof msg.revision !== 'string' ||
+          !/^(0|[1-9][0-9]*)$/.test(msg.revision) ||
+          msg.revision.length > 20 ||
+          BigInt(msg.revision) > 18446744073709551615n) {
+        return null;
+      }
+      return msg;
+    }
+
+    function applyElement(element) {
+      if (!element || typeof element.target !== 'string' ||
+          typeof element.html !== 'string') return;
+      // A room may publish targets absent from the current view.
+      if (!/^#[A-Za-z][A-Za-z0-9_-]*$/.test(element.target) ||
+          !document.querySelector(element.target)) return;
+      touchTarget(element.target);
+      applyHtmlUpdate(element.target, element.html);
+    }
+
+    function open() {
+      if (closed) return;
+      revision = null;
+      connection = new window.EventSource('/__nulang/ui-sse/' + encodeURIComponent(room));
+      const active = connection;
+      active.addEventListener('nulang-ui-snapshot', function (e) {
+        if (closed || active !== connection) return;
+        const msg = parseEvent(e, 'snapshot');
+        if (!msg || !Array.isArray(msg.elements) || msg.elements.length > 32) return;
+        if (msg.elements.some(function (el) {
+          return !el || typeof el.target !== 'string' ||
+            !/^#[A-Za-z][A-Za-z0-9_-]*$/.test(el.target) ||
+            typeof el.html !== 'string';
+        })) return;
+        if (msg.invalidated !== undefined && (
+          !Array.isArray(msg.invalidated) || msg.invalidated.length > 32 ||
+          msg.invalidated.some(function (target) {
+            return typeof target !== 'string' ||
+              !/^#[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(target);
+          }) || msg.invalidated.length + msg.elements.length > 32
+        )) return;
+        const invalidated = msg.invalidated || [];
+        if (new Set(invalidated.concat(msg.elements.map(function (el) {return el.target;}))).size
+            !== invalidated.length + msg.elements.length) return;
+        msg.elements.forEach(applyElement);
+        revision = BigInt(msg.revision);
+        refreshInvalidated(invalidated, active);
+      });
+      active.addEventListener('nulang-ui-patch', function (e) {
+        if (closed || active !== connection) return;
+        const msg = parseEvent(e, 'patch');
+        if (!msg || revision === null ||
+            typeof msg.base_revision !== 'string' ||
+            !/^(0|[1-9][0-9]*)$/.test(msg.base_revision)) return;
+        const incoming = BigInt(msg.revision);
+        const base = BigInt(msg.base_revision);
+        if (incoming <= revision) return;
+        if (base !== revision || incoming !== base + 1n) {
+          active.close();
+          open();
+          return;
+        }
+        if (!msg.element || typeof msg.element.target !== 'string' ||
+            !/^#[A-Za-z][A-Za-z0-9_-]*$/.test(msg.element.target) ||
+            typeof msg.element.html !== 'string') return;
+        applyElement(msg.element);
+        revision = incoming;
+      });
+      active.addEventListener('nulang-ui-invalidate', function (e) {
+        if (closed || active !== connection) return;
+        const msg = parseEvent(e, 'invalidate');
+        if (!msg || revision === null ||
+            typeof msg.base_revision !== 'string' ||
+            !/^(0|[1-9][0-9]*)$/.test(msg.base_revision) ||
+            msg.base_revision.length > 20 ||
+            BigInt(msg.base_revision) > 18446744073709551615n ||
+            typeof msg.target !== 'string' ||
+            !/^#[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(msg.target)) return;
+        const incoming = BigInt(msg.revision);
+        const base = BigInt(msg.base_revision);
+        if (incoming <= revision) return;
+        if (base !== revision || incoming !== base + 1n) {
+          active.close();
+          open();
+          return;
+        }
+        revision = incoming;
+        refreshInvalidated([msg.target], active);
+      });
+    }
+    open();
+    return {close: function () {
+      closed = true;
+      if (connection) connection.close();
+    }};
+  }
+
+  // Coordination lanes are per primary #id. Secondary regions are claimed
+  // by each in-flight request and can supersede old replace-only requests.
+  // Client-side abort never implies that a server mutation was rolled back.
   async function runServerAction(handler, el) {
+    const requestUrl = window.location.href;
     const form = el.closest('form');
+    const target = el.dataset.nulangTarget || (form && form.dataset.nulangTarget);
+    const policy = el.dataset.nulangCoordination ||
+      (form && form.dataset.nulangCoordination) || 'replace';
+    if (!['replace', 'drop', 'queue'].includes(policy)) {
+      throw new Error('invalid Nulang action coordination policy: ' + policy);
+    }
+    if (!target && policy !== 'replace') {
+      throw new Error('Nulang action coordination requires a target');
+    }
+    const ownerDialog = typeof el.closest === 'function' ? el.closest('dialog') : null;
+    const ownerScope = ownerDialog && overlays.get('#' + ownerDialog.id);
+    if (ownerScope && ownerScope.active &&
+        (!target || !ownerDialog.contains(document.querySelector(target)))) {
+      throw new Error('Nulang overlay scope forbids an external action target');
+    }
+    const revalidate = el.dataset.nulangRevalidate !== undefined
+      ? el.dataset.nulangRevalidate : (form && form.dataset.nulangRevalidate);
+    const keys = target ? [target] : [];
+    if (target && revalidate !== undefined && revalidate !== null) {
+      keys.push(...revalidationTargets(revalidate, target));
+    }
+    if (ownerScope && ownerScope.active && keys.some(function (key) {
+      return !ownerDialog.contains(document.querySelector(key));
+    })) {
+      throw new Error('Nulang overlay scope forbids external revalidation targets');
+    }
+    const activeLane = target && actionLanes.get(target);
+    if (activeLane && activeLane.policy !== policy) {
+      throw new Error('cannot change coordination policy while target is busy');
+    }
+    // Never overwrite an in-flight drop or queue action through a secondary
+    // region claimed by another primary action.
+    if (keys.some(function (key) {
+      const owner = pendingPatches.get(key);
+      return owner && owner.lane && owner.lane !== activeLane &&
+        owner.lane.policy !== 'replace';
+    })) {
+      throw new Error('Nulang action coordination conflict with an active target');
+    }
+    if (activeLane && policy === 'drop') return Promise.resolve();
+    if (activeLane && policy === 'queue' &&
+        activeLane.queue.length >= MAX_QUEUED_ACTIONS_PER_TARGET) {
+      throw new Error('Nulang action queue is full for target ' + target);
+    }
+
+    // Snapshot the mutable form and idempotency key at the interaction time.
     const body = formBody(form);
     const message = createActionMessage(handler, 'server', body);
     body.append('__nulang_action', handler);
     body.append('__nulang_ui_message', JSON.stringify(message));
-    const response = await fetch(window.location.href, { method: 'POST', body: body });
-    if (!response.ok) {
-      throw new Error('server action failed: ' + response.status);
+    const lane = target ? (policy === 'replace' || !activeLane
+      ? {policy: policy, queue: []} : activeLane) : null;
+    const job = {handler: handler, target: target, keys: keys, body: body,
+      revalidate: revalidate, requestUrl: requestUrl, lane: lane,
+      ownerScope: ownerScope};
+    if (activeLane && policy === 'queue') {
+      return new Promise(function (resolve, reject) {
+        activeLane.queue.push({job: job, resolve: resolve, reject: reject});
+      });
     }
-    window.location.reload();
+    if (target) actionLanes.set(target, lane);
+    return executeServerAction(job);
+  }
+
+  async function executeServerAction(job) {
+    const {target, keys, body, revalidate, requestUrl, lane} = job;
+    const previous = new Set(keys.map(function (key) {
+      return pendingPatches.get(key);
+    }).filter(Boolean));
+    const controller = target && typeof AbortController === 'function'
+      ? new AbortController() : null;
+    const request = target ? {controller: controller, lane: lane} : null;
+    const claims = keys.map(function (key) {
+      pendingPatches.set(key, request);
+      return {key: key, generation: touchTarget(key)};
+    });
+    previous.forEach(function (pending) {
+      if (pending.controller) pending.controller.abort();
+    });
+    const isCurrent = () => window.location.href === requestUrl &&
+      (!target || actionLanes.get(target) === lane) &&
+      claims.every(function (claim) {
+        return pendingPatches.get(claim.key) === request &&
+          targetGenerations.get(claim.key) === claim.generation;
+      });
+    try {
+      const options = {method: 'POST', body: body};
+      if (controller) options.signal = controller.signal;
+      const response = await fetch(requestUrl, options);
+      if (!isCurrent()) return;
+      if (!response.ok) throw new Error('server action failed: ' + response.status);
+      if (target) {
+        if (revalidate !== undefined && revalidate !== null) {
+          await patchActionWithRevalidation(response, target, keys.slice(1),
+            isCurrent, controller, requestUrl);
+        } else {
+          await patchActionResponse(response, target, isCurrent);
+        }
+      } else {
+        window.location.reload();
+      }
+    } catch (error) {
+      if (isCurrent()) throw error;
+    } finally {
+      keys.forEach(function (key) {
+        if (pendingPatches.get(key) === request) pendingPatches.delete(key);
+      });
+      if (target && actionLanes.get(target) === lane) {
+        let started = false;
+        // Cancel every queued mutation whose original page or overlay scope
+        // disappeared. Never issue a POST against a route the user left.
+        while (lane.policy === 'queue' && lane.queue.length && !started) {
+          const next = lane.queue.shift();
+          if (window.location.href !== next.job.requestUrl ||
+              (next.job.ownerScope && !next.job.ownerScope.active)) {
+            next.reject(new Error('Nulang queued action canceled by navigation or overlay close'));
+          } else {
+            started = true;
+            executeServerAction(next.job).then(next.resolve, next.reject);
+          }
+        }
+        if (!started) actionLanes.delete(target);
+      }
+    }
+  }
+
+  // Only explicitly enhanced links use the Navigation API. Unsupported
+  // browsers, reloads, history traversal, downloads and forms retain native
+  // navigation; Nulang does not maintain a competing history/router stack.
+  function installNavigation() {
+    if (!window.navigation || typeof window.navigation.addEventListener !== 'function') return;
+    window.navigation.addEventListener('navigate', function (event) {
+      if (!event.canIntercept || event.hashChange || event.downloadRequest != null ||
+          event.formData != null ||
+          (event.navigationType !== 'push' && event.navigationType !== 'replace')) return;
+      const source = event.sourceElement;
+      const link = source && typeof source.closest === 'function'
+        ? source.closest('a[data-nulang-nav-target]') : null;
+      if (!link || link.hasAttribute('download') ||
+          (link.target && link.target !== '_self') ||
+          /(?:^|\s)external(?:\s|$)/i.test(link.getAttribute('rel') || '')) return;
+      const selector = link.dataset.nulangNavTarget;
+      if (!selector || !/^#[A-Za-z][A-Za-z0-9_-]*$/.test(selector) ||
+          !document.querySelector(selector)) return;
+      let url;
+      try {
+        url = new URL(event.destination.url);
+        if (url.origin !== window.location.origin ||
+            (url.protocol !== 'http:' && url.protocol !== 'https:') ||
+            new URL(link.href, window.location.href).href !== url.href) return;
+      } catch (_) { return; }
+      event.intercept({
+        async handler() {
+          const active = () => !event.signal || !event.signal.aborted;
+          try {
+            if (!active()) return;
+            const response = await fetch(url.href, {
+              method: 'GET', headers: { Accept: 'text/html' }, signal: event.signal
+            });
+            if (!active()) return;
+            // A redirect or failure may require a completely different page.
+            // Restore ordinary document navigation instead of patching HTML.
+            if (!response.ok || response.redirected) {
+              throw new Error('navigation requires document fallback: ' + response.status);
+            }
+            await patchActionResponse(response, selector, active, true);
+          } catch (error) {
+            if (!active()) return;
+            console.error('nulang: navigation patch failed', error);
+            // The Navigation API has already committed its history entry.
+            // Replace rather than pushing a duplicate history entry.
+            window.location.replace(url.href);
+          }
+        }
+      });
+    });
   }
 
   function hydrate() {
+    // Rebuild the signal index after patches; detached elements must not stay
+    // subscribed. Preserve signal values instead of reinitializing them.
+    Object.keys(signalBindings).forEach(function (name) {
+      signalBindings[name] = [];
+    });
     document.querySelectorAll('[data-signal]').forEach(function (el) {
       const name = el.dataset.signal;
       if (!(name in signals)) {
@@ -875,9 +1573,14 @@ pub fn generate_client_runtime() -> String {
     });
 
     document.querySelectorAll('[data-action]').forEach(function (el) {
-      const handler = el.dataset.action;
-      const placement = el.dataset.actionPlacement;
+      if (hydratedActions.has(el)) return;
+      hydratedActions.add(el);
       const listener = function (e) {
+        // Morphing may change the compiled action on an existing DOM node.
+        // Read the latest binding rather than retaining an obsolete handler.
+        const handler = el.dataset.action;
+        if (!handler) return;
+        const placement = el.dataset.actionPlacement;
         e.preventDefault();
         if (placement === 'server') {
           runServerAction(handler, el).catch(function (err) {
@@ -893,7 +1596,170 @@ pub fn generate_client_runtime() -> String {
     });
   }
 
+  // Scoped overlays have explicit ownership, cancellation, and typed results.
+  // They are browser lifecycles, NOT durable actors or cross-page sessions.
+  const overlays = new Map();
+  const MAX_OVERLAYS = 8;
+
+  function validOverlayValue(value, depth) {
+    if (!value || typeof value !== 'object' || depth > 8) return false;
+    switch (value.type) {
+      case 'null': return !('value' in value);
+      case 'bool': return typeof value.value === 'boolean';
+      case 'string': return typeof value.value === 'string' && value.value.length <= 8192;
+      case 'i64':
+        return typeof value.value === 'string' &&
+          /^-?(0|[1-9][0-9]*)$/.test(value.value) &&
+          (function () {
+            const n = BigInt(value.value);
+            return n >= -9223372036854775808n && n <= 9223372036854775807n;
+          })();
+      case 'f64': return typeof value.value === 'string' && /^[0-9a-fA-F]{16}$/.test(value.value);
+      case 'bytes': return Array.isArray(value.value) && value.value.length <= 8192 &&
+        value.value.every(function (n) {return Number.isInteger(n) && n >= 0 && n <= 255;});
+      case 'array': return Array.isArray(value.value) && value.value.length <= 128 &&
+        value.value.every(function (v) {return validOverlayValue(v, depth + 1);});
+      case 'object':
+        return value.value !== null && typeof value.value === 'object' &&
+          !Array.isArray(value.value) && Object.keys(value.value).length <= 128 &&
+          Object.keys(value.value).every(function (key) {
+            return key.length <= 128 && validOverlayValue(value.value[key], depth + 1);
+          });
+      default: return false;
+    }
+  }
+
+  function settleOverlay(scope, outcome) {
+    if (!scope.active) return;
+    scope.active = false;
+    overlays.delete(scope.target);
+    if (scope.controller) scope.controller.abort();
+    if (scope.observer) scope.observer.disconnect();
+    if (scope.dialog) {
+      if (scope.onCancel) scope.dialog.removeEventListener('cancel', scope.onCancel);
+      if (scope.onClose) scope.dialog.removeEventListener('close', scope.onClose);
+      if (scope.dialog.open) scope.dialog.close();
+    }
+    if (scope.previousFocus && scope.previousFocus.isConnected &&
+        typeof scope.previousFocus.focus === 'function') {
+      scope.previousFocus.focus({preventScroll: true});
+    }
+    if (outcome === null) {
+      scope.reject(new Error('Nulang overlay canceled'));
+    } else if (outcome instanceof Error) {
+      scope.reject(outcome);
+    } else {
+      scope.resolve(outcome);
+    }
+  }
+
+  function openOverlay(target, href) {
+    if (typeof target !== 'string' ||
+        !/^#[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(target)) {
+      throw new Error('invalid Nulang overlay target');
+    }
+    const existing = document.querySelector(target);
+    if (!existing || existing.tagName !== 'DIALOG' ||
+        typeof existing.showModal !== 'function') {
+      throw new Error('Nulang overlay target must be an existing dialog');
+    }
+    if (overlays.has(target)) throw new Error('Nulang overlay is already active');
+    if (overlays.size >= MAX_OVERLAYS) throw new Error('Nulang overlay limit reached');
+    let url;
+    try {
+      url = new URL(href, window.location.href);
+      if (!['http:', 'https:'].includes(url.protocol) ||
+          url.origin !== new URL(window.location.href).origin) {
+        throw new Error('cross-origin');
+      }
+    } catch (_) {
+      throw new Error('Nulang overlay requires a same-origin URL');
+    }
+    const controller = typeof AbortController === 'function'
+      ? new AbortController() : null;
+    const scope = {
+      target: target, active: true, dialog: null, controller: controller,
+      previousFocus: document.activeElement, pageUrl: window.location.href,
+      resolve: null, reject: null, onCancel: null, onClose: null, observer: null,
+      opened: false
+    };
+    const result = new Promise(function (resolve, reject) {
+      scope.resolve = resolve;
+      scope.reject = reject;
+    });
+    overlays.set(target, scope);
+    fetch(url.href, {
+      method: 'GET', headers: {Accept: 'text/html'}, cache: 'no-store',
+      ...(controller ? {signal: controller.signal} : {})
+    }).then(async function (response) {
+      if (!scope.active) return;
+      if (!response.ok || response.redirected) {
+        throw new Error('Nulang overlay GET failed: ' + response.status);
+      }
+      const page = await parseHtmlResponse(response);
+      if (!scope.active) return;
+      if (window.location.href !== scope.pageUrl) {
+        throw new Error('Nulang overlay canceled by navigation');
+      }
+      const incoming = page.querySelector(target);
+      if (!incoming || incoming.tagName !== 'DIALOG') {
+        throw new Error('Nulang overlay response must contain a matching dialog');
+      }
+      applyHtmlTargets([{selector: target, page: page}], null);
+      const dialog = document.querySelector(target);
+      if (!dialog || dialog.tagName !== 'DIALOG' ||
+          typeof dialog.showModal !== 'function') {
+        throw new Error('Nulang overlay must render an existing dialog target');
+      }
+      scope.dialog = dialog;
+      scope.onCancel = function (event) {
+        event.preventDefault();
+        cancelOverlay(target);
+      };
+      scope.onClose = function () {cancelOverlay(target);};
+      dialog.addEventListener('cancel', scope.onCancel);
+      dialog.addEventListener('close', scope.onClose);
+      dialog.showModal();
+      scope.opened = true;
+      // Some hosts defer or omit the native close event. Observe the actual
+      // dialog state so a closed scope never retains an unresolved promise.
+      if (typeof MutationObserver === 'function') {
+        scope.observer = new MutationObserver(function () {
+          if (scope.active && scope.opened && !dialog.open) cancelOverlay(target);
+        });
+        scope.observer.observe(dialog, {attributes: true, attributeFilter: ['open']});
+      }
+    }).catch(function (error) {
+      if (scope.active) settleOverlay(scope, error);
+    });
+    return result;
+  }
+
+  function completeOverlay(target, value) {
+    const scope = overlays.get(target);
+    if (!scope || !scope.opened || !scope.active) return false;
+    if (!validOverlayValue(value, 0)) throw new Error('invalid Nulang overlay result value');
+    settleOverlay(scope, {
+      protocol: 'nulang-ui-msg/1', overlay_id: target,
+      status: 'completed', value: value
+    });
+    return true;
+  }
+
+  function cancelOverlay(target) {
+    const scope = overlays.get(target);
+    if (!scope || !scope.active) return false;
+    settleOverlay(scope, null);
+    return true;
+  }
+
   window.nulang = {
+    overlay: {
+      open: openOverlay,
+      complete: completeOverlay,
+      cancel: cancelOverlay
+    },
+    stream: stream,
     signal: function (name) {
       return {
         get: function () { return signals[name]; },
@@ -905,6 +1771,7 @@ pub fn generate_client_runtime() -> String {
     }
   };
 
+  installNavigation();
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', hydrate);
   } else {
@@ -976,6 +1843,86 @@ fn badge() -> Html {
     }
 
     #[test]
+    fn test_action_coordination_projects_to_typed_protocol() {
+        let module = parse(
+            r##"
+fn save() {}
+fn view() {
+    el("form", [
+        ("action", save),
+        ("data-nulang-target", text("#status")),
+        ("data-nulang-coordination", text("queue"))
+    ], [])
+}
+"##,
+        );
+        let graph = analyze_module(&module, None);
+        assert!(graph.errors.is_empty(), "{:?}", graph.errors);
+        let action = graph
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                GraphNode::Action {
+                    target,
+                    coordination,
+                    ..
+                } => Some((target, coordination)),
+                _ => None,
+            })
+            .expect("form action");
+        assert_eq!(action.0.as_deref(), Some("#status"));
+        assert_eq!(*action.1, nulang_ui_protocol::ActionCoordination::Queue);
+        let document = graph.to_ui_document("app", nulang_ui_protocol::Revision(1));
+        assert_eq!(
+            document
+                .nodes
+                .iter()
+                .find(|n| n.kind == "action")
+                .unwrap()
+                .actions[0]
+                .coordination,
+            nulang_ui_protocol::ActionCoordination::Queue
+        );
+        assert_eq!(
+            document
+                .nodes
+                .iter()
+                .find(|n| n.kind == "action")
+                .unwrap()
+                .actions[0]
+                .target
+                .as_deref(),
+            Some("#status")
+        );
+    }
+
+    #[test]
+    fn test_action_coordination_fails_closed_on_invalid_or_dynamic_policy() {
+        for policy in ["text(\"unknown\")", "text(input)"] {
+            let module = parse(&format!(
+                "fn save() {{}}\nfn view() {{ el(\"form\", [(\"action\", save), (\"data-nulang-target\", text(\"#status\")), (\"data-nulang-coordination\", {})], []) }}",
+                policy
+            ));
+            let graph = analyze_module(&module, None);
+            assert!(
+                !graph.errors.is_empty(),
+                "invalid or dynamic policy accepted: {}",
+                policy
+            );
+        }
+        let module = parse(
+            r#"
+fn save() {}
+fn view() {
+    el("form", [("action", save), ("data-nulang-coordination", text("drop"))], [])
+}
+"#,
+        );
+        let graph = analyze_module(&module, None);
+        assert!(graph.errors.iter().any(|e| e.contains("target")));
+    }
+
+    #[test]
     fn test_action_attribute() {
         let module = parse(
             r#"
@@ -994,6 +1941,8 @@ fn button() -> Html {
             handler: "add".to_string(),
             path: "button".to_string(),
             placement: ActionPlacement::Server,
+            target: None,
+            coordination: ActionCoordination::Replace,
         }));
     }
 
@@ -1026,11 +1975,15 @@ fn view() -> Html {
             handler: "add".to_string(),
             path: "div > button".to_string(),
             placement: ActionPlacement::Client,
+            target: None,
+            coordination: ActionCoordination::Replace,
         }));
         assert!(graph.nodes.contains(&GraphNode::Action {
             handler: "submit".to_string(),
             path: "div > form".to_string(),
             placement: ActionPlacement::Server,
+            target: None,
+            coordination: ActionCoordination::Replace,
         }));
     }
 
@@ -1133,6 +2086,22 @@ fn view() -> Html {
         let html = r#"<button data-action="save">Save</button>"#;
         let out = inject_client_runtime_script(html);
         assert!(out.ends_with(r#"<script src="/app.client.js"></script>"#));
+    }
+
+    #[test]
+    fn test_overlay_only_html_injects_client_runtime() {
+        let html = r#"<html><body><dialog id="editor" data-nulang-overlay="">Empty</dialog></body></html>"#;
+        let out = inject_client_runtime_script(html);
+        assert!(out.contains(r#"<script src="/app.client.js"></script>"#));
+        assert!(out.find("<script").unwrap() < out.find("</body>").unwrap());
+    }
+
+    #[test]
+    fn test_navigation_only_html_injects_client_runtime() {
+        let html = r##"<html><body><main id="page">Old</main><a href="/next" data-nulang-nav-target="#page">Next</a></body></html>"##;
+        let out = inject_client_runtime_script(html);
+        assert!(out.contains(r#"<script src="/app.client.js"></script>"#));
+        assert!(out.find("<script").unwrap() < out.find("</body>").unwrap());
     }
 
     #[test]

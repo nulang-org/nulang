@@ -9,6 +9,7 @@ use std::fmt;
 
 pub const UI_PROTOCOL_VERSION: &str = "nulang-ui/1";
 pub const UI_MESSAGE_PROTOCOL_VERSION: &str = "nulang-ui-msg/1";
+pub const UI_HTML_STREAM_PROTOCOL_VERSION: &str = "nulang-ui-html/1";
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -195,11 +196,42 @@ pub enum ActionPlacement {
     Server,
 }
 
+/// Compile-time checked browser request scheduling. Ordering controls
+/// client requests, not the commit order of server-side mutations.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionCoordination {
+    #[default]
+    Replace,
+    Drop,
+    Queue,
+}
+
+impl ActionCoordination {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Replace => "replace",
+            Self::Drop => "drop",
+            Self::Queue => "queue",
+        }
+    }
+
+    pub fn is_replace(&self) -> bool {
+        *self == Self::Replace
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionBinding {
     pub event: String,
     pub action_id: ActionId,
     pub placement: ActionPlacement,
+    /// Exact DOM ID selector for this interaction (not an arbitrary selector).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Omitted on the wire for legacy/default latest-wins behavior.
+    #[serde(default, skip_serializing_if = "ActionCoordination::is_replace")]
+    pub coordination: ActionCoordination,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -473,6 +505,233 @@ impl ActionRequest {
     }
 }
 
+/// A typed browser overlay completion. The host returns this value to the
+/// caller; cancellation rejects the browser promise rather than committing a
+/// server mutation. This is not a persistent workflow result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiOverlayStatus {
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiOverlayOutcome {
+    pub protocol: String,
+    pub overlay_id: String,
+    pub status: UiOverlayStatus,
+    pub value: WireValue,
+}
+
+impl UiOverlayOutcome {
+    pub fn completed(overlay_id: impl Into<String>, value: WireValue) -> Self {
+        Self {
+            protocol: UI_MESSAGE_PROTOCOL_VERSION.to_owned(),
+            overlay_id: overlay_id.into(),
+            status: UiOverlayStatus::Completed,
+            value,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        require_protocol(UI_MESSAGE_PROTOCOL_VERSION, &self.protocol)?;
+        validate_html_target(&self.overlay_id)
+    }
+}
+
+/// Escaped server-rendered HTML targeted at an element ID. The host must
+/// morph rather than evaluate the fragment as arbitrary JavaScript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiHtmlElement {
+    pub target: String,
+    pub html: String,
+}
+
+/// A separate transport adapter for HTML over SSE. This does not replace the
+/// renderer-neutral nulang-ui/1 patch algebra; revisions use the same exact
+/// decimal-string encoding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UiHtmlStreamMessage {
+    Snapshot {
+        protocol: String,
+        document_id: DocumentId,
+        revision: Revision,
+        elements: Vec<UiHtmlElement>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        invalidated: Vec<String>,
+    },
+    Patch {
+        protocol: String,
+        document_id: DocumentId,
+        base_revision: Revision,
+        revision: Revision,
+        element: UiHtmlElement,
+    },
+    Invalidate {
+        protocol: String,
+        document_id: DocumentId,
+        base_revision: Revision,
+        revision: Revision,
+        target: String,
+    },
+}
+
+impl UiHtmlStreamMessage {
+    pub fn snapshot(
+        document_id: DocumentId,
+        revision: Revision,
+        elements: Vec<UiHtmlElement>,
+    ) -> Self {
+        Self::snapshot_with_invalidated(document_id, revision, elements, Vec::new())
+    }
+
+    pub fn snapshot_with_invalidated(
+        document_id: DocumentId,
+        revision: Revision,
+        elements: Vec<UiHtmlElement>,
+        invalidated: Vec<String>,
+    ) -> Self {
+        Self::Snapshot {
+            protocol: UI_HTML_STREAM_PROTOCOL_VERSION.into(),
+            document_id,
+            revision,
+            elements,
+            invalidated,
+        }
+    }
+
+    pub fn invalidate(
+        document_id: DocumentId,
+        base_revision: Revision,
+        revision: Revision,
+        target: String,
+    ) -> Self {
+        Self::Invalidate {
+            protocol: UI_HTML_STREAM_PROTOCOL_VERSION.into(),
+            document_id,
+            base_revision,
+            revision,
+            target,
+        }
+    }
+
+    pub fn patch(
+        document_id: DocumentId,
+        base_revision: Revision,
+        revision: Revision,
+        element: UiHtmlElement,
+    ) -> Self {
+        Self::Patch {
+            protocol: UI_HTML_STREAM_PROTOCOL_VERSION.into(),
+            document_id,
+            base_revision,
+            revision,
+            element,
+        }
+    }
+
+    pub fn revision(&self) -> Revision {
+        match self {
+            Self::Snapshot { revision, .. }
+            | Self::Patch { revision, .. }
+            | Self::Invalidate { revision, .. } => *revision,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        let (protocol, document_id) = match self {
+            Self::Snapshot {
+                protocol,
+                document_id,
+                ..
+            }
+            | Self::Patch {
+                protocol,
+                document_id,
+                ..
+            }
+            | Self::Invalidate {
+                protocol,
+                document_id,
+                ..
+            } => (protocol, document_id),
+        };
+        require_protocol(UI_HTML_STREAM_PROTOCOL_VERSION, protocol)?;
+        require_id("document_id", document_id.as_str())?;
+        match self {
+            Self::Snapshot {
+                elements,
+                invalidated,
+                ..
+            } => {
+                if elements.len() + invalidated.len() > 32 {
+                    return Err(ProtocolError::InvalidHtmlTarget(
+                        "too many UI targets".into(),
+                    ));
+                }
+                let mut seen = BTreeSet::new();
+                for element in elements {
+                    validate_html_element(element)?;
+                    if !seen.insert(element.target.as_str()) {
+                        return Err(ProtocolError::InvalidHtmlTarget(element.target.clone()));
+                    }
+                }
+                for target in invalidated {
+                    validate_html_target(target)?;
+                    if !seen.insert(target.as_str()) {
+                        return Err(ProtocolError::InvalidHtmlTarget(target.clone()));
+                    }
+                }
+            }
+            Self::Patch {
+                base_revision,
+                revision,
+                element,
+                ..
+            } => {
+                if base_revision.0.checked_add(1) != Some(revision.0) {
+                    return Err(ProtocolError::NonIncreasingRevision {
+                        base: *base_revision,
+                        next: *revision,
+                    });
+                }
+                validate_html_element(element)?;
+            }
+            Self::Invalidate {
+                base_revision,
+                revision,
+                target,
+                ..
+            } => {
+                if base_revision.0.checked_add(1) != Some(revision.0) {
+                    return Err(ProtocolError::NonIncreasingRevision {
+                        base: *base_revision,
+                        next: *revision,
+                    });
+                }
+                validate_html_target(target)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_html_element(element: &UiHtmlElement) -> Result<(), ProtocolError> {
+    validate_html_target(&element.target)
+}
+
+fn validate_html_target(target: &str) -> Result<(), ProtocolError> {
+    let id = target.strip_prefix('#').unwrap_or("");
+    let mut chars = id.chars();
+    let valid = id.len() <= 64
+        && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !valid {
+        return Err(ProtocolError::InvalidHtmlTarget(target.to_owned()));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeToHostMessage {
@@ -565,6 +824,7 @@ pub enum ProtocolError {
         found: String,
     },
     EmptyIdentifier(&'static str),
+    InvalidHtmlTarget(String),
     EmptyNodeKind(NodeId),
     EmptyActionEvent(NodeId),
     DuplicateNode(NodeId),
@@ -601,6 +861,7 @@ impl fmt::Display for ProtocolError {
                 write!(f, "unsupported protocol {found:?}; expected {expected:?}")
             }
             Self::EmptyIdentifier(field) => write!(f, "{field} must not be empty"),
+            Self::InvalidHtmlTarget(target) => write!(f, "invalid HTML target ID: {target}"),
             Self::EmptyNodeKind(node) => write!(f, "node {node} has an empty kind"),
             Self::EmptyActionEvent(node) => write!(f, "node {node} has an empty action event"),
             Self::DuplicateNode(node) => write!(f, "duplicate node id {node}"),
@@ -721,6 +982,162 @@ mod tests {
             NodeId::from("root"),
             vec![root, leaf("task-1", "text")],
         )
+    }
+
+    #[test]
+    fn overlay_completion_has_typed_wire_value_and_scoped_identity() {
+        let outcome = UiOverlayOutcome::completed("#editor", WireValue::from("saved"));
+        outcome.validate().unwrap();
+        let encoded = serde_json::to_string(&outcome).unwrap();
+        assert!(encoded.contains(r##""overlay_id":"#editor""##));
+        assert!(encoded.contains(r#""status":"completed""#));
+        assert_eq!(
+            serde_json::from_str::<UiOverlayOutcome>(&encoded).unwrap(),
+            outcome
+        );
+        // Matches the exact envelope produced by window.nulang.overlay.complete.
+        let browser_wire = r##"{"protocol":"nulang-ui-msg/1","overlay_id":"#editor","status":"completed","value":{"type":"string","value":"saved"}}"##;
+        assert_eq!(
+            serde_json::from_str::<UiOverlayOutcome>(browser_wire).unwrap(),
+            outcome
+        );
+        assert!(UiOverlayOutcome::completed("body", WireValue::Null)
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn html_stream_invalidation_is_revisioned_and_snapshots_recover_it() {
+        let event = UiHtmlStreamMessage::invalidate(
+            DocumentId::from("tasks"),
+            Revision(4),
+            Revision(5),
+            "#summary".into(),
+        );
+        event.validate().unwrap();
+        let serialized = serde_json::to_string(&event).unwrap();
+        assert!(serialized.contains(r#""type":"invalidate""#));
+        assert_eq!(
+            serde_json::from_str::<UiHtmlStreamMessage>(&serialized).unwrap(),
+            event
+        );
+        assert!(UiHtmlStreamMessage::invalidate(
+            DocumentId::from("tasks"),
+            Revision(4),
+            Revision(6),
+            "#summary".into()
+        )
+        .validate()
+        .is_err());
+        assert!(UiHtmlStreamMessage::invalidate(
+            DocumentId::from("tasks"),
+            Revision(4),
+            Revision(5),
+            "body > div".into()
+        )
+        .validate()
+        .is_err());
+        let snapshot = UiHtmlStreamMessage::snapshot_with_invalidated(
+            DocumentId::from("tasks"),
+            Revision(5),
+            vec![],
+            vec!["#summary".into()],
+        );
+        snapshot.validate().unwrap();
+        assert_eq!(
+            serde_json::from_str::<UiHtmlStreamMessage>(&serde_json::to_string(&snapshot).unwrap())
+                .unwrap(),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn html_stream_messages_are_revisioned_and_lossless() {
+        let patch = UiHtmlStreamMessage::patch(
+            DocumentId::from("tasks"),
+            Revision(4),
+            Revision(5),
+            UiHtmlElement {
+                target: "#items".into(),
+                html: "<ul id=\"items\">hello 🌍</ul>".into(),
+            },
+        );
+        patch.validate().unwrap();
+        let encoded = serde_json::to_string(&patch).unwrap();
+        assert!(encoded.contains("\"nulang-ui-html/1\""));
+        assert!(encoded.contains("\"revision\":\"5\""));
+        assert_eq!(
+            serde_json::from_str::<UiHtmlStreamMessage>(&encoded).unwrap(),
+            patch
+        );
+
+        let snapshot = UiHtmlStreamMessage::snapshot(
+            DocumentId::from("tasks"),
+            Revision(5),
+            vec![UiHtmlElement {
+                target: "#items".into(),
+                html: "<ul id=\"items\">hello 🌍</ul>".into(),
+            }],
+        );
+        snapshot.validate().unwrap();
+        assert_eq!(
+            serde_json::from_str::<UiHtmlStreamMessage>(&serde_json::to_string(&snapshot).unwrap())
+                .unwrap(),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn html_stream_rejects_invalid_targets_and_revision_gaps() {
+        let patch = UiHtmlStreamMessage::patch(
+            DocumentId::from("tasks"),
+            Revision(1),
+            Revision(3),
+            UiHtmlElement {
+                target: "body > div".into(),
+                html: "hi".into(),
+            },
+        );
+        assert!(patch.validate().is_err());
+        let valid = UiHtmlStreamMessage::patch(
+            DocumentId::from("tasks"),
+            Revision(1),
+            Revision(3),
+            UiHtmlElement {
+                target: "#items".into(),
+                html: "hi".into(),
+            },
+        );
+        assert!(
+            valid.validate().is_err(),
+            "a patch must advance by exactly one revision"
+        );
+    }
+
+    #[test]
+    fn action_policy_is_typed_and_legacy_bindings_default_to_replace() {
+        let legacy = r#"{"event":"activate","action_id":"save","placement":"server"}"#;
+        let binding: ActionBinding = serde_json::from_str(legacy).unwrap();
+        assert_eq!(binding.coordination, ActionCoordination::Replace);
+        assert_eq!(binding.target, None);
+        assert_eq!(serde_json::to_string(&binding).unwrap(), legacy);
+
+        let queued = ActionBinding {
+            event: "activate".into(),
+            action_id: ActionId::from("save"),
+            placement: ActionPlacement::Server,
+            target: Some("#status".into()),
+            coordination: ActionCoordination::Queue,
+        };
+        let json = serde_json::to_string(&queued).unwrap();
+        assert!(json.contains(r#""coordination":"queue""#));
+        assert_eq!(
+            serde_json::from_str::<ActionBinding>(&json).unwrap(),
+            queued
+        );
+        assert!(serde_json::from_str::<ActionBinding>(
+            r#"{"event":"activate","action_id":"save","placement":"server","coordination":"unknown"}"#
+        ).is_err());
     }
 
     #[test]

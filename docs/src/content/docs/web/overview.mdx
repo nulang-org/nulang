@@ -230,11 +230,255 @@ It runs the route registrations, renders every route to `dist/<path>/index.html`
 
 For a pure static response without the `app` machinery, `Web.text`/`Web.raw` are enough on their own — any `fn() -> Html` can be rendered by the same pipeline.
 
+## Progressive HTML action updates (experimental)
+
+Server actions normally submit a form and reload the page after a successful
+response. To update one element instead, add `data-nulang-target` to an
+action-enabled form (or its action control). The target must be a simple
+element ID selector such as `#current-message`.
+
+```html
+<p id="current-message">Nothing submitted yet</p>
+<form method="POST"
+      data-action="save_message"
+      data-action-placement="server"
+      data-nulang-target="#current-message">
+  <input name="message">
+  <button type="submit">Save</button>
+</form>
+```
+
+The `POST` route should return an HTML fragment containing the same ID:
+
+```nulang
+fn save_message() {
+    let msg = form_value("message")
+    kv_set("patch-web-message", msg)
+    el("p", [("id", text("current-message"))], [text(msg)])
+}
+```
+
+The browser parses a successful `text/html` response and morphs just
+`#current-message`. It also accepts a complete rendered HTML page and extracts
+the target from it. Matching elements retain their DOM identities and event
+listeners; keyed siblings (`id` or `data-nulang-key`) can move without losing
+their state. User-modified inputs, checkboxes, textareas, and selects retain
+their local values, and a retained focused input keeps its selection.
+
+A missing target, non-HTML response, or unsuccessful HTTP status is reported
+without changing the page. Actions without `data-nulang-target` retain the
+existing reload behavior. For overlapping requests targeting the same element,
+the latest submitted response wins, even when an earlier fetch or streamed
+response body completes later. Superseded requests are aborted when supported,
+and ignored if an abort races with their completion.
+
+### Explicit selective revalidation (experimental)
+
+A progressive action can refresh related regions after its POST without
+reloading the full page. Declare **one primary patch target** and up to eight
+additional IDs to revalidate from the route's canonical GET representation:
+
+```html
+<div id="detail">Current item</div>
+<div id="summary">Current summary</div>
+<div id="notifications">Current notifications</div>
+<form method="POST" data-action="save_item" data-action-placement="server"
+      data-nulang-target="#detail"
+      data-nulang-revalidate="#summary, #notifications">
+  <button type="submit">Save</button>
+</form>
+```
+
+The POST must return `text/html` containing `#detail`. After a successful
+POST, the browser performs one same-origin, uncached GET of the current route;
+that HTML must contain both `#summary` and `#notifications`. Nulang validates
+**every** requested region before morphing the primary and related regions.
+Duplicate, overlapping, missing, or arbitrary CSS targets are rejected. Invalid
+revalidation declarations fail **before** the POST is submitted. Non-HTML,
+failed, or redirected GET responses leave the displayed regions unchanged.
+
+By default (`replace`), the latest submission wins across all claimed
+regions, including when two actions revalidate the same summary. Actions may
+instead opt into `drop` to suppress overlapping submissions or `queue` to run
+up to 32 pending actions sequentially **through their revalidation GET**.
+Queued submissions snapshot the form payload and idempotency key at submission
+time. Switching policy mid-request, using a policy without a patch target, or
+colliding with another active non-replace lane fails closed. No client policy
+can undo a server mutation, and overlapping ancestor/descendant selectors
+remain outside this contract. Fetch cancellation is best-effort and cannot
+roll back server-side mutations. This is **explicit
+DOM-region revalidation**, not automatic typed loader dependency inference:
+Web Contract IR does not yet validate these region names or derive database
+read dependencies. To avoid redundant work, declare only regions that actually
+depend on the mutated data. An application must still enforce idempotency,
+authorization, and transactional consistency on the server.
+
+### Action scheduling (experimental)
+
+On a form or action control, use `data-nulang-coordination="replace"` (default),
+`"drop"`, or `"queue"` with an exact `data-nulang-target="#id"`.
+`drop` ignores duplicate clicks while a request is pending; `queue` runs
+requests in interaction order, including the authoritative multi-region GET.
+The browser rejects invalid policies and enforces a maximum of 32 queued
+actions. Apply server-side idempotency and transaction ordering separately;
+client-side cancellation is never a server rollback. Queued mutations are
+canceled rather than sent after navigation or an owning overlay closes.
+In-flight multi-region GET responses are discarded when a newer SSE patch
+updates a claimed region, so stale canonical HTML cannot roll that patch back.
+
+For statically recognized `el(...)` actions and compiler-generated JSX
+actions, the compiler also projects `target` and `coordination` as typed
+`ActionBinding` metadata in the `nulang-ui/1` signal graph. The web build
+rejects duplicate attributes, nonliteral or unknown policy values, invalid
+target selectors, and `drop`/`queue` policies without an explicit local
+`data-nulang-target="#id"`. Policy values may be string literals or
+`text("queue")`-style static HTML literals. For dynamically generated HTML
+that the compiler cannot inspect, the browser still enforces request policy
+validation; this compile-time check is **not** a substitute for runtime checks.
+
+
+See [examples/patch-web](https://github.com/nulang-org/nulang/tree/main/examples/patch-web)
+for a standalone sample. Run `nulang nula dev` from that directory.
+
+:::caution[Scope of this first slice]
+This is an **opt-in, DOM-preserving HTML response**, not an SSE patch
+protocol. The morph algorithm is intentionally small: elements without
+stable IDs/keys can still be replaced, and changing a node's element type
+replaces that node. Request ordering protects the **client DOM for claimed
+target selectors**, but cannot undo or order server-side mutation side effects,
+guarantee exactly-once execution, or coordinate overlapping ancestor/descendant
+targets. Use idempotency and server-side concurrency controls for those cases.
+The response must be generated from trusted, properly escaped server-side
+`Html`; using `raw` with untrusted content can introduce XSS. This does not
+make the experimental HTTP/action host production-ready.
+:::
+
+## Typed HTML over SSE (experimental)
+
+The web runtime now has a separate, revisioned HTML patch stream: `Realtime.patch(room, target, html)` via `stdlib::web::realtime::patch`. In the browser use `window.nulang.stream("tasks")`, which returns a handle with `close()` for cancellation. The native EventSource endpoint is `/__nulang/ui-sse/tasks`.
+
+Every connection receives a current-state snapshot, followed by typed `nulang-ui-html/1` events with decimal-string revisions. Duplicate updates are ignored and revision gaps trigger a fresh snapshot. Limits per development-server process: 32 rooms, 32 targets per room, 8 subscribers per room, 8 queued updates per subscriber, and 64 KiB per HTML update. Falling-behind subscribers are disconnected instead of buffering indefinitely.
+
+### Actor-triggered fragment invalidation (experimental)
+
+When a durable actor or server action changes application state, it can explicitly
+request that subscribers refresh an affected region without constructing a
+server-side HTML patch:
+
+```nulang
+import stdlib::web::realtime
+
+// After the authoritative mutation has committed:
+let accepted = invalidate("tasks", "#summary")
+```
+
+`Realtime.invalidate(room, target)` publishes a revisioned `invalidate`
+event. Each subscribed browser fetches its **current page URL** using a
+same-origin, no-store GET, then morphs the matching stable `#id` from the
+canonical HTML response. A stale GET response is ignored when a newer patch,
+invalidation, reconnect, or navigation supersedes it.
+
+The server removes the target's previous cached HTML from the room snapshot
+and records the target as invalidated. A reconnect therefore refreshes the
+target rather than replaying obsolete HTML. Publishing a new HTML patch clears
+that invalidation. The union of cached and invalidated targets remains bounded
+at 32 per room. This is an explicit event-to-view bridge, **not** automatic
+compiler-derived resource dependency tracking. The application must identify
+which view target changed and ensure the GET route renders authoritative data.
+
+Invalidation transport is in-process and experimental; do **not** use it for
+private or tenant-scoped updates on a public server. It is not a durable event
+log, an authentication mechanism, or an exactly-once mutation guarantee.
+
+**Security and durability:** Unlike the general dev-server routes, this UI stream accepts **only loopback TCP connections** with a literal local `Host` (`localhost`, `127.0.0.1`, or `[::1]`) and rejects cross-origin browser requests (including DNS-rebinding Host values and cross-site Fetch Metadata). It is **not an authentication system**: local processes and local reverse proxies can still access streams, and the rest of the dev server binds to all interfaces. There is no subscriber identity, tenant isolation, persistent history, or cross-process distribution. Do not publish private data into shared rooms, forward the stream from a publicly reachable proxy, or expose the development server to untrusted clients. Actor-backed subscriptions and application authorization remain future work.
+
+## Scoped overlays (experimental)
+
+Pages can opt into a small browser-owned dialog lifecycle without adopting a
+SPA router. Render a stable placeholder and mark it for client-runtime
+injection, even if the page has no other reactive features:
+
+```html
+<dialog id="editor" data-nulang-overlay=""></dialog>
+```
+
+`window.nulang.overlay.open("#editor", "/edit-fragment")` fetches a
+**same-origin** GET response, validates that it contains a matching
+`<dialog id="editor">`, morphs that region, and calls the native
+`showModal()` API. It returns a promise that resolves only when an action
+explicitly completes the overlay:
+
+```js
+const pending = window.nulang.overlay.open("#editor", "/edit-fragment");
+// Later, from a client action inside the dialog:
+window.nulang.overlay.complete("#editor", {type: "string", value: "saved"});
+const outcome = await pending;
+// {protocol: "nulang-ui-msg/1", overlay_id: "#editor",
+//  status: "completed", value: {type: "string", value: "saved"}}
+```
+
+The result uses the renderer-neutral `WireValue` envelope and corresponds to
+`UiOverlayOutcome` in the Rust UI protocol. Supported value types include
+null, bool, string, lossless i64, f64 bits, bytes, arrays, and objects;
+unrecognized or unbounded values are rejected by the client. Calling
+`window.nulang.overlay.cancel("#editor")`, pressing Escape, or closing a
+native dialog rejects the pending promise and cleans up event listeners.
+Previously focused controls regain focus. Navigation during loading also
+settles the promise instead of leaving a stale overlay active. Native dialog
+closure is also detected by observing the `open` state in case a host
+delays or omits the `close` event.
+
+Server actions submitted from an active overlay may update **only elements
+within that overlay**, including secondary revalidation targets. Parent-view
+updates should be derived from the returned typed result and a fresh,
+authorized read—not from hidden cross-scope DOM mutations. Up to eight overlay
+lifecycles may be active concurrently; duplicate opens for a target fail.
+
+This is **browser-scoped** interaction state, not an actor-backed or durable
+workflow. It does not provide compiler-checked application result types, parent
+route coordination, authorization, or automatic actor supervision. Its HTML
+content must come from trusted, escaped rendering. The development-server
+security limitations above still apply.
+
+## Progressive navigation with the Navigation API (experimental)
+
+Opt in individual same-origin links using `data-nulang-nav-target` and a stable
+ID present in both the current page and the destination's server-rendered HTML:
+
+```html
+<main id="page-content"><h1>Current page</h1></main>
+<a href="/next" data-nulang-nav-target="#page-content">Next</a>
+```
+
+When the browser supports the Navigation API, Nulang intercepts eligible link
+navigations, fetches the destination's HTML with `GET`, and morphs only the
+specified region. If the response is a full document, its title is updated.
+The browser manages URL and history entries; Nulang does **not** ship a
+second client-side router or `pushState` implementation. The client script is
+injected even when these links are the page's only enhanced feature.
+
+All other links remain ordinary browser navigations. Downloads, forms,
+fragment-only navigation, cross-origin links, reloads, and Back/Forward
+traversals are intentionally not intercepted by this first slice. Browsers
+without the Navigation API navigate normally. For an intercepted link, an
+HTTP error, redirect, non-HTML response, or missing target triggers a full
+browser navigation rather than updating an unrelated region. Canceled
+navigations cannot patch stale HTML. No extra JavaScript dependency is needed.
+
+:::caution[Current limitations]
+Back/Forward traversal performs a native document navigation rather than an
+in-place restoration. This implementation does not provide route loaders,
+client-side prefetch, View Transitions, nested target coordination, or an
+end-to-end browser/HTTP production security guarantee. Navigation should be
+used only with trusted server-rendered HTML and stable, explicitly selected
+regions. HTTP request admission and response safety remain separately gated.
+:::
+
 ## Realtime Broadcast
 
-`Realtime` currently has a single operation:
+For the legacy broadcast channel:
 
-- `perform Realtime.broadcast(room: String, message: String) -> Unit` — broadcast a message to all subscribers of a realtime room.
+- `perform Realtime.broadcast(room: String, message: String) -> Unit` broadcasts to subscribers of a realtime room. Unlike the revisioned UI stream, this channel does not provide bounded snapshot recovery.
 
 Subscribers connect to the built-in Server-Sent Events endpoint `/<room-prefix>/sse/<room>` — in the dev server that is `GET /__nulang/sse/<room>`. In the server above, `perform Realtime.broadcast("signs", msg)` in the `sign` handler pushes `data: "<msg>"` events to every open SSE connection:
 

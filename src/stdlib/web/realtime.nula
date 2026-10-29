@@ -9,3 +9,18 @@ import stdlib::web::types
 pub fn broadcast(room: String, message: String) -> Unit ! {Realtime} {
     perform Realtime.broadcast(room, message)
 }
+
+
+// Publish a revisioned HTML update to subscribers of this room.
+// Returns false on invalid selectors or bounded capacity exhaustion.
+// Browsers subscribe with window.nulang.stream(room) from an action-enabled page.
+pub fn patch(room: String, target: String, html: Html) -> Bool ! {Realtime} {
+    perform Realtime.patch(room, target, html)
+}
+
+/// Publish an invalidation to subscribed views. Browsers refresh the target
+/// from their canonical same-origin GET route, preserving cache correctness
+/// through stream reconnects. Dev-server only; no production tenant auth.
+pub fn invalidate(room: String, target: String) -> Bool ! {Realtime} {
+    perform Realtime.invalidate(room, target)
+}
