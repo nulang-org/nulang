@@ -129,6 +129,25 @@ fn required_host_authority(
         },
         ("Realtime", Some("broadcast")) => other("Realtime", "Broadcast", Some(string_arg(0)?)),
         ("Realtime", Some("patch")) => other("Realtime", "Patch", Some(string_arg(0)?)),
+        ("Realtime", Some("scoped_bind" | "scoped_patch" | "scoped_cancel")) => {
+            let operation = match op_name {
+                Some("scoped_bind") => "ScopedBind",
+                Some("scoped_patch") => "ScopedPatch",
+                _ => "ScopedCancel",
+            };
+            let app = string_arg(0)?;
+            let room = string_arg(1)?;
+            if ![app.as_str(), room.as_str()].iter().all(|name| {
+                !name.is_empty()
+                    && name.len() <= 48
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+            }) {
+                return Err("invalid scoped UI application or room".into());
+            }
+            other("Realtime", operation, Some(format!("{app}/{room}")))
+        }
         ("Env", Some("get")) => AuthorityGrant::EnvRead {
             name: string_arg(0)?,
         },
@@ -530,6 +549,9 @@ pub(crate) fn perform_realtime_builtin(
         crate::vm::resolve_value_string(constants, value)
     }
     match op_name {
+        Some("scoped_bind" | "scoped_patch" | "scoped_cancel") => {
+            Some(crate::vm::Value::bool(false))
+        }
         Some("broadcast") => {
             let room = resolve(constants, *regs.first()?);
             let message = resolve(constants, *regs.get(1)?);
@@ -546,6 +568,41 @@ pub(crate) fn perform_realtime_builtin(
         }
         _ => None,
     }
+}
+
+/// Scoped realtime effects require a live actor and an attached host.
+fn is_scoped_realtime_op(op_name: Option<&str>) -> bool {
+    matches!(
+        op_name,
+        Some("scoped_bind" | "scoped_patch" | "scoped_cancel")
+    )
+}
+
+fn perform_scoped_realtime_builtin(
+    runtime: &mut Runtime,
+    op_name: Option<&str>,
+    constants: &[crate::bytecode::Constant],
+    regs: &[crate::vm::Value],
+) -> Option<crate::vm::Value> {
+    let value = |index: usize| {
+        regs.get(index)
+            .map(|v| crate::vm::resolve_value_string(constants, *v))
+            .unwrap_or_default()
+    };
+    let result = match op_name {
+        Some("scoped_bind") if regs.len() == 2 => {
+            runtime.native_scoped_ui_bind(&value(0), &value(1))
+        }
+        Some("scoped_patch") if regs.len() == 4 => {
+            runtime.native_scoped_ui_patch(&value(0), &value(1), &value(2), &value(3))
+        }
+        Some("scoped_cancel") if regs.len() == 2 => {
+            runtime.native_scoped_ui_cancel(&value(0), &value(1))
+        }
+        Some("scoped_bind" | "scoped_patch" | "scoped_cancel") => false,
+        _ => return None,
+    };
+    Some(crate::vm::Value::bool(result))
 }
 
 /// Bridges the standalone VM to a real `Runtime`.
@@ -1037,6 +1094,10 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
             return perform_web_builtin(self, op_name, constants, regs);
         }
         if effect_name == "Realtime" {
+            if is_scoped_realtime_op(op_name) {
+                let mut rt = self.runtime.borrow_mut();
+                return perform_scoped_realtime_builtin(&mut rt, op_name, constants, regs);
+            }
             return perform_realtime_builtin(self, op_name, constants, regs);
         }
         self.perform_effect(effect_name, regs)
@@ -1854,6 +1915,14 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                 return perform_web_builtin(self, op_name, constants, regs);
             }
             if effect_name == "Realtime" {
+                if is_scoped_realtime_op(op_name) {
+                    return perform_scoped_realtime_builtin(
+                        &mut *self.runtime,
+                        op_name,
+                        constants,
+                        regs,
+                    );
+                }
                 return perform_realtime_builtin(self, op_name, constants, regs);
             }
             if effect_name == "StrBuilder" {
@@ -2642,7 +2711,10 @@ mod migration_authority_tests {
 
 #[cfg(test)]
 mod host_authority_tests {
-    use super::{authorize_actor_host_effect, http_outbound_authority, required_host_authority};
+    use super::{
+        authorize_actor_host_effect, http_outbound_authority, perform_scoped_realtime_builtin,
+        required_host_authority,
+    };
     use crate::authority::{AuthorityGrant, AuthorityManifest};
     use crate::bytecode::Constant;
     use crate::runtime::{Actor, Runtime};
@@ -2732,6 +2804,102 @@ mod host_authority_tests {
             Some(AuthorityGrant::ProcessRun {
                 command: "printf hello".into(),
             })
+        );
+    }
+
+    #[test]
+    fn scoped_realtime_authority_is_exact_for_app_and_room() {
+        let (constants, regs) = string_args(&["billing", "invoices", "#status", "ok"]);
+        for (op, expected_op) in [
+            ("scoped_bind", "ScopedBind"),
+            ("scoped_patch", "ScopedPatch"),
+            ("scoped_cancel", "ScopedCancel"),
+        ] {
+            assert_eq!(
+                required_host_authority("Realtime", Some(op), &constants, &regs).unwrap(),
+                Some(AuthorityGrant::Other {
+                    namespace: "Realtime".into(),
+                    operation: expected_op.into(),
+                    argument: Some("billing/invoices".into()),
+                })
+            );
+        }
+        let (constants, regs) = string_args(&["billing/other", "invoices"]);
+        assert!(
+            required_host_authority("Realtime", Some("scoped_bind"), &constants, &regs).is_err()
+        );
+        let (constants, regs) = string_args(&["billing", "../invoices"]);
+        assert!(
+            required_host_authority("Realtime", Some("scoped_patch"), &constants, &regs).is_err()
+        );
+        let (constants, regs) = string_args(&["billing", "invoices"]);
+        let mut runtime = Runtime::new();
+        assert_eq!(
+            perform_scoped_realtime_builtin(&mut runtime, Some("scoped_bind"), &constants, &regs,),
+            Some(Value::bool(false)),
+        );
+        assert_eq!(
+            perform_scoped_realtime_builtin(&mut runtime, Some("scoped_cancel"), &constants, &regs,),
+            Some(Value::bool(false)),
+        );
+        assert_eq!(
+            perform_scoped_realtime_builtin(&mut runtime, Some("scoped_patch"), &constants, &regs,),
+            Some(Value::bool(false)),
+        );
+
+        // Exercise the native effect dispatcher, not only the Rust publisher.
+        let owner = runtime.spawn_actor(Box::new(|| vec![]));
+        let other = runtime.spawn_actor(Box::new(|| vec![]));
+        let authorized: crate::runtime::UiStreamAuthorizer =
+            std::sync::Arc::new(|_request, app, room| app == "billing" && room == "invoices");
+        let server = crate::runtime::WebDevServer::bind_with_ui_authorizer(
+            0,
+            None,
+            None,
+            vec![],
+            authorized,
+        )
+        .unwrap();
+        server.attach_scoped_ui_to_runtime(&mut runtime);
+        runtime.current_actor = Some(owner);
+        assert_eq!(
+            perform_scoped_realtime_builtin(&mut runtime, Some("scoped_bind"), &constants, &regs),
+            Some(Value::bool(true)),
+        );
+        let (patch_constants, patch_regs) =
+            string_args(&["billing", "invoices", "#status", "<p>private</p>"]);
+        runtime.current_actor = Some(other);
+        assert_eq!(
+            perform_scoped_realtime_builtin(
+                &mut runtime,
+                Some("scoped_patch"),
+                &patch_constants,
+                &patch_regs
+            ),
+            Some(Value::bool(false)),
+        );
+        runtime.current_actor = Some(owner);
+        assert_eq!(
+            perform_scoped_realtime_builtin(
+                &mut runtime,
+                Some("scoped_patch"),
+                &patch_constants,
+                &patch_regs
+            ),
+            Some(Value::bool(true)),
+        );
+        assert_eq!(
+            perform_scoped_realtime_builtin(&mut runtime, Some("scoped_cancel"), &constants, &regs),
+            Some(Value::bool(true)),
+        );
+        assert_eq!(
+            perform_scoped_realtime_builtin(
+                &mut runtime,
+                Some("scoped_patch"),
+                &patch_constants,
+                &patch_regs
+            ),
+            Some(Value::bool(false)),
         );
     }
 

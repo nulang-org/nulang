@@ -17,3 +17,20 @@ pub fn broadcast(room: String, message: String) -> Unit ! {Realtime} {
 pub fn patch(room: String, target: String, html: Html) -> Bool ! {Realtime} {
     perform Realtime.patch(room, target, html)
 }
+
+
+// Bind the current actor to an application-scoped UI stream. The embedding
+// host must explicitly attach its authorized WebDevServer to the Runtime.
+pub fn scoped_bind(application: String, room: String) -> Bool ! {Realtime} {
+    perform Realtime.scoped_bind(application, room)
+}
+
+// Only the bound actor can publish escaped HTML to its private stream.
+pub fn scoped_patch(application: String, room: String, target: String, html: Html) -> Bool ! {Realtime} {
+    perform Realtime.scoped_patch(application, room, target, html)
+}
+
+// Explicitly cancel the current actor binding (also canceled on actor exit).
+pub fn scoped_cancel(application: String, room: String) -> Bool ! {Realtime} {
+    perform Realtime.scoped_cancel(application, room)
+}

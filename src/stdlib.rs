@@ -654,6 +654,30 @@ impl StdLib {
                     description: "Publish bounded, revisioned HTML patches to a realtime room.",
                 },
                 BuiltinOp {
+                    name: "Realtime.scoped_bind",
+                    effect: "Realtime",
+                    op: "scoped_bind",
+                    signature: "scoped_bind(application: String, room: String) -> Bool",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Bind the current actor to a private, host-authorized UI stream.",
+                },
+                BuiltinOp {
+                    name: "Realtime.scoped_patch",
+                    effect: "Realtime",
+                    op: "scoped_patch",
+                    signature: "scoped_patch(application: String, room: String, target: String, html: Html) -> Bool",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Publish escaped HTML only from the actor owning a scoped UI stream.",
+                },
+                BuiltinOp {
+                    name: "Realtime.scoped_cancel",
+                    effect: "Realtime",
+                    op: "scoped_cancel",
+                    signature: "scoped_cancel(application: String, room: String) -> Bool",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Cancel the current actor scoped UI stream binding.",
+                },
+                BuiltinOp {
                     name: "Actor.link",
                     effect: "Actor",
                     op: "link",
@@ -1149,6 +1173,35 @@ mod tests {
             ]
         );
     }
+    #[test]
+    fn native_scoped_realtime_stdlib_is_syntactically_valid_and_registered() {
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        let source = include_str!("stdlib/web/realtime.nula");
+        let tokens = Lexer::new(source).lex().expect("lex realtime stdlib");
+        let ast = Parser::new(tokens)
+            .parse_module()
+            .expect("parse realtime stdlib");
+        for operation in ["scoped_bind", "scoped_patch", "scoped_cancel"] {
+            let name = format!("Realtime.{operation}");
+            assert!(
+                StdLib::new().lookup(&name).is_some(),
+                "{name} not registered"
+            );
+            assert!(
+                ast.decls.iter().any(|decl| matches!(decl,
+                    crate::ast::Decl::Function { name, .. } if name == operation
+                )),
+                "{operation} absent from language module"
+            );
+        }
+        assert!(StdLib::new()
+            .lookup("Realtime.scoped_patch")
+            .unwrap()
+            .signature
+            .contains("html: Html"));
+    }
+
     #[test]
     fn lookup_unknown_returns_none() {
         let lib = StdLib::new();
