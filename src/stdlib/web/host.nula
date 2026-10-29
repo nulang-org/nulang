@@ -30,6 +30,22 @@ pub fn route_json_typed(method: String, path: String, h) -> Unit ! {Web, Request
     perform Web.route_json_typed(method, path, h)
 }
 
+/// Register a route under a static URL prefix; compiler and runtime agree
+/// on the final path. This only scopes paths, not authorization middleware.
+pub fn route_scoped(method: String, prefix: String, path: String, h) -> Unit ! {Web, Request} {
+    perform Web.route_scoped(method, prefix, path, h)
+}
+
+/// Register an opaque JSON route under a static URL prefix.
+pub fn route_json_scoped(method: String, prefix: String, path: String, h) -> Unit ! {Web, Request} {
+    perform Web.route_json_scoped(method, prefix, path, h)
+}
+
+/// Register a typed JSON route under a static URL prefix.
+pub fn route_json_typed_scoped(method: String, prefix: String, path: String, h) -> Unit ! {Web, Request} {
+    perform Web.route_json_typed_scoped(method, prefix, path, h)
+}
+
 /// Wrap a serialized JSON value in an opaque Json payload.
 /// The HTTP adapter validates JSON before sending a successful response.
 pub fn json(value: String) -> Json ! {Web, Respond} {

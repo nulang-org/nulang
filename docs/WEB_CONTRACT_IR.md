@@ -419,6 +419,35 @@ Optional top-level request bodies (`from json` directly on `Option[T]`)
 are not supported; the nullable contract is for fields in closed records.
 
 
+### Static route prefixes (experimental)
+
+A scoped registration combines a **literal** absolute prefix with a literal
+path before building the normal route contract and runtime registration:
+
+```nulang
+fn show() -> String { "hello" }
+fn web_main() {
+    perform Web.route_scoped("GET", "/api/v1", "/health", show)
+}
+```
+
+The public `stdlib::web` wrappers `route_scoped`, `route_json_scoped`,
+and `route_json_typed_scoped` provide the same opt-in semantics. Direct
+effect registrations also support these operations. Static prefixes and paths
+must begin with `/`; embedded empty/dot segments, percent-encoded delimiters,
+query strings, fragments, backslashes, whitespace and oversize paths are
+rejected. `/` is the identity prefix. The compiler and VM use the **same**
+join routine so the declared route identity matches the actual HTTP match.
+OpenAPI and request-path parameter binding see the composed path.
+
+These registrations do **not** constitute a general nested route-group DSL.
+Crucially, **no middleware or authorization is implicitly inherited from a
+prefix**. Until compiler-verified middleware chain invocation, scope isolation,
+cancellation, and ordering semantics have end-to-end coverage, authorization
+must be enforced by the explicit handler. Do not deploy relying on a visual
+prefix grouping for security. Dynamic prefixes are rejected by contract
+extraction, rather than guessed at runtime.
+
 ## Remaining implementation priorities
 
 1. Extend the experimental scalar JSON binding and `Json` marker into a typed request/response algebra (`Json[T]`, `Html`, bytes, streams, typed record schemas/media) so Contract IR and OpenAPI can represent full payloads without guessing.

@@ -1052,3 +1052,62 @@ fn register() {{ perform Web.route_json_typed("GET", "{path}", show) }}
         assert_eq!(body, expected);
     }
 }
+
+#[test]
+fn scoped_route_registration_uses_same_canonical_runtime_path_as_compiler() {
+    let source = r#"
+fn show() -> String { "scoped response" }
+fn register() {
+    perform Web.route_scoped("GET", "/api/v1", "/reports", show)
+}
+"#;
+    let (mut module, register_idx) = compile_handler(source, "register");
+    let ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_module()
+        .unwrap();
+    let contracts = compile_module_contracts(&ast);
+    assert!(
+        contracts.diagnostics.is_empty(),
+        "{:?}",
+        contracts.diagnostics
+    );
+    assert_eq!(contracts.routes.len(), 1);
+    assert_eq!(contracts.routes[0].path, "/api/v1/reports");
+
+    use nulang::bytecode::{Instruction, OpCode};
+    use nulang::vm::VM;
+    let offset = module.instructions.len();
+    module.emit(Instruction::new3(
+        OpCode::Closure,
+        ((register_idx >> 8) & 0xff) as u8,
+        (register_idx & 0xff) as u8,
+        0,
+    ));
+    module.emit(Instruction::new3(OpCode::ClosureCall, 0, 0, 0));
+    module.emit(Instruction::new0(OpCode::Ret));
+    let mut vm = VM::new();
+    vm.load_module(module);
+    vm.run_from(0, offset).expect("execute scoped registration");
+    let routes = vm.take_web_routes();
+    assert_eq!(routes.len(), 1);
+    assert_eq!(routes[0].path, contracts.routes[0].path);
+
+    let attached = nulang::web::runtime_bindings::attach_runtime_route_plans(routes, &contracts);
+    assert!(
+        attached.diagnostics.is_empty(),
+        "{:?}",
+        attached.diagnostics
+    );
+    let server = WebDevServer::bind_runtime(0, None, None, attached.routes).unwrap();
+    let ok = send_raw_request(
+        server.port,
+        "GET /api/v1/reports HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(ok.starts_with("HTTP/1.1 200 OK"), "{ok}");
+    assert_eq!(response_body(&ok), "scoped response");
+    let missing = send_raw_request(
+        server.port,
+        "GET /reports HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(missing.starts_with("HTTP/1.1 404"), "{missing}");
+}

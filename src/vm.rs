@@ -1861,19 +1861,42 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
         regs: &[Value],
     ) -> Option<Value> {
         if effect_name == "Web"
-            && matches!(op_name, Some("route" | "route_json" | "route_json_typed"))
+            && matches!(
+                op_name,
+                Some(
+                    "route"
+                        | "route_json"
+                        | "route_json_typed"
+                        | "route_scoped"
+                        | "route_json_scoped"
+                        | "route_json_typed_scoped"
+                )
+            )
         {
             let method = regs.get(0).copied();
-            let path = regs.get(1).copied();
-            let handler = regs.get(2).copied();
+            let scoped = op_name.is_some_and(|name| name.ends_with("_scoped"));
+            let path = regs.get(if scoped { 2 } else { 1 }).copied();
+            let handler = regs.get(if scoped { 3 } else { 2 }).copied();
             if let (Some(m), Some(p), Some(h)) = (method, path, handler) {
-                if let Some(route) = crate::runtime::WebRoute::from_registers(
+                if let Some(mut route) = crate::runtime::WebRoute::from_registers(
                     m,
                     p,
                     h,
                     &module.constants,
                     module.clone(),
                 ) {
+                    if scoped {
+                        let prefix = regs
+                            .get(1)
+                            .map(|v| resolve_value_string(&module.constants, *v));
+                        match prefix.and_then(|prefix| {
+                            crate::web::route_prefix::join_scoped_route_path(&prefix, &route.path)
+                                .ok()
+                        }) {
+                            Some(path) => route.path = path,
+                            None => return Some(Value::unit()),
+                        }
+                    }
                     self.routes.push(route);
                 }
             }

@@ -318,9 +318,11 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
         .collect();
 
     let mut raw_routes = Vec::new();
-    collect_routes_in_module(module, &mut raw_routes);
+    let mut route_diagnostics = Vec::new();
+    collect_routes_in_module(module, &mut raw_routes, &mut route_diagnostics);
 
     let mut out = ContractCompilation::default();
+    out.diagnostics.extend(route_diagnostics);
     for (method, path, handler, json_response) in raw_routes {
         let handler_name = match &handler {
             Expr::Var(name, _) => Some(name.clone()),
@@ -585,65 +587,111 @@ pub fn parse_path_params(path: &str) -> Result<Vec<RouteParamContract>, String> 
     Ok(params)
 }
 
-fn collect_routes_in_module(module: &AstModule, out: &mut Vec<(String, String, Expr, String)>) {
-    collect_routes_in_decls(&module.decls, out);
+fn collect_routes_in_module(
+    module: &AstModule,
+    out: &mut Vec<(String, String, Expr, String)>,
+    diagnostics: &mut Vec<String>,
+) {
+    collect_routes_in_decls(&module.decls, out, diagnostics);
 }
 
-fn collect_routes_in_decls(decls: &[Decl], out: &mut Vec<(String, String, Expr, String)>) {
+fn collect_routes_in_decls(
+    decls: &[Decl],
+    out: &mut Vec<(String, String, Expr, String)>,
+    diagnostics: &mut Vec<String>,
+) {
     for decl in decls {
         match decl {
             Decl::Function { body, .. }
             | Decl::LetBinding { value: body, .. }
-            | Decl::Signal { init: body, .. } => collect_routes_in_expr(body, out),
+            | Decl::Signal { init: body, .. } => collect_routes_in_expr(body, out, diagnostics),
             Decl::Workflow { items, .. } => {
                 for item in items {
                     match item {
-                        WorkflowItem::Step(step) => collect_routes_in_expr(&step.body, out),
+                        WorkflowItem::Step(step) => {
+                            collect_routes_in_expr(&step.body, out, diagnostics)
+                        }
                         WorkflowItem::Parallel(steps) => {
                             for step in steps {
-                                collect_routes_in_expr(&step.body, out);
+                                collect_routes_in_expr(&step.body, out, diagnostics);
                             }
                         }
                     }
                 }
             }
-            Decl::Module { decls, .. } => collect_routes_in_decls(decls, out),
+            Decl::Module { decls, .. } => collect_routes_in_decls(decls, out, diagnostics),
             _ => {}
         }
     }
 }
 
-fn collect_routes_in_expr(expr: &Expr, out: &mut Vec<(String, String, Expr, String)>) {
+fn collect_routes_in_expr(
+    expr: &Expr,
+    out: &mut Vec<(String, String, Expr, String)>,
+    diagnostics: &mut Vec<String>,
+) {
     if let Expr::Perform {
         effect, op, args, ..
     } = expr
     {
-        if effect == "Web"
-            && matches!(op.as_str(), "route" | "route_json" | "route_json_typed")
-            && args.len() == 3
-        {
-            if let (Some(method), Some(path)) = (string_literal(&args[0]), string_literal(&args[1]))
+        if effect == "Web" {
+            if matches!(op.as_str(), "route" | "route_json" | "route_json_typed") && args.len() == 3
             {
-                out.push((method, path, args[2].clone(), op.clone()));
+                if let (Some(method), Some(path)) =
+                    (string_literal(&args[0]), string_literal(&args[1]))
+                {
+                    out.push((method, path, args[2].clone(), op.clone()));
+                }
+            } else if matches!(
+                op.as_str(),
+                "route_scoped" | "route_json_scoped" | "route_json_typed_scoped"
+            ) {
+                if let [method, prefix, path, handler] = args.as_slice() {
+                    match (
+                        string_literal(method),
+                        string_literal(prefix),
+                        string_literal(path),
+                    ) {
+                        (Some(method), Some(prefix), Some(path)) => {
+                            match crate::web::route_prefix::join_scoped_route_path(&prefix, &path) {
+                                Ok(path) => {
+                                    let normalized_op = op
+                                        .strip_suffix("_scoped")
+                                        .unwrap_or(op.as_str())
+                                        .to_string();
+                                    out.push((method, path, handler.clone(), normalized_op));
+                                }
+                                Err(why) => diagnostics.push(format!(
+                                    "invalid scoped route {method} {prefix}{path}: {why}"
+                                )),
+                            }
+                        }
+                        _ => diagnostics.push(format!(
+                            "Web.{op} requires literal method, prefix, and route path"
+                        )),
+                    }
+                } else {
+                    diagnostics.push(format!("Web.{op} expects four arguments"));
+                }
             }
         }
         for arg in args {
-            collect_routes_in_expr(arg, out);
+            collect_routes_in_expr(arg, out, diagnostics);
         }
         return;
     }
 
     match expr {
-        Expr::Lambda { body, .. } => collect_routes_in_expr(body, out),
+        Expr::Lambda { body, .. } => collect_routes_in_expr(body, out, diagnostics),
         Expr::App { func, args, .. } => {
-            collect_routes_in_expr(func, out);
+            collect_routes_in_expr(func, out, diagnostics);
             for arg in args {
-                collect_routes_in_expr(arg, out);
+                collect_routes_in_expr(arg, out, diagnostics);
             }
         }
         Expr::Let { value, body, .. } | Expr::LetRec { value, body, .. } => {
-            collect_routes_in_expr(value, out);
-            collect_routes_in_expr(body, out);
+            collect_routes_in_expr(value, out, diagnostics);
+            collect_routes_in_expr(body, out, diagnostics);
         }
         Expr::If {
             cond,
@@ -651,81 +699,81 @@ fn collect_routes_in_expr(expr: &Expr, out: &mut Vec<(String, String, Expr, Stri
             else_branch,
             ..
         } => {
-            collect_routes_in_expr(cond, out);
-            collect_routes_in_expr(then_branch, out);
+            collect_routes_in_expr(cond, out, diagnostics);
+            collect_routes_in_expr(then_branch, out, diagnostics);
             if let Some(else_branch) = else_branch {
-                collect_routes_in_expr(else_branch, out);
+                collect_routes_in_expr(else_branch, out, diagnostics);
             }
         }
         Expr::Match {
             scrutinee, arms, ..
         } => {
-            collect_routes_in_expr(scrutinee, out);
+            collect_routes_in_expr(scrutinee, out, diagnostics);
             for (_, guard, body) in arms {
                 if let Some(guard) = guard {
-                    collect_routes_in_expr(guard, out);
+                    collect_routes_in_expr(guard, out, diagnostics);
                 }
-                collect_routes_in_expr(body, out);
+                collect_routes_in_expr(body, out, diagnostics);
             }
         }
         Expr::Block { exprs, .. } | Expr::Par { exprs, .. } => {
             for expr in exprs {
-                collect_routes_in_expr(expr, out);
+                collect_routes_in_expr(expr, out, diagnostics);
             }
         }
         Expr::Tuple(exprs, ..) | Expr::Array(exprs, ..) | Expr::FString(exprs, ..) => {
             for expr in exprs {
-                collect_routes_in_expr(expr, out);
+                collect_routes_in_expr(expr, out, diagnostics);
             }
         }
         Expr::Record(fields, ..) | Expr::RecordUpdate { fields, .. } => {
             for (_, expr) in fields {
-                collect_routes_in_expr(expr, out);
+                collect_routes_in_expr(expr, out, diagnostics);
             }
         }
         Expr::FieldAccess { expr, .. }
         | Expr::Unary { expr, .. }
         | Expr::Consume { expr, .. }
         | Expr::CapAnnotate { expr, .. }
-        | Expr::TypeAnnotate { expr, .. } => collect_routes_in_expr(expr, out),
+        | Expr::TypeAnnotate { expr, .. } => collect_routes_in_expr(expr, out, diagnostics),
         Expr::Index { arr, idx, .. } => {
-            collect_routes_in_expr(arr, out);
-            collect_routes_in_expr(idx, out);
+            collect_routes_in_expr(arr, out, diagnostics);
+            collect_routes_in_expr(idx, out, diagnostics);
         }
         Expr::Binary { left, right, .. } | Expr::Pipe { left, right, .. } => {
-            collect_routes_in_expr(left, out);
-            collect_routes_in_expr(right, out);
+            collect_routes_in_expr(left, out, diagnostics);
+            collect_routes_in_expr(right, out, diagnostics);
         }
         Expr::Assign { target, value, .. } => {
-            collect_routes_in_expr(target, out);
-            collect_routes_in_expr(value, out);
+            collect_routes_in_expr(target, out, diagnostics);
+            collect_routes_in_expr(value, out, diagnostics);
         }
         Expr::For { iterable, body, .. } => {
-            collect_routes_in_expr(iterable, out);
-            collect_routes_in_expr(body, out);
+            collect_routes_in_expr(iterable, out, diagnostics);
+            collect_routes_in_expr(body, out, diagnostics);
         }
         Expr::While { cond, body, .. } => {
-            collect_routes_in_expr(cond, out);
-            collect_routes_in_expr(body, out);
+            collect_routes_in_expr(cond, out, diagnostics);
+            collect_routes_in_expr(body, out, diagnostics);
         }
         Expr::Return(value, ..) | Expr::Break(value, ..) => {
             if let Some(value) = value {
-                collect_routes_in_expr(value, out);
+                collect_routes_in_expr(value, out, diagnostics);
             }
         }
         Expr::Recover { body, .. } | Expr::Hide { body, .. } | Expr::Seal { body, .. } => {
-            collect_routes_in_expr(body, out)
+            collect_routes_in_expr(body, out, diagnostics)
         }
-        Expr::Defer { expr, .. } => collect_routes_in_expr(expr, out),
+        Expr::Defer { expr, .. } => collect_routes_in_expr(expr, out, diagnostics),
         Expr::Handle { body, handlers, .. } => {
-            collect_routes_in_expr(body, out);
+            collect_routes_in_expr(body, out, diagnostics);
             for handler in handlers {
-                collect_routes_in_expr(&handler.body, out);
+                collect_routes_in_expr(&handler.body, out, diagnostics);
             }
         }
         Expr::Emit { args, .. } => {
             for arg in args {
-                collect_routes_in_expr(arg, out);
+                collect_routes_in_expr(arg, out, diagnostics);
             }
         }
         Expr::Spawn {
@@ -735,42 +783,42 @@ fn collect_routes_in_expr(expr: &Expr, out: &mut Vec<(String, String, Expr, Stri
             target_node,
             ..
         } => {
-            collect_routes_in_expr(actor_type, out);
+            collect_routes_in_expr(actor_type, out, diagnostics);
             for (_, expr) in init {
-                collect_routes_in_expr(expr, out);
+                collect_routes_in_expr(expr, out, diagnostics);
             }
             if let Some(args) = positional_args {
                 for arg in args {
-                    collect_routes_in_expr(arg, out);
+                    collect_routes_in_expr(arg, out, diagnostics);
                 }
             }
             if let Some(target) = target_node {
-                collect_routes_in_expr(target, out);
+                collect_routes_in_expr(target, out, diagnostics);
             }
         }
         Expr::Send { actor, args, .. } | Expr::Ask { actor, args, .. } => {
-            collect_routes_in_expr(actor, out);
+            collect_routes_in_expr(actor, out, diagnostics);
             for arg in args {
-                collect_routes_in_expr(arg, out);
+                collect_routes_in_expr(arg, out, diagnostics);
             }
         }
         Expr::Receive { arms, after, .. } => {
             for (_, _, guard, body) in arms {
                 if let Some(guard) = guard {
-                    collect_routes_in_expr(guard, out);
+                    collect_routes_in_expr(guard, out, diagnostics);
                 }
-                collect_routes_in_expr(body, out);
+                collect_routes_in_expr(body, out, diagnostics);
             }
             if let Some((timeout, body)) = after {
-                collect_routes_in_expr(timeout, out);
-                collect_routes_in_expr(body, out);
+                collect_routes_in_expr(timeout, out, diagnostics);
+                collect_routes_in_expr(body, out, diagnostics);
             }
         }
-        Expr::GrainRef { key, .. } => collect_routes_in_expr(key, out),
-        Expr::Resume { value, .. } => collect_routes_in_expr(value, out),
+        Expr::GrainRef { key, .. } => collect_routes_in_expr(key, out, diagnostics),
+        Expr::Resume { value, .. } => collect_routes_in_expr(value, out, diagnostics),
         Expr::Migrate { actor, node, .. } => {
-            collect_routes_in_expr(actor, out);
-            collect_routes_in_expr(node, out);
+            collect_routes_in_expr(actor, out, diagnostics);
+            collect_routes_in_expr(node, out, diagnostics);
         }
         _ => {}
     }
@@ -803,6 +851,56 @@ mod tests {
         assert_eq!(typed[0].ty.as_deref(), Some("OrgId"));
         assert_eq!(typed[1].name, "member_id");
         assert_eq!(typed[1].ty, None);
+    }
+
+    #[test]
+    fn scoped_routes_compose_literal_prefix_before_contract_validation() {
+        let ast = parse(
+            r#"
+fn show_user(id: String from path) -> String { id }
+fn show_me() -> String { "me" }
+fn register() {
+    perform Web.route_scoped("GET", "/api/v1", "/users/{id: String}", show_user)
+    perform Web.route_json_typed_scoped("GET", "/api/v1", "/users/me", show_me)
+}
+"#,
+        );
+        let contracts = compile_module_contracts(&ast);
+        assert_eq!(contracts.routes.len(), 2, "{:?}", contracts.diagnostics);
+        assert!(
+            contracts.diagnostics.is_empty(),
+            "{:?}",
+            contracts.diagnostics
+        );
+        assert_eq!(contracts.routes[0].path, "/api/v1/users/{id: String}");
+        assert_eq!(contracts.routes[0].params[0].name, "id");
+        assert_eq!(contracts.routes[1].path, "/api/v1/users/me");
+        assert_eq!(
+            contracts.routes[1].response_type.as_deref(),
+            Some("Json[String]")
+        );
+    }
+
+    #[test]
+    fn scoped_route_rejects_ambiguous_or_traversal_prefixes() {
+        let ast = parse(
+            r#"
+fn show() -> String { "OK" }
+fn register() {
+    perform Web.route_scoped("GET", "/api/../admin", "/users", show)
+    perform Web.route_scoped("GET", "/api", "//other", show)
+    perform Web.route_scoped("GET", "/api%2fprivate", "/users", show)
+}
+"#,
+        );
+        let contracts = compile_module_contracts(&ast);
+        assert_eq!(contracts.routes.len(), 0, "{:?}", contracts.routes);
+        assert_eq!(
+            contracts.diagnostics.len(),
+            3,
+            "{:?}",
+            contracts.diagnostics
+        );
     }
 
     #[test]
