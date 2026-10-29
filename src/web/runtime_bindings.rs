@@ -287,7 +287,7 @@ pub struct BoundRouteArgument {
     pub value: Constant,
     /// Typed JSON record values are injected as VM records, never as a
     /// string pretending to satisfy a source-level record type.
-    pub record_fields: Option<Vec<(String, Constant)>>,
+    pub record_fields: Option<Vec<(String, crate::web::json_records::JsonBoundValue)>>,
 }
 
 /// Convert captured path values into a complete handler argument vector.

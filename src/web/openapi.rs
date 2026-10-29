@@ -289,19 +289,27 @@ fn binding_source_name(source: RouteBindingSource) -> &'static str {
 }
 
 fn schema_for_type(ty: Option<&str>) -> Value {
-    if let Some(fields) = ty.and_then(crate::web::json_records::parse_flat_record_type) {
-        let mut properties = Map::new();
-        let mut required = Vec::new();
-        for (name, field_type) in fields {
-            properties.insert(name.clone(), schema_for_type(Some(&field_type)));
-            required.push(name);
+    fn record_schema(ty: &crate::web::json_records::JsonType) -> Value {
+        match ty {
+            crate::web::json_records::JsonType::Scalar(name) => schema_for_type(Some(name)),
+            crate::web::json_records::JsonType::Record(fields) => {
+                let mut properties = Map::new();
+                let mut required = Vec::new();
+                for (name, field_ty) in fields {
+                    properties.insert(name.clone(), record_schema(field_ty));
+                    required.push(name.clone());
+                }
+                json!({
+                    "type": "object", "properties": Value::Object(properties),
+                    "required": required, "additionalProperties": false
+                })
+            }
         }
-        return json!({
-            "type": "object",
-            "properties": Value::Object(properties),
-            "required": required,
-            "additionalProperties": false,
-        });
+    }
+    if let Some(crate::web::json_records::JsonType::Record(fields)) =
+        ty.and_then(crate::web::json_records::parse_json_type)
+    {
+        return record_schema(&crate::web::json_records::JsonType::Record(fields));
     }
     match ty.map(str::trim) {
         Some("Int") => json!({ "type": "integer", "format": "int64" }),
@@ -466,6 +474,48 @@ mod tests {
     fn raw_body_does_not_invent_an_openapi_media_type() {
         let body = binding(RouteBindingSource::Body, "body", "Payload");
         assert!(form_request_body(&[body]).is_none());
+    }
+
+    #[test]
+    fn nested_json_schema_is_closed_at_every_level() {
+        let ty = "{ name: String, address: { city: String, zip: Int } }";
+        let schema = schema_for_type(Some(ty));
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["address"]["type"], "object");
+        assert_eq!(
+            schema["properties"]["address"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            schema["properties"]["address"]["properties"]["zip"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            schema["properties"]["address"]["required"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let mut response = route();
+        response.params.clear();
+        response.handler_params.clear();
+        response.response_type = Some(format!("Json[{ty}]"));
+        let spec = generate_openapi(
+            &ContractCompilation {
+                routes: vec![response],
+                diagnostics: vec![],
+            },
+            "Test",
+            "1.0",
+        );
+        assert_eq!(
+            spec["paths"]["/users/{id}"]["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["properties"]["address"]["properties"]["city"]["type"],
+            "string"
+        );
     }
 
     #[test]

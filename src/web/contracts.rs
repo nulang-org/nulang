@@ -375,7 +375,7 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
                 let ty = source_ty.and_then(|ty| named_json_records.get(ty).map(String::as_str).or(Some(ty)));
                 match ty {
                     Some(ty) if matches!(ty, "String" | "Int" | "Float" | "Bool")
-                        || crate::web::json_records::parse_flat_record_type(ty).is_some() =>
+                        || crate::web::json_records::parse_json_type(ty).is_some() =>
                     {
                         Some(format!("Json[{ty}]"))
                     }

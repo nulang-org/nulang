@@ -718,3 +718,98 @@ fn register() { perform Web.route_json_typed("GET", "/int", show) }"#,
         assert_eq!(response_body(&response), expected);
     }
 }
+
+#[test]
+fn nested_json_response_serializes_embedded_vm_record() {
+    let source = r#"
+type User = { name: String, address: { city: String, zip: Int } }
+fn show() -> User {
+    { name: "Ada", address: { city: "London", zip: 12345 } }
+}
+fn register() { perform Web.route_json_typed("GET", "/nested", show) }
+"#;
+    let route = typed_json_response_route(source, "show", "/nested");
+    let server = WebDevServer::bind_runtime(0, None, None, vec![route]).unwrap();
+    let response = send_raw_request(
+        server.port,
+        "GET /nested HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    let body: serde_json::Value = serde_json::from_str(response_body(&response)).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "name": "Ada", "address": { "city": "London", "zip": 12345 }
+        })
+    );
+}
+
+#[test]
+fn nested_json_request_materializes_embedded_vm_record() {
+    let source = r#"
+type CreateUser = { name: String, address: { city: String, zip: Int } }
+fn create_user(input: CreateUser from json) -> String { input.address.city }
+fn register() { perform Web.route("POST", "/nested", create_user) }
+"#;
+    let (module, function_index) = compile_handler(source, "create_user");
+    let ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_module()
+        .unwrap();
+    let compilation = compile_module_contracts(&ast);
+    assert!(
+        compilation.diagnostics.is_empty(),
+        "{:?}",
+        compilation.diagnostics
+    );
+    let plan = compile_runtime_route_plan(&compilation.routes[0]).unwrap();
+    let server = WebDevServer::bind_runtime(
+        0,
+        None,
+        None,
+        vec![RuntimeWebRoute {
+            route: WebRoute {
+                method: HttpMethod::Post,
+                path: "/nested".into(),
+                handler_module: module,
+                handler_func_idx: function_index,
+            },
+            plan: Some(plan),
+        }],
+    )
+    .unwrap();
+    for (body, expected) in [
+        (
+            r#"{"name":"Ada","address":{"city":"London","zip":12345}}"#,
+            200,
+        ),
+        (r#"{"name":"Ada","address":{"city":"London"}}"#, 400),
+        (
+            r#"{"name":"Ada","address":{"city":"London","zip":12345,"admin":true}}"#,
+            400,
+        ),
+        (
+            r#"{"name":"Ada","address":{"city":"London","zip":"12345"}}"#,
+            400,
+        ),
+        (
+            r#"{"name":"Ada","address":{"city":"London","zip":12345,"zip":42}}"#,
+            400,
+        ),
+    ] {
+        let request = format!(
+            "POST /nested HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(), body);
+        let response = send_raw_request(server.port, &request);
+        let status = if response.starts_with("HTTP/1.1 200 OK") {
+            200
+        } else if response.starts_with("HTTP/1.1 400") {
+            400
+        } else {
+            0
+        };
+        assert_eq!(status, expected, "body={body}; response={response}");
+        if expected == 200 {
+            assert_eq!(response_body(&response), "London");
+        }
+    }
+}

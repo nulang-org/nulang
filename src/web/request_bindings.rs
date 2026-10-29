@@ -206,8 +206,12 @@ pub fn bind_request_arguments(
             binding
                 .ty
                 .as_deref()
-                .and_then(crate::web::json_records::parse_flat_record_type)
-                .map(|fields| crate::web::json_records::decode_flat_record(raw, &fields))
+                .and_then(crate::web::json_records::parse_json_type)
+                .and_then(|shape| match shape {
+                    crate::web::json_records::JsonType::Record(_) => Some(shape),
+                    _ => None,
+                })
+                .map(|schema| crate::web::json_records::decode_nested_record(raw, &schema))
                 .transpose()
                 .map_err(|message| error(binding, RequestDecodeErrorKind::InvalidType, message))?
         } else {

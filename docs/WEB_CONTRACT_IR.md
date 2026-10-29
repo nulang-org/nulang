@@ -313,8 +313,8 @@ contracts, while preserving extensions for opaque/unmodeled body types.
 
 ### Flat typed JSON record DTOs (experimental follow-up)
 
-For a statically declared record whose fields are only `Int`, `Float`,
-`Bool`, and `String`, the compiler can lower `from json` into a
+For a statically declared record whose leaf fields are `Int`, `Float`,
+`Bool`, or `String`, the compiler can lower `from json` into a
 typed input schema and a real VM record argument:
 
 ```nulang
@@ -367,8 +367,30 @@ This route-contract notation does **not** add a generic source-level
 The original `Web.route_json`/`Web.json` path remains compatible: it still
 expects already-serialized JSON and validates the resulting bytes.
 
-Nested/optional records, arrays, user-defined custom scalars, statuses other
-than 200, streaming, and response envelopes remain separate follow-up work.
+Nested inline closed records are supported in a subsequent experimental
+compiler/VM contract slice. JSON request objects are decoded recursively into
+real VM records using the shared module field-layout ABI; typed JSON results
+serialize embedded VM records recursively. Every level uses exact declared
+fields, rejects unknown or missing fields, validates primitive scalar types
+without coercion, and rejects duplicate keys. The compiler schema parser is
+bounded to eight levels and 255 field occurrences. OpenAPI describes nested
+objects with required properties and `additionalProperties: false` at each
+level.
+
+For example, use a compiler-supported inline nested type:
+
+```nulang
+type UserView = {
+    name: String,
+    address: { city: String, zip: Int }
+}
+```
+
+Option/nullable fields, arrays, named nested type aliases that do not
+currently typecheck as nested structural records, custom scalars,
+non-200 status variants, streaming, and response envelopes remain separate
+work. In particular, the HTTP adapter must not invent an `Option[T]` VM
+representation by interpreting null or missing JSON as `nil`.
 
 ## Remaining implementation priorities
 
