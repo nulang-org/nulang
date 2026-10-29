@@ -103,12 +103,32 @@ fn collect_routes_in_expr(expr: &Expr, out: &mut Vec<(String, String, Expr)>) {
         Expr::Perform {
             effect, op, args, ..
         } if effect == "Web"
-            && matches!(op.as_str(), "route" | "route_json" | "route_json_typed")
-            && args.len() == 3 =>
+            && matches!(
+                op.as_str(),
+                "route"
+                    | "route_json"
+                    | "route_json_typed"
+                    | "route_scoped"
+                    | "route_json_scoped"
+                    | "route_json_typed_scoped"
+            )
+            && matches!(args.len(), 3 | 4) =>
         {
             let method = string_literal(&args[0]).unwrap_or_else(|| "GET".to_string());
-            let path = string_literal(&args[1]).unwrap_or_default();
-            out.push((method, path, args[2].clone()));
+            if args.len() == 4 {
+                if let (Some(prefix), Some(path)) =
+                    (string_literal(&args[1]), string_literal(&args[2]))
+                {
+                    if let Ok(full) =
+                        crate::web::route_prefix::join_scoped_route_path(&prefix, &path)
+                    {
+                        out.push((method, full, args[3].clone()));
+                    }
+                }
+            } else {
+                let path = string_literal(&args[1]).unwrap_or_default();
+                out.push((method, path, args[2].clone()));
+            }
         }
         _ => {}
     }
