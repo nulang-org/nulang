@@ -12,15 +12,13 @@ nulang-ai-director = { path = "../nulang-ai-director" }
 nulang-ai-manager = { path = "../nulang-ai-manager" }
 nulang-ai-worker = { path = "../nulang-ai-worker" }
 chrono = { version = "0.4", features = ["serde"] }
-# Do not bundle a second sqlite3 C implementation: the host CLI also links
-# libsql-ffi, which bundles SQLite itself. Double-bundling makes default
-# feature binaries fail with duplicate sqlite3_* symbols at native link time.
-# Use the host-provided SQLite library for the local agent store.
-rusqlite = "0.32"
+# Share the one libSQL SQLite FFI implementation with the host CLI.
+# A second SQLite native library breaks serialized initialization and Windows linking.
+libsql = { version = "0.10.0-pre.4", default-features = false, features = ["core"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "rt", "time"] }
 toml = "0.8"
 uuid = { version = "1", features = ["serde", "v4"] }
 

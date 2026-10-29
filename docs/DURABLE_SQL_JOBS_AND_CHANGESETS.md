@@ -52,12 +52,17 @@ payload JSON, run timestamp and maximum attempts. Jobs eventually reach
 - Workers may extend a live lease with `DurableSqlJobs::renew`, using the
   original attempt token. A stale or expired attempt cannot renew; a renewal
   never shortens the lease. A worker must call this explicitly for long tasks.
-- When the `ai-runtime` feature is also enabled, `nulang-ai-local` now links
-  against host-provided system SQLite rather than bundling a second copy. This
-  avoids duplicate `sqlite3_*` C symbols, but changes native packaging:
-  clean-machine release checks must verify the required system SQLite library
-  exists and remains compatible. A future shared-backend migration is preferable
-  if a completely self-contained single executable is required.
+- With the `ai-runtime` feature, `nulang-ai-local` uses **the same libSQL
+  SQLite implementation** as the host, rather than a second bundled or
+  system-linked `rusqlite` library. This avoids duplicate native
+  `sqlite3_*` symbols, eliminates the Windows `sqlite3.lib` requirement,
+  and avoids the order-dependent `SQLITE_CONFIG_SERIALIZED` initialization
+  failure. Existing `agents.db` files retain their SQLite schema.
+- The synchronous agent-store API executes libSQL operations on scoped threads,
+  with a short-lived Tokio runtime and database connection for each operation.
+  This is safe from synchronous CLI entry points and existing async Tokio
+  contexts, but introduces per-call thread/connection overhead. A persistent
+  dedicated database worker is a future performance refinement.
 - The caller supplies clock values, enabling deterministic testing but also
   requiring a consistent wall-clock source in production.
 - The SQL schema and operations are currently tested only against local SQLite,
@@ -70,6 +75,8 @@ payload JSON, run timestamp and maximum attempts. Jobs eventually reach
 
 ```sh
 cargo test --locked --no-default-features --features sqlite --test durable_sql_jobs
+cargo test --locked --no-default-features --features sqlite,ai-runtime --test sqlite_backend_coexistence
+cargo test --locked -p nulang-ai-local --test store_order
 cargo test --locked --no-default-features --test changeset_contract
 cargo fmt --check
 ```
