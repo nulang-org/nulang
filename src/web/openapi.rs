@@ -94,7 +94,14 @@ fn operation_for(route: &RouteContract) -> Value {
             | ResponseKind::FormOutcome => {
                 json!({"type": "string"})
             }
-            ResponseKind::Json | ResponseKind::Created => json!({}),
+            ResponseKind::Json => route
+                .response_type
+                .as_deref()
+                .and_then(|ty| ty.strip_prefix("Json["))
+                .and_then(|ty| ty.strip_suffix(']'))
+                .map(|ty| schema_for_type(Some(ty)))
+                .unwrap_or_else(|| json!({ "x-nulang-type": "Json" })),
+            ResponseKind::Created => json!({}),
             ResponseKind::Problem => json!({
                 "type": "object",
                 "required": ["status", "title"],
@@ -152,7 +159,9 @@ fn operation_for(route: &RouteContract) -> Value {
     if !parameters.is_empty() {
         operation.insert("parameters".to_string(), Value::Array(parameters));
     }
-    if let Some(request_body) = form_request_body(&binding_compilation.bindings) {
+    if let Some(request_body) = json_request_body(&binding_compilation.bindings)
+        .or_else(|| form_request_body(&binding_compilation.bindings))
+    {
         operation.insert("requestBody".to_string(), request_body);
     }
     operation.insert("responses".to_string(), Value::Object(responses));
@@ -222,9 +231,10 @@ fn binding_parameter(binding: &RouteBindingContract) -> Option<Value> {
         RouteBindingSource::Query => "query",
         RouteBindingSource::Header => "header",
         RouteBindingSource::Cookie => "cookie",
-        RouteBindingSource::Path | RouteBindingSource::Body | RouteBindingSource::Form => {
-            return None
-        }
+        RouteBindingSource::Path
+        | RouteBindingSource::Body
+        | RouteBindingSource::Form
+        | RouteBindingSource::Json => return None,
     };
 
     Some(json!({
@@ -233,6 +243,22 @@ fn binding_parameter(binding: &RouteBindingContract) -> Option<Value> {
         "required": true,
         "schema": schema_for_type(binding.ty.as_deref()),
         "x-nulang-handler-param": binding.handler_param,
+    }))
+}
+
+/// `from json` carries an explicit scalar JSON media type, unlike the raw
+/// `from body` binding, whose payload representation is intentionally unknown.
+fn json_request_body(bindings: &[RouteBindingContract]) -> Option<Value> {
+    let binding = bindings
+        .iter()
+        .find(|binding| binding.source == RouteBindingSource::Json)?;
+    Some(json!({
+        "required": true,
+        "content": {
+            "application/json": {
+                "schema": schema_for_type(binding.ty.as_deref())
+            }
+        }
     }))
 }
 
@@ -298,10 +324,33 @@ fn binding_source_name(source: RouteBindingSource) -> &'static str {
         RouteBindingSource::Cookie => "cookie",
         RouteBindingSource::Body => "body",
         RouteBindingSource::Form => "form",
+        RouteBindingSource::Json => "json",
     }
 }
 
 fn schema_for_type(ty: Option<&str>) -> Value {
+    fn record_schema(ty: &crate::web::json_records::JsonType) -> Value {
+        match ty {
+            crate::web::json_records::JsonType::Scalar(name) => schema_for_type(Some(name)),
+            crate::web::json_records::JsonType::Record(fields) => {
+                let mut properties = Map::new();
+                let mut required = Vec::new();
+                for (name, field_ty) in fields {
+                    properties.insert(name.clone(), record_schema(field_ty));
+                    required.push(name.clone());
+                }
+                json!({
+                    "type": "object", "properties": Value::Object(properties),
+                    "required": required, "additionalProperties": false
+                })
+            }
+        }
+    }
+    if let Some(crate::web::json_records::JsonType::Record(fields)) =
+        ty.and_then(crate::web::json_records::parse_json_type)
+    {
+        return record_schema(&crate::web::json_records::JsonType::Record(fields));
+    }
     match ty.map(str::trim) {
         Some("Int") => json!({ "type": "integer", "format": "int64" }),
         Some("Float") => json!({ "type": "number", "format": "double" }),
@@ -551,10 +600,161 @@ mod tests {
     }
 
     #[test]
+    fn nested_json_schema_is_closed_at_every_level() {
+        let ty = "{ name: String, address: { city: String, zip: Int } }";
+        let schema = schema_for_type(Some(ty));
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["address"]["type"], "object");
+        assert_eq!(
+            schema["properties"]["address"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            schema["properties"]["address"]["properties"]["zip"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            schema["properties"]["address"]["required"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let mut response = route();
+        response.params.clear();
+        response.handler_params.clear();
+        response.response_type = Some(format!("Json[{ty}]"));
+        let spec = generate_openapi(
+            &ContractCompilation {
+                routes: vec![response],
+                diagnostics: vec![],
+            },
+            "Test",
+            "1.0",
+        );
+        assert_eq!(
+            spec["paths"]["/users/{id}"]["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["properties"]["address"]["properties"]["city"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn json_record_body_emits_exact_object_schema() {
+        let mut contract = route();
+        contract.path = "/users".into();
+        contract.method = "POST".into();
+        contract.params.clear();
+        contract.handler_params = vec![HandlerParamContract {
+            name: "input".into(),
+            ty: Some("{ name: String, age: Int }".into()),
+            capability: None,
+            request: Some(crate::web::contracts::RequestParamBindingContract {
+                source: RouteBindingSource::Json,
+                source_name: "body".into(),
+            }),
+        }];
+        let document = generate_openapi(
+            &ContractCompilation {
+                routes: vec![contract],
+                diagnostics: vec![],
+            },
+            "Test",
+            "1.0",
+        );
+        let schema = &document["paths"]["/users"]["post"]["requestBody"]["content"]
+            ["application/json"]["schema"];
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["name"]["type"], "string");
+        assert_eq!(schema["properties"]["age"]["type"], "integer");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn typed_json_response_schema_reflects_compiler_declared_return_type() {
+        let mut contract = route();
+        contract.path = "/typed".into();
+        contract.params.clear();
+        contract.handler_params.clear();
+        contract.response_type = Some("Json[{ name: String, age: Int }]".into());
+        let document = generate_openapi(
+            &ContractCompilation {
+                routes: vec![contract],
+                diagnostics: vec![],
+            },
+            "Test",
+            "1.0",
+        );
+        let schema = &document["paths"]["/typed"]["get"]["responses"]["200"]["content"]
+            ["application/json"]["schema"];
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["name"]["type"], "string");
+        assert_eq!(schema["properties"]["age"]["type"], "integer");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"].as_array().unwrap().len(), 2);
+
+        let mut scalar = route();
+        scalar.params.clear();
+        scalar.handler_params.clear();
+        scalar.response_type = Some("Json[String]".into());
+        let document = generate_openapi(
+            &ContractCompilation {
+                routes: vec![scalar],
+                diagnostics: vec![],
+            },
+            "Test",
+            "1.0",
+        );
+        assert_eq!(
+            document["paths"]["/users/{id}"]["get"]["responses"]["200"]["content"]
+                ["application/json"]["schema"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
     fn maps_primitive_path_types_to_openapi_schema() {
         assert_eq!(schema_for_type(Some("Int"))["type"], "integer");
         assert_eq!(schema_for_type(Some("Float"))["type"], "number");
         assert_eq!(schema_for_type(Some("Bool"))["type"], "boolean");
         assert_eq!(schema_for_type(Some("String"))["type"], "string");
+    }
+    #[test]
+    fn generates_explicit_json_body_and_response_media_types() {
+        let mut r = route();
+        r.method = "POST".into();
+        r.path = "/api/counter".into();
+        r.params.clear();
+        r.handler_params = vec![HandlerParamContract {
+            name: "count".into(),
+            ty: Some("Int".into()),
+            capability: None,
+            request: Some(crate::web::contracts::RequestParamBindingContract {
+                source: RouteBindingSource::Json,
+                source_name: "body".into(),
+            }),
+        }];
+        r.response_type = Some("Json".into());
+        let document = generate_openapi(
+            &ContractCompilation {
+                routes: vec![r],
+                diagnostics: vec![],
+            },
+            "Test",
+            "1.0",
+        );
+        let op = &document["paths"]["/api/counter"]["post"];
+        assert_eq!(
+            op["requestBody"]["content"]["application/json"]["schema"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            op["responses"]["200"]["content"]["application/json"]["schema"]["x-nulang-type"],
+            "Json"
+        );
+        assert!(op["requestBody"]["required"].as_bool().unwrap());
     }
 }

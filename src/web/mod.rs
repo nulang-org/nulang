@@ -9,6 +9,7 @@ pub mod html_safety;
 pub mod http_problem;
 pub mod http_request;
 pub mod ir;
+pub mod json_records;
 pub mod modules;
 pub mod openapi;
 pub mod package_contracts;

@@ -36,6 +36,7 @@ pub enum RequestParamSource {
     Cookie,
     Body,
     Form,
+    Json,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,11 +251,40 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
         })
         .collect();
 
+    let named_json_records: HashMap<String, String> = module
+        .decls
+        .iter()
+        .filter_map(|decl| {
+            if let Decl::RecordType {
+                name,
+                type_params,
+                fields,
+                ..
+            } = decl
+            {
+                if type_params.is_empty() {
+                    return Some((
+                        name.clone(),
+                        format!(
+                            "{{ {} }}",
+                            fields
+                                .iter()
+                                .map(|(name, ty)| format!("{name}: {ty}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    ));
+                }
+            }
+            None
+        })
+        .collect();
+
     let mut raw_routes = Vec::new();
     collect_routes_in_module(module, &mut raw_routes);
 
     let mut out = ContractCompilation::default();
-    for (method, path, handler) in raw_routes {
+    for (method, path, handler, json_response) in raw_routes {
         let handler_name = match &handler {
             Expr::Var(name, _) => Some(name.clone()),
             _ => None,
@@ -308,8 +338,8 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
         }
 
         out.routes.push(RouteContract {
-            method,
-            path,
+            method: method.clone(),
+            path: path.clone(),
             handler: handler_name,
             params,
             handler_params: meta
@@ -317,12 +347,50 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
                     m.params
                         .iter()
                         .map(|param| {
-                            handler_param_contract(param, m.request_bindings.get(&param.name))
+                            let mut contract =
+                                handler_param_contract(param, m.request_bindings.get(&param.name));
+                            if contract
+                                .request
+                                .as_ref()
+                                .is_some_and(|request| request.source == RequestParamSource::Json)
+                            {
+                                if let Some(named) = contract
+                                    .ty
+                                    .as_ref()
+                                    .and_then(|ty| named_json_records.get(ty))
+                                {
+                                    contract.ty = Some(named.clone());
+                                }
+                            }
+                            contract
                         })
                         .collect()
                 })
                 .unwrap_or_default(),
-            response_type: meta.and_then(|m| m.response_type.clone()),
+            // Route registration owns the wire media type even when an
+            // opaque Json return type is erased to its String representation
+            // by frontend type normalization.
+            response_type: if json_response == "route_json_typed" {
+                let source_ty = meta.and_then(|m| m.response_type.as_deref());
+                let ty = source_ty.and_then(|ty| named_json_records.get(ty).map(String::as_str).or(Some(ty)));
+                match ty {
+                    Some(ty) if matches!(ty, "String" | "Int" | "Float" | "Bool")
+                        || crate::web::json_records::parse_json_type(ty).is_some() =>
+                    {
+                        Some(format!("Json[{ty}]"))
+                    }
+                    _ => {
+                        out.diagnostics.push(format!(
+                            "{method} {path}: typed JSON responses require a declared String, Int, Float, Bool, or flat primitive record return type"
+                        ));
+                        None
+                    }
+                }
+            } else if json_response == "route_json" {
+                Some("Json".to_string())
+            } else {
+                meta.and_then(|m| m.response_type.clone())
+            },
             error_type: meta.and_then(|m| m.error_type.clone()),
             effects: meta.map(|m| m.effects.clone()).unwrap_or_default(),
             reference_capability: meta.and_then(|m| m.reference_capability.clone()),
@@ -408,6 +476,7 @@ fn request_source_contract(source: WebRequestParamSource) -> RequestParamSource 
         WebRequestParamSource::Cookie => RequestParamSource::Cookie,
         WebRequestParamSource::Body => RequestParamSource::Body,
         WebRequestParamSource::Form => RequestParamSource::Form,
+        WebRequestParamSource::Json => RequestParamSource::Json,
     }
 }
 
@@ -479,11 +548,11 @@ pub fn parse_path_params(path: &str) -> Result<Vec<RouteParamContract>, String> 
     Ok(params)
 }
 
-fn collect_routes_in_module(module: &AstModule, out: &mut Vec<(String, String, Expr)>) {
+fn collect_routes_in_module(module: &AstModule, out: &mut Vec<(String, String, Expr, String)>) {
     collect_routes_in_decls(&module.decls, out);
 }
 
-fn collect_routes_in_decls(decls: &[Decl], out: &mut Vec<(String, String, Expr)>) {
+fn collect_routes_in_decls(decls: &[Decl], out: &mut Vec<(String, String, Expr, String)>) {
     for decl in decls {
         match decl {
             Decl::Function { body, .. }
@@ -507,15 +576,18 @@ fn collect_routes_in_decls(decls: &[Decl], out: &mut Vec<(String, String, Expr)>
     }
 }
 
-fn collect_routes_in_expr(expr: &Expr, out: &mut Vec<(String, String, Expr)>) {
+fn collect_routes_in_expr(expr: &Expr, out: &mut Vec<(String, String, Expr, String)>) {
     if let Expr::Perform {
         effect, op, args, ..
     } = expr
     {
-        if effect == "Web" && op == "route" && args.len() == 3 {
+        if effect == "Web"
+            && matches!(op.as_str(), "route" | "route_json" | "route_json_typed")
+            && args.len() == 3
+        {
             if let (Some(method), Some(path)) = (string_literal(&args[0]), string_literal(&args[1]))
             {
-                out.push((method, path, args[2].clone()));
+                out.push((method, path, args[2].clone(), op.clone()));
             }
         }
         for arg in args {
@@ -694,6 +766,27 @@ mod tests {
         assert_eq!(typed[0].ty.as_deref(), Some("OrgId"));
         assert_eq!(typed[1].name, "member_id");
         assert_eq!(typed[1].ty, None);
+    }
+
+    #[test]
+    fn typed_json_registration_rejects_unsupported_return_shapes() {
+        let module = parse(
+            r#"
+fn show() -> [Int] { [1, 2] }
+fn register() { perform Web.route_json_typed("GET", "/array", show) }
+"#,
+        );
+        let compiled = compile_module_contracts(&module);
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("typed JSON responses require a declared")),
+            "{:?}",
+            compiled.diagnostics
+        );
+        assert_eq!(compiled.routes.len(), 1);
+        assert!(compiled.routes[0].response_type.is_none());
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub struct RequestBindingValues<'a> {
 pub enum RequestDecodeErrorKind {
     Missing,
     InvalidType,
+    UnsupportedMediaType,
     DuplicateHandlerSlot,
     InvalidHandlerSlot,
     IncompleteBindingPlan,
@@ -43,7 +44,9 @@ impl RequestDecodeError {
     pub fn is_client_error(&self) -> bool {
         matches!(
             self.kind,
-            RequestDecodeErrorKind::Missing | RequestDecodeErrorKind::InvalidType
+            RequestDecodeErrorKind::Missing
+                | RequestDecodeErrorKind::InvalidType
+                | RequestDecodeErrorKind::UnsupportedMediaType
         )
     }
 
@@ -53,10 +56,10 @@ impl RequestDecodeError {
     /// those are compiler/runtime defects and must not be presented as client
     /// mistakes.
     pub fn http_status(&self) -> u16 {
-        if self.is_client_error() {
-            400
-        } else {
-            500
+        match self.kind {
+            RequestDecodeErrorKind::UnsupportedMediaType => 415,
+            _ if self.is_client_error() => 400,
+            _ => 500,
         }
     }
 
@@ -66,6 +69,7 @@ impl RequestDecodeError {
         match self.kind {
             RequestDecodeErrorKind::Missing => "missing_request_input",
             RequestDecodeErrorKind::InvalidType => "invalid_request_input",
+            RequestDecodeErrorKind::UnsupportedMediaType => "unsupported_media_type",
             RequestDecodeErrorKind::DuplicateHandlerSlot => "duplicate_handler_slot",
             RequestDecodeErrorKind::InvalidHandlerSlot => "invalid_handler_slot",
             RequestDecodeErrorKind::IncompleteBindingPlan => "incomplete_binding_plan",
@@ -179,6 +183,13 @@ pub fn bind_request_arguments(
             ));
         }
 
+        if binding.source == RouteBindingSource::Json && !is_json_content_type(values.headers) {
+            return Err(error(
+                binding,
+                RequestDecodeErrorKind::UnsupportedMediaType,
+                "JSON request binding requires Content-Type: application/json".to_string(),
+            ));
+        }
         let raw = lookup(binding, values).ok_or_else(|| {
             error(
                 binding,
@@ -191,7 +202,29 @@ pub fn bind_request_arguments(
                 ),
             )
         })?;
-        let value = decode_scalar_constant(raw, binding.ty.as_deref()).map_err(|message| {
+        let record_fields = if binding.source == RouteBindingSource::Json {
+            binding
+                .ty
+                .as_deref()
+                .and_then(crate::web::json_records::parse_json_type)
+                .and_then(|shape| match shape {
+                    crate::web::json_records::JsonType::Record(_) => Some(shape),
+                    _ => None,
+                })
+                .map(|schema| crate::web::json_records::decode_nested_record(raw, &schema))
+                .transpose()
+                .map_err(|message| error(binding, RequestDecodeErrorKind::InvalidType, message))?
+        } else {
+            None
+        };
+        let value = (if record_fields.is_some() {
+            Ok(Constant::Nil)
+        } else if binding.source == RouteBindingSource::Json {
+            decode_json_scalar_constant(raw, binding.ty.as_deref())
+        } else {
+            decode_scalar_constant(raw, binding.ty.as_deref())
+        })
+        .map_err(|message| {
             error(
                 binding,
                 RequestDecodeErrorKind::InvalidType,
@@ -206,6 +239,7 @@ pub fn bind_request_arguments(
         slots[binding.handler_index] = Some(BoundRouteArgument {
             handler_index: binding.handler_index,
             value,
+            record_fields,
         });
     }
 
@@ -255,7 +289,7 @@ fn lookup<'a>(
             .find(|(name, _)| name.eq_ignore_ascii_case(&binding.source_name))
             .map(|(_, value)| value.as_str()),
         RouteBindingSource::Cookie => values.cookies.get(&binding.source_name).map(String::as_str),
-        RouteBindingSource::Body => values.body,
+        RouteBindingSource::Body | RouteBindingSource::Json => values.body,
         RouteBindingSource::Form => values.form.get(&binding.source_name).map(String::as_str),
     }
 }
@@ -268,6 +302,62 @@ fn source_name(source: RouteBindingSource) -> &'static str {
         RouteBindingSource::Cookie => "cookie",
         RouteBindingSource::Body => "body",
         RouteBindingSource::Form => "form",
+        RouteBindingSource::Json => "json",
+    }
+}
+
+/// A JSON body is a single JSON value, not a URL-encoded scalar.
+/// Strictly enforce media type rather than guessing from payload shape.
+fn is_json_content_type(headers: &[(String, String)]) -> bool {
+    let values: Vec<_> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    if values.len() != 1 {
+        return false;
+    }
+    let mut parts = values[0].split(';');
+    let media = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+    if media != "application/json"
+        && !(media.starts_with("application/") && media.ends_with("+json"))
+    {
+        return false;
+    }
+    parts.all(|part| {
+        let part = part.trim();
+        let Some((name, value)) = part.split_once('=') else {
+            return false;
+        };
+        !name.trim().eq_ignore_ascii_case("charset")
+            || value.trim().trim_matches('"').eq_ignore_ascii_case("utf-8")
+    })
+}
+
+/// Phase 1 JSON bindings intentionally support only scalar VM constants.
+/// Composite records/arrays require a typed heap representation and are
+/// rejected by Web Contract validation rather than silently stringifying.
+pub fn decode_json_scalar_constant(raw: &str, ty: Option<&str>) -> Result<Constant, String> {
+    let value: Value =
+        serde_json::from_str(raw).map_err(|_| "malformed JSON request body".to_string())?;
+    match (ty, value) {
+        (Some("String"), Value::String(value)) => Ok(Constant::String(value)),
+        (Some("Int"), Value::Number(value)) => value
+            .as_i64()
+            .map(Constant::Int)
+            .ok_or_else(|| "expected JSON Int within signed 64-bit range".to_string()),
+        (Some("Float"), Value::Number(value)) => value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .map(Constant::Float)
+            .ok_or_else(|| "expected finite JSON Float".to_string()),
+        (Some("Bool"), Value::Bool(value)) => Ok(Constant::Bool(value)),
+        (Some("String" | "Int" | "Float" | "Bool"), _) => {
+            Err(format!("expected JSON {} scalar", ty.unwrap_or("value")))
+        }
+        _ => {
+            Err("unsupported JSON binding type (expected Int, Float, Bool, or String)".to_string())
+        }
     }
 }
 
@@ -542,6 +632,80 @@ mod tests {
         assert_eq!(
             decode_scalar_constant("1.5", Some("Float")).unwrap(),
             crate::bytecode::Constant::Float(1.5)
+        );
+    }
+    #[test]
+    fn json_binding_decodes_primitive_without_coercion() {
+        let empty = HashMap::new();
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/json; charset=utf-8".to_string(),
+        )];
+        let int_binding = binding(RouteBindingSource::Json, "body", 0, "Int");
+        let values = RequestBindingValues {
+            path: &empty,
+            query: &empty,
+            headers: &headers,
+            cookies: &empty,
+            body: Some("42"),
+            form: &empty,
+        };
+        let args = bind_request_arguments(&[int_binding.clone()], 1, &values).unwrap();
+        assert_eq!(args[0].value, Constant::Int(42));
+
+        let string_binding = binding(RouteBindingSource::Json, "body", 0, "String");
+        let values = RequestBindingValues {
+            body: Some(r#""hello""#),
+            ..values
+        };
+        let args = bind_request_arguments(&[string_binding.clone()], 1, &values).unwrap();
+        assert_eq!(args[0].value, Constant::String("hello".into()));
+        let values = RequestBindingValues {
+            body: Some("hello"),
+            ..values
+        };
+        let err = bind_request_arguments(&[string_binding], 1, &values).unwrap_err();
+        assert_eq!(err.http_status(), 400);
+    }
+
+    #[test]
+    fn json_binding_enforces_media_type_and_scalar_type() {
+        let empty = HashMap::new();
+        let no_headers = vec![];
+        let binding = binding(RouteBindingSource::Json, "body", 0, "Bool");
+        let values = RequestBindingValues {
+            path: &empty,
+            query: &empty,
+            headers: &no_headers,
+            cookies: &empty,
+            body: Some("true"),
+            form: &empty,
+        };
+        let error = bind_request_arguments(&[binding.clone()], 1, &values).unwrap_err();
+        assert_eq!(error.http_status(), 415);
+        assert_eq!(error.code(), "unsupported_media_type");
+
+        let headers = vec![("Content-Type".into(), "application/json".into())];
+        let values = RequestBindingValues {
+            headers: &headers,
+            body: Some(r#""true""#),
+            ..values
+        };
+        assert_eq!(
+            bind_request_arguments(&[binding.clone()], 1, &values)
+                .unwrap_err()
+                .http_status(),
+            400
+        );
+        let values = RequestBindingValues {
+            body: Some("null"),
+            ..values
+        };
+        assert_eq!(
+            bind_request_arguments(&[binding], 1, &values)
+                .unwrap_err()
+                .http_status(),
+            400
         );
     }
 }

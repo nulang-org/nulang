@@ -356,6 +356,14 @@ impl HttpServerState {
     }
 
     fn write_response(stream: &mut TcpStream, response: &HttpResponse) {
+        Self::write_response_with_body(stream, response, true);
+    }
+
+    fn write_response_without_body(stream: &mut TcpStream, response: &HttpResponse) {
+        Self::write_response_with_body(stream, response, false);
+    }
+
+    fn write_response_with_body(stream: &mut TcpStream, response: &HttpResponse, send_body: bool) {
         let status_text = match response.status {
             200 => "OK",
             201 => "Created",
@@ -371,6 +379,7 @@ impl HttpServerState {
             409 => "Conflict",
             408 => "Request Timeout",
             413 => "Payload Too Large",
+            415 => "Unsupported Media Type",
             417 => "Expectation Failed",
             422 => "Unprocessable Entity",
             429 => "Too Many Requests",
@@ -395,7 +404,9 @@ impl HttpServerState {
         out.push_str(&format!("Content-Length: {}\r\n", response.body.len()));
         out.push_str("\r\n");
         let _ = stream.write_all(out.as_bytes());
-        let _ = stream.write_all(&response.body);
+        if send_body {
+            let _ = stream.write_all(&response.body);
+        }
         let _ = stream.flush();
     }
 
@@ -919,6 +930,38 @@ fn invalid_ui_action_response(captured: &HttpRequestBindingInputs) -> Option<Htt
         })
 }
 
+/// Reject invalid UTF-8 before lossy request-body capture can alter JSON
+/// payloads. Raw `from body` compatibility retains its historical behavior.
+fn invalid_json_utf8_response(
+    route: &RuntimeWebRoute,
+    request: &HttpRequest,
+) -> Option<HttpResponse> {
+    let binding = route
+        .plan
+        .as_ref()?
+        .bindings
+        .iter()
+        .find(|binding| binding.source == crate::web::bindings::RouteBindingSource::Json)?;
+    if std::str::from_utf8(&request.body).is_ok() {
+        return None;
+    }
+    let error = crate::web::request_bindings::RequestDecodeError {
+        kind: crate::web::request_bindings::RequestDecodeErrorKind::InvalidType,
+        source: Some(crate::web::bindings::RouteBindingSource::Json),
+        source_name: Some(binding.source_name.clone()),
+        handler_param: Some(binding.handler_param.clone()),
+        handler_index: Some(binding.handler_index),
+        expected_type: binding.ty.clone(),
+        message: "invalid UTF-8 JSON request body".to_string(),
+    };
+    let problem = request_decode_problem_response(&error);
+    Some(HttpResponse {
+        status: problem.status,
+        headers: problem.headers,
+        body: problem.body,
+    })
+}
+
 /// Limits concurrently active development-server connections, including
 /// long-lived SSE streams. Lease release is automatic on worker exit or panic.
 /// This is capacity control, not an isolation boundary for untrusted code.
@@ -1118,82 +1161,111 @@ impl WebDevServer {
         let path = request.path.clone();
 
         let mut response = if path.starts_with(Self::SSE_PATH_PREFIX) {
-            let room = &path[Self::SSE_PATH_PREFIX.len()..];
-            Self::serve_sse(room, &mut stream, shutdown.clone());
-            return;
-        } else if let Some((route, params)) = routes
-            .iter()
-            .filter(|r| r.route.method == request.method)
-            .find_map(|r| {
-                crate::web::dispatch::match_route(r, &request.path).map(|params| (r, params))
-            })
-        {
-            let captured =
-                HttpRequestBindingInputs::capture(&request.path, &request.headers, &request.body);
-            if let Some(response) = invalid_ui_action_response(&captured) {
-                response
+            if request.method == HttpMethod::Get {
+                let room = &path[Self::SSE_PATH_PREFIX.len()..];
+                Self::serve_sse(room, &mut stream, shutdown.clone());
+                return;
+            }
+            // The SSE transport is streaming-only; never open a subscription
+            // for an unsupported method, especially HEAD or POST.
+            if request.method == HttpMethod::Options {
+                HttpResponse {
+                    status: 204,
+                    headers: vec![("Allow".into(), "GET, OPTIONS".into())],
+                    body: Vec::new(),
+                }
             } else {
-                let values = captured.values(&params, &request.headers);
-                let ctx = RequestContext {
-                    request: request.clone(),
-                    params: params.clone(),
-                };
-                let rendered =
-                    with_request_context(ctx, || match render_direct_request(route, &values) {
-                        Ok(Some(rendered)) => Ok(Some(rendered)),
-                        Ok(None) => Ok(render_route_handler(
-                            &route.route.handler_module,
-                            route.route.handler_func_idx,
-                            None,
-                        )),
-                        Err(error) => Err(error),
-                    });
-                // User headers are honored only for a successfully rendered page.
-                // Discard pending headers on decode/handler errors.
-                let response_headers = take_response_headers();
-                match rendered {
-                    Ok(Some(html)) => match Self::render_web_response(route, &html) {
-                        Ok(mut response) => {
-                            response.headers.extend(response_headers);
-                            response
-                        }
-                        Err(error) => {
-                            eprintln!("invalid web response: {error}");
-                            HttpResponse {
-                                status: 500,
-                                headers: vec![(
-                                    "Content-Type".into(),
-                                    "text/plain; charset=utf-8".into(),
-                                )],
-                                body: b"Internal server error".to_vec(),
-                            }
-                        }
-                    },
-                    Ok(None) => HttpResponse {
-                        status: 500,
-                        headers: vec![("Content-Type".into(), "text/plain".into())],
-                        body: b"Internal server error".to_vec(),
-                    },
-                    Err(DirectRequestRenderError::Decode(error)) => {
-                        let problem = request_decode_problem_response(&error);
-                        HttpResponse {
-                            status: problem.status,
-                            headers: problem.headers,
-                            body: problem.body,
-                        }
-                    }
-                    Err(DirectRequestRenderError::Execution(error)) => {
-                        eprintln!("typed route dispatch error: {error}");
-                        HttpResponse {
-                            status: 500,
-                            headers: vec![("Content-Type".into(), "text/plain".into())],
-                            body: b"Internal server error".to_vec(),
-                        }
-                    }
+                HttpResponse {
+                    status: 405,
+                    headers: vec![("Allow".into(), "GET, OPTIONS".into())],
+                    body: Vec::new(),
                 }
             }
         } else {
-            Self::serve_static(static_dir.as_deref(), output_dir.as_deref(), &request.path)
+            match crate::web::dispatch::resolve_route(&routes, request.method, &request.path) {
+                crate::web::dispatch::RouteResolution::Matched(route, params) => {
+                    let captured = HttpRequestBindingInputs::capture(
+                        &request.path,
+                        &request.headers,
+                        &request.body,
+                    );
+                    if let Some(response) = invalid_ui_action_response(&captured)
+                        .or_else(|| invalid_json_utf8_response(route, &request))
+                    {
+                        response
+                    } else {
+                        let values = captured.values(&params, &request.headers);
+                        let ctx = RequestContext {
+                            request: request.clone(),
+                            params: params.clone(),
+                        };
+                        let rendered = with_request_context(ctx, || {
+                            match render_direct_request(route, &values) {
+                                Ok(Some(rendered)) => Ok(Some(rendered)),
+                                Ok(None) => Ok(render_route_handler(
+                                    &route.route.handler_module,
+                                    route.route.handler_func_idx,
+                                    None,
+                                )),
+                                Err(error) => Err(error),
+                            }
+                        });
+                        let response_headers = take_response_headers();
+                        match rendered {
+                            Ok(Some(html)) => match Self::render_web_response(route, &html) {
+                                Ok(mut response) => {
+                                    response.headers.extend(response_headers);
+                                    response
+                                }
+                                Err(error) => {
+                                    eprintln!("invalid web response: {error}");
+                                    HttpResponse {
+                                        status: 500,
+                                        headers: vec![("Content-Type".into(), "text/plain".into())],
+                                        body: b"Internal server error".to_vec(),
+                                    }
+                                }
+                            },
+                            Ok(None) => HttpResponse {
+                                status: 500,
+                                headers: vec![("Content-Type".into(), "text/plain".into())],
+                                body: b"Internal server error".to_vec(),
+                            },
+                            Err(DirectRequestRenderError::Decode(error)) => {
+                                let problem = request_decode_problem_response(&error);
+                                HttpResponse {
+                                    status: problem.status,
+                                    headers: problem.headers,
+                                    body: problem.body,
+                                }
+                            }
+                            Err(DirectRequestRenderError::Execution(error)) => {
+                                eprintln!("typed route dispatch error: {error}");
+                                HttpResponse {
+                                    status: 500,
+                                    headers: vec![("Content-Type".into(), "text/plain".into())],
+                                    body: b"Internal server error".to_vec(),
+                                }
+                            }
+                        }
+                    }
+                }
+                crate::web::dispatch::RouteResolution::AutomaticOptions(allow) => HttpResponse {
+                    status: 204,
+                    headers: vec![("Allow".into(), allow)],
+                    body: Vec::new(),
+                },
+                crate::web::dispatch::RouteResolution::MethodNotAllowed(allow) => HttpResponse {
+                    status: 405,
+                    headers: vec![("Allow".into(), allow)],
+                    body: Vec::new(),
+                },
+                crate::web::dispatch::RouteResolution::NotFound => Self::serve_static_for_method(
+                    static_dir.as_deref(),
+                    output_dir.as_deref(),
+                    &request,
+                ),
+            }
         };
         for cookie in take_response_cookies() {
             response.headers.push(("Set-Cookie".into(), cookie));
@@ -1202,7 +1274,11 @@ impl WebDevServer {
         for m in &middlewares {
             m.apply(&request, &mut response);
         }
-        HttpServerState::write_response(&mut stream, &response);
+        if request.method == HttpMethod::Head {
+            HttpServerState::write_response_without_body(&mut stream, &response);
+        } else {
+            HttpServerState::write_response(&mut stream, &response);
+        }
     }
 
     /// Decode a route result according to its compiler-validated response type.
@@ -1263,6 +1339,36 @@ impl WebDevServer {
         stream.write_all(json.as_bytes())?;
         stream.write_all(b"\n\n")?;
         stream.flush()
+    }
+
+    /// Static assets are GET/HEAD resources. A method mismatch must never
+    /// execute a file download, and OPTIONS only applies to an existing file.
+    fn serve_static_for_method(
+        static_dir: Option<&Path>,
+        output_dir: Option<&Path>,
+        request: &HttpRequest,
+    ) -> HttpResponse {
+        let path = request
+            .path
+            .split_once('?')
+            .map_or(request.path.as_str(), |(path, _)| path);
+        let response = Self::serve_static(static_dir, output_dir, path);
+        if response.status != 200 {
+            return response;
+        }
+        match request.method {
+            HttpMethod::Get | HttpMethod::Head => response,
+            HttpMethod::Options => HttpResponse {
+                status: 204,
+                headers: vec![("Allow".into(), "GET, HEAD, OPTIONS".into())],
+                body: Vec::new(),
+            },
+            _ => HttpResponse {
+                status: 405,
+                headers: vec![("Allow".into(), "GET, HEAD, OPTIONS".into())],
+                body: Vec::new(),
+            },
+        }
     }
 
     fn serve_static(
