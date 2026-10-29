@@ -22,6 +22,7 @@ pub mod behavior_manifest;
 #[cfg(test)]
 pub mod benchmarks;
 pub mod bytecode;
+pub mod changeset;
 #[cfg(feature = "wasmfx-backend")]
 pub mod cir;
 #[cfg(feature = "wasmfx-backend")]
@@ -45,6 +46,8 @@ pub mod dst;
 pub mod durable_effect;
 pub mod durable_effect_persistence;
 pub mod durable_effect_runtime;
+#[cfg(feature = "sqlite")]
+pub mod durable_sql_jobs;
 pub mod effect_checker;
 pub mod execution_site_map;
 pub mod ffi;

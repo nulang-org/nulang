@@ -43,3 +43,30 @@ fn goal_graph_tasks_restore_in_stable_created_at_then_id_order() {
     drop(store);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn agent_store_is_usable_inside_tokio_and_survives_reopen() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let dir = std::env::temp_dir().join(format!("nulang-ai-store-async-{}", Uuid::new_v4()));
+        let goal = Goal::new("demo", "async-safe storage", 10.0);
+
+        // These are intentionally synchronous calls made inside an async test.
+        // A libSQL store using an in-place nested Runtime::block_on would panic.
+        {
+            let store = SqliteStore::open(&dir).unwrap();
+            store.upsert_goal(&goal).unwrap();
+            let goals = store.list_goals().unwrap();
+            assert_eq!(goals.len(), 1);
+            assert_eq!(goals[0].id, goal.id);
+        }
+        {
+            let reopened = SqliteStore::open(&dir).unwrap();
+            assert_eq!(reopened.get_goal_graph(goal.id).unwrap().goal.id, goal.id);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    });
+}
