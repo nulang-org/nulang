@@ -4,7 +4,7 @@ Nulang retains libSQL local and remote database interfaces, including the libsql
 
 Nulang instead uses libSQL's public connector API with Hyper 0.14 and supported tokio-rustls 0.26 / rustls 0.23. This preserves native certificate roots, chain verification, SNI, and hostname verification. It does not install a permissive verifier or downgrade HTTPS to plaintext.
 
-The upstream client permits plain HTTP for development; the connector retains unauthenticated HTTP for that use. `LibsqlStore::new_remote` now rejects an HTTP destination whenever an authentication token is supplied, before allocating a runtime or opening any connection. It also rejects URLs with embedded userinfo, invalid schemes, and missing hosts. Authenticated remote databases must use HTTPS or `libsql://` (mapped to HTTPS). This is a destination-admission boundary, not proof that redirect behavior, server access controls, or an external Turso session is secure.
+The upstream client permits plain HTTP for development; the connector retains unauthenticated HTTP for that use. `LibsqlStore::new_remote` now rejects an HTTP destination whenever an authentication token is supplied, before allocating a runtime or opening any connection. Additionally, the token-bound Hyper connector rejects **each** non-HTTPS destination before socket creation, protecting against credential downgrades if an HTTP client later starts following redirects. It also rejects URLs with embedded userinfo, invalid schemes, and missing hosts. Authenticated remote databases must use HTTPS or `libsql://` (mapped to HTTPS). This is a destination-admission boundary, not proof that redirect behavior, server access controls, or an external Turso session is secure.
 
 ## Required validation
 

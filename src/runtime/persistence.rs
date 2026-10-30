@@ -1378,7 +1378,7 @@ impl LibsqlStore {
         let db = rt.block_on(async {
             libsql::Builder::new_remote(url.to_string(), auth_token.to_string())
                 .connector(
-                    crate::runtime::libsql_tls::connector()
+                    crate::runtime::libsql_tls::connector(auth_token)
                         .map_err(|e| io::Error::other(e.to_string()))?,
                 )
                 .build()

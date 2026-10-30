@@ -71,6 +71,9 @@ impl AsyncWrite for ModernStream {
 pub struct ModernConnector {
     tcp: HttpConnector,
     tls: TlsConnector,
+    /// Token-bearing connections cannot be downgraded even if a caller
+    /// follows an HTTPS redirect to a new HTTP destination.
+    require_https: bool,
 }
 
 /// Validate the destination before constructing a client with a bearer token.
@@ -103,7 +106,7 @@ pub(crate) fn validate_authenticated_remote_transport(url: &str, token: &str) ->
 }
 
 /// Requires usable platform roots; no insecure trust-all fallback.
-pub fn connector() -> io::Result<ModernConnector> {
+pub fn connector(auth_token: &str) -> io::Result<ModernConnector> {
     let certs = rustls_native_certs::load_native_certs();
     let mut roots = RootCertStore::empty();
     let (added, _) = roots.add_parsable_certificates(certs.certs);
@@ -112,11 +115,17 @@ pub fn connector() -> io::Result<ModernConnector> {
             "no usable native TLS roots for libSQL remote connection",
         ));
     }
-    Ok(connector_with_roots(roots))
+    let mut connector = connector_with_roots(roots);
+    connector.require_https = !auth_token.is_empty();
+    Ok(connector)
 }
 
 /// Use the same rustls certificate verifier for both system and test roots.
 fn connector_with_roots(roots: RootCertStore) -> ModernConnector {
+    connector_with_roots_and_policy(roots, false)
+}
+
+fn connector_with_roots_and_policy(roots: RootCertStore, require_https: bool) -> ModernConnector {
     let config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
@@ -126,6 +135,7 @@ fn connector_with_roots(roots: RootCertStore) -> ModernConnector {
     ModernConnector {
         tcp,
         tls: TlsConnector::from(std::sync::Arc::new(config)),
+        require_https,
     }
 }
 
@@ -139,6 +149,17 @@ impl Service<Uri> for ModernConnector {
     }
 
     fn call(&mut self, dst: Uri) -> Self::Future {
+        // Defense in depth: validate *each* actual transport destination,
+        // not just the URL checked by LibsqlStore::new_remote. No socket I/O.
+        if self.require_https && dst.scheme_str() != Some("https") {
+            return Box::pin(async {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "authenticated libSQL connections require HTTPS at every destination",
+                )
+                .into())
+            });
+        }
         let is_https = match dst.scheme_str() {
             Some("https") => true,
             Some("http") => false,
@@ -231,6 +252,40 @@ mod tests {
         .err()
         .expect("plaintext bearer-token transport must fail before IO");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn authenticated_connector_rejects_plaintext_redirect_target_before_io() {
+        // A future HTTP library upgrade could follow 307 redirects. Its
+        // connector must never dial HTTP when carrying bearer credentials.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination: Uri = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let mut authenticated = connector_with_roots_and_policy(RootCertStore::empty(), true);
+        let error = authenticated
+            .call(destination.clone())
+            .await
+            .err()
+            .expect("authenticated connector must reject HTTP before connecting");
+        assert!(error.to_string().contains("HTTPS"), "{error}");
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "plaintext destination must never receive a connection"
+        );
+
+        // Existing anonymous HTTP development behavior remains available.
+        let mut anonymous = connector_with_roots(RootCertStore::empty());
+        let _socket = timeout(Duration::from_secs(3), anonymous.call(destination))
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
