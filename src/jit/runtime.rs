@@ -686,16 +686,18 @@ thread_local! {
 }
 
 #[derive(Clone, Copy)]
-struct JitLeafCallEntry {
-    func_idx: usize,
-    ptr: *const u8,
-    return_reg: u8,
-    required_args: usize,
+pub(crate) struct JitLeafCallEntry {
+    pub(crate) func_idx: usize,
+    pub(crate) ptr: *const u8,
+    pub(crate) return_reg: u8,
+    pub(crate) required_args: usize,
 }
 
 thread_local! {
-    static JIT_LEAF_CALLS: std::cell::RefCell<Vec<JitLeafCallEntry>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    // Immutable module-scoped snapshots avoid rebuilding and reallocating
+    // the call table on every hot-region execution or nested VM entry.
+    static JIT_LEAF_CALLS: std::cell::RefCell<Option<std::sync::Arc<[JitLeafCallEntry]>>> =
+        const { std::cell::RefCell::new(None) };
     static JIT_LEAF_CONSTANTS: Cell<*const u64> = const { Cell::new(std::ptr::null()) };
 }
 
@@ -712,37 +714,29 @@ pub(crate) fn jit_leaf_table_installs_for_test() -> usize {
     JIT_LEAF_TABLE_INSTALLS.load(Ordering::Relaxed)
 }
 
-pub(crate) fn set_jit_leaf_calls(calls: &[(usize, *const u8, u8, usize)], constants: *const u64) {
+pub(crate) fn set_jit_leaf_calls(
+    calls: Option<&std::sync::Arc<[JitLeafCallEntry]>>,
+    constants: *const u64,
+) {
     #[cfg(test)]
     JIT_LEAF_TABLE_INSTALLS.fetch_add(1, Ordering::Relaxed);
-    JIT_LEAF_CALLS.with(|slot| {
-        let mut entries = slot.borrow_mut();
-        entries.clear();
-        entries.extend(
-            calls.iter().map(
-                |&(func_idx, ptr, return_reg, required_args)| JitLeafCallEntry {
-                    func_idx,
-                    ptr,
-                    return_reg,
-                    required_args,
-                },
-            ),
-        );
-    });
+    JIT_LEAF_CALLS.with(|slot| *slot.borrow_mut() = calls.cloned());
     JIT_LEAF_CONSTANTS.with(|slot| slot.set(constants));
 }
 
 pub(crate) fn clear_jit_leaf_calls() {
-    JIT_LEAF_CALLS.with(|slot| slot.borrow_mut().clear());
+    JIT_LEAF_CALLS.with(|slot| *slot.borrow_mut() = None);
     JIT_LEAF_CONSTANTS.with(|slot| slot.set(std::ptr::null()));
 }
 
 fn jit_leaf_call(func_idx: usize) -> Option<JitLeafCallEntry> {
     JIT_LEAF_CALLS.with(|slot| {
-        slot.borrow()
-            .iter()
-            .copied()
-            .find(|entry| entry.func_idx == func_idx)
+        let calls = slot.borrow();
+        let entries = calls.as_deref()?;
+        let idx = entries
+            .binary_search_by_key(&func_idx, |entry| entry.func_idx)
+            .ok()?;
+        Some(entries[idx])
     })
 }
 
@@ -823,7 +817,7 @@ struct JitThreadState {
     yield_pc: u64,
     branch_exit_pc: u64,
     pending_error: Option<String>,
-    leaf_calls: Vec<JitLeafCallEntry>,
+    leaf_calls: Option<std::sync::Arc<[JitLeafCallEntry]>>,
     leaf_constants: *const u64,
 }
 
@@ -934,6 +928,12 @@ pub unsafe extern "C" fn nulang_jit_direct_call(
 
                 if let Some(msg) = leaf_error {
                     set_jit_pending_vm_error(msg);
+                    return 1;
+                }
+                // A nested compiled leaf may have called this same helper.
+                // Propagate its failure instead of returning an uninitialized
+                // or partial register as if the parent completed successfully.
+                if JIT_PENDING_VM_ERROR.with(|slot| slot.borrow().is_some()) {
                     return 1;
                 }
 
