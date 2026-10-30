@@ -155,7 +155,36 @@ pub unsafe fn cstr_to_value(s: *const c_char) -> Value {
     // SAFETY: caller guarantees `s` is a valid, null-terminated C string.
     let cstr = CStr::from_ptr(s);
     let cstring = CString::new(cstr.to_bytes()).unwrap_or_else(|_| CString::default());
-    ptr_to_value_checked(cstring.into_raw() as *mut u8)
+    // Check while CString still owns the allocation. into_raw would leak it
+    // if the address cannot fit in Value's 48-bit pointer payload.
+    if !crate::value_layout::ptr_fits_payload(cstring.as_ptr() as u64) {
+        return Value::nil();
+    }
+    let ptr = cstring.into_raw();
+    // SAFETY: the owned CString allocation is alive, unmodified, and its
+    // pointer was checked for a lossless tagged-Value representation.
+    unsafe { Value::ptr(ptr as *mut u8) }
+}
+
+/// Reclaim ownership of a temporary C string returned by cstr_to_value.
+///
+/// The returned CString frees its allocation on every exit path, including
+/// when a later actor-heap allocation fails. Do not also call free_cstr_value.
+///
+/// # Safety
+/// A non-nil value must be returned by cstr_to_value exactly once and
+/// must not have been freed or otherwise transferred already. Arbitrary
+/// pointer-tagged values are not accepted by this ownership contract.
+pub unsafe fn take_cstr_return(value: Value) -> Result<Option<CString>, &'static str> {
+    if value.is_nil() {
+        return Ok(None);
+    }
+    let ptr = value
+        .as_ptr()
+        .ok_or("FFI C string return was not a pointer")? as *mut c_char;
+    // SAFETY: the caller guarantees this is the live, uniquely owned pointer
+    // originally produced by CString::into_raw in cstr_to_value.
+    Ok(Some(unsafe { CString::from_raw(ptr) }))
 }
 
 /// Free a pointer value previously created by `cstr_to_value`.
@@ -335,7 +364,13 @@ pub unsafe fn call_native(func: &NativeFunction, args: &[Value]) -> Result<Value
         }
         CType::VoidPtr => {
             let r: *mut c_void = unsafe { cif.call(code, &ffi_args) };
-            Ok(voidptr_to_value(r))
+            // Do not turn a non-null unrepresentable foreign address into nil:
+            // nil is a legitimate C NULL, not a successful pointer conversion.
+            if !r.is_null() && !crate::value_layout::ptr_fits_payload(r as u64) {
+                Err("FFI void pointer exceeds the 48-bit Value payload".to_string())
+            } else {
+                Ok(voidptr_to_value(r))
+            }
         }
         CType::Unit => {
             let _: () = unsafe { cif.call(code, &ffi_args) };
@@ -644,6 +679,24 @@ mod tests {
     }
 
     #[test]
+    fn test_take_cstr_return_transfers_ownership_into_raii() {
+        // The temporary returned by cstr_to_value must become a CString so
+        // error paths in the VM release it without an explicit cleanup call.
+        let value = unsafe { cstr_to_value(c"owned result".as_ptr()) };
+        let owned = unsafe { take_cstr_return(value) }
+            .expect("valid return pointer")
+            .expect("non-null return pointer");
+        assert_eq!(owned.as_bytes(), b"owned result");
+        // Dropping `owned` is the sole cleanup; never free the old Value again.
+    }
+
+    #[test]
+    fn test_take_cstr_return_rejects_non_pointer_and_accepts_null() {
+        assert!(unsafe { take_cstr_return(Value::nil()) }.unwrap().is_none());
+        assert!(unsafe { take_cstr_return(Value::int(7)) }.is_err());
+    }
+
+    #[test]
     fn test_marshal_cstr_roundtrip() {
         let original = CString::new("hello ffi").unwrap();
         let ptr = original.as_ptr() as *mut u8;
@@ -733,6 +786,22 @@ mod tests {
             .unwrap()
         };
         assert_eq!(result.as_int(), Some(21));
+    }
+
+    #[test]
+    #[cfg(all(feature = "ffi", target_pointer_width = "64"))]
+    fn test_call_native_rejects_unrepresentable_nonnull_void_pointer() {
+        extern "C" fn return_high_address() -> *mut c_void {
+            // A numeric pointer is safe to pass through the ABI as long as it
+            // is never dereferenced. This exceeds Value's 48-bit payload.
+            (1usize << 48) as *mut c_void
+        }
+        let func = make_func(
+            return_high_address as *const c_void,
+            Signature::new(vec![], CType::VoidPtr),
+        );
+        let result = unsafe { call_native(&func, &[]) };
+        assert!(result.unwrap_err().contains("48-bit"));
     }
 
     #[test]

@@ -3151,40 +3151,41 @@ impl VM {
         }
     }
 
-    /// Copy a C string return value into the actor heap and free the temporary.
+    /// Copy an owned C string return value into the actor heap.
+    ///
+    /// Ownership transfers from cstr_to_value to an RAII CString before
+    /// allocating actor memory, so allocation errors cannot leak the
+    /// temporary. Only the resulting actor allocation escapes this method.
     fn copy_cstr_return(&mut self, value: Value) -> NuResult<Value> {
-        // cstr_to_value maps a NULL C string to nil; pass it through instead
-        // of failing on the missing pointer.
+        // A NULL C string is a valid nil result, not an allocation error.
         if value.is_nil() {
             return Ok(value);
         }
-        let ptr = value.as_ptr().ok_or_else(|| NuError::VMError {
-            msg: "FFI C string return was not a pointer".to_string(),
-            span: Span::default(),
-        })?;
-        // SAFETY: ptr is a valid null-terminated C string from cstr_to_value.
-        let bytes = unsafe { CStr::from_ptr(ptr as *const c_char).to_bytes() };
+        // SAFETY: the caller passes the unique temporary created by
+        // cstr_to_value for the immediately preceding native CStr return.
+        let owned = unsafe { crate::ffi::marshal::take_cstr_return(value) }
+            .map_err(|msg| NuError::VMError {
+                msg: msg.to_string(),
+                span: Span::default(),
+            })?
+            .expect("nil C string handled above");
+        let bytes = owned.as_bytes();
         let len = bytes.len();
-        let heap_ptr = self
+        let (heap_ptr, heap_value) = self
             .actor_callbacks
-            .alloc(len + 1, HeapTypeTag::String)
+            .alloc_value(len + 1, HeapTypeTag::String)
             .ok_or_else(|| NuError::VMError {
                 msg: "FFI C string heap allocation failed".to_string(),
                 span: Span::default(),
             })?;
-        // SAFETY: heap_ptr points to len+1 bytes of freshly allocated memory.
+        // SAFETY: alloc_value returned len+1 writable bytes in the actor
+        // heap, and owned keeps the source buffer alive for this copy.
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), heap_ptr, len);
             *heap_ptr.add(len) = 0;
         }
-        // SAFETY: value was produced by cstr_to_value.
-        unsafe {
-            crate::ffi::marshal::free_cstr_value(value);
-        }
-        Ok(unsafe {
-            /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
-            Value::ptr(heap_ptr)
-        })
+        Ok(heap_value)
+        // The CString drops on success and on every error path.
     }
 
     /// Get a constant string from a module's constant pool.
@@ -6288,6 +6289,7 @@ mod vm_tests {
     struct ReadyValueCallbacks {
         heap: ActorHeap,
         gc: crate::runtime::OrcaGc,
+        reject_alloc: bool,
     }
 
     impl ReadyValueCallbacks {
@@ -6297,13 +6299,18 @@ mod vm_tests {
             Self {
                 heap,
                 gc: crate::runtime::OrcaGc::new(0),
+                reject_alloc: false,
             }
         }
     }
 
     impl ActorVmCallbacks for ReadyValueCallbacks {
         fn alloc(&mut self, size: usize, type_tag: HeapTypeTag) -> Option<*mut u8> {
-            self.heap.alloc(size, type_tag)
+            if self.reject_alloc {
+                None
+            } else {
+                self.heap.alloc(size, type_tag)
+            }
         }
 
         fn drop_ref(&mut self, ptr: *mut u8) {
@@ -6407,6 +6414,21 @@ mod vm_tests {
             .to_str()
             .unwrap();
         assert_eq!(s, "hello ffi");
+    }
+
+    #[test]
+    fn test_copy_cstr_return_heap_allocation_failure() {
+        let mut vm = VM::new_without_jit();
+        let mut callbacks = ReadyValueCallbacks::new();
+        callbacks.reject_alloc = true;
+        vm.set_actor_callbacks(Box::new(callbacks));
+
+        // SAFETY: source is a valid static C string; ownership of the
+        // temporary produced by cstr_to_value transfers to the VM.
+        let value = unsafe { crate::ffi::marshal::cstr_to_value(c"alloc fails".as_ptr()) };
+        let error = vm.copy_cstr_return(value).unwrap_err();
+        assert!(format!("{error}").contains("FFI C string heap allocation failed"));
+        // The temporary CString is now RAII-owned and freed on this error path.
     }
 
     /// Test 1: Basic integer arithmetic.
