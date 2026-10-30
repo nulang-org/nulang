@@ -1661,17 +1661,23 @@ impl SqliteStore {
                 })
                 .collect();
             let param_refs: Vec<&str> = param_values.iter().map(|s| s.as_str()).collect();
-            let mut rows = conn
-                .query_rows(sql, rusqlite::params_from_iter(param_refs))
+            // Stream through SQLite's cursor; do not materialize an additional
+            // copy of the full query before constructing the API response.
+            let mut statement = conn
+                .prepare(sql)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let column_count = statement.column_count();
+            let mut rows = statement
+                .query(rusqlite::params_from_iter(param_refs))
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             let mut results = Vec::new();
             loop {
                 match rows.next() {
                     Ok(Some(row)) => {
                         let mut cols: Vec<serde_json::Value> = Vec::new();
-                        for i in 0..row.column_count() {
+                        for i in 0..column_count {
                             let val = row
-                                .get_value(i)
+                                .get::<_, rusqlite::types::Value>(i)
                                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
                             let json_val = match val {
                                 rusqlite::types::Value::Null => serde_json::Value::Null,
@@ -1745,13 +1751,17 @@ impl PersistenceStore for SqliteStore {
     ) -> io::Result<Option<DurableEffectPersistenceRecord>> {
         let conn = self.conn();
         (|| {
-            let mut rows = conn
-                .query_rows(
+            // Scan the cursor incrementally. Durable-effect history may be
+            // large, and a matching receipt can appear before the final row.
+            let mut statement = conn
+                .prepare(
                     "SELECT record FROM durable_effect_records
                      WHERE actor_id = ?1
                      ORDER BY sequence DESC, ordinal DESC",
-                    rusqlite::params![actor_id as i64],
                 )
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+            let mut rows = statement
+                .query(rusqlite::params![actor_id as i64])
                 .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
 
             while let Some(row) = rows
