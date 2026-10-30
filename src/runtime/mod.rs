@@ -3077,6 +3077,20 @@ impl Runtime {
     /// Stale tokens are discarded so tests/manual pumps can share the same
     /// invariant as the production scheduler instead of mutating the raw queue.
     pub(crate) fn claim_next_ready_actor(&mut self) -> Option<u64> {
+        // The handoff slot bypasses scheduler queues in strict mode. In fair
+        // mode, feed it back into its priority band so a stream of handoffs
+        // cannot bypass the weighted fairness budget.
+        if self.scheduler.fair_scheduling_enabled() {
+            if let Some(parked_id) = self.next_run_slot.take() {
+                let priority = self
+                    .actors
+                    .get(&parked_id)
+                    .map(|actor| actor.priority)
+                    .unwrap_or(ActorPriority::Normal);
+                self.scheduler
+                    .enqueue_local_with_priority(0, parked_id, priority);
+            }
+        }
         loop {
             let actor_id = if let Some(id) = self.next_run_slot {
                 // Preserve the strict High > Normal > Low contract: a parked
