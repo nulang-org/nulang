@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Opt-in bounded native FFI calls — 2026-10-30
+- Added an unsafe Rust-host-only native-call adapter for generation-checked foreign buffers. It supports a pointer-and-length C ABI with non-pointer returns; stale handles, out-of-bounds windows, denied permissions and unsupported signatures fail before invocation.
+- Buffer ownership stays with its registry during a synchronous scoped call; trusted native code must not retain the pointer or violate aliasing rules. VM, bytecode, JIT and tagged Value ABI are unchanged.
+- Regressions cover read-only and mutable calls, denied calls, pointer-return rejection, and adversarial NaN payloads that could impersonate pointer tags. Exact-head CI and backend integration remain merge gates.
+
 ### Experimental generational foreign-memory handles — 2026-10-30
 - Added an opt-in, std-only `ffi::handles::ForeignBufferRegistry` with private, registry-scoped generational handles, fixed-size owned buffers, checked offsets and lengths, read-only/read-write permissions, and deterministic invalidation after release and slot reuse.
 - Safe access uses borrowed slices; raw native pointers require explicit unsafe scoped leases with a non-retention contract. Untrusted native libraries still require out-of-process isolation, and the existing `CType::VoidPtr` ABI is unchanged.
