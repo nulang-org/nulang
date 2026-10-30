@@ -1955,7 +1955,11 @@ impl Value {
 
     /// Create a float value.
     pub fn float(f: f64) -> Self {
-        Value { raw: f.to_bits() }
+        // All managed floats, including native FFI returns, must avoid
+        // NaN bit patterns reserved for pointer and other tagged Values.
+        Value {
+            raw: crate::value_layout::float_bits(f),
+        }
     }
 
     /// Create a boolean value.
