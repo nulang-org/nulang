@@ -1320,6 +1320,26 @@ pub struct LibsqlStore {
 }
 
 #[cfg(feature = "sqlite")]
+fn validate_secure_libsql_url(endpoint: &str) -> io::Result<()> {
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "remote libSQL requires an HTTPS or libsql URL without credentials or fragments",
+        )
+    };
+    let url = url::Url::parse(endpoint).map_err(|_| invalid())?;
+    if !matches!(url.scheme(), "https" | "libsql")
+        || url.host_str().is_none_or(str::is_empty)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sqlite")]
 impl LibsqlStore {
     /// Open (or create) a local file database with the default
     /// `SqliteSyncMode::Full` durability.  Pass `":memory:"` for an
@@ -1370,10 +1390,18 @@ impl LibsqlStore {
     /// skipped: a Turso server manages its own journal and durability
     /// policy.
     pub fn new_remote(url: &str, auth_token: &str) -> io::Result<Self> {
+        validate_secure_libsql_url(url)?;
+
+        // libSQL normalizes the libsql scheme to HTTPS before requests.
+        // Native TLS checks certificates with system roots and forbids HTTP.
+        let mut connector = hyper_tls::HttpsConnector::new();
+        connector.https_only(true);
+
         let rt =
             tokio::runtime::Runtime::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let db = rt.block_on(async {
             libsql::Builder::new_remote(url.to_string(), auth_token.to_string())
+                .connector(connector)
                 .build()
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
@@ -4404,5 +4432,50 @@ mod libsql_atomic_transition_tests {
 
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(store.latest_sequence(42), 1);
+    }
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod secure_libsql_url_tests {
+    use super::validate_secure_libsql_url;
+
+    #[test]
+    fn secure_libsql_url_rejects_plaintext_and_malformed_endpoints() {
+        for url in [
+            "http://localhost:8080",
+            "file:///tmp/example.db",
+            "https://",
+            "libsql://",
+            "https://user:password@example.com",
+            "https://127.0.0.1#fragment",
+            "not-a-url",
+        ] {
+            assert!(
+                validate_secure_libsql_url(url).is_err(),
+                "unexpectedly accepted: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_constructor_rejects_http_before_network_or_tls_setup() {
+        let err = super::LibsqlStore::new_remote("http://127.0.0.1:1", "unused")
+            .err()
+            .expect("plaintext remote URL must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn secure_libsql_url_allows_valid_https_and_libsql_schemes() {
+        for url in [
+            "https://database.example.com",
+            "https://database.example.com:443",
+            "libsql://database.example.com",
+        ] {
+            assert!(
+                validate_secure_libsql_url(url).is_ok(),
+                "unexpectedly rejected: {url}"
+            );
+        }
     }
 }
