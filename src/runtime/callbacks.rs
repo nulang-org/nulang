@@ -2059,12 +2059,8 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                 return PerformAsyncResult::Ready(None);
             };
             if !(*rt).dispatch_llm_request(actor_id, request, prompt) {
-                // Dispatch failed: fall back to a nil response.
-                rt.llm.inflight_count = rt.llm.inflight_count.saturating_sub(1);
-                if let Some(actor) = rt.actors.get_mut(&actor_id) {
-                    actor.llm_inflight = false;
-                    actor.llm_pending_prompt = None;
-                }
+                // Backpressure or worker exit: no request was admitted and
+                // dispatch left actor state and in-flight accounting unchanged.
                 return PerformAsyncResult::Ready(None);
             }
             PerformAsyncResult::Pending
