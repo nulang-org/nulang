@@ -348,6 +348,80 @@ pub unsafe fn call_native(func: &NativeFunction, args: &[Value]) -> Result<Value
     }
 }
 
+/// Invoke a trusted native buffer function against a registry-owned window.
+///
+/// The opt-in host API accepts only (void*, i64) -> i64/f64/bool/void.
+/// The pointer cannot escape as an untracked return value. This does not
+/// change Nulang's ordinary bytecode FFI invocation path.
+///
+/// # Safety
+/// The function pointer must have the exact declared ABI. Native code must
+/// not retain, free, or use the pointer after return, exceed its length,
+/// write through a read-only lease, re-enter the registry, or perform
+/// conflicting accesses. Untrusted native code must run in a sandbox.
+#[cfg(feature = "ffi")]
+pub unsafe fn call_native_bounded_buffer(
+    func: &NativeFunction,
+    buffers: &mut super::handles::ForeignBufferRegistry,
+    handle: super::handles::ForeignBufferHandle,
+    offset: usize,
+    len: usize,
+    access: super::handles::ForeignAccess,
+) -> Result<Value, String> {
+    use super::handles::ForeignAccess;
+
+    if func.signature.params != [CType::VoidPtr, CType::I64]
+        || !matches!(
+            func.signature.ret,
+            CType::I64 | CType::F64 | CType::Bool | CType::Unit
+        )
+    {
+        return Err("bounded native FFI requires (VoidPtr, I64) and a non-pointer return".into());
+    }
+
+    // A Nulang integer Value is a signed 48-bit payload. Reject values
+    // that would silently truncate the native buffer length.
+    let length =
+        i64::try_from(len).map_err(|_| "bounded native FFI length does not fit i64".to_string())?;
+    let length_value = Value::int(length);
+    if length_value.as_int() != Some(length) {
+        return Err("bounded native FFI length exceeds Value integer payload".into());
+    }
+
+    let invoke = |ptr: *const u8| -> Result<Value, String> {
+        if !crate::value_layout::ptr_fits_payload(ptr as u64) {
+            return Err("bounded native FFI pointer exceeds 48-bit Value payload".into());
+        }
+        // SAFETY: the registry has provided a live scoped allocation; the
+        // caller establishes the native signature and non-retention contract.
+        let pointer = unsafe { Value::ptr(ptr as *mut u8) };
+        let value = unsafe { call_native(func, &[pointer, length_value]) }?;
+        if func.signature.ret == CType::F64 {
+            // A foreign NaN payload can have the same bits as TAG_PTR.
+            // Normalize every F64 result before it enters managed Values.
+            // SAFETY: float_bits guarantees a non-tagged floating encoding.
+            let bits = crate::value_layout::float_bits(f64::from_bits(value.to_bits()));
+            return Ok(unsafe { Value::from_bits(bits) });
+        }
+        Ok(value)
+    };
+
+    match access {
+        ForeignAccess::ReadOnly => {
+            // SAFETY: the caller ensures no mutation or pointer retention.
+            unsafe { buffers.with_raw_read(handle, offset, len, |ptr, _| invoke(ptr)) }
+                .map_err(|e| format!("bounded native FFI buffer: {e:?}"))?
+        }
+        ForeignAccess::ReadWrite => {
+            // SAFETY: the caller ensures exclusive scoped native access.
+            unsafe {
+                buffers.with_raw_write(handle, offset, len, |ptr, _| invoke(ptr.cast_const()))
+            }
+            .map_err(|e| format!("bounded native FFI buffer: {e:?}"))?
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fixed-arity fallback (used when the `ffi` feature is disabled)
 // ---------------------------------------------------------------------------
@@ -608,6 +682,205 @@ mod tests {
             library: None,
             symbol: "test".to_string(),
         }
+    }
+
+    #[cfg(feature = "ffi")]
+    #[test]
+    fn bounded_native_call_reads_only_selected_window() {
+        extern "C" fn sum(ptr: *const u8, len: i64) -> i64 {
+            // SAFETY: with_raw_read guarantees this trusted, live buffer
+            // contains len initialized bytes for the duration of the call.
+            unsafe { std::slice::from_raw_parts(ptr, len as usize) }
+                .iter()
+                .map(|b| i64::from(*b))
+                .sum()
+        }
+        let func = make_func(
+            sum as *const c_void,
+            Signature::new(vec![CType::VoidPtr, CType::I64], CType::I64),
+        );
+        let mut buffers = crate::ffi::handles::ForeignBufferRegistry::new();
+        let h = buffers
+            .register(
+                &[5, 10, 15, 20],
+                crate::ffi::handles::ForeignAccess::ReadOnly,
+            )
+            .unwrap();
+        // SAFETY: sum is a trusted ABI match and never retains its pointer.
+        let result = unsafe {
+            call_native_bounded_buffer(
+                &func,
+                &mut buffers,
+                h,
+                1,
+                2,
+                crate::ffi::handles::ForeignAccess::ReadOnly,
+            )
+        }
+        .unwrap();
+        assert_eq!(result.as_int(), Some(25));
+    }
+
+    #[cfg(feature = "ffi")]
+    #[test]
+    fn bounded_native_call_writes_only_selected_window() {
+        extern "C" fn fill(ptr: *mut u8, len: i64) -> i64 {
+            // SAFETY: scoped, exclusively borrowed live buffer.
+            unsafe { std::slice::from_raw_parts_mut(ptr, len as usize).fill(99) };
+            len
+        }
+        let func = make_func(
+            fill as *const c_void,
+            Signature::new(vec![CType::VoidPtr, CType::I64], CType::I64),
+        );
+        let mut buffers = crate::ffi::handles::ForeignBufferRegistry::new();
+        let h = buffers
+            .register(&[1, 2, 3, 4], crate::ffi::handles::ForeignAccess::ReadWrite)
+            .unwrap();
+        // SAFETY: fill never retains its pointer and writes only the window.
+        let result = unsafe {
+            call_native_bounded_buffer(
+                &func,
+                &mut buffers,
+                h,
+                1,
+                2,
+                crate::ffi::handles::ForeignAccess::ReadWrite,
+            )
+        }
+        .unwrap();
+        assert_eq!(result.as_int(), Some(2));
+        assert_eq!(buffers.read(h, 0, 4).unwrap(), &[1, 99, 99, 4]);
+    }
+
+    #[cfg(feature = "ffi")]
+    #[test]
+    fn bounded_native_call_rejects_stale_cross_domain_bounds_and_permissions() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static INVOCATIONS: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn count_calls(_ptr: *const u8, _len: i64) -> i64 {
+            INVOCATIONS.fetch_add(1, Ordering::SeqCst);
+            5
+        }
+        let func = make_func(
+            count_calls as *const c_void,
+            Signature::new(vec![CType::VoidPtr, CType::I64], CType::I64),
+        );
+        let mut a = crate::ffi::handles::ForeignBufferRegistry::new();
+        let mut b = crate::ffi::handles::ForeignBufferRegistry::new();
+        let h = a
+            .register(&[1, 2], crate::ffi::handles::ForeignAccess::ReadOnly)
+            .unwrap();
+        let initial = INVOCATIONS.load(Ordering::SeqCst);
+        // SAFETY: correctly typed function never dereferences or retains its pointer.
+        let cross_domain = unsafe {
+            call_native_bounded_buffer(
+                &func,
+                &mut b,
+                h,
+                0,
+                1,
+                crate::ffi::handles::ForeignAccess::ReadOnly,
+            )
+        };
+        assert!(cross_domain.is_err());
+        for (offset, len, access) in [
+            (usize::MAX, 1, crate::ffi::handles::ForeignAccess::ReadOnly),
+            (0, 3, crate::ffi::handles::ForeignAccess::ReadOnly),
+            (0, 1, crate::ffi::handles::ForeignAccess::ReadWrite),
+        ] {
+            let r = unsafe { call_native_bounded_buffer(&func, &mut a, h, offset, len, access) };
+            assert!(r.is_err(), "invalid buffer admission must fail closed");
+        }
+        a.release(h).unwrap();
+        // SAFETY: stale handle is rejected before the trusted callback.
+        assert!(unsafe {
+            call_native_bounded_buffer(
+                &func,
+                &mut a,
+                h,
+                0,
+                1,
+                crate::ffi::handles::ForeignAccess::ReadOnly,
+            )
+        }
+        .is_err());
+        assert_eq!(INVOCATIONS.load(Ordering::SeqCst), initial);
+    }
+
+    #[cfg(feature = "ffi")]
+    #[test]
+    fn bounded_native_call_canonicalizes_adversarial_nan_tag_bits() {
+        extern "C" fn tagged_nan(_ptr: *const u8, _len: i64) -> f64 {
+            f64::from_bits(crate::value_layout::TAG_PTR | 0x1234)
+        }
+        let func = make_func(
+            tagged_nan as *const c_void,
+            Signature::new(vec![CType::VoidPtr, CType::I64], CType::F64),
+        );
+        let mut buffers = crate::ffi::handles::ForeignBufferRegistry::new();
+        let h = buffers
+            .register(&[1], crate::ffi::handles::ForeignAccess::ReadOnly)
+            .unwrap();
+        // SAFETY: the trusted native function has the declared ABI and
+        // ignores the pointer rather than retaining or dereferencing it.
+        let value = unsafe {
+            call_native_bounded_buffer(
+                &func,
+                &mut buffers,
+                h,
+                0,
+                1,
+                crate::ffi::handles::ForeignAccess::ReadOnly,
+            )
+        }
+        .unwrap();
+        assert!(value.as_float().unwrap().is_nan());
+        assert!(!value.is_ptr());
+    }
+
+    #[cfg(feature = "ffi")]
+    #[test]
+    fn bounded_native_call_rejects_pointer_returns_and_wrong_signatures() {
+        let mut buffers = crate::ffi::handles::ForeignBufferRegistry::new();
+        let h = buffers
+            .register(&[1], crate::ffi::handles::ForeignAccess::ReadWrite)
+            .unwrap();
+        for ret in [CType::VoidPtr, CType::CStr, CType::Value] {
+            let invalid = make_func(
+                std::ptr::null(),
+                Signature::new(vec![CType::VoidPtr, CType::I64], ret),
+            );
+            // SAFETY: signature validation rejects before using the null ptr.
+            let err = unsafe {
+                call_native_bounded_buffer(
+                    &invalid,
+                    &mut buffers,
+                    h,
+                    0,
+                    1,
+                    crate::ffi::handles::ForeignAccess::ReadOnly,
+                )
+            }
+            .unwrap_err();
+            assert!(err.contains("non-pointer return"));
+        }
+        let invalid = make_func(
+            std::ptr::null(),
+            Signature::new(vec![CType::I64, CType::VoidPtr], CType::I64),
+        );
+        // SAFETY: signature validation rejects before using the null ptr.
+        assert!(unsafe {
+            call_native_bounded_buffer(
+                &invalid,
+                &mut buffers,
+                h,
+                0,
+                1,
+                crate::ffi::handles::ForeignAccess::ReadOnly,
+            )
+        }
+        .is_err());
     }
 
     #[test]
