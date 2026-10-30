@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Terminal effect-continuation disposal (draft, 2026-10-30)
+- Terminal bytecode execution releases abandoned algebraic-effect handler frames, including the captured continuations they own. A fresh independent VM invocation starts without inheriting handlers from a previous execution.
+- True suspension (`NuError::Suspended`) and cooperative JIT yields preserve handler state for later `resume`; tests cover abort, error, and suspension state transfer.
+- **Scope limit:** dropping a continuation's VM snapshot is not a user-level resource finalizer. This change does not execute `defer` on cancellation, prove close-once behavior for external resources, or add durable crash recovery. Full suite and hosted exact-head CI remain merge gates.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
