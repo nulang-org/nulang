@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Scope-exit value preservation and fail-closed errdefer — 2026-10-30
+- **Normal block results and explicit return/break expressions are evaluated and captured before scope defers run.** A cleanup action mutating a local can no longer silently change an already-selected return value; both paths use a single HIR temporary and existing `Use` lowering.
+- **`errdefer` now fails at parsing rather than silently behaving like `defer` on a successful exit.** Error-only unwinding is not yet implemented, and the former behavior falsely suggested error-safe resource cleanup. Ordinary `defer` remains available for successful scope exits and explicit returns/breaks.
+- **Not a general cancellation-finalization guarantee.** Abortive effect handlers, runtime errors, task cancellation, and crash recovery still require a separate unwind/replay contract. Source-level cross-backend tests and exact-head hosted CI remain promotion gates.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.

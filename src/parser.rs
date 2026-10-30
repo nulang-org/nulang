@@ -5372,7 +5372,17 @@ impl Parser {
 
     fn parse_defer_expr(&mut self, error_only: bool) -> NuResult<Expr> {
         let span = self.current_span();
-        self.advance(); // consume 'defer' or 'errdefer'
+        if error_only {
+            // The current HIR has no failure-specific unwind edge: treating
+            // errdefer as ordinary defer would run cleanup on success and
+            // silently violate a resource-lifetime guarantee. Fail closed
+            // until error exit, cancellation, and effect abort are modeled.
+            return Err(NuError::parse_error(
+                "errdefer requires error-exit unwinding, which is not yet supported".to_string(),
+                span,
+            ));
+        }
+        self.advance(); // consume 'defer'
         let expr = self.parse_expr()?;
         Ok(Expr::Defer {
             expr: Box::new(expr),
