@@ -12126,11 +12126,31 @@ match { a: 2, b: 9 } with {
         assert_int(source, 42);
     }
 
-    /// errdefer: same as defer (error-only distinction not yet tracked in HIR).
+    /// Normal block results are captured before LIFO scope cleanup.
     #[test]
-    fn test_errdefer_basic() {
-        let source = "{ errdefer 1; 42 }";
-        assert_int(source, 42);
+    fn test_defer_block_value_is_captured_before_cleanup() {
+        assert_int("var x = 1 in { defer x = 2; x }", 1);
+    }
+
+    /// The return expression is evaluated before deferred cleanup runs.
+    /// A deferred mutation must not change the already-computed result.
+    #[test]
+    fn test_defer_return_value_is_captured_before_cleanup() {
+        assert_int("var x = 1 in { defer x = 2; return x }", 1);
+        assert_int("var x = 1 in { defer x = 2; return x + 10 }", 11);
+    }
+
+    /// errdefer must not silently execute on successful exit.
+    /// Until failure-specific unwinding exists, reject this construct
+    /// explicitly rather than treating it like unconditional defer.
+    #[test]
+    fn test_errdefer_rejected_until_error_exit_semantics_exist() {
+        let error = run_source("{ errdefer 1; 42 }")
+            .expect_err("errdefer must not silently run as ordinary defer");
+        assert!(
+            format!("{error}").contains("errdefer requires error-exit unwinding"),
+            "unexpected error: {error}"
+        );
     }
 
     /// Defer with break: defers run on break path.
