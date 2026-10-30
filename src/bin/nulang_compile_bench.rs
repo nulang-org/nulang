@@ -130,8 +130,7 @@ fn measure(source: &str) -> Result<Timings, String> {
     times.hir_ns = started.elapsed().as_nanos();
 
     let started = Instant::now();
-    let mut mir = nulang::mir_lower::lower_module(&hir)
-        .map_err(|err| format!("MIR: {err}"))?;
+    let mut mir = nulang::mir_lower::lower_module(&hir).map_err(|err| format!("MIR: {err}"))?;
     times.mir_ns = started.elapsed().as_nanos();
 
     let started = Instant::now();
@@ -312,16 +311,27 @@ mod tests {
         assert_eq!(record["backend"], "bytecode");
         assert_eq!(record["source_bytes"], 2);
         for stage in [
-            "lex", "parse", "typecheck", "effectcheck", "capability", "hir", "mir",
+            "lex",
+            "parse",
+            "typecheck",
+            "effectcheck",
+            "capability",
+            "hir",
+            "mir",
             "bytecode",
         ] {
-            assert!(record["stages_ns"][stage].is_number(), "missing stage {stage}");
+            assert!(
+                record["stages_ns"][stage].is_number(),
+                "missing stage {stage}"
+            );
         }
     }
 
     #[test]
     fn rejects_invalid_workloads_and_zero_repetitions() {
-        let workload_args = ["--workload", "not-a-workload"].into_iter().map(str::to_string);
+        let workload_args = ["--workload", "not-a-workload"]
+            .into_iter()
+            .map(str::to_string);
         let repeat_args = ["--repeat", "0"].into_iter().map(str::to_string);
         assert!(parse_args(workload_args).is_err());
         assert!(parse_args(repeat_args).is_err());
