@@ -19,13 +19,16 @@
 //! The optional `otel` feature can bridge those fields into real OTLP spans
 //! via `tracing-opentelemetry`.
 
+use rand_core::RngCore;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 /// Thread-safe stateless PRNG for trace / span id generation.
 ///
-/// A monotonically incremented counter fed through splitmix64. Deterministic
-/// seeding is fine here — trace ids are correlation keys, not a security
-/// boundary, and this avoids pulling in `rand`/`getrandom`.
+/// A monotonically incremented counter fed through splitmix64. Unlike a
+/// fixed process seed, an OS-randomized seed prevents independent nodes from
+/// producing identical trace-ID sequences. IDs are correlation keys, not
+/// security tokens. The OS entropy is acquired once per process.
 struct Rng {
     state: AtomicU64,
 }
@@ -41,13 +44,23 @@ impl Rng {
     }
 }
 
-static RNG: Rng = Rng {
-    state: AtomicU64::new(0x4D59_5DF4_D0F3_3173),
-};
+static RNG: OnceLock<Rng> = OnceLock::new();
+
+fn rng() -> &'static Rng {
+    RNG.get_or_init(|| {
+        let mut seed = [0u8; 8];
+        rand_core::OsRng
+            .try_fill_bytes(&mut seed)
+            .expect("W3C trace ID generation requires platform entropy");
+        Rng {
+            state: AtomicU64::new(u64::from_le_bytes(seed)),
+        }
+    })
+}
 
 fn nonzero_u64() -> u64 {
     loop {
-        let v = RNG.next_u64();
+        let v = rng().next_u64();
         if v != 0 {
             return v;
         }
@@ -56,7 +69,7 @@ fn nonzero_u64() -> u64 {
 
 fn nonzero_u128() -> u128 {
     let hi = nonzero_u64();
-    let lo = RNG.next_u64();
+    let lo = rng().next_u64();
     let v = ((hi as u128) << 64) | lo as u128;
     if v == 0 {
         1
@@ -102,28 +115,19 @@ impl TraceContext {
     /// obtain this side's own span under it. Returns `None` on malformed
     /// input, non-zero-length version, or a zero trace/span id.
     pub fn from_traceparent(s: &str) -> Option<Self> {
-        let mut parts = s.split('-');
-        let version = parts.next()?;
-        let trace = parts.next()?;
-        let span = parts.next()?;
-        let flags = parts.next()?;
-        if parts.next().is_some() {
-            return None; // too many fields
-        }
-        if version.len() != 2 || trace.len() != 32 || span.len() != 16 || flags.len() != 2 {
+        // A version-00 traceparent is always exactly 55 ASCII bytes. Validate
+        // before indexing; byte slices reject malformed UTF-8 boundaries safely.
+        let bytes = s.as_bytes();
+        if bytes.len() != 55 || &bytes[..3] != b"00-" || bytes[35] != b'-' || bytes[52] != b'-' {
             return None;
         }
-        let mut version_buf = [0u8; 1];
-        hex::decode_to_slice(version, &mut version_buf).ok()?;
-        if version_buf[0] != 0 {
-            return None; // only version 00 is understood
-        }
+
         let mut trace_buf = [0u8; 16];
-        hex::decode_to_slice(trace, &mut trace_buf).ok()?;
+        hex::decode_to_slice(&bytes[3..35], &mut trace_buf).ok()?;
         let mut span_buf = [0u8; 8];
-        hex::decode_to_slice(span, &mut span_buf).ok()?;
+        hex::decode_to_slice(&bytes[36..52], &mut span_buf).ok()?;
         let mut flags_buf = [0u8; 1];
-        hex::decode_to_slice(flags, &mut flags_buf).ok()?;
+        hex::decode_to_slice(&bytes[53..55], &mut flags_buf).ok()?;
         let trace_id = u128::from_be_bytes(trace_buf);
         let span_id = u64::from_be_bytes(span_buf);
         if trace_id == 0 || span_id == 0 {
@@ -139,8 +143,18 @@ impl TraceContext {
 
     /// Encode as a W3C `traceparent` string.
     pub fn to_traceparent(&self) -> String {
-        let flags = if self.sampled { "01" } else { "00" };
-        format!("00-{:032x}-{:016x}-{flags}", self.trace_id, self.span_id)
+        // Encode into a fixed-size ASCII buffer rather than the generic
+        // formatting machinery. The final String makes one allocation.
+        let mut out = [0u8; 55];
+        out[..3].copy_from_slice(b"00-");
+        hex::encode_to_slice(self.trace_id.to_be_bytes(), &mut out[3..35])
+            .expect("fixed-length trace ID buffer");
+        out[35] = b'-';
+        hex::encode_to_slice(self.span_id.to_be_bytes(), &mut out[36..52])
+            .expect("fixed-length span ID buffer");
+        out[52] = b'-';
+        out[53..55].copy_from_slice(if self.sampled { b"01" } else { b"00" });
+        String::from_utf8(out.to_vec()).expect("hex output is always ASCII")
     }
 
     pub fn trace_id(&self) -> u128 {
@@ -261,5 +275,53 @@ mod tests {
         assert_ne!(a.trace_id(), 0);
         assert_ne!(a.span_id(), 0);
         assert_ne!(a.trace_id(), b.trace_id());
+    }
+
+    #[test]
+    fn test_traceparent_codec_preserves_case_and_leading_zeros() {
+        let upper = "00-00000000000000000000000000ABCDEF-000000000000000A-01";
+        let parsed = TraceContext::from_traceparent(upper).expect("uppercase hex accepted");
+        assert_eq!(parsed.trace_id(), 0xABCDEF);
+        assert_eq!(parsed.span_id(), 0xA);
+        assert!(parsed.sampled());
+        assert_eq!(
+            parsed.to_traceparent(),
+            "00-00000000000000000000000000abcdef-000000000000000a-01"
+        );
+
+        let unsampled = "00-00000000000000000000000000abcdef-000000000000000a-00";
+        let parsed = TraceContext::from_traceparent(unsampled).expect("unsampled accepted");
+        assert!(!parsed.sampled());
+        assert_eq!(parsed.to_traceparent(), unsampled);
+    }
+
+    #[test]
+    fn test_traceparent_codec_rejects_invalid_hex_and_delimiters() {
+        let good = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        assert_eq!(good.len(), 55);
+        for pos in [2usize, 35, 52] {
+            let mut invalid = good.as_bytes().to_vec();
+            invalid[pos] = b':';
+            assert!(
+                TraceContext::from_traceparent(std::str::from_utf8(&invalid).unwrap()).is_none(),
+                "bad delimiter at {pos}"
+            );
+        }
+        for pos in [3usize, 34, 36, 51, 53, 54] {
+            let mut invalid = good.as_bytes().to_vec();
+            invalid[pos] = b'z';
+            assert!(
+                TraceContext::from_traceparent(std::str::from_utf8(&invalid).unwrap()).is_none(),
+                "bad hex at {pos}"
+            );
+        }
+        assert!(TraceContext::from_traceparent(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01x"
+        )
+        .is_none());
+        assert!(TraceContext::from_traceparent(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01"
+        )
+        .is_none());
     }
 }
