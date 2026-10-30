@@ -255,3 +255,8 @@ harness = false
 [[bench]]
 name = "trace_profile"
 harness = false
+
+# Opt-in actor trace dispatch diagnostic; setup and teardown are not timed.
+[[bench]]
+name = "trace_actor_profile"
+harness = false
