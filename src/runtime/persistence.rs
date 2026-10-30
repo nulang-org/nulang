@@ -1290,10 +1290,6 @@ struct SqliteRow {
 
 #[cfg(feature = "sqlite")]
 impl SqliteRow {
-    fn column_count(&self) -> usize {
-        self.values.len()
-    }
-
     fn get<T: rusqlite::types::FromSql>(&self, index: usize) -> rusqlite::Result<T> {
         let value = self
             .values
@@ -1302,13 +1298,6 @@ impl SqliteRow {
         T::column_result(rusqlite::types::ValueRef::from(value)).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(index, value.data_type(), Box::new(err))
         })
-    }
-
-    fn get_value(&self, index: usize) -> rusqlite::Result<rusqlite::types::Value> {
-        self.values
-            .get(index)
-            .cloned()
-            .ok_or(rusqlite::Error::InvalidColumnIndex(index))
     }
 }
 
