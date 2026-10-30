@@ -849,7 +849,9 @@ impl Runtime {
                         let actor = actors.get(actor_id)?;
                         let depth = actor.mailbox.len();
                         let capacity = actor.mailbox.capacity();
-                        if capacity > 0 && depth >= capacity {
+                        // System signals bypass normal mailbox capacity, and
+                        // must not make an otherwise idle Fabric target ineligible.
+                        if capacity > 0 && actor.mailbox.regular_len() >= capacity {
                             return None;
                         }
                         Some(FabricPlacementScore {
@@ -1179,6 +1181,37 @@ mod tests {
             .unwrap();
         assert_eq!(saturated.selected, 0);
         assert_eq!(saturated.admitted, 0);
+    }
+
+    #[test]
+    fn fabric_routing_ignores_system_messages_for_regular_admission() {
+        let mut rt = Runtime::new();
+        let actor_id = 9001_u64;
+        let mut actor = Actor::new(actor_id, "system-bypass-fabric", 1);
+        actor.state = ActorState::Running;
+        actor.register_behavior("handle", noop);
+        actor
+            .mailbox
+            .push(crate::runtime::Message {
+                behavior_id: 0,
+                payload: crate::runtime::MessagePayload::from_slice(&[]),
+                sender: 0,
+                priority: crate::runtime::MessagePriority::System,
+                trace_id: None,
+            })
+            .unwrap();
+        rt.actors.insert(actor_id, actor);
+        rt.fabric_subscribe("events.*", actor_id, "handle").unwrap();
+
+        let report = rt
+            .fabric_publish_report("events.created", &[Value::int(1)])
+            .unwrap();
+        assert_eq!(
+            report.selected, 1,
+            "system traffic must not fill regular capacity"
+        );
+        assert_eq!(report.admitted, 1);
+        assert_eq!(rt.actors.get(&actor_id).unwrap().mailbox.len(), 2);
     }
 
     #[test]

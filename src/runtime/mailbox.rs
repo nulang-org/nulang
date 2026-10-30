@@ -8,9 +8,11 @@
 //!
 //! Concurrent producers use the lock-free `SegQueue`s through `push(&self)`.
 //! Scheduler-local traffic uses a plain `VecDeque` through methods requiring
-//! `&mut self`. A single atomic logical-message count makes capacity
-//! reservation race-safe without exposing scheduler-owned collections through
-//! interior mutability.
+//! `&mut self`. A total logical-message counter and a bounded-traffic
+//! admission counter avoid exposing scheduler-owned collections through
+//! interior mutability. Unbounded mailboxes retain a single-atomic hot path.
+//! Only Normal/Bulk traffic counts against capacity; System traffic is tracked
+//! in the total logical depth but never consumes regular admission slots.
 
 use crate::vm::Value;
 use crossbeam::queue::SegQueue;
@@ -274,6 +276,8 @@ pub struct Mailbox {
     local_queue: VecDeque<Message>,
     capacity: usize,
     queued_count: AtomicUsize,
+    /// Non-system messages reserved against the configured capacity.
+    regular_count: AtomicUsize,
     /// System messages already observed by a selective receive. They remain
     /// logically queued until a successful pattern+guard commits exactly one.
     system_skip_buffer: VecDeque<(Message, bool)>,
@@ -294,7 +298,7 @@ pub struct Mailbox {
 impl Mailbox {
     /// Create a new mailbox.
     ///
-    /// `capacity`: maximum total messages allowed. `0` = unbounded.
+    /// `capacity`: maximum Normal/Bulk messages allowed. `0` = unbounded.
     /// `System` messages always bypass the limit.
     pub fn new(capacity: usize) -> Self {
         Mailbox {
@@ -303,6 +307,7 @@ impl Mailbox {
             local_queue: VecDeque::new(),
             capacity,
             queued_count: AtomicUsize::new(0),
+            regular_count: AtomicUsize::new(0),
             system_skip_buffer: VecDeque::new(),
             local_skip_buffer: VecDeque::new(),
             skip_buffer: VecDeque::new(),
@@ -319,6 +324,8 @@ impl Mailbox {
         self.capacity = capacity;
         self.queued_count
             .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.regular_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         self.system_skip_buffer.clear();
         self.local_skip_buffer.clear();
         self.skip_buffer.clear();
@@ -326,40 +333,45 @@ impl Mailbox {
         self.active_match = None;
     }
 
-    /// Reserve one logical mailbox slot.
+    /// Reserve one logical slot, charging only regular traffic against capacity.
     ///
-    /// System messages and unbounded mailboxes always reserve successfully.
-    /// Bounded normal/bulk traffic uses CAS so concurrent producers cannot all
-    /// observe the same free slot and overfill the mailbox.
+    /// The total count remains the externally visible queue depth. The
+    /// independent regular count is required because supervisor/system traffic
+    /// bypasses limits without reducing ordinary application throughput.
+    /// SegQueue owns message publication; relaxed accounting atomics suffice.
     fn reserve_slot(&self, system: bool) -> bool {
-        // queued_count is capacity/accounting state only; SegQueue owns
-        // publication and synchronization for the message itself. Atomic
-        // modification order is sufficient to keep bounded producers from
-        // over-reserving slots, so acquire/release fences add no ordering
-        // guarantee that the mailbox relies on.
+        // Preserve the single-atomic fast path for unbounded mailboxes,
+        // which are Nulang's default, as well as bypassing System traffic.
         if system || self.capacity == 0 {
             self.queued_count.fetch_add(1, Ordering::Relaxed);
             return true;
         }
 
-        let mut current = self.queued_count.load(Ordering::Relaxed);
+        let mut current = self.regular_count.load(Ordering::Relaxed);
         loop {
             if current >= self.capacity {
                 return false;
             }
-            match self.queued_count.compare_exchange_weak(
+            match self.regular_count.compare_exchange_weak(
                 current,
                 current + 1,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return true,
+                Ok(_) => break,
                 Err(observed) => current = observed,
             }
         }
+
+        self.queued_count.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
-    fn release_slot(&self) {
+    fn release_slot(&self, system: bool) {
+        if !system && self.capacity > 0 {
+            let previous = self.regular_count.fetch_sub(1, Ordering::Relaxed);
+            debug_assert!(previous > 0, "mailbox regular count underflow");
+        }
         let previous = self.queued_count.fetch_sub(1, Ordering::Relaxed);
         debug_assert!(previous > 0, "mailbox logical count underflow");
     }
@@ -402,10 +414,10 @@ impl Mailbox {
             .or_else(|| self.local_queue.pop_front())
             .or_else(|| self.skip_buffer.pop_front().map(|(m, _)| m))
             .or_else(|| self.normal_queue.pop());
-        if result.is_some() {
+        if let Some(message) = result.as_ref() {
             self.active_match = None;
             self.invalidate_receive_indexes();
-            self.release_slot();
+            self.release_slot(message.priority == MessagePriority::System);
         }
         result
     }
@@ -503,6 +515,12 @@ impl Mailbox {
         None
     }
 
+    /// Number of capacity-limited Normal/Bulk messages, including staged receives.
+    /// Returns zero for unbounded mailboxes; System traffic never uses this budget.
+    pub fn regular_len(&self) -> usize {
+        self.regular_count.load(Ordering::Relaxed)
+    }
+
     /// Total logical message count. Safe to query concurrently.
     pub fn len(&self) -> usize {
         self.queued_count.load(Ordering::Relaxed)
@@ -584,12 +602,12 @@ impl Mailbox {
     /// after the pattern+guard succeeds.
     pub fn commit_receive_match(&mut self) -> Option<Arc<Vec<Value>>> {
         let (lane, idx, payload) = self.active_match.take()?;
-        let _removed = match lane {
+        let removed = match lane {
             MatchLane::System => self.system_skip_buffer.remove(idx),
             MatchLane::Local => self.local_skip_buffer.remove(idx),
             MatchLane::Normal => self.skip_buffer.remove(idx),
         }?;
-        self.release_slot();
+        self.release_slot(removed.priority == MessagePriority::System);
         self.invalidate_receive_indexes();
         self.clear_tried_flags();
         Some(payload)
@@ -689,6 +707,61 @@ mod tests {
         let accepted: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
         assert_eq!(accepted, 100);
         assert_eq!(mb.len(), 100);
+    }
+
+    #[test]
+    fn system_traffic_does_not_consume_regular_mailbox_capacity() {
+        let mut mb = Mailbox::new(2);
+        for sender in 0..16 {
+            let mut signal = make_msg(1, sender);
+            signal.priority = MessagePriority::System;
+            mb.push(signal).unwrap();
+        }
+        assert_eq!(mb.len(), 16);
+        assert!(mb.push(make_msg(2, 100)).is_ok());
+        assert!(mb.push_local(make_msg(2, 101)).is_ok());
+        assert!(
+            mb.push(make_msg(2, 102)).is_err(),
+            "only regular traffic uses capacity"
+        );
+        assert_eq!(mb.len(), 18);
+
+        for _ in 0..16 {
+            assert_eq!(mb.pop().unwrap().priority, MessagePriority::System);
+        }
+        assert!(
+            mb.push(make_msg(2, 103)).is_err(),
+            "system drain does not free regular slots"
+        );
+        assert_eq!(mb.pop().unwrap().sender, 101);
+        assert!(
+            mb.push(make_msg(2, 103)).is_ok(),
+            "regular drain frees one slot"
+        );
+    }
+
+    #[test]
+    fn selective_system_commit_does_not_release_regular_capacity() {
+        let mut mb = Mailbox::new(1);
+        mb.push(make_msg(2, 100)).unwrap();
+        let mut signal = make_msg(3, 200);
+        signal.priority = MessagePriority::System;
+        mb.push(signal).unwrap();
+
+        mb.receive_match(&[3]).expect("system candidate");
+        mb.commit_receive_match().expect("system commit");
+        assert_eq!(mb.len(), 1);
+        assert!(
+            mb.push(make_msg(2, 101)).is_err(),
+            "regular slot still occupied"
+        );
+
+        mb.receive_match(&[2]).expect("regular candidate");
+        mb.commit_receive_match().expect("regular commit");
+        assert!(
+            mb.push(make_msg(2, 101)).is_ok(),
+            "regular commit frees slot"
+        );
     }
 
     #[test]
