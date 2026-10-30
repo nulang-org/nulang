@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Secure libSQL remote connector without vulnerable legacy rustls — 2026-10-30
+- Replace libSQL's optional bundled TLS transport with a caller-provided HTTPS-only native TLS connector that validates server certificates using the operating system trust store; preserve remote Turso access and libsql URL compatibility.
+- Reject plaintext HTTP, malformed endpoints, embedded URL credentials, and fragments before network access. Keep local SQLite unaffected.
+- Remove legacy rustls-webpki 0.102.x from the lockfile; add focused URL/SQLite regression tests. This introduces platform TLS linkage for the optional sqlite feature, so Linux images need working OpenSSL/native TLS libraries.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
