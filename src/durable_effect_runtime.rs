@@ -321,6 +321,13 @@ impl<'a> DurableEffectCoordinator<'a> {
             return Ok(recorded.to_vec());
         }
 
+        // A prepared effect may have been written by an earlier activation.
+        // The new owner must claim its epoch durably before it can write a
+        // completion receipt. Otherwise this write would silently fence the
+        // previous owner without an actual recovery/activation transition.
+        // commit_transition still provides the final CAS fence against races.
+        self.require_claimed_activation()?;
+
         let completed = existing.effect().clone().complete(result);
         let durable_result = match &completed {
             DurableEffectRecord::Completed { result, .. } => result.clone(),
@@ -644,6 +651,68 @@ mod tests {
                 if error.kind() == io::ErrorKind::PermissionDenied
         ));
         assert_eq!(store.latest_sequence(42), 1);
+    }
+
+    #[test]
+    fn unclaimed_future_activation_cannot_complete_an_existing_prepared_effect() {
+        let mut store = MemoryStore::new();
+        let prepared = spec(42, "turn:pending-receipt", DeliverySemantics::AtLeastOnce);
+        {
+            let mut first = DurableEffectCoordinator::new(&mut store, 42, 1);
+            first.begin(prepared.clone(), b"request").unwrap();
+        }
+
+        // Epoch 2 has not claimed durable ownership. A late provider receipt
+        // must not implicitly allow this coordinator to fence epoch 1.
+        let mut unclaimed = DurableEffectCoordinator::new(&mut store, 42, 2);
+        assert!(matches!(
+            unclaimed.complete(prepared.id, b"request", b"receipt".to_vec()),
+            Err(DurableEffectRuntimeError::Storage(ref error))
+                if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(store.latest_sequence(42), 1);
+        assert!(matches!(
+            store
+                .load_durable_effect(42, prepared.id)
+                .unwrap()
+                .unwrap()
+                .effect(),
+            DurableEffectRecord::Prepared { .. }
+        ));
+    }
+
+    #[test]
+    fn claimed_future_activation_can_complete_a_prepared_effect() {
+        let mut store = MemoryStore::new();
+        let prepared = spec(42, "turn:pending-receipt", DeliverySemantics::AtLeastOnce);
+        {
+            let mut first = DurableEffectCoordinator::new(&mut store, 42, 1);
+            first.begin(prepared.clone(), b"request").unwrap();
+        }
+        {
+            let mut current = DurableEffectCoordinator::new(&mut store, 42, 2);
+            current
+                .begin(
+                    spec(42, "turn:claim", DeliverySemantics::AtLeastOnce),
+                    b"claim",
+                )
+                .unwrap();
+            assert_eq!(
+                current
+                    .complete(prepared.id, b"request", b"receipt".to_vec())
+                    .unwrap(),
+                b"receipt"
+            );
+        }
+        assert_eq!(store.latest_sequence(42), 3);
+        assert!(matches!(
+            store
+                .load_durable_effect(42, prepared.id)
+                .unwrap()
+                .unwrap()
+                .effect(),
+            DurableEffectRecord::Completed { .. }
+        ));
     }
 
     #[test]
