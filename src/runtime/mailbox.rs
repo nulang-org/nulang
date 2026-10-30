@@ -607,7 +607,7 @@ impl Mailbox {
             MatchLane::Local => self.local_skip_buffer.remove(idx),
             MatchLane::Normal => self.skip_buffer.remove(idx),
         }?;
-        self.release_slot(removed.priority == MessagePriority::System);
+        self.release_slot(removed.0.priority == MessagePriority::System);
         self.invalidate_receive_indexes();
         self.clear_tried_flags();
         Some(payload)
