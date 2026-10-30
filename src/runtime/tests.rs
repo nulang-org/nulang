@@ -581,6 +581,44 @@ fn test_lifo_handoff_slot_does_not_preempt_queued_high_priority() {
 }
 
 #[test]
+fn test_fair_scheduler_drains_handoff_without_starving_normal_actor() {
+    let mut rt = Runtime::new();
+    let high = rt.spawn_actor(Box::new(|| vec![]));
+    let normal = rt.spawn_actor(Box::new(|| vec![]));
+
+    for _ in 0..2 {
+        let id = rt.claim_next_ready_actor().expect("spawned actor");
+        rt.finish_actor_turn(id);
+    }
+    assert_eq!(
+        rt.perform_actor_builtin(Some(high), Some("set_priority"), &[], &[Value::int(0)]),
+        Some(Value::nil())
+    );
+    rt.scheduler.set_fair_scheduling(true);
+
+    rt.enqueue_actor_handoff(normal);
+    rt.enqueue_actor(high);
+    let mut normal_seen = false;
+    for _ in 0..13 {
+        let id = rt.claim_next_ready_actor().expect("runnable actor");
+        rt.finish_actor_turn(id);
+        if id == normal {
+            normal_seen = true;
+            break;
+        }
+        rt.enqueue_actor(high);
+    }
+    assert!(
+        normal_seen,
+        "a Normal handoff must not starve behind a repeatedly runnable High actor"
+    );
+    assert!(
+        rt.next_run_slot.is_none(),
+        "handoff must enter the fair queue"
+    );
+}
+
+#[test]
 fn test_anonymous_actor_accepts_untyped_mailbox_delivery_without_handler_alias() {
     let mut rt = Runtime::new();
     let actor_id = rt.spawn_actor(Box::new(|| vec![]));

@@ -102,8 +102,16 @@ can place a notification in its dead-letter mailbox, but that notification does
 Do not promise lossless, exactly-once, or durable remote delivery without an
 application-level acknowledgment, retry, and idempotency protocol.
 
-Strict High > Normal > Low scheduler priority is implemented, but sustained
-higher-priority traffic can starve lower-priority actors.
+Strict High > Normal > Low scheduler priority remains the default. Embedders
+may opt into weighted-fair owner-thread dispatch with
+`runtime.scheduler.set_fair_scheduling(true)` before executing actor turns:
+when every band stays busy, High/Normal/Low receive 8/4/1 dequeue slots per
+13 successful dispatches. Empty bands are skipped. Fair mode also routes parked
+LIFO handoffs into the priority queues so they cannot bypass the fairness budget.
+The generic `next_task` / `steal_one` paths remain strict-priority. Fair
+scheduling limits queue-level starvation only: long-running actor behaviors
+still need cooperative yielding or JIT safepoints, and mailbox admission and
+distributed-delivery guarantees are unchanged.
 
 ## Durability and persistence
 
