@@ -46,23 +46,31 @@ pub(crate) struct RegionPlanner {
 }
 
 impl RegionPlanner {
-    pub(crate) fn plan(&mut self, module_idx: usize, pc: usize, module: &CodeModule) -> RegionPlan {
-        if !self.may_suspend.contains_key(&module_idx) {
-            self.may_suspend
-                .insert(module_idx, compute_may_suspend(module));
-        }
-        if !self.recursive.contains_key(&module_idx) {
-            self.recursive.insert(module_idx, compute_recursive(module));
-        }
+    pub(crate) fn call_safety(
+        &mut self,
+        module_idx: usize,
+        module: &CodeModule,
+    ) -> (&[bool], &[bool]) {
+        self.may_suspend
+            .entry(module_idx)
+            .or_insert_with(|| compute_may_suspend(module));
+        self.recursive
+            .entry(module_idx)
+            .or_insert_with(|| compute_recursive(module));
+        (
+            self.may_suspend[&module_idx].as_slice(),
+            self.recursive[&module_idx].as_slice(),
+        )
+    }
 
-        let may_suspend = self.may_suspend.get(&module_idx).map(Vec::as_slice);
-        let recursive = self.recursive.get(&module_idx).map(Vec::as_slice);
+    pub(crate) fn plan(&mut self, module_idx: usize, pc: usize, module: &CodeModule) -> RegionPlan {
+        let (may_suspend, recursive) = self.call_safety(module_idx, module);
         let (len, native_calls) = find_compilable_region_with_calls(
             pc,
             &module.instructions,
             module,
-            may_suspend,
-            recursive,
+            Some(may_suspend),
+            Some(recursive),
         );
 
         RegionPlan {
@@ -509,17 +517,21 @@ pub(crate) fn native_direct_call(
 /// other VM state. `required_args` is the highest read-before-write register
 /// plus one; the runtime fast path uses it to reject a call site whose staged
 /// argument count would leave a callee input uninitialized.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeLeafPlan {
     pub(crate) start: usize,
     pub(crate) len: usize,
     pub(crate) return_reg: u8,
     pub(crate) required_args: usize,
+    /// Absolute bytecode PC to proven acyclic, non-suspending callee index.
+    pub(crate) native_calls: HashMap<usize, usize>,
 }
 
 pub(crate) fn native_leaf_plan(
     module: &crate::bytecode::CodeModule,
     func_idx: usize,
+    may_suspend: &[bool],
+    recursive: &[bool],
 ) -> Option<NativeLeafPlan> {
     use crate::bytecode::OpCode;
 
@@ -546,8 +558,9 @@ pub(crate) fn native_leaf_plan(
 
     let mut written = [false; 256];
     let mut required_args = 0usize;
+    let mut native_calls = HashMap::new();
 
-    for instr in &module.instructions[start..body_end] {
+    for (offset, instr) in module.instructions[start..body_end].iter().enumerate() {
         let mut note_read = |reg: u8| {
             let idx = reg as usize;
             if !written[idx] {
@@ -555,6 +568,21 @@ pub(crate) fn native_leaf_plan(
             }
         };
         match instr.opcode {
+            // Acyclic direct calls may remain in native code when all their
+            // dependencies can themselves be compiled as native leaves.
+            // The session verifies that dependency graph before installation.
+            OpCode::Call => {
+                let pc = start + offset;
+                let callee = native_direct_call(module, pc, Some(may_suspend), Some(recursive))?;
+                if callee == func_idx {
+                    return None;
+                }
+                for reg in 0..instr.op2 {
+                    note_read(reg);
+                }
+                written[instr.op3 as usize] = true;
+                native_calls.insert(pc, callee);
+            }
             OpCode::Nop => {}
             OpCode::Const0 | OpCode::Const1 | OpCode::Const2 | OpCode::ConstM1 => {
                 written[instr.op1 as usize] = true;
@@ -621,6 +649,7 @@ pub(crate) fn native_leaf_plan(
         len: body_end - start,
         return_reg,
         required_args,
+        native_calls,
     })
 }
 
