@@ -715,6 +715,129 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn libsql_unclaimed_activation_cannot_implicitly_claim_on_receipt_completion() {
+        use crate::runtime::{DurableTailPosition, LibsqlStore};
+
+        let mut store = LibsqlStore::in_memory().unwrap();
+        let prepared = spec(42, "libsql:prepared", DeliverySemantics::AtLeastOnce);
+        DurableEffectCoordinator::new(&mut store, 42, 1)
+            .begin(prepared.clone(), b"charge")
+            .unwrap();
+
+        let error = DurableEffectCoordinator::new(&mut store, 42, 2)
+            .complete(prepared.id, b"charge", b"provider-receipt".to_vec())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DurableEffectRuntimeError::Storage(ref source)
+                if source.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(store.latest_sequence(42), 1);
+        assert_eq!(
+            store.load_durable_tail_position(42).unwrap(),
+            Some(DurableTailPosition {
+                activation_epoch: 1,
+                sequence: 1,
+            })
+        );
+        assert!(matches!(
+            store
+                .load_durable_effect(42, prepared.id)
+                .unwrap()
+                .unwrap()
+                .effect(),
+            DurableEffectRecord::Prepared { .. }
+        ));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn libsql_recovered_effect_receipt_survives_reopen_after_claimed_activation() {
+        use crate::runtime::{DurableTailPosition, LibsqlStore};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "nulang_receipt_activation_fence_{}_{}.db",
+            std::process::id(),
+            stamp
+        ));
+        let prepared = spec(42, "libsql:restart", DeliverySemantics::AtLeastOnce);
+
+        {
+            let mut store = LibsqlStore::new(&path).unwrap();
+            DurableEffectCoordinator::new(&mut store, 42, 1)
+                .begin(prepared.clone(), b"request")
+                .unwrap();
+            // A crashed owner left a Prepared intent on disk, not a receipt.
+        }
+        {
+            let mut store = LibsqlStore::new(&path).unwrap();
+            assert!(matches!(
+                store
+                    .load_durable_effect(42, prepared.id)
+                    .unwrap()
+                    .unwrap()
+                    .effect(),
+                DurableEffectRecord::Prepared { .. }
+            ));
+            let error = DurableEffectCoordinator::new(&mut store, 42, 2)
+                .complete(prepared.id, b"request", b"receipt".to_vec())
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                DurableEffectRuntimeError::Storage(ref source)
+                    if source.kind() == io::ErrorKind::PermissionDenied
+            ));
+            assert_eq!(store.latest_sequence(42), 1);
+
+            let mut current = DurableEffectCoordinator::new(&mut store, 42, 2);
+            current
+                .begin(
+                    spec(42, "libsql:ownership-claim", DeliverySemantics::AtLeastOnce),
+                    b"claim",
+                )
+                .unwrap();
+            assert_eq!(
+                current
+                    .complete(prepared.id, b"request", b"receipt".to_vec())
+                    .unwrap(),
+                b"receipt"
+            );
+            assert_eq!(store.latest_sequence(42), 3);
+        }
+        {
+            let mut store = LibsqlStore::new(&path).unwrap();
+            assert_eq!(
+                store.load_durable_tail_position(42).unwrap(),
+                Some(DurableTailPosition {
+                    activation_epoch: 2,
+                    sequence: 3,
+                })
+            );
+            let mut old = DurableEffectCoordinator::new(&mut store, 42, 1);
+            assert_eq!(
+                old.begin(prepared.clone(), b"request").unwrap(),
+                DurableEffectDispatchDecision::ReplayRecordedResult(b"receipt".to_vec())
+            );
+            assert_eq!(
+                old.complete(prepared.id, b"request", b"late-different-result".to_vec())
+                    .unwrap(),
+                b"receipt"
+            );
+            assert_eq!(store.latest_sequence(42), 3);
+        }
+
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
     #[test]
     fn completed_result_can_be_read_without_dispatch_from_old_epoch() {
         let mut store = MemoryStore::new();
