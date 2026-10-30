@@ -170,6 +170,36 @@ pub(crate) fn enable_distribution_with_transport(
     Ok(())
 }
 
+/// Tell a Joining seed our authoritative listening address on the first
+/// heartbeat connection, before regular fanout can relay its ephemeral TCP
+/// source port as our node's address. This reuses existing NUL0 Gossip
+/// semantics and avoids a new handshake or heartbeat wire field.
+fn bootstrap_join_self_advertisement(
+    cluster: &ClusterState,
+    seed: NodeId,
+    local: NodeId,
+) -> Option<Packet> {
+    if cluster.get_node(seed)?.status != crate::runtime::NodeStatus::Joining {
+        return None;
+    }
+    let self_info = cluster.get_node(local)?;
+    let incarnation = self_info
+        .metadata
+        .get("_incarnation")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    Some(Packet::Gossip {
+        members: vec![crate::runtime::NodeGossip {
+            node_id: local,
+            address: self_info.address,
+            status: self_info.status,
+            incarnation,
+        }],
+        directory: vec![],
+        fabric: None,
+    })
+}
+
 /// Join a cluster by connecting to a seed node.
 pub(crate) fn join_cluster(rt: &mut Runtime, seed_addr: std::net::SocketAddr) {
     if let Some(cluster) = &mut rt.distributed.cluster {
@@ -294,13 +324,22 @@ pub(crate) fn process_network(rt: &mut Runtime) {
         match action {
             ClusterAction::SendHeartbeat { to, addr } => {
                 let timestamp = heartbeat_timestamp(rt);
+                let local_id = rt.distributed.node_id.unwrap_or(NodeId::LOCAL);
+                let self_advertisement = rt.distributed.cluster.as_ref().and_then(|cluster| {
+                    bootstrap_join_self_advertisement(cluster, NodeId(to.0), local_id)
+                });
                 if let Some(transport) = &mut rt.distributed.transport {
-                    let local_id = rt.distributed.node_id.unwrap_or(NodeId::LOCAL);
                     let packet = Packet::Heartbeat {
                         node_id: local_id,
                         timestamp,
                     };
                     transport.send(NodeId(to.0), addr, packet);
+                    // The seed initially sees this TCP connection's source
+                    // port. Give it our real listener via a sender-authored
+                    // self-entry on the same ordered connection.
+                    if let Some(advertisement) = self_advertisement {
+                        transport.send(NodeId(to.0), addr, advertisement);
+                    }
                 }
             }
             ClusterAction::NodeJoined { node, addr } => {
@@ -634,6 +673,47 @@ pub(crate) fn sync_crdts(rt: &mut Runtime) {
 /// True when the given 1-based sync round should ship full state.
 pub(crate) fn crdt_sync_is_full_round(round: u64) -> bool {
     round % crate::runtime::CRDT_FULL_SYNC_INTERVAL == 1
+}
+
+#[cfg(test)]
+mod join_bootstrap_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    #[test]
+    fn joining_seed_receives_authoritative_self_address_before_regular_gossip() {
+        let local_addr = addr(19011);
+        let seed_addr = addr(19012);
+        let local = NodeId::new(&local_addr);
+        let seed = NodeId::new(&seed_addr);
+        let mut cluster = ClusterState::new(local, local_addr);
+        cluster.join_cluster(seed_addr);
+
+        let packet = bootstrap_join_self_advertisement(&cluster, seed, local)
+            .expect("Joining seed must be told our listening address");
+        match packet {
+            Packet::Gossip {
+                members,
+                directory,
+                fabric,
+            } => {
+                assert_eq!(members.len(), 1);
+                assert_eq!(members[0].node_id, local);
+                assert_eq!(members[0].address, local_addr);
+                assert!(directory.is_empty());
+                assert!(fabric.is_none());
+            }
+            _ => panic!("expected self-advertisement gossip"),
+        }
+
+        // Once the seed is Healthy, periodic gossip covers address repair.
+        cluster.handle_heartbeat(seed, seed_addr);
+        assert!(bootstrap_join_self_advertisement(&cluster, seed, local).is_none());
+    }
 }
 
 #[cfg(test)]
