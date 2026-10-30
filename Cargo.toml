@@ -177,7 +177,7 @@ wasm-encoder = { version = "0.220", optional = true }
 # Borsh serialization for the WASM component boundary (optional, see [features])
 borsh = { version = "1.5", optional = true, features = ["derive"] }
 # WASM runtime using Wasmtime (optional, see [features])
-wasmtime = { version = "48.0.7", optional = true, default-features = false, features = ["cranelift", "runtime", "std", "anyhow", "component-model", "wat"] }
+wasmtime = { version = "48.0.8", optional = true, default-features = false, features = ["cranelift", "runtime", "std", "anyhow", "component-model", "wat"] }
 wat = { version = "1.254", optional = true }
 blake3 = "1.8"
 rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "ring", "logging"] }
@@ -251,4 +251,14 @@ rcgen = "0.14"
 
 [[bench]]
 name = "bench_main"
+harness = false
+
+# Opt-in diagnostic probes; excluded from the rolling Criterion history.
+[[bench]]
+name = "trace_profile"
+harness = false
+
+# Opt-in actor trace dispatch diagnostic; setup and teardown are not timed.
+[[bench]]
+name = "trace_actor_profile"
 harness = false
