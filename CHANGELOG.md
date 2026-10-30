@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Experimental generational foreign-memory handles — 2026-10-30
+- Added an opt-in, std-only `ffi::handles::ForeignBufferRegistry` with private, registry-scoped generational handles, fixed-size owned buffers, checked offsets and lengths, read-only/read-write permissions, and deterministic invalidation after release and slot reuse.
+- Safe access uses borrowed slices; raw native pointers require explicit unsafe scoped leases with a non-retention contract. Untrusted native libraries still require out-of-process isolation, and the existing `CType::VoidPtr` ABI is unchanged.
+- Nine focused regressions cover bounds arithmetic, permission checks, stale and cross-registry references, zero-initialization, and scoped calls into C ABI functions. No core syntax, pointer-tag representation, dependencies, or stable capability-lattice changes.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
