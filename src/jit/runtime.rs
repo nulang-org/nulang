@@ -2166,6 +2166,19 @@ pub unsafe extern "C" fn nulang_aot_receive_pop() -> u64 {
 mod tests {
 
     #[test]
+    fn foreign_voidptr_is_not_a_managed_heap_string() {
+        // Valid borrowed C pointer, intentionally not allocated by ActorHeap.
+        // Using an unaligned payload address exposes unsound header_of calls.
+        let mut foreign = [0u8; 128];
+        let ptr = unsafe { foreign.as_mut_ptr().add(1) } as *mut std::ffi::c_void;
+        let result = crate::ffi::marshal::voidptr_to_value(ptr);
+        // A foreign pointer may be carried by the FFI API, but must not be
+        // interpreted as an ActorHeap object or dereferenced as a header.
+        assert!(!super::raw_is_string(result.as_raw()));
+        assert_eq!(super::resolve_string_coerce(result.as_raw()), None);
+    }
+
+    #[test]
     fn test_jit_float_arithmetic_coerces_tagged_values_like_interpreter() {
         use crate::vm::Value;
 

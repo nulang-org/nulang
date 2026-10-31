@@ -71,6 +71,8 @@ pub const TAG_STRING: u64 = 0x7FFE_0000_0000_0000;
 pub const TAG_CLOSURE: u64 = 0x7FF7_0000_0000_0000;
 /// Tag for shared object-store references (immutable `val` buffers).
 pub const TAG_OBJECT: u64 = 0x7FF5_0000_0000_0000;
+/// Opaque foreign C pointer: NOT a VM heap object, never read an OrcaHeader.
+pub const TAG_FOREIGN_PTR: u64 = 0x7FF4_0000_0000_0000;
 
 // ---------------------------------------------------------------------------
 // Integer range
@@ -261,6 +263,7 @@ mod tests {
             TAG_STRING,
             TAG_CLOSURE,
             TAG_OBJECT,
+            TAG_FOREIGN_PTR,
         ];
         for i in 0..tags.len() {
             for j in (i + 1)..tags.len() {
@@ -284,6 +287,7 @@ mod tests {
             (TAG_STRING, "string"),
             (TAG_CLOSURE, "closure"),
             (TAG_OBJECT, "object"),
+            (TAG_FOREIGN_PTR, "foreign_ptr"),
         ];
         let mut seen = std::collections::HashSet::new();
         for &(tag, name) in tags {
@@ -379,6 +383,7 @@ mod tests {
         assert!(!is_float_raw(TAG_NIL));
         assert!(!is_float_raw(TAG_PTR | 0x1000));
         assert!(!is_float_raw(TAG_CLOSURE | 0x10));
+        assert!(!is_float_raw(TAG_FOREIGN_PTR | 0x1000));
         // NaN values (even with upper bits outside the known tag range) are NOT floats.
         assert!(!is_float_raw(0x7FF5_0000_0000_0000)); // NaN, not a tag, still NaN
         assert!(!is_float_raw(0x7FF8_0000_0000_0000)); // hardware quiet NaN == TAG_NIL
@@ -402,6 +407,7 @@ mod tests {
             TAG_STRING,
             TAG_CLOSURE,
             TAG_OBJECT,
+            TAG_FOREIGN_PTR,
         ] {
             assert_ne!(upper, tag >> TAG_SHIFT, "canonical NaN aliases a tag");
         }

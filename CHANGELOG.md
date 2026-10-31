@@ -1,5 +1,10 @@
 # Nulang Changelog
 
+### FFI foreign-pointer provenance isolation — 2026-10-31
+- Encode returned native `VoidPtr` and copied `CStr` allocations with a distinct opaque foreign-pointer value tag. These addresses no longer impersonate `ActorHeap` objects and may only be dereferenced by explicitly unsafe FFI adapters with valid lifetime guarantees.
+- Preserve native pointer round-trips and the VM's C-string copy-and-free contract. Reject both heap and foreign pointer tags when decoding externally supplied raw `Value` bits.
+- A native regression reproduced a `SIGABRT` from a valid foreign pointer being read as a heap header; the same regression passes after the correction. This adds a tagged-value ABI variant; backend/FFI interoperability and security review remain required before release.
+
 ### Canonicalize managed floating-point NaNs — 2026-10-30
 - Canonicalize all NaNs at `Value::float` construction, including ordinary native FFI F64 returns, so adversarial NaN payload bits cannot impersonate Nulang pointer, integer, or other value tags.
 - Add regression coverage for raw FFI conversion and a native C-ABI float return. Existing finite floats preserve their original bit patterns. The JIT/AOT/WASM differential matrix still requires hosted exact-head verification.
