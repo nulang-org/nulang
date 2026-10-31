@@ -3955,7 +3955,13 @@ impl VM {
                     // caller so the outer region resumes on the correct frame.
                     self.frames.truncate(caller_idx + 1);
                     self.current_frame_idx = Some(caller_idx);
-                    crate::jit::runtime::set_jit_pending_vm_error(e.to_string());
+                    // The outer VM step adds the RuntimeError location/prefix.
+                    // Preserve the inner payload to avoid double-wrapping errors.
+                    let message = match e {
+                        NuError::RuntimeError { msg, .. } => msg,
+                        other => other.to_string(),
+                    };
+                    crate::jit::runtime::set_jit_pending_vm_error(message);
                     break 1;
                 }
             }
