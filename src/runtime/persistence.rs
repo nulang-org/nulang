@@ -1372,8 +1372,11 @@ impl LibsqlStore {
     pub fn new_remote(url: &str, auth_token: &str) -> io::Result<Self> {
         let rt =
             tokio::runtime::Runtime::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        crate::runtime::libsql_tls::validate_remote_url(url)?;
+        let tls_connector = crate::runtime::libsql_tls::verified_connector()?;
         let db = rt.block_on(async {
             libsql::Builder::new_remote(url.to_string(), auth_token.to_string())
+                .connector(tls_connector)
                 .build()
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
