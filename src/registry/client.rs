@@ -11,6 +11,27 @@
 #[cfg(feature = "ureq")]
 use std::io::Read;
 
+/// Never transmit a bearer token to a plaintext or malformed endpoint.
+/// Deliberately fail closed instead of relying on an HTTP client's defaults.
+#[cfg(feature = "ureq")]
+pub(crate) fn require_https_for_bearer(url: &str) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err("HTTPS is required for bearer-token requests".to_string());
+    }
+    let authority = url["https://".len()..]
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+    if authority.is_empty()
+        || authority.starts_with(':')
+        || authority.contains('@')
+        || authority.chars().any(char::is_whitespace)
+    {
+        return Err("HTTPS bearer-token endpoint requires a valid host without userinfo".into());
+    }
+    Ok(())
+}
+
 /// Client for a package registry server.
 pub struct RegistryClient {
     registry_url: String,
@@ -36,6 +57,9 @@ impl RegistryClient {
         #[cfg(feature = "ureq")]
         {
             let url = format!("{}/api/v1/packages/{}/{}", self.base_url(), name, version);
+            if self.token.is_some() {
+                require_https_for_bearer(&url)?;
+            }
             let request = match &self.token {
                 Some(token) => ureq::put(&url).header("Authorization", format!("Bearer {}", token)),
                 None => ureq::put(&url),
@@ -145,6 +169,36 @@ mod ureq3_regressions {
     use std::thread;
 
     #[test]
+    fn authenticated_publish_rejects_plaintext_before_connect() {
+        let client = RegistryClient::new(
+            "http://127.0.0.1:1".into(),
+            Some("fake-test-credential".into()),
+        );
+        let error = client
+            .publish("demo", "1.0", b"fixture")
+            .expect_err("authenticated publishing must reject HTTP");
+        assert!(
+            error.contains("HTTPS"),
+            "credential guard should fail before network I/O: {error}"
+        );
+    }
+
+    #[test]
+    fn authenticated_endpoint_requires_https_and_host() {
+        for rejected in [
+            "http://registry.example",
+            "http://127.0.0.1:8080",
+            "ftp://registry.example",
+            "https://",
+            "https:///missing-host",
+            "https://user:pass@registry.example",
+        ] {
+            assert!(require_https_for_bearer(rejected).is_err(), "{rejected}");
+        }
+        assert!(require_https_for_bearer("https://registry.example/api/v1/packages").is_ok());
+    }
+
+    #[test]
     fn registry_publish_fetch_versions_and_status_are_preserved() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -205,7 +259,10 @@ mod ureq3_regressions {
                     assert!(request.starts_with(expected), "{request}");
                 }
                 if i == 0 || i == 3 {
-                    assert!(auth.contains("Bearer test-token"), "{auth}");
+                    assert!(
+                        auth.is_empty(),
+                        "unauthenticated HTTP must not send a bearer token"
+                    );
                     assert_eq!(body, b"test-tarball");
                 }
                 let response = format!(
@@ -216,7 +273,7 @@ mod ureq3_regressions {
                 socket.write_all(answer).unwrap();
             }
         });
-        let client = RegistryClient::new(format!("http://{address}"), Some("test-token".into()));
+        let client = RegistryClient::new(format!("http://{address}"), None);
         client.publish("demo", "1.0", b"test-tarball").unwrap();
         assert_eq!(client.fetch("demo", "1.0").unwrap(), b"binary tarball");
         assert_eq!(client.list_versions("demo").unwrap(), vec!["1.0"]);
