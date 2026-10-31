@@ -1,6 +1,7 @@
 # Nulang Changelog
 
 ### FFI foreign-pointer provenance isolation — 2026-10-31
+- Make WASM FFI registration-only: guests can invoke explicitly registered, library-agnostic host callbacks with matching ABI, but can no longer use guest-controlled library/symbol strings to dynamically load arbitrary host libraries or reuse native-VM library-scoped cache entries. A real Wasmtime guest previously reached an unregistered `libc.so.6` function; regression now rejects this at resolution. Native interpreter FFI remains unchanged.
 - Check the *resolved native function* signature against the guest-declared WASM FFI signature before invocation. Pre-registered native callbacks previously accepted contradictory declarations, allowing a guest to claim an integer return and receive an actual native `VoidPtr` tagged host address; end-to-end WASM test reproduced the bypass.
 - WASM native FFI imports now fail closed before symbol resolution when the declared return type is a host-pointer-bearing `VoidPtr` or `CStr`. The previous WASM host FFI adapter returned raw tagged host addresses directly to guest code; a minimal real Wasmtime import regression reproduced the address disclosure, and scalar FFI return values remain supported.
 - Prevent opaque foreign-pointer handles from crossing node boundaries or persisting into durable continuation snapshots: network classification rejects them, direct wire encoding does not disclose native address bits, and save/restore maps them to nil while rejecting forged legacy raw pointer tags.

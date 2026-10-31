@@ -641,12 +641,13 @@ fn read_wasm_string(mut caller: &mut Caller<'_, HostState>, v: i64) -> String {
 /// CStr params are read from WASM memory. Reuses the AOT FFI registry + marshalling.
 fn host_ffi_call_impl(
     mut caller: &mut Caller<'_, HostState>,
-    lib: i64,
+    _lib: i64,
     sym: i64,
     sig: i64,
     args: &[i64],
 ) -> Result<i64, Error> {
-    let lib_s = read_wasm_string(&mut caller, lib);
+    // The guest library name is intentionally ignored. WASM may only call
+    // explicitly registered host symbols, never choose a native library.
     let sym_s = read_wasm_string(&mut caller, sym);
     let sig = sig as u64;
     let ret_tag = sig & 0b111;
@@ -671,11 +672,17 @@ fn host_ffi_call_impl(
     let func = {
         let registry = crate::ffi::native::FFI_REGISTRY
             .get_or_init(|| std::sync::Mutex::new(crate::ffi::native::FfiRegistry::new()));
-        let mut reg = registry
+        let reg = registry
             .lock()
             .map_err(|_| Error::msg("ffi registry lock"))?;
-        unsafe { reg.resolve_or_load(&lib_s, &sym_s, signature.clone()) }
-            .map_err(|_| Error::msg("ffi resolve"))?
+        // WASM is an isolated guest, not a trusted native plugin. Never let
+        // guest-controlled library/symbol strings trigger dlopen/dlsym, nor
+        // reuse a dynamically loaded callback cached by the native VM.
+        // Only explicit, library-agnostic host registrations have authority
+        // to cross the guest→native boundary. Native interpreter FFI retains
+        // its separately governed resolve_or_load path.
+        reg.resolve(None, &sym_s)
+            .ok_or_else(|| Error::msg("WASM FFI requires pre-registered native function"))?
     };
     // Pre-registered callbacks carry their own authoritative signature.
     // The guest's declaration is untrusted: call_native uses func.signature,
@@ -1120,6 +1127,10 @@ mod tests {
     }
 
     fn ffi_test_wasm(symbol: &str, return_ctype: u64) -> Vec<u8> {
+        ffi_test_wasm_for_library("test-native-ffi", symbol, return_ctype)
+    }
+
+    fn ffi_test_wasm_for_library(library: &str, symbol: &str, return_ctype: u64) -> Vec<u8> {
         // A real WASM guest imports the same host FFI function used by the
         // compiled backend, then returns its raw i64 result to the test.
         let library_tag = crate::vm::Value::string(128).as_raw();
@@ -1128,7 +1139,7 @@ mod tests {
             r#"(module
                 (import "env" "memory" (memory 1))
                 (import "env" "ffi_call_0" (func $ffi (param i64 i64 i64) (result i64)))
-                (data (i32.const 128) "test-native-ffi\00")
+                (data (i32.const 128) "{library}\00")
                 (data (i32.const 160) "{symbol}\00")
                 (func (export "nulang_init") (result i64)
                     i64.const {library_tag}
@@ -1137,6 +1148,47 @@ mod tests {
                     call $ffi))"#
         );
         wat::parse_str(&wat).expect("valid host FFI guest")
+    }
+
+    #[test]
+    fn wasm_ffi_rejects_library_scoped_native_registry_entries() {
+        let symbol = "nulang_p0_wasm_cached_dynamic_symbol";
+        let library = "p0-local-only-native-library";
+        let reg = crate::ffi::native::FFI_REGISTRY
+            .get_or_init(|| std::sync::Mutex::new(crate::ffi::native::FfiRegistry::new()));
+        reg.lock().unwrap().register(unsafe {
+            crate::ffi::native::NativeFunction::new(
+                fixture_native_scalar as *const std::ffi::c_void,
+                crate::ffi::marshal::Signature::new(vec![], crate::ffi::marshal::CType::I64),
+                Some(library.into()),
+                symbol.into(),
+            )
+        });
+        let wasm = ffi_test_wasm_for_library(library, symbol, 0);
+        let mut runtime = WasmRuntime::new(&wasm, None).unwrap();
+        let err = runtime
+            .init_func
+            .call(&mut runtime.store, ())
+            .expect_err("WASM guest must not reuse native library-scoped cache entries");
+        assert!(format!("{err:?}").contains("WASM FFI requires pre-registered native function"));
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "ffi"))]
+    fn wasm_ffi_unregistered_native_library_must_not_load() {
+        // gethostid() is harmless and has the exact C ABI `long(void)` on
+        // Linux x86_64. No function was pre-registered under this symbol.
+        // A guest must not cause an unrequested dlopen/dlsym and C invocation.
+        let wasm = ffi_test_wasm_for_library("libc.so.6", "gethostid", 0);
+        let mut runtime = WasmRuntime::new(&wasm, None).unwrap();
+        let err = runtime
+            .init_func
+            .call(&mut runtime.store, ())
+            .expect_err("WASM guest must not load arbitrary host libraries");
+        assert!(
+            format!("{err:?}").contains("WASM FFI requires pre-registered native function"),
+            "must reject unregistered host dynamic symbols before loading: {err:?}"
+        );
     }
 
     #[test]
