@@ -846,6 +846,14 @@ impl StdLib {
                     description: "Trusted standalone-only direct argv execution (no implicit shell). Returns (exit_code, stdout, stderr), or nil for launch errors, timeouts, output-limit violations, or invalid arguments. UTF-8 output is lossily decoded. Bounds: timeout 1..60000ms, combined output 1..16777216 bytes. Actor-backed hosts fail closed.",
                 },
                 BuiltinOp {
+                    name: "Process.exec_in",
+                    effect: "Process",
+                    op: "exec_in",
+                    signature: "exec_in(program: String, args: [String], cwd: String, env: [(String, String)], timeout_ms: Int, max_output_bytes: Int) -> (Int, String, String)",
+                    implemented_in: ImplSite::StandaloneVm,
+                    description: "Trusted standalone argv execution with child-only working directory and environment overrides. Empty cwd inherits host cwd; other environment variables remain inherited. Returns (exit_code, stdout, stderr) or nil on failure. Bounds and actor isolation restrictions match Process.exec.",
+                },
+                BuiltinOp {
                     name: "System.arg",
                     effect: "System",
                     op: "arg",

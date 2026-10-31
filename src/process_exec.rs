@@ -3,6 +3,7 @@
 use std::io::{self, Read};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -19,6 +20,15 @@ pub const MAX_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct ExecOptions {
     pub timeout: Duration,
     pub max_output_bytes: usize,
+}
+
+/// Trusted-host process context. It does not constrain filesystem or secret access.
+#[derive(Debug, Default, Clone)]
+pub struct ExecContext {
+    /// Child working directory; None inherits the host's directory.
+    pub cwd: Option<PathBuf>,
+    /// Child-only environment overrides; other environment variables are inherited.
+    pub env: Vec<(String, String)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -43,6 +53,17 @@ pub enum ExecError {
 /// Both pipes are drained concurrently; the combined captured output is bounded.
 /// An exceeded limit or deadline terminates and reaps the direct child.
 pub fn exec(program: &str, args: &[String], options: ExecOptions) -> Result<ExecOutput, ExecError> {
+    exec_in(program, args, options, &ExecContext::default())
+}
+
+/// Execute with a child-specific working directory and environment overrides.
+/// This operation does NOT isolate the child's filesystem or environment.
+pub fn exec_in(
+    program: &str,
+    args: &[String],
+    options: ExecOptions,
+    context: &ExecContext,
+) -> Result<ExecOutput, ExecError> {
     if program.is_empty()
         || options.timeout.is_zero()
         || options.timeout > MAX_TIMEOUT
@@ -52,7 +73,27 @@ pub fn exec(program: &str, args: &[String], options: ExecOptions) -> Result<Exec
         return Err(ExecError::InvalidOptions);
     }
 
+    if context.env.len() > 64
+        || context.env.iter().any(|(key, value)| {
+            key.is_empty()
+                || key.len() > 256
+                || key.contains(['=', '\0'])
+                || value.len() > 8192
+                || value.contains('\0')
+        })
+        || context
+            .cwd
+            .as_ref()
+            .is_some_and(|dir| dir.as_os_str().is_empty())
+    {
+        return Err(ExecError::InvalidOptions);
+    }
+
     let mut command = Command::new(program);
+    if let Some(cwd) = &context.cwd {
+        command.current_dir(cwd);
+    }
+    command.envs(context.env.iter().map(|(key, value)| (key, value)));
     command
         .args(args)
         .stdin(Stdio::null())
@@ -247,6 +288,68 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, ExecError::OutputLimitExceeded);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_context_sets_cwd_without_changing_parent() {
+        let home = std::env::current_dir().unwrap();
+        let context = ExecContext {
+            cwd: Some(std::env::temp_dir()),
+            env: vec![],
+        };
+        let result = exec_in("pwd", &[], opts(), &context).unwrap();
+        assert_eq!(
+            String::from_utf8(result.stdout).unwrap().trim(),
+            std::fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .to_string_lossy()
+        );
+        assert_eq!(std::env::current_dir().unwrap(), home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_context_sets_env_without_polluting_parent() {
+        let key = "NULANG_PROCESS_EXEC_CONTEXT_REGRESSION";
+        let context = ExecContext {
+            cwd: None,
+            env: vec![(key.to_string(), "literal $(do_not_expand)".into())],
+        };
+        let result = exec_in("printenv", &[key.to_string()], opts(), &context).unwrap();
+        assert_eq!(result.stdout, b"literal $(do_not_expand)\n");
+        assert!(std::env::var_os(key).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_context_rejects_invalid_env_and_cwd() {
+        for name in ["", "A=B", "a\0b"] {
+            let context = ExecContext {
+                cwd: None,
+                env: vec![(name.into(), "ok".into())],
+            };
+            assert_eq!(
+                exec_in("true", &[], opts(), &context),
+                Err(ExecError::InvalidOptions)
+            );
+        }
+        let context = ExecContext {
+            cwd: None,
+            env: vec![("GOOD".into(), "nul\0bad".into())],
+        };
+        assert_eq!(
+            exec_in("true", &[], opts(), &context),
+            Err(ExecError::InvalidOptions)
+        );
+        let context = ExecContext {
+            cwd: Some(std::env::temp_dir().join("nulang-missing-dir-67161914")),
+            env: vec![],
+        };
+        assert!(matches!(
+            exec_in("true", &[], opts(), &context),
+            Err(ExecError::Spawn(_))
+        ));
     }
 
     #[test]

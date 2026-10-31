@@ -1671,7 +1671,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                 .as_secs() as i64;
             return Some(Value::int(now));
         }
-        if effect_name == "Process" && op_name == Some("exec") {
+        if effect_name == "Process" && matches!(op_name, Some("exec" | "exec_in")) {
             // String validation is explicit: resolve_value_string treats arbitrary
             // pointer values as C strings and must not be called on arrays/records.
             let string_arg = |value: Value| -> Option<String> {
@@ -1722,21 +1722,76 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
             if program.contains('\0') {
                 return Some(Value::nil());
             }
-            let timeout = match regs.get(2).and_then(|v| v.as_int()) {
+            let (context, timeout_index) = if op_name == Some("exec_in") {
+                let cwd = string_arg(*regs.get(2)?)?;
+                let env_ptr = regs.get(3)?.as_ptr()?;
+                let env = unsafe {
+                    let header = &*ActorHeap::header_of(env_ptr);
+                    if header.type_tag != HeapTypeTag::Array {
+                        return Some(Value::nil());
+                    }
+                    let bytes = header.size.checked_sub(ActorHeap::HEADER_SIZE)?;
+                    if bytes % std::mem::size_of::<Value>() != 0 {
+                        return Some(Value::nil());
+                    }
+                    let len = bytes / std::mem::size_of::<Value>();
+                    if len > 64 {
+                        return Some(Value::nil());
+                    }
+                    let items = std::slice::from_raw_parts(env_ptr as *const Value, len);
+                    let mut env = Vec::with_capacity(len);
+                    for entry in items {
+                        let Some(tuple_ptr) = entry.as_ptr() else {
+                            return Some(Value::nil());
+                        };
+                        let tuple_header = &*ActorHeap::header_of(tuple_ptr);
+                        if tuple_header.type_tag != HeapTypeTag::Tuple
+                            || tuple_header.size.checked_sub(ActorHeap::HEADER_SIZE)
+                                != Some(2 * std::mem::size_of::<Value>())
+                        {
+                            return Some(Value::nil());
+                        }
+                        let pair = std::slice::from_raw_parts(tuple_ptr as *const Value, 2);
+                        let Some(name) = string_arg(pair[0]) else {
+                            return Some(Value::nil());
+                        };
+                        let Some(value) = string_arg(pair[1]) else {
+                            return Some(Value::nil());
+                        };
+                        env.push((name, value));
+                    }
+                    env
+                };
+                (
+                    crate::process_exec::ExecContext {
+                        cwd: if cwd.is_empty() {
+                            None
+                        } else {
+                            Some(std::path::PathBuf::from(cwd))
+                        },
+                        env,
+                    },
+                    4,
+                )
+            } else {
+                (crate::process_exec::ExecContext::default(), 2)
+            };
+            let timeout = match regs.get(timeout_index).and_then(|v| v.as_int()) {
                 Some(n @ 1..=60000) => n as u64,
                 _ => return Some(Value::nil()),
             };
-            let output_limit = match regs.get(3).and_then(|v| v.as_int()) {
+            let output_limit = match regs.get(timeout_index + 1).and_then(|v| v.as_int()) {
                 Some(n @ 1..=16777216) => n as usize,
                 _ => return Some(Value::nil()),
             };
-            let output = match crate::process_exec::exec(
+            let output = match crate::process_exec::exec_in(
                 &program,
                 &args,
                 crate::process_exec::ExecOptions {
                     timeout: std::time::Duration::from_millis(timeout),
                     max_output_bytes: output_limit,
                 },
+                &context,
             ) {
                 Ok(out) => out,
                 Err(_) => return Some(Value::nil()),

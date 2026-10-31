@@ -147,7 +147,7 @@ fn required_host_authority(
         }
         // No production host sandbox exists for the new direct argv API.
         // Fail closed rather than treating it as a generic extension grant.
-        ("Process", Some("exec")) => {
+        ("Process", Some("exec" | "exec_in")) => {
             return Err(
                 "Process.exec is standalone-only until an isolated process host exists".into(),
             );
@@ -3051,6 +3051,9 @@ mod host_authority_tests {
         let (constants, regs) = string_args(&["printf"]);
         let err = required_host_authority("Process", Some("exec"), &constants, &regs)
             .expect_err("Process.exec must not inherit broad extension authority");
+        assert!(err.contains("standalone-only"), "{err}");
+        let err = required_host_authority("Process", Some("exec_in"), &constants, &regs)
+            .expect_err("Process.exec_in must not inherit broad extension authority");
         assert!(err.contains("standalone-only"), "{err}");
     }
 
