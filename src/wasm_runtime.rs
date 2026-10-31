@@ -674,9 +674,17 @@ fn host_ffi_call_impl(
         let mut reg = registry
             .lock()
             .map_err(|_| Error::msg("ffi registry lock"))?;
-        unsafe { reg.resolve_or_load(&lib_s, &sym_s, signature) }
+        unsafe { reg.resolve_or_load(&lib_s, &sym_s, signature.clone()) }
             .map_err(|_| Error::msg("ffi resolve"))?
     };
+    // Pre-registered callbacks carry their own authoritative signature.
+    // The guest's declaration is untrusted: call_native uses func.signature,
+    // not the packed guest signature checked above. A mismatch could make a
+    // guest-requested scalar return execute a native VoidPtr-return function,
+    // leaking a process-local host address through the WASM i64 result.
+    if func.signature != signature {
+        return Err(Error::msg("WASM FFI signature mismatch"));
+    }
     // Marshal CStr params from WASM memory into CStrings valid for the call.
     // All other values must be safe to represent as host Values; in
     // particular a guest TAG_PTR is a linear-memory offset, not a host pointer.
@@ -1179,6 +1187,37 @@ mod tests {
             !WASM_CSTR_TEST_CALLED.load(std::sync::atomic::Ordering::SeqCst),
             "reject unsafe native return signatures before invoking C"
         );
+    }
+
+    #[test]
+    fn wasm_ffi_cannot_disguise_registered_native_pointer_as_scalar() {
+        // A malicious guest declares I64 while the trusted registry entry
+        // actually has a pointer-returning ABI. The registered signature,
+        // not the guest declaration, governs call_native's conversion.
+        let symbol = "nulang_p0_wasm_foreign_address_signature_spoof";
+        unsafe {
+            crate::ffi::native::register_native_function(
+                symbol,
+                fixture_native_host_address as *const std::ffi::c_void,
+                crate::ffi::marshal::Signature::new(vec![], crate::ffi::marshal::CType::VoidPtr),
+            )
+        }
+        .expect("pre-register trusted foreign pointer function");
+
+        // Guest lies: 0 is I64. On the old code, the host checks I64, then
+        // call_native uses the registered VoidPtr ABI and emits TAG_FOREIGN_PTR.
+        let wasm = ffi_test_wasm(symbol, 0);
+        let mut runtime = WasmRuntime::new(&wasm, None).unwrap();
+        match runtime.init_func.call(&mut runtime.store, ()) {
+            Ok(raw) => panic!(
+                "WASM guest bypassed return guard using signature spoof: {:#018x}",
+                raw as u64
+            ),
+            Err(e) => assert!(
+                format!("{e:?}").contains("WASM FFI signature mismatch"),
+                "must fail closed on registered signature mismatch: {e:?}"
+            ),
+        }
     }
 
     #[test]

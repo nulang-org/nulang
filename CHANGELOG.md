@@ -1,6 +1,7 @@
 # Nulang Changelog
 
 ### FFI foreign-pointer provenance isolation — 2026-10-31
+- Check the *resolved native function* signature against the guest-declared WASM FFI signature before invocation. Pre-registered native callbacks previously accepted contradictory declarations, allowing a guest to claim an integer return and receive an actual native `VoidPtr` tagged host address; end-to-end WASM test reproduced the bypass.
 - WASM native FFI imports now fail closed before symbol resolution when the declared return type is a host-pointer-bearing `VoidPtr` or `CStr`. The previous WASM host FFI adapter returned raw tagged host addresses directly to guest code; a minimal real Wasmtime import regression reproduced the address disclosure, and scalar FFI return values remain supported.
 - Prevent opaque foreign-pointer handles from crossing node boundaries or persisting into durable continuation snapshots: network classification rejects them, direct wire encoding does not disclose native address bits, and save/restore maps them to nil while rejecting forged legacy raw pointer tags.
 - Encode returned native `VoidPtr` and copied `CStr` allocations with a distinct opaque foreign-pointer value tag. These addresses no longer impersonate `ActorHeap` objects and may only be dereferenced by explicitly unsafe FFI adapters with valid lifetime guarantees.
