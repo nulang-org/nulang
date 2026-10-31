@@ -145,6 +145,13 @@ fn required_host_authority(
             }
             other("Net", "Listen", Some(port.to_string()))
         }
+        // No production host sandbox exists for the new direct argv API.
+        // Fail closed rather than treating it as a generic extension grant.
+        ("Process", Some("exec")) => {
+            return Err(
+                "Process.exec is standalone-only until an isolated process host exists".into(),
+            );
+        }
         ("Process", Some("run")) => AuthorityGrant::ProcessRun {
             command: string_arg(0)?,
         },
@@ -3037,6 +3044,14 @@ mod host_authority_tests {
             !marker.exists(),
             "holding Process::Run authority must not by itself grant host shell execution"
         );
+    }
+
+    #[test]
+    fn actor_process_exec_remains_fail_closed_without_sandbox() {
+        let (constants, regs) = string_args(&["printf"]);
+        let err = required_host_authority("Process", Some("exec"), &constants, &regs)
+            .expect_err("Process.exec must not inherit broad extension authority");
+        assert!(err.contains("standalone-only"), "{err}");
     }
 
     #[test]

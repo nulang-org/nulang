@@ -1671,6 +1671,101 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                 .as_secs() as i64;
             return Some(Value::int(now));
         }
+        if effect_name == "Process" && op_name == Some("exec") {
+            // String validation is explicit: resolve_value_string treats arbitrary
+            // pointer values as C strings and must not be called on arrays/records.
+            let string_arg = |value: Value| -> Option<String> {
+                if let Some(id) = value.as_string_id() {
+                    match constants.get(id as usize) {
+                        Some(Constant::String(s)) => Some(s.clone()),
+                        _ => None,
+                    }
+                } else {
+                    let ptr = value.as_ptr()?;
+                    unsafe {
+                        if (*ActorHeap::header_of(ptr)).type_tag != HeapTypeTag::String {
+                            return None;
+                        }
+                        Some(
+                            CStr::from_ptr(ptr as *const c_char)
+                                .to_string_lossy()
+                                .into_owned(),
+                        )
+                    }
+                }
+            };
+            let program = string_arg(*regs.first()?)?;
+            let args_ptr = regs.get(1)?.as_ptr()?;
+            let args = unsafe {
+                let header = &*ActorHeap::header_of(args_ptr);
+                if header.type_tag != HeapTypeTag::Array {
+                    return Some(Value::nil());
+                }
+                let bytes = header.size.checked_sub(ActorHeap::HEADER_SIZE)?;
+                if bytes % std::mem::size_of::<Value>() != 0 {
+                    return Some(Value::nil());
+                }
+                let len = bytes / std::mem::size_of::<Value>();
+                if len > 256 {
+                    return Some(Value::nil());
+                }
+                let values = std::slice::from_raw_parts(args_ptr as *const Value, len);
+                let mut result = Vec::with_capacity(len);
+                for value in values {
+                    match string_arg(*value) {
+                        Some(s) if !s.contains('\0') => result.push(s),
+                        _ => return Some(Value::nil()),
+                    }
+                }
+                result
+            };
+            if program.contains('\0') {
+                return Some(Value::nil());
+            }
+            let timeout = match regs.get(2).and_then(|v| v.as_int()) {
+                Some(n @ 1..=60000) => n as u64,
+                _ => return Some(Value::nil()),
+            };
+            let output_limit = match regs.get(3).and_then(|v| v.as_int()) {
+                Some(n @ 1..=16777216) => n as usize,
+                _ => return Some(Value::nil()),
+            };
+            let output = match crate::process_exec::exec(
+                &program,
+                &args,
+                crate::process_exec::ExecOptions {
+                    timeout: std::time::Duration::from_millis(timeout),
+                    max_output_bytes: output_limit,
+                },
+            ) {
+                Ok(out) => out,
+                Err(_) => return Some(Value::nil()),
+            };
+            // Heap strings use NUL terminators. Replace embedded NULs to avoid
+            // accidentally returning truncated output.
+            let stdout = String::from_utf8_lossy(&output.stdout).replace('\0', "\u{FFFD}");
+            let stderr = String::from_utf8_lossy(&output.stderr).replace('\0', "\u{FFFD}");
+            let out_value = self.alloc_string(&stdout);
+            let err_value = self.alloc_string(&stderr);
+            if out_value.is_nil() || err_value.is_nil() {
+                return Some(Value::nil());
+            }
+            let tuple_size = 3 * std::mem::size_of::<Value>();
+            let Some(ptr) = self.heap.alloc(tuple_size, HeapTypeTag::Tuple) else {
+                return Some(Value::nil());
+            };
+            unsafe {
+                let values = std::slice::from_raw_parts_mut(ptr as *mut Value, 3);
+                values[0] = Value::int(output.exit_code.unwrap_or(-1) as i64);
+                values[1] = out_value;
+                values[2] = err_value;
+                self.gc
+                    .local_ref(&self.heap, out_value.as_ptr().expect("allocated string"));
+                self.gc
+                    .local_ref(&self.heap, err_value.as_ptr().expect("allocated string"));
+                return Some(Value::ptr(ptr));
+            }
+        }
         if effect_name == "Process" && op_name == Some("run") {
             let cmd = regs
                 .first()
