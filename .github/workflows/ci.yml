@@ -336,9 +336,6 @@ jobs:
       - name: Check docs
         run: cargo doc --locked --no-deps
 
-      # Documentation warnings are non-blocking but visible.
-      - name: Doc warnings (info only)
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps 2>&1 || true
 
   # -----------------------------------------------------------------------
   # Lean formalization — verifies the formal specs compile
