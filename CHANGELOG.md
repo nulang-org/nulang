@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Canonicalize managed floating-point NaNs — 2026-10-30
+- Canonicalize all NaNs at `Value::float` construction, including ordinary native FFI F64 returns, so adversarial NaN payload bits cannot impersonate Nulang pointer, integer, or other value tags.
+- Add regression coverage for raw FFI conversion and a native C-ABI float return. Existing finite floats preserve their original bit patterns. The JIT/AOT/WASM differential matrix still requires hosted exact-head verification.
+
 ### Ureq 3 Rustls and HTTP client compatibility — 2026-10-29
 - **Upgrade the opt-in synchronous HTTP client from ureq 2.12.1 to ureq 3.5.0**, using its maintained Rustls 0.23 backend and patched WebPKI 1.0.x trust roots. Cargo's dependency resolver removes the obsolete `webpki-roots 0.26.11` tree; no direct checksum edits or audit exclusions.
 - **Preserve registry publish/fetch/list, VM Http.get/Http.post and cloud deploy behavior** across the ureq 3 request and response API changes. Deploy explicitly returns the 401 authentication hint and readable error bodies for non-2xx HTTP responses, while transport failures remain errors. Rustls still authenticates server certificates and hostnames.
