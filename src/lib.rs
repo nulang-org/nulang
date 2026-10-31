@@ -6,6 +6,7 @@
 // Test fixtures intentionally exercise source-level decimal spellings such as 3.14;
 // replacing those values with mathematical constants would change test semantics.
 #![cfg_attr(test, allow(clippy::approx_constant))]
+pub mod process_exec;
 
 mod actor_protocol;
 pub mod agent;

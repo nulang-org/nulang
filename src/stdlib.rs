@@ -838,6 +838,14 @@ impl StdLib {
                     description: "Trusted/standalone host primitive: execute a shell command via /bin/sh -c and return stdout; actor-backed runtimes do not dispatch it until an isolated process sandbox exists.",
                 },
                 BuiltinOp {
+                    name: "Process.exec",
+                    effect: "Process",
+                    op: "exec",
+                    signature: "exec(program: String, args: [String], timeout_ms: Int, max_output_bytes: Int) -> (Int, String, String)",
+                    implemented_in: ImplSite::StandaloneVm,
+                    description: "Trusted standalone-only direct argv execution (no implicit shell). Returns (exit_code, stdout, stderr), or nil for launch errors, timeouts, output-limit violations, or invalid arguments. UTF-8 output is lossily decoded. Bounds: timeout 1..60000ms, combined output 1..16777216 bytes. Actor-backed hosts fail closed.",
+                },
+                BuiltinOp {
                     name: "System.arg",
                     effect: "System",
                     op: "arg",
