@@ -656,6 +656,17 @@ fn host_ffi_call_impl(
         params.push(crate::jit::runtime::aot_ctype_from_tag(tag));
     }
     let ret = crate::jit::runtime::aot_ctype_from_tag(ret_tag);
+    // Never return a native process address to linear-memory-only WASM.
+    // VoidPtr and CStr both carry host pointers. Reject *before* resolving
+    // or invoking a native symbol (also avoids leaking temporary CStr copies).
+    if matches!(
+        ret,
+        crate::ffi::marshal::CType::VoidPtr | crate::ffi::marshal::CType::CStr
+    ) {
+        return Err(Error::msg(
+            "WASM cannot return native pointers (VoidPtr/CStr)",
+        ));
+    }
     let signature = crate::ffi::marshal::Signature::new(params.clone(), ret);
     let func = {
         let registry = crate::ffi::native::FFI_REGISTRY
@@ -1079,6 +1090,112 @@ pub fn load_precompiled(cwasm_bytes: &[u8]) -> NuResult<WasmRuntime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // These fixtures are pre-registered under an isolated symbol. No host
+    // libraries, production keys, or external processes are involved.
+    static WASM_FFI_TEST_TOKEN: u64 = 0x1234_5678_ABCD;
+
+    extern "C" fn fixture_native_host_address() -> *mut std::ffi::c_void {
+        std::ptr::addr_of!(WASM_FFI_TEST_TOKEN) as *mut std::ffi::c_void
+    }
+
+    extern "C" fn fixture_native_scalar() -> i64 {
+        42
+    }
+
+    static WASM_CSTR_TEST_CALLED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    extern "C" fn fixture_native_cstr() -> *const std::ffi::c_char {
+        WASM_CSTR_TEST_CALLED.store(true, std::sync::atomic::Ordering::SeqCst);
+        c"native pointer return".as_ptr()
+    }
+
+    fn ffi_test_wasm(symbol: &str, return_ctype: u64) -> Vec<u8> {
+        // A real WASM guest imports the same host FFI function used by the
+        // compiled backend, then returns its raw i64 result to the test.
+        let library_tag = crate::vm::Value::string(128).as_raw();
+        let symbol_tag = crate::vm::Value::string(160).as_raw();
+        let wat = format!(
+            r#"(module
+                (import "env" "memory" (memory 1))
+                (import "env" "ffi_call_0" (func $ffi (param i64 i64 i64) (result i64)))
+                (data (i32.const 128) "test-native-ffi\00")
+                (data (i32.const 160) "{symbol}\00")
+                (func (export "nulang_init") (result i64)
+                    i64.const {library_tag}
+                    i64.const {symbol_tag}
+                    i64.const {return_ctype}
+                    call $ffi))"#
+        );
+        wat::parse_str(&wat).expect("valid host FFI guest")
+    }
+
+    #[test]
+    fn wasm_ffi_voidptr_result_must_not_expose_host_address() {
+        let symbol = "nulang_p0_wasm_foreign_address_return";
+        unsafe {
+            crate::ffi::native::register_native_function(
+                symbol,
+                fixture_native_host_address as *const std::ffi::c_void,
+                crate::ffi::marshal::Signature::new(vec![], crate::ffi::marshal::CType::VoidPtr),
+            )
+        }
+        .expect("pre-register trusted test function");
+        let wasm = ffi_test_wasm(symbol, 4);
+        let mut runtime = WasmRuntime::new(&wasm, None).unwrap();
+        match runtime.init_func.call(&mut runtime.store, ()) {
+            Ok(raw) => panic!(
+                "guest observed a host FFI result instead of a rejection: {:#018x}",
+                raw as u64
+            ),
+            Err(e) => assert!(
+                format!("{e:?}").contains("WASM cannot return native pointers"),
+                "wrong failure; must reject pointer result before FFI execution: {e:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn wasm_ffi_cstr_return_rejected_before_native_call() {
+        let symbol = "nulang_p0_wasm_cstr_pointer_return";
+        WASM_CSTR_TEST_CALLED.store(false, std::sync::atomic::Ordering::SeqCst);
+        unsafe {
+            crate::ffi::native::register_native_function(
+                symbol,
+                fixture_native_cstr as *const std::ffi::c_void,
+                crate::ffi::marshal::Signature::new(vec![], crate::ffi::marshal::CType::CStr),
+            )
+        }
+        .expect("register valid native CStr fixture");
+        let wasm = ffi_test_wasm(symbol, 3);
+        let mut runtime = WasmRuntime::new(&wasm, None).unwrap();
+        let error = runtime
+            .init_func
+            .call(&mut runtime.store, ())
+            .expect_err("WASM guest cannot receive a native CStr pointer");
+        assert!(format!("{error:?}").contains("WASM cannot return native pointers"));
+        assert!(
+            !WASM_CSTR_TEST_CALLED.load(std::sync::atomic::Ordering::SeqCst),
+            "reject unsafe native return signatures before invoking C"
+        );
+    }
+
+    #[test]
+    fn wasm_ffi_scalar_result_still_roundtrips() {
+        let symbol = "nulang_p0_wasm_scalar_result";
+        unsafe {
+            crate::ffi::native::register_native_function(
+                symbol,
+                fixture_native_scalar as *const std::ffi::c_void,
+                crate::ffi::marshal::Signature::new(vec![], crate::ffi::marshal::CType::I64),
+            )
+        }
+        .expect("pre-register trusted scalar fixture");
+        let wasm = ffi_test_wasm(symbol, 0);
+        let mut runtime = WasmRuntime::new(&wasm, None).unwrap();
+        assert_eq!(runtime.run().unwrap().as_int(), Some(42));
+    }
 
     #[test]
     fn guest_non_pointer_value_rejects_host_pointer_tag() {
