@@ -630,6 +630,44 @@ mod tests {
     }
 
     #[test]
+    fn test_foreign_nan_cannot_mint_pointer_or_other_value_tags() {
+        for tag in [
+            crate::value_layout::TAG_PTR,
+            crate::value_layout::TAG_INT,
+            crate::value_layout::TAG_BOOL,
+            crate::value_layout::TAG_NIL,
+            crate::value_layout::TAG_STRING,
+        ] {
+            let returned = f64::from_bits(tag | 0x1234);
+            let result = f64_to_value(returned);
+            assert!(
+                result.as_float().is_some_and(f64::is_nan),
+                "foreign floating-point NaN {tag:#018x} must remain a float"
+            );
+            assert!(
+                !result.is_ptr(),
+                "NaN payload cannot grant pointer provenance"
+            );
+        }
+    }
+
+    #[cfg(feature = "ffi")]
+    #[test]
+    fn test_native_f64_tagged_nan_result_is_canonicalized() {
+        extern "C" fn native_colliding_nan() -> f64 {
+            f64::from_bits(crate::value_layout::TAG_PTR | 0x1234)
+        }
+        let func = make_func(
+            native_colliding_nan as *const c_void,
+            Signature::new(vec![], CType::F64),
+        );
+        // SAFETY: native_colliding_nan has the exact declared signature.
+        let result = unsafe { call_native(&func, &[]) }.expect("valid native return");
+        assert!(result.as_float().is_some_and(f64::is_nan));
+        assert!(!result.is_ptr());
+    }
+
+    #[test]
     fn test_marshal_f64_roundtrip() {
         let v = Value::float(2.5);
         assert_eq!(value_to_f64(&v), Ok(2.5));
