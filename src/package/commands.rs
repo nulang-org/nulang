@@ -2385,9 +2385,14 @@ fn cmd_deploy(
         .or_else(|| std::env::var("NULANG_CLOUD_URL").ok())
         .unwrap_or_else(|| "https://deploy.nulang.cloud".to_string());
 
-    eprintln!("Deploying {} to {} ...", name, cloud_url);
-
     let url = format!("{}/api/v1/deploy", cloud_url.trim_end_matches('/'));
+    crate::registry::client::require_https_for_bearer(&url).map_err(|msg| {
+        NuError::PackageError {
+            msg,
+            span: Span::default(),
+        }
+    })?;
+    eprintln!("Deploying {} to {} ...", name, cloud_url);
     // ureq 3 returns only the status code on 4xx/5xx errors. Disable that
     // conversion for this one request so cloud diagnostic bodies and the
     // special 401 guidance remain available without weakening TLS.
