@@ -269,6 +269,30 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_process_exec_in_typed_env_and_cwd_end_to_end() {
+        assert_int(
+            r#"let out = perform Process.exec_in(
+                  "printenv", ["NULANG_PROCESS_CONTEXT_TEST"], "/tmp",
+                  [("NULANG_PROCESS_CONTEXT_TEST", "literal; $(nothing)")], 1000, 4096
+               ) in if out.1 == "literal; $(nothing)\n" then out.0 else 99"#,
+            0,
+        );
+        assert_bool(
+            r#"perform Process.exec_in(
+                "true", [], ".", [("INVALID=KEY", "value")], 1000, 4096
+            ) == nil"#,
+            true,
+        );
+        assert_bool(
+            r#"perform Process.exec_in(
+                "true", [], "/tmp/nulang-process-context-missing-82739372", [], 1000, 4096
+            ) == nil"#,
+            true,
+        );
+    }
+
     #[test]
     fn test_literal_int() {
         assert_int("42", 42);

@@ -101,7 +101,7 @@ are:
 | `StrBuilder` | `new`, `push`, `to_string`, `len`, `reset` | Efficient string building |
 | `FS` | `read`, `write`, `append`, `exists` | File-system access |
 | `Env` | `get` | Environment variables |
-| `Process` | `run`, `exec` | Trusted standalone shell/direct-process execution |
+| `Process` | `run`, `exec`, `exec_in` | Trusted standalone shell/direct-process execution |
 | `Debug` | `inspect` | Labeled value inspection |
 | `Test` | `assert`, `assert_eq`, `assert_true` | Test assertions |
 | `Random` | `int` | Random numbers |
@@ -116,6 +116,7 @@ are:
 | `Web` | `html`, `text`, `route`, `param`, `header`, `cookie`, … | Web framework primitives |
 | `Python` | `import`, `call`, `get_attr` | Python interop (PyO3) |
 | `System` | `arg` | Command-line arguments |
+| `Realtime` | `broadcast` | Realtime channel broadcast |
 
 ### Standalone process execution
 
@@ -139,13 +140,33 @@ bytes **combined** for stdout and stderr. The result is a
 launch failures, timeouts, and exceeded limits currently return `nil`.
 Output is lossy UTF-8 text, not an arbitrary binary stream.
 
+`Process.exec_in` accepts a working directory and typed environment overrides
+without changing the caller's directory or environment:
+
+```nulang
+let result = perform Process.exec_in(
+    "printenv",
+    ["BUILD_MODE"],
+    ".",
+    [("BUILD_MODE", "release")],
+    1000,
+    4096
+)
+perform IO.print(result.1)
+```
+
+The six arguments are `(program, args, cwd, env, timeout_ms,
+max_output_bytes)`. A blank `cwd` inherits the host directory; `env`
+contains at most 64 `(String, String)` overrides. Empty keys, keys containing
+`=` or NUL, NUL-bearing values, and oversized keys or values fail closed.
+Other environment variables are inherited (not removed). Directory resolution
+is by the operating system; this does not restrict the child to that directory.
+
 This is a **trusted standalone host API**, **not** a sandbox. On Unix,
 timeouts and output violations terminate the child process group. It is
 unavailable in actor-backed production runtimes until process sandboxing,
 resource admission, and external-authority enforcement are implemented.
 External commands are not replay-safe durable workflow operations by default.
-
-| `Realtime` | `broadcast` | Realtime channel broadcast |
 
 `perform LLM.ask(prompt)` remains accepted as a legacy alias for
 `perform Inference.ask(prompt)` — both dispatch identically at runtime.
