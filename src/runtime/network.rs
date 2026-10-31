@@ -1612,6 +1612,12 @@ fn zigzag_decode(v: u64) -> i64 {
 }
 /// Write a [`Value`] into `buf`.
 fn write_value(buf: &mut Vec<u8>, v: &Value) {
+    // A native address is never portable, even when callers bypass the
+    // packet-level wire-safety preflight. Do not emit its raw bits as a float.
+    if v.is_foreign_ptr() {
+        buf.push(VAL_NIL);
+        return;
+    }
     if let Some(i) = v.as_int() {
         buf.push(VAL_INT);
         buf.extend_from_slice(&i.to_be_bytes());
@@ -1644,12 +1650,12 @@ fn write_value(buf: &mut Vec<u8>, v: &Value) {
 
 /// A [`Value`] is wire-safe only if it can cross to another node without
 /// silent corruption: int, float, bool, nil, or unit always qualify. A heap
-/// pointer is process-local, so those are always rejected. A string-id is
+/// pointer or foreign native address is process-local, so those are always rejected. A string-id is
 /// safe only when `strings_ok` — i.e. the enclosing packet carries a string
 /// table with the content (actor messages do; spawn requests do not).
 #[cfg(feature = "tcp")]
 fn value_is_wire_safe(v: &Value, strings_ok: bool) -> bool {
-    !(v.is_ptr() || v.is_actor_ref() || v.is_closure())
+    !(v.is_ptr() || v.is_foreign_ptr() || v.is_actor_ref() || v.is_closure())
         && (strings_ok || !v.is_string())
         && (strings_ok || !v.is_object())
 }
@@ -3728,6 +3734,19 @@ mod tests {
             },
             true
         ));
+        // A valid C pointer is not an actor-heap pointer, but it is equally
+        // process-local: no network packet may carry its host address.
+        let mut foreign = 47u64;
+        let foreign = Value::foreign_ptr((&mut foreign as *mut u64).cast());
+        assert!(!value_is_wire_safe(&foreign, true));
+        assert!(!value_is_wire_safe(&foreign, false));
+        let mut encoded = Vec::new();
+        write_value(&mut encoded, &foreign);
+        assert_eq!(
+            encoded,
+            vec![VAL_NIL],
+            "wire encoding must never disclose a native address"
+        );
         assert!(!value_is_wire_safe(&Value::actor_ref(9), true));
         assert!(!value_is_wire_safe(&Value::closure(3), true));
         assert!(value_is_wire_safe(&Value::nil(), true));
@@ -3747,6 +3766,7 @@ mod tests {
             priority: MessagePriority::Normal,
             trace_id: None,
         };
+        assert!(!packet_payload_wire_safe(&mk(vec![foreign], vec![])));
         assert!(packet_payload_wire_safe(&mk(vec![Value::int(1)], vec![])));
         assert!(packet_payload_wire_safe(&mk(
             vec![Value::string(0)],

@@ -1,6 +1,7 @@
 # Nulang Changelog
 
 ### FFI foreign-pointer provenance isolation — 2026-10-31
+- Prevent opaque foreign-pointer handles from crossing node boundaries or persisting into durable continuation snapshots: network classification rejects them, direct wire encoding does not disclose native address bits, and save/restore maps them to nil while rejecting forged legacy raw pointer tags.
 - Encode returned native `VoidPtr` and copied `CStr` allocations with a distinct opaque foreign-pointer value tag. These addresses no longer impersonate `ActorHeap` objects and may only be dereferenced by explicitly unsafe FFI adapters with valid lifetime guarantees.
 - Preserve native pointer round-trips and the VM's C-string copy-and-free contract. Reject both heap and foreign pointer tags when decoding externally supplied raw `Value` bits.
 - A native regression reproduced a `SIGABRT` from a valid foreign pointer being read as a heap header; the same regression passes after the correction. This adds a tagged-value ABI variant; backend/FFI interoperability and security review remain required before release.
