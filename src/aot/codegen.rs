@@ -3187,9 +3187,9 @@ fn compile_const(
                 Ok(emit_tag_int(builder, iconst_val))
             }
         }
-        crate::bytecode::Constant::Float(f) => {
-            Ok(builder.ins().iconst(types::I64, f.to_bits() as i64))
-        }
+        crate::bytecode::Constant::Float(f) => Ok(builder
+            .ins()
+            .iconst(types::I64, crate::value_layout::float_bits(*f) as i64)),
         crate::bytecode::Constant::Bool(b) => Ok(builder
             .ins()
             .iconst(types::I64, TAG_BOOL_I64 | if *b { 1 } else { 0 })),
@@ -3677,6 +3677,28 @@ mod tests {
         let func = builder.build();
         assert!(func.type_metadata.is_empty());
         assert_eq!(func.name, "empty");
+    }
+
+    #[test]
+    fn test_aot_float_constant_nan_must_not_mint_pointer_tag() {
+        let forged = f64::from_bits(crate::value_layout::TAG_PTR | 0x1234);
+        let mut builder = mir::FunctionBuilder::new("__main", Some(crate::types::Type::float()));
+        let tmp = builder.add_temp(crate::types::Type::float());
+        builder.assign(
+            tmp,
+            mir::RValue::Const(crate::bytecode::Constant::Float(forged)),
+        );
+        builder.terminate(mir::Terminator::Return(Some(tmp)));
+        let mut module = mir::Module::new("aot_nan_constant_provenance");
+        module.functions.push(builder.build());
+
+        let aot = crate::aot::AotModule::compile(&module).expect("AOT compile");
+        let raw = aot.run().expect("AOT execution");
+        assert_eq!(
+            raw,
+            crate::value_layout::CANONICAL_NAN_BITS,
+            "native AOT must not reinterpret floating NaN payloads as heap pointers"
+        );
     }
 
     #[test]
