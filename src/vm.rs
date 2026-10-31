@@ -1555,7 +1555,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                     #[cfg(feature = "ureq")]
                     {
                         match ureq::get(&url).call() {
-                            Ok(response) => match response.into_string() {
+                            Ok(mut response) => match response.body_mut().read_to_string() {
                                 Ok(body) => {
                                     let bytes = body.into_bytes();
                                     match self.heap.alloc(bytes.len() + 1, HeapTypeTag::String) {
@@ -1613,8 +1613,8 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         .unwrap_or_default();
                     #[cfg(feature = "ureq")]
                     {
-                        match ureq::post(&url).send_string(&body) {
-                            Ok(response) => match response.into_string() {
+                        match ureq::post(&url).send(&body) {
+                            Ok(mut response) => match response.body_mut().read_to_string() {
                                 Ok(body) => {
                                     let bytes = body.into_bytes();
                                     match self.heap.alloc(bytes.len() + 1, HeapTypeTag::String) {
@@ -3955,7 +3955,13 @@ impl VM {
                     // caller so the outer region resumes on the correct frame.
                     self.frames.truncate(caller_idx + 1);
                     self.current_frame_idx = Some(caller_idx);
-                    crate::jit::runtime::set_jit_pending_vm_error(e.to_string());
+                    // The outer VM step adds the RuntimeError location/prefix.
+                    // Preserve the inner payload to avoid double-wrapping errors.
+                    let message = match e {
+                        NuError::RuntimeError { msg, .. } => msg,
+                        other => other.to_string(),
+                    };
+                    crate::jit::runtime::set_jit_pending_vm_error(message);
                     break 1;
                 }
             }
