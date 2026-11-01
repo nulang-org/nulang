@@ -136,6 +136,40 @@ def assert_emissions_equal(case_id: str, host_hex: bytes, self_hex: bytes) -> No
     )
 
 
+def compiler_prefix_source(prepared: bytes) -> bytes:
+    """Keep all preceding compiler helpers and the exact curried instr body.
+
+    Removing a source declaration perturbs register layout, so this probe
+    preserves the original preprocessor output until the next top-level let.
+    """
+    text = prepared.decode('utf-8')
+    boundary = ' in let emit_word ='
+    if (not text.startswith('let main = fn() => (let ')
+            or text.count(boundary) != 1
+            or text.count(' in let instr =') != 1):
+        raise ValueError('compiler prefix markers missing or ambiguous')
+    return (text.split(boundary, 1)[0] +
+            ' in instr(82)(25)(7)(0)) in main()').encode('utf-8')
+
+
+def verify_compiler_prefix(nulang: Path, stage2_path: Path,
+                           prepared: bytes, work: Path) -> str:
+    """Check host/self-compiled parity for the exact leading compiler context."""
+    source = compiler_prefix_source(prepared)
+    host_hex = run([str(nulang), 'bootstrap/compile_hex.nula'], source)
+    stage2_hex = run([str(nulang), str(stage2_path)], source)
+    assert_emissions_equal('compiler_prefix', host_hex, stage2_hex)
+    for name, emission in (('stage1', host_hex), ('stage2', stage2_hex)):
+        binary = work / f'compiler_prefix-{name}.nbc'
+        binary.write_bytes(assemble(emission))
+        result = last_result(run([str(nulang), str(binary)]).decode('utf-8'))
+        if result != '1377371904':
+            raise AssertionError(
+                f'compiler_prefix {name}: expected 1377371904, got {result!r}'
+            )
+    return 'compiler-prefix contextual parity: 1377371904 in both generations'
+
+
 def verify_fixed_point(nulang: Path, prepared: bytes, stage2: bytes, work: Path,
                        stage1_hex: bytes | None = None) -> None:
     """Require the restricted compiler built by Stage 1 to reproduce its own artifact.
@@ -172,6 +206,12 @@ def verify_fixed_point(nulang: Path, prepared: bytes, stage2: bytes, work: Path,
                 )
             else:
                 details += '; normalized compiler emissions match (fixup/metadata divergence)'
+        if stage1_hex is not None:
+            try:
+                prefix_result = verify_compiler_prefix(nulang, stage2_path, prepared, work)
+                details += f'; {prefix_result}'
+            except (AssertionError, RuntimeError, ValueError, UnicodeError) as exc:
+                details += f'; compiler-prefix probe failed: {exc}'
         raise AssertionError(
             'bootstrap fixed-point mismatch: '
             f'Stage 2 {len(stage2)} bytes sha256={first}, '

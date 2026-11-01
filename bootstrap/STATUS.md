@@ -59,6 +59,24 @@ bootstrap. Stage 3 here is a compiler **generation**, not the independent
 minimal Core VM proposed by the language roadmap. Byte identity is stronger
 than six matching expression outputs, but not full-language compiler parity.
 
+## Exact compiler-prefix context probe (diagnostic only)
+
+The hosted exact-head run for draft #2471 at `e533295af` passed all **nine**
+Stage 1/Stage 2 execution cases (including scalar, single-closure and
+four-curried `instr` arithmetic), but the full Stage 2 → Stage 3 compiler
+still failed at emitted instruction word 639. These successful isolated
+cases do not validate the complete compiler's environment/register layout.
+
+When the full `.nbc` fixed-point fails, `verify_differential.py` now extracts
+the real preprocessed compiler source through the *end* of `instr`, keeping
+all preceding top-level helper definitions intact, and replaces later helpers
+with a call to `instr(82)(25)(7)(0)`. It compiles the same prefix under both
+compiler generations, compares exact normalized instruction streams, and
+executes both generated `.nbc` artifacts expecting `1377371904`. The result
+is attached to the **still-failing** fixed-point error, never used to accept
+mismatching artifacts. This is a source-context isolation experiment, not a
+compiler/allocator fix or a replacement for required bootstrap/security gates.
+
 ## Experimental Nulang-native word-patch slice
 
 `bootstrap/fixup_words.nula` is a small standalone Core program for encoding

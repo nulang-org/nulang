@@ -119,6 +119,60 @@ class DifferentialContractTests(unittest.TestCase):
     def test_corpus_emissions_allow_comments_to_differ(self):
         self.module.assert_emissions_equal('equal_case', b'; foo\n11111111\n', b'; bar\n11111111\n')
 
+    def test_compiler_prefix_probe_keeps_earlier_source_bindings(self):
+        prepared = b'let main = fn() => (let low17 = fn(x) => x in let instr = fn(opcode) => opcode in let emit_word = fn(x) => x in 0) in main()'
+        self.assertEqual(
+            self.module.compiler_prefix_source(prepared),
+            b'let main = fn() => (let low17 = fn(x) => x in let instr = fn(opcode) => opcode in instr(82)(25)(7)(0)) in main()'
+        )
+
+    def test_compiler_prefix_probe_extracts_real_preprocessed_compiler(self):
+        source = (self.module.ROOT / 'bootstrap/compile_hex.nula').read_bytes()
+        prepared = self.module.run([sys.executable, 'bootstrap/prep_core.py'], source)
+        prefix = self.module.compiler_prefix_source(prepared).decode('utf-8')
+        self.assertTrue(prefix.startswith('let main = fn() => (let low17 ='))
+        self.assertIn('let instr = fn(opcode) => fn(op1) => fn(op2) => fn(op3)', prefix)
+        self.assertTrue(prefix.endswith('in instr(82)(25)(7)(0)) in main()'))
+        self.assertNotIn(' in let emit_word =', prefix)
+
+    def test_compiler_prefix_probe_fails_on_missing_anchor(self):
+        with self.assertRaisesRegex(ValueError, 'compiler prefix'):
+            self.module.compiler_prefix_source(b'let instr = fn(x) => x in 0')
+
+    def test_compiler_prefix_probe_runs_both_generations_and_rejects_different_emission(self):
+        prepared = b'let main = fn() => (let low17 = fn(x) => x in let instr = fn(opcode) => opcode in let emit_word = fn(x) => x in 0) in main()'
+        with tempfile.TemporaryDirectory() as temp:
+            work = pathlib.Path(temp)
+            stage2 = work / 'stage2.nbc'
+            stage2.write_bytes(b'stage2')
+            with mock.patch.object(self.module, 'run', side_effect=[b'11111111\n', b'22222222\n']) as runner:
+                with self.assertRaisesRegex(AssertionError, 'compiler_prefix.*word 0'):
+                    self.module.verify_compiler_prefix(pathlib.Path('/example/nulang'), stage2, prepared, work)
+            self.assertEqual(runner.call_count, 2)
+            self.assertEqual(runner.call_args.args[1], self.module.compiler_prefix_source(prepared))
+
+    def test_compiler_prefix_probe_executes_both_assembled_generations(self):
+        prepared = b'let main = fn() => (let low17 = fn(x) => x in let instr = fn(opcode) => opcode in let emit_word = fn(x) => x in 0) in main()'
+        with tempfile.TemporaryDirectory() as temp:
+            work = pathlib.Path(temp)
+            stage2_path = work / 'stage2.nbc'
+            stage2_path.write_bytes(b'stage2')
+            outputs = [b'11111111\n', b'; comments differ\n11111111\n',
+                       b'1377371904\n', b'1377371904\n']
+            def command_result(cmd, source=b''):
+                if len(cmd) == 2 and cmd[1].endswith('.nbc') and cmd[1] != str(stage2_path):
+                    return outputs.pop(0)
+                return outputs.pop(0)
+            with mock.patch.object(self.module, 'run', side_effect=command_result) as runner:
+                with mock.patch.object(self.module, 'assemble', return_value=b'nbc'):
+                    report = self.module.verify_compiler_prefix(
+                        pathlib.Path('/example/nulang'), stage2_path, prepared, work)
+            self.assertIn('1377371904', report)
+            self.assertEqual(runner.call_count, 4)
+            self.assertEqual(outputs, [])
+            self.assertTrue((work / 'compiler_prefix-stage1.nbc').exists())
+            self.assertTrue((work / 'compiler_prefix-stage2.nbc').exists())
+
     def test_first_difference_detects_changed_and_missing_bytes(self):
         self.assertEqual(self.module.first_difference(b'ABCD', b'ABXD'), 2)
         self.assertEqual(self.module.first_difference(b'ABCD', b'AB'), 2)
