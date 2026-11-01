@@ -617,6 +617,17 @@ mod tests {
     }
 
     #[test]
+    fn test_named_effect_row_callback_propagation() {
+        let same = "fn apply(f: (Int) -> Int ! {| row}) -> Int ! {| row} { f(1) }";
+        let different = "fn apply(f: (Int) -> Int ! {| callback}) -> Int ! {| outer} { f(1) }";
+        check_module_effects(same).expect("same row name must permit callback propagation");
+        assert!(
+            check_module_effects(different).is_err(),
+            "unrelated row tails must remain rejected"
+        );
+    }
+
+    #[test]
     fn test_pure_fn_calling_io_fn_rejected() {
         // Finding: a function declared pure (`! {}`) that calls a function
         // performing IO must be rejected statically (SPEC2 §4.7/§4.9); the
