@@ -449,17 +449,10 @@ fn mgu(t1: &Type, t2: &Type, span: Span) -> NuResult<Substitution> {
     if t1 == t2 {
         return Ok(vec![]);
     }
-    // NTIR erases opaque nominal wrappers to their underlying type, so two
-    // ground types that differ only by opacity must not short-circuit here.
-    // Let the Type::Nominal cases below enforce the opacity contract.
-    if !matches!(t1, Type::Nominal { .. })
-        && !matches!(t2, Type::Nominal { .. })
-        && t1.is_ground()
-        && t2.is_ground()
-        && t1.to_ntir().hash() == t2.to_ntir().hash()
-    {
-        return Ok(vec![]);
-    }
+    // NTIR hashes are intentionally lossy: function effects, some scalar
+    // distinctions, and nominal wrappers are erased for structural hashing.
+    // A matching NTIR hash is therefore NOT proof of type equality, even for
+    // ground types. Only structural unification below may discharge mgu.
 
     match (t1, t2) {
         // Identical primitives unify trivially
@@ -5010,6 +5003,65 @@ mod tests {
         let s = mgu(&f1, &f2, sp()).unwrap();
         let result = apply_subst(&Type::Var(v2), &s);
         assert_eq!(result, Type::int());
+    }
+
+    #[test]
+    fn test_mgu_ground_function_effects_are_not_erased_by_ntir_hash() {
+        let pure = Type::Function {
+            param: Box::new(Type::unit()),
+            ret: Box::new(Type::unit()),
+            effect: EffectRow::empty(),
+            cap: Capability::Ref,
+        };
+        let io = Type::Function {
+            param: Box::new(Type::unit()),
+            ret: Box::new(Type::unit()),
+            effect: EffectRow::singleton(Effect::IO),
+            cap: Capability::Ref,
+        };
+        // NTIR's structural hash intentionally omits effect rows; it must
+        // never be used to establish equality in the source type unifier.
+        assert_eq!(pure.to_ntir().hash(), io.to_ntir().hash());
+        assert!(mgu(&pure, &io, sp()).is_err());
+        assert!(mgu(&io, &pure, sp()).is_err());
+        assert!(mgu(&pure, &pure, sp()).is_ok());
+    }
+
+    #[test]
+    fn test_mgu_ground_function_nested_effects_are_not_erased() {
+        let callback = |effect| Type::Function {
+            param: Box::new(Type::unit()),
+            ret: Box::new(Type::unit()),
+            effect,
+            cap: Capability::Ref,
+        };
+        let expected = Type::Record(vec![("callback".to_string(), callback(EffectRow::empty()))]);
+        let actual = Type::Record(vec![(
+            "callback".to_string(),
+            callback(EffectRow::singleton(Effect::FS)),
+        )]);
+        assert!(mgu(&actual, &expected, sp()).is_err());
+    }
+
+    #[test]
+    fn test_mgu_ground_nil_and_unit_remain_distinct() {
+        // NTIR intentionally maps several scalar types to one hash, which
+        // must not make those scalar types interchangeable in the unifier.
+        assert_eq!(Type::nil().to_ntir().hash(), Type::unit().to_ntir().hash());
+        assert!(mgu(&Type::nil(), &Type::unit(), sp()).is_err());
+    }
+
+    #[test]
+    fn test_check_src_rejects_effectful_callback_in_pure_parameter() {
+        let source = r#"
+            fn only_io() -> Unit ! {IO} { perform IO.print("only io") }
+            fn accepts_pure(cb: () -> Unit ! {}) -> Unit { cb() }
+            accepts_pure(only_io)
+        "#;
+        assert!(
+            check_src(source).is_err(),
+            "an IO callback cannot satisfy a pure callback signature"
+        );
     }
 
     #[test]
