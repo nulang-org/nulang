@@ -62,7 +62,8 @@ class DifferentialContractTests(unittest.TestCase):
             corpus.write_text(json.dumps([{'id': 'seven', 'source': '7', 'expected': '7'}]))
             inspected = []
 
-            def check_workspace(_nulang, _prepared, _stage2, work):
+            def check_workspace(_nulang, _prepared, _stage2, work, stage1_hex=None):
+                self.assertEqual(stage1_hex, b'7\n')
                 self.assertTrue(work.is_dir(), 'Stage 3 attempted after workspace cleanup')
                 self.assertTrue((work / 'self_compile.nbc').is_file())
                 inspected.append(work)
@@ -73,6 +74,25 @@ class DifferentialContractTests(unittest.TestCase):
                         self.module.verify(pathlib.Path('/example/nulang'), corpus, fixed_point=True)
             self.assertEqual(len(inspected), 1)
             self.assertFalse(inspected[0].exists(), 'workspace should be cleaned after verification')
+
+    def test_first_difference_detects_changed_and_missing_bytes(self):
+        self.assertEqual(self.module.first_difference(b'ABCD', b'ABXD'), 2)
+        self.assertEqual(self.module.first_difference(b'ABCD', b'AB'), 2)
+        self.assertEqual(self.module.first_difference(b'ABC', b'ABC'), -1)
+
+    def test_fixed_point_mismatch_identifies_first_emitted_word(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(self.module, 'run', return_value=b'; comment\n00112244\n'):
+                with mock.patch.object(self.module, 'assemble', return_value=b'ABCE'):
+                    with self.assertRaisesRegex(AssertionError, 'first differing compiled byte at offset 3') as error:
+                        self.module.verify_fixed_point(
+                            pathlib.Path('/example/nulang'), b'prepared compiler',
+                            b'ABCD', pathlib.Path(tmp),
+                            stage1_hex=b'; comment\n00112233\n'
+                        )
+            self.assertIn('first differing emitted hex character at offset 6', str(error.exception))
+            self.assertIn('Stage 1 word=00112233', str(error.exception))
+            self.assertIn('Stage 2 word=00112244', str(error.exception))
 
     def test_third_generation_compiles_prepared_compiler_source(self):
         with tempfile.TemporaryDirectory() as tmp:

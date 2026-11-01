@@ -32,8 +32,17 @@ Stage 2's `.nbc` artifact, assembles Stage 3, and requires the **complete
 binary `.nbc` artifacts to match byte for byte**. SHA-256 digests and lengths
 are emitted when they differ. The dedicated bootstrap workflow deliberately
 runs this separately, so a failure cannot be mistaken for passing conformance.
-The check is experimental and the exact-head executable outcome must be
-observed before promotion. Unit tests alone do not establish it passes.
+The first successful *execution* of this oracle on GitHub head `8a63f6649`
+(2026-11-01, after correcting the temp-workspace lifetime bug) **failed**:
+Stage 2 compiled `.nbc` was 108,678 bytes, Stage 3 was 108,538 bytes, and
+SHA-256 hashes differed. The existing six-case differential corpus and
+seven-stage bootstrap checks passed on the same exact head, which does **not**
+resolve the fixed-point divergence. Do not promote this gate or claim compiler
+self-hosting until the mismatch is explained and resolved.
+
+The next diagnostic revision reports the first differing output byte and,
+when the compiler emissions differ, the first differing normalized hex word.
+These diagnostics are only for investigation; the oracle still fails closed.
 
 This is a reproducibility check of the restricted compiler only: the Python
 preprocessor/fixup/serialization and Rust-hosted VM remain in the trusted

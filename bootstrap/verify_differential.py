@@ -75,7 +75,16 @@ def assemble(hex_stream: bytes) -> bytes:
 
 
 
-def verify_fixed_point(nulang: Path, prepared: bytes, stage2: bytes, work: Path) -> None:
+def first_difference(left: bytes | str, right: bytes | str) -> int:
+    """First differing index, including at EOF when one value is a prefix."""
+    for offset, (a, b) in enumerate(zip(left, right)):
+        if a != b:
+            return offset
+    return min(len(left), len(right)) if len(left) != len(right) else -1
+
+
+def verify_fixed_point(nulang: Path, prepared: bytes, stage2: bytes, work: Path,
+                       stage1_hex: bytes | None = None) -> None:
     """Require the restricted compiler built by Stage 1 to reproduce its own artifact.
 
     The Rust-hosted VM still executes both generations, and Python still
@@ -83,14 +92,31 @@ def verify_fixed_point(nulang: Path, prepared: bytes, stage2: bytes, work: Path)
     """
     stage2_path = work / 'self_compile.nbc'
     stage2_path.write_bytes(stage2)
-    stage3 = assemble(run([str(nulang), str(stage2_path)], prepared))
+    stage2_hex = run([str(nulang), str(stage2_path)], prepared)
+    stage3 = assemble(stage2_hex)
     if stage3 != stage2:
         first = hashlib.sha256(stage2).hexdigest()
         next_ = hashlib.sha256(stage3).hexdigest()
+        byte_offset = first_difference(stage2, stage3)
+        details = f'; first differing compiled byte at offset {byte_offset}'
+        if stage1_hex is not None:
+            host = instructions(stage1_hex.decode('utf-8'))
+            self_hosted = instructions(stage2_hex.decode('utf-8'))
+            hex_offset = first_difference(host, self_hosted)
+            if hex_offset >= 0:
+                word_start = hex_offset // 8 * 8
+                details += (
+                    f'; first differing emitted hex character at offset {hex_offset}'
+                    f' (word {hex_offset // 8}); '
+                    f'Stage 1 word={host[word_start:word_start + 8]!s}; '
+                    f'Stage 2 word={self_hosted[word_start:word_start + 8]!s}'
+                )
+            else:
+                details += '; normalized compiler emissions match (fixup/metadata divergence)'
         raise AssertionError(
             'bootstrap fixed-point mismatch: '
             f'Stage 2 {len(stage2)} bytes sha256={first}, '
-            f'Stage 3 {len(stage3)} bytes sha256={next_}'
+            f'Stage 3 {len(stage3)} bytes sha256={next_}{details}'
         )
     print(f'PASS bootstrap fixed-point: {len(stage2)} byte-identical bytes', flush=True)
 
@@ -101,7 +127,8 @@ def verify(nulang: Path, corpus: Path, fixed_point: bool = False) -> None:
     # Only the already-built Rust host binary executes the bootstrap programs.
     prepared = run([sys.executable, 'bootstrap/prep_core.py'],
                    (ROOT / 'bootstrap/compile_hex.nula').read_bytes())
-    stage2 = assemble(run([str(nulang), 'bootstrap/compile_hex.nula'], prepared))
+    stage1_hex = run([str(nulang), 'bootstrap/compile_hex.nula'], prepared)
+    stage2 = assemble(stage1_hex)
     with tempfile.TemporaryDirectory(prefix='nulang-bootstrap-') as work:
         stage2_path = Path(work) / 'self_compile.nbc'
         stage2_path.write_bytes(stage2)
@@ -121,7 +148,7 @@ def verify(nulang: Path, corpus: Path, fixed_point: bool = False) -> None:
                     )
             print(f'PASS {case["id"]}: both generations returned {case["expected"]}', flush=True)
         if fixed_point:
-            verify_fixed_point(nulang, prepared, stage2, Path(work))
+            verify_fixed_point(nulang, prepared, stage2, Path(work), stage1_hex=stage1_hex)
     print(f'PASS bootstrap differential corpus: {len(cases)} cases', flush=True)
 
 
