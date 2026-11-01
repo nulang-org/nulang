@@ -59,6 +59,19 @@ bootstrap. Stage 3 here is a compiler **generation**, not the independent
 minimal Core VM proposed by the language roadmap. Byte identity is stronger
 than six matching expression outputs, but not full-language compiler parity.
 
+## Isolated dead-helper pruning candidate (draft)
+
+The first distinct compiler emission at word 639 is inside the `instr`
+helper, following the `; const 16777216` marker. `instr` has no callers in
+`compile_hex.nula` or `compiler_core.nula`; the active output path uses
+`emit_word` instead. Because the preprocessor compiles even unused top-level
+functions into the self-host compiler artifact, an isolated experiment
+removes this dead declaration and adds a source contract. This does **not**
+change any active call site but can still affect compilation and register
+layout. It is not evidence of a repaired compiler until real exact-head
+seven-stage and full fixed-point CI run successfully; if the mismatch moves,
+retain the diagnostic failure and investigate that next location.
+
 ## Experimental Nulang-native word-patch slice
 
 `bootstrap/fixup_words.nula` is a small standalone Core program for encoding

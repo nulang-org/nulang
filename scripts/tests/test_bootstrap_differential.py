@@ -87,6 +87,12 @@ class DifferentialContractTests(unittest.TestCase):
             '@0 ; if | @1 ; JmpF -> else | @2 ; else:',
         )
 
+    def test_compiler_source_omits_unused_instr_helper(self):
+        # A dead helper still becomes closure bytecode in the self-host chain.
+        # The full Stage 2/Stage 3 executable oracle remains authoritative.
+        source = (self.module.ROOT / 'bootstrap/compile_hex.nula').read_text()
+        self.assertNotIn('fn instr(', source)
+
     def test_emission_context_shows_numbered_words_near_divergence(self):
         self.assertEqual(
             self.module.emission_context('11111111222222223333333344444444', 2, radius=1),

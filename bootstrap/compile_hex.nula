@@ -60,18 +60,6 @@ fn emit_hex(w: Int) {
     )
 }
 
-// Encode instruction: opcode<<24 | op1<<16 | op2<<8 | op3
-
-fn instr(opcode: Int, op1: Int, op2: Int, op3: Int) -> Int {
-    // Each product is computed and immediately summed into a fresh
-    // accumulator; the accumulator chain never aliases an operand staging
-    // register the way a flat (a*b)+(c*d)+(e*f)+g chain does.
-    let hi = opcode * 16777216;
-    let acc1 = hi + op1 * 65536;
-    let acc2 = acc1 + op2 * 256;
-    acc2 + op3
-}
-
 fn emit_word(opcode: Int, op1: Int, op2: Int, op3: Int) -> Int {
     emit_hex(opcode * 0x1000000 + op1 * 0x10000 + op2 * 0x100 + op3);
     0
