@@ -107,3 +107,11 @@ run, and repeated raw emissions were byte-identical within each generation.
 The fixed-point oracle and this regression must remain failing until a real
 fix is demonstrated. The Rust host and Python bootstrap tooling remain part
 of the trusted path.
+
+A smaller closed case, `let a = 82 in let b = 25 in a * 10 + b`,
+returns 845 from the host generation and 820 from the self-compiled
+generation. Its emitted stream omits `12c90e00` (Move from the saved `b`
+register to the arithmetic operand) after the multiplication. Simple
+addition and `a + b * 2` produced matching emissions and correct values in
+the same experiment. This narrows the failure to state after compiling a
+left-hand multiplication; it does not establish why the Move is omitted.
