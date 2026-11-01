@@ -44,6 +44,15 @@ The next diagnostic revision reports the first differing output byte and,
 when the compiler emissions differ, the first differing normalized hex word.
 These diagnostics are only for investigation; the oracle still fails closed.
 
+The next exact-head diagnostic result (commit `c83f7cb7`, hosted job
+`124986720733`) localized the first emitted instruction mismatch to **word
+639**: Stage 1 `12192100` (register Move) versus Stage 2 `07000022`
+(constant load). The first compiled-byte difference at offset 47 is in the
+`.nbc` instruction-count header, consistent with the unequal instruction
+streams. This is **not merely a serializer difference**. The current follow-up
+prints bounded neighboring instruction words plus nearby compiler-emitted
+markers to identify the source branch without changing code generation.
+
 This is a reproducibility check of the restricted compiler only: the Python
 preprocessor/fixup/serialization and Rust-hosted VM remain in the trusted
 bootstrap. Stage 3 here is a compiler **generation**, not the independent

@@ -83,6 +83,38 @@ def first_difference(left: bytes | str, right: bytes | str) -> int:
     return min(len(left), len(right)) if len(left) != len(right) else -1
 
 
+def emission_context(hex_text: str, target_word: int, radius: int = 6) -> str:
+    """Bounded, word-indexed context for a compiler-generation divergence."""
+    count = (len(hex_text) + 7) // 8
+    begin = max(0, target_word - radius)
+    end = min(count, target_word + radius + 1)
+    entries = []
+    for index in range(begin, end):
+        word = hex_text[index * 8:(index + 1) * 8]
+        value = f'[{word}]' if index == target_word else word
+        entries.append(f'{index}:{value}')
+    if target_word >= count:
+        entries.append(f'{target_word}:[<eof>]')
+    return ' '.join(entries)
+
+
+def marker_context(raw_emission: str, target_word: int, limit: int = 3) -> str:
+    """Nearest comments preceding an instruction, with their word offsets."""
+    word_index = 0
+    recent = []
+    for line in raw_emission.splitlines():
+        if line.startswith(';'):
+            if word_index > target_word:
+                break
+            recent.append(f'@{word_index} {line[:100]}')
+            recent = recent[-limit:]
+        elif line.strip():
+            if word_index >= target_word:
+                break
+            word_index += 1
+    return ' | '.join(recent) or '<none>'
+
+
 def verify_fixed_point(nulang: Path, prepared: bytes, stage2: bytes, work: Path,
                        stage1_hex: bytes | None = None) -> None:
     """Require the restricted compiler built by Stage 1 to reproduce its own artifact.
@@ -109,7 +141,13 @@ def verify_fixed_point(nulang: Path, prepared: bytes, stage2: bytes, work: Path,
                     f'; first differing emitted hex character at offset {hex_offset}'
                     f' (word {hex_offset // 8}); '
                     f'Stage 1 word={host[word_start:word_start + 8]!s}; '
-                    f'Stage 2 word={self_hosted[word_start:word_start + 8]!s}'
+                    f'Stage 2 word={self_hosted[word_start:word_start + 8]!s}; '
+                    f'Stage 1 nearby: {emission_context(host, hex_offset // 8)}; '
+                    f'Stage 2 nearby: {emission_context(self_hosted, hex_offset // 8)}; '
+                    f'Stage 1 recent markers: '
+                    f'{marker_context(stage1_hex.decode("utf-8"), hex_offset // 8)}; '
+                    f'Stage 2 recent markers: '
+                    f'{marker_context(stage2_hex.decode("utf-8"), hex_offset // 8)}'
                 )
             else:
                 details += '; normalized compiler emissions match (fixup/metadata divergence)'
