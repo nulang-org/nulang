@@ -47,3 +47,5 @@ jobs:
           NULANG_BIN=/tmp/cargo-target/debug/nulang bash bootstrap/verify.sh
       - name: Differential bootstrap corpus (host vs self-compiled)
         run: python3 bootstrap/verify_differential.py --nulang /tmp/cargo-target/debug/nulang
+      - name: Experimental compiler fixed-point oracle (Stage 2 to Stage 3)
+        run: python3 bootstrap/verify_differential.py --nulang /tmp/cargo-target/debug/nulang --fixed-point

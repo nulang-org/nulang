@@ -6,6 +6,7 @@ This is *bootstrap-generation* parity, not Rust-frontend or full-language parity
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -73,7 +74,28 @@ def assemble(hex_stream: bytes) -> bytes:
     return binary
 
 
-def verify(nulang: Path, corpus: Path) -> None:
+
+def verify_fixed_point(nulang: Path, prepared: bytes, stage2: bytes, work: Path) -> None:
+    """Require the restricted compiler built by Stage 1 to reproduce its own artifact.
+
+    The Rust-hosted VM still executes both generations, and Python still
+    prepares/assembles the input. This does not prove host independence.
+    """
+    stage2_path = work / 'self_compile.nbc'
+    stage2_path.write_bytes(stage2)
+    stage3 = assemble(run([str(nulang), str(stage2_path)], prepared))
+    if stage3 != stage2:
+        first = hashlib.sha256(stage2).hexdigest()
+        next_ = hashlib.sha256(stage3).hexdigest()
+        raise AssertionError(
+            'bootstrap fixed-point mismatch: '
+            f'Stage 2 {len(stage2)} bytes sha256={first}, '
+            f'Stage 3 {len(stage3)} bytes sha256={next_}'
+        )
+    print(f'PASS bootstrap fixed-point: {len(stage2)} byte-identical bytes', flush=True)
+
+
+def verify(nulang: Path, corpus: Path, fixed_point: bool = False) -> None:
     cases = load_cases(corpus)
     # Stage 2 requires the Nulang emitter to compile its preprocessed source.
     # Only the already-built Rust host binary executes the bootstrap programs.
@@ -98,6 +120,8 @@ def verify(nulang: Path, corpus: Path) -> None:
                         f'{case["id"]} ({generation}): expected {case["expected"]!r}, got {actual!r}'
                     )
             print(f'PASS {case["id"]}: both generations returned {case["expected"]}', flush=True)
+    if fixed_point:
+        verify_fixed_point(nulang, prepared, stage2, Path(work))
     print(f'PASS bootstrap differential corpus: {len(cases)} cases', flush=True)
 
 
@@ -105,13 +129,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--nulang', required=True, type=Path, help='path to built nulang binary')
     parser.add_argument('--corpus', type=Path, default=CORPUS)
+    parser.add_argument('--fixed-point', action='store_true',
+                        help='add the full restricted-compiler Stage 2 → Stage 3 byte-identity oracle')
     arguments = parser.parse_args()
     nulang = arguments.nulang.resolve()
     if not nulang.is_file():
         parser.error(f'nulang binary does not exist: {nulang}')
     os.environ.setdefault('NULANG_STEP_LIMIT', '400000000')
     try:
-        verify(nulang, arguments.corpus)
+        verify(nulang, arguments.corpus, fixed_point=arguments.fixed_point)
     except (AssertionError, RuntimeError, ValueError, UnicodeDecodeError) as error:
         print(f'FAIL bootstrap differential: {error}', file=sys.stderr)
         return 1

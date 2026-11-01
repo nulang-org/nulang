@@ -5,6 +5,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SCRIPT = pathlib.Path(__file__).resolve().parents[2] / 'bootstrap' / 'verify_differential.py'
 
@@ -54,6 +55,37 @@ class DifferentialContractTests(unittest.TestCase):
 
     def test_result_uses_final_nonempty_line(self):
         self.assertEqual(self.module.last_result('booted\n42\n'), '42')
+
+    def test_third_generation_compiles_prepared_compiler_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(self.module, 'run', return_value=b'generated hex') as run:
+                with mock.patch.object(self.module, 'assemble', return_value=b'compiled bytes'):
+                    self.module.verify_fixed_point(
+                        pathlib.Path('/example/nulang'), b'prepared compiler',
+                        b'compiled bytes', pathlib.Path(tmp)
+                    )
+            self.assertEqual(run.call_args.args[1], b'prepared compiler')
+            self.assertEqual(run.call_args.args[0][0], '/example/nulang')
+            self.assertEqual(run.call_args.args[0][1], str(pathlib.Path(tmp) / 'self_compile.nbc'))
+
+    def test_third_generation_rejects_different_bytecode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(self.module, 'run', return_value=b'generated hex'):
+                with mock.patch.object(self.module, 'assemble', return_value=b'different bytes'):
+                    with self.assertRaisesRegex(AssertionError, 'fixed.point'):
+                        self.module.verify_fixed_point(
+                            pathlib.Path('/example/nulang'), b'prepared compiler',
+                            b'compiled bytes', pathlib.Path(tmp)
+                        )
+
+    def test_third_generation_propagates_compiler_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(self.module, 'run', side_effect=RuntimeError('compiler exited 4')):
+                with self.assertRaisesRegex(RuntimeError, 'exited 4'):
+                    self.module.verify_fixed_point(
+                        pathlib.Path('/example/nulang'), b'prepared compiler',
+                        b'compiled bytes', pathlib.Path(tmp)
+                    )
 
 
 if __name__ == '__main__':
