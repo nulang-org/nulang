@@ -109,8 +109,14 @@ jobs:
         # nextest intentionally does not execute rustdoc tests.
         run: cargo test --locked --doc
 
-      - name: Test benchmark harness scripts
-        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+      - name: Test Python harness and Nulang-native bootstrap contracts
+        env:
+          # Cargo's checked-in config writes default-profile binaries here.
+          # Fail closed if the compiler binary is missing; never skip native tests.
+          NULANG_BIN: /tmp/cargo-target/debug/nulang
+        run: |
+          test -x "$NULANG_BIN"
+          python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
       - name: Install cargo-llvm-cov
         if: env.CODECOV_TOKEN != ''
