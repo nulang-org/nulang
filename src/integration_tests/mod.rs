@@ -10282,6 +10282,8 @@ match { a: 2, b: 9 } with {
             let mut backend = WasmBackend::new();
             let wasm = backend.compile(&module, "main").expect("wasm compile");
             let mut rt = crate::wasm_runtime::WasmRuntime::new(&wasm, None).expect("runtime");
+            rt.grant_registered_ffi_callback("wasm_double")
+                .expect("trusted host grant");
             let val = rt.run().expect("run");
             assert_eq!(val.as_int(), Some(42), "wasm_double(21) must be 42");
 
@@ -10343,6 +10345,8 @@ match { a: 2, b: 9 } with {
             let mut backend = WasmBackend::new();
             let wasm = backend.compile(&module, "main").expect("wasm compile");
             let mut rt = crate::wasm_runtime::WasmRuntime::new(&wasm, None).expect("runtime");
+            rt.grant_registered_ffi_callback("wasm_strlen")
+                .expect("trusted host grant");
             let val = rt.run().expect("run");
             assert_eq!(val.as_int(), Some(6), "wasm_strlen(\"nulang\") must be 6");
         }
