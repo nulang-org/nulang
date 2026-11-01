@@ -1349,7 +1349,7 @@ fn map_option[A, B](opt: Option[A], f: (A) -> B ! {| row}) -> Option[B] ! {| row
 }
 ```
 
-The function `map_option` preserves the effect row of its callback function `f`. If `f` is pure, `map_option` is pure. If `f` performs `Console` effects, so does `map_option`.
+The shared `row` name expresses that `map_option` passes through the effects of `f`. The current checker can accept a pure callback, but does not yet solve open-row constraints at call sites: an effectful callback may be rejected even when its effects are allowed by the caller. General effect-polymorphic invocation remains incomplete; see draft PR #1492. A rejected call must not be interpreted as proof that the effectful operation is unsafe.
 
 ### 4.5.3 Effect Row Subtyping
 
