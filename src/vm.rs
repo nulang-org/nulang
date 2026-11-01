@@ -1934,8 +1934,8 @@ pub struct Value {
 }
 
 use crate::value_layout::{
-    is_float_raw, sext48, tag_object, PAYLOAD_MASK, TAG_ACTOR, TAG_BOOL, TAG_CLOSURE, TAG_INT,
-    TAG_MASK, TAG_NIL, TAG_OBJECT, TAG_PTR, TAG_STRING, TAG_UNIT,
+    is_float_raw, sext48, tag_object, PAYLOAD_MASK, TAG_ACTOR, TAG_BOOL, TAG_CLOSURE,
+    TAG_FOREIGN_PTR, TAG_INT, TAG_MASK, TAG_NIL, TAG_OBJECT, TAG_PTR, TAG_STRING, TAG_UNIT,
 };
 
 impl Value {
@@ -1955,7 +1955,11 @@ impl Value {
 
     /// Create a float value.
     pub fn float(f: f64) -> Self {
-        Value { raw: f.to_bits() }
+        // All managed floats, including native FFI returns, must avoid
+        // NaN bit patterns reserved for pointer and other tagged Values.
+        Value {
+            raw: crate::value_layout::float_bits(f),
+        }
     }
 
     /// Create a boolean value.
@@ -2015,6 +2019,19 @@ impl Value {
         );
         Value {
             raw: TAG_PTR | p as u64,
+        }
+    }
+
+    /// Encode an opaque foreign pointer without granting VM heap ownership.
+    /// This is a non-owning handle; only explicitly unsafe native FFI APIs
+    /// may dereference it, subject to the caller's lifetime guarantees.
+    pub fn foreign_ptr(p: *mut u8) -> Self {
+        assert!(
+            crate::value_layout::ptr_fits_payload(p as u64),
+            "foreign pointer does not fit the 48-bit Value payload"
+        );
+        Value {
+            raw: TAG_FOREIGN_PTR | p as u64,
         }
     }
 
@@ -2092,6 +2109,21 @@ impl Value {
     pub fn is_ptr(&self) -> bool {
         (self.raw & TAG_MASK) == TAG_PTR
     }
+
+    /// A foreign pointer must never be treated as an actor-heap object.
+    pub fn is_foreign_ptr(&self) -> bool {
+        (self.raw & TAG_MASK) == TAG_FOREIGN_PTR
+    }
+
+    /// Opaque native address, for FFI use only; dereferencing still requires
+    /// the caller to satisfy the original C allocation's safety contract.
+    pub fn as_foreign_ptr(&self) -> Option<*mut u8> {
+        if self.is_foreign_ptr() {
+            Some((self.raw & PAYLOAD_MASK) as *mut u8)
+        } else {
+            None
+        }
+    }
     pub fn is_string(&self) -> bool {
         (self.raw & TAG_MASK) == TAG_STRING
     }
@@ -2154,7 +2186,7 @@ impl Value {
     /// transport as opaque values; `TAG_PTR` requires host provenance and is
     /// therefore rejected at untrusted boundaries.
     pub fn try_from_untrusted_bits(raw: u64) -> Result<Self, &'static str> {
-        if (raw & TAG_MASK) == TAG_PTR {
+        if matches!(raw & TAG_MASK, TAG_PTR | TAG_FOREIGN_PTR) {
             Err("pointer-tagged raw value has no Nulang host-heap provenance")
         } else {
             Ok(Value { raw })
@@ -3158,8 +3190,8 @@ impl VM {
         if value.is_nil() {
             return Ok(value);
         }
-        let ptr = value.as_ptr().ok_or_else(|| NuError::VMError {
-            msg: "FFI C string return was not a pointer".to_string(),
+        let ptr = value.as_foreign_ptr().ok_or_else(|| NuError::VMError {
+            msg: "FFI C string return was not a foreign pointer".to_string(),
             span: Span::default(),
         })?;
         // SAFETY: ptr is a valid null-terminated C string from cstr_to_value.
@@ -3955,7 +3987,13 @@ impl VM {
                     // caller so the outer region resumes on the correct frame.
                     self.frames.truncate(caller_idx + 1);
                     self.current_frame_idx = Some(caller_idx);
-                    crate::jit::runtime::set_jit_pending_vm_error(e.to_string());
+                    // The outer VM step adds the RuntimeError location/prefix.
+                    // Preserve the inner payload to avoid double-wrapping errors.
+                    let message = match e {
+                        NuError::RuntimeError { msg, .. } => msg,
+                        other => other.to_string(),
+                    };
+                    crate::jit::runtime::set_jit_pending_vm_error(message);
                     break 1;
                 }
             }

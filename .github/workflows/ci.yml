@@ -260,6 +260,13 @@ jobs:
     name: Build & Test (wasm-backend feature)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # Cranelift + Wasmtime test binaries can fill the hosted runner filesystem
+    # when both all-targets and test linking retain full DWARF and incremental
+    # state. Preserve both build and test coverage; omit only debug symbols.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v7
 
