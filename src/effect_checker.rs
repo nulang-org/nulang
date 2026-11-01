@@ -579,12 +579,23 @@ impl EffectChecker {
         self.fn_rows.get(name).cloned()
     }
 
+    /// Type and capability annotations do not execute or change the
+    /// underlying function. They must not erase the effects of its invocation.
+    fn callable_source(expr: &Expr) -> &Expr {
+        match expr {
+            Expr::TypeAnnotate { expr, .. } | Expr::CapAnnotate { expr, .. } => {
+                Self::callable_source(expr)
+            }
+            other => other,
+        }
+    }
+
     /// Resolve callable effects through a conditional expression as well as
     /// direct function names and annotated lambdas. A value-returning branch
     /// that is not proven callable must not be silently treated as pure when
     /// invoked; callers handle that unknown case conservatively.
     fn known_callable_expr_row(&self, expr: &Expr) -> Option<EffectRow> {
-        match expr {
+        match Self::callable_source(expr) {
             Expr::Var(name, _) => self.known_callable_row(name),
             Expr::Lambda {
                 effect: Some(effect),
@@ -669,7 +680,7 @@ impl EffectChecker {
                 }
                 if let Some(callee_row) = self.known_callable_expr_row(func) {
                     row = effect_row_union(&row, &callee_row);
-                } else if let Expr::Var(name, _) = func.as_ref() {
+                } else if let Expr::Var(name, _) = Self::callable_source(func) {
                     // An untyped local callback may perform arbitrary effects.
                     // Preserve that uncertainty as an unresolved tail: explicit
                     // closed effect contracts reject it, while unconstrained
@@ -685,7 +696,7 @@ impl EffectChecker {
                     {
                         row = effect_row_union(&row, &EffectRow::Open(vec![], Region::fresh()));
                     }
-                } else if matches!(func.as_ref(), Expr::If { .. }) {
+                } else if matches!(Self::callable_source(func), Expr::If { .. }) {
                     // A computed callable with an unproven branch cannot
                     // discharge a closed effect budget merely because
                     // evaluating its branch selector is pure.
@@ -703,12 +714,13 @@ impl EffectChecker {
                 // Capture only statically known callable provenance. An
                 // unrelated local binding remains an explicit shadow.
                 let callable = self.known_callable_expr_row(value).or_else(|| {
-                    if matches!(value.as_ref(), Expr::Lambda { .. }) {
+                    if matches!(Self::callable_source(value), Expr::Lambda { .. }) {
                         // An unannotated literal closure has already had its
                         // body inferred above. Retain that known row for calls
                         // through its local name, including proven-pure ones.
+                        // Transparent annotations cannot erase that proof.
                         Some(val_row.clone())
-                    } else if matches!(value.as_ref(), Expr::If { .. }) {
+                    } else if matches!(Self::callable_source(value), Expr::If { .. }) {
                         // Retain unknown callable provenance for computed
                         // aliases until inference can prove a closed budget.
                         Some(EffectRow::Open(vec![], Region::fresh()))
@@ -5207,6 +5219,178 @@ mod tests {
         assert!(
             checker.check_decl(&ast.decls[0]).is_ok(),
             "actor behavior can invoke an IO callback when the contract permits it"
+        );
+    }
+
+    #[test]
+    fn test_typed_callback_effect_cannot_escape_through_type_annotation() {
+        let cb_type = Type::Function {
+            param: Box::new(Type::Tuple(vec![])),
+            ret: Box::new(Type::unit()),
+            effect: EffectRow::singleton(Effect::IO),
+            cap: Capability::Ref,
+        };
+        let lambda = Expr::Lambda {
+            params: vec![Param::new("cb", Some(cb_type.clone()))],
+            ret_type: None,
+            body: Box::new(Expr::App {
+                func: Box::new(Expr::TypeAnnotate {
+                    expr: Box::new(Expr::Var("cb".to_string(), s())),
+                    ty: cb_type,
+                    span: s(),
+                }),
+                args: vec![],
+                span: s(),
+            }),
+            effect: Some(EffectRow::empty()),
+            span: s(),
+        };
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker
+                .infer_effects(&EffectContext::empty(), &lambda)
+                .is_err(),
+            "annotating a callback must not conceal its IO effect"
+        );
+    }
+
+    #[test]
+    fn test_typed_callback_effect_cannot_escape_through_cap_annotation() {
+        let cb_type = Type::Function {
+            param: Box::new(Type::Tuple(vec![])),
+            ret: Box::new(Type::unit()),
+            effect: EffectRow::singleton(Effect::FS),
+            cap: Capability::Ref,
+        };
+        let lambda = Expr::Lambda {
+            params: vec![Param::new("cb", Some(cb_type))],
+            ret_type: None,
+            body: Box::new(Expr::App {
+                func: Box::new(Expr::CapAnnotate {
+                    expr: Box::new(Expr::Var("cb".to_string(), s())),
+                    cap: Capability::Ref,
+                    span: s(),
+                }),
+                args: vec![],
+                span: s(),
+            }),
+            effect: Some(EffectRow::empty()),
+            span: s(),
+        };
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker
+                .infer_effects(&EffectContext::empty(), &lambda)
+                .is_err(),
+            "capability annotation must not conceal a callback's FS effect"
+        );
+    }
+
+    #[test]
+    fn test_pure_callback_through_nested_annotations_remains_pure() {
+        let cb_type = Type::Function {
+            param: Box::new(Type::Tuple(vec![])),
+            ret: Box::new(Type::unit()),
+            effect: EffectRow::empty(),
+            cap: Capability::Ref,
+        };
+        let lambda = Expr::Lambda {
+            params: vec![Param::new("cb", Some(cb_type.clone()))],
+            ret_type: None,
+            body: Box::new(Expr::App {
+                func: Box::new(Expr::TypeAnnotate {
+                    expr: Box::new(Expr::CapAnnotate {
+                        expr: Box::new(Expr::Var("cb".to_string(), s())),
+                        cap: Capability::Ref,
+                        span: s(),
+                    }),
+                    ty: cb_type,
+                    span: s(),
+                }),
+                args: vec![],
+                span: s(),
+            }),
+            effect: Some(EffectRow::empty()),
+            span: s(),
+        };
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker
+                .infer_effects(&EffectContext::empty(), &lambda)
+                .is_ok(),
+            "annotating a statically pure callback must remain legal"
+        );
+    }
+
+    #[test]
+    fn test_annotated_untyped_pure_lambda_binding_remains_pure() {
+        let pure = Type::Function {
+            param: Box::new(Type::Tuple(vec![])),
+            ret: Box::new(Type::unit()),
+            effect: EffectRow::empty(),
+            cap: Capability::Ref,
+        };
+        let value = Expr::TypeAnnotate {
+            expr: Box::new(Expr::Lambda {
+                params: vec![],
+                ret_type: None,
+                body: Box::new(Expr::Literal(Literal::Unit, s())),
+                effect: None,
+                span: s(),
+            }),
+            ty: pure,
+            span: s(),
+        };
+        let expr = Expr::Let {
+            name: "callback".into(),
+            ty: None,
+            value: Box::new(value),
+            body: Box::new(Expr::App {
+                func: Box::new(Expr::Var("callback".into(), s())),
+                args: vec![],
+                span: s(),
+            }),
+            mutable: false,
+            let_in: false,
+            span: s(),
+        };
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker
+                .check_effects(&EffectContext::empty(), &expr, &EffectRow::empty())
+                .is_ok(),
+            "a type annotation must not hide the body inference of a pure literal closure"
+        );
+    }
+
+    #[test]
+    fn test_unknown_callback_effect_cannot_escape_through_annotation() {
+        let lambda = Expr::Lambda {
+            params: vec![Param::new("cb", None)],
+            ret_type: None,
+            body: Box::new(Expr::App {
+                func: Box::new(Expr::TypeAnnotate {
+                    expr: Box::new(Expr::Var("cb".to_string(), s())),
+                    ty: Type::Function {
+                        param: Box::new(Type::Tuple(vec![])),
+                        ret: Box::new(Type::unit()),
+                        effect: EffectRow::empty(),
+                        cap: Capability::Ref,
+                    },
+                    span: s(),
+                }),
+                args: vec![],
+                span: s(),
+            }),
+            effect: Some(EffectRow::empty()),
+            span: s(),
+        };
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker
+                .infer_effects(&EffectContext::empty(), &lambda)
+                .is_err(),
+            "an untyped callback must remain unknown until sound type evidence proves otherwise"
         );
     }
 
