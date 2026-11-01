@@ -67,6 +67,21 @@ The reduced corpus case remains a required failing executable regression;
 Python fixture-contract tests passing do not certify the compiler. Diagnose
 why recursive operator compilation clobbers `elen` before any source fix.
 
+**Experimental register-count repair (local evidence, pending hosted CI).**
+The self-compiled `comp()` function could pass `elen=0` into an operator
+continuation while its encoded `env` still contained two 4-code-point
+bindings. Passing `String.length(env) / 4` at every recursive `comp()` call
+rather than forwarding the potentially clobbered count made the existing
+bound-variable fixture (57), nested-curried instruction arithmetic and the
+new `and`/`or` short-circuit cases agree across Stage 1 and Stage 2.
+The unchanged full-compiler fixed-point oracle then returned **108,950
+byte-identical bytes** in one local Fedora execution. This does not prove
+that the underlying register lifetime defect in the bootstrap-generated
+compiler is eliminated, nor does it prove an independent VM or removal of
+Python fixup. A freshly built exact-head hosted bootstrap run, all other
+required checks, security audit and parent-stack qualification remain gates.
+Do not merge on a local green result alone.
+
 This is a reproducibility check of the restricted compiler only: the Python
 preprocessor/fixup/serialization and Rust-hosted VM remain in the trusted
 bootstrap. Stage 3 here is a compiler **generation**, not the independent

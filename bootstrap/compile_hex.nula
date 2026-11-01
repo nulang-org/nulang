@@ -512,6 +512,9 @@ fn np_parse(comp_rec, src: String, pos: Int, len: Int, nr: Int, env: String, ele
 }
 
 fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env: String, elen: Int) -> Int {
+    // env_push encodes each binding as four code points. Re-derive the
+    // count at every recursive comp() call: self-compiled operator frames
+    // can clobber the forwarded elen register while preserving env itself.
     let no_left = 268435456 * 4096;
     let pair = if left == no_left then {
         let p = skip_ws(src, pos, len);
@@ -532,7 +535,7 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                 };
                 (nr << 18) + q
             } else if c == 40 then {
-                let inner = comp(src, p + 1, len, no_left, 0 - 1, nr, env, elen);
+                let inner = comp(src, p + 1, len, no_left, 0 - 1, nr, env, (perform String.length(env)) / 4);
                 let rv = inner >> 18;
                 let rp = low17(inner);
                 let q2 = skip_ws(src, rp, len);
@@ -620,7 +623,7 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                     comp_fn_parse(comp, src, pos, len, nr, env, elen, no_left, p, q)
                 } else if h == 3987 then {
                     // if
-                    let cond = comp(src, q, len, no_left, 0 - 1, nr, env, elen);
+                    let cond = comp(src, q, len, no_left, 0 - 1, nr, env, (perform String.length(env)) / 4);
                     let cr = cond >> 18;
                     let cp = low17(cond);
                     let cnext = nr + 1;
@@ -656,7 +659,7 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                         };
                         remark("then:");
                         let nxt_t = nr + 1;
-                        let then_body = comp(src, tp, len, no_left, 0 - 1, nxt_t, env, elen);
+                        let then_body = comp(src, tp, len, no_left, 0 - 1, nxt_t, env, (perform String.length(env)) / 4);
                         let tr = then_body >> 18;
                         let tbp = low17(then_body);
                         emit_word(0x12, tr, result_reg, 0);
@@ -669,7 +672,7 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                         let ep = low16(else_id);
                         if eh == 25281 then {
                             let nxt_e = nr + 1;
-                            let else_body = comp(src, ep, len, no_left, 0 - 1, nxt_e, env, elen);
+                            let else_body = comp(src, ep, len, no_left, 0 - 1, nxt_e, env, (perform String.length(env)) / 4);
                             let er = else_body >> 18;
                             let ebp = low17(else_body);
                             emit_word(0x12, er, result_reg, 0);
@@ -687,7 +690,7 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                     (nr << 18) + q
                 } else if h == 23741 then {
                     // not
-                    let inner = comp(src, q, len, no_left, 0 - 1, nr, env, elen);
+                    let inner = comp(src, q, len, no_left, 0 - 1, nr, env, (perform String.length(env)) / 4);
                     let iv = inner >> 18;
                     let ip = low17(inner);
                     let dr = nr + 1;
@@ -738,7 +741,7 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
             // byte; wrap within the high temporary bank [93,255].
             let save_reg = if ne < 56 then 200 + ne else if ne < 152 then 160 + (ne - 56) else 93 + ((ne - 152) % 163);
             emit_word(0x12, lr, save_reg, 0);
-            let arg = comp(src, p + 1, len, no_left, 0 - 1, nr + 1, env, elen);
+            let arg = comp(src, p + 1, len, no_left, 0 - 1, nr + 1, env, (perform String.length(env)) / 4);
             let arg_end = low17(arg);
             let ap = skip_ws(src, arg_end, len);
             if ap < len then {
@@ -754,7 +757,7 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                     let dst = nr;
                     let argc = if has_arg then 1 else 0;
                     emit_word(0x64, save_reg, argc, dst);
-                    comp(src, ap + 1, len, dst, min_prec, dst + 1, env, elen)
+                    comp(src, ap + 1, len, dst, min_prec, dst + 1, env, (perform String.length(env)) / 4)
                 } else pair
             } else pair
         } else if c == 61 or c == 33 or c == 60 or c == 62 then {
@@ -764,14 +767,14 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                 let sop = low8((shift >> 8));
                 let slen = low8(shift);
                 if sprec < min_prec then pair else {
-                    let rhs = comp(src, p + slen, len, no_left, sprec, nr + 1, env, elen);
+                    let rhs = comp(src, p + slen, len, no_left, sprec, nr + 1, env, (perform String.length(env)) / 4);
                     let dr = nr + 2;
                     let rr = rhs >> 18;
                     let rp = low17(rhs);
                     emit_word(sop, lr, rr, dr);
                     let drp = dr + (268435456 * 2048);
                     let drn = dr + 1;
-                    comp(src, rp, len, drp, min_prec, drn, env, elen)
+                    comp(src, rp, len, drp, min_prec, drn, env, (perform String.length(env)) / 4)
                 }
             } else {
                 let cmp = parse_cmp(src, p, len);
@@ -780,7 +783,7 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                     let cop = low8((cmp >> 8));
                     let clen = low8(cmp);
                     if cprec < min_prec then pair else {
-                        let rhs = comp(src, p + clen, len, no_left, cprec, nr + 1, env, elen);
+                        let rhs = comp(src, p + clen, len, no_left, cprec, nr + 1, env, (perform String.length(env)) / 4);
                         let dr = nr + 2;
                         let rr = rhs >> 18;
                         let rp = low17(rhs);
@@ -792,7 +795,7 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                         };
                         let drp = dr + (268435456 * 2048);
                     let drn = dr + 1;
-                    comp(src, rp, len, drp, min_prec, drn, env, elen)
+                    comp(src, rp, len, drp, min_prec, drn, env, (perform String.length(env)) / 4)
                     }
                 }
             }
@@ -818,7 +821,7 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                         remark("JmpF -> and_fill");
                         emit_word(0x52, lr, 0, 0)
                     };
-                    let rhs = comp(src, q, len, no_left, 0, nr + 1, env, elen);
+                    let rhs = comp(src, q, len, no_left, 0, nr + 1, env, (perform String.length(env)) / 4);
                     let rr = rhs >> 18;
                     let rp = low17(rhs);
                     remark("Jmp -> and_cont");
@@ -826,7 +829,7 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                     remark("and_fill:");
                     emit_word(0x03, rr, 0, 0);
                     remark("and_cont:");
-                    comp(src, rp, len, rr, min_prec, rr + 1, env, elen)
+                    comp(src, rp, len, rr, min_prec, rr + 1, env, (perform String.length(env)) / 4)
                 }
             } else if kw == 4221 then {
                 if 0 < min_prec then pair else {
@@ -848,7 +851,7 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                     remark("Jmp -> or_fill");
                     emit_word(0x50, 0, 0, 0);
                     remark("or_right:");
-                    let rhs = comp(src, q, len, no_left, 0, nr + 1, env, elen);
+                    let rhs = comp(src, q, len, no_left, 0, nr + 1, env, (perform String.length(env)) / 4);
                     let rr = rhs >> 18;
                     let rp = low17(rhs);
                     remark("Jmp -> or_cont");
@@ -856,7 +859,7 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                     remark("or_fill:");
                     emit_word(0x04, rr, 0, 0);
                     remark("or_cont:");
-                    comp(src, rp, len, rr, min_prec, rr + 1, env, elen)
+                    comp(src, rp, len, rr, min_prec, rr + 1, env, (perform String.length(env)) / 4)
                 }
             } else pair
         } else {
@@ -864,12 +867,12 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
             if prec == 0 or prec < min_prec then pair else {
                 let opcode = if c == 43 then 0x20 else if c == 45 then 0x21
                 else if c == 42 then 0x22 else if c == 47 then 0x23 else 0x24;
-                let rhs = comp(src, p + 1, len, no_left, prec, nr + 1, env, elen);
+                let rhs = comp(src, p + 1, len, no_left, prec, nr + 1, env, (perform String.length(env)) / 4);
                 let rr = rhs >> 18;
                 let rp = low17(rhs);
                 let dr = nr + 2;
                 emit_word(opcode, lr, rr, dr);
-                comp(src, rp, len, dr, min_prec, dr + 1, env, elen)
+                comp(src, rp, len, dr, min_prec, dr + 1, env, (perform String.length(env)) / 4)
             }
         }
     }
