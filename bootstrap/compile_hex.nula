@@ -805,6 +805,8 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                     // and: falsy lhs short-circuits to a fill that writes a
                     // real int 0 into the result register.  Truthy lhs
                     // evaluates rhs and jumps over the fill.
+                    // Keep the environment length live while emitting the branch.
+                    let saved_elen = elen;
                     let lb = bit17(pair);
                     remark("and");
                     if lb == 0 then {
@@ -818,7 +820,7 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                         remark("JmpF -> and_fill");
                         emit_word(0x52, lr, 0, 0)
                     };
-                    let rhs = comp(src, q, len, no_left, 0, nr + 1, env, elen);
+                    let rhs = comp(src, q, len, no_left, 0, nr + 1, env, saved_elen);
                     let rr = rhs >> 18;
                     let rp = low17(rhs);
                     remark("Jmp -> and_cont");
@@ -832,6 +834,8 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                 if 0 < min_prec then pair else {
                     // or: falsy lhs evaluates rhs; truthy lhs short-circuits
                     // to a fill writing int 1 into the result register.
+                    // Keep the environment length live while emitting the branch.
+                    let saved_elen = elen;
                     let lb = bit17(pair);
                     remark("or");
                     if lb == 0 then {
@@ -848,7 +852,7 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                     remark("Jmp -> or_fill");
                     emit_word(0x50, 0, 0, 0);
                     remark("or_right:");
-                    let rhs = comp(src, q, len, no_left, 0, nr + 1, env, elen);
+                    let rhs = comp(src, q, len, no_left, 0, nr + 1, env, saved_elen);
                     let rr = rhs >> 18;
                     let rp = low17(rhs);
                     remark("Jmp -> or_cont");
