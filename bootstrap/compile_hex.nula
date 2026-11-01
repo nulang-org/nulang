@@ -864,12 +864,16 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
             if prec == 0 or prec < min_prec then pair else {
                 let opcode = if c == 43 then 0x20 else if c == 45 then 0x21
                 else if c == 42 then 0x22 else if c == 47 then 0x23 else 0x24;
+                // Keep the environment length live across recursive compilation.
+                // Without this binding, the self-compiled generation can lose
+                // later variable lookups after a left-hand multiplication.
+                let saved_elen = elen;
                 let rhs = comp(src, p + 1, len, no_left, prec, nr + 1, env, elen);
                 let rr = rhs >> 18;
                 let rp = low17(rhs);
                 let dr = nr + 2;
                 emit_word(opcode, lr, rr, dr);
-                comp(src, rp, len, dr, min_prec, dr + 1, env, elen)
+                comp(src, rp, len, dr, min_prec, dr + 1, env, saved_elen)
             }
         }
     }
