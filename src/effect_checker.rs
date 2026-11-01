@@ -610,6 +610,22 @@ impl EffectChecker {
                 let else_row = self.known_callable_expr_row(else_branch)?;
                 Some(effect_row_union(&then_row, &else_row))
             }
+            Expr::Block { exprs, .. } if exprs.len() == 1 => {
+                // A single-expression block returns that exact value without
+                // introducing a separate name-binding scope.
+                self.known_callable_expr_row(&exprs[0])
+            }
+            Expr::Let {
+                name, value, body, ..
+            } if matches!(
+                Self::callable_source(body),
+                Expr::Var(bound, _) if bound == name
+            ) =>
+            {
+                // Returning a let-bound alias returns the original callable.
+                // Preserve its effects. More complex let bodies are unknown.
+                self.known_callable_expr_row(value)
+            }
             Expr::Match { arms, .. } => {
                 // Every arm can return a different callable. Only claim a
                 // closed effect budget when all possible arms are known.
@@ -724,7 +740,11 @@ impl EffectChecker {
                     }
                 } else if matches!(
                     Self::callable_source(func),
-                    Expr::If { .. } | Expr::Match { .. }
+                    Expr::If { .. }
+                        | Expr::Match { .. }
+                        | Expr::Block { .. }
+                        | Expr::Let { .. }
+                        | Expr::LetRec { .. }
                 ) {
                     // A computed callable with an unproven branch cannot
                     // discharge a closed effect budget merely because
@@ -751,7 +771,11 @@ impl EffectChecker {
                         Some(val_row.clone())
                     } else if matches!(
                         Self::callable_source(value),
-                        Expr::If { .. } | Expr::Match { .. }
+                        Expr::If { .. }
+                            | Expr::Match { .. }
+                            | Expr::Block { .. }
+                            | Expr::Let { .. }
+                            | Expr::LetRec { .. }
                     ) {
                         // Retain unknown callable provenance for computed
                         // aliases until inference can prove a closed budget.
@@ -5423,6 +5447,40 @@ mod tests {
                 .infer_effects(&EffectContext::empty(), &lambda)
                 .is_err(),
             "an untyped callback must remain unknown until sound type evidence proves otherwise"
+        );
+    }
+
+    #[test]
+    fn test_block_returned_callback_cannot_escape_effect_budget() {
+        let ast = parse_module("fn invoke(cb: () -> Unit ! {IO}) -> Unit ! {} { ({cb})() }");
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker.check_module(&ast.decls).is_err(),
+            "calling a callback returned from a block must retain IO"
+        );
+    }
+
+    #[test]
+    fn test_let_returned_callback_cannot_escape_effect_budget() {
+        let ast = parse_module(
+            "fn invoke(cb: () -> Unit ! {IO}) -> Unit ! {} { (let wrapped = cb in wrapped)() }",
+        );
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker.check_module(&ast.decls).is_err(),
+            "calling a callback returned through a let must retain IO"
+        );
+    }
+
+    #[test]
+    fn test_pure_callback_returned_from_block_or_let_stays_pure() {
+        let ast = parse_module(
+            "fn by_block(cb: () -> Unit ! {}) -> Unit ! {} { ({cb})() }\n             fn by_let(cb: () -> Unit ! {}) -> Unit ! {} { (let wrapped = cb in wrapped)() }",
+        );
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker.check_module(&ast.decls).is_ok(),
+            "known-pure callbacks returned from blocks and let bindings remain pure"
         );
     }
 

@@ -1,0 +1,1 @@
+{"exit_code":5,"stdout":"","stderr":"disallowed effect(s): IO","proves":"Calling a callback returned from a single-expression block must retain the callback's IO effect."}
