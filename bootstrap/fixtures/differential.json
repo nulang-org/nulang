@@ -15,5 +15,11 @@
   {"id": "multiply_then_subtract", "source": "let a = 82 in let b = 25 in a * 10 - b", "expected": "795"},
   {"id": "divide_then_add", "source": "let a = 82 in let b = 25 in a / 2 + b", "expected": "66"},
   {"id": "multiply_both_terms", "source": "let a = 82 in let b = 25 in a * b + b * a", "expected": "4100"},
+  {"id": "digit_range_inside", "source": "let digit = fn(c) => c >= 48 and c <= 57 in digit(53)", "expected": "true"},
+  {"id": "digit_range_below", "source": "let digit = fn(c) => c >= 48 and c <= 57 in digit(47)", "expected": "0"},
+  {"id": "digit_range_above", "source": "let digit = fn(c) => c >= 48 and c <= 57 in digit(58)", "expected": "false"},
+  {"id": "alpha_lowercase", "source": "let alpha = fn(c) => (c >= 65 and c <= 90) or (c >= 97 and c <= 122) in alpha(98)", "expected": "1"},
+  {"id": "alpha_gap", "source": "let alpha = fn(c) => (c >= 65 and c <= 90) or (c >= 97 and c <= 122) in alpha(91)", "expected": "0"},
+  {"id": "alpha_above", "source": "let alpha = fn(c) => (c >= 65 and c <= 90) or (c >= 97 and c <= 122) in alpha(123)", "expected": "0"},
   {"id": "flat_curried_call_arithmetic", "source": "let emit_hex = fn(w) => w in let emit_word = fn(opcode) => fn(op1) => fn(op2) => fn(op3) => emit_hex(opcode * 16777216 + op1 * 65536 + op2 * 256 + op3) in emit_word(82)(25)(7)(0)", "expected": "1377371904"}
 ]

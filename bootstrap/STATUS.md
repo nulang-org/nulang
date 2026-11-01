@@ -130,3 +130,22 @@ The full Stage 2/3 fixed-point oracle still fails: the first emitted
 divergence moves from word 639 to word 1877, near an `and` branch and
 constant 57. Preserve the strict oracle and treat this change as a partial
 candidate until the remaining divergence and hosted gates are resolved.
+
+### Boolean-branch environment candidate and remaining shared defect
+
+Preserving the environment length while emitting `and` and `or` branches
+makes the digit-range boundary cases agree and moves the complete restricted
+compiler through the Stage 2/3 byte-identity oracle: on Fedora with the
+hosted release binary built from #2465's recorded test merge, both artifacts
+were 108702 bytes and byte-identical. This local run used 19 cases, excluding
+two newly discovered failing alphabet-boundary cases; the fixed-point result
+therefore does not establish correctness or a green full corpus.
+
+Both generations incorrectly return truthy `1` for input 91 and 123 in the
+fixture `alpha_gap` / `alpha_above`, although those values are outside both
+ASCII letter ranges. Each comparison and each unparenthesized `and` branch
+was separately checked at 91; the combined parenthesized `or` is wrong.
+The standard differential corpus retains those expectations and fails closed.
+A possible dropped boolean marker at the parenthesis boundary needs further
+investigation; one attempted preservation change broke self-compilation and
+was discarded. Do not promote or merge on fixed-point equality alone.
