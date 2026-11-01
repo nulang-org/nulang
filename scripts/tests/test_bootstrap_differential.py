@@ -63,6 +63,19 @@ class DifferentialContractTests(unittest.TestCase):
         self.assertEqual(case['expected'], '57')
         self.assertEqual(case['source'], 'let a = 25 in let b = 7 in a * 2 + b')
 
+    def test_short_circuit_after_comparison_fixtures_are_pinned(self):
+        # Source compilation must not lose a live environment binding when
+        # the RHS of `and` or `or` reads it after evaluating a comparison.
+        cases = {c['id']: c for c in self.module.load_cases(self.module.CORPUS)}
+        self.assertEqual(
+            cases['and_retained_binding'],
+            {'id': 'and_retained_binding', 'source': 'let c = 52 in c >= 48 and c <= 57', 'expected': 'true'},
+        )
+        self.assertEqual(
+            cases['or_retained_binding'],
+            {'id': 'or_retained_binding', 'source': 'let c = 52 in c < 48 or c <= 57', 'expected': 'true'},
+        )
+
     def test_corpus_rejects_duplicate_ids(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / 'corpus.json'

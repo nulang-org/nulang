@@ -12,5 +12,7 @@
   {"id": "staged_instr_curried", "source": "let instr = fn(opcode) => fn(op1) => fn(op2) => fn(op3) => (let hi = opcode * 16777216 in let acc1 = hi + op1 * 65536 in let acc2 = acc1 + op2 * 256 in acc2 + op3) in instr(82)(25)(7)(0)", "expected": "1377371904"},
   {"id": "multiply_then_add_variable", "source": "let a = 82 in let b = 25 in a * 10 + b", "expected": "845"},
   {"id": "flat_curried_call_arithmetic", "source": "let emit_hex = fn(w) => w in let emit_word = fn(opcode) => fn(op1) => fn(op2) => fn(op3) => emit_hex(opcode * 16777216 + op1 * 65536 + op2 * 256 + op3) in emit_word(82)(25)(7)(0)", "expected": "1377371904"},
-  {"id": "mul_then_saved_variable", "source": "let a = 25 in let b = 7 in a * 2 + b", "expected": "57"}
+  {"id": "mul_then_saved_variable", "source": "let a = 25 in let b = 7 in a * 2 + b", "expected": "57"},
+  {"id": "and_retained_binding", "source": "let c = 52 in c >= 48 and c <= 57", "expected": "true"},
+  {"id": "or_retained_binding", "source": "let c = 52 in c < 48 or c <= 57", "expected": "true"}
 ]
