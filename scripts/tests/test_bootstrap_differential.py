@@ -24,6 +24,16 @@ class DifferentialContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'empty'):
             self.module.instructions('; only remarks\n')
 
+    def test_staged_instruction_arithmetic_fixture_is_pinned(self):
+        # This nested let chain mirrors the source pattern at the first
+        # Stage 2 / Stage 3 compiler divergence (instr helper at word 639).
+        cases = self.module.load_cases(self.module.CORPUS)
+        staged = next((case for case in cases if case['id'] == 'staged_instr_arithmetic'), None)
+        self.assertIsNotNone(staged, 'missing compiler-generation regression fixture')
+        self.assertEqual(staged['expected'], '1377371904')
+        self.assertIn('let acc1 = hi + op1 * 65536', staged['source'])
+        self.assertIn('let acc2 = acc1 + op2 * 256', staged['source'])
+
     def test_corpus_rejects_duplicate_ids(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / 'corpus.json'
