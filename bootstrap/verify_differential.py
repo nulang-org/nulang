@@ -115,6 +115,27 @@ def marker_context(raw_emission: str, target_word: int, limit: int = 3) -> str:
     return ' | '.join(recent) or '<none>'
 
 
+def assert_emissions_equal(case_id: str, host_hex: bytes, self_hex: bytes) -> None:
+    """Fail closed, identifying the first divergent word in a corpus case."""
+    host = instructions(host_hex.decode('utf-8'))
+    self_hosted = instructions(self_hex.decode('utf-8'))
+    offset = first_difference(host, self_hosted)
+    if offset == -1:
+        return
+    word_index = offset // 8
+    word_start = word_index * 8
+    raise AssertionError(
+        f'{case_id}: Stage 1 and Stage 2 bytecode emissions differ at word {word_index}'
+        f' (hex character {offset}); '
+        f'Stage 1 word={host[word_start:word_start + 8]}; '
+        f'Stage 2 word={self_hosted[word_start:word_start + 8]}; '
+        f'Stage 1 nearby: {emission_context(host, word_index)}; '
+        f'Stage 2 nearby: {emission_context(self_hosted, word_index)}; '
+        f'Stage 1 recent markers: {marker_context(host_hex.decode("utf-8"), word_index)}; '
+        f'Stage 2 recent markers: {marker_context(self_hex.decode("utf-8"), word_index)}'
+    )
+
+
 def verify_fixed_point(nulang: Path, prepared: bytes, stage2: bytes, work: Path,
                        stage1_hex: bytes | None = None) -> None:
     """Require the restricted compiler built by Stage 1 to reproduce its own artifact.
@@ -174,8 +195,7 @@ def verify(nulang: Path, corpus: Path, fixed_point: bool = False) -> None:
             source = case['source'].encode('utf-8')
             host_hex = run([str(nulang), 'bootstrap/compile_hex.nula'], source)
             self_hex = run([str(nulang), str(stage2_path)], source)
-            if instructions(host_hex.decode('utf-8')) != instructions(self_hex.decode('utf-8')):
-                raise AssertionError(f'{case["id"]}: Stage 1 and Stage 2 bytecode emissions differ')
+            assert_emissions_equal(case['id'], host_hex, self_hex)
             for generation, output in (('stage1', host_hex), ('stage2', self_hex)):
                 artifact = Path(work) / f'{case["id"]}-{generation}.nbc'
                 artifact.write_bytes(assemble(output))

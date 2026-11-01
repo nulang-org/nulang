@@ -96,6 +96,20 @@ class DifferentialContractTests(unittest.TestCase):
             self.assertEqual(len(inspected), 1)
             self.assertFalse(inspected[0].exists(), 'workspace should be cleaned after verification')
 
+    def test_corpus_emission_mismatch_reports_first_word_and_context(self):
+        host = b'; if\n11111111\n; JmpF -> else\n22222222\n'
+        self_hosted = b'; if\n11111111\n; JmpF -> else\n33333333\n'
+        with self.assertRaisesRegex(AssertionError, 'case_x.*word 1') as caught:
+            self.module.assert_emissions_equal('case_x', host, self_hosted)
+        result = str(caught.exception)
+        self.assertIn('Stage 1 word=22222222', result)
+        self.assertIn('Stage 2 word=33333333', result)
+        self.assertIn('Stage 1 nearby:', result)
+        self.assertIn('Stage 2 recent markers:', result)
+
+    def test_corpus_emissions_allow_comments_to_differ(self):
+        self.module.assert_emissions_equal('equal_case', b'; foo\n11111111\n', b'; bar\n11111111\n')
+
     def test_first_difference_detects_changed_and_missing_bytes(self):
         self.assertEqual(self.module.first_difference(b'ABCD', b'ABXD'), 2)
         self.assertEqual(self.module.first_difference(b'ABCD', b'AB'), 2)
