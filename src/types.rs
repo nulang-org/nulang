@@ -366,20 +366,33 @@ impl EffectRow {
         EffectRow::Closed(vec![e])
     }
 
-    /// Row concatenation.
+    /// Combine effect rows as sets, retaining the first occurrence's order.
+    ///
+    /// Repeated interprocedural inference revisits the same effects; blindly
+    /// concatenating these lists can grow them exponentially and exhaust the
+    /// compiler's memory. Most rows contain only a few effects, so a linear
+    /// membership check avoids adding a hash-table allocation to every union.
     pub fn combine(self, other: EffectRow) -> EffectRow {
+        fn extend_unique(target: &mut Vec<Effect>, additions: Vec<Effect>) {
+            for effect in additions {
+                if !target.contains(&effect) {
+                    target.push(effect);
+                }
+            }
+        }
+
         match (self, other) {
             (EffectRow::Closed(mut a), EffectRow::Closed(b)) => {
-                a.extend(b);
+                extend_unique(&mut a, b);
                 EffectRow::Closed(a)
             }
             (EffectRow::Closed(mut a), EffectRow::Open(b, r))
             | (EffectRow::Open(mut a, r), EffectRow::Closed(b)) => {
-                a.extend(b);
+                extend_unique(&mut a, b);
                 EffectRow::Open(a, r)
             }
             (EffectRow::Open(mut a, r1), EffectRow::Open(b, r2)) => {
-                a.extend(b);
+                extend_unique(&mut a, b);
                 // Distinct row tails must not be silently identified. Until
                 // the typechecker carries row substitutions, a fresh unknown
                 // tail conservatively over-approximates their union. It must

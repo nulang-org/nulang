@@ -669,6 +669,22 @@ impl EffectChecker {
                 }
                 if let Some(callee_row) = self.known_callable_expr_row(func) {
                     row = effect_row_union(&row, &callee_row);
+                } else if let Expr::Var(name, _) = func.as_ref() {
+                    // An untyped local callback may perform arbitrary effects.
+                    // Preserve that uncertainty as an unresolved tail: explicit
+                    // closed effect contracts reject it, while unconstrained
+                    // higher-order functions can still be inferred and checked
+                    // against their callers. Do not claim this proves row
+                    // polymorphism or constraints between independent tails.
+                    if self
+                        .scoped_function_rows
+                        .iter()
+                        .rev()
+                        .find(|(bound, _)| bound == name)
+                        .is_some_and(|(_, known)| known.is_none())
+                    {
+                        row = effect_row_union(&row, &EffectRow::Open(vec![], Region::fresh()));
+                    }
                 } else if matches!(func.as_ref(), Expr::If { .. }) {
                     // A computed callable with an unproven branch cannot
                     // discharge a closed effect budget merely because
@@ -687,7 +703,12 @@ impl EffectChecker {
                 // Capture only statically known callable provenance. An
                 // unrelated local binding remains an explicit shadow.
                 let callable = self.known_callable_expr_row(value).or_else(|| {
-                    if matches!(value.as_ref(), Expr::If { .. }) {
+                    if matches!(value.as_ref(), Expr::Lambda { .. }) {
+                        // An unannotated literal closure has already had its
+                        // body inferred above. Retain that known row for calls
+                        // through its local name, including proven-pure ones.
+                        Some(val_row.clone())
+                    } else if matches!(value.as_ref(), Expr::If { .. }) {
                         // Retain unknown callable provenance for computed
                         // aliases until inference can prove a closed budget.
                         Some(EffectRow::Open(vec![], Region::fresh()))
@@ -3121,6 +3142,21 @@ mod tests {
         assert!(u.contains(&Effect::IO));
         assert!(u.contains(&Effect::FS));
         assert!(u.contains(&Effect::Net));
+        assert_eq!(
+            u.effects().len(),
+            3,
+            "effect rows represent sets; duplicate effects must not accumulate"
+        );
+    }
+
+    #[test]
+    fn test_combining_open_rows_does_not_duplicate_known_effects() {
+        let a = EffectRow::Open(vec![Effect::IO], Region::fresh());
+        let b = EffectRow::Open(vec![Effect::IO, Effect::FS], Region::fresh());
+        let merged = effect_row_union(&a, &b);
+        assert_eq!(merged.effects().len(), 2);
+        assert!(merged.contains(&Effect::IO));
+        assert!(merged.contains(&Effect::FS));
     }
 
     #[test]
@@ -4919,6 +4955,37 @@ mod tests {
                 .check_effects(&ctx, &call("do_io"), &EffectRow::empty())
                 .is_err(),
             "unshadowed direct call must propagate the callee row"
+        );
+    }
+
+    #[test]
+    fn test_untyped_callback_cannot_discharge_closed_pure_effect_budget() {
+        let ast = parse_module("fn invoke(cb) -> Unit ! {} { cb() }");
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker.check_module(&ast.decls).is_err(),
+            "an untyped callback may perform arbitrary effects and is not proven pure"
+        );
+    }
+
+    #[test]
+    fn test_untyped_callback_infers_open_row_without_claiming_purity() {
+        let ast = parse_module("fn invoke(cb) -> Unit { cb() }");
+        let mut checker = EffectChecker::new();
+        checker.check_module(&ast.decls).unwrap();
+        assert!(
+            matches!(checker.function_row("invoke"), Some(EffectRow::Open(_, _))),
+            "an untyped higher-order function must retain an unknown effect tail"
+        );
+    }
+
+    #[test]
+    fn test_untyped_callback_alias_cannot_discharge_closed_pure_effect_budget() {
+        let ast = parse_module("fn invoke(cb) -> Unit ! {} { let renamed = cb in renamed() }");
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker.check_module(&ast.decls).is_err(),
+            "renaming an unknown callback must not erase its effect uncertainty"
         );
     }
 
