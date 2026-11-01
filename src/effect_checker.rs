@@ -613,13 +613,26 @@ impl EffectChecker {
             Expr::Match { arms, .. } => {
                 // Every arm can return a different callable. Only claim a
                 // closed effect budget when all possible arms are known.
-                // Scrutinee and guard evaluation effects are accounted for
-                // separately by infer_effects.
+                // Pattern-bound names shadow outer callback parameters. We
+                // cannot borrow their outer effect rows: the matched value
+                // may carry a different effect budget. Defer to an unknown
+                // open tail if an arm's callable depends on such a binding.
+                // Scrutinee and guard effects are assessed by infer_effects.
+                let arm_row = |pat: &Pattern, arm: &Expr| -> Option<EffectRow> {
+                    let mut bound = Vec::new();
+                    pat_bound_vars(pat, &mut bound);
+                    let mut references = Vec::new();
+                    free_vars(arm, &mut Vec::new(), &mut references);
+                    if bound.iter().any(|name| references.contains(name)) {
+                        return None;
+                    }
+                    self.known_callable_expr_row(arm)
+                };
                 let mut arms_iter = arms.iter();
-                let (_, _, first) = arms_iter.next()?;
-                let mut row = self.known_callable_expr_row(first)?;
-                for (_, _, arm) in arms_iter {
-                    row = effect_row_union(&row, &self.known_callable_expr_row(arm)?);
+                let (first_pat, _, first) = arms_iter.next()?;
+                let mut row = arm_row(first_pat, first)?;
+                for (pat, _, arm) in arms_iter {
+                    row = effect_row_union(&row, &arm_row(pat, arm)?);
                 }
                 Some(row)
             }
@@ -5497,6 +5510,52 @@ mod tests {
                 .infer_effects(&EffectContext::empty(), &expr)
                 .is_err(),
             "a match-selected callback alias must not erase its FS effect"
+        );
+    }
+
+    #[test]
+    fn test_match_pattern_binding_cannot_inherit_outer_pure_callback_effects() {
+        let pure = Type::Function {
+            param: Box::new(Type::Tuple(vec![])),
+            ret: Box::new(Type::unit()),
+            effect: EffectRow::empty(),
+            cap: Capability::Ref,
+        };
+        let io = Type::Function {
+            param: Box::new(Type::Tuple(vec![])),
+            ret: Box::new(Type::unit()),
+            effect: EffectRow::singleton(Effect::IO),
+            cap: Capability::Ref,
+        };
+        let callback = Expr::Match {
+            scrutinee: Box::new(Expr::Var("unsafe_callback".to_string(), s())),
+            arms: vec![(
+                Pattern::Var("cb".to_string()),
+                None,
+                Expr::Var("cb".to_string(), s()),
+            )],
+            span: s(),
+        };
+        let lambda = Expr::Lambda {
+            params: vec![
+                Param::new("cb", Some(pure)),
+                Param::new("unsafe_callback", Some(io)),
+            ],
+            ret_type: None,
+            body: Box::new(Expr::App {
+                func: Box::new(callback),
+                args: vec![],
+                span: s(),
+            }),
+            effect: Some(EffectRow::empty()),
+            span: s(),
+        };
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker
+                .infer_effects(&EffectContext::empty(), &lambda)
+                .is_err(),
+            "a match-bound callback must not inherit a shadowed outer callback's pure effect row"
         );
     }
 
