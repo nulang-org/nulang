@@ -59,6 +59,43 @@ bootstrap. Stage 3 here is a compiler **generation**, not the independent
 minimal Core VM proposed by the language roadmap. Byte identity is stronger
 than six matching expression outputs, but not full-language compiler parity.
 
+## Exact compiler-prefix context probe (diagnostic only)
+
+The hosted exact-head run for draft #2471 at `e533295af` passed all **nine**
+Stage 1/Stage 2 execution cases (including scalar, single-closure and
+four-curried `instr` arithmetic), but the full Stage 2 → Stage 3 compiler
+still failed at emitted instruction word 639. These successful isolated
+cases do not validate the complete compiler's environment/register layout.
+
+When the full `.nbc` fixed-point fails, `verify_differential.py` now extracts
+the real preprocessed compiler source through the *end* of `instr`, keeping
+all preceding top-level helper definitions intact, and replaces later helpers
+with a call to `instr(82)(25)(7)(0)`. It compiles the same prefix under both
+compiler generations, compares exact normalized instruction streams, and
+executes both generated `.nbc` artifacts expecting `1377371904`. The result
+is attached to the **still-failing** fixed-point error, never used to accept
+mismatching artifacts. This is a source-context isolation experiment, not a
+compiler/allocator fix or a replacement for required bootstrap/security gates.
+
+### Progressive compiler-context checkpoints
+
+Exact-head bootstrap on `9e7539018` (job `125014660841`) passed the original
+nine expression cases and the real-helper compiler-prefix probe, but still
+failed at emitted word 639 with the same Stage 2/3 hashes and sizes. The
+missing instruction is therefore not reproduced even with all definitions
+**preceding** `instr` included. This is only evidence about that isolated
+prefix, not proof that a specific later declaration causes the defect.
+
+The follow-up *diagnostic-only* path independently checks five source cutoffs:
+`emit_word`, `read_int`, `prec_of`, `comp_infix_call`, and `compile`. For each,
+it retains all preceding generated top-level function bindings, then calls
+`instr(82)(25)(7)(0)` under both compiler generations. A bounded first-word
+trace or expected-result error is reported per checkpoint while the original
+full compiler fixed-point failure remains fatal. These checkpoints must be
+interpreted independently, **not as a monotonic binary search**: removing even
+unused helpers previously changed bootstrap behavior. Until real exact-head
+execution provides results, do not claim register-allocation root cause.
+
 ## Experimental Nulang-native word-patch slice
 
 `bootstrap/fixup_words.nula` is a small standalone Core program for encoding

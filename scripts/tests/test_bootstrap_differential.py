@@ -34,6 +34,26 @@ class DifferentialContractTests(unittest.TestCase):
         self.assertIn('let acc1 = hi + op1 * 65536', staged['source'])
         self.assertIn('let acc2 = acc1 + op2 * 256', staged['source'])
 
+    def test_staged_instruction_inside_function_fixture_is_pinned(self):
+        # Same staged arithmetic but inside a closure with a captured operand:
+        # this probes code-generation context absent from the scalar fixture.
+        cases = self.module.load_cases(self.module.CORPUS)
+        case = next((c for c in cases if c['id'] == 'staged_instr_closure'), None)
+        self.assertIsNotNone(case, 'missing function-context compiler regression')
+        self.assertEqual(case['expected'], '1377371904')
+        self.assertIn('fn(opcode) => let op1', case['source'])
+        self.assertIn('let acc1 = hi + op1 * 65536', case['source'])
+        self.assertIn('instr(82)', case['source'])
+
+    def test_four_curried_closures_instruction_fixture_is_pinned(self):
+        # The actual preprocessed compiler uses four curried fn layers.
+        cases = self.module.load_cases(self.module.CORPUS)
+        case = next((c for c in cases if c['id'] == 'staged_instr_curried'), None)
+        self.assertIsNotNone(case, 'missing four-closure compiler regression')
+        self.assertEqual(case['expected'], '1377371904')
+        self.assertIn('fn(opcode) => fn(op1) => fn(op2) => fn(op3)', case['source'])
+        self.assertIn('instr(82)(25)(7)(0)', case['source'])
+
     def test_corpus_rejects_duplicate_ids(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / 'corpus.json'
@@ -84,6 +104,119 @@ class DifferentialContractTests(unittest.TestCase):
                         self.module.verify(pathlib.Path('/example/nulang'), corpus, fixed_point=True)
             self.assertEqual(len(inspected), 1)
             self.assertFalse(inspected[0].exists(), 'workspace should be cleaned after verification')
+
+    def test_corpus_emission_mismatch_reports_first_word_and_context(self):
+        host = b'; if\n11111111\n; JmpF -> else\n22222222\n'
+        self_hosted = b'; if\n11111111\n; JmpF -> else\n33333333\n'
+        with self.assertRaisesRegex(AssertionError, 'case_x.*word 1') as caught:
+            self.module.assert_emissions_equal('case_x', host, self_hosted)
+        result = str(caught.exception)
+        self.assertIn('Stage 1 word=22222222', result)
+        self.assertIn('Stage 2 word=33333333', result)
+        self.assertIn('Stage 1 nearby:', result)
+        self.assertIn('Stage 2 recent markers:', result)
+
+    def test_corpus_emissions_allow_comments_to_differ(self):
+        self.module.assert_emissions_equal('equal_case', b'; foo\n11111111\n', b'; bar\n11111111\n')
+
+    def test_compiler_prefix_probe_keeps_earlier_source_bindings(self):
+        prepared = b'let main = fn() => (let low17 = fn(x) => x in let instr = fn(opcode) => opcode in let emit_word = fn(x) => x in 0) in main()'
+        self.assertEqual(
+            self.module.compiler_prefix_source(prepared),
+            b'let main = fn() => (let low17 = fn(x) => x in let instr = fn(opcode) => opcode in instr(82)(25)(7)(0)) in main()'
+        )
+
+    def test_compiler_prefix_probe_extracts_real_preprocessed_compiler(self):
+        source = (self.module.ROOT / 'bootstrap/compile_hex.nula').read_bytes()
+        prepared = self.module.run([sys.executable, 'bootstrap/prep_core.py'], source)
+        prefix = self.module.compiler_prefix_source(prepared).decode('utf-8')
+        self.assertTrue(prefix.startswith('let main = fn() => (let low17 ='))
+        self.assertIn('let instr = fn(opcode) => fn(op1) => fn(op2) => fn(op3)', prefix)
+        self.assertTrue(prefix.endswith('in instr(82)(25)(7)(0)) in main()'))
+        self.assertNotIn(' in let emit_word =', prefix)
+
+    def test_compiler_context_source_retains_later_helpers_through_boundary(self):
+        prepared = (
+            b'let main = fn() => (let low17 = fn(x) => x '
+            b'in let instr = fn(opcode) => opcode '
+            b'in let emit_word = fn(x) => (let y = x in y) '
+            b'in let env_decode = fn(y) => y in 0) in main()'
+        )
+        self.assertEqual(
+            self.module.compiler_context_source(prepared, 'env_decode'),
+            b'let main = fn() => (let low17 = fn(x) => x '
+            b'in let instr = fn(opcode) => opcode '
+            b'in let emit_word = fn(x) => (let y = x in y) '
+            b'in instr(82)(25)(7)(0)) in main()'
+        )
+        self.assertEqual(
+            self.module.compiler_context_source(prepared, 'emit_word'),
+            self.module.compiler_prefix_source(prepared)
+        )
+
+    def test_compiler_context_source_real_preprocessor_cutoffs(self):
+        prepared = self.module.run(
+            [sys.executable, 'bootstrap/prep_core.py'],
+            (self.module.ROOT / 'bootstrap/compile_hex.nula').read_bytes()
+        )
+        for cutoff in ('emit_word', 'read_int', 'prec_of', 'comp_infix_call', 'compile'):
+            with self.subTest(cutoff=cutoff):
+                source = self.module.compiler_context_source(prepared, cutoff).decode()
+                self.assertIn('let instr = fn(opcode)', source)
+                self.assertTrue(source.endswith('in instr(82)(25)(7)(0)) in main()'))
+                self.assertNotIn(f' in let {cutoff} =', source)
+
+    def test_compiler_context_source_rejects_unknown_boundary(self):
+        prepared = b'let main = fn() => (let instr = fn(opcode) => opcode in let emit_word = fn(x) => x in 0) in main()'
+        with self.assertRaisesRegex(ValueError, 'unknown|context'):
+            self.module.compiler_context_source(prepared, 'does_not_exist')
+
+    def test_compiler_context_sweep_reports_every_checkpoint_without_accepting_mismatch(self):
+        with mock.patch.object(self.module, 'verify_compiler_context',
+                side_effect=['parity result', AssertionError('Stage 2 word mismatch')]):
+            result = self.module.verify_context_sweep(
+                pathlib.Path('/example/nulang'), pathlib.Path('/example/stage2.nbc'),
+                b'prepared', pathlib.Path('/tmp'), boundaries=('emit_word', 'env_decode'))
+        self.assertIn('emit_word: parity result', result)
+        self.assertIn('env_decode: Stage 2 word mismatch', result)
+
+    def test_compiler_prefix_probe_fails_on_missing_anchor(self):
+        with self.assertRaisesRegex(ValueError, 'compiler prefix'):
+            self.module.compiler_prefix_source(b'let instr = fn(x) => x in 0')
+
+    def test_compiler_prefix_probe_runs_both_generations_and_rejects_different_emission(self):
+        prepared = b'let main = fn() => (let low17 = fn(x) => x in let instr = fn(opcode) => opcode in let emit_word = fn(x) => x in 0) in main()'
+        with tempfile.TemporaryDirectory() as temp:
+            work = pathlib.Path(temp)
+            stage2 = work / 'stage2.nbc'
+            stage2.write_bytes(b'stage2')
+            with mock.patch.object(self.module, 'run', side_effect=[b'11111111\n', b'22222222\n']) as runner:
+                with self.assertRaisesRegex(AssertionError, 'compiler_prefix.*word 0'):
+                    self.module.verify_compiler_prefix(pathlib.Path('/example/nulang'), stage2, prepared, work)
+            self.assertEqual(runner.call_count, 2)
+            self.assertEqual(runner.call_args.args[1], self.module.compiler_prefix_source(prepared))
+
+    def test_compiler_prefix_probe_executes_both_assembled_generations(self):
+        prepared = b'let main = fn() => (let low17 = fn(x) => x in let instr = fn(opcode) => opcode in let emit_word = fn(x) => x in 0) in main()'
+        with tempfile.TemporaryDirectory() as temp:
+            work = pathlib.Path(temp)
+            stage2_path = work / 'stage2.nbc'
+            stage2_path.write_bytes(b'stage2')
+            outputs = [b'11111111\n', b'; comments differ\n11111111\n',
+                       b'1377371904\n', b'1377371904\n']
+            def command_result(cmd, source=b''):
+                if len(cmd) == 2 and cmd[1].endswith('.nbc') and cmd[1] != str(stage2_path):
+                    return outputs.pop(0)
+                return outputs.pop(0)
+            with mock.patch.object(self.module, 'run', side_effect=command_result) as runner:
+                with mock.patch.object(self.module, 'assemble', return_value=b'nbc'):
+                    report = self.module.verify_compiler_prefix(
+                        pathlib.Path('/example/nulang'), stage2_path, prepared, work)
+            self.assertIn('1377371904', report)
+            self.assertEqual(runner.call_count, 4)
+            self.assertEqual(outputs, [])
+            self.assertTrue((work / 'compiler_prefix-stage1.nbc').exists())
+            self.assertTrue((work / 'compiler_prefix-stage2.nbc').exists())
 
     def test_first_difference_detects_changed_and_missing_bytes(self):
         self.assertEqual(self.module.first_difference(b'ABCD', b'ABXD'), 2)

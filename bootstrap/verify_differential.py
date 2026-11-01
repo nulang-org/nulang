@@ -115,6 +115,140 @@ def marker_context(raw_emission: str, target_word: int, limit: int = 3) -> str:
     return ' | '.join(recent) or '<none>'
 
 
+def assert_emissions_equal(case_id: str, host_hex: bytes, self_hex: bytes) -> None:
+    """Fail closed, identifying the first divergent word in a corpus case."""
+    host = instructions(host_hex.decode('utf-8'))
+    self_hosted = instructions(self_hex.decode('utf-8'))
+    offset = first_difference(host, self_hosted)
+    if offset == -1:
+        return
+    word_index = offset // 8
+    word_start = word_index * 8
+    raise AssertionError(
+        f'{case_id}: Stage 1 and Stage 2 bytecode emissions differ at word {word_index}'
+        f' (hex character {offset}); '
+        f'Stage 1 word={host[word_start:word_start + 8]}; '
+        f'Stage 2 word={self_hosted[word_start:word_start + 8]}; '
+        f'Stage 1 nearby: {emission_context(host, word_index)}; '
+        f'Stage 2 nearby: {emission_context(self_hosted, word_index)}; '
+        f'Stage 1 recent markers: {marker_context(host_hex.decode("utf-8"), word_index)}; '
+        f'Stage 2 recent markers: {marker_context(self_hex.decode("utf-8"), word_index)}'
+    )
+
+
+def compiler_prefix_source(prepared: bytes) -> bytes:
+    """Keep all preceding compiler helpers and the exact curried instr body.
+
+    Removing a source declaration perturbs register layout, so this probe
+    preserves the original preprocessor output until the next top-level let.
+    """
+    text = prepared.decode('utf-8')
+    boundary = ' in let emit_word ='
+    if (not text.startswith('let main = fn() => (let ')
+            or text.count(boundary) != 1
+            or text.count(' in let instr =') != 1):
+        raise ValueError('compiler prefix markers missing or ambiguous')
+    return (text.split(boundary, 1)[0] +
+            ' in instr(82)(25)(7)(0)) in main()').encode('utf-8')
+
+
+def compiler_context_source(prepared: bytes, boundary: str) -> bytes:
+    """Preserve full top-level compiler helper declarations before `boundary`.
+
+    Generated helper bindings are at parenthesis depth one under main's body.
+    Parsing this boundary structurally avoids splitting nested local lets.
+    This is an on-failure *probe*, not a transformation used to build Stage 2.
+    """
+    text = prepared.decode('utf-8')
+    if not text.startswith('let main = fn() => (let ') or not text.rstrip().endswith(') in main()'):
+        raise ValueError('invalid compiler context source format')
+    depth = 0
+    in_string = False
+    escaped = False
+    sites = {}
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == '(':
+            depth += 1
+        elif char == ')':
+            depth -= 1
+            if depth < 0:
+                raise ValueError('unbalanced compiler context source')
+        if depth == 1 and text.startswith(' in let ', index):
+            rest = text[index + len(' in let '):]
+            match = re.match(r'([a-zA-Z_][a-zA-Z0-9_]*) = fn\(', rest)
+            if match:
+                name = match.group(1)
+                if name in sites:
+                    raise ValueError(f'compiler context duplicate helper {name}')
+                sites[name] = index
+    if depth != 0 or in_string or 'instr' not in sites or boundary not in sites:
+        raise ValueError(f'unknown or malformed compiler context boundary {boundary}')
+    if sites[boundary] <= sites['instr']:
+        raise ValueError('compiler context boundary precedes instr')
+    return (text[:sites[boundary]] + ' in instr(82)(25)(7)(0)) in main()').encode('utf-8')
+
+
+def verify_compiler_context(nulang: Path, stage2_path: Path, prepared: bytes,
+                            work: Path, boundary: str) -> str:
+    """Run strict emission and result comparisons on one compiler prefix."""
+    source = compiler_context_source(prepared, boundary)
+    host_hex = run([str(nulang), 'bootstrap/compile_hex.nula'], source)
+    self_hex = run([str(nulang), str(stage2_path)], source)
+    assert_emissions_equal('compiler_context', host_hex, self_hex)
+    for generation, stream in (('stage1', host_hex), ('stage2', self_hex)):
+        binary = work / f'compiler-context-{generation}.nbc'
+        binary.write_bytes(assemble(stream))
+        actual = last_result(run([str(nulang), str(binary)]).decode('utf-8'))
+        if actual != '1377371904':
+            raise AssertionError(
+                f'{generation} expected 1377371904, got {actual!r}'
+            )
+    return 'parity 1377371904 in both generations'
+
+
+def verify_context_sweep(nulang: Path, stage2_path: Path, prepared: bytes,
+                         work: Path, boundaries: tuple[str, ...] =
+                         ('emit_word', 'read_int', 'prec_of', 'comp_infix_call', 'compile')) -> str:
+    """Report independent non-monotonic checkpoints; never accept a mismatch."""
+    results = []
+    for boundary in boundaries:
+        try:
+            outcome = verify_compiler_context(nulang, stage2_path, prepared, work, boundary)
+        except (AssertionError, RuntimeError, ValueError, UnicodeError) as exc:
+            outcome = str(exc)[:1100] or type(exc).__name__
+        results.append(f'{boundary}: {outcome}')
+    return ' | '.join(results)
+
+
+def verify_compiler_prefix(nulang: Path, stage2_path: Path,
+                           prepared: bytes, work: Path) -> str:
+    """Check host/self-compiled parity for the exact leading compiler context."""
+    source = compiler_prefix_source(prepared)
+    host_hex = run([str(nulang), 'bootstrap/compile_hex.nula'], source)
+    stage2_hex = run([str(nulang), str(stage2_path)], source)
+    assert_emissions_equal('compiler_prefix', host_hex, stage2_hex)
+    for name, emission in (('stage1', host_hex), ('stage2', stage2_hex)):
+        binary = work / f'compiler_prefix-{name}.nbc'
+        binary.write_bytes(assemble(emission))
+        result = last_result(run([str(nulang), str(binary)]).decode('utf-8'))
+        if result != '1377371904':
+            raise AssertionError(
+                f'compiler_prefix {name}: expected 1377371904, got {result!r}'
+            )
+    return 'compiler-prefix contextual parity: 1377371904 in both generations'
+
+
 def verify_fixed_point(nulang: Path, prepared: bytes, stage2: bytes, work: Path,
                        stage1_hex: bytes | None = None) -> None:
     """Require the restricted compiler built by Stage 1 to reproduce its own artifact.
@@ -151,6 +285,12 @@ def verify_fixed_point(nulang: Path, prepared: bytes, stage2: bytes, work: Path,
                 )
             else:
                 details += '; normalized compiler emissions match (fixup/metadata divergence)'
+        if stage1_hex is not None:
+            try:
+                sweep_result = verify_context_sweep(nulang, stage2_path, prepared, work)
+                details += f'; compiler context sweep: {sweep_result}'
+            except (AssertionError, RuntimeError, ValueError, UnicodeError) as exc:
+                details += f'; compiler context sweep failed: {exc}'
         raise AssertionError(
             'bootstrap fixed-point mismatch: '
             f'Stage 2 {len(stage2)} bytes sha256={first}, '
@@ -174,8 +314,7 @@ def verify(nulang: Path, corpus: Path, fixed_point: bool = False) -> None:
             source = case['source'].encode('utf-8')
             host_hex = run([str(nulang), 'bootstrap/compile_hex.nula'], source)
             self_hex = run([str(nulang), str(stage2_path)], source)
-            if instructions(host_hex.decode('utf-8')) != instructions(self_hex.decode('utf-8')):
-                raise AssertionError(f'{case["id"]}: Stage 1 and Stage 2 bytecode emissions differ')
+            assert_emissions_equal(case['id'], host_hex, self_hex)
             for generation, output in (('stage1', host_hex), ('stage2', self_hex)):
                 artifact = Path(work) / f'{case["id"]}-{generation}.nbc'
                 artifact.write_bytes(assemble(output))
