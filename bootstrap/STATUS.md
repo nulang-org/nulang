@@ -24,6 +24,26 @@ The additional differential runner, executed in `bootstrap-contract.yml`, builds
 
 **Evidence boundary:** agreement between two generations of `compile_hex.nula` is *not* differential testing against Rust's full frontend. The fixed expected outcomes prevent both generations from silently agreeing on a wrong result for these cases, but they do not prove type-checker parity, error compatibility, or complete Core coverage. GitHub CI must execute the exact PR head before this new gate can be called passing. A zero-job GitHub Actions run is not execution evidence.
 
+## Experimental Nulang-native word-patch slice
+
+`bootstrap/fixup_words.nula` is a small standalone Core program for encoding
+four instruction forms using exact hexadecimal operands: unconditional jump
+(`Jhhhh`), conditional jump (`Frrhhhh`), constant load (`Crrhhhh`), and
+effect invocation (`Prrhhhh`). The hexadecimal `hhhh` field is interpreted
+as 16 raw bits, including two's-complement negative jump offsets.
+
+`scripts/tests/test_bootstrap_native_word_patch.py` checks fixed expected
+instruction words and malformed inputs with the existing Rust-hosted Nulang
+CLI. This is **a proof-of-concept component, not a stream fixup replacement**.
+The original Python implementation still owns nested marker resolution,
+closure indices, constant pool construction and emitted instruction ordering.
+Do not call this full self-hosting or switch the bootstrap pipeline to use it.
+
+The native slice must pass its exact-head executable checks before extending
+it. The next candidate is a streaming emitter with complete Python parity,
+tested using realistic marker streams, nested control flow and byte-identical
+`.nbc` results. Avoid adding a second independent compiler semantics model.
+
 ## Follow-up milestones (ordered)
 
 1. **Broaden independently checked Core cases.** Add valid and invalid samples one-by-one, including nested closures, shadowing, operator boundaries, parser errors and diagnostic contracts. Only bless a case after reference behavior has been inspected; do not add unsupported syntax as a passing expectation.

@@ -1,0 +1,89 @@
+// Small Nulang-native subset of bootstrap/fixup_hex.py.
+//
+// Protocol: one ASCII request from stdin, exactly Jhhhh, Frrhhhh,
+// Crrhhhh, or Prrhhhh. hhhh is the raw two's-complement 16-bit offset
+// or constant index; rr is a register. Output is one eight-digit hex word.
+// Malformed requests output ERROR and never emit executable bytecode.
+//
+// This does NOT replace fixup_hex.py: stream parsing, marker matching,
+// closure indices and pool collection remain Python-owned until proven.
+
+fn nibble(c: Int) -> Int {
+    if c >= 48 and c <= 57 then c - 48
+    else if c >= 97 and c <= 102 then c - 87
+    else if c >= 65 and c <= 70 then c - 55
+    else 0 - 1
+}
+
+fn read_byte(src: String, pos: Int) -> Int {
+    let hi = nibble(perform String.charAt(src, pos));
+    let lo = nibble(perform String.charAt(src, pos + 1));
+    if hi < 0 or lo < 0 then 0 - 1
+    else hi * 16 + lo
+}
+
+fn read_u16(src: String, pos: Int) -> Int {
+    let hi = read_byte(src, pos);
+    let lo = read_byte(src, pos + 2);
+    if hi < 0 or lo < 0 then 0 - 1
+    else hi * 256 + lo
+}
+
+fn low4(n: Int) -> Int {
+    let q = n / 16;
+    n - q * 16
+}
+
+fn digit(n: Int) -> String {
+    if n < 10 then perform Int.to_string(n)
+    else if n == 10 then "a"
+    else if n == 11 then "b"
+    else if n == 12 then "c"
+    else if n == 13 then "d"
+    else if n == 14 then "e"
+    else "f"
+}
+
+fn format_word(word: Int) -> String {
+    let d0 = digit(low4(word / 0x10000000));
+    let d1 = digit(low4(word / 0x1000000));
+    let d2 = digit(low4(word / 0x100000));
+    let d3 = digit(low4(word / 0x10000));
+    let d4 = digit(low4(word / 0x1000));
+    let d5 = digit(low4(word / 0x100));
+    let d6 = digit(low4(word / 0x10));
+    let d7 = digit(low4(word));
+    let a = d0 + d1;
+    let b = a + d2;
+    let c = b + d3;
+    let d = c + d4;
+    let e = d + d5;
+    let f = e + d6;
+    f + d7
+}
+
+fn patch_word(src: String) -> String {
+    let len = perform String.length(src);
+    if len == 0 then "ERROR"
+    else {
+        let kind = perform String.charAt(src, 0);
+        if kind == 74 and len == 5 then {
+            let offset = read_u16(src, 1);
+            if offset < 0 then "ERROR"
+            else format_word(0x50000000 + offset * 256)
+        } else if len == 7 then {
+            let reg = read_byte(src, 1);
+            let value = read_u16(src, 3);
+            if reg < 0 or value < 0 then "ERROR"
+            else if kind == 70 then format_word(0x52000000 + reg * 65536 + value)
+            else if kind == 67 then format_word(0x07000000 + value * 256 + reg)
+            else if kind == 80 then format_word(0x90000000 + value * 256 + reg)
+            else "ERROR"
+        } else "ERROR"
+    }
+}
+
+fn main() {
+    let input = perform IO.read();
+    perform IO.print(patch_word(input))
+}

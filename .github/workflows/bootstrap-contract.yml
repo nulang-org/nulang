@@ -7,12 +7,14 @@ on:
       - 'bootstrap/**'
       - 'scripts/tests/test_bootstrap_differential.py'
       - 'scripts/tests/test_bootstrap_fixup_contract.py'
+      - 'scripts/tests/test_bootstrap_native_word_patch.py'
       - '.github/workflows/bootstrap-contract.yml'
   pull_request:
     paths:
       - 'bootstrap/**'
       - 'scripts/tests/test_bootstrap_differential.py'
       - 'scripts/tests/test_bootstrap_fixup_contract.py'
+      - 'scripts/tests/test_bootstrap_native_word_patch.py'
       - '.github/workflows/bootstrap-contract.yml'
   workflow_dispatch:
 
@@ -37,6 +39,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build reference host once
         run: cargo build --locked --bin nulang
+      - name: Verify isolated Nulang-native word patch subset
+        run: NULANG_BIN=/tmp/cargo-target/debug/nulang python3 -m unittest discover -s scripts/tests -p test_bootstrap_native_word_patch.py
       - name: Verify existing seven-stage bootstrap checks
         run: |
           test -x /tmp/cargo-target/debug/nulang
