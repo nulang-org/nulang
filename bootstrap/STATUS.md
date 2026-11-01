@@ -115,3 +115,18 @@ register to the arithmetic operand) after the multiplication. Simple
 addition and `a + b * 2` produced matching emissions and correct values in
 the same experiment. This narrows the failure to state after compiling a
 left-hand multiplication; it does not establish why the Move is omitted.
+
+### Arithmetic environment-length candidate (experimental)
+
+On the recorded hosted release binary, preserving `elen` in a separate
+binding around recursive binary-expression compilation makes the reduced
+arithmetic and flat curried-call regressions pass, along with four additional
+mixed-operator cases and the existing bootstrap checks. A trace of an
+instrumented compiler showed an incorrect environment length at the later
+variable lookup, but instrumentation also changed that value and behavior;
+the underlying register or calling-convention defect remains unproven.
+
+The full Stage 2/3 fixed-point oracle still fails: the first emitted
+divergence moves from word 639 to word 1877, near an `and` branch and
+constant 57. Preserve the strict oracle and treat this change as a partial
+candidate until the remaining divergence and hosted gates are resolved.
