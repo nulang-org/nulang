@@ -815,6 +815,14 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                         emit_word(0x40, lr, 7, tmp);
                         emit_word(0x49, tmp, tmp, 0);
                         remark("JmpF -> and_fill");
+                        emit_word(0x52, tmp, 0, 0);
+                        // Untyped expressions may also yield boolean false.
+                        // Compare it separately from integer zero using tmp.
+                        emit_word(0x04, tmp, 0, 0);
+                        emit_word(0x40, 7, tmp, tmp);
+                        emit_word(0x40, lr, tmp, tmp);
+                        emit_word(0x49, tmp, tmp, 0);
+                        remark("JmpF -> and_fill");
                         emit_word(0x52, tmp, 0, 0)
                     } else {
                         remark("JmpF -> and_fill");
@@ -842,6 +850,14 @@ fn comp(src: String, pos: Int, len: Int, left: Int, min_prec: Int, nr: Int, env:
                         emit_word(0x03, 7, 0, 0);
                         let tmp = nr + 1;
                         emit_word(0x40, lr, 7, tmp);
+                        emit_word(0x49, tmp, tmp, 0);
+                        remark("JmpF -> or_right");
+                        emit_word(0x52, tmp, 0, 0);
+                        // Untyped expressions may also yield boolean false.
+                        // Compare it separately from integer zero using tmp.
+                        emit_word(0x04, tmp, 0, 0);
+                        emit_word(0x40, 7, tmp, tmp);
+                        emit_word(0x40, lr, tmp, tmp);
                         emit_word(0x49, tmp, tmp, 0);
                         remark("JmpF -> or_right");
                         emit_word(0x52, tmp, 0, 0)
