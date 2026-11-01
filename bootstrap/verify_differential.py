@@ -120,8 +120,8 @@ def verify(nulang: Path, corpus: Path, fixed_point: bool = False) -> None:
                         f'{case["id"]} ({generation}): expected {case["expected"]!r}, got {actual!r}'
                     )
             print(f'PASS {case["id"]}: both generations returned {case["expected"]}', flush=True)
-    if fixed_point:
-        verify_fixed_point(nulang, prepared, stage2, Path(work))
+        if fixed_point:
+            verify_fixed_point(nulang, prepared, stage2, Path(work))
     print(f'PASS bootstrap differential corpus: {len(cases)} cases', flush=True)
 
 
