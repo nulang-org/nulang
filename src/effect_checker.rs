@@ -738,17 +738,18 @@ impl EffectChecker {
                     {
                         row = effect_row_union(&row, &EffectRow::Open(vec![], Region::fresh()));
                     }
-                } else if matches!(
+                } else if !matches!(
                     Self::callable_source(func),
-                    Expr::If { .. }
-                        | Expr::Match { .. }
-                        | Expr::Block { .. }
-                        | Expr::Let { .. }
-                        | Expr::LetRec { .. }
+                    Expr::Var(_, _) | Expr::Lambda { .. }
                 ) {
-                    // A computed callable with an unproven branch cannot
-                    // discharge a closed effect budget merely because
-                    // evaluating its branch selector is pure.
+                    // A computed function value with no proven callable row
+                    // could invoke arbitrary effects. This includes calls
+                    // through record fields, collection indices, and nested
+                    // applications—not only conditionals and let expressions.
+                    // Preserve that unknown as an open tail, rather than
+                    // silently discharging a closed purity contract. Direct
+                    // lambdas have already been inferred above; direct names
+                    // are handled by their own scoped or module resolution.
                     row = effect_row_union(&row, &EffectRow::Open(vec![], Region::fresh()));
                 }
                 Ok(row)
@@ -5447,6 +5448,57 @@ mod tests {
                 .infer_effects(&EffectContext::empty(), &lambda)
                 .is_err(),
             "an untyped callback must remain unknown until sound type evidence proves otherwise"
+        );
+    }
+
+    #[test]
+    fn test_record_field_callback_cannot_discharge_pure_effect_budget() {
+        let ast = parse_module(
+            r#"fn invoke(cb: () -> Unit ! {IO}) -> Unit ! {} { ({ callback: cb }.callback)() }"#,
+        );
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker.check_module(&ast.decls).is_err(),
+            "record-field callback invocation must not erase IO effects"
+        );
+    }
+
+    #[test]
+    fn test_indexed_callback_cannot_discharge_pure_effect_budget() {
+        let ast = parse_module(r#"fn invoke(cb: () -> Unit ! {IO}) -> Unit ! {} { ([cb][0])() }"#);
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker.check_module(&ast.decls).is_err(),
+            "array-index callback invocation must not erase IO effects"
+        );
+    }
+
+    #[test]
+    fn test_direct_pure_lambda_and_named_calls_remain_admissible() {
+        let ast = parse_module("fn pure() -> Unit ! {} {}\nfn invoke() -> Unit ! {} { pure() }");
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker.check_module(&ast.decls).is_ok(),
+            "direct, statically proven-pure named calls remain admissible"
+        );
+
+        let pure_lambda_call = Expr::App {
+            func: Box::new(Expr::Lambda {
+                params: vec![],
+                ret_type: None,
+                body: Box::new(Expr::Literal(Literal::Unit, s())),
+                effect: Some(EffectRow::empty()),
+                span: s(),
+            }),
+            args: vec![],
+            span: s(),
+        };
+        assert_eq!(
+            checker
+                .infer_effects(&EffectContext::empty(), &pure_lambda_call)
+                .unwrap(),
+            EffectRow::empty(),
+            "direct proven-pure literal lambda calls remain pure"
         );
     }
 
