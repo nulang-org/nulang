@@ -378,10 +378,14 @@ impl EffectRow {
                 a.extend(b);
                 EffectRow::Open(a, r)
             }
-            (EffectRow::Open(mut a, r1), EffectRow::Open(b, _)) => {
-                // Open rows share the same row variable convention
+            (EffectRow::Open(mut a, r1), EffectRow::Open(b, r2)) => {
                 a.extend(b);
-                EffectRow::Open(a, r1)
+                // Distinct row tails must not be silently identified. Until
+                // the typechecker carries row substitutions, a fresh unknown
+                // tail conservatively over-approximates their union. It must
+                // not be treated as equal to either input variable.
+                let merged_tail = if r1 == r2 { r1 } else { Region::fresh() };
+                EffectRow::Open(a, merged_tail)
             }
         }
     }
@@ -2642,6 +2646,42 @@ mod tests {
             ret: Box::new(prim(PrimitiveType::Int)),
             effect,
             cap: Capability::Ref,
+        }
+    }
+
+    #[test]
+    fn test_combine_independent_open_effect_tails_does_not_alias_either_input() {
+        let left_tail = Region::fresh();
+        let right_tail = Region::fresh();
+        let left = EffectRow::Open(vec![Effect::IO], left_tail);
+        let right = EffectRow::Open(vec![Effect::FS], right_tail);
+
+        let merged = left.combine(right);
+        match merged {
+            EffectRow::Open(effects, merged_tail) => {
+                assert!(effects.contains(&Effect::IO));
+                assert!(effects.contains(&Effect::FS));
+                assert_ne!(merged_tail, left_tail);
+                assert_ne!(merged_tail, right_tail);
+            }
+            other => panic!("independent open tails must remain conservatively open: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_combine_same_open_effect_tail_preserves_identity() {
+        let tail = Region::fresh();
+        let left = EffectRow::Open(vec![Effect::IO], tail);
+        let right = EffectRow::Open(vec![Effect::FS], tail);
+
+        let merged = left.combine(right);
+        match merged {
+            EffectRow::Open(effects, merged_tail) => {
+                assert_eq!(merged_tail, tail);
+                assert!(effects.contains(&Effect::IO));
+                assert!(effects.contains(&Effect::FS));
+            }
+            other => panic!("same-tail union must remain open: {other:?}"),
         }
     }
 
