@@ -6,4 +6,6 @@
   {"id": "closure_application", "source": "(fn(x) => x + 1)(41)", "expected": "42"},
   {"id": "recursion", "source": "let fib = fn(n) => if n < 2 then n else fib(n - 1) + fib(n - 2) in fib(10)", "expected": "55"},
   {"id": "staged_instr_arithmetic", "source": "let opcode = 82 in let op1 = 25 in let op2 = 7 in let op3 = 0 in let hi = opcode * 16777216 in let acc1 = hi + op1 * 65536 in let acc2 = acc1 + op2 * 256 in acc2 + op3", "expected": "1377371904"}
+,
+  {"id": "staged_instr_closure", "source": "let instr = fn(opcode) => let op1 = 25 in let op2 = 7 in let op3 = 0 in let hi = opcode * 16777216 in let acc1 = hi + op1 * 65536 in let acc2 = acc1 + op2 * 256 in acc2 + op3 in instr(82)", "expected": "1377371904"}
 ]

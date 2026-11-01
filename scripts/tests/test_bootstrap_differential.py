@@ -34,6 +34,17 @@ class DifferentialContractTests(unittest.TestCase):
         self.assertIn('let acc1 = hi + op1 * 65536', staged['source'])
         self.assertIn('let acc2 = acc1 + op2 * 256', staged['source'])
 
+    def test_staged_instruction_inside_function_fixture_is_pinned(self):
+        # Same staged arithmetic but inside a closure with a captured operand:
+        # this probes code-generation context absent from the scalar fixture.
+        cases = self.module.load_cases(self.module.CORPUS)
+        case = next((c for c in cases if c['id'] == 'staged_instr_closure'), None)
+        self.assertIsNotNone(case, 'missing function-context compiler regression')
+        self.assertEqual(case['expected'], '1377371904')
+        self.assertIn('fn(opcode) => let op1', case['source'])
+        self.assertIn('let acc1 = hi + op1 * 65536', case['source'])
+        self.assertIn('instr(82)', case['source'])
+
     def test_corpus_rejects_duplicate_ids(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / 'corpus.json'
