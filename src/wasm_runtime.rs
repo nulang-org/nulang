@@ -654,22 +654,38 @@ fn host_fneg(_caller: Caller<'_, HostState>, a: i64) -> Result<i64, Error> {
     }
 }
 
-/// Read a TAG_STRING value's null-terminated bytes from WASM linear memory.
-fn read_wasm_string(mut caller: &mut Caller<'_, HostState>, v: i64) -> String {
-    let v = v as u64;
-    if (v & value_layout::TAG_MASK) != value_layout::TAG_STRING {
-        return String::new();
+/// Bound every guest-controlled FFI string *before* allocating host memory.
+/// The previous implementation duplicated the entire guest linear memory on
+/// every FFI call, including for denied symbols, enabling memory amplification
+/// as tenants grew their WASM memory. No guest pointer is ever dereferenced as
+/// a native address: offsets refer strictly to this instance's linear memory.
+const MAX_WASM_FFI_SYMBOL_BYTES: usize = 256;
+const MAX_WASM_FFI_CSTR_BYTES: usize = 1024 * 1024;
+
+fn read_wasm_ffi_string(
+    caller: &mut Caller<'_, HostState>,
+    v: i64,
+    max_bytes: usize,
+    kind: &str,
+) -> Result<String, Error> {
+    let raw = v as u64;
+    if (raw & value_layout::TAG_MASK) != value_layout::TAG_STRING {
+        return Err(Error::msg(format!("WASM FFI {kind} must be a string")));
     }
-    let off = (v & value_layout::PAYLOAD_MASK) as usize;
-    let data = match get_memory(&mut caller) {
-        Ok(m) => m.data(&caller).to_vec(),
-        Err(_) => return String::new(),
-    };
-    let bytes: Vec<u8> = data
-        .get(off..)
-        .map(|s| s.iter().take_while(|&&c| c != 0).copied().collect())
-        .unwrap_or_default();
-    String::from_utf8_lossy(&bytes).into_owned()
+    let offset = (raw & value_layout::PAYLOAD_MASK) as usize;
+    let memory = get_memory(caller)?;
+    let data = memory.data(&*caller);
+    let tail = data
+        .get(offset..)
+        .ok_or_else(|| Error::msg(format!("WASM FFI {kind} offset out of bounds")))?;
+    let terminator = tail
+        .iter()
+        .take(max_bytes + 1)
+        .position(|&byte| byte == 0)
+        .ok_or_else(|| Error::msg(format!("WASM FFI {kind} exceeds maximum length")))?;
+    let text = std::str::from_utf8(&tail[..terminator])
+        .map_err(|_| Error::msg(format!("WASM FFI {kind} must be valid UTF-8")))?;
+    Ok(text.to_owned())
 }
 
 /// `env.ffi_call_N(lib, sym, sig, arg0..argN-1) -> i64`
@@ -687,7 +703,7 @@ fn host_ffi_call_impl(
 ) -> Result<i64, Error> {
     // The guest library name is intentionally ignored. WASM may only call
     // explicitly registered host symbols, never choose a native library.
-    let sym_s = read_wasm_string(&mut caller, sym);
+    let sym_s = read_wasm_ffi_string(&mut caller, sym, MAX_WASM_FFI_SYMBOL_BYTES, "symbol")?;
     let sig = sig as u64;
     let ret_tag = sig & 0b111;
     let mut params: Vec<crate::ffi::marshal::CType> = Vec::with_capacity(args.len());
@@ -732,7 +748,7 @@ fn host_ffi_call_impl(
     let mut cargs: Vec<crate::vm::Value> = Vec::with_capacity(args.len());
     for (i, p) in params.iter().enumerate() {
         if *p == crate::ffi::marshal::CType::CStr {
-            let s = read_wasm_string(&mut caller, args[i]);
+            let s = read_wasm_ffi_string(&mut caller, args[i], MAX_WASM_FFI_CSTR_BYTES, "CStr")?;
             let c = std::ffi::CString::new(s).map_err(|_| Error::msg("bad cstr"))?;
             cargs.push(unsafe { /* SAFETY: host-side storage owns this pointer for the duration required by the guest/host bridge. */ crate::vm::Value::ptr(c.as_ptr() as *mut u8) });
             cstrings.push(c);
@@ -1307,6 +1323,25 @@ mod tests {
                 "must fail closed on registered signature mismatch: {e:?}"
             ),
         }
+    }
+
+    #[test]
+    fn wasm_ffi_rejects_oversized_guest_symbol_before_registry_lookup() {
+        // A hostile WASM guest controls the TAG_STRING offset and length;
+        // no symbol can legitimately need several kilobytes of text.
+        // The old reader duplicated all guest memory before scanning it,
+        // then attempted a registry lookup with this huge untrusted key.
+        let symbol = "x".repeat(4097);
+        let wasm = ffi_test_wasm_for_library("unused", &symbol, 0);
+        let mut runtime = WasmRuntime::new(&wasm, None).unwrap();
+        let err = runtime
+            .init_func
+            .call(&mut runtime.store, ())
+            .expect_err("WASM FFI symbol must have a fixed size bound");
+        assert!(
+            format!("{err:?}").contains("WASM FFI symbol exceeds maximum length"),
+            "must reject oversized symbol before registry lookup: {err:?}"
+        );
     }
 
     #[test]
