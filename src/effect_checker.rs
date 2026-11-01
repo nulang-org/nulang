@@ -610,6 +610,19 @@ impl EffectChecker {
                 let else_row = self.known_callable_expr_row(else_branch)?;
                 Some(effect_row_union(&then_row, &else_row))
             }
+            Expr::Match { arms, .. } => {
+                // Every arm can return a different callable. Only claim a
+                // closed effect budget when all possible arms are known.
+                // Scrutinee and guard evaluation effects are accounted for
+                // separately by infer_effects.
+                let mut arms_iter = arms.iter();
+                let (_, _, first) = arms_iter.next()?;
+                let mut row = self.known_callable_expr_row(first)?;
+                for (_, _, arm) in arms_iter {
+                    row = effect_row_union(&row, &self.known_callable_expr_row(arm)?);
+                }
+                Some(row)
+            }
             _ => None,
         }
     }
@@ -696,7 +709,10 @@ impl EffectChecker {
                     {
                         row = effect_row_union(&row, &EffectRow::Open(vec![], Region::fresh()));
                     }
-                } else if matches!(Self::callable_source(func), Expr::If { .. }) {
+                } else if matches!(
+                    Self::callable_source(func),
+                    Expr::If { .. } | Expr::Match { .. }
+                ) {
                     // A computed callable with an unproven branch cannot
                     // discharge a closed effect budget merely because
                     // evaluating its branch selector is pure.
@@ -720,7 +736,10 @@ impl EffectChecker {
                         // through its local name, including proven-pure ones.
                         // Transparent annotations cannot erase that proof.
                         Some(val_row.clone())
-                    } else if matches!(Self::callable_source(value), Expr::If { .. }) {
+                    } else if matches!(
+                        Self::callable_source(value),
+                        Expr::If { .. } | Expr::Match { .. }
+                    ) {
                         // Retain unknown callable provenance for computed
                         // aliases until inference can prove a closed budget.
                         Some(EffectRow::Open(vec![], Region::fresh()))
@@ -5391,6 +5410,132 @@ mod tests {
                 .infer_effects(&EffectContext::empty(), &lambda)
                 .is_err(),
             "an untyped callback must remain unknown until sound type evidence proves otherwise"
+        );
+    }
+
+    #[test]
+    fn test_matched_callback_invocation_charges_effects() {
+        let io = Type::Function {
+            param: Box::new(Type::Tuple(vec![])),
+            ret: Box::new(Type::unit()),
+            effect: EffectRow::singleton(Effect::IO),
+            cap: Capability::Ref,
+        };
+        let choose = Expr::Match {
+            scrutinee: Box::new(Expr::Literal(Literal::Bool(true), s())),
+            arms: vec![
+                (Pattern::Wild, None, Expr::Var("first".to_string(), s())),
+                (Pattern::Wild, None, Expr::Var("second".to_string(), s())),
+            ],
+            span: s(),
+        };
+        let expr = Expr::Lambda {
+            params: vec![
+                Param::new("first", Some(io.clone())),
+                Param::new("second", Some(io)),
+            ],
+            ret_type: None,
+            body: Box::new(Expr::App {
+                func: Box::new(choose),
+                args: vec![],
+                span: s(),
+            }),
+            effect: Some(EffectRow::empty()),
+            span: s(),
+        };
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker
+                .infer_effects(&EffectContext::empty(), &expr)
+                .is_err(),
+            "selecting a callback with match must not erase its IO effect"
+        );
+    }
+
+    #[test]
+    fn test_matched_callback_alias_charges_effects() {
+        let fs = Type::Function {
+            param: Box::new(Type::Tuple(vec![])),
+            ret: Box::new(Type::unit()),
+            effect: EffectRow::singleton(Effect::FS),
+            cap: Capability::Ref,
+        };
+        let choose = Expr::Match {
+            scrutinee: Box::new(Expr::Literal(Literal::Bool(true), s())),
+            arms: vec![
+                (Pattern::Wild, None, Expr::Var("first".to_string(), s())),
+                (Pattern::Wild, None, Expr::Var("second".to_string(), s())),
+            ],
+            span: s(),
+        };
+        let local = Expr::Let {
+            name: "selected".to_string(),
+            ty: None,
+            value: Box::new(choose),
+            body: Box::new(Expr::App {
+                func: Box::new(Expr::Var("selected".to_string(), s())),
+                args: vec![],
+                span: s(),
+            }),
+            mutable: false,
+            let_in: false,
+            span: s(),
+        };
+        let expr = Expr::Lambda {
+            params: vec![
+                Param::new("first", Some(fs.clone())),
+                Param::new("second", Some(fs)),
+            ],
+            ret_type: None,
+            body: Box::new(local),
+            effect: Some(EffectRow::empty()),
+            span: s(),
+        };
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker
+                .infer_effects(&EffectContext::empty(), &expr)
+                .is_err(),
+            "a match-selected callback alias must not erase its FS effect"
+        );
+    }
+
+    #[test]
+    fn test_matched_pure_callbacks_remain_pure() {
+        let pure = Type::Function {
+            param: Box::new(Type::Tuple(vec![])),
+            ret: Box::new(Type::unit()),
+            effect: EffectRow::empty(),
+            cap: Capability::Ref,
+        };
+        let choose = Expr::Match {
+            scrutinee: Box::new(Expr::Literal(Literal::Bool(true), s())),
+            arms: vec![
+                (Pattern::Wild, None, Expr::Var("first".to_string(), s())),
+                (Pattern::Wild, None, Expr::Var("second".to_string(), s())),
+            ],
+            span: s(),
+        };
+        let expr = Expr::Lambda {
+            params: vec![
+                Param::new("first", Some(pure.clone())),
+                Param::new("second", Some(pure)),
+            ],
+            ret_type: None,
+            body: Box::new(Expr::App {
+                func: Box::new(choose),
+                args: vec![],
+                span: s(),
+            }),
+            effect: Some(EffectRow::empty()),
+            span: s(),
+        };
+        let mut checker = EffectChecker::new();
+        assert!(
+            checker
+                .infer_effects(&EffectContext::empty(), &expr)
+                .is_ok(),
+            "selecting an explicitly pure callback by match remains allowed"
         );
     }
 
