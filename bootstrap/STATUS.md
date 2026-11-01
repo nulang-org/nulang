@@ -149,3 +149,24 @@ The standard differential corpus retains those expectations and fails closed.
 A possible dropped boolean marker at the parenthesis boundary needs further
 investigation; one attempted preservation change broke self-compilation and
 was discarded. Do not promote or merge on fixed-point equality alone.
+
+### Boolean false truthiness candidate
+
+The prior alphabet failure reduces to `(c <= 90) or false` at c=91:
+parentheses discard the packed boolean marker, and the untyped `or` path
+previously checked integer zero but not boolean false. The same defect
+affected `and`. The candidate adds both checks using the existing temporary
+register, with conditional jumps patched to the existing short-circuit target.
+The earlier alternative of preserving the marker directly broke Stage 2 and
+is not included.
+
+On Fedora, using the hosted release binary built from the recorded #2465 test
+merge, the complete 37-case corpus passed in both generations and the full
+Stage 2/3 byte comparison passed at 109530 bytes. Cases cover the two formerly
+failing alphabet boundaries, boolean/integer operands and short-circuit
+expressions. A separate sweep of all 128 ASCII values found matching generation
+emissions and correct truthy/falsy classification for the alphabet predicate.
+The existing bootstrap script and Python contract suites passed.
+This is local evidence using the Rust-hosted VM and Python tooling, not an
+independent VM or a hosted exact-head result; parent stack and security gates
+remain required before merge.
