@@ -1,0 +1,1 @@
+{"exit_code":5,"stdout":"","stderr":"not a subset of allowed effects","proves":"An untyped local callback has an unresolved effect tail and cannot satisfy an explicitly pure function contract."}
