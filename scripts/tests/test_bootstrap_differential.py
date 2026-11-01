@@ -45,6 +45,15 @@ class DifferentialContractTests(unittest.TestCase):
         self.assertIn('let acc1 = hi + op1 * 65536', case['source'])
         self.assertIn('instr(82)', case['source'])
 
+    def test_four_curried_closures_instruction_fixture_is_pinned(self):
+        # The actual preprocessed compiler uses four curried fn layers.
+        cases = self.module.load_cases(self.module.CORPUS)
+        case = next((c for c in cases if c['id'] == 'staged_instr_curried'), None)
+        self.assertIsNotNone(case, 'missing four-closure compiler regression')
+        self.assertEqual(case['expected'], '1377371904')
+        self.assertIn('fn(opcode) => fn(op1) => fn(op2) => fn(op3)', case['source'])
+        self.assertIn('instr(82)(25)(7)(0)', case['source'])
+
     def test_corpus_rejects_duplicate_ids(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / 'corpus.json'
