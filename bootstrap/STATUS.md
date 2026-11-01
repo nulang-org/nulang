@@ -24,6 +24,41 @@ The additional differential runner, executed in `bootstrap-contract.yml`, builds
 
 **Evidence boundary:** agreement between two generations of `compile_hex.nula` is *not* differential testing against Rust's full frontend. The fixed expected outcomes prevent both generations from silently agreeing on a wrong result for these cases, but they do not prove type-checker parity, error compatibility, or complete Core coverage. GitHub CI must execute the exact PR head before this new gate can be called passing. A zero-job GitHub Actions run is not execution evidence.
 
+## Experimental Stage 2 → Stage 3 fixed-point check (draft)
+
+The optional `--fixed-point` flag to `bootstrap/verify_differential.py`
+compiles the full preprocessed restricted-Core compiler a second time using
+Stage 2's `.nbc` artifact, assembles Stage 3, and requires the **complete
+binary `.nbc` artifacts to match byte for byte**. SHA-256 digests and lengths
+are emitted when they differ. The dedicated bootstrap workflow deliberately
+runs this separately, so a failure cannot be mistaken for passing conformance.
+The first successful *execution* of this oracle on GitHub head `8a63f6649`
+(2026-11-01, after correcting the temp-workspace lifetime bug) **failed**:
+Stage 2 compiled `.nbc` was 108,678 bytes, Stage 3 was 108,538 bytes, and
+SHA-256 hashes differed. The existing six-case differential corpus and
+seven-stage bootstrap checks passed on the same exact head, which does **not**
+resolve the fixed-point divergence. Do not promote this gate or claim compiler
+self-hosting until the mismatch is explained and resolved.
+
+The next diagnostic revision reports the first differing output byte and,
+when the compiler emissions differ, the first differing normalized hex word.
+These diagnostics are only for investigation; the oracle still fails closed.
+
+The next exact-head diagnostic result (commit `c83f7cb7`, hosted job
+`124986720733`) localized the first emitted instruction mismatch to **word
+639**: Stage 1 `12192100` (register Move) versus Stage 2 `07000022`
+(constant load). The first compiled-byte difference at offset 47 is in the
+`.nbc` instruction-count header, consistent with the unequal instruction
+streams. This is **not merely a serializer difference**. The current follow-up
+prints bounded neighboring instruction words plus nearby compiler-emitted
+markers to identify the source branch without changing code generation.
+
+This is a reproducibility check of the restricted compiler only: the Python
+preprocessor/fixup/serialization and Rust-hosted VM remain in the trusted
+bootstrap. Stage 3 here is a compiler **generation**, not the independent
+minimal Core VM proposed by the language roadmap. Byte identity is stronger
+than six matching expression outputs, but not full-language compiler parity.
+
 ## Experimental Nulang-native word-patch slice
 
 `bootstrap/fixup_words.nula` is a small standalone Core program for encoding

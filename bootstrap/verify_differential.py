@@ -6,6 +6,7 @@ This is *bootstrap-generation* parity, not Rust-frontend or full-language parity
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -73,13 +74,99 @@ def assemble(hex_stream: bytes) -> bytes:
     return binary
 
 
-def verify(nulang: Path, corpus: Path) -> None:
+
+def first_difference(left: bytes | str, right: bytes | str) -> int:
+    """First differing index, including at EOF when one value is a prefix."""
+    for offset, (a, b) in enumerate(zip(left, right)):
+        if a != b:
+            return offset
+    return min(len(left), len(right)) if len(left) != len(right) else -1
+
+
+def emission_context(hex_text: str, target_word: int, radius: int = 6) -> str:
+    """Bounded, word-indexed context for a compiler-generation divergence."""
+    count = (len(hex_text) + 7) // 8
+    begin = max(0, target_word - radius)
+    end = min(count, target_word + radius + 1)
+    entries = []
+    for index in range(begin, end):
+        word = hex_text[index * 8:(index + 1) * 8]
+        value = f'[{word}]' if index == target_word else word
+        entries.append(f'{index}:{value}')
+    if target_word >= count:
+        entries.append(f'{target_word}:[<eof>]')
+    return ' '.join(entries)
+
+
+def marker_context(raw_emission: str, target_word: int, limit: int = 3) -> str:
+    """Nearest comments preceding an instruction, with their word offsets."""
+    word_index = 0
+    recent = []
+    for line in raw_emission.splitlines():
+        if line.startswith(';'):
+            if word_index > target_word:
+                break
+            recent.append(f'@{word_index} {line[:100]}')
+            recent = recent[-limit:]
+        elif line.strip():
+            if word_index >= target_word:
+                break
+            word_index += 1
+    return ' | '.join(recent) or '<none>'
+
+
+def verify_fixed_point(nulang: Path, prepared: bytes, stage2: bytes, work: Path,
+                       stage1_hex: bytes | None = None) -> None:
+    """Require the restricted compiler built by Stage 1 to reproduce its own artifact.
+
+    The Rust-hosted VM still executes both generations, and Python still
+    prepares/assembles the input. This does not prove host independence.
+    """
+    stage2_path = work / 'self_compile.nbc'
+    stage2_path.write_bytes(stage2)
+    stage2_hex = run([str(nulang), str(stage2_path)], prepared)
+    stage3 = assemble(stage2_hex)
+    if stage3 != stage2:
+        first = hashlib.sha256(stage2).hexdigest()
+        next_ = hashlib.sha256(stage3).hexdigest()
+        byte_offset = first_difference(stage2, stage3)
+        details = f'; first differing compiled byte at offset {byte_offset}'
+        if stage1_hex is not None:
+            host = instructions(stage1_hex.decode('utf-8'))
+            self_hosted = instructions(stage2_hex.decode('utf-8'))
+            hex_offset = first_difference(host, self_hosted)
+            if hex_offset >= 0:
+                word_start = hex_offset // 8 * 8
+                details += (
+                    f'; first differing emitted hex character at offset {hex_offset}'
+                    f' (word {hex_offset // 8}); '
+                    f'Stage 1 word={host[word_start:word_start + 8]!s}; '
+                    f'Stage 2 word={self_hosted[word_start:word_start + 8]!s}; '
+                    f'Stage 1 nearby: {emission_context(host, hex_offset // 8)}; '
+                    f'Stage 2 nearby: {emission_context(self_hosted, hex_offset // 8)}; '
+                    f'Stage 1 recent markers: '
+                    f'{marker_context(stage1_hex.decode("utf-8"), hex_offset // 8)}; '
+                    f'Stage 2 recent markers: '
+                    f'{marker_context(stage2_hex.decode("utf-8"), hex_offset // 8)}'
+                )
+            else:
+                details += '; normalized compiler emissions match (fixup/metadata divergence)'
+        raise AssertionError(
+            'bootstrap fixed-point mismatch: '
+            f'Stage 2 {len(stage2)} bytes sha256={first}, '
+            f'Stage 3 {len(stage3)} bytes sha256={next_}{details}'
+        )
+    print(f'PASS bootstrap fixed-point: {len(stage2)} byte-identical bytes', flush=True)
+
+
+def verify(nulang: Path, corpus: Path, fixed_point: bool = False) -> None:
     cases = load_cases(corpus)
     # Stage 2 requires the Nulang emitter to compile its preprocessed source.
     # Only the already-built Rust host binary executes the bootstrap programs.
     prepared = run([sys.executable, 'bootstrap/prep_core.py'],
                    (ROOT / 'bootstrap/compile_hex.nula').read_bytes())
-    stage2 = assemble(run([str(nulang), 'bootstrap/compile_hex.nula'], prepared))
+    stage1_hex = run([str(nulang), 'bootstrap/compile_hex.nula'], prepared)
+    stage2 = assemble(stage1_hex)
     with tempfile.TemporaryDirectory(prefix='nulang-bootstrap-') as work:
         stage2_path = Path(work) / 'self_compile.nbc'
         stage2_path.write_bytes(stage2)
@@ -98,6 +185,8 @@ def verify(nulang: Path, corpus: Path) -> None:
                         f'{case["id"]} ({generation}): expected {case["expected"]!r}, got {actual!r}'
                     )
             print(f'PASS {case["id"]}: both generations returned {case["expected"]}', flush=True)
+        if fixed_point:
+            verify_fixed_point(nulang, prepared, stage2, Path(work), stage1_hex=stage1_hex)
     print(f'PASS bootstrap differential corpus: {len(cases)} cases', flush=True)
 
 
@@ -105,13 +194,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--nulang', required=True, type=Path, help='path to built nulang binary')
     parser.add_argument('--corpus', type=Path, default=CORPUS)
+    parser.add_argument('--fixed-point', action='store_true',
+                        help='add the full restricted-compiler Stage 2 → Stage 3 byte-identity oracle')
     arguments = parser.parse_args()
     nulang = arguments.nulang.resolve()
     if not nulang.is_file():
         parser.error(f'nulang binary does not exist: {nulang}')
     os.environ.setdefault('NULANG_STEP_LIMIT', '400000000')
     try:
-        verify(nulang, arguments.corpus)
+        verify(nulang, arguments.corpus, fixed_point=arguments.fixed_point)
     except (AssertionError, RuntimeError, ValueError, UnicodeDecodeError) as error:
         print(f'FAIL bootstrap differential: {error}', file=sys.stderr)
         return 1
