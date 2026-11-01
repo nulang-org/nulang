@@ -53,6 +53,20 @@ streams. This is **not merely a serializer difference**. The current follow-up
 prints bounded neighboring instruction words plus nearby compiler-emitted
 markers to identify the source branch without changing code generation.
 
+A smaller independently executed **RED** reproduction on Fedora is
+`let a = 25 in let b = 7 in a * 2 + b`. Stage 1 emits 11 instructions
+and evaluates to **57**; Stage 2 emits 10 and evaluates to **50**. The first
+missing instruction is `12c90e00` (`Move r201 -> r14`), needed to load `b`
+for the addition after the multiplication. Temporary instrumentation of the
+variable-lookup branch observed that Stage 2's `elen` parameter had become
+**0** while `String.length(env)` was **8** (two four-code-point bindings);
+Stage 1 retained `elen=2`. The instrumentation was reverted. A trial to
+recompute the count from `String.length(env)` inside the compiler was also
+reverted because the modified Stage 2 compiler stopped producing valid hex.
+The reduced corpus case remains a required failing executable regression;
+Python fixture-contract tests passing do not certify the compiler. Diagnose
+why recursive operator compilation clobbers `elen` before any source fix.
+
 This is a reproducibility check of the restricted compiler only: the Python
 preprocessor/fixup/serialization and Rust-hosted VM remain in the trusted
 bootstrap. Stage 3 here is a compiler **generation**, not the independent

@@ -54,6 +54,15 @@ class DifferentialContractTests(unittest.TestCase):
         self.assertIn('fn(opcode) => fn(op1) => fn(op2) => fn(op3)', case['source'])
         self.assertIn('instr(82)(25)(7)(0)', case['source'])
 
+    def test_multiply_then_saved_variable_fixture_is_pinned(self):
+        # Minimal real self-hosted compiler failure: Stage 1 returns 57, but
+        # Stage 2 skips the Move loading `b` after the multiplication (50).
+        cases = self.module.load_cases(self.module.CORPUS)
+        case = next((c for c in cases if c['id'] == 'mul_then_saved_variable'), None)
+        self.assertIsNotNone(case, 'missing register-liveness regression fixture')
+        self.assertEqual(case['expected'], '57')
+        self.assertEqual(case['source'], 'let a = 25 in let b = 7 in a * 2 + b')
+
     def test_corpus_rejects_duplicate_ids(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / 'corpus.json'
