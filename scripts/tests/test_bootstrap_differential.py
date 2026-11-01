@@ -135,6 +135,51 @@ class DifferentialContractTests(unittest.TestCase):
         self.assertTrue(prefix.endswith('in instr(82)(25)(7)(0)) in main()'))
         self.assertNotIn(' in let emit_word =', prefix)
 
+    def test_compiler_context_source_retains_later_helpers_through_boundary(self):
+        prepared = (
+            b'let main = fn() => (let low17 = fn(x) => x '
+            b'in let instr = fn(opcode) => opcode '
+            b'in let emit_word = fn(x) => (let y = x in y) '
+            b'in let env_decode = fn(y) => y in 0) in main()'
+        )
+        self.assertEqual(
+            self.module.compiler_context_source(prepared, 'env_decode'),
+            b'let main = fn() => (let low17 = fn(x) => x '
+            b'in let instr = fn(opcode) => opcode '
+            b'in let emit_word = fn(x) => (let y = x in y) '
+            b'in instr(82)(25)(7)(0)) in main()'
+        )
+        self.assertEqual(
+            self.module.compiler_context_source(prepared, 'emit_word'),
+            self.module.compiler_prefix_source(prepared)
+        )
+
+    def test_compiler_context_source_real_preprocessor_cutoffs(self):
+        prepared = self.module.run(
+            [sys.executable, 'bootstrap/prep_core.py'],
+            (self.module.ROOT / 'bootstrap/compile_hex.nula').read_bytes()
+        )
+        for cutoff in ('emit_word', 'read_int', 'prec_of', 'comp_infix_call', 'compile'):
+            with self.subTest(cutoff=cutoff):
+                source = self.module.compiler_context_source(prepared, cutoff).decode()
+                self.assertIn('let instr = fn(opcode)', source)
+                self.assertTrue(source.endswith('in instr(82)(25)(7)(0)) in main()'))
+                self.assertNotIn(f' in let {cutoff} =', source)
+
+    def test_compiler_context_source_rejects_unknown_boundary(self):
+        prepared = b'let main = fn() => (let instr = fn(opcode) => opcode in let emit_word = fn(x) => x in 0) in main()'
+        with self.assertRaisesRegex(ValueError, 'unknown|context'):
+            self.module.compiler_context_source(prepared, 'does_not_exist')
+
+    def test_compiler_context_sweep_reports_every_checkpoint_without_accepting_mismatch(self):
+        with mock.patch.object(self.module, 'verify_compiler_context',
+                side_effect=['parity result', AssertionError('Stage 2 word mismatch')]):
+            result = self.module.verify_context_sweep(
+                pathlib.Path('/example/nulang'), pathlib.Path('/example/stage2.nbc'),
+                b'prepared', pathlib.Path('/tmp'), boundaries=('emit_word', 'env_decode'))
+        self.assertIn('emit_word: parity result', result)
+        self.assertIn('env_decode: Stage 2 word mismatch', result)
+
     def test_compiler_prefix_probe_fails_on_missing_anchor(self):
         with self.assertRaisesRegex(ValueError, 'compiler prefix'):
             self.module.compiler_prefix_source(b'let instr = fn(x) => x in 0')

@@ -77,6 +77,25 @@ is attached to the **still-failing** fixed-point error, never used to accept
 mismatching artifacts. This is a source-context isolation experiment, not a
 compiler/allocator fix or a replacement for required bootstrap/security gates.
 
+### Progressive compiler-context checkpoints
+
+Exact-head bootstrap on `9e7539018` (job `125014660841`) passed the original
+nine expression cases and the real-helper compiler-prefix probe, but still
+failed at emitted word 639 with the same Stage 2/3 hashes and sizes. The
+missing instruction is therefore not reproduced even with all definitions
+**preceding** `instr` included. This is only evidence about that isolated
+prefix, not proof that a specific later declaration causes the defect.
+
+The follow-up *diagnostic-only* path independently checks five source cutoffs:
+`emit_word`, `read_int`, `prec_of`, `comp_infix_call`, and `compile`. For each,
+it retains all preceding generated top-level function bindings, then calls
+`instr(82)(25)(7)(0)` under both compiler generations. A bounded first-word
+trace or expected-result error is reported per checkpoint while the original
+full compiler fixed-point failure remains fatal. These checkpoints must be
+interpreted independently, **not as a monotonic binary search**: removing even
+unused helpers previously changed bootstrap behavior. Until real exact-head
+execution provides results, do not claim register-allocation root cause.
+
 ## Experimental Nulang-native word-patch slice
 
 `bootstrap/fixup_words.nula` is a small standalone Core program for encoding

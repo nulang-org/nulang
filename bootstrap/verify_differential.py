@@ -152,6 +152,85 @@ def compiler_prefix_source(prepared: bytes) -> bytes:
             ' in instr(82)(25)(7)(0)) in main()').encode('utf-8')
 
 
+def compiler_context_source(prepared: bytes, boundary: str) -> bytes:
+    """Preserve full top-level compiler helper declarations before `boundary`.
+
+    Generated helper bindings are at parenthesis depth one under main's body.
+    Parsing this boundary structurally avoids splitting nested local lets.
+    This is an on-failure *probe*, not a transformation used to build Stage 2.
+    """
+    text = prepared.decode('utf-8')
+    if not text.startswith('let main = fn() => (let ') or not text.rstrip().endswith(') in main()'):
+        raise ValueError('invalid compiler context source format')
+    depth = 0
+    in_string = False
+    escaped = False
+    sites = {}
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == '(':
+            depth += 1
+        elif char == ')':
+            depth -= 1
+            if depth < 0:
+                raise ValueError('unbalanced compiler context source')
+        if depth == 1 and text.startswith(' in let ', index):
+            rest = text[index + len(' in let '):]
+            match = re.match(r'([a-zA-Z_][a-zA-Z0-9_]*) = fn\(', rest)
+            if match:
+                name = match.group(1)
+                if name in sites:
+                    raise ValueError(f'compiler context duplicate helper {name}')
+                sites[name] = index
+    if depth != 0 or in_string or 'instr' not in sites or boundary not in sites:
+        raise ValueError(f'unknown or malformed compiler context boundary {boundary}')
+    if sites[boundary] <= sites['instr']:
+        raise ValueError('compiler context boundary precedes instr')
+    return (text[:sites[boundary]] + ' in instr(82)(25)(7)(0)) in main()').encode('utf-8')
+
+
+def verify_compiler_context(nulang: Path, stage2_path: Path, prepared: bytes,
+                            work: Path, boundary: str) -> str:
+    """Run strict emission and result comparisons on one compiler prefix."""
+    source = compiler_context_source(prepared, boundary)
+    host_hex = run([str(nulang), 'bootstrap/compile_hex.nula'], source)
+    self_hex = run([str(nulang), str(stage2_path)], source)
+    assert_emissions_equal('compiler_context', host_hex, self_hex)
+    for generation, stream in (('stage1', host_hex), ('stage2', self_hex)):
+        binary = work / f'compiler-context-{generation}.nbc'
+        binary.write_bytes(assemble(stream))
+        actual = last_result(run([str(nulang), str(binary)]).decode('utf-8'))
+        if actual != '1377371904':
+            raise AssertionError(
+                f'{generation} expected 1377371904, got {actual!r}'
+            )
+    return 'parity 1377371904 in both generations'
+
+
+def verify_context_sweep(nulang: Path, stage2_path: Path, prepared: bytes,
+                         work: Path, boundaries: tuple[str, ...] =
+                         ('emit_word', 'read_int', 'prec_of', 'comp_infix_call', 'compile')) -> str:
+    """Report independent non-monotonic checkpoints; never accept a mismatch."""
+    results = []
+    for boundary in boundaries:
+        try:
+            outcome = verify_compiler_context(nulang, stage2_path, prepared, work, boundary)
+        except (AssertionError, RuntimeError, ValueError, UnicodeError) as exc:
+            outcome = str(exc)[:1100] or type(exc).__name__
+        results.append(f'{boundary}: {outcome}')
+    return ' | '.join(results)
+
+
 def verify_compiler_prefix(nulang: Path, stage2_path: Path,
                            prepared: bytes, work: Path) -> str:
     """Check host/self-compiled parity for the exact leading compiler context."""
@@ -208,10 +287,10 @@ def verify_fixed_point(nulang: Path, prepared: bytes, stage2: bytes, work: Path,
                 details += '; normalized compiler emissions match (fixup/metadata divergence)'
         if stage1_hex is not None:
             try:
-                prefix_result = verify_compiler_prefix(nulang, stage2_path, prepared, work)
-                details += f'; {prefix_result}'
+                sweep_result = verify_context_sweep(nulang, stage2_path, prepared, work)
+                details += f'; compiler context sweep: {sweep_result}'
             except (AssertionError, RuntimeError, ValueError, UnicodeError) as exc:
-                details += f'; compiler-prefix probe failed: {exc}'
+                details += f'; compiler context sweep failed: {exc}'
         raise AssertionError(
             'bootstrap fixed-point mismatch: '
             f'Stage 2 {len(stage2)} bytes sha256={first}, '
