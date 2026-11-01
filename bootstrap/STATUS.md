@@ -88,3 +88,22 @@ tested using realistic marker streams, nested control flow and byte-identical
 5. **Evaluate a minimal independent Core VM** only after prior gates pass; running `.nbc` in the Rust VM does not confer toolchain independence.
 
 Priority: keep compiler/VM semantic correctness, exact-head CI, and durable execution safety ahead of full self-hosting. This workstream should remain narrowly scoped while those P0 invariants are open.
+
+### Flat curried-call reproducer (known failing)
+
+The `flat_curried_call_arithmetic` differential fixture captures a smaller,
+closed program that reproduces a missing Move pattern also seen at the first
+fixed-point divergence. Using the release binary built by hosted CI from test
+merge `8d207eb520120df5e849e010cfe24021eaed9947` (head `b094446`), the host
+compiler's artifact returned 1377371904; the self-compiled artifact returned
+1375731712. Their instruction streams differ, so the differential harness
+fails before executing this case. This is a behavioral counterexample, not
+proof that its root cause is the full compiler's first mismatch. The staged
+arithmetic fixtures in this branch pass using the same binary.
+
+The full fixed-point comparison was also repeated on Fedora with that hosted
+release binary: Stage 2 and Stage 3 hashes matched the failing hosted debug
+run, and repeated raw emissions were byte-identical within each generation.
+The fixed-point oracle and this regression must remain failing until a real
+fix is demonstrated. The Rust host and Python bootstrap tooling remain part
+of the trusted path.
