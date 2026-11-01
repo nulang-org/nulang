@@ -1,0 +1,3 @@
+fn invoke(cb: () -> Unit ! {IO}) -> Unit ! {} { cb() }
+fn print_it() -> Unit ! {IO} { perform IO.print("should not execute") }
+invoke(print_it)

@@ -1,0 +1,3 @@
+fn invoke(cb: () -> Unit ! {IO}) -> Unit ! {IO} { cb() }
+fn print_it() -> Unit ! {IO} { perform IO.print("callback") }
+invoke(print_it)

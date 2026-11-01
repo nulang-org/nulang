@@ -1282,8 +1282,7 @@ If the handled body completes without performing any effect that escapes, the va
 ```nulang
 let sum = handle {
   let x = perform Random.int() in
-  let y = perform Random.int() in
-  x + y
+  x + 5
 } {
   | Random.int() => 5
 }

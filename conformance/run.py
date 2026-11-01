@@ -2,6 +2,28 @@
 import os, subprocess, json, sys
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)) + "/..")
+
+# Select real .nula/.json fixture pairs before building the compiler.
+# A misspelled prefix must fail, not silently report zero tests passed.
+prefixes = tuple(sys.argv[1:])
+selected = sorted(
+    file for file in os.listdir("conformance/behavior")
+    if file.endswith(".nula")
+    and (not prefixes or file.startswith(prefixes))
+    and os.path.isfile(f"conformance/behavior/{file[:-5]}.json")
+)
+if not selected:
+    print(f"No conformance fixtures matched: {prefixes or ('all',)}", file=sys.stderr)
+    sys.exit(1)
+
+missing_prefixes = [
+    prefix for prefix in prefixes
+    if not any(file.startswith(prefix) for file in selected)
+]
+if missing_prefixes:
+    print(f"No conformance fixtures matched: {missing_prefixes}", file=sys.stderr)
+    sys.exit(1)
+
 subprocess.run(["cargo", "build", "--quiet"], check=True)
 # Resolve the binary through cargo so the repo's `target-dir` override in
 # `.cargo/config.toml` (currently `/tmp/cargo-target`) is respected — a
@@ -14,12 +36,12 @@ nulang_bin = os.path.join(target_dir, "debug", "nulang")
 passed = 0
 failed = 0
 
-for file in os.listdir("conformance/behavior"):
-    if not file.endswith(".nula"): continue
+# Optional basename prefixes select a focused conformance subset; no args
+# retain the full-suite behavior used by existing manual invocations.
+for file in selected:
     base = file[:-5]
     json_path = f"conformance/behavior/{base}.json"
     nula_path = f"conformance/behavior/{file}"
-    if not os.path.exists(json_path): continue
     
     with open(json_path) as f:
         expected = json.load(f)
