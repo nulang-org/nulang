@@ -92,10 +92,16 @@ self-compiled remapped capture string was 24 characters instead of 4;
 its decoded capture word also differed. The real compiler source was
 restored after every experiment. `bootstrap/verify_layout_invariance.py`
 reproduces this in a temporary workspace, checks the curated corpus and,
-if those pass, the unchanged fixed-point oracle. Its new CI step must
-remain failing until a causal, independently tested fix removes this
-source-layout dependence. The normal compiler's successful hosted 108,950
-byte fixed point remains valid only for the currently tested source.
+if those pass, the unchanged fixed-point oracle. The original exact-head draft source has a confirmed hosted 108,950-byte
+fixed point, but this source-layout test revealed additional corruption.
+A narrow candidate fix re-derives the pure capture mapping **after**
+emitting the Closure instruction, which was shown by temporary markers to
+clobber the mapping's long-lived register in the self-compiled compiler.
+Both the unperturbed (109,022-byte) and helper-removed (106,700-byte)
+compilers passed the unchanged complete fixed-point oracle locally with
+14/14 differential fixtures. Hosted exact-head qualification and review
+remain mandatory; this does not prove the underlying register allocator
+is layout-independent for other unrelated source perturbations.
 
 This is a reproducibility check of the restricted compiler only: the Python
 preprocessor/fixup/serialization and Rust-hosted VM remain in the trusted
