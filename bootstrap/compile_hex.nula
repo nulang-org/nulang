@@ -393,7 +393,11 @@ fn comp_fn_closure(comp_rec, src: String, q6: Int, len: Int, nr: Int, env: Strin
             remark("fn_end:");
             let closure_reg = nr;
             emit_word(0x60, 0xFF, 0xFF, closure_reg);
-            let _ = emit_fnend_caps(env_captures, capture_count, 0, env, 0, elen, closure_reg);
+            // Emitting Closure can overwrite the long-lived captured-env local
+            // in the self-compiled compiler (layout-sensitive register alias).
+            // Rebuild the pure mapping after that emission before CapStore.
+            let final_captures = remap_captures(env, elen, 0, 0);
+            let _ = emit_fnend_caps(final_captures, capture_count, 0, env, 0, elen, closure_reg);
             (closure_reg << 18) + body_end
         } else (nr << 18) + p
     } else (nr << 18) + p

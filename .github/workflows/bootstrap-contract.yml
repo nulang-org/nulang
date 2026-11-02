@@ -6,6 +6,7 @@ on:
     paths:
       - 'bootstrap/**'
       - 'scripts/tests/test_bootstrap_differential.py'
+      - 'scripts/tests/test_bootstrap_layout_invariance.py'
       - 'scripts/tests/test_bootstrap_fixup_contract.py'
       - 'scripts/tests/test_bootstrap_native_word_patch.py'
       - '.github/workflows/bootstrap-contract.yml'
@@ -13,6 +14,7 @@ on:
     paths:
       - 'bootstrap/**'
       - 'scripts/tests/test_bootstrap_differential.py'
+      - 'scripts/tests/test_bootstrap_layout_invariance.py'
       - 'scripts/tests/test_bootstrap_fixup_contract.py'
       - 'scripts/tests/test_bootstrap_native_word_patch.py'
       - '.github/workflows/bootstrap-contract.yml'
@@ -34,6 +36,7 @@ jobs:
       - name: Validate harness contract
         run: |
           python3 -m unittest discover -s scripts/tests -p test_bootstrap_differential.py
+          python3 -m unittest discover -s scripts/tests -p test_bootstrap_layout_invariance.py
           python3 -m unittest discover -s scripts/tests -p test_bootstrap_fixup_contract.py
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -49,3 +52,5 @@ jobs:
         run: python3 bootstrap/verify_differential.py --nulang /tmp/cargo-target/debug/nulang
       - name: Experimental compiler fixed-point oracle (Stage 2 to Stage 3)
         run: python3 bootstrap/verify_differential.py --nulang /tmp/cargo-target/debug/nulang --fixed-point
+      - name: Experimental source-layout invariance oracle (remove unused instr)
+        run: python3 bootstrap/verify_layout_invariance.py --nulang /tmp/cargo-target/debug/nulang

@@ -82,6 +82,27 @@ Python fixup. A freshly built exact-head hosted bootstrap run, all other
 required checks, security audit and parent-stack qualification remain gates.
 Do not merge on a local green result alone.
 
+**Separate source-layout invariant (deliberate RED gate).** Removing the
+unused `instr()` helper from a **temporary copy** of `compile_hex.nula`
+currently corrupts the self-compiled `fib(10)` capture store. The first
+changed emitted word is `620800c8` (Stage 1) versus `620860c8`
+(Stage 2): the capture slot changes from 0 to 96. Diagnostic-only
+experiments showed `mapped_reg=11` in both generations, but the
+self-compiled remapped capture string was 24 characters instead of 4;
+its decoded capture word also differed. The real compiler source was
+restored after every experiment. `bootstrap/verify_layout_invariance.py`
+reproduces this in a temporary workspace, checks the curated corpus and,
+if those pass, the unchanged fixed-point oracle. The original exact-head draft source has a confirmed hosted 108,950-byte
+fixed point, but this source-layout test revealed additional corruption.
+A narrow candidate fix re-derives the pure capture mapping **after**
+emitting the Closure instruction, which was shown by temporary markers to
+clobber the mapping's long-lived register in the self-compiled compiler.
+Both the unperturbed (109,022-byte) and helper-removed (106,700-byte)
+compilers passed the unchanged complete fixed-point oracle locally with
+14/14 differential fixtures. Hosted exact-head qualification and review
+remain mandatory; this does not prove the underlying register allocator
+is layout-independent for other unrelated source perturbations.
+
 This is a reproducibility check of the restricted compiler only: the Python
 preprocessor/fixup/serialization and Rust-hosted VM remain in the trusted
 bootstrap. Stage 3 here is a compiler **generation**, not the independent
