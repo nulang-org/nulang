@@ -1,5 +1,6 @@
 //! Manual, isolated compatibility gate for replacing libSQL's local SQLite
 //! driver. This does NOT migrate cloud URLs, credentials or production data.
+mod rich_probe;
 mod turso_writer;
 mod writer_probe;
 use nulang::runtime::{
@@ -307,6 +308,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // child exits without running Rust connection destructors.
     verify_crashed_turso_transaction_is_atomic(&db_file)?;
     writer_probe::verify_turso_transition_writer(&db_file)?;
+    rich_probe::verify_full_record_parity(&db_file)?;
 
     let legacy = LibsqlStore::new(&db_file)?;
     assert!(
