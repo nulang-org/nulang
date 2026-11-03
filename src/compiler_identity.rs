@@ -10,7 +10,9 @@ use crate::content_identity::{SemanticId, SourceId};
 use crate::hir;
 use crate::mir;
 use crate::semantic_identity::SemanticIdentityError;
-use crate::semantic_schema::semantic_id_for_typed_program;
+use crate::semantic_schema::{
+    actor_definition_semantic_ids_for_typed_program, semantic_id_for_typed_program,
+};
 
 /// Derive a complete artifact identity manifest from one typed/lowered program.
 ///
@@ -49,6 +51,43 @@ where
         backend,
         flags,
     ))
+}
+
+/// Compile one typed HIR/MIR program to bytecode and attach its proven
+/// backend-independent semantic identity as an in-memory sidecar.
+///
+/// Low-level `mir_codegen::compile_mir` intentionally remains available for
+/// fuzzers, backend tests, and raw codegen work and produces an unproven
+/// `CodeModule`. Production typed frontend paths should use this helper.
+pub fn compile_typed_bytecode<D>(
+    hir: &hir::Module,
+    mir: &mut mir::Module,
+    dependency_semantic_ids: D,
+    name: &str,
+) -> crate::types::NuResult<crate::bytecode::CodeModule>
+where
+    D: IntoIterator<Item = SemanticId>,
+{
+    let dependencies: Vec<_> = dependency_semantic_ids.into_iter().collect();
+    let semantic_id = semantic_id_for_typed_program(hir, mir, dependencies.iter().copied())
+        .map_err(|error| crate::types::NuError::VMError {
+            msg: format!("cannot derive canonical semantic identity: {error}"),
+            span: crate::types::Span::default(),
+        })?;
+    let actor_semantic_ids =
+        actor_definition_semantic_ids_for_typed_program(hir, mir, dependencies.iter().copied())
+            .map_err(|error| crate::types::NuError::VMError {
+                msg: format!("cannot derive actor semantic identities: {error}"),
+                span: crate::types::Span::default(),
+            })?;
+
+    let mut module = crate::mir_codegen::compile_mir(mir, name)?;
+    module.semantic_id = Some(semantic_id);
+    module.actor_semantic_ids = actor_semantic_ids
+        .into_iter()
+        .map(|(_, semantic_id)| semantic_id)
+        .collect();
+    Ok(module)
 }
 
 #[cfg(test)]
@@ -96,6 +135,175 @@ mod tests {
         assert_ne!(first.source_id(), reformatted.source_id());
         assert_eq!(first.semantic_id(), reformatted.semantic_id());
         assert_eq!(first.artifact_id(), reformatted.artifact_id());
+    }
+
+    #[test]
+    fn typed_bytecode_carries_semantic_identity_but_raw_codegen_does_not() {
+        let (hir, mut typed_mir) = empty_program();
+        let mut raw_mir = typed_mir.clone();
+
+        let typed = compile_typed_bytecode(&hir, &mut typed_mir, [], "typed").unwrap();
+        let raw = crate::mir_codegen::compile_mir(&mut raw_mir, "raw").unwrap();
+
+        assert!(typed.semantic_id.is_some());
+        assert!(raw.semantic_id.is_none());
+        assert!(typed.actor_semantic_ids.is_empty());
+        assert!(raw.actor_semantic_ids.is_empty());
+    }
+
+    #[test]
+    fn frozen_nbc_roundtrip_does_not_self_assert_semantic_identity() {
+        let (hir, mut mir) = empty_program();
+        let typed = compile_typed_bytecode(&hir, &mut mir, [], "typed").unwrap();
+        assert!(typed.semantic_id.is_some());
+
+        let bytes = typed.to_nbc(None).unwrap();
+        let decoded = crate::bytecode::CodeModule::from_nbc(&bytes)
+            .unwrap()
+            .module;
+        assert!(decoded.semantic_id.is_none());
+        assert!(decoded.actor_semantic_ids.is_empty());
+    }
+
+    #[test]
+    fn artifact_binding_requires_proven_semantics_and_rejects_rebinding() {
+        let (hir, mut mir) = empty_program();
+        let mut module = compile_typed_bytecode(&hir, &mut mir, [], "typed").unwrap();
+        let semantic = module.semantic_id.unwrap();
+        let valid = ArtifactIdentityManifest::new(
+            None,
+            semantic,
+            "nulangc-test",
+            "portable",
+            "nulang-abi-v1",
+            "bytecode",
+            ["opt=0"],
+        );
+        assert_eq!(module.artifact_id, None);
+        module.attach_artifact_identity(&valid).unwrap();
+        module.attach_artifact_identity(&valid).unwrap();
+        assert_eq!(module.artifact_id, Some(valid.artifact_id()));
+
+        let different_codegen = ArtifactIdentityManifest::new(
+            None,
+            semantic,
+            "nulangc-test",
+            "portable",
+            "nulang-abi-v1",
+            "bytecode",
+            ["opt=3"],
+        );
+        assert!(matches!(
+            module.attach_artifact_identity(&different_codegen),
+            Err(crate::artifact_identity::ArtifactIdentityError::ArtifactIdentityMismatch { .. })
+        ));
+        let wrong_semantics = ArtifactIdentityManifest::new(
+            None,
+            SemanticId::from_canonical_bytes(b"unrelated", []),
+            "nulangc-test",
+            "portable",
+            "nulang-abi-v1",
+            "bytecode",
+            ["opt=0"],
+        );
+        assert!(matches!(
+            module.attach_artifact_identity(&wrong_semantics),
+            Err(crate::artifact_identity::ArtifactIdentityError::SemanticIdentityMismatch { .. })
+        ));
+        assert_eq!(module.artifact_id, Some(valid.artifact_id()));
+    }
+
+    #[test]
+    fn artifact_binding_is_unavailable_to_raw_or_legacy_bytecode() {
+        let (hir, mut mir) = empty_program();
+        let mut raw = crate::mir_codegen::compile_mir(&mut mir, "raw").unwrap();
+        let manifest = artifact_identity_for_typed_program(
+            None,
+            &hir,
+            &mir,
+            [],
+            "nulangc-test",
+            "portable",
+            "nulang-abi-v1",
+            "bytecode",
+            ["opt=0"],
+        )
+        .unwrap();
+        assert!(matches!(
+            raw.attach_artifact_identity(&manifest),
+            Err(crate::artifact_identity::ArtifactIdentityError::MissingModuleSemanticIdentity)
+        ));
+        assert_eq!(raw.artifact_id, None);
+
+        let mut typed_mir = mir.clone();
+        let mut typed = compile_typed_bytecode(&hir, &mut typed_mir, [], "typed").unwrap();
+        let matching = ArtifactIdentityManifest::new(
+            None,
+            typed.semantic_id.unwrap(),
+            "nulangc-test",
+            "portable",
+            "nulang-abi-v1",
+            "bytecode",
+            ["opt=0"],
+        );
+        typed.attach_artifact_identity(&matching).unwrap();
+        let bytes = typed.to_nbc(None).unwrap();
+        let decoded = crate::bytecode::CodeModule::from_nbc(&bytes)
+            .unwrap()
+            .module;
+        assert_eq!(decoded.artifact_id, None);
+        assert_eq!(decoded.semantic_id, None);
+    }
+
+    #[test]
+    fn typed_bytecode_actor_sidecar_aligns_with_actor_metadata() {
+        use crate::ast::{Literal, StateModel};
+        use crate::bytecode::ActorMeta;
+        use crate::types::{PrimitiveType, Span, Type};
+
+        let int = Type::Primitive(PrimitiveType::Int);
+        let actor = hir::ActorDef {
+            name: "Counter".to_string(),
+            type_params: Vec::new(),
+            persistent: true,
+            state_fields: vec![(
+                "value".to_string(),
+                StateModel::Durable,
+                int.clone(),
+                hir::Operand::Literal(Literal::Int(0), int),
+            )],
+            behaviors: Vec::new(),
+            init: Vec::new(),
+            events: Vec::new(),
+            apply_handlers: Vec::new(),
+            version: 1,
+            migrations: Vec::new(),
+            is_organization: false,
+            is_workflow: false,
+            is_agent: false,
+            virtual_: false,
+            tools: Vec::new(),
+            semantic_memory_dimensions: None,
+            procedural_memory_namespace: None,
+            fallback_config: String::new(),
+            retry_config: String::new(),
+            span: Span::default(),
+        };
+        let hir = hir::Module {
+            name: "typed".to_string(),
+            decls: vec![hir::Decl::Actor(actor)],
+        };
+        let mut mir = mir::Module::new("typed");
+        mir.actor_metadata.push(ActorMeta::new("Counter"));
+
+        let module = compile_typed_bytecode(&hir, &mut mir, [], "typed").unwrap();
+        assert_eq!(module.actor_metadata.len(), 1);
+        assert_eq!(module.actor_semantic_ids.len(), 1);
+        assert_eq!(
+            module.actor_semantic_id("Counter"),
+            module.actor_semantic_id_at(0)
+        );
+        assert!(module.actor_semantic_id_at(0).is_some());
     }
 
     #[test]

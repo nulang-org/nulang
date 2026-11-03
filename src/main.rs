@@ -2431,7 +2431,7 @@ fn compile_with_new_pipeline(
     // compiler.
     let hir = nulang::hir_lower::lower_module(ast, &type_checker.inferred_decl_types);
     let mut mir = nulang::mir_lower::lower_module(&hir)?;
-    nulang::mir_codegen::compile_mir(&mut mir, name)
+    nulang::compiler_identity::compile_typed_bytecode(&hir, &mut mir, [], name)
 }
 /// Compile a source string to a `.nbc` artifact and write it to `out_path`.
 ///
