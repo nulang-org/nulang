@@ -82,9 +82,7 @@ fn verify_crashed_turso_transaction_is_atomic(db_path: &Path) -> Result<(), Box<
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    if std::env::args().nth(1).as_deref()
-        == Some("--crash-with-uncommitted-turso-transaction")
-    {
+    if std::env::args().nth(1).as_deref() == Some("--crash-with-uncommitted-turso-transaction") {
         let filename = std::env::args_os()
             .nth(2)
             .ok_or("crash fixture requires an isolated database filename")?;
