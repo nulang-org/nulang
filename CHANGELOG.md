@@ -2,7 +2,7 @@
 
 ### Reference VM invalid arithmetic operand guard — 2026-11-03
 - **Bytecode `IAdd`, `ISub`, and `IMul` now reject invalid non-numeric tagged operands rather than silently substitute zero** on their integer paths. Existing string concatenation, Float-pair arithmetic, and legacy `nil`-as-zero behavior remain unchanged.
-- **Direct-bytecode regressions check Boolean rejection in both operand positions and preserve nil compatibility** for all three opcodes. This is VM-only hardening; it does not establish JIT/AOT/WASM semantic parity or make a change to the source type system.
+- **Direct-bytecode regressions check Boolean rejection in both operand positions and preserve nil compatibility** for all three opcodes. The portable CoreVM now performs the same rejection, with its own bytecode-level regression tests. JIT/AOT/WASM malformed-operand parity remains outside this change; the source type system is unchanged.
 
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
