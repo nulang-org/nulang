@@ -199,11 +199,98 @@ pub(crate) fn verify_exclusive_file_handoff(database: &Path) -> Result<(), Box<d
 }
 
 pub(crate) fn run_handoff_child(
-    _mode: &str,
-    _database: &Path,
-    _actor: u64,
-    _barrier: &Path,
+    mode: &str,
+    database: &Path,
+    actor: u64,
+    barrier: &Path,
 ) -> Result<(), Box<dyn Error>> {
-    // RED: a missing child must fail before parent accepts handoff as proven.
-    Err(io::Error::new(io::ErrorKind::Unsupported, "handoff child not implemented").into())
+    // A test child must never accept an arbitrary production path. The
+    // parent creates an isolated tempdir, test-only marker and barrier.
+    let marked = database.parent().is_some_and(|parent| {
+        parent.join(".nulang-turso-test-only").is_file()
+    });
+    if std::env::var("NULANG_TURSO_HANDOFF_TEST_CHILD").ok().as_deref() != Some("1")
+        || !barrier.to_string_lossy().contains("nulang-turso-process-handoff-")
+        || database.file_name() != Some(std::ffi::OsStr::new("durable.db"))
+        || !marked
+    {
+        return Err("handoff child requires marked disposable database and isolated barrier".into());
+    }
+    let filename = database.to_str().ok_or("non-UTF8 disposable database")?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    match mode {
+        "--turso-handoff-owner" => rt.block_on(async {
+            let db = turso::Builder::new_local(filename).build().await?;
+            let conn = db.connect()?;
+            commit_transition(&conn, candidate(actor, 777)).await?;
+            // Keep BOTH handles alive after COMMIT to test exclusive file
+            // ownership rather than just transient SQL writer locks.
+            fs::write(barrier.join("owner-ready"), b"1")?;
+            let deadline = Instant::now() + TIMEOUT;
+            while !barrier.join("release").exists() {
+                if Instant::now() >= deadline {
+                    return Err::<(), Box<dyn Error>>("owner handoff release timed out".into());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            drop(conn);
+            drop(db);
+            Ok::<(), Box<dyn Error>>(())
+        }),
+        "--turso-handoff-contender" => rt.block_on(async {
+            match turso::Builder::new_local(filename).build().await {
+                Err(error) if error.to_string().to_ascii_lowercase().contains("locked") => {
+                    std::process::exit(REJECTED_EXCLUSIVE_FILE_LOCK)
+                }
+                Err(error) => Err(Box::<dyn Error>::from(error)),
+                Ok(db) => {
+                    drop(db);
+                    Err::<(), Box<dyn Error>>(
+                        "second process unexpectedly acquired the exclusive owner file".into(),
+                    )
+                }
+            }
+        }),
+        "--turso-handoff-successor" => rt.block_on(async {
+            let db = turso::Builder::new_local(filename).build().await?;
+            let conn = db.connect()?;
+
+            let stale = DurableTransition {
+                version: DURABLE_TRANSITION_VERSION,
+                actor_id: actor,
+                activation_epoch: 3,
+                sequence: 2,
+                expected_previous_sequence: 1,
+                command: None,
+                snapshot: None,
+                workflow_events: vec![],
+                domain_events: vec![],
+                durable_effects: vec![],
+                outbox: vec![],
+            };
+            let denial = commit_transition(&conn, stale)
+                .await
+                .expect_err("stale owner must not be allowed to advance the tail");
+            if denial.kind() != io::ErrorKind::PermissionDenied {
+                return Err::<(), Box<dyn Error>>(
+                    format!("unexpected stale-epoch error kind: {denial}").into(),
+                );
+            }
+
+            let next = successor(actor);
+            let expected = next.digest()?;
+            let receipt = commit_transition(&conn, next).await?;
+            assert_eq!(
+                receipt.digest, expected,
+                "new owner must persist the canonical successor digest"
+            );
+            drop(conn);
+            drop(db);
+            Ok::<(), Box<dyn Error>>(())
+        }),
+        _ => Err("unrecognized isolated Turso handoff child mode".into()),
+    }
 }
