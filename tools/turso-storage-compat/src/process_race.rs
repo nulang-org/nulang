@@ -34,15 +34,54 @@ fn candidate(actor: u64, value: i64) -> DurableTransition {
 // Child entry: explicitly test-only and requires a unique barrier supplied by
 // the parent. This is NOT a general-purpose database write command.
 pub(crate) fn writer_child(
-    _database: &Path,
-    _actor: u64,
-    _value: i64,
-    _barrier: &Path,
+    database: &Path,
+    actor: u64,
+    value: i64,
+    barrier: &Path,
 ) -> Result<(), Box<dyn Error>> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "independent process test writer not implemented",
-    ).into())
+    if std::env::var("NULANG_TURSO_RACE_TEST_CHILD").as_deref() != Ok("1")
+        || !barrier
+            .to_string_lossy()
+            .contains("nulang-turso-process-race-")
+    {
+        return Err("process-race child requires an isolated test barrier".into());
+    }
+    let db_path = database
+        .to_str()
+        .ok_or("non-UTF8 disposable database filename")?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let db = turso::Builder::new_local(db_path).build().await?;
+        let connection = db.connect()?;
+
+        // Must signal readiness after opening our connection, but before
+        // BEGIN IMMEDIATE, or this would only test sequential retries.
+        fs::write(barrier.join(format!("ready-{value}")), b"1")?;
+        let deadline = Instant::now() + READY_TIMEOUT;
+        while !barrier.join("go").exists() {
+            if Instant::now() >= deadline {
+                return Err::<(), Box<dyn Error>>("race start signal timed out".into());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        match commit_transition(&connection, candidate(actor, value)).await {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                std::process::exit(REJECTED_CONFLICT);
+            }
+            Err(error) if {
+                let message = error.to_string().to_ascii_lowercase();
+                message.contains("busy") || message.contains("locked")
+            } =>
+            {
+                std::process::exit(REJECTED_LOCK);
+            }
+            Err(error) => Err(Box::<dyn Error>::from(error)),
+        }
+    })
 }
 
 struct ReapChildren(Vec<Child>);
