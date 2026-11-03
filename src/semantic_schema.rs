@@ -71,6 +71,12 @@ pub struct ActorStateField {
 /// Actor names are qualified from the root HIR module through every nested
 /// module so nominal identity cannot collapse two distinct actors that happen
 /// to share a short name.
+///
+/// Extraction deliberately preserves declaration order. MIR actor metadata is
+/// reserved by walking the same HIR declarations in order, and definition-level
+/// semantic IDs are positionally aligned with that metadata. Canonical hashing
+/// remains order-independent because `canonical_actor_state_schema_bytes`
+/// sorts schemas before encoding them.
 pub fn actor_state_schemas_from_hir(module: &hir::Module) -> Vec<ActorStateSchema> {
     let mut schemas = Vec::new();
     let mut namespace = Vec::new();
@@ -78,7 +84,6 @@ pub fn actor_state_schemas_from_hir(module: &hir::Module) -> Vec<ActorStateSchem
         namespace.push(module.name.clone());
     }
     collect_decl_schemas(&module.decls, &mut namespace, &mut schemas);
-    schemas.sort_by(|left, right| left.actor_name.cmp(&right.actor_name));
     schemas
 }
 
@@ -928,6 +933,29 @@ mod tests {
         assert_eq!(ids[0].0, "typed::Billing::Counter");
         assert_eq!(ids[1].0, "typed::Inventory::Counter");
         assert_ne!(ids[0].1, ids[1].1);
+    }
+
+    #[test]
+    fn typed_definition_ids_follow_declaration_order_not_lexical_name_order() {
+        let field_ty = primitive(PrimitiveType::Int);
+        let hir = hir::Module {
+            name: "typed".to_string(),
+            decls: vec![
+                hir::Decl::Actor(actor_def("Zulu", "value", field_ty.clone())),
+                hir::Decl::Actor(actor_def("Alpha", "value", field_ty)),
+            ],
+        };
+        let mir = crate::mir_lower::lower_module(&hir).unwrap();
+        assert_eq!(mir.actor_metadata[0].name, "Zulu");
+        assert_eq!(mir.actor_metadata[1].name, "Alpha");
+
+        let schemas = actor_state_schemas_from_hir(&hir);
+        assert_eq!(schemas[0].actor_name, "typed::Zulu");
+        assert_eq!(schemas[1].actor_name, "typed::Alpha");
+
+        let ids = actor_definition_semantic_ids_for_typed_program(&hir, &mir, []).unwrap();
+        assert_eq!(ids[0].0, "typed::Zulu");
+        assert_eq!(ids[1].0, "typed::Alpha");
     }
 
     #[test]

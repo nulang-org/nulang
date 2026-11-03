@@ -65,6 +65,8 @@ pub mod format;
 pub mod mir;
 #[path = "../../../src/content_identity.rs"]
 pub mod content_identity;
+#[path = "../../../src/artifact_identity.rs"]
+pub mod artifact_identity;
 #[path = "../../../src/semantic_identity.rs"]
 pub mod semantic_identity;
 #[path = "../../../src/mir_inline.rs"]
