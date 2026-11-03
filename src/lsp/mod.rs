@@ -22,6 +22,7 @@
 //! | `textDocument/documentLink` | Clickable import paths to stdlib/files |
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -68,7 +69,7 @@ pub struct NulangLanguageServer {
     documents: Arc<Mutex<HashMap<Url, DocumentState>>>,
     /// In-flight debounced diagnostics tasks per document. Stored so that
     /// rapid edits can abort the previous task before scheduling a new one.
-    pending_diagnostics: Arc<Mutex<HashMap<Url, tokio::task::JoinHandle<()>>>>,
+    pending_diagnostics: Arc<Mutex<HashMap<Url, PendingDiagnosticsTask>>>,
     /// Cached importable names from stdlib and workspace `.nula` files.
     import_index: Arc<Mutex<ImportIndex>>,
 }
@@ -96,6 +97,12 @@ struct DiagnosticResult {
     ast: Option<crate::ast::AstModule>,
     inferred_decl_types: FxHashMap<String, crate::types::Type>,
     function_rows: FxHashMap<String, crate::types::EffectRow>,
+}
+
+/// Owns the async diagnostics task and the cooperative cancellation flag.
+struct PendingDiagnosticsTask {
+    handle: tokio::task::JoinHandle<()>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl NulangLanguageServer {
@@ -145,15 +152,17 @@ impl NulangLanguageServer {
     fn schedule_diagnostics(&self, uri: Url, version: i32, source: String) {
         let client = self.client.clone();
         let documents = Arc::clone(&self.documents);
-
-        // Abort any existing task for this document.
+        // Aborting an async handle cannot interrupt synchronous compiler work.
         {
             let mut pending = self.pending_diagnostics.lock().unwrap();
             if let Some(old) = pending.remove(&uri) {
-                old.abort();
+                old.cancelled.store(true, Ordering::Release);
+                old.handle.abort();
             }
         }
 
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let task_cancelled = Arc::clone(&cancelled);
         let uri_clone = uri.clone();
         let pending = Arc::clone(&self.pending_diagnostics);
         let handle = tokio::spawn(async move {
@@ -161,34 +170,66 @@ impl NulangLanguageServer {
                 Self::DIAGNOSTICS_DEBOUNCE_MS,
             ))
             .await;
+            if task_cancelled.load(Ordering::Acquire) {
+                return;
+            }
 
-            let result = Self::compute_diagnostics(&source);
+            // Keep synchronous semantic work off the Tokio reactor.
+            let worker_cancelled = Arc::clone(&task_cancelled);
+            let analysis = tokio::task::spawn_blocking(move || {
+                Self::compute_diagnostics_cancellable(&source, || {
+                    worker_cancelled.load(Ordering::Acquire)
+                })
+            })
+            .await;
+            let result = match analysis {
+                Ok(Some(result)) => result,
+                Ok(None) => return,
+                Err(error) => {
+                    tracing::warn!(%error, "LSP diagnostics worker failed");
+                    return;
+                }
+            };
+            if task_cancelled.load(Ordering::Acquire) {
+                return;
+            }
 
             {
                 let mut docs = documents.lock().unwrap();
-                if let Some(doc) = docs.get_mut(&uri_clone) {
-                    // Ignore stale results for an older version.
-                    if doc.version != version {
-                        return;
-                    }
-                    doc.diagnostics = result.diagnostics.clone();
-                    doc.diagnostics_pending = false;
-                    doc.type_map = Some(result.type_map);
-                    doc.ast = result.ast;
-                    doc.inferred_decl_types = Some(result.inferred_decl_types);
-                    doc.function_rows = Some(result.function_rows);
+                let Some(doc) = docs.get_mut(&uri_clone) else {
+                    return;
+                };
+                if doc.version != version {
+                    return;
                 }
+                doc.diagnostics = result.diagnostics.clone();
+                doc.diagnostics_pending = false;
+                doc.type_map = Some(result.type_map);
+                doc.ast = result.ast;
+                doc.inferred_decl_types = Some(result.inferred_decl_types);
+                doc.function_rows = Some(result.function_rows);
             }
 
+            if task_cancelled.load(Ordering::Acquire) {
+                return;
+            }
             client
                 .publish_diagnostics(uri_clone.clone(), result.diagnostics, Some(version))
                 .await;
 
-            // Remove ourselves from the pending map.
-            let _ = pending.lock().unwrap().remove(&uri_clone);
+            // An older task must not remove a newer edit's tracking handle.
+            let mut tasks = pending.lock().unwrap();
+            if tasks
+                .get(&uri_clone)
+                .is_some_and(|task| Arc::ptr_eq(&task.cancelled, &task_cancelled))
+            {
+                tasks.remove(&uri_clone);
+            }
         });
-
-        self.pending_diagnostics.lock().unwrap().insert(uri, handle);
+        self.pending_diagnostics
+            .lock()
+            .unwrap()
+            .insert(uri, PendingDiagnosticsTask { handle, cancelled });
     }
 }
 
@@ -357,7 +398,8 @@ impl LanguageServer for NulangLanguageServer {
         {
             let mut pending = self.pending_diagnostics.lock().unwrap();
             if let Some(old) = pending.remove(uri) {
-                old.abort();
+                old.cancelled.store(true, Ordering::Release);
+                old.handle.abort();
             }
         }
         let mut docs = self.documents.lock().unwrap();
@@ -1805,6 +1847,17 @@ impl NulangLanguageServer {
         ranges
     }
     fn compute_diagnostics(source: &str) -> DiagnosticResult {
+        Self::compute_diagnostics_cancellable(source, || false)
+            .expect("non-cancellable frontend analysis must complete")
+    }
+
+    fn compute_diagnostics_cancellable(
+        source: &str,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<DiagnosticResult> {
+        if cancelled() {
+            return None;
+        }
         let mut diagnostics = Vec::new();
 
         // Lex
@@ -1812,30 +1865,38 @@ impl NulangLanguageServer {
             Ok(t) => t,
             Err(e) => {
                 diagnostics.extend(nu_error_to_diagnostic(e));
-                return DiagnosticResult {
+                return Some(DiagnosticResult {
                     diagnostics,
                     type_map: HashMap::new(),
                     ast: None,
                     inferred_decl_types: FxHashMap::default(),
                     function_rows: FxHashMap::default(),
-                };
+                });
             }
         };
+
+        if cancelled() {
+            return None;
+        }
 
         // Parse
         let ast = match Parser::new(tokens).parse_module() {
             Ok(a) => a,
             Err(e) => {
                 diagnostics.extend(nu_error_to_diagnostic(e));
-                return DiagnosticResult {
+                return Some(DiagnosticResult {
                     diagnostics,
                     type_map: HashMap::new(),
                     ast: None,
                     inferred_decl_types: FxHashMap::default(),
                     function_rows: FxHashMap::default(),
-                };
+                });
             }
         };
+
+        if cancelled() {
+            return None;
+        }
 
         // Type check — collect all errors so we surface every problem,
         // not just the first. Downstream effect/capability checks still
@@ -1847,6 +1908,10 @@ impl NulangLanguageServer {
             diagnostics.extend(nu_error_to_diagnostic(err));
         }
         let inferred_decl_types = tc.inferred_decl_types.clone();
+
+        if cancelled() {
+            return None;
+        }
 
         // Effect check: same two-pass driver as the CLI frontend
         // (`run_frontend` in main.rs) — `check_module` flattens nested
@@ -1871,6 +1936,10 @@ impl NulangLanguageServer {
             });
         }
         let function_rows = effect_checker.function_rows();
+
+        if cancelled() {
+            return None;
+        }
 
         // Capability analysis over the flattened declaration list, so
         // functions nested in `module {}` blocks are checked like top-level
@@ -1910,14 +1979,18 @@ impl NulangLanguageServer {
             });
         }
 
+        if cancelled() {
+            return None;
+        }
+
         let type_map = Self::extract_type_map(source, &ast);
-        DiagnosticResult {
+        Some(DiagnosticResult {
             diagnostics,
             type_map,
             ast: Some(ast),
             inferred_decl_types,
             function_rows,
-        }
+        })
     }
 
     /// Walk the AST and extract type information for `let` bindings.
@@ -4707,5 +4780,51 @@ mod lsp_tests {
                 .any(|h| matches!(&h.label, InlayHintLabel::String(s) if s.contains("Int"))),
             "expected cached inlay hint with Int type"
         );
+    }
+}
+
+#[cfg(test)]
+mod salsa_cancellation_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn superseded_analysis_stops_after_lexing() {
+        let checkpoints = Cell::new(0);
+        let result =
+            NulangLanguageServer::compute_diagnostics_cancellable("fn answer() { 42 }", || {
+                checkpoints.set(checkpoints.get() + 1);
+                checkpoints.get() >= 2
+            });
+        assert!(
+            result.is_none(),
+            "obsolete analysis must not yield diagnostics"
+        );
+        assert_eq!(checkpoints.get(), 2);
+    }
+
+    #[test]
+    fn superseded_analysis_stops_after_typechecking() {
+        let checkpoints = Cell::new(0);
+        let result =
+            NulangLanguageServer::compute_diagnostics_cancellable("fn answer() { 42 }", || {
+                checkpoints.set(checkpoints.get() + 1);
+                checkpoints.get() >= 4
+            });
+        assert!(
+            result.is_none(),
+            "obsolete analysis must not reach capability analysis"
+        );
+        assert_eq!(checkpoints.get(), 4);
+    }
+
+    #[test]
+    fn uncancelled_analysis_preserves_diagnostics() {
+        let source = "fn broken(";
+        let baseline = NulangLanguageServer::compute_diagnostics(source);
+        let result = NulangLanguageServer::compute_diagnostics_cancellable(source, || false)
+            .expect("uncancelled frontend must complete");
+        assert_eq!(result.diagnostics, baseline.diagnostics);
+        assert_eq!(result.type_map, baseline.type_map);
     }
 }
