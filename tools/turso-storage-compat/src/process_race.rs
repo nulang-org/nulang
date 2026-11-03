@@ -20,7 +20,7 @@ const REJECTED_LOCK: i32 = 76;
 const READY_TIMEOUT: Duration = Duration::from_secs(40);
 const COMMIT_TIMEOUT: Duration = Duration::from_secs(40);
 
-fn candidate(actor: u64, value: i64) -> DurableTransition {
+pub(crate) fn candidate(actor: u64, value: i64) -> DurableTransition {
     let (mut transition, _) = rich_transition(actor);
     transition
         .command
