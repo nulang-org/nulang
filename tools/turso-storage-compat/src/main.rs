@@ -104,8 +104,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         return process_race::writer_child(Path::new(&args[2]), actor, value, Path::new(&args[5]));
     }
 
-    if let Some(mode @ ("--turso-handoff-owner" | "--turso-handoff-contender" | "--turso-handoff-successor")) =
-        std::env::args().nth(1).as_deref()
+    if let Some(
+        mode
+        @ ("--turso-handoff-owner" | "--turso-handoff-contender" | "--turso-handoff-successor"),
+    ) = std::env::args().nth(1).as_deref()
     {
         let args: Vec<_> = std::env::args_os().collect();
         if args.len() != 5 {
