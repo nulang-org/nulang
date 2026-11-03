@@ -4425,10 +4425,13 @@ impl VM {
                 msg: "PerformAsync PC was not advanced before dispatch".into(),
                 span: Span::default(),
             })?;
-        let module = self.modules.get(module_idx).ok_or_else(|| NuError::VMError {
-            msg: format!("PerformAsync references missing module {module_idx}"),
-            span: Span::default(),
-        })?;
+        let module = self
+            .modules
+            .get(module_idx)
+            .ok_or_else(|| NuError::VMError {
+                msg: format!("PerformAsync references missing module {module_idx}"),
+                span: Span::default(),
+            })?;
         let args = &self.frames[frame_idx].regs;
         match self
             .actor_callbacks
@@ -6308,15 +6311,16 @@ fn module_with_handler_table(bindings: Vec<crate::bytecode::HandlerBinding>) -> 
 #[cfg(test)]
 mod vm_tests {
     use super::*;
-    use crate::bytecode::{BehaviorTableEntry, EffectSiteMetadata, HandlerBinding, HandlerTable, Instruction};
+    use crate::bytecode::{
+        BehaviorTableEntry, EffectSiteMetadata, HandlerBinding, HandlerTable, Instruction,
+    };
 
     #[derive(Debug)]
     struct ReadyValueCallbacks {
         heap: ActorHeap,
         gc: crate::runtime::OrcaGc,
-        observed_async_sites: std::rc::Rc<
-            std::cell::RefCell<Vec<(String, usize, Option<[u8; 32]>)>>,
-        >,
+        observed_async_sites:
+            std::rc::Rc<std::cell::RefCell<Vec<(String, usize, Option<[u8; 32]>)>>>,
     }
 
     impl ReadyValueCallbacks {
