@@ -1,9 +1,8 @@
 //! Test-only Turso-backed atomic transition prototype.
 //!
 //! This is NOT installed as Nulang's production PersistenceStore. It supports
-//! snapshots, commands and durable outbox rows. It deliberately rejects
-//! workflow/domain events and durable effect records until their parity is
-//! independently exercised, rather than dropping them and reporting success.
+//! snapshots, commands, replayable workflow/domain events, versioned durable
+//! effects, and durable outbox records inside one atomic SQLite transaction.
 use nulang::runtime::{DurableCommit, DurableTransition};
 use std::io;
 
@@ -29,16 +28,6 @@ pub(crate) async fn commit_transition(
     conn: &turso::Connection,
     transition: DurableTransition,
 ) -> io::Result<DurableCommit> {
-    // Fail closed on record families not yet proven to be persisted atomically.
-    if !transition.workflow_events.is_empty()
-        || !transition.domain_events.is_empty()
-        || !transition.durable_effects.is_empty()
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "test Turso writer does not yet support workflow, domain or durable-effect records",
-        ));
-    }
     // This public NuLang method performs structural checks and computes the
     // same canonical BLAKE3 digest that the production libSQL writer stores.
     let digest = transition.digest()?;
@@ -69,6 +58,27 @@ pub(crate) async fn commit_transition(
         .as_ref()
         .map(|c| json(&c.payload))
         .transpose()?;
+    let workflow_json = transition
+        .workflow_events
+        .iter()
+        .map(json)
+        .collect::<io::Result<Vec<_>>>()?;
+    let domain_json = transition
+        .domain_events
+        .iter()
+        .map(json)
+        .collect::<io::Result<Vec<_>>>()?;
+    let effect_json = transition
+        .durable_effects
+        .iter()
+        .map(|record| {
+            let bytes = record
+                .to_json()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            String::from_utf8(bytes)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
     let outbox = transition
         .outbox
         .iter()
@@ -190,6 +200,33 @@ pub(crate) async fn commit_transition(
                 "INSERT INTO journal (actor_id, sequence, behavior_id, payload)
                  VALUES (?1,?2,?3,?4)",
                 turso::params![actor, sequence, i64::from(c.behavior_id), payload.as_str()],
+            )
+            .await
+            .map_err(db_error)?;
+        }
+        for (ordinal, event) in workflow_json.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO durable_workflow_events
+                 (actor_id, sequence, ordinal, event) VALUES (?1,?2,?3,?4)",
+                turso::params![actor, sequence, sql_int(ordinal as u64)?, event.as_str()],
+            )
+            .await
+            .map_err(db_error)?;
+        }
+        for (ordinal, event) in domain_json.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO durable_domain_events
+                 (actor_id, sequence, ordinal, event) VALUES (?1,?2,?3,?4)",
+                turso::params![actor, sequence, sql_int(ordinal as u64)?, event.as_str()],
+            )
+            .await
+            .map_err(db_error)?;
+        }
+        for (ordinal, record) in effect_json.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO durable_effect_records
+                 (actor_id, sequence, ordinal, record) VALUES (?1,?2,?3,?4)",
+                turso::params![actor, sequence, sql_int(ordinal as u64)?, record.as_str()],
             )
             .await
             .map_err(db_error)?;
