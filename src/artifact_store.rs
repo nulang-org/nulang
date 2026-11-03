@@ -95,6 +95,9 @@ impl FileArtifactStore {
             .parent()
             .ok_or_else(|| ArtifactStoreError::Corrupt("artifact path has no parent".into()))?;
         fs::create_dir_all(parent)?;
+        // The store root is trusted, but its shard/record entries must not
+        // redirect retention to paths outside that root.
+        self.check_artifact_path(artifact_id)?;
 
         let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let temp_path = parent.join(format!(
@@ -143,6 +146,7 @@ impl FileArtifactStore {
 
     /// Load and verify a retained artifact by immutable `ArtifactId`.
     pub fn load(&self, artifact_id: ArtifactId) -> Result<RetainedArtifact, ArtifactStoreError> {
+        self.check_artifact_path(artifact_id)?;
         let path = self.artifact_path(artifact_id);
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -167,6 +171,30 @@ impl FileArtifactStore {
     fn artifact_path(&self, artifact_id: ArtifactId) -> PathBuf {
         let hex = artifact_id.to_hex();
         self.root.join(&hex[..2]).join(format!("{hex}.nart"))
+    }
+
+    fn check_artifact_path(&self, artifact_id: ArtifactId) -> Result<(), ArtifactStoreError> {
+        let path = self.artifact_path(artifact_id);
+        let shard = path
+            .parent()
+            .ok_or_else(|| ArtifactStoreError::Corrupt("artifact path has no parent".into()))?;
+        reject_symlink(shard)?;
+        reject_symlink(&path)?;
+        Ok(())
+    }
+}
+
+/// Reject existing shard/record symlinks instead of following them. The store
+/// root and its parent must still be protected from untrusted concurrent writes:
+/// this metadata preflight is not an atomic defense against directory races.
+fn reject_symlink(path: &Path) -> Result<(), ArtifactStoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(ArtifactStoreError::SymlinkPath(path.to_path_buf()))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -273,6 +301,7 @@ fn sync_directory(_path: &Path) -> Result<(), ArtifactStoreError> {
 #[derive(Debug)]
 pub enum ArtifactStoreError {
     NotFound(ArtifactId),
+    SymlinkPath(PathBuf),
     Io(std::io::Error),
     Manifest(ArtifactIdentityError),
     UnsupportedVersion(u16),
@@ -293,6 +322,11 @@ impl fmt::Display for ArtifactStoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotFound(id) => write!(f, "artifact {id} is not retained"),
+            Self::SymlinkPath(path) => write!(
+                f,
+                "artifact store shard or record path must not be a symlink: {}",
+                path.display()
+            ),
             Self::Io(error) => write!(f, "artifact store I/O error: {error}"),
             Self::Manifest(error) => write!(f, "invalid retained artifact manifest: {error}"),
             Self::UnsupportedVersion(version) => {
@@ -454,6 +488,44 @@ mod tests {
             Err(ArtifactStoreError::ByteDigestMismatch { artifact_id })
                 if artifact_id == manifest.artifact_id()
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_shard_directory_cannot_redirect_artifact_writes() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TestDir::new();
+        let root = dir.0.join("artifacts");
+        let outside = dir.0.join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        let manifest = manifest(b"source");
+        let id_hex = manifest.artifact_id().to_hex();
+        symlink(&outside, root.join(&id_hex[..2])).unwrap();
+
+        let store = FileArtifactStore::new(&root);
+        assert!(store.retain(&manifest, b"artifact").is_err());
+        assert!(!outside.join(format!("{id_hex}.nart")).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_artifact_record_cannot_redirect_verified_reads() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TestDir::new();
+        let store = FileArtifactStore::new(dir.0.join("artifacts"));
+        let manifest = manifest(b"source");
+        store.retain(&manifest, b"artifact").unwrap();
+
+        let path = store.artifact_path(manifest.artifact_id());
+        let outside = dir.0.join("outside.nart");
+        fs::rename(&path, &outside).unwrap();
+        symlink(&outside, &path).unwrap();
+
+        assert!(store.load(manifest.artifact_id()).is_err());
     }
 
     #[test]
