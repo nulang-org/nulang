@@ -26,6 +26,17 @@ The test uses the actual production Nulang `LibsqlStore` schema and checks:
   destructors**. A fresh Nulang LibsqlStore and Turso connection must both
   observe no partial durable commit. The parent requires the exact child
   exit code, so an unrelated crash is not mistaken for a passing test.
+- A **test-only Turso transition writer** derives the canonical digest using
+  `DurableTransition::digest()` and checks the predecessor/activation epoch
+  inside `BEGIN IMMEDIATE`, then writes snapshots, commands, durable outbox,
+  transition receipt, and compare-and-swap tail atomically. It verifies
+  identical replay, changed-payload conflicts, stale-epoch rejection,
+  predecessor mismatch, two competing writers on separate connections, and
+  libSQL reading and advancing the Turso-authored tail.
+- The experimental writer **rejects** nonempty workflow events, domain
+  events, and durable-effect records with `Unsupported`; it does not pretend
+  to persist unimplemented record families. Its result cannot replace the
+  production `PersistenceStore::commit_transition` implementation.
 
 The probe is fully local, uses only disposable SQLite files, and requires
 no credentials, external service, production file, or live database.
