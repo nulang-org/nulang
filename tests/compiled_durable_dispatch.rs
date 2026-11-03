@@ -11,7 +11,7 @@ use nulang::mir_lower;
 use nulang::parser::Parser;
 use nulang::runtime::{Actor, MemoryStore, PersistenceStore};
 use nulang::typechecker::TypeChecker;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
 fn inference_grant() -> AuthorityGrant {
@@ -275,4 +275,69 @@ fn stale_activation_does_not_call_provider_for_prepared_effect() {
         Err(DurableAsyncDispatchError::Recovery(_))
     ));
     assert_eq!(store.latest_sequence(42), 2);
+}
+
+#[test]
+fn repeated_compiled_effect_site_occurrences_have_distinct_replay_stable_receipts() {
+    let module = compiled_source();
+    let pc = module.effect_sites[0].pc;
+    let actor = authorized_actor();
+    let grant = inference_grant();
+    let mut store = MemoryStore::new();
+    let mut observed_keys = BTreeSet::new();
+    let mut receipts = BTreeMap::<u32, Vec<u8>>::new();
+    const OCCURRENCES: u32 = 32;
+
+    // All invocations share the same static compiler-owned effect site,
+    // execution key and request. Only the dynamic occurrence distinguishes them.
+    for occurrence in 0..OCCURRENCES {
+        let mut coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
+        let receipt = coordinator
+            .execute_compiled_async_with_deduplication(
+                &actor,
+                &grant,
+                &module,
+                pc,
+                "batch:42",
+                occurrence,
+                b"same-request",
+                |key, request| {
+                    assert_eq!(request, b"same-request");
+                    assert!(
+                        observed_keys.insert(key.to_owned()),
+                        "different dynamic occurrences must not share a provider key"
+                    );
+                    Ok(format!("receipt-{occurrence}").into_bytes())
+                },
+            )
+            .unwrap();
+        receipts.insert(occurrence, receipt);
+    }
+
+    assert_eq!(observed_keys.len(), OCCURRENCES as usize);
+    assert_eq!(store.latest_sequence(42), 2 * u64::from(OCCURRENCES));
+
+    // A fresh coordinator can replay each invocation in any inspection order,
+    // without calling the provider or writing another journal transition.
+    for occurrence in (0..OCCURRENCES).rev() {
+        let mut recovered = DurableEffectCoordinator::new(&mut store, 42, 1);
+        let replay = recovered
+            .execute_compiled_async_with_deduplication(
+                &actor,
+                &grant,
+                &module,
+                pc,
+                "batch:42",
+                occurrence,
+                b"same-request",
+                |_, _| panic!("completed occurrence must not redispatch"),
+            )
+            .unwrap();
+        assert_eq!(
+            replay.as_slice(),
+            receipts.get(&occurrence).unwrap().as_slice()
+        );
+    }
+
+    assert_eq!(store.latest_sequence(42), 2 * u64::from(OCCURRENCES));
 }
