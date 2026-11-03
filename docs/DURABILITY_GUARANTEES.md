@@ -149,6 +149,45 @@ execute the VM's live `PerformAsync` callback, kill a process, verify provider
 side-effect deduplication, or prove atomic actor-turn completion. Those require
 separate integration and crash tests.
 
+## Opt-in VM opcode-to-journal bridge (experimental)
+
+The exact-opcode `ActorVmCallbacks::perform_async_at_site` hook receives a
+compiler-produced module and the running `PerformAsync` PC. Existing runtime
+callbacks continue to use their previous behavior unless they explicitly
+override the hook. The hook returns `NuResult<PerformAsyncResult>` so a
+durable-aware callback can propagate a **real error**, rather than converting
+denied/recovered effects into a successful nil result.
+
+A trusted host can construct `DurableVmAsyncInvocation` from a *live*
+persistent actor, exact typed authority, replay-stable turn key, dynamic
+occurrence and canonical provider request bytes. It can then call
+`DurableEffectCoordinator::execute_vm_async_text_with_deduplication` from
+the opcode callback. The bridge verifies the observed operation against
+the module's static site, requires persistence, and delegates preparation,
+deduplication, receipt commit, request equality, and epoch fencing to the
+existing coordinator. The text-only response is decoded as UTF-8; arbitrary
+binary or non-string effects require a separately specified lossless codec.
+
+`tests/durable_vm_callback_bridge.rs` compiles and NBC-roundtrips a
+`.nula` actor behavior, executes **the real VM** through a trusted
+host-provided callback, and checks libSQL restart/replay, lost provider
+responses, revoked authority, drifted requests, missing semantic metadata,
+and stale-epoch fencing. Its subprocess fixture exits after a fsynced fake
+provider commit but before the local receipt is recorded, then retries from
+a fresh process with provider-side deduplication and compares journal
+positions. This is stronger evidence than merely recreating a coordinator,
+but the fake provider is **not** an external service.
+
+**Not production-wide:** Neither default `BytecodeRuntimeCallbacks` nor
+`RuntimeVmCallbacks` is automatically redirected through this bridge.
+Production callers still must authenticate and pin the compiled artifact,
+derive turn and occurrence identity from trustworthy persistent runtime state,
+canonicalize the actual evaluated provider request, enforce resource-bound
+grants for operations needing them, and commit the resumed actor turn
+atomically. Neither the test nor the bridge proves exactly-once delivery
+without cooperating provider-side deduplication. The crash fixture covers
+a process exit, not multi-node takeover under simultaneous leases.
+
 ## What is not yet a production-wide guarantee
 
 Passing this gate does **not** prove that every `perform`, workflow activity,
