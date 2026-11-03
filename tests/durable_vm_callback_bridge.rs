@@ -42,6 +42,7 @@ static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 struct TestDb {
     dir: PathBuf,
     path: PathBuf,
+    owns_directory: bool,
 }
 
 impl TestDb {
@@ -57,13 +58,27 @@ impl TestDb {
         ));
         fs::create_dir(&dir).expect("isolated test directory");
         let path = dir.join("effects.db");
-        Self { dir, path }
+        Self {
+            dir,
+            path,
+            owns_directory: true,
+        }
+    }
+
+    fn from_existing(path: PathBuf) -> Self {
+        Self {
+            dir: path.parent().expect("parent directory").to_path_buf(),
+            path,
+            owns_directory: false,
+        }
     }
 }
 
 impl Drop for TestDb {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
+        if self.owns_directory {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -107,6 +122,10 @@ struct Provider {
     mutations: usize,
     committed: BTreeMap<String, Vec<u8>>,
     lose_first_response: bool,
+    /// Optional file-backed fake for subprocess crash tests.
+    disk_path: Option<PathBuf>,
+    /// Terminate process after a provider commit but before returning its result.
+    exit_after_commit: bool,
 }
 
 struct Callback {
@@ -326,4 +345,64 @@ fn vm_prepared_retry_rejects_stale_activation_after_new_owner_claims() {
     assert_eq!(provider.borrow().mutations, 1);
     assert!(observed.borrow().is_empty());
     assert_eq!(LibsqlStore::new(&db.path).unwrap().latest_sequence(ACTOR_ID), 2);
+}
+
+#[test]
+fn process_exit_after_provider_commit_restarts_vm_with_one_external_mutation() {
+    use std::process::Command;
+
+    let db = TestDb::new();
+    let receipt_path = db.dir.join("provider-receipt");
+    let child = Command::new(std::env::current_exe().expect("integration test binary"))
+        .arg("--exact")
+        .arg("durable_vm_crash_fixture_child")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env("NULANG_VM_BRIDGE_DB_PATH", &db.path)
+        .env("NULANG_VM_BRIDGE_PROVIDER_PATH", &receipt_path)
+        .status()
+        .expect("launch isolated VM subprocess");
+    assert_eq!(child.code(), Some(94), "child must exit at provider-commit window");
+    assert!(receipt_path.is_file(), "provider must durably commit before exit");
+    assert_eq!(
+        LibsqlStore::new(&db.path).unwrap().latest_sequence(ACTOR_ID),
+        1,
+        "prepared intent must precede provider commit and survive process exit"
+    );
+
+    // New process, VM, callback and database connection. The external
+    // provider's idempotency ledger survives independently on disk.
+    let provider = Rc::new(RefCell::new(Provider {
+        disk_path: Some(receipt_path),
+        ..Provider::default()
+    }));
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    execute_vm(&db, provider.clone(), observed.clone(), true, 1, REQUEST, false).unwrap();
+    assert_eq!(provider.borrow().attempts, 1);
+    assert_eq!(provider.borrow().mutations, 0, "the persisted provider result must be reused");
+    assert_eq!(observed.borrow().as_slice(), &["receipt:order=42&cents=100"]);
+    assert_eq!(LibsqlStore::new(&db.path).unwrap().latest_sequence(ACTOR_ID), 2);
+
+    execute_vm(&db, provider.clone(), observed, true, 1, REQUEST, false).unwrap();
+    assert_eq!(provider.borrow().attempts, 1, "completed VM replay must not call provider");
+    assert_eq!(LibsqlStore::new(&db.path).unwrap().latest_sequence(ACTOR_ID), 2);
+}
+
+#[test]
+#[ignore = "subprocess crash fixture; invoked only by the parent test"]
+fn durable_vm_crash_fixture_child() {
+    let db = TestDb::from_existing(PathBuf::from(
+        std::env::var_os("NULANG_VM_BRIDGE_DB_PATH").expect("parent db path"),
+    ));
+    let provider_path = PathBuf::from(
+        std::env::var_os("NULANG_VM_BRIDGE_PROVIDER_PATH").expect("parent provider path"),
+    );
+    let provider = Rc::new(RefCell::new(Provider {
+        disk_path: Some(provider_path),
+        exit_after_commit: true,
+        ..Provider::default()
+    }));
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let result = execute_vm(&db, provider, observed, true, 1, REQUEST, false);
+    panic!("fixture must exit while provider receipt is not yet acknowledged: {result:?}");
 }
