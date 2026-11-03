@@ -121,6 +121,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     if std::env::args().nth(1).as_deref() == Some("--verify-exclusive-handoff") {
         let isolated = tempfile::tempdir()?;
+        // Child processes must prove this DB was created by the disposable probe.
+        std::fs::write(isolated.path().join(".nulang-turso-test-only"), b"1")?;
         let database = isolated.path().join("durable.db");
         drop(LibsqlStore::new(&database)?);
         return process_handoff::verify_exclusive_file_handoff(&database);
