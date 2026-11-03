@@ -45,6 +45,14 @@ pub(super) fn verified_connector() -> io::Result<VerifiedLibsqlConnector> {
     let certificates = rustls_native_certs::load_native_certs();
     let mut roots = RootCertStore::empty();
     roots.add_parsable_certificates(certificates.certs);
+    verified_connector_with_roots(roots)
+}
+
+/// Construct the same production TLS stack with an explicitly supplied root
+/// store. Production callers pass OS roots. Local tests pass an isolated,
+/// ephemeral CA so they can verify both valid and invalid certificate paths
+/// without changing system trust or connecting to remote services.
+fn verified_connector_with_roots(roots: RootCertStore) -> io::Result<VerifiedLibsqlConnector> {
     if roots.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
