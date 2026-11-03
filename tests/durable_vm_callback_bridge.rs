@@ -10,9 +10,7 @@
 use nulang::authority::{AuthorityGrant, AuthorityManifest};
 use nulang::bytecode::{CodeModule, Constant};
 use nulang::durable_effect::{DurableEffectId, DurableEffectSpec};
-use nulang::durable_effect_runtime::{
-    DurableEffectCoordinator, DurableVmAsyncInvocation,
-};
+use nulang::durable_effect_runtime::{DurableEffectCoordinator, DurableVmAsyncInvocation};
 use nulang::hir_lower;
 use nulang::lexer::Lexer;
 use nulang::mir_codegen;
@@ -146,8 +144,13 @@ impl fmt::Debug for Callback {
 }
 
 impl Callback {
-    fn new(db: &TestDb, provider: Rc<RefCell<Provider>>, observed: Rc<RefCell<Vec<String>>>,
-           authorized: bool, epoch: u64) -> Self {
+    fn new(
+        db: &TestDb,
+        provider: Rc<RefCell<Provider>>,
+        observed: Rc<RefCell<Vec<String>>>,
+        authorized: bool,
+        epoch: u64,
+    ) -> Self {
         let mut heap = ActorHeap::new(1024 * 1024);
         heap.set_actor_id(ACTOR_ID);
         Self {
@@ -189,8 +192,13 @@ impl ActorVmCallbacks for Callback {
         }
     }
 
-    fn spawn_actor(&mut self, _module: &CodeModule, _spawn_pc: usize,
-                   _behavior_idx: usize, _init: Vec<(String, Value)>) -> Value {
+    fn spawn_actor(
+        &mut self,
+        _module: &CodeModule,
+        _spawn_pc: usize,
+        _behavior_idx: usize,
+        _init: Vec<(String, Value)>,
+    ) -> Value {
         Value::actor_ref(0)
     }
 
@@ -205,10 +213,14 @@ impl ActorVmCallbacks for Callback {
     ) -> NuResult<PerformAsyncResult> {
         // The trusted host defines a canonical byte-encoding of the provider
         // request. Never derive a durable key from transient VM register bits.
-        let request = args.first()
+        let request = args
+            .first()
             .and_then(Value::as_string_id)
             .and_then(|id| module.constants.get(id as usize))
-            .and_then(|c| match c { Constant::String(s) => Some(s.as_bytes()), _ => None })
+            .and_then(|c| match c {
+                Constant::String(s) => Some(s.as_bytes()),
+                _ => None,
+            })
             .ok_or_else(|| NuError::VMError {
                 msg: "invalid durable provider request".into(),
                 span: Span::default(),
@@ -236,11 +248,16 @@ impl ActorVmCallbacks for Callback {
                     // ledger independent of the Nulang effect journal.
                     if path.exists() {
                         let saved = fs::read(path)?;
-                        let split = saved.iter().position(|byte| *byte == b'\n')
-                            .ok_or_else(|| io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "invalid provider receipt record",
-                            ))?;
+                        let split =
+                            saved
+                                .iter()
+                                .position(|byte| *byte == b'\n')
+                                .ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "invalid provider receipt record",
+                                    )
+                                })?;
                         if &saved[..split] != key.as_bytes() {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
@@ -276,7 +293,10 @@ impl ActorVmCallbacks for Callback {
                 };
                 if provider.lose_first_response {
                     provider.lose_first_response = false;
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "provider reply lost"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "provider reply lost",
+                    ));
                 }
                 Ok(response)
             },
@@ -305,7 +325,9 @@ fn execute_vm(
     }
     let mut vm = VM::new_without_jit();
     vm.load_module(module);
-    vm.set_actor_callbacks(Box::new(Callback::new(db, provider, observed, authorized, epoch)));
+    vm.set_actor_callbacks(Box::new(Callback::new(
+        db, provider, observed, authorized, epoch,
+    )));
     vm.call_function(0, behavior_pc, &[Value::string(string_id as u32)])?;
     Ok(())
 }
@@ -319,21 +341,66 @@ fn real_vm_retries_prepared_effect_after_store_reopen_with_same_provider_key() {
     }));
     let observed = Rc::new(RefCell::new(Vec::new()));
 
-    assert!(execute_vm(&db, provider.clone(), observed.clone(), true, 1, REQUEST, false).is_err());
-    assert_eq!(LibsqlStore::new(&db.path).unwrap().latest_sequence(ACTOR_ID), 1);
+    assert!(execute_vm(
+        &db,
+        provider.clone(),
+        observed.clone(),
+        true,
+        1,
+        REQUEST,
+        false
+    )
+    .is_err());
+    assert_eq!(
+        LibsqlStore::new(&db.path)
+            .unwrap()
+            .latest_sequence(ACTOR_ID),
+        1
+    );
     assert_eq!(provider.borrow().attempts, 1);
     assert_eq!(provider.borrow().mutations, 1);
 
-    execute_vm(&db, provider.clone(), observed.clone(), true, 1, REQUEST, false).unwrap();
-    assert_eq!(LibsqlStore::new(&db.path).unwrap().latest_sequence(ACTOR_ID), 2);
+    execute_vm(
+        &db,
+        provider.clone(),
+        observed.clone(),
+        true,
+        1,
+        REQUEST,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        LibsqlStore::new(&db.path)
+            .unwrap()
+            .latest_sequence(ACTOR_ID),
+        2
+    );
     assert_eq!(provider.borrow().attempts, 2);
     assert_eq!(provider.borrow().mutations, 1);
-    assert_eq!(observed.borrow().as_slice(), &["receipt:order=42&cents=100"]);
+    assert_eq!(
+        observed.borrow().as_slice(),
+        &["receipt:order=42&cents=100"]
+    );
 
     // A completed receipt is returned without any external provider call,
     // even after both VM and persistence store are recreated again.
-    execute_vm(&db, provider.clone(), observed.clone(), true, 1, REQUEST, false).unwrap();
-    assert_eq!(LibsqlStore::new(&db.path).unwrap().latest_sequence(ACTOR_ID), 2);
+    execute_vm(
+        &db,
+        provider.clone(),
+        observed.clone(),
+        true,
+        1,
+        REQUEST,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        LibsqlStore::new(&db.path)
+            .unwrap()
+            .latest_sequence(ACTOR_ID),
+        2
+    );
     assert_eq!(provider.borrow().attempts, 2);
     assert_eq!(observed.borrow().len(), 2);
 }
@@ -343,13 +410,54 @@ fn vm_replay_rejects_revoked_grant_request_drift_and_missing_site() {
     let db = TestDb::new();
     let provider = Rc::new(RefCell::new(Provider::default()));
     let observed = Rc::new(RefCell::new(Vec::new()));
-    execute_vm(&db, provider.clone(), observed.clone(), true, 1, REQUEST, false).unwrap();
+    execute_vm(
+        &db,
+        provider.clone(),
+        observed.clone(),
+        true,
+        1,
+        REQUEST,
+        false,
+    )
+    .unwrap();
 
-    assert!(execute_vm(&db, provider.clone(), observed.clone(), false, 1, REQUEST, false).is_err());
-    assert!(execute_vm(&db, provider.clone(), observed.clone(), true, 1, "tampered", false).is_err());
-    assert!(execute_vm(&db, provider.clone(), observed.clone(), true, 1, REQUEST, true).is_err());
+    assert!(execute_vm(
+        &db,
+        provider.clone(),
+        observed.clone(),
+        false,
+        1,
+        REQUEST,
+        false
+    )
+    .is_err());
+    assert!(execute_vm(
+        &db,
+        provider.clone(),
+        observed.clone(),
+        true,
+        1,
+        "tampered",
+        false
+    )
+    .is_err());
+    assert!(execute_vm(
+        &db,
+        provider.clone(),
+        observed.clone(),
+        true,
+        1,
+        REQUEST,
+        true
+    )
+    .is_err());
     assert_eq!(provider.borrow().attempts, 1);
-    assert_eq!(LibsqlStore::new(&db.path).unwrap().latest_sequence(ACTOR_ID), 2);
+    assert_eq!(
+        LibsqlStore::new(&db.path)
+            .unwrap()
+            .latest_sequence(ACTOR_ID),
+        2
+    );
     assert_eq!(observed.borrow().len(), 1);
 }
 
@@ -361,7 +469,16 @@ fn vm_prepared_retry_rejects_stale_activation_after_new_owner_claims() {
         ..Provider::default()
     }));
     let observed = Rc::new(RefCell::new(Vec::new()));
-    assert!(execute_vm(&db, provider.clone(), observed.clone(), true, 1, REQUEST, false).is_err());
+    assert!(execute_vm(
+        &db,
+        provider.clone(),
+        observed.clone(),
+        true,
+        1,
+        REQUEST,
+        false
+    )
+    .is_err());
 
     {
         let mut store = LibsqlStore::new(&db.path).unwrap();
@@ -374,12 +491,31 @@ fn vm_prepared_retry_rejects_stale_activation_after_new_owner_claims() {
         let mut current = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 2);
         current.begin(spec, b"claim").unwrap();
     }
-    assert_eq!(LibsqlStore::new(&db.path).unwrap().latest_sequence(ACTOR_ID), 2);
-    assert!(execute_vm(&db, provider.clone(), observed.clone(), true, 1, REQUEST, false).is_err());
+    assert_eq!(
+        LibsqlStore::new(&db.path)
+            .unwrap()
+            .latest_sequence(ACTOR_ID),
+        2
+    );
+    assert!(execute_vm(
+        &db,
+        provider.clone(),
+        observed.clone(),
+        true,
+        1,
+        REQUEST,
+        false
+    )
+    .is_err());
     assert_eq!(provider.borrow().attempts, 1);
     assert_eq!(provider.borrow().mutations, 1);
     assert!(observed.borrow().is_empty());
-    assert_eq!(LibsqlStore::new(&db.path).unwrap().latest_sequence(ACTOR_ID), 2);
+    assert_eq!(
+        LibsqlStore::new(&db.path)
+            .unwrap()
+            .latest_sequence(ACTOR_ID),
+        2
+    );
 }
 
 #[test]
@@ -397,10 +533,19 @@ fn process_exit_after_provider_commit_restarts_vm_with_one_external_mutation() {
         .env("NULANG_VM_BRIDGE_PROVIDER_PATH", &receipt_path)
         .status()
         .expect("launch isolated VM subprocess");
-    assert_eq!(child.code(), Some(94), "child must exit at provider-commit window");
-    assert!(receipt_path.is_file(), "provider must durably commit before exit");
     assert_eq!(
-        LibsqlStore::new(&db.path).unwrap().latest_sequence(ACTOR_ID),
+        child.code(),
+        Some(94),
+        "child must exit at provider-commit window"
+    );
+    assert!(
+        receipt_path.is_file(),
+        "provider must durably commit before exit"
+    );
+    assert_eq!(
+        LibsqlStore::new(&db.path)
+            .unwrap()
+            .latest_sequence(ACTOR_ID),
         1,
         "prepared intent must precede provider commit and survive process exit"
     );
@@ -412,15 +557,45 @@ fn process_exit_after_provider_commit_restarts_vm_with_one_external_mutation() {
         ..Provider::default()
     }));
     let observed = Rc::new(RefCell::new(Vec::new()));
-    execute_vm(&db, provider.clone(), observed.clone(), true, 1, REQUEST, false).unwrap();
+    execute_vm(
+        &db,
+        provider.clone(),
+        observed.clone(),
+        true,
+        1,
+        REQUEST,
+        false,
+    )
+    .unwrap();
     assert_eq!(provider.borrow().attempts, 1);
-    assert_eq!(provider.borrow().mutations, 0, "the persisted provider result must be reused");
-    assert_eq!(observed.borrow().as_slice(), &["receipt:order=42&cents=100"]);
-    assert_eq!(LibsqlStore::new(&db.path).unwrap().latest_sequence(ACTOR_ID), 2);
+    assert_eq!(
+        provider.borrow().mutations,
+        0,
+        "the persisted provider result must be reused"
+    );
+    assert_eq!(
+        observed.borrow().as_slice(),
+        &["receipt:order=42&cents=100"]
+    );
+    assert_eq!(
+        LibsqlStore::new(&db.path)
+            .unwrap()
+            .latest_sequence(ACTOR_ID),
+        2
+    );
 
     execute_vm(&db, provider.clone(), observed, true, 1, REQUEST, false).unwrap();
-    assert_eq!(provider.borrow().attempts, 1, "completed VM replay must not call provider");
-    assert_eq!(LibsqlStore::new(&db.path).unwrap().latest_sequence(ACTOR_ID), 2);
+    assert_eq!(
+        provider.borrow().attempts,
+        1,
+        "completed VM replay must not call provider"
+    );
+    assert_eq!(
+        LibsqlStore::new(&db.path)
+            .unwrap()
+            .latest_sequence(ACTOR_ID),
+        2
+    );
 }
 
 #[test]
