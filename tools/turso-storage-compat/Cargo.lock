@@ -1738,6 +1738,8 @@ name = "nulang-turso-storage-compat"
 version = "0.0.0"
 dependencies = [
  "nulang",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "turso",
