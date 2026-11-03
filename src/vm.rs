@@ -6282,12 +6282,15 @@ fn module_with_handler_table(bindings: Vec<crate::bytecode::HandlerBinding>) -> 
 #[cfg(test)]
 mod vm_tests {
     use super::*;
-    use crate::bytecode::{BehaviorTableEntry, HandlerBinding, HandlerTable, Instruction};
+    use crate::bytecode::{BehaviorTableEntry, EffectSiteMetadata, HandlerBinding, HandlerTable, Instruction};
 
     #[derive(Debug)]
     struct ReadyValueCallbacks {
         heap: ActorHeap,
         gc: crate::runtime::OrcaGc,
+        observed_async_sites: std::rc::Rc<
+            std::cell::RefCell<Vec<(String, usize, Option<[u8; 32]>)>>,
+        >,
     }
 
     impl ReadyValueCallbacks {
@@ -6297,6 +6300,7 @@ mod vm_tests {
             Self {
                 heap,
                 gc: crate::runtime::OrcaGc::new(0),
+                observed_async_sites: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             }
         }
     }
@@ -6350,6 +6354,58 @@ mod vm_tests {
         ) -> PerformAsyncResult {
             PerformAsyncResult::ReadyValue(Value::int(73))
         }
+
+        fn perform_async_at_site(
+            &mut self,
+            module: &CodeModule,
+            pc: usize,
+            effect_op: &str,
+            args: &[Value],
+        ) -> PerformAsyncResult {
+            self.observed_async_sites.borrow_mut().push((
+                module.name.clone(),
+                pc,
+                module.effect_site_at(pc).map(|site| site.id),
+            ));
+            self.perform_async(effect_op, &module.constants, args)
+        }
+    }
+
+    #[test]
+    fn perform_async_passes_exact_site_context_to_runtime_callback() {
+        let mut vm = VM::new_without_jit();
+        let mut module = CodeModule::new("site-context");
+        let effect_idx = module.add_string_constant("Test.value");
+        let instr = Instruction::new3(
+            OpCode::PerformAsync,
+            ((effect_idx >> 8) & 0xff) as u8,
+            (effect_idx & 0xff) as u8,
+            7,
+        );
+        module.instructions.push(instr);
+        module.effect_sites.push(EffectSiteMetadata {
+            pc: 0,
+            id: [0xa5; 32],
+            effect_operation: "Test.value".into(),
+        });
+        vm.load_module(module);
+
+        let callbacks = ReadyValueCallbacks::new();
+        let observations = callbacks.observed_async_sites.clone();
+        vm.set_actor_callbacks(Box::new(callbacks));
+
+        let mut frame = Frame::new(None, 0);
+        frame.pc = 1; // The interpreter advances before dispatching opcode 0.
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+
+        vm.step_perform_async(0, 0, instr)
+            .expect("site-context callback must complete");
+        assert_eq!(vm.frames[0].regs[7].as_int(), Some(73));
+        assert_eq!(
+            observations.borrow().as_slice(),
+            &[("site-context".to_string(), 0, Some([0xa5; 32]))]
+        );
     }
 
     #[test]
