@@ -230,10 +230,7 @@ mod tests {
 
     fn trusted_loopback_certificate(
         server_san: &str,
-    ) -> (
-        RootCertStore,
-        Arc<tokio_rustls::rustls::ServerConfig>,
-    ) {
+    ) -> (RootCertStore, Arc<tokio_rustls::rustls::ServerConfig>) {
         use rcgen::{
             BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
             KeyUsagePurpose,
@@ -254,7 +251,9 @@ mod tests {
         let server = tokio_rustls::rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(
-                vec![CertificateDer::from(leaf_certificate.der().as_ref().to_vec())],
+                vec![CertificateDer::from(
+                    leaf_certificate.der().as_ref().to_vec(),
+                )],
                 PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
             )
             .unwrap();
@@ -301,6 +300,4 @@ mod tests {
             probe_trusted_loopback_tls("127.0.0.2").await.is_err(),
             "a trusted CA must not bypass hostname/IP SAN verification"
         );
-    }
-
-}
+    }}
