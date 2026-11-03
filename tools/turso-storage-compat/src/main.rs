@@ -219,6 +219,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     })?;
     drop(rt);
 
+    // Cross-process fault injection: unlike an in-process ROLLBACK this
+    // child exits without running Rust connection destructors.
+    verify_crashed_turso_transaction_is_atomic(&db_file)?;
+
     let legacy = LibsqlStore::new(&db_file)?;
     assert!(
         legacy.load_durable_tail_position(31)?.is_none(),
