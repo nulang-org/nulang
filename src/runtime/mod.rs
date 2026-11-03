@@ -450,6 +450,11 @@ pub struct Runtime {
     /// Kept separate from the module tuple so whole-program artifact identity
     /// cannot accidentally become the durable actor compatibility key.
     pub(crate) recovery_definition_semantic_ids: HashMap<u64, crate::content_identity::SemanticId>,
+    /// Exact actor-metadata index selected for each recovery module when
+    /// definition identity resolves unambiguously. This prevents mixed
+    /// actor/workflow modules from restoring another definition's role,
+    /// defaults, or state-model metadata.
+    pub(crate) recovery_definition_indices: HashMap<u64, usize>,
     /// Content-addressed bytecode cache for fetch-on-demand.
     /// When a node receives a message for an unknown content hash, it can
     /// request the bytecode from the sender and cache it here keyed by hash.
@@ -643,6 +648,7 @@ impl Runtime {
             idle_callback: None,
             recovery_modules: HashMap::new(),
             recovery_definition_semantic_ids: HashMap::new(),
+            recovery_definition_indices: HashMap::new(),
             #[cfg(feature = "ai-runtime")]
             ai: AiRuntimeRegistry::new(),
             #[cfg(feature = "ai-runtime")]
@@ -5123,6 +5129,174 @@ impl Runtime {
         }
     }
 
+    /// Recover a strongly identified durable actor by loading the exact
+    /// historical executable from immutable artifact retention.
+    ///
+    /// This path is intentionally unavailable to legacy snapshots: exact
+    /// artifact hydration requires both a persisted ArtifactId and a
+    /// definition-scoped SemanticId so the runtime can select one actor
+    /// definition inside a potentially multi-definition module without
+    /// guessing from short names or role flags.
+    pub fn recover_actor_from_artifact_store(
+        &mut self,
+        actor_id: u64,
+        store: &crate::artifact_store::FileArtifactStore,
+        identity_policy: RecoveryIdentityPolicy,
+    ) -> Result<u64, NuError> {
+        let snapshot =
+            self.persistence
+                .load_snapshot(actor_id)
+                .ok_or_else(|| NuError::RuntimeError {
+                    msg: format!("actor {actor_id} has no durable snapshot"),
+                    span: Span::new(0, 0),
+                })?;
+
+        let artifact_id = snapshot
+            .artifact_id
+            .as_deref()
+            .ok_or_else(|| NuError::RuntimeError {
+                msg: format!(
+                    "actor {actor_id} snapshot has no ArtifactId; historical executable recovery requires explicit provenance"
+                ),
+                span: Span::new(0, 0),
+            })?
+            .parse::<crate::content_identity::ArtifactId>()
+            .map_err(|error| NuError::RuntimeError {
+                msg: format!("actor {actor_id} has malformed ArtifactId: {error}"),
+                span: Span::new(0, 0),
+            })?;
+
+        let definition_id = snapshot
+            .semantic_id
+            .as_deref()
+            .ok_or_else(|| NuError::RuntimeError {
+                msg: format!(
+                    "actor {actor_id} snapshot has no definition SemanticId; exact definition selection is impossible"
+                ),
+                span: Span::new(0, 0),
+            })?
+            .parse::<crate::content_identity::SemanticId>()
+            .map_err(|error| NuError::RuntimeError {
+                msg: format!("actor {actor_id} has malformed definition SemanticId: {error}"),
+                span: Span::new(0, 0),
+            })?;
+
+        let module =
+            store
+                .load_identified_module(artifact_id)
+                .map_err(|error| NuError::RuntimeError {
+                    msg: format!(
+                    "cannot load retained executable {artifact_id} for actor {actor_id}: {error}"
+                ),
+                    span: Span::new(0, 0),
+                })?;
+
+        let mut matching_definitions = module
+            .actor_semantic_ids
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| **candidate == definition_id)
+            .map(|(index, _)| index);
+        let definition_index =
+            matching_definitions
+                .next()
+                .ok_or_else(|| NuError::RuntimeError {
+                    msg: format!(
+                        "retained artifact {artifact_id} has no actor definition matching snapshot SemanticId {definition_id}"
+                    ),
+                    span: Span::new(0, 0),
+                })?;
+        if matching_definitions.next().is_some() {
+            return Err(NuError::RuntimeError {
+                msg: format!(
+                    "retained artifact {artifact_id} contains multiple actor definitions with snapshot SemanticId {definition_id}"
+                ),
+                span: Span::new(0, 0),
+            });
+        }
+
+        let meta = module
+            .actor_metadata
+            .get(definition_index)
+            .ok_or_else(|| NuError::RuntimeError {
+                msg: format!(
+                    "retained artifact {artifact_id} definition index {definition_index} has no actor metadata"
+                ),
+                span: Span::new(0, 0),
+            })?
+            .clone();
+        let role = meta.role().map_err(|error| NuError::RuntimeError {
+            msg: format!(
+                "retained artifact {artifact_id} actor definition {} has conflicting role metadata: {error}",
+                meta.name
+            ),
+            span: Span::new(0, 0),
+        })?;
+
+        let offsets = if matches!(role, crate::primitives::ActorRole::Workflow) {
+            let mut offsets = Vec::with_capacity(meta.behavior_indices.len());
+            for &index in &meta.behavior_indices {
+                let behavior =
+                    module
+                        .behaviors
+                        .get(index)
+                        .ok_or_else(|| NuError::RuntimeError {
+                            msg: format!(
+                                "retained artifact {artifact_id} actor definition {} references missing behavior index {index}",
+                                meta.name
+                            ),
+                            span: Span::new(0, 0),
+                        })?;
+                offsets.push(behavior.code_offset);
+            }
+            offsets
+        } else {
+            module
+                .behaviors
+                .iter()
+                .map(|behavior| behavior.code_offset)
+                .collect()
+        };
+        let mut compensation_offsets = Vec::with_capacity(meta.behavior_indices.len());
+        for &index in &meta.behavior_indices {
+            let behavior = module
+                .behaviors
+                .get(index)
+                .ok_or_else(|| NuError::RuntimeError {
+                    msg: format!(
+                        "retained artifact {artifact_id} actor definition {} references missing behavior index {index}",
+                        meta.name
+                    ),
+                    span: Span::new(0, 0),
+                })?;
+            compensation_offsets.push(behavior.compensate_offset);
+        }
+
+        spawn::register_recovery_module(
+            self,
+            actor_id,
+            module,
+            offsets,
+            compensation_offsets,
+            Some(definition_id),
+        );
+
+        match self.recover_actor_with_identity_policy(actor_id, identity_policy) {
+            Some(recovered) => Ok(recovered),
+            None => {
+                self.recovery_modules.remove(&actor_id);
+                self.recovery_definition_semantic_ids.remove(&actor_id);
+                self.recovery_definition_indices.remove(&actor_id);
+                Err(NuError::RuntimeError {
+                    msg: format!(
+                        "actor {actor_id} failed durable recovery under retained artifact {artifact_id}"
+                    ),
+                    span: Span::new(0, 0),
+                })
+            }
+        }
+    }
+
     /// Recover a persistent actor from the latest snapshot and replay the journal.
     ///
     /// For workflow actors the durable workflow event journal is replayed
@@ -5201,18 +5375,38 @@ impl Runtime {
                 }
             };
         let workflow_events = self.persistence.read_workflow_events(actor_id);
-        let is_workflow = self
+        let recovery_definition_index = self.recovery_definition_indices.get(&actor_id).copied();
+        let selected_recovery_meta = self
             .recovery_modules
             .get(&actor_id)
-            .map(|(m, _, _)| m.actor_metadata.iter().any(|meta| meta.is_workflow))
+            .and_then(|(module, _, _)| {
+                recovery_definition_index.and_then(|index| module.actor_metadata.get(index))
+            })
+            .cloned();
+        let is_workflow = selected_recovery_meta
+            .as_ref()
+            .map(|meta| meta.is_workflow)
+            .or_else(|| {
+                self.recovery_modules
+                    .get(&actor_id)
+                    .map(|(m, _, _)| m.actor_metadata.iter().any(|meta| meta.is_workflow))
+            })
             .unwrap_or(!workflow_events.is_empty());
-        let is_agent = self
-            .recovery_modules
-            .get(&actor_id)
-            .map(|(m, _, _)| m.actor_metadata.iter().any(|meta| meta.is_agent))
+        let is_agent = selected_recovery_meta
+            .as_ref()
+            .map(|meta| meta.is_agent)
+            .or_else(|| {
+                self.recovery_modules
+                    .get(&actor_id)
+                    .map(|(m, _, _)| m.actor_metadata.iter().any(|meta| meta.is_agent))
+            })
             .unwrap_or(false);
 
-        let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
+        let actor_name = selected_recovery_meta
+            .as_ref()
+            .map(|meta| meta.name.clone())
+            .unwrap_or_else(|| format!("actor_{}", actor_id));
+        let mut actor = Actor::new(actor_id, actor_name, 0);
         actor.definition_semantic_id = verified_definition_semantic_id;
         actor.execution_artifact_id = verified_execution_artifact_id;
         actor.persistent = true;
@@ -5261,17 +5455,26 @@ impl Runtime {
         }
         // Parse cached retry/fallback configs from restored state for agents.
         if is_agent {
-            if let Some(module) = actor
-                .bytecode_module
+            let selected_defaults = selected_recovery_meta
                 .as_ref()
-                .or_else(|| self.recovery_modules.get(&actor_id).map(|(m, _, _)| m))
-            {
+                .map(|meta| meta.state_defaults.as_slice());
+            if let Some(defaults) = selected_defaults {
+                for (name, c) in defaults {
+                    if let crate::bytecode::Constant::String(json) = c {
+                        if name == "retry_config" {
+                            actor.retry_config = serde_json::from_str(json).ok();
+                        } else if name == "fallback_config" {
+                            actor.fallback_config = serde_json::from_str(json).unwrap_or_default();
+                        }
+                    }
+                }
+            } else if let Some(module) = self.recovery_modules.get(&actor_id).map(|(m, _, _)| m) {
                 for (name, c) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
                     if let crate::bytecode::Constant::String(json) = c {
                         if name == "retry_config" {
-                            actor.retry_config = serde_json::from_str(&json).ok();
+                            actor.retry_config = serde_json::from_str(json).ok();
                         } else if name == "fallback_config" {
-                            actor.fallback_config = serde_json::from_str(&json).unwrap_or_default();
+                            actor.fallback_config = serde_json::from_str(json).unwrap_or_default();
                         }
                     }
                 }
@@ -5314,7 +5517,18 @@ impl Runtime {
         // persisted events legitimately has no value yet either, but
         // that's a separate, pre-existing question this fix doesn't
         // change.
-        if let Some(module) = self.recovery_modules.get(&actor_id).map(|(m, _, _)| m) {
+        if let Some(meta) = selected_recovery_meta.as_ref() {
+            for (name, c) in &meta.state_defaults {
+                if actor.get_state_field(name).is_some() {
+                    continue;
+                }
+                let v = match c {
+                    crate::bytecode::Constant::String(s) => actor.allocate_string(s),
+                    other => crate::vm::constant_to_value(other),
+                };
+                actor.set_state_field(name, v);
+            }
+        } else if let Some(module) = self.recovery_modules.get(&actor_id).map(|(m, _, _)| m) {
             for (name, c) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
                 if actor.get_state_field(name).is_some() {
                     continue;
@@ -5342,12 +5556,19 @@ impl Runtime {
             // would drop Durable fields from the snapshot entirely, and
             // EventSourced fields would stop accumulating via emitted
             // events.
-            actor.state_models = module
-                .actor_metadata
-                .iter()
-                .flat_map(|m| &m.state_models)
-                .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
-                .collect();
+            actor.state_models = if let Some(meta) = selected_recovery_meta.as_ref() {
+                meta.state_models
+                    .iter()
+                    .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
+                    .collect()
+            } else {
+                module
+                    .actor_metadata
+                    .iter()
+                    .flat_map(|m| &m.state_models)
+                    .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
+                    .collect()
+            };
         }
         if is_workflow {
             self.actors.insert(actor_id, actor);
