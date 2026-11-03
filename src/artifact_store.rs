@@ -237,6 +237,7 @@ impl FileArtifactStore {
             ArtifactStoreError::Corrupt("runtime manifest path has no parent".into())
         })?;
         fs::create_dir_all(parent)?;
+        self.reject_runtime_manifest_symlink(artifact_id)?;
 
         let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let temp_path = parent.join(format!(
@@ -289,6 +290,7 @@ impl FileArtifactStore {
         artifact_id: ArtifactId,
     ) -> Result<RuntimeArtifactManifest, ArtifactStoreError> {
         self.load(artifact_id)?;
+        self.reject_runtime_manifest_symlink(artifact_id)?;
         let path = self.runtime_manifest_path(artifact_id);
         let record = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -340,6 +342,24 @@ impl FileArtifactStore {
         self.root
             .join(&hex[..2])
             .join(format!("{hex}.runtime.narm"))
+    }
+
+    /// Do not treat a pre-existing symlink as an immutable runtime identity
+    /// sidecar. This complements the artifact-path guard in #952; both still
+    /// require the store root to be protected from concurrent untrusted writers.
+    fn reject_runtime_manifest_symlink(
+        &self,
+        artifact_id: ArtifactId,
+    ) -> Result<(), ArtifactStoreError> {
+        let path = self.runtime_manifest_path(artifact_id);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => Err(ArtifactStoreError::Corrupt(
+                "runtime manifest record is a symlink".into(),
+            )),
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -883,6 +903,52 @@ mod tests {
             Err(ArtifactStoreError::RuntimeManifestDigestMismatch { artifact_id })
                 if artifact_id == identity.artifact_id()
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_runtime_sidecar_cannot_be_read_as_verified_history() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TestDir::new();
+        let store = FileArtifactStore::new(&dir.0);
+        let identity = manifest(b"source");
+        let definition = SemanticId::from_canonical_bytes(b"counter-definition", []);
+        let module = runtime_module(&identity, definition);
+        let runtime_manifest = RuntimeArtifactManifest::from_module(&module, &identity).unwrap();
+        store
+            .retain_runtime(&identity, &runtime_manifest, &module.to_nbc(None).unwrap())
+            .unwrap();
+
+        let sidecar_path = store.runtime_manifest_path(identity.artifact_id());
+        let outside_path = dir.0.join("outside-sidecar.narm");
+        fs::rename(&sidecar_path, &outside_path).unwrap();
+        symlink(&outside_path, &sidecar_path).unwrap();
+
+        assert!(store.load_runtime_manifest(identity.artifact_id()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_runtime_sidecar_cannot_satisfy_immutable_retention() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TestDir::new();
+        let store = FileArtifactStore::new(&dir.0);
+        let identity = manifest(b"source");
+        let definition = SemanticId::from_canonical_bytes(b"counter-definition", []);
+        let module = runtime_module(&identity, definition);
+        let runtime_manifest = RuntimeArtifactManifest::from_module(&module, &identity).unwrap();
+        store
+            .retain_runtime(&identity, &runtime_manifest, &module.to_nbc(None).unwrap())
+            .unwrap();
+
+        let sidecar_path = store.runtime_manifest_path(identity.artifact_id());
+        let outside_path = dir.0.join("outside-sidecar.narm");
+        fs::rename(&sidecar_path, &outside_path).unwrap();
+        symlink(&outside_path, &sidecar_path).unwrap();
+
+        assert!(store.retain_runtime_manifest(&runtime_manifest).is_err());
     }
 
     #[test]
