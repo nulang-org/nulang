@@ -17,6 +17,7 @@ pub mod ast;
 pub mod authority;
 pub mod authority_host;
 mod authority_runtime;
+pub mod runtime_artifact_manifest;
 pub use authority_runtime::RuntimeAuthorityError;
 pub mod backends;
 pub mod behavior_manifest;
