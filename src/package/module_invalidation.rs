@@ -304,4 +304,70 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn long_dependency_chain_invalidates_iteratively_without_missing_dependents() {
+        // Thousands of imports must not use the native call stack for graph
+        // traversal. This also catches partial invalidation of deep chains.
+        const MODULES: usize = 4_096;
+        let mut before = ModuleSnapshot::new(b"fixed compiler context");
+        for index in 0..MODULES {
+            let name = format!("module_{index:05}");
+            if index == 0 {
+                before.insert(name, b"initial", [] as [&str; 0]);
+            } else {
+                before.insert(
+                    name,
+                    b"unchanged",
+                    [format!("module_{:05}", index - 1)],
+                );
+            }
+        }
+
+        let mut after = before.clone();
+        after.insert("module_00000", b"edited", [] as [&str; 0]);
+        let expected = (0..MODULES)
+            .map(|index| format!("module_{index:05}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            invalidated_modules(&before, &after),
+            Invalidation::Dirty { modules: expected }
+        );
+    }
+
+    #[test]
+    fn layered_diamond_invalidates_each_module_once_despite_shared_paths() {
+        // A layered diamond has exponentially many paths, but only O(n)
+        // modules and import edges. Invalidation must operate on the graph,
+        // not enumerate every path from the changed root.
+        const LEVELS: usize = 96;
+        let mut before = ModuleSnapshot::new(b"fixed compiler context");
+        before.insert("root", b"initial", [] as [&str; 0]);
+        before.insert("unrelated", b"unchanged", [] as [&str; 0]);
+        for level in 0..LEVELS {
+            let imports = if level == 0 {
+                vec!["root".to_string()]
+            } else {
+                vec![
+                    format!("left_{:03}", level - 1),
+                    format!("right_{:03}", level - 1),
+                ]
+            };
+            before.insert(format!("left_{level:03}"), b"unchanged", imports.clone());
+            before.insert(format!("right_{level:03}"), b"unchanged", imports);
+        }
+
+        let mut after = before.clone();
+        after.insert("root", b"edited", [] as [&str; 0]);
+        let result = invalidated_modules(&before, &after);
+        let Invalidation::Dirty { modules } = result else {
+            panic!("complete valid graph must yield a dirty set");
+        };
+        assert_eq!(modules.len(), 1 + 2 * LEVELS);
+        assert!(modules.contains(&"root".to_string()));
+        assert!(modules.contains(&format!("left_{:03}", LEVELS - 1)));
+        assert!(modules.contains(&format!("right_{:03}", LEVELS - 1)));
+        assert!(!modules.contains(&"unrelated".to_string()));
+    }
+
 }
