@@ -1,5 +1,6 @@
 //! Manual, isolated compatibility gate for replacing libSQL's local SQLite
 //! driver. This does NOT migrate cloud URLs, credentials or production data.
+mod turso_writer;
 mod writer_probe;
 use nulang::runtime::{
     ActorSnapshot, DurableTransition, JournalEntry, LibsqlStore, PersistedValue, PersistenceStore,
