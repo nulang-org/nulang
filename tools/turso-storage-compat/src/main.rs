@@ -1,5 +1,7 @@
 //! Manual, isolated compatibility gate for replacing libSQL's local SQLite
 //! driver. This does NOT migrate cloud URLs, credentials or production data.
+mod process_handoff;
+mod process_race;
 mod rich_probe;
 mod turso_writer;
 mod writer_probe;
@@ -90,6 +92,42 @@ fn main() -> Result<(), Box<dyn Error>> {
             .nth(2)
             .ok_or("crash fixture requires an isolated database filename")?;
         return crash_with_uncommitted_turso_transaction(Path::new(&filename));
+    }
+
+    if std::env::args().nth(1).as_deref() == Some("--turso-multiprocess-race-child") {
+        let args: Vec<_> = std::env::args_os().collect();
+        if args.len() != 6 {
+            return Err("process-race child requires database, actor, value and barrier".into());
+        }
+        let actor: u64 = args[3].to_str().ok_or("invalid race actor")?.parse()?;
+        let value: i64 = args[4].to_str().ok_or("invalid race payload")?.parse()?;
+        return process_race::writer_child(Path::new(&args[2]), actor, value, Path::new(&args[5]));
+    }
+
+    if let Some(
+        mode
+        @ ("--turso-handoff-owner" | "--turso-handoff-contender" | "--turso-handoff-successor"),
+    ) = std::env::args().nth(1).as_deref()
+    {
+        let args: Vec<_> = std::env::args_os().collect();
+        if args.len() != 5 {
+            return Err("handoff child needs database, actor, and barrier".into());
+        }
+        let actor: u64 = args[3].to_str().ok_or("invalid handoff actor")?.parse()?;
+        return process_handoff::run_handoff_child(
+            mode,
+            Path::new(&args[2]),
+            actor,
+            Path::new(&args[4]),
+        );
+    }
+    if std::env::args().nth(1).as_deref() == Some("--verify-exclusive-handoff") {
+        let isolated = tempfile::tempdir()?;
+        // Child processes must prove this DB was created by the disposable probe.
+        std::fs::write(isolated.path().join(".nulang-turso-test-only"), b"1")?;
+        let database = isolated.path().join("durable.db");
+        drop(LibsqlStore::new(&database)?);
+        return process_handoff::verify_exclusive_file_handoff(&database);
     }
 
     let temp = tempfile::tempdir()?;
@@ -309,6 +347,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     verify_crashed_turso_transaction_is_atomic(&db_file)?;
     writer_probe::verify_turso_transition_writer(&db_file)?;
     rich_probe::verify_full_record_parity(&db_file)?;
+    process_race::verify_cross_process_fencing(&db_file)?;
 
     let legacy = LibsqlStore::new(&db_file)?;
     assert!(

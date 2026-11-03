@@ -11,7 +11,7 @@ use nulang::runtime::{
 };
 use std::{collections::HashMap, error::Error, path::Path};
 
-fn rich_transition(actor: u64) -> (DurableTransition, DurableEffectPersistenceRecord) {
+pub(crate) fn rich_transition(actor: u64) -> (DurableTransition, DurableEffectPersistenceRecord) {
     let sequence = 1;
     let spec = DurableEffectSpec::new(
         DurableEffectId::derive(actor, "probe:turn:1", 0, "Provider.ask"),
