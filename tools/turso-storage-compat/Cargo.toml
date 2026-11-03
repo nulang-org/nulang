@@ -13,3 +13,5 @@ nulang = { path = "../..", default-features = false, features = ["sqlite"] }
 turso = { version = "=0.8.3", default-features = false }
 tokio = { version = "1.53", features = ["rt", "time"] }
 tempfile = "3"
+serde = "1"
+serde_json = "1"
