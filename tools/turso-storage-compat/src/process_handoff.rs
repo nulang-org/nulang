@@ -10,8 +10,7 @@ use nulang::runtime::{
 };
 use std::{
     error::Error,
-    fs,
-    io,
+    fs, io,
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
     thread,
@@ -111,13 +110,20 @@ fn verify_reopened_state(database: &Path, actor: u64) -> Result<(), Box<dyn Erro
         "new owner must have advanced exactly one successor transition"
     );
     let journal = store.read_journal(actor);
-    assert_eq!(journal.len(), 2, "handoff must not duplicate committed commands");
+    assert_eq!(
+        journal.len(),
+        2,
+        "handoff must not duplicate committed commands"
+    );
     assert_eq!(journal[0].payload, vec![PersistedValue::Int(777)]);
     assert_eq!(journal[1].payload, vec![PersistedValue::Int(888)]);
     assert_eq!(store.read_workflow_events(actor).len(), 2);
     assert_eq!(store.read_events(actor).len(), 2);
     assert_eq!(
-        store.load_snapshot(actor).ok_or("initial snapshot missing")?.sequence,
+        store
+            .load_snapshot(actor)
+            .ok_or("initial snapshot missing")?
+            .sequence,
         1,
         "successor with no snapshot must preserve prior complete snapshot"
     );
@@ -142,7 +148,11 @@ fn verify_reopened_state(database: &Path, actor: u64) -> Result<(), Box<dyn Erro
         let values = store.query(&sql, &[])?;
         let parsed: Vec<i64> =
             serde_json::from_str(values.first().ok_or("missing handoff table count")?)?;
-        assert_eq!(parsed, vec![expected], "{table} changed unexpectedly during handoff");
+        assert_eq!(
+            parsed,
+            vec![expected],
+            "{table} changed unexpectedly during handoff"
+        );
     }
     let sql = format!("SELECT digest FROM durable_tails WHERE actor_id={actor}");
     let values = store.query(&sql, &[])?;
@@ -167,8 +177,7 @@ pub(crate) fn verify_exclusive_file_handoff(database: &Path) -> Result<(), Box<d
     let mut owner = spawn_child("--turso-handoff-owner", database, actor, barrier.path())?;
     wait_ready(&mut owner, barrier.path())?;
 
-    let mut contender =
-        spawn_child("--turso-handoff-contender", database, actor, barrier.path())?;
+    let mut contender = spawn_child("--turso-handoff-contender", database, actor, barrier.path())?;
     let contested = wait_exit(&mut contender, "exclusive-lock contender")?;
     assert_eq!(
         contested.code(),
@@ -184,8 +193,7 @@ pub(crate) fn verify_exclusive_file_handoff(database: &Path) -> Result<(), Box<d
     );
     drop(owner);
 
-    let mut resumed =
-        spawn_child("--turso-handoff-successor", database, actor, barrier.path())?;
+    let mut resumed = spawn_child("--turso-handoff-successor", database, actor, barrier.path())?;
     assert!(
         wait_exit(&mut resumed, "new owner")?.success(),
         "a fresh process must reopen, fence stale epochs and commit successor"
@@ -206,15 +214,22 @@ pub(crate) fn run_handoff_child(
 ) -> Result<(), Box<dyn Error>> {
     // A test child must never accept an arbitrary production path. The
     // parent creates an isolated tempdir, test-only marker and barrier.
-    let marked = database.parent().is_some_and(|parent| {
-        parent.join(".nulang-turso-test-only").is_file()
-    });
-    if std::env::var("NULANG_TURSO_HANDOFF_TEST_CHILD").ok().as_deref() != Some("1")
-        || !barrier.to_string_lossy().contains("nulang-turso-process-handoff-")
+    let marked = database
+        .parent()
+        .is_some_and(|parent| parent.join(".nulang-turso-test-only").is_file());
+    if std::env::var("NULANG_TURSO_HANDOFF_TEST_CHILD")
+        .ok()
+        .as_deref()
+        != Some("1")
+        || !barrier
+            .to_string_lossy()
+            .contains("nulang-turso-process-handoff-")
         || database.file_name() != Some(std::ffi::OsStr::new("durable.db"))
         || !marked
     {
-        return Err("handoff child requires marked disposable database and isolated barrier".into());
+        return Err(
+            "handoff child requires marked disposable database and isolated barrier".into(),
+        );
     }
     let filename = database.to_str().ok_or("non-UTF8 disposable database")?;
     let rt = tokio::runtime::Builder::new_current_thread()
