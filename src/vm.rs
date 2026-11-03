@@ -4400,7 +4400,8 @@ impl VM {
     /// Generic async effect dispatch (`PerformAsync` opcode).
     ///
     /// Reads the effect_op string from the constant pool, collects arguments
-    /// from registers r0..rN, and calls `ActorVmCallbacks::perform_async`.
+    /// from registers r0..rN, and calls `ActorVmCallbacks::perform_async_at_site`
+    /// with the loaded module and exact executing opcode PC.
     /// On `Ready(value)` the result is written to the destination register
     /// and execution continues. On `Pending` the PC is decremented so the
     /// instruction re-executes on resume, and the VM returns a
