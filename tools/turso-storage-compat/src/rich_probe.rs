@@ -23,6 +23,17 @@ fn rich_transition(actor: u64) -> (DurableTransition, DurableEffectPersistenceRe
     let completed = DurableEffectPersistenceRecord::from_effect(
         prepared.clone().complete(b"answer=world".to_vec()),
     );
+    let compensation = completed
+        .effect()
+        .prepare_compensation(
+            0,
+            "Provider.undo",
+            EffectBoundary::External,
+            DeliverySemantics::EffectivelyOnceWithDeduplication,
+            b"undo=request",
+        )
+        .expect("completed effect must allow compensation");
+    let compensation = DurableEffectPersistenceRecord::from_compensation(&compensation);
     let mut state = HashMap::new();
     state.insert("counter".to_string(), PersistedValue::Int(9));
     (
@@ -76,6 +87,7 @@ fn rich_transition(actor: u64) -> (DurableTransition, DurableEffectPersistenceRe
             durable_effects: vec![
                 DurableEffectPersistenceRecord::from_effect(prepared),
                 completed.clone(),
+                compensation,
             ],
             outbox: vec![DurableOutboxMessage {
                 destination_actor_id: actor + 1,
@@ -99,6 +111,7 @@ pub(crate) fn verify_full_record_parity(path: &Path) -> Result<(), Box<dyn Error
         let db = turso::Builder::new_local(filename).build().await?;
         let conn = db.connect()?;
         let (rich, completed) = rich_transition(71);
+        let compensation = rich.durable_effects[2].clone();
         let digest = rich.digest()?;
         assert_eq!(
             commit_transition(&conn, rich.clone()).await?.digest,
@@ -192,9 +205,9 @@ pub(crate) fn verify_full_record_parity(path: &Path) -> Result<(), Box<dyn Error
         drop(rows);
         drop(conn);
         drop(db);
-        Ok::<_, Box<dyn Error>>(completed)
+        Ok::<_, Box<dyn Error>>((completed, compensation))
     })
-    .and_then(|completed| {
+    .and_then(|(completed, compensation)| {
         drop(rt);
         let mut legacy = LibsqlStore::new(path)?;
         assert_eq!(legacy.read_workflow_events(71).len(), 2);
@@ -204,6 +217,21 @@ pub(crate) fn verify_full_record_parity(path: &Path) -> Result<(), Box<dyn Error
             legacy.load_durable_effect(71, effect_id)?,
             Some(completed),
             "legacy reader must load newest Turso-written versioned effect"
+        );
+        assert_eq!(
+            compensation.original_effect_id(),
+            Some(effect_id),
+            "compensation must preserve original effect identity"
+        );
+        assert_eq!(
+            compensation.compensation_ordinal(),
+            Some(0),
+            "compensation must preserve its ordinal"
+        );
+        assert_eq!(
+            legacy.load_durable_effect(71, compensation.effect().spec().id)?,
+            Some(compensation),
+            "legacy reader must recover Turso-authored compensation linkage"
         );
         assert!(
             legacy.load_snapshot(72).is_none(),
