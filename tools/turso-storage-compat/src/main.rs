@@ -1,5 +1,6 @@
 //! Manual, isolated compatibility gate for replacing libSQL's local SQLite
 //! driver. This does NOT migrate cloud URLs, credentials or production data.
+mod process_handoff;
 mod process_race;
 mod rich_probe;
 mod turso_writer;
@@ -101,6 +102,28 @@ fn main() -> Result<(), Box<dyn Error>> {
         let actor: u64 = args[3].to_str().ok_or("invalid race actor")?.parse()?;
         let value: i64 = args[4].to_str().ok_or("invalid race payload")?.parse()?;
         return process_race::writer_child(Path::new(&args[2]), actor, value, Path::new(&args[5]));
+    }
+
+    if let Some(mode @ ("--turso-handoff-owner" | "--turso-handoff-contender" | "--turso-handoff-successor")) =
+        std::env::args().nth(1).as_deref()
+    {
+        let args: Vec<_> = std::env::args_os().collect();
+        if args.len() != 5 {
+            return Err("handoff child needs database, actor, and barrier".into());
+        }
+        let actor: u64 = args[3].to_str().ok_or("invalid handoff actor")?.parse()?;
+        return process_handoff::run_handoff_child(
+            mode,
+            Path::new(&args[2]),
+            actor,
+            Path::new(&args[4]),
+        );
+    }
+    if std::env::args().nth(1).as_deref() == Some("--verify-exclusive-handoff") {
+        let isolated = tempfile::tempdir()?;
+        let database = isolated.path().join("durable.db");
+        drop(LibsqlStore::new(&database)?);
+        return process_handoff::verify_exclusive_file_handoff(&database);
     }
 
     let temp = tempfile::tempdir()?;
