@@ -355,6 +355,25 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
         PerformAsyncResult::Ready(None)
     }
 
+    /// Dispatch an async effect with its loaded bytecode artifact and exact
+    /// executing opcode PC, for compiler-owned effect-site identity lookup.
+    ///
+    /// This preserves source compatibility for existing callbacks by
+    /// delegating to `perform_async` by default. A durable host must override
+    /// this method, verify the admitted artifact and exact effect site, and
+    /// supply separate replay-stable turn/occurrence identity before any
+    /// externally observable provider dispatch. Supplying a `CodeModule`
+    /// alone does not authenticate its provenance or authorize an effect.
+    fn perform_async_at_site(
+        &mut self,
+        module: &CodeModule,
+        _pc: usize,
+        effect_op: &str,
+        args: &[Value],
+    ) -> PerformAsyncResult {
+        self.perform_async(effect_op, &module.constants, args)
+    }
+
     /// Try to receive a message from the current actor's mailbox.
     /// Returns `Some((behavior_id, value))` if a message is available,
     /// or `None` if the mailbox is empty. Default returns `None`.
@@ -4398,15 +4417,21 @@ impl VM {
         let effect_op = self.module_const_string(module_idx, effect_op_idx);
         // Pass the full frame register slice and the module's constant pool
         // so the callback can resolve string-id arguments from registers.
+        let pc = self.frames[frame_idx]
+            .pc
+            .checked_sub(1)
+            .ok_or_else(|| NuError::VMError {
+                msg: "PerformAsync PC was not advanced before dispatch".into(),
+                span: Span::default(),
+            })?;
+        let module = self.modules.get(module_idx).ok_or_else(|| NuError::VMError {
+            msg: format!("PerformAsync references missing module {module_idx}"),
+            span: Span::default(),
+        })?;
         let args = &self.frames[frame_idx].regs;
-        let constants = self
-            .modules
-            .get(module_idx)
-            .map(|m| &m.constants[..])
-            .unwrap_or(&[]);
         match self
             .actor_callbacks
-            .perform_async(&effect_op, constants, args)
+            .perform_async_at_site(module, pc, &effect_op, args)
         {
             PerformAsyncResult::Ready(result) => {
                 let value = match result {
