@@ -28,7 +28,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -231,7 +231,42 @@ impl ActorVmCallbacks for Callback {
             |key, request| {
                 let mut provider = self.provider.borrow_mut();
                 provider.attempts += 1;
-                let response = if let Some(saved) = provider.committed.get(key) {
+                let response = if let Some(path) = provider.disk_path.clone() {
+                    // The subprocess fake models a provider-side idempotency
+                    // ledger independent of the Nulang effect journal.
+                    if path.exists() {
+                        let saved = fs::read(path)?;
+                        let split = saved.iter().position(|byte| *byte == b'\n')
+                            .ok_or_else(|| io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "invalid provider receipt record",
+                            ))?;
+                        if &saved[..split] != key.as_bytes() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "provider idempotency key changed on retry",
+                            ));
+                        }
+                        saved[split + 1..].to_vec()
+                    } else {
+                        let response = [b"receipt:".as_slice(), request].concat();
+                        let mut file = fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(path)?;
+                        file.write_all(key.as_bytes())?;
+                        file.write_all(b"\n")?;
+                        file.write_all(&response)?;
+                        file.sync_all()?;
+                        provider.mutations += 1;
+                        if provider.exit_after_commit {
+                            // No Rust destructors or journal completion. The
+                            // parent starts a new process from persisted state.
+                            std::process::exit(94);
+                        }
+                        response
+                    }
+                } else if let Some(saved) = provider.committed.get(key) {
                     saved.clone()
                 } else {
                     provider.mutations += 1;
