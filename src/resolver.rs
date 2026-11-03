@@ -1,9 +1,10 @@
 use crate::ast::{AstModule, Decl};
 use crate::lexer::Lexer;
+use crate::package::module_invalidation::ModuleSnapshot;
 use crate::parser::Parser;
 use crate::types::{NuError, NuResult, Span};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 thread_local! {
@@ -17,6 +18,33 @@ pub fn resolve_imports(
     module: &mut AstModule,
     current_file: &Path,
     stack: &mut HashSet<PathBuf>,
+) -> NuResult<()> {
+    resolve_imports_inner(module, current_file, stack, &mut None)
+}
+
+/// Resolve imports using the normal compiler path and additionally record the
+/// exact source bytes and canonical direct import edges observed along the way.
+///
+/// Diagnostic-only: the trace does not prove a complete compiler input closure
+/// (stdlib version, target, FFI, capabilities, feature flags, etc.). It cannot
+/// authorize reuse of typechecking results, executable code or Cloud caches.
+/// The current_file argument must refer to an actual, readable source file.
+pub fn resolve_imports_with_snapshot(
+    module: &mut AstModule,
+    current_file: &Path,
+    stack: &mut HashSet<PathBuf>,
+    context_bytes: &[u8],
+) -> NuResult<ModuleSnapshot> {
+    let mut snapshot = ModuleSnapshot::new(context_bytes);
+    resolve_imports_inner(module, current_file, stack, &mut Some(&mut snapshot))?;
+    Ok(snapshot)
+}
+
+fn resolve_imports_inner(
+    module: &mut AstModule,
+    current_file: &Path,
+    stack: &mut HashSet<PathBuf>,
+    recording: &mut Option<&mut ModuleSnapshot>,
 ) -> NuResult<()> {
     if stack.is_empty() {
         IMPORT_CACHE.with(|c| c.borrow_mut().clear());
@@ -45,6 +73,32 @@ pub fn resolve_imports(
             _ => None,
         })
         .collect();
+
+    // Dependency paths and import declarations come from the normal compiler
+    // resolver/parser, never source-text matching or test-supplied edges.
+    // The ordinary compiler path performs no additional observation or I/O.
+    if let Some(snapshot) = recording.as_deref_mut() {
+        let path = canonical_file
+            .canonicalize()
+            .map_err(|e| NuError::RuntimeError {
+                msg: format!("cannot canonicalize '{}': {e}", canonical_file.display()),
+                span: Span::default(),
+            })?;
+        let source = std::fs::read(&path).map_err(|e| NuError::RuntimeError {
+            msg: format!("cannot read '{}': {e}", path.display()),
+            span: Span::default(),
+        })?;
+        let mut edges = BTreeSet::new();
+        for (import, _) in &imports {
+            let resolved = resolve_path(&canonical_base, import);
+            let dependency = resolved.canonicalize().map_err(|e| NuError::RuntimeError {
+                msg: format!("cannot resolve imported module '{import}': {e}"),
+                span: Span::default(),
+            })?;
+            edges.insert(dependency.to_string_lossy().into_owned());
+        }
+        snapshot.insert(path.to_string_lossy().into_owned(), &source, edges);
+    }
 
     for (import_path, items) in &imports {
         let resolved = resolve_path(&canonical_base, import_path);
@@ -83,7 +137,7 @@ pub fn resolve_imports(
                     span: Span::default(),
                 })?;
 
-        resolve_imports(&mut imported, &resolved_canonical, stack)?;
+        resolve_imports_inner(&mut imported, &resolved_canonical, stack, recording)?;
 
         let imported_decls = if items.is_empty() {
             imported.decls
