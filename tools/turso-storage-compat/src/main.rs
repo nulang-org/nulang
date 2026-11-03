@@ -4,9 +4,91 @@ use nulang::runtime::{
     ActorSnapshot, DurableTransition, JournalEntry, LibsqlStore, PersistedValue, PersistenceStore,
     DURABLE_TRANSITION_VERSION,
 };
-use std::{collections::HashMap, error::Error};
+use std::{collections::HashMap, error::Error, path::Path, process::Command};
+
+/// This child never returns after both SQL writes have succeeded. It aborts
+/// the process (not merely an async transaction or Rust object) while a
+/// Turso BEGIN IMMEDIATE is open. The parent verifies rollback through both
+/// drivers after OS file locks are released on process termination.
+fn crash_with_uncommitted_turso_transaction(db_path: &Path) -> Result<(), Box<dyn Error>> {
+    let filename = db_path.to_str().ok_or("non-UTF8 crash fixture filename")?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let db = turso::Builder::new_local(filename).build().await?;
+        let conn = db.connect()?;
+        conn.execute("BEGIN IMMEDIATE", ()).await?;
+        conn.execute(
+            "INSERT INTO durable_tails
+             (actor_id, activation_epoch, sequence, digest)
+             VALUES (41, 8, 1, 'uncommitted-child-tail')",
+            (),
+        )
+        .await?;
+        conn.execute(
+            "INSERT INTO durable_transitions
+             (actor_id, sequence, activation_epoch, expected_previous_sequence, digest)
+             VALUES (41, 1, 8, 0, 'uncommitted-child-transition')",
+            (),
+        )
+        .await?;
+        // A normal drop or explicit ROLLBACK would prove a weaker property.
+        // These rows must remain absent even if the process dies here.
+        std::process::exit(94);
+        #[allow(unreachable_code)]
+        Ok::<(), Box<dyn Error>>(())
+    })
+}
+
+fn verify_crashed_turso_transaction_is_atomic(db_path: &Path) -> Result<(), Box<dyn Error>> {
+    let status = Command::new(std::env::current_exe()?)
+        .arg("--crash-with-uncommitted-turso-transaction")
+        .arg(db_path)
+        .status()?;
+    assert_eq!(
+        status.code(),
+        Some(94),
+        "crash fixture must exit at the known point after two uncommitted SQL writes"
+    );
+
+    let legacy = LibsqlStore::new(db_path)?;
+    assert!(
+        legacy.load_durable_tail_position(41)?.is_none(),
+        "Nulang must not see an uncommitted Turso durable tail after crash"
+    );
+    drop(legacy);
+
+    let filename = db_path.to_str().ok_or("non-UTF8 crash fixture filename")?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let db = turso::Builder::new_local(filename).build().await?;
+        let conn = db.connect()?;
+        for table in ["durable_tails", "durable_transitions"] {
+            let sql = format!("SELECT COUNT(*) FROM {table} WHERE actor_id=41");
+            let mut rows = conn.query(&sql, ()).await?;
+            let count: i64 = rows.next().await?.ok_or("missing row count")?.get(0)?;
+            assert_eq!(
+                count, 0,
+                "incomplete {table} mutation must not survive process termination"
+            );
+        }
+        Ok::<(), Box<dyn Error>>(())
+    })?;
+    println!("PASS: process exit before Turso COMMIT leaves neither durable table visible");
+    Ok(())
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
+    if std::env::args().nth(1).as_deref() == Some("--crash-with-uncommitted-turso-transaction") {
+        let filename = std::env::args_os()
+            .nth(2)
+            .ok_or("crash fixture requires an isolated database filename")?;
+        return crash_with_uncommitted_turso_transaction(Path::new(&filename));
+    }
+
     let temp = tempfile::tempdir()?;
     let db_file = temp.path().join("durable.db");
 
@@ -218,6 +300,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         Ok::<(), Box<dyn Error>>(())
     })?;
     drop(rt);
+
+    // Cross-process fault injection: unlike an in-process ROLLBACK this
+    // child exits without running Rust connection destructors.
+    verify_crashed_turso_transaction_is_atomic(&db_file)?;
 
     let legacy = LibsqlStore::new(&db_file)?;
     assert!(
