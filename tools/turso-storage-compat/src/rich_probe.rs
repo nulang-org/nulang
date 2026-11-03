@@ -130,8 +130,10 @@ pub(crate) fn verify_full_record_parity(path: &Path) -> Result<(), Box<dyn Error
         let expected_effect = rich
             .durable_effects
             .iter()
-            .map(|record| String::from_utf8(record.to_json().unwrap()))
-            .collect::<Vec<_>>();
+            .map(|record| -> Result<String, Box<dyn Error>> {
+                Ok(String::from_utf8(record.to_json()?)?)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         for (table, column, expected) in [
             ("durable_workflow_events", "event", &expected_workflow),
