@@ -300,4 +300,5 @@ mod tests {
             probe_trusted_loopback_tls("127.0.0.2").await.is_err(),
             "a trusted CA must not bypass hostname/IP SAN verification"
         );
-    }}
+    }
+}
