@@ -316,11 +316,7 @@ mod tests {
             if index == 0 {
                 before.insert(name, b"initial", [] as [&str; 0]);
             } else {
-                before.insert(
-                    name,
-                    b"unchanged",
-                    [format!("module_{:05}", index - 1)],
-                );
+                before.insert(name, b"unchanged", [format!("module_{:05}", index - 1)]);
             }
         }
 
@@ -369,5 +365,4 @@ mod tests {
         assert!(modules.contains(&format!("right_{:03}", LEVELS - 1)));
         assert!(!modules.contains(&"unrelated".to_string()));
     }
-
 }
