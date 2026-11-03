@@ -8,8 +8,7 @@ use crate::{rich_probe::rich_transition, turso_writer::commit_transition};
 use nulang::runtime::{DurableTransition, LibsqlStore, PersistedValue, PersistenceStore};
 use std::{
     error::Error,
-    fs,
-    io,
+    fs, io,
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
     thread,
@@ -72,10 +71,11 @@ pub(crate) fn writer_child(
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 std::process::exit(REJECTED_CONFLICT);
             }
-            Err(error) if {
-                let message = error.to_string().to_ascii_lowercase();
-                message.contains("busy") || message.contains("locked")
-            } =>
+            Err(error)
+                if {
+                    let message = error.to_string().to_ascii_lowercase();
+                    message.contains("busy") || message.contains("locked")
+                } =>
             {
                 std::process::exit(REJECTED_LOCK);
             }
@@ -142,7 +142,9 @@ fn prove_committed_records(
         .find(|value| journal[0].payload == vec![PersistedValue::Int(*value)])
         .ok_or("committed command was not written by either contender")?;
 
-    let snapshot = store.load_snapshot(actor).ok_or("winner snapshot missing")?;
+    let snapshot = store
+        .load_snapshot(actor)
+        .ok_or("winner snapshot missing")?;
     assert_eq!(snapshot.sequence, 1);
     assert_eq!(snapshot.activation_epoch, 4);
     assert_eq!(store.read_workflow_events(actor).len(), 2);
@@ -175,15 +177,13 @@ fn prove_committed_records(
     ] {
         let sql = format!("SELECT COUNT(*) FROM {table} WHERE actor_id={actor}");
         let output = store.query(&sql, &[])?;
-        let row: Vec<i64> = serde_json::from_str(
-            output.first().ok_or("missing SQL count result")?,
-        )?;
+        let row: Vec<i64> =
+            serde_json::from_str(output.first().ok_or("missing SQL count result")?)?;
         assert_eq!(row, vec![count], "partial or duplicated {table} after race");
     }
     let sql = format!("SELECT digest FROM durable_tails WHERE actor_id={actor}");
     let output = store.query(&sql, &[])?;
-    let row: Vec<String> =
-        serde_json::from_str(output.first().ok_or("missing digest result")?)?;
+    let row: Vec<String> = serde_json::from_str(output.first().ok_or("missing digest result")?)?;
     assert_eq!(
         row,
         vec![expected_digest],
@@ -248,9 +248,7 @@ pub(crate) fn verify_cross_process_fencing(database: &Path) -> Result<(), Box<dy
             statuses
                 .iter()
                 .filter(|status| !status.success())
-                .all(|status| {
-                    matches!(status.code(), Some(REJECTED_CONFLICT | REJECTED_LOCK))
-                }),
+                .all(|status| { matches!(status.code(), Some(REJECTED_CONFLICT | REJECTED_LOCK)) }),
             "losing process must reject conflict or SQLite writer lock: {statuses:?}"
         );
         prove_committed_records(database, actor, values)?;
