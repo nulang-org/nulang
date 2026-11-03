@@ -219,4 +219,80 @@ mod tests {
             .expect("plaintext must fail");
         assert_eq!(failure.kind(), io::ErrorKind::PermissionDenied);
     }
+
+    fn trusted_loopback_certificate(
+        server_san: &str,
+    ) -> (
+        RootCertStore,
+        Arc<tokio_rustls::rustls::ServerConfig>,
+    ) {
+        use rcgen::{
+            BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+            KeyUsagePurpose,
+        };
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_certificate = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let mut leaf_params = CertificateParams::new(vec![server_san.to_owned()]).unwrap();
+        leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf_certificate = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+        let server = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(leaf_certificate.der().as_ref().to_vec())],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
+            )
+            .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(ca_certificate.der().as_ref().to_vec()))
+            .unwrap();
+        (roots, Arc::new(server))
+    }
+
+    async fn probe_trusted_loopback_tls(server_san: &str) -> io::Result<()> {
+        use tokio::net::TcpListener;
+
+        let (roots, server_config) = trusted_loopback_certificate(server_san);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+        let server_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _ = acceptor.accept(socket).await;
+        });
+
+        // The client connects to the numeric loopback IP so the test never
+        // depends on external DNS. Only the ephemeral test CA is trusted.
+        let mut connector = verified_connector_with_roots(roots)?;
+        let uri: Uri = format!("https://127.0.0.1:{port}/").parse().unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), connector.call(uri))
+            .await
+            .expect("loopback TLS handshake timed out");
+        server_task.await.unwrap();
+        outcome.map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn trusted_ca_with_matching_ip_san_succeeds_on_loopback() {
+        probe_trusted_loopback_tls("127.0.0.1")
+            .await
+            .expect("a valid trusted CA chain and matching IP SAN must connect");
+    }
+
+    #[tokio::test]
+    async fn trusted_ca_with_wrong_ip_san_is_rejected_on_loopback() {
+        assert!(
+            probe_trusted_loopback_tls("127.0.0.2").await.is_err(),
+            "a trusted CA must not bypass hostname/IP SAN verification"
+        );
+    }
+
 }
