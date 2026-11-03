@@ -5700,39 +5700,62 @@ impl Runtime {
         actor_id: u64,
         module: &crate::bytecode::CodeModule,
         snapshot: &ActorSnapshot,
-        is_workflow: bool,
-        is_agent: bool,
+        definition_index: Option<usize>,
+        fallback_is_workflow: bool,
+        fallback_is_agent: bool,
     ) -> Result<Actor, crate::authority_runtime::RuntimeAuthorityError> {
         let authority_manifest =
             crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens)?;
-        let offsets: Vec<usize> = crate::runtime::spawn::bytecode_offsets_for(module, is_workflow);
-        let compensation_offsets: Vec<Option<usize>> = if is_workflow {
-            module
-                .actor_metadata
-                .iter()
-                .find(|m| m.is_workflow)
+        let selected_meta = definition_index.and_then(|index| module.actor_metadata.get(index));
+        let is_workflow = selected_meta
+            .map(|meta| meta.is_workflow)
+            .unwrap_or(fallback_is_workflow);
+        let is_agent = selected_meta
+            .map(|meta| meta.is_agent)
+            .unwrap_or(fallback_is_agent);
+        let offsets: Vec<usize> = if is_workflow {
+            selected_meta
+                .or_else(|| module.actor_metadata.iter().find(|meta| meta.is_workflow))
                 .map(|meta| {
                     meta.behavior_indices
                         .iter()
-                        .map(|&i| module.behaviors[i].compensate_offset.map(|o| o as usize))
+                        .filter_map(|&index| module.behaviors.get(index))
+                        .map(|behavior| behavior.code_offset)
+                        .collect()
+                })
+                .unwrap_or_else(|| module.behaviors.iter().map(|b| b.code_offset).collect())
+        } else {
+            module.behaviors.iter().map(|b| b.code_offset).collect()
+        };
+        let compensation_offsets: Vec<Option<usize>> = if is_workflow {
+            selected_meta
+                .or_else(|| module.actor_metadata.iter().find(|meta| meta.is_workflow))
+                .map(|meta| {
+                    meta.behavior_indices
+                        .iter()
+                        .filter_map(|&index| module.behaviors.get(index))
+                        .map(|behavior| behavior.compensate_offset)
                         .collect()
                 })
                 .unwrap_or_else(|| {
                     module
                         .behaviors
                         .iter()
-                        .map(|b| b.compensate_offset.map(|o| o as usize))
+                        .map(|behavior| behavior.compensate_offset)
                         .collect()
                 })
         } else {
             module
                 .behaviors
                 .iter()
-                .map(|b| b.compensate_offset.map(|o| o as usize))
+                .map(|behavior| behavior.compensate_offset)
                 .collect()
         };
 
-        let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
+        let actor_name = selected_meta
+            .map(|meta| meta.name.clone())
+            .unwrap_or_else(|| format!("actor_{}", actor_id));
+        let mut actor = Actor::new(actor_id, actor_name, 0);
         actor.persistent = true;
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
@@ -5744,12 +5767,19 @@ impl Runtime {
         actor.compensation_offsets = compensation_offsets;
 
         // Restore per-field state-model tracking.
-        actor.state_models = module
-            .actor_metadata
-            .iter()
-            .flat_map(|m| &m.state_models)
-            .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
-            .collect();
+        actor.state_models = if let Some(meta) = selected_meta {
+            meta.state_models
+                .iter()
+                .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
+                .collect()
+        } else {
+            module
+                .actor_metadata
+                .iter()
+                .flat_map(|meta| &meta.state_models)
+                .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
+                .collect()
+        };
 
         // Restore durable state fields from the snapshot.
         for (name, value) in &snapshot.state {
@@ -5765,15 +5795,28 @@ impl Runtime {
         }
 
         // Fill in declared initial values for fields not touched above.
-        for (name, c) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
-            if actor.get_state_field(name).is_some() {
-                continue;
+        if let Some(meta) = selected_meta {
+            for (name, c) in &meta.state_defaults {
+                if actor.get_state_field(name).is_some() {
+                    continue;
+                }
+                let v = match c {
+                    crate::bytecode::Constant::String(s) => actor.allocate_string(s),
+                    other => crate::vm::constant_to_value(other),
+                };
+                actor.set_state_field(name, v);
             }
-            let v = match c {
-                crate::bytecode::Constant::String(s) => actor.allocate_string(s),
-                other => crate::vm::constant_to_value(other),
-            };
-            actor.set_state_field(name, v);
+        } else {
+            for (name, c) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
+                if actor.get_state_field(name).is_some() {
+                    continue;
+                }
+                let v = match c {
+                    crate::bytecode::Constant::String(s) => actor.allocate_string(s),
+                    other => crate::vm::constant_to_value(other),
+                };
+                actor.set_state_field(name, v);
+            }
         }
 
         Ok(actor)
@@ -5847,10 +5890,26 @@ impl Runtime {
         };
 
         let mut actor = if let Some(ref snap) = snapshot {
+            let definition_index = {
+                let mut matches = grain_type
+                    .module
+                    .actor_metadata
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, meta)| meta.name == grain_id.grain_type)
+                    .map(|(index, _)| index);
+                let index = matches.next();
+                if matches.next().is_some() {
+                    None
+                } else {
+                    index
+                }
+            };
             Self::restore_actor_from_snapshot(
                 stable_actor_id,
                 &grain_type.module,
                 snap,
+                definition_index,
                 false,
                 false,
             )
@@ -5941,103 +6000,220 @@ impl Runtime {
         nbc_bytes: Vec<u8>,
         snapshot_json: Vec<u8>,
     ) -> bool {
+        self.receive_migrated_actor_with_provenance(actor_id, nbc_bytes, snapshot_json, None)
+    }
+
+    /// Provenance-preserving migration receiver used by NUL0 packet handling
+    /// and shadow re-spawn. The public three-argument entry point above remains
+    /// the legacy compatibility path.
+    pub(crate) fn receive_migrated_actor_with_provenance(
+        &mut self,
+        actor_id: u64,
+        nbc_bytes: Vec<u8>,
+        snapshot_json: Vec<u8>,
+        artifact_provenance: Option<network::RuntimeArtifactProvenance>,
+    ) -> bool {
         use crate::bytecode::CodeModule;
         use crate::runtime::persistence::ActorSnapshot;
 
-        // Parse the bytecode module.
-        let module = match CodeModule::from_nbc(&nbc_bytes) {
-            Ok(artifact) => artifact.module,
-            Err(e) => {
-                tracing::warn!(
-                    "nulang-migrate: bad NBC module for actor {}: {}",
-                    actor_id,
-                    e
-                );
-                return false;
-            }
-        };
-
-        // Parse the durable state snapshot.
         let snapshot: ActorSnapshot = match serde_json::from_slice(&snapshot_json) {
-            Ok(s) => s,
-            Err(e) => {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
                 tracing::warn!(
                     "nulang-migrate: bad snapshot JSON for actor {}: {}",
                     actor_id,
-                    e
+                    error
                 );
                 return false;
             }
         };
 
-        // Frozen NBC v1 does not embed the semantic sidecar, so an identified
-        // snapshot arriving through this legacy transport cannot be verified
-        // against the received bytecode. Reject it rather than trusting the
-        // snapshot to self-certify the code that should execute its state.
-        if snapshot.semantic_id.is_some() || snapshot.artifact_id.is_some() {
-            tracing::warn!(
-                "nulang-migrate: refusing identified snapshot for actor {} over legacy NBC v1 transport",
-                actor_id
-            );
-            return false;
+        let mut module = match CodeModule::from_nbc(&nbc_bytes) {
+            Ok(artifact) => artifact.module,
+            Err(error) => {
+                tracing::warn!(
+                    "nulang-migrate: bad NBC module for actor {}: {}",
+                    actor_id,
+                    error
+                );
+                return false;
+            }
+        };
+
+        match artifact_provenance {
+            Some(provenance) => {
+                let actual_digest = *blake3::hash(&nbc_bytes).as_bytes();
+                if actual_digest != provenance.nbc_blake3 {
+                    tracing::warn!(
+                        actor_id,
+                        "nulang-migrate: NBC byte digest does not match transported artifact provenance"
+                    );
+                    return false;
+                }
+                let runtime_manifest =
+                    match crate::runtime_artifact_manifest::RuntimeArtifactManifest::from_json(
+                        &provenance.runtime_manifest_json,
+                    ) {
+                        Ok(manifest) => manifest,
+                        Err(error) => {
+                            tracing::warn!(
+                                actor_id,
+                                %error,
+                                "nulang-migrate: invalid runtime artifact provenance"
+                            );
+                            return false;
+                        }
+                    };
+                if let Err(error) = runtime_manifest.bind_module(&mut module) {
+                    tracing::warn!(
+                        actor_id,
+                        %error,
+                        "nulang-migrate: runtime artifact provenance does not bind to NBC module"
+                    );
+                    return false;
+                }
+            }
+            None if snapshot.semantic_id.is_some() || snapshot.artifact_id.is_some() => {
+                tracing::warn!(
+                    actor_id,
+                    "nulang-migrate: refusing identified snapshot without byte-verified artifact provenance"
+                );
+                return false;
+            }
+            None => {}
         }
 
-        let is_workflow = module.actor_metadata.iter().any(|m| m.is_workflow);
-        let is_agent = module.actor_metadata.iter().any(|m| m.is_agent);
+        let definition_index = match snapshot.semantic_id.as_deref() {
+            Some(value) => {
+                let definition_id = match value.parse::<crate::content_identity::SemanticId>() {
+                    Ok(id) => id,
+                    Err(error) => {
+                        tracing::warn!(
+                            actor_id,
+                            %error,
+                            "nulang-migrate: malformed definition SemanticId"
+                        );
+                        return false;
+                    }
+                };
+                let mut matches = module
+                    .actor_semantic_ids
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, candidate)| **candidate == definition_id)
+                    .map(|(index, _)| index);
+                let Some(index) = matches.next() else {
+                    tracing::warn!(
+                        actor_id,
+                        %definition_id,
+                        "nulang-migrate: retained module has no matching actor definition"
+                    );
+                    return false;
+                };
+                if matches.next().is_some() {
+                    tracing::warn!(
+                        actor_id,
+                        %definition_id,
+                        "nulang-migrate: actor definition identity is ambiguous in retained module"
+                    );
+                    return false;
+                }
+                Some(index)
+            }
+            None => None,
+        };
 
-        let actor = match Self::restore_actor_from_snapshot(
+        if let Some(index) = definition_index {
+            let Some(meta) = module.actor_metadata.get(index) else {
+                tracing::warn!(
+                    actor_id,
+                    index,
+                    "nulang-migrate: definition identity has no actor metadata"
+                );
+                return false;
+            };
+            if let Some(invalid) = meta
+                .behavior_indices
+                .iter()
+                .copied()
+                .find(|behavior_index| *behavior_index >= module.behaviors.len())
+            {
+                tracing::warn!(
+                    actor_id,
+                    actor = %meta.name,
+                    behavior_index = invalid,
+                    "nulang-migrate: actor metadata references missing behavior"
+                );
+                return false;
+            }
+        }
+
+        let current_definition_id =
+            definition_index.and_then(|index| module.actor_semantic_id_at(index));
+        let verified_definition_semantic_id =
+            match Self::verify_snapshot_definition_semantic_identity(
+                actor_id,
+                &snapshot,
+                current_definition_id,
+                RecoveryIdentityPolicy::LegacyCompatible,
+            ) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    tracing::warn!("nulang-migrate: refusing {error}");
+                    return false;
+                }
+            };
+        let verified_execution_artifact_id = match Self::verify_snapshot_execution_artifact_identity(
+            actor_id,
+            &snapshot,
+            module.artifact_id,
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
+                tracing::warn!("nulang-migrate: refusing {error}");
+                return false;
+            }
+        };
+
+        let fallback_is_workflow = module.actor_metadata.iter().any(|meta| meta.is_workflow);
+        let fallback_is_agent = module.actor_metadata.iter().any(|meta| meta.is_agent);
+        let mut actor = match Self::restore_actor_from_snapshot(
             actor_id,
             &module,
             &snapshot,
-            is_workflow,
-            is_agent,
+            definition_index,
+            fallback_is_workflow,
+            fallback_is_agent,
         ) {
             Ok(actor) => actor,
-            Err(err) => {
+            Err(error) => {
                 warn!(
                     "nulang-migrate: invalid authority manifest for actor {}: {}",
-                    actor_id, err
+                    actor_id, error
                 );
                 return false;
             }
         };
+        actor.definition_semantic_id = verified_definition_semantic_id;
+        actor.execution_artifact_id = verified_execution_artifact_id;
 
-        // Register the recovery module.
-        let offsets: Vec<usize> = module
-            .behaviors
-            .iter()
-            .map(|b| b.code_offset as usize)
-            .collect();
-        // Filter compensation_offsets to this actor's own behaviors using
-        // behavior_indices from the first workflow ActorMeta (a migrated
-        // actor module carries its own metadata).
-        let compensation_offsets: Vec<Option<usize>> = module
-            .actor_metadata
-            .iter()
-            .find(|m| m.is_workflow)
-            .map(|meta| {
-                meta.behavior_indices
-                    .iter()
-                    .map(|&i| module.behaviors[i].compensate_offset.map(|o| o as usize))
-                    .collect()
-            })
-            .unwrap_or_else(|| {
-                module
-                    .behaviors
-                    .iter()
-                    .map(|b| b.compensate_offset.map(|o| o as usize))
-                    .collect()
-            });
-        self.recovery_modules
-            .insert(actor_id, (module, offsets, compensation_offsets));
+        let offsets = actor.bytecode_offsets.clone();
+        let compensation_offsets = actor.compensation_offsets.clone();
+        spawn::register_recovery_module(
+            self,
+            actor_id,
+            module,
+            offsets,
+            compensation_offsets,
+            verified_definition_semantic_id,
+        );
 
-        // Restore CRDT state if present.
         if let Some(crdt_snap) = &snapshot.crdt_snapshot {
             if let Some(manager) = &mut self.crdt_manager {
                 let crdt_map: HashMap<CrdtId, (CrdtType, Vec<u8>)> = crdt_snap
                     .iter()
                     .filter_map(|(id, ty, bytes)| {
-                        CrdtType::from_u8(*ty).map(|t| (CrdtId(*id), (t, bytes.clone())))
+                        CrdtType::from_u8(*ty).map(|ty| (CrdtId(*id), (ty, bytes.clone())))
                     })
                     .collect();
                 manager.restore(crdt_map);
@@ -6054,18 +6230,24 @@ impl Runtime {
             }
         }
 
+        let is_workflow = actor.is_workflow;
+        self.actors.insert(actor_id, actor);
         if is_workflow {
             self.layout_workflow_behavior_table(actor_id);
         }
-        self.actors.insert(actor_id, actor);
-        if let Some(ref mut mgr) = self.crdt_manager {
+        if let Some(ref mut manager) = self.crdt_manager {
             if let Some(actor) = self.actors.get(&actor_id) {
-                mgr.register_actor_fields(actor_id, actor);
+                manager.register_actor_fields(actor_id, actor);
             }
         }
         self.enqueue_actor(actor_id);
 
-        tracing::info!("nulang-migrate: actor {} received and enqueued", actor_id);
+        tracing::info!(
+            actor_id,
+            identified = verified_definition_semantic_id.is_some()
+                || verified_execution_artifact_id.is_some(),
+            "nulang-migrate: actor received and enqueued"
+        );
         true
     }
 
@@ -7081,6 +7263,7 @@ impl Runtime {
         nbc_bytes: Vec<u8>,
         snapshot_json: Vec<u8>,
         epoch: u64,
+        artifact_provenance: Option<network::RuntimeArtifactProvenance>,
     ) {
         let replace = match self.shadow_replicas.get(&actor_id) {
             Some(existing) => epoch >= existing.epoch,
@@ -7093,6 +7276,7 @@ impl Runtime {
                     nbc_bytes,
                     snapshot_json,
                     epoch,
+                    artifact_provenance,
                 },
             );
         }
@@ -7121,17 +7305,6 @@ impl Runtime {
         if shadow == home {
             return;
         }
-        // Shadow replication still transports frozen NBC v1, which cannot
-        // prove the in-memory semantic-identity sidecar on the receiving node.
-        // Preserve the strongly identified local snapshot, but send an
-        // explicitly legacy/unverified replica until the transport carries a
-        // verifiable artifact manifest.
-        let mut replicated_snapshot = snapshot.clone();
-        replicated_snapshot.semantic_id = None;
-        replicated_snapshot.artifact_id = None;
-        let Ok(snapshot_json) = serde_json::to_vec(&replicated_snapshot) else {
-            return;
-        };
         let module = match self
             .actors
             .get(&actor_id)
@@ -7141,10 +7314,41 @@ impl Runtime {
                     .get(&actor_id)
                     .map(|(m, _, _)| m.clone())
             }) {
-            Some(m) => m,
+            Some(module) => module,
             None => return,
         };
         let Ok(nbc_bytes) = module.to_nbc(None) else {
+            return;
+        };
+        let artifact_provenance = match module.artifact_identity_manifest.as_ref() {
+            Some(identity) => {
+                let Ok(runtime_manifest) =
+                    crate::runtime_artifact_manifest::RuntimeArtifactManifest::from_module(
+                        &module, identity,
+                    )
+                else {
+                    return;
+                };
+                let Ok(runtime_manifest_json) = runtime_manifest.to_json() else {
+                    return;
+                };
+                Some(network::RuntimeArtifactProvenance {
+                    nbc_blake3: *blake3::hash(&nbc_bytes).as_bytes(),
+                    runtime_manifest_json,
+                })
+            }
+            None => None,
+        };
+        if (snapshot.semantic_id.is_some() || snapshot.artifact_id.is_some())
+            && artifact_provenance.is_none()
+        {
+            tracing::warn!(
+                actor_id,
+                "nulang-shadow: refusing to downgrade identified snapshot without artifact provenance"
+            );
+            return;
+        }
+        let Ok(snapshot_json) = serde_json::to_vec(snapshot) else {
             return;
         };
         let packet = Packet::ShadowReplicate {
@@ -7152,6 +7356,7 @@ impl Runtime {
             nbc_bytes,
             snapshot_json,
             epoch,
+            artifact_provenance,
         };
         let Some(addr) = cluster.get_node(shadow).map(|info| info.address) else {
             return;
@@ -7256,6 +7461,7 @@ pub(crate) struct ShadowReplica {
     pub nbc_bytes: Vec<u8>,
     pub snapshot_json: Vec<u8>,
     pub epoch: u64,
+    pub artifact_provenance: Option<network::RuntimeArtifactProvenance>,
 }
 
 /// Interval (in `sync_crdts` rounds) between full-state repair syncs.

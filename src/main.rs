@@ -25,7 +25,7 @@
 //!                            | wasm* (IO.print/read only; no user-defined effect
 //!                            handlers, no actor mailbox — requires wasm-backend)
 //!   --out <file>             Output file (WASM backends / --emit-nbc)
-//!   --emit-nbc               Compile <FILE> to a .nbc artifact; don't run
+//!   --emit-nbc               Compile <FILE> to .nbc + identity sidecars; don't run
 //!   <FILE>.nbc               Run a pre-compiled .nbc artifact directly
 //!   --verify <src>           Verify .nbc source hash against <src>
 //!   nula <cmd>               Package manager (new, init, build, build-wasm, test, run, add, remove, publish, deploy, list, clean)
@@ -1111,7 +1111,7 @@ fn print_help() {
     if cfg!(feature = "wasm-backend") {
         println!("  --out <file>     Output file for WASM backends (default: out.wasm)");
     }
-    println!("  --out <file>     Output path for --emit-nbc (default: <FILE> with .nbc extension)");
+    println!("  --out <file>     Output path for --emit-nbc (also writes .identity.json + .runtime.json sidecars)");
     println!("  <FILE>.nbc       Run a pre-compiled .nbc artifact directly (no compiler invoked)");
     println!(
         "  --verify <src>   When running a .nbc artifact, verify its source hash against <src>"
@@ -2363,18 +2363,39 @@ fn parse_frontend(
     Ok((ast, base_dir))
 }
 
-fn compile_with_new_pipeline(
+fn compile_identified_with_new_pipeline(
     ast: &nulang::ast::AstModule,
     name: &str,
     type_checker: &nulang::typechecker::TypeChecker,
-) -> NuResult<nulang::bytecode::CodeModule> {
+    source_bytes: Option<&[u8]>,
+) -> NuResult<nulang::compiler_identity::IdentifiedBytecodeArtifact> {
     // Anything this pipeline can't yet lower faithfully (see hir_lower.rs
     // and mir_lower.rs module docs) returns an honest NotYetImplemented
     // error, which the caller turns into a loud fallback to the stable
     // compiler.
     let hir = nulang::hir_lower::lower_module(ast, &type_checker.inferred_decl_types);
     let mut mir = nulang::mir_lower::lower_module(&hir)?;
-    nulang::compiler_identity::compile_typed_bytecode(&hir, &mut mir, [], name)
+    nulang::compiler_identity::compile_identified_bytecode(
+        source_bytes,
+        &hir,
+        &mut mir,
+        [],
+        name,
+        nulang::compiler_identity::BYTECODE_ARTIFACT_COMPILER_VERSION,
+        nulang::compiler_identity::BYTECODE_ARTIFACT_TARGET,
+        nulang::compiler_identity::BYTECODE_ARTIFACT_ABI,
+        nulang::compiler_identity::BYTECODE_ARTIFACT_BACKEND,
+        nulang::compiler_identity::bytecode_artifact_flags(),
+    )
+}
+
+fn compile_with_new_pipeline(
+    ast: &nulang::ast::AstModule,
+    name: &str,
+    type_checker: &nulang::typechecker::TypeChecker,
+) -> NuResult<nulang::bytecode::CodeModule> {
+    compile_identified_with_new_pipeline(ast, name, type_checker, None)
+        .map(|artifact| artifact.module)
 }
 /// Compile a source string to a `.nbc` artifact and write it to `out_path`.
 ///
@@ -2407,24 +2428,60 @@ fn compile_source_to_nbc(
             span: Span::default(),
         })?;
     }
-    let m = compile_with_new_pipeline(&ast, "main", &type_checker)?;
+    let artifact =
+        compile_identified_with_new_pipeline(&ast, "main", &type_checker, Some(source.as_bytes()))?;
     let source_hash = blake3::hash(source.as_bytes());
-    let bytes =
-        m.to_nbc(Some(*source_hash.as_bytes()))
-            .map_err(|e| nulang::types::NuError::VMError {
-                msg: e.to_string(),
-                span: Span::default(),
-            })?;
+    let bytes = artifact
+        .module
+        .to_nbc(Some(*source_hash.as_bytes()))
+        .map_err(|e| nulang::types::NuError::VMError {
+            msg: e.to_string(),
+            span: Span::default(),
+        })?;
     std::fs::write(out_path, &bytes).map_err(|e| nulang::types::NuError::VMError {
         msg: format!("failed to write {out_path}: {e}"),
         span: Span::default(),
     })?;
+
+    let identity_path = format!("{out_path}.identity.json");
+    let identity_json =
+        artifact
+            .identity
+            .to_json()
+            .map_err(|e| nulang::types::NuError::VMError {
+                msg: format!("failed to encode artifact identity manifest: {e}"),
+                span: Span::default(),
+            })?;
+    std::fs::write(&identity_path, identity_json).map_err(|e| nulang::types::NuError::VMError {
+        msg: format!("failed to write {identity_path}: {e}"),
+        span: Span::default(),
+    })?;
+
+    let runtime_manifest_path = format!("{out_path}.runtime.json");
+    let runtime_manifest_json =
+        artifact
+            .runtime_manifest
+            .to_json()
+            .map_err(|e| nulang::types::NuError::VMError {
+                msg: format!("failed to encode runtime artifact manifest: {e}"),
+                span: Span::default(),
+            })?;
+    std::fs::write(&runtime_manifest_path, runtime_manifest_json).map_err(|e| {
+        nulang::types::NuError::VMError {
+            msg: format!("failed to write {runtime_manifest_path}: {e}"),
+            span: Span::default(),
+        }
+    })?;
+
     println!(
-        "Wrote {out_path} ({} bytes, .nbc format v{}, language v{})",
+        "Wrote {out_path} ({} bytes, .nbc format v{}, language v{}, artifact {})",
         bytes.len(),
         nulang::format::constants::BYTECODE_VERSION,
         nulang::format::constants::LANGUAGE_VERSION,
+        artifact.identity.artifact_id(),
     );
+    println!("Wrote {identity_path}");
+    println!("Wrote {runtime_manifest_path}");
     Ok(())
 }
 

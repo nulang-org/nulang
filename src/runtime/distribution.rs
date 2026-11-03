@@ -493,8 +493,12 @@ pub(crate) fn handle_node_removed(rt: &mut Runtime, node: NodeId) {
             continue;
         }
         if let Some(replica) = rt.shadow_replicas.remove(&entry.actor_id) {
-            let ok =
-                rt.receive_migrated_actor(entry.actor_id, replica.nbc_bytes, replica.snapshot_json);
+            let ok = rt.receive_migrated_actor_with_provenance(
+                entry.actor_id,
+                replica.nbc_bytes,
+                replica.snapshot_json,
+                replica.artifact_provenance,
+            );
             if ok {
                 // Bump the activation epoch and re-announce so a
                 // resurrected old node self-demotes its stale copy (§5).
