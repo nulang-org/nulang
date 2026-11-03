@@ -9,9 +9,13 @@ ignore = [
     # The previous rustls 0.22 / webpki 0.102 / roots 0.26 branch is
     # absent after the verified libsql and ureq TLS-owner migration. Do not
     # retain their exemptions: a future reintroduction must fail cargo-audit.
-    # h2 "unbounded empty DATA frames" DoS (RUSTSEC-2026-0258). Nulang does not
-    # expose an HTTP/2 server; h2 is a transitive dependency of HTTP clients.
-    # Upgrading requires hyper/reqwest ecosystem updates.
+    # Remaining known risk: RUSTSEC-2026-0258 still affects h2 0.3.27
+    # through libsql 0.10 -> Hyper 0.14. No patched h2 0.3 is available.
+    # The modern h2 0.4 graph is independently locked to >=0.4.16 and tested
+    # by tests/security_h2_lockfile.rs. Cargo-audit ignores by advisory ID,
+    # not by version; a green configured audit does NOT mean the old graph is
+    # fixed. Remove this waiver only after the Hyper 0.14 graph is migrated
+    # with recovery, remote TLS and compatibility proof (issue #2293).
     "RUSTSEC-2026-0258",
     # rustls-pemfile remains unmaintained (RUSTSEC-2025-0134).
     # This existing warning requires a separate dependency-owner removal,
