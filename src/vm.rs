@@ -5328,8 +5328,18 @@ impl VM {
                     frame.regs[instr.op3 as usize] =
                         Value::float(a.as_float().unwrap() + b.as_float().unwrap());
                 } else {
-                    frame.regs[instr.op3 as usize] =
-                        Value::int(a.as_int().unwrap_or(0) + b.as_int().unwrap_or(0));
+                    // Existing runtime semantics coerce nil to zero; reject other
+                    // non-numeric tags instead of silently manufacturing a zero.
+                    let (Some(a), Some(b)) = (
+                        a.as_int().or_else(|| a.is_nil().then_some(0)),
+                        b.as_int().or_else(|| b.is_nil().then_some(0)),
+                    ) else {
+                        return Err(NuError::vm_error(
+                            "IAdd requires numeric operands".to_string(),
+                            Span::default(),
+                        ));
+                    };
+                    frame.regs[instr.op3 as usize] = Value::int(a + b);
                 }
             }
             OpCode::ISub => {
@@ -5339,8 +5349,18 @@ impl VM {
                     frame.regs[instr.op3 as usize] =
                         Value::float(a.as_float().unwrap() - b.as_float().unwrap());
                 } else {
-                    frame.regs[instr.op3 as usize] =
-                        Value::int(a.as_int().unwrap_or(0) - b.as_int().unwrap_or(0));
+                    // Existing runtime semantics coerce nil to zero; reject other
+                    // non-numeric tags instead of silently manufacturing a zero.
+                    let (Some(a), Some(b)) = (
+                        a.as_int().or_else(|| a.is_nil().then_some(0)),
+                        b.as_int().or_else(|| b.is_nil().then_some(0)),
+                    ) else {
+                        return Err(NuError::vm_error(
+                            "ISub requires numeric operands".to_string(),
+                            Span::default(),
+                        ));
+                    };
+                    frame.regs[instr.op3 as usize] = Value::int(a - b);
                 }
             }
             OpCode::IMul => {
@@ -5350,13 +5370,20 @@ impl VM {
                     frame.regs[instr.op3 as usize] =
                         Value::float(a.as_float().unwrap() * b.as_float().unwrap());
                 } else {
+                    // Existing runtime semantics coerce nil to zero; reject other
+                    // non-numeric tags instead of silently manufacturing a zero.
+                    let (Some(a), Some(b)) = (
+                        a.as_int().or_else(|| a.is_nil().then_some(0)),
+                        b.as_int().or_else(|| b.is_nil().then_some(0)),
+                    ) else {
+                        return Err(NuError::vm_error(
+                            "IMul requires numeric operands".to_string(),
+                            Span::default(),
+                        ));
+                    };
                     // wrapping_mul: 48-bit operands can overflow i64 when
                     // multiplied; the result is masked to 48 bits by Value::int.
-                    frame.regs[instr.op3 as usize] = Value::int(
-                        a.as_int()
-                            .unwrap_or(0)
-                            .wrapping_mul(b.as_int().unwrap_or(0)),
-                    );
+                    frame.regs[instr.op3 as usize] = Value::int(a.wrapping_mul(b));
                 }
             }
             OpCode::IDiv => {
@@ -6442,6 +6469,101 @@ mod vm_tests {
         let result = vm.run();
         assert!(result.is_ok(), "Arithmetic should work: {:?}", result.err());
         assert_eq!(result.unwrap().as_int(), Some(13), "10 + 3 = 13");
+    }
+
+    /// Invalid numeric operands must fail instead of silently becoming zero.
+    /// Build bytecode directly to cover the VM trust boundary independently
+    /// of the source typechecker.
+    #[test]
+    fn test_integer_arithmetic_rejects_non_numeric_operands() {
+        for opcode in [OpCode::IAdd, OpCode::ISub, OpCode::IMul] {
+            for invalid_left in [true, false] {
+                let mut module = CodeModule::new("invalid_numeric_operand");
+                let invalid_idx = module.add_constant(Constant::Bool(true));
+                let int_idx = module.add_constant(Constant::Int(3));
+                let (left, right) = if invalid_left {
+                    (invalid_idx, int_idx)
+                } else {
+                    (int_idx, invalid_idx)
+                };
+                module.emit(Instruction::new3(
+                    OpCode::ConstU,
+                    ((left >> 8) & 0xff) as u8,
+                    (left & 0xff) as u8,
+                    0,
+                ));
+                module.emit(Instruction::new3(
+                    OpCode::ConstU,
+                    ((right >> 8) & 0xff) as u8,
+                    (right & 0xff) as u8,
+                    1,
+                ));
+                module.emit(Instruction::new3(opcode, 0, 1, 2));
+                module.emit(Instruction::new2(OpCode::Move, 2, 0));
+                module.emit(Instruction::new0(OpCode::Halt));
+                module.entry_point = Some(0);
+
+                let mut vm = VM::new();
+                vm.load_module(module);
+                let error = vm.run().expect_err("invalid arithmetic must fail closed");
+                let detail = format!("{error}");
+                assert!(
+                    detail.contains("requires numeric operands"),
+                    "{opcode:?} invalid_left={invalid_left}: {detail}"
+                );
+            }
+        }
+    }
+
+    /// Legacy nil-as-zero arithmetic is observable in map lookups and
+    /// workflow compensation code; this hardening must not change it.
+    #[test]
+    fn test_integer_arithmetic_preserves_nil_zero_compatibility() {
+        for (opcode, expected_left, expected_right) in [
+            (OpCode::IAdd, 3, 3),
+            (OpCode::ISub, -3, 3),
+            (OpCode::IMul, 0, 0),
+        ] {
+            for nil_left in [true, false] {
+                let mut module = CodeModule::new("nil_numeric_compatibility");
+                let nil_idx = module.add_constant(Constant::Nil);
+                let int_idx = module.add_constant(Constant::Int(3));
+                let (left, right) = if nil_left {
+                    (nil_idx, int_idx)
+                } else {
+                    (int_idx, nil_idx)
+                };
+                module.emit(Instruction::new3(
+                    OpCode::ConstU,
+                    ((left >> 8) & 0xff) as u8,
+                    (left & 0xff) as u8,
+                    0,
+                ));
+                module.emit(Instruction::new3(
+                    OpCode::ConstU,
+                    ((right >> 8) & 0xff) as u8,
+                    (right & 0xff) as u8,
+                    1,
+                ));
+                module.emit(Instruction::new3(opcode, 0, 1, 2));
+                module.emit(Instruction::new2(OpCode::Move, 2, 0));
+                module.emit(Instruction::new0(OpCode::Halt));
+                module.entry_point = Some(0);
+
+                let mut vm = VM::new();
+                vm.load_module(module);
+                let value = vm.run().expect("nil must retain existing zero coercion");
+                assert_eq!(
+                    value.as_int(),
+                    Some(if nil_left {
+                        expected_left
+                    } else {
+                        expected_right
+                    }),
+                    "{opcode:?} nil_left={nil_left}"
+                );
+            }
+        }
     }
 
     /// IInc/IDec on a normal int-tagged register: in-place ±1.
