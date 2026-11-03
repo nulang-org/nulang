@@ -55,7 +55,10 @@ pub(crate) fn verify_turso_transition_writer(db_path: &Path) -> Result<(), Box<d
         let original = transition(52, 9, 1, 10);
         let original_digest = original.digest()?;
         let receipt = commit_transition(&conn, original.clone()).await?;
-        assert_eq!(receipt.digest, original_digest, "must use Nulang canonical digest");
+        assert_eq!(
+            receipt.digest, original_digest,
+            "must use Nulang canonical digest"
+        );
         assert_eq!(
             commit_transition(&conn, original.clone()).await?.digest,
             original_digest,
@@ -71,7 +74,9 @@ pub(crate) fn verify_turso_transition_writer(db_path: &Path) -> Result<(), Box<d
         let newer = transition(52, 10, 2, 11);
         commit_transition(&conn, newer.clone()).await?;
         assert!(
-            commit_transition(&conn, transition(52, 9, 3, 12)).await.is_err(),
+            commit_transition(&conn, transition(52, 9, 3, 12))
+                .await
+                .is_err(),
             "older activation epoch must be fenced"
         );
         let mut wrong_predecessor = transition(52, 10, 4, 13);
@@ -96,7 +101,8 @@ pub(crate) fn verify_turso_transition_writer(db_path: &Path) -> Result<(), Box<d
             commit_transition(&contender_b, transition(53, 1, 1, 202))
         );
         assert_eq!(
-            usize::from(a.is_ok()) + usize::from(b.is_ok()), 1,
+            usize::from(a.is_ok()) + usize::from(b.is_ok()),
+            1,
             "concurrent conflicting writers must have exactly one winner: a={a:?}, b={b:?}"
         );
 
@@ -112,7 +118,10 @@ pub(crate) fn verify_turso_transition_writer(db_path: &Path) -> Result<(), Box<d
             let sql = format!("SELECT COUNT(*) FROM {table} WHERE actor_id=?1");
             let mut rows = conn.query(&sql, [actor]).await?;
             let count: i64 = rows.next().await?.ok_or("missing count")?.get(0)?;
-            assert_eq!(count, expected, "unexpected {table} count for actor {actor}");
+            assert_eq!(
+                count, expected,
+                "unexpected {table} count for actor {actor}"
+            );
         }
 
         let mut rows = conn
@@ -142,7 +151,9 @@ pub(crate) fn verify_turso_transition_writer(db_path: &Path) -> Result<(), Box<d
         .load_durable_tail_position(52)?
         .ok_or("existing reader cannot see Turso committed tail")?;
     assert_eq!((tail.activation_epoch, tail.sequence), (10, 2));
-    let snapshot = legacy.load_snapshot(52).ok_or("Turso snapshot unreadable")?;
+    let snapshot = legacy
+        .load_snapshot(52)
+        .ok_or("Turso snapshot unreadable")?;
     assert_eq!(snapshot.sequence, 2);
     assert_eq!(snapshot.state.get("count"), Some(&PersistedValue::Int(11)));
     let commands = legacy.read_journal(52);
@@ -155,7 +166,8 @@ pub(crate) fn verify_turso_transition_writer(db_path: &Path) -> Result<(), Box<d
     );
     legacy.commit_transition(transition(52, 11, 3, 12))?;
     assert_eq!(
-        legacy.load_durable_tail_position(52)?.unwrap().sequence, 3,
+        legacy.load_durable_tail_position(52)?.unwrap().sequence,
+        3,
         "Nulang's writer must advance the Turso-created tail"
     );
     println!("PASS: test-only Turso transition commits/replays/conflicts/fences, concurrent writer, cross-driver read/write");
