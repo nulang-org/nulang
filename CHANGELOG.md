@@ -1943,6 +1943,10 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Immutable ArtifactId retention and historical lookup — 2026-09-24
+- **Compiled artifacts can now be retained durably under `ArtifactId` with independent BLAKE3 byte verification** (Experimental, `src/artifact_store.rs`). The filesystem store writes one versioned manifest+artifact record, fsyncs it, and publishes it with no-clobber hard-link semantics so concurrent writers cannot overwrite historical code.
+- **Historical lookup fails closed on corruption or codegen nondeterminism.** Every load re-validates the versioned `ArtifactIdentityManifest`, requires its embedded `ArtifactId` to match the requested key, and re-hashes the retained artifact bytes. Reusing one `ArtifactId` with different emitted bytes is rejected as an artifact collision rather than silently replacing the original executable.
+- This establishes the retention primitive required by durable semantic pinning. Snapshot-level `ArtifactId` pinning and automatic recovery-module hydration remain separate follow-up work under #333.
 ### ORCA deferred reclamation scan reduction — 2026-09-21
 - **Deferred ORCA reclamation avoids redundant linear scans.** Foreign-ref reclamation no longer searches the deferred list twice, and `process_deferred` skips the self-removal lookup after it already `swap_remove`s the current header. Recursive child cleanup keeps the defensive removal path.
 ### Cloud control-plane placement foundation — 2026-09-24
