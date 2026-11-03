@@ -364,14 +364,16 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
     /// supply separate replay-stable turn/occurrence identity before any
     /// externally observable provider dispatch. Supplying a `CodeModule`
     /// alone does not authenticate its provenance or authorize an effect.
+    /// Unlike the legacy callback, this can return an explicit VM error so a
+    /// durable-aware host can fail closed instead of converting rejection to nil.
     fn perform_async_at_site(
         &mut self,
         module: &CodeModule,
         _pc: usize,
         effect_op: &str,
         args: &[Value],
-    ) -> PerformAsyncResult {
-        self.perform_async(effect_op, &module.constants, args)
+    ) -> NuResult<PerformAsyncResult> {
+        Ok(self.perform_async(effect_op, &module.constants, args))
     }
 
     /// Try to receive a message from the current actor's mailbox.
@@ -4435,7 +4437,7 @@ impl VM {
         let args = &self.frames[frame_idx].regs;
         match self
             .actor_callbacks
-            .perform_async_at_site(module, pc, &effect_op, args)
+            .perform_async_at_site(module, pc, &effect_op, args)?
         {
             PerformAsyncResult::Ready(result) => {
                 let value = match result {
@@ -6321,6 +6323,7 @@ mod vm_tests {
         gc: crate::runtime::OrcaGc,
         observed_async_sites:
             std::rc::Rc<std::cell::RefCell<Vec<(String, usize, Option<[u8; 32]>)>>>,
+        require_compiler_site: bool,
     }
 
     impl ReadyValueCallbacks {
@@ -6331,6 +6334,7 @@ mod vm_tests {
                 heap,
                 gc: crate::runtime::OrcaGc::new(0),
                 observed_async_sites: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+                require_compiler_site: false,
             }
         }
     }
@@ -6391,14 +6395,53 @@ mod vm_tests {
             pc: usize,
             effect_op: &str,
             args: &[Value],
-        ) -> PerformAsyncResult {
+        ) -> NuResult<PerformAsyncResult> {
+            if self.require_compiler_site && module.effect_site_at(pc).is_none() {
+                return Err(NuError::VMError {
+                    msg: "missing compiler-owned effect-site metadata".into(),
+                    span: Span::default(),
+                });
+            }
             self.observed_async_sites.borrow_mut().push((
                 module.name.clone(),
                 pc,
                 module.effect_site_at(pc).map(|site| site.id),
             ));
-            self.perform_async(effect_op, &module.constants, args)
+            Ok(self.perform_async(effect_op, &module.constants, args))
         }
+    }
+
+    #[test]
+    fn perform_async_context_callback_can_fail_closed_without_effect_site() {
+        let mut vm = VM::new_without_jit();
+        let mut module = CodeModule::new("legacy-no-site");
+        let effect_idx = module.add_string_constant("Test.value");
+        let instr = Instruction::new3(
+            OpCode::PerformAsync,
+            ((effect_idx >> 8) & 0xff) as u8,
+            (effect_idx & 0xff) as u8,
+            7,
+        );
+        module.instructions.push(instr);
+        vm.load_module(module);
+
+        let mut callbacks = ReadyValueCallbacks::new();
+        callbacks.require_compiler_site = true;
+        let observations = callbacks.observed_async_sites.clone();
+        vm.set_actor_callbacks(Box::new(callbacks));
+
+        let mut frame = Frame::new(None, 0);
+        frame.pc = 1;
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+
+        let error = vm.step_perform_async(0, 0, instr).unwrap_err();
+        assert!(matches!(
+            error,
+            NuError::VMError { msg, .. } if msg == "missing compiler-owned effect-site metadata"
+        ));
+        assert!(observations.borrow().is_empty());
+        assert!(vm.frames[0].regs[7].is_nil());
     }
 
     #[test]
