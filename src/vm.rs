@@ -2532,6 +2532,9 @@ pub struct VM {
     pub handler_stack: Vec<HandlerFrame>,
     /// Step counter (for debugging / limits).
     step_count: usize,
+    /// Optional shared cooperative-cancellation contract, also used by CoreVM.
+    /// When present, JIT regions are disabled until they support safe points.
+    cancellation_token: Option<crate::task_cancellation::CancellationToken>,
     /// Set by try_jit_execute when a JIT safepoint triggers a yield.
     /// Consumed by run_from / resume to return early; reset at start of run_from.
     pub yield_pending: bool,
@@ -2738,6 +2741,7 @@ impl VM {
             current_frame_idx: None,
             handler_stack: Vec::new(),
             step_count: 0,
+            cancellation_token: None,
             yield_pending: false,
             jit_session: if enable_jit {
                 create_default_jit()
@@ -2762,6 +2766,29 @@ impl VM {
             debug_hook: None,
             capture_output: None,
         }
+    }
+
+    /// Attach a cooperative cancellation scope; None restores normal VM
+    /// execution. The JIT stays disabled while a token is attached because
+    /// its compiled regions do not yet guarantee cancellation checkpoints.
+    pub fn set_cancellation_token(
+        &mut self,
+        token: Option<crate::task_cancellation::CancellationToken>,
+    ) {
+        self.cancellation_token = token;
+    }
+
+    #[inline]
+    fn check_cancellation(&self) -> NuResult<()> {
+        if let Some(token) = &self.cancellation_token {
+            if let Err(reason) = token.checkpoint() {
+                return Err(NuError::runtime_error(
+                    crate::task_cancellation::cancellation_error_message(reason).to_string(),
+                    Span::default(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Return a shared reference to the currently executing frame.
@@ -3324,6 +3351,7 @@ impl VM {
 
         // Main execution loop
         loop {
+            self.check_cancellation()?;
             // Check if halted
             if let Some(idx) = self.current_frame_idx {
                 let module_idx = self.frames[idx].module_idx;
@@ -3397,6 +3425,7 @@ impl VM {
         }
 
         loop {
+            self.check_cancellation()?;
             if let Some(idx) = self.current_frame_idx {
                 let m_idx = self.frames[idx].module_idx;
                 let pc = self.frames[idx].pc;
@@ -3490,6 +3519,7 @@ impl VM {
     pub fn resume(&mut self) -> NuResult<Value> {
         self.yield_pending = false;
         loop {
+            self.check_cancellation()?;
             if let Some(idx) = self.current_frame_idx {
                 let m_idx = self.frames[idx].module_idx;
                 let pc = self.frames[idx].pc;
@@ -4980,6 +5010,7 @@ impl VM {
     }
 
     pub fn step(&mut self) -> NuResult<()> {
+        self.check_cancellation()?;
         // Step limit: configurable via env var NULANG_STEP_LIMIT.
         // Default 10M steps — long-running actors (servers, processors) may need more.
         // Check every 64 steps to reduce branch overhead (safety limit, not precise).
@@ -5005,7 +5036,8 @@ impl VM {
         // Try JIT execution for hot bytecode regions before interpreting.
         // Disabled while a debugger is attached so every instruction flows
         // through the interpreter (and the debug hook below).
-        if self.debug_hook.is_none()
+        if self.cancellation_token.is_none()
+            && self.debug_hook.is_none()
             && self.jit_session.is_some()
             && self.try_jit_execute(frame_idx)
         {
