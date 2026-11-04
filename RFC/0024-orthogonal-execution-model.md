@@ -321,6 +321,25 @@ Phase 1 does not:
   They **do not** establish live WASM scheduling or JIT/bytecode equivalence
   under cancellation.
 
+#### Phase 2 actor-runtime isolation slice
+
+- Bytecode actors can opt into a non-durable, actor-owned cancellation token
+  via `Runtime::set_actor_cancellation_token`. Actor pool reuse clears the
+  token so it cannot transfer between actor identities.
+- The shared runtime VM installs the owning actor's token for each bytecode
+  behavior invocation and for all signal, timer, selective-receive, LLM, and
+  JIT-yield resume entry points. Scope restoration is automatic on normal
+  return, VM error, panic unwind, and nested dispatch.
+- This is **not** an actor termination/kill API. Cancellation is reported as
+  a VM execution error and does not automatically drain or discard mailboxes,
+  interrupt in-flight native/AOT operations, or persist a cancellation request.
+  Cancellation semantics for durable workflows, compensation, and recoverable
+  suspensions require a separate lifecycle specification before exposure as a
+  general-purpose actor cancellation primitive.
+- Nested VM actor dispatch still uses the existing shared-VM execution model;
+  this change only isolates the cancellation context. Native-codegen and
+  suspended/async behavior invariants require exact-head hosted validation.
+
 ### Phase 3 — role decomposition
 
 - migrate virtuality to activation metadata;

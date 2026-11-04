@@ -280,6 +280,9 @@ pub struct Actor {
     pub bytecode_module: Option<Box<crate::bytecode::CodeModule>>,
     /// Index of the loaded bytecode module in the runtime VM.
     pub bytecode_module_idx: Option<usize>,
+    /// Opt-in, non-durable cancellation context for this actor's bytecode
+    /// execution. Actor pooling must clear it before reassignment.
+    pub(crate) cancellation_token: Option<crate::task_cancellation::CancellationToken>,
     pub parent: Option<u64>, // Supervisor
     pub children: Vec<u64>,  // Supervised actors
     pub monitors: Vec<u64>,  // Actors monitoring this one
@@ -446,6 +449,7 @@ impl Actor {
             compensated_steps: Vec::new(),
             bytecode_module: None,
             bytecode_module_idx: None,
+            cancellation_token: None,
             parent: None,
             children: Vec::new(),
             monitors: Vec::new(),
@@ -516,6 +520,7 @@ impl Actor {
         self.compensated_steps.clear();
         self.bytecode_module = None;
         self.bytecode_module_idx = None;
+        self.cancellation_token = None;
         self.parent = None;
         self.children.clear();
         self.monitors.clear();
