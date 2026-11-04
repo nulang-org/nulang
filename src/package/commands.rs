@@ -510,7 +510,7 @@ fn template_files(name: &str) -> Vec<(&'static str, &'static str)> {
     match name {
         "default" => vec![(
             "src/main.nula",
-            "fn main() {\n  perform IO.print(\"Hello from Nulang!\")\n}\n",
+            "fn main() {\n    perform IO.print(\"Hello from Nulang!\")\n}\n",
         )],
         "cli" => vec![(
             "src/main.nula",
@@ -2718,6 +2718,28 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn test_default_template_is_formatter_clean() {
+        // A brand-new project should pass `nulang fmt --check` without edits.
+        // This catches drift between the scaffold output and the canonical formatter.
+        let source = template_files("default")
+            .into_iter()
+            .find(|(path, _)| *path == "src/main.nula")
+            .map(|(_, source)| source)
+            .expect("default template must provide src/main.nula");
+        assert_eq!(
+            source,
+            include_str!("templates/default/src/main.nula"),
+            "scaffolded source must match the checked-in default example"
+        );
+        let formatted = crate::fmt::format_source(source)
+            .expect("default template must be supported by the source formatter");
+        assert_eq!(
+            formatted, source,
+            "new default projects must be formatter-clean"
+        );
     }
 
     #[test]
