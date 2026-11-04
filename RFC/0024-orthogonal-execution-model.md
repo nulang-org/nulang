@@ -282,14 +282,19 @@ Phase 1 does not:
 - `src/scoped_tasks.rs` provides a std-only **reference executor** for
   lexically scoped child tasks: cooperative cancellation, fail-fast sibling
   notification, typed failure/panic reporting, ordered results, and mandatory
-  child joins. It uses one OS thread per child and is **not connected** to
-  source-level `par` or to production actor-scheduler workers.
+  child joins. A follow-up reference slice uses a fixed per-scope worker
+  budget (1–64 threads, default capped at 32), a FIFO child queue,
+  monotonic deadlines, explicit cancellation checkpoints, deterministic
+  lowest-index failure reporting, and a guard against unbounded thread
+  creation. The executor is **not connected** to source-level `par` or to
+  production actor-scheduler workers.
 - `src/parallel_analysis.rs` now rejects actor-state mutations through nested
   fields and indexed paths, including `self.items[0] = value`, before
   attempting future concurrent lowering.
 - Source-level `par` remains sequential. Real parallel execution is blocked
-  on backend integration, effect/authority compatibility, budgeted scheduling,
-  cancellation safe points, and differential VM/WASM conformance tests.
+  on backend integration, effect/authority compatibility, runtime-wide
+  (not just per-scope) worker budgeting, VM/WASM cancellation safe points,
+  and differential VM/WASM conformance tests.
 - Cancellation is cooperative: a child performing uninterruptible blocking I/O
   can still delay scope completion. No arbitrary task preemption is promised.
 
