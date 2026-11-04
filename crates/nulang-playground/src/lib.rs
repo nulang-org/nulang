@@ -75,6 +75,8 @@ pub mod mir_lower;
 pub mod mir_codegen;
 #[path = "../../../src/value_layout.rs"]
 pub mod value_layout;
+#[path = "../../../src/task_cancellation.rs"]
+pub mod task_cancellation;
 #[path = "../../../src/core_vm/mod.rs"]
 pub mod core_vm;
 

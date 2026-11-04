@@ -22,6 +22,8 @@ pub mod behavior_manifest;
 #[cfg(test)]
 pub mod benchmarks;
 pub mod bytecode;
+#[cfg(test)]
+mod cancellation_conformance;
 #[cfg(feature = "wasmfx-backend")]
 pub mod cir;
 #[cfg(feature = "wasmfx-backend")]
@@ -96,6 +98,7 @@ pub mod semantic_schema;
 pub mod stdlib;
 #[cfg(test)]
 pub mod stress_tests;
+pub mod task_cancellation;
 pub mod tool_schema;
 pub mod type_ir;
 pub mod type_metadata;

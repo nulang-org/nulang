@@ -6,107 +6,97 @@
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{
-    atomic::{AtomicU8, Ordering},
-    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+    Mutex, OnceLock,
 };
 use std::thread;
-use std::time::Instant;
+
+pub use crate::task_cancellation::{CancellationReason, CancellationToken};
 
 /// Maximum OS threads per reference task scope. Production scheduler
 /// integration must use the actor/runtime's own resource budgets instead.
 pub const MAX_SCOPED_WORKERS: usize = 64;
-const ACTIVE: u8 = 0;
-const CANCELLED: u8 = 1;
-const DEADLINE: u8 = 2;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CancellationReason {
-    Cancelled,
-    DeadlineExceeded,
-}
+pub const MAX_SHARED_TASK_WORKERS: usize = 256;
 
+/// Shared worker pool admission budget. Clone/Arc this across callers to
+/// enforce a single limit across cooperating scopes; no blocking waits are
+/// used because waiting inside a child scope could deadlock its parent.
 #[derive(Debug)]
-struct CancellationState {
-    state: AtomicU8,
-    deadline: Option<Instant>,
+pub struct SharedTaskBudget {
+    capacity: usize,
+    active: AtomicUsize,
 }
 
-/// Cooperative cancellation shared by one task scope and its descendants.
-///
-/// A checkpoint consults a monotonic deadline, if configured. Cancellation
-/// never kills a thread or preempts blocking syscalls; children are responsible
-/// for checking the token between bounded pieces of work.
-#[derive(Clone, Debug)]
-pub struct CancellationToken {
-    state: Arc<CancellationState>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedBudgetError {
+    InvalidCapacity,
 }
 
-impl Default for CancellationToken {
-    fn default() -> Self {
-        Self {
-            state: Arc::new(CancellationState {
-                state: AtomicU8::new(ACTIVE),
-                deadline: None,
-            }),
+impl SharedTaskBudget {
+    pub fn new(capacity: usize) -> Result<Self, SharedBudgetError> {
+        if capacity == 0 || capacity > MAX_SHARED_TASK_WORKERS {
+            return Err(SharedBudgetError::InvalidCapacity);
+        }
+        Ok(Self {
+            capacity,
+            active: AtomicUsize::new(0),
+        })
+    }
+
+    pub fn active_workers(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn try_reserve(&self, requested: usize) -> Option<WorkerReservation<'_>> {
+        debug_assert!(requested > 0);
+        loop {
+            let active = self.active.load(Ordering::Acquire);
+            let free = self.capacity.saturating_sub(active);
+            if free == 0 {
+                return None;
+            }
+            let count = requested.min(free);
+            if self
+                .active
+                .compare_exchange_weak(active, active + count, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(WorkerReservation {
+                    budget: self,
+                    count,
+                });
+            }
         }
     }
 }
 
-impl CancellationToken {
-    pub fn with_deadline(deadline: Instant) -> Self {
-        Self {
-            state: Arc::new(CancellationState {
-                state: AtomicU8::new(ACTIVE),
-                deadline: Some(deadline),
-            }),
-        }
-    }
+/// RAII reservation: always release capacity after all started children join.
+struct WorkerReservation<'a> {
+    budget: &'a SharedTaskBudget,
+    count: usize,
+}
 
-    pub fn cancel(&self) {
-        // A deadline that has already elapsed must not be overwritten by
-        // a later explicit cancellation that happens before a checkpoint.
-        let _ = self.cancellation_reason();
-        let _ = self.state.state.compare_exchange(
-            ACTIVE,
-            CANCELLED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+impl Drop for WorkerReservation<'_> {
+    fn drop(&mut self) {
+        self.budget.active.fetch_sub(self.count, Ordering::AcqRel);
     }
+}
 
-    /// Report the earliest cancellation cause. Once cancelled, the cause is
-    /// stable: a later deadline cannot replace an explicit cancellation.
-    pub fn cancellation_reason(&self) -> Option<CancellationReason> {
-        if self
-            .state
-            .deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            let _ = self.state.state.compare_exchange(
-                ACTIVE,
-                DEADLINE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-        }
-        match self.state.state.load(Ordering::Acquire) {
-            CANCELLED => Some(CancellationReason::Cancelled),
-            DEADLINE => Some(CancellationReason::DeadlineExceeded),
-            _ => None,
-        }
-    }
+// All reference executor calls using run_scoped_tasks or run_scoped_tasks_bounded
+// opt in to one process-wide limit. Native actors, VMs, and custom budgets
+// are NOT accounted here until explicitly integrated.
+static DEFAULT_SHARED_BUDGET: OnceLock<SharedTaskBudget> = OnceLock::new();
 
-    /// Call at explicit safe points in child work.
-    pub fn checkpoint(&self) -> Result<(), CancellationReason> {
-        match self.cancellation_reason() {
-            Some(reason) => Err(reason),
-            None => Ok(()),
-        }
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.cancellation_reason().is_some()
-    }
+fn default_shared_budget() -> &'static SharedTaskBudget {
+    DEFAULT_SHARED_BUDGET.get_or_init(|| {
+        SharedTaskBudget::new(MAX_SCOPED_WORKERS)
+            .expect("nonzero MAX_SCOPED_WORKERS must fit shared budget")
+    })
 }
 
 /// A child task can borrow from its lexical parent; it cannot escape scope.
@@ -120,6 +110,7 @@ pub enum ScopedTaskFailure<E> {
     Cancelled,
     DeadlineExceeded,
     InvalidConcurrencyLimit,
+    NoWorkerCapacity,
 }
 
 enum ChildOutcome<T, E> {
@@ -150,6 +141,41 @@ pub fn run_scoped_tasks<T: Send, E: Send>(
 /// This does not integrate with source-level `par` (still sequential), bytecode
 /// VM, WASM, or the actor scheduler. Cancellation is always cooperative.
 pub fn run_scoped_tasks_bounded<T: Send, E: Send>(
+    parent: &CancellationToken,
+    tasks: Vec<ScopedTask<'_, T, E>>,
+    max_in_flight: usize,
+) -> Result<Vec<T>, ScopedTaskFailure<E>> {
+    run_scoped_tasks_with_budget(parent, tasks, max_in_flight, default_shared_budget())
+}
+
+/// Run a scope with a caller-supplied budget shared across other scopes.
+///
+/// Capacity is acquired atomically without waiting. If no worker slot is
+/// available, return NoWorkerCapacity before executing any child, avoiding
+/// nested-scope deadlocks. A partially available budget may reduce the actual
+/// worker count. Permits are released after all started children are joined.
+pub fn run_scoped_tasks_with_budget<T: Send, E: Send>(
+    parent: &CancellationToken,
+    tasks: Vec<ScopedTask<'_, T, E>>,
+    max_in_flight: usize,
+    budget: &SharedTaskBudget,
+) -> Result<Vec<T>, ScopedTaskFailure<E>> {
+    if max_in_flight == 0 || max_in_flight > MAX_SCOPED_WORKERS {
+        return Err(ScopedTaskFailure::InvalidConcurrencyLimit);
+    }
+    if let Err(reason) = parent.checkpoint() {
+        return Err(cancel_failure(reason));
+    }
+    if tasks.is_empty() {
+        return Ok(vec![]);
+    }
+    let reservation = budget
+        .try_reserve(max_in_flight.min(tasks.len()))
+        .ok_or(ScopedTaskFailure::NoWorkerCapacity)?;
+    run_scoped_tasks_bounded_inner(parent, tasks, reservation.count)
+}
+
+fn run_scoped_tasks_bounded_inner<T: Send, E: Send>(
     parent: &CancellationToken,
     tasks: Vec<ScopedTask<'_, T, E>>,
     max_in_flight: usize,
@@ -562,5 +588,109 @@ mod bounded_safety_tests {
             Err(ScopedTaskFailure::Cancelled)
         ));
         assert!(!started.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod shared_budget_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    #[test]
+    fn shared_budget_denies_extra_scope_without_starting_queued_tasks() {
+        let budget = Arc::new(SharedTaskBudget::new(1).unwrap());
+        let parent = CancellationToken::default();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let rejected_task_ran = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let worker_budget = Arc::clone(&budget);
+            let worker_parent = parent.clone();
+            scope.spawn(move || {
+                let tasks: Vec<ScopedTask<'_, usize, &'static str>> = vec![Box::new(move |_| {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(1)
+                })];
+                assert_eq!(
+                    run_scoped_tasks_with_budget(&worker_parent, tasks, 1, &worker_budget),
+                    Ok(vec![1])
+                );
+            });
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(budget.active_workers(), 1);
+            let extra: Vec<ScopedTask<'_, usize, &'static str>> = vec![Box::new(|_| {
+                rejected_task_ran.store(true, Ordering::SeqCst);
+                Ok(2)
+            })];
+            assert_eq!(
+                run_scoped_tasks_with_budget(&parent, extra, 1, &budget),
+                Err(ScopedTaskFailure::NoWorkerCapacity)
+            );
+            assert!(!rejected_task_ran.load(Ordering::SeqCst));
+            release_tx.send(()).unwrap();
+        });
+        assert_eq!(budget.active_workers(), 0);
+    }
+
+    #[test]
+    fn nested_same_budget_fails_fast_instead_of_deadlocking() {
+        let budget = SharedTaskBudget::new(1).unwrap();
+        let parent = CancellationToken::default();
+        let tasks: Vec<ScopedTask<'_, usize, &'static str>> = vec![Box::new(|token| {
+            let nested: Vec<ScopedTask<'_, usize, &'static str>> = vec![Box::new(|_| Ok(99))];
+            assert_eq!(
+                run_scoped_tasks_with_budget(&token, nested, 1, &budget),
+                Err(ScopedTaskFailure::NoWorkerCapacity)
+            );
+            Ok(7)
+        })];
+        assert_eq!(
+            run_scoped_tasks_with_budget(&parent, tasks, 1, &budget),
+            Ok(vec![7])
+        );
+        assert_eq!(budget.active_workers(), 0);
+    }
+
+    #[test]
+    fn scope_failure_returns_permits_to_shared_budget() {
+        let budget = SharedTaskBudget::new(2).unwrap();
+        let parent = CancellationToken::default();
+        let tasks: Vec<ScopedTask<'_, usize, &'static str>> = vec![Box::new(|_| Err("boom"))];
+        assert_eq!(
+            run_scoped_tasks_with_budget(&parent, tasks, 2, &budget),
+            Err(ScopedTaskFailure::Child {
+                index: 0,
+                error: "boom"
+            })
+        );
+        assert_eq!(budget.active_workers(), 0);
+        let fresh = CancellationToken::default();
+        let tasks: Vec<ScopedTask<'_, usize, &'static str>> = vec![Box::new(|_| Ok(42))];
+        assert_eq!(
+            run_scoped_tasks_with_budget(&fresh, tasks, 2, &budget),
+            Ok(vec![42])
+        );
+    }
+
+    #[test]
+    fn shared_budget_rejects_zero_capacity_and_skips_pre_cancelled_scope() {
+        assert!(SharedTaskBudget::new(0).is_err());
+        let budget = SharedTaskBudget::new(2).unwrap();
+        let parent = CancellationToken::default();
+        parent.cancel();
+        let ran = AtomicBool::new(false);
+        let tasks: Vec<ScopedTask<'_, usize, &'static str>> = vec![Box::new(|_| {
+            ran.store(true, Ordering::SeqCst);
+            Ok(1)
+        })];
+        assert_eq!(
+            run_scoped_tasks_with_budget(&parent, tasks, 1, &budget),
+            Err(ScopedTaskFailure::Cancelled)
+        );
+        assert_eq!(budget.active_workers(), 0);
+        assert!(!ran.load(Ordering::SeqCst));
     }
 }
