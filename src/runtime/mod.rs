@@ -730,6 +730,25 @@ impl Runtime {
         }
     }
 
+    /// Attach or clear an opt-in cancellation token for an existing actor.
+    ///
+    /// This is an ephemeral bytecode execution context, not a lifecycle
+    /// command: cancellation returns a VM error and does not terminate the
+    /// actor or remove its mailbox. Native/AOT handlers are not preempted.
+    /// Every runtime VM entry point restores the previous token afterward,
+    /// including error exits and nested actor execution.
+    pub fn set_actor_cancellation_token(
+        &mut self,
+        actor_id: u64,
+        token: Option<crate::task_cancellation::CancellationToken>,
+    ) -> bool {
+        let Some(actor) = self.actors.get_mut(&actor_id) else {
+            return false;
+        };
+        actor.cancellation_token = token;
+        true
+    }
+
     /// Compute the BLAKE3 hash of `data` using the configured [`CryptoProvider`].
     pub fn hash_bytes(&self, data: &[u8]) -> [u8; 32] {
         self.crypto.hash(data)
@@ -1349,7 +1368,11 @@ impl Runtime {
             }
 
             (*self_ptr).vm_exec_begin();
-            let result = vm.resume();
+            let actor_token = (*self_ptr)
+                .actors
+                .get(&actor_id)
+                .and_then(|actor| actor.cancellation_token.clone());
+            let result = vm.with_cancellation_scope(actor_token, |vm| vm.resume());
             crate::jit::runtime::clear_jit_safepoint_ptr();
 
             match result {
@@ -1706,7 +1729,11 @@ impl Runtime {
             let saved_suspend = (*self_ptr).suspend_enabled;
             (*self_ptr).suspend_enabled = true;
             (*self_ptr).vm_exec_begin();
-            let result = vm.resume();
+            let actor_token = (*self_ptr)
+                .actors
+                .get(&actor_id)
+                .and_then(|actor| actor.cancellation_token.clone());
+            let result = vm.with_cancellation_scope(actor_token, |vm| vm.resume());
             (*self_ptr).suspend_enabled = saved_suspend;
             result
         };
@@ -4871,7 +4898,11 @@ impl Runtime {
             }));
             vm.restore_suspended_state(suspended.vm_state);
             (*self_ptr).vm_exec_begin();
-            let result = vm.resume();
+            let actor_token = (*self_ptr)
+                .actors
+                .get(&actor_id)
+                .and_then(|actor| actor.cancellation_token.clone());
+            let result = vm.with_cancellation_scope(actor_token, |vm| vm.resume());
             // Distinguish completion from re-suspension by the resume
             // RESULT, not `take_suspended_state`: after a normal
             // completion the frame is still live, so take_suspended_state
@@ -4973,7 +5004,11 @@ impl Runtime {
             let saved_suspend = (*self_ptr).suspend_enabled;
             (*self_ptr).suspend_enabled = true;
             (*self_ptr).vm_exec_begin();
-            let result = vm.resume();
+            let actor_token = (*self_ptr)
+                .actors
+                .get(&actor_id)
+                .and_then(|actor| actor.cancellation_token.clone());
+            let result = vm.with_cancellation_scope(actor_token, |vm| vm.resume());
             (*self_ptr).suspend_enabled = saved_suspend;
             match result {
                 Ok(_) => {
@@ -5280,7 +5315,12 @@ impl Runtime {
                 }
             }
 
-            let result = vm.run_from(module_idx, code_offset);
+            let actor_token = (*self_ptr)
+                .actors
+                .get(&actor_id)
+                .and_then(|actor| actor.cancellation_token.clone());
+            let result =
+                vm.with_cancellation_scope(actor_token, |vm| vm.run_from(module_idx, code_offset));
 
             #[cfg(feature = "native-codegen")]
             {

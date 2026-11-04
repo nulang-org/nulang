@@ -130,3 +130,43 @@ fn native_run_from_and_resume_honor_token_without_changing_bytecode() {
     native.set_cancellation_token(None);
     assert!(native.resume().is_ok());
 }
+
+#[test]
+fn vm_actor_scope_restores_outer_token_after_nested_dispatch() {
+    let mut vm = VM::new_without_jit();
+    vm.load_module(module_with_halt());
+    let outer = CancellationToken::default();
+    outer.cancel();
+    vm.set_cancellation_token(Some(outer.clone()));
+
+    vm.with_cancellation_scope(None, |vm| {
+        assert!(
+            vm.run().is_ok(),
+            "inner execution must not inherit cancellation"
+        );
+        vm.with_cancellation_scope(Some(CancellationToken::default()), |vm| {
+            assert!(vm.run().is_ok());
+        });
+        assert!(vm.run().is_ok(), "nested token must restore inner context");
+    });
+    assert!(
+        format!("{}", vm.run().unwrap_err()).contains("Task cancelled"),
+        "returning to outer scope must restore its cancelled token"
+    );
+}
+
+#[test]
+fn vm_actor_scope_restores_token_even_when_execution_panics() {
+    let mut vm = VM::new_without_jit();
+    vm.load_module(module_with_halt());
+    let token = CancellationToken::default();
+    token.cancel();
+
+    let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        vm.with_cancellation_scope(Some(token), |_vm| {
+            panic!("intentional task-body panic");
+        });
+    }));
+    assert!(panic_result.is_err());
+    assert!(vm.run().is_ok(), "panic must not leak a cancelled token");
+}

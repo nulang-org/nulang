@@ -2778,6 +2778,30 @@ impl VM {
         self.cancellation_token = token;
     }
 
+    /// Temporarily install the actor-local cancellation context for one VM
+    /// dispatch. Restore even if the callback panics or returns an error.
+    /// This is needed because the actor runtime reuses a shared VM across
+    /// unrelated actors, and synchronous nested dispatch may re-enter it.
+    pub(crate) fn with_cancellation_scope<R>(
+        &mut self,
+        token: Option<crate::task_cancellation::CancellationToken>,
+        execute: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        struct Restore<'a> {
+            vm: &'a mut VM,
+            previous: Option<crate::task_cancellation::CancellationToken>,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.vm.cancellation_token = self.previous.take();
+            }
+        }
+
+        let previous = std::mem::replace(&mut self.cancellation_token, token);
+        let guard = Restore { vm: self, previous };
+        execute(&mut *guard.vm)
+    }
+
     #[inline]
     fn check_cancellation(&self) -> NuResult<()> {
         if let Some(token) = &self.cancellation_token {

@@ -8710,3 +8710,60 @@ fn confirmed_node_removal_forgets_crdt_receiver_knowledge() {
         "a peer that rejoins after confirmed removal must receive full state"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Opt-in actor-scoped cancellation: a shared runtime VM must never leak the
+// cancelled state of one actor into another actor's behavior.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_actor_scoped_cancellation_does_not_leak_across_shared_vm() {
+    use crate::bytecode::{CodeModule, Instruction, OpCode};
+    use crate::task_cancellation::CancellationToken;
+    use crate::vm::Value;
+
+    let mut runtime = Runtime::new();
+    let cancelled_actor = runtime.spawn_actor(Box::new(Vec::new));
+    let healthy_actor = runtime.spawn_actor(Box::new(Vec::new));
+    let mut module = CodeModule::new("actor_cancellation_isolation");
+    module.emit(Instruction::new1(OpCode::Const1, 0));
+    module.emit(Instruction::new0(OpCode::Halt));
+    module.entry_point = Some(0);
+    for actor_id in [cancelled_actor, healthy_actor] {
+        runtime.actors.get_mut(&actor_id).unwrap().bytecode_module = Some(Box::new(module.clone()));
+    }
+    let token = CancellationToken::default();
+    token.cancel();
+    assert!(runtime.set_actor_cancellation_token(cancelled_actor, Some(token.clone())));
+    let error = runtime
+        .run_bytecode_at_offset(cancelled_actor, 0, &[])
+        .unwrap_err();
+    assert!(format!("{error}").contains("Task cancelled"), "{error}");
+
+    // The second actor runs on the *same* VM; the token from the first actor
+    // must be uninstalled before this dispatch.
+    let value = runtime
+        .run_bytecode_at_offset(healthy_actor, 0, &[])
+        .unwrap();
+    assert_eq!(value, Value::int(1));
+    assert!(runtime.set_actor_cancellation_token(cancelled_actor, None));
+    assert_eq!(
+        runtime
+            .run_bytecode_at_offset(cancelled_actor, 0, &[])
+            .unwrap(),
+        Value::int(1)
+    );
+    assert!(!runtime.set_actor_cancellation_token(0, Some(token)));
+}
+
+#[test]
+fn test_actor_pool_reset_clears_cancellation_token() {
+    use crate::runtime::actor::Actor;
+    use crate::task_cancellation::CancellationToken;
+
+    let mut actor = Actor::new(777, "first", 16);
+    let token = CancellationToken::default();
+    token.cancel();
+    actor.cancellation_token = Some(token);
+    actor.reset(778, "reused", 16);
+    assert!(actor.cancellation_token.is_none());
+}

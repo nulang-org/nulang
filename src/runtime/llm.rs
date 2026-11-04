@@ -455,7 +455,11 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
         let saved_suspend = (*self_ptr).suspend_enabled;
         (*self_ptr).suspend_enabled = true;
         (*self_ptr).vm_exec_begin();
-        let result = vm.resume();
+        let actor_token = (*self_ptr)
+            .actors
+            .get(&actor_id)
+            .and_then(|actor| actor.cancellation_token.clone());
+        let result = vm.with_cancellation_scope(actor_token, |vm| vm.resume());
         (*self_ptr).suspend_enabled = saved_suspend;
         match result {
             Ok(_) => {
