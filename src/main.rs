@@ -57,6 +57,94 @@ use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::time::Instant;
 use tracing::instrument;
+
+/// Compatibility shortcuts for the existing `nulang nula` package commands.
+fn is_package_alias(command: &str) -> bool {
+    matches!(
+        command,
+        "new"
+            | "run"
+            | "test"
+            | "build"
+            | "build-wasm"
+            | "dev"
+            | "watch"
+            | "add"
+            | "remove"
+            | "list"
+            | "clean"
+            | "doc"
+            | "publish"
+            | "deploy"
+    )
+}
+
+fn long_option_alias(command: &str) -> Option<&'static str> {
+    match command {
+        "check" => Some("--check"),
+        _ => None,
+    }
+}
+
+/// Read-only snapshot of the local CLI environment. A feature compiled into
+/// a binary is not evidence that its runtime dependencies work.
+fn doctor_report() -> String {
+    use std::fmt::Write as _;
+    let mut report = String::new();
+    let executable = std::env::current_exe().ok();
+    let binary = executable
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "unavailable".to_string());
+    let package = std::env::current_dir()
+        .ok()
+        .map(|dir| dir.join("Nulang.toml"))
+        .filter(|p| p.is_file())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "none in current directory".to_string());
+
+    let stdlib = std::env::var_os("NULANG_STDLIB")
+        .map(PathBuf::from)
+        .or_else(|| {
+            executable
+                .as_ref()
+                .and_then(|p| p.parent())
+                .map(|dir| dir.join("stdlib"))
+        })
+        .map(|p| {
+            if p.is_dir() {
+                format!("{} (found)", p.display())
+            } else {
+                format!("{} (not found; check NULANG_STDLIB for imports)", p.display())
+            }
+        })
+        .unwrap_or_else(|| "not configured".to_string());
+    let _ = writeln!(report, "Nulang doctor");
+    let _ = writeln!(report, "compiler version: {VERSION}");
+    let _ = writeln!(
+        report,
+        "language version: {}",
+        nulang::format::constants::LANGUAGE_VERSION_STR
+    );
+    let _ = writeln!(
+        report,
+        "target: {}-{}",
+        std::env::consts::ARCH,
+        std::env::consts::OS
+    );
+    let _ = writeln!(report, "binary: {binary}");
+    let _ = writeln!(report, "stdlib: {stdlib}");
+    let _ = writeln!(report, "package: {package}");
+    let _ = writeln!(
+        report,
+        "compiled features: lsp={}, wasm={}, native={}",
+        cfg!(feature = "lsp"),
+        cfg!(feature = "wasm-backend"),
+        cfg!(feature = "native-codegen")
+    );
+    report
+}
+
 fn main() {
     // Initialize structured tracing (RUST_LOG env var controls verbosity).
     // Default level: warn (silent for normal runs). Users opt in with
@@ -98,7 +186,10 @@ fn main() {
             .init();
     }
 
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    if let Some(alias) = args.get(1).and_then(|arg| long_option_alias(arg)) {
+        args[1] = alias.to_string();
+    }
 
     if args.len() <= 1 {
         // If stdin is piped, execute as a script; otherwise start REPL.
@@ -175,6 +266,24 @@ fn main() {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
+    }
+
+    if args[1] == "doctor" {
+        if args.len() != 2 {
+            eprintln!("Usage: nulang doctor");
+            std::process::exit(2);
+        }
+        print!("{}", doctor_report());
+        return;
+    }
+
+    // Top-level package commands dispatch to the existing nula handlers.
+    if is_package_alias(&args[1]) {
+        if let Err(e) = nulang::package::commands::run(&args[1..]) {
+            print_error(&e, true);
+            std::process::exit(exit_code(&e));
+        }
+        return;
     }
 
     // `nulang nula <cmd>` dispatches to the package manager.
@@ -1122,6 +1231,9 @@ fn print_help() {
     println!("Usage: nulang [OPTIONS] <FILE>");
     println!("       nulang --repl");
     println!("       nulang --eval <CODE>");
+    println!("       nulang check <FILE> [--json]");
+    println!("       nulang new|run|test|build|dev|watch|add|remove|doc ...");
+    println!("       nulang doctor");
     println!("       nulang --check <FILE>");
     println!("       nulang --lsp");
     println!("       nulang --dap");
@@ -1175,6 +1287,11 @@ fn print_help() {
     );
     println!(
         "  nula <cmd>       Package manager (new, init, build, build-wasm, test, run, add, remove, watch, doc, list, clean)"
+    );
+    println!("  new|run|test|build|dev ...  Short aliases for `nulang nula <cmd>`");
+    println!("  check <file>     Alias for --check <file>");
+    println!(
+        "  doctor           Show binary, compiled features, stdlib and package status"
     );
     println!("  --version, -V    Print version and exit");
     println!("  init <name>      Scaffold experiment");
@@ -2807,6 +2924,44 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_top_level_package_aliases_do_not_shadow_runtime_commands() {
+        for cmd in [
+            "new", "run", "test", "build", "dev", "watch", "add", "remove", "list", "clean", "doc",
+        ] {
+            assert!(
+                is_package_alias(cmd),
+                "{cmd} should forward to the package manager"
+            );
+        }
+        for cmd in [
+            "fmt", "nula", "init", "agent", "node", "registry", "doctor", "check",
+        ] {
+            assert!(
+                !is_package_alias(cmd),
+                "{cmd} must preserve its own dispatch"
+            );
+        }
+    }
+
+    #[test]
+    fn test_check_command_maps_to_existing_check_option() {
+        assert_eq!(long_option_alias("check"), Some("--check"));
+        assert_eq!(long_option_alias("--check"), None);
+        assert_eq!(long_option_alias("run"), None);
+    }
+
+    #[test]
+    fn test_doctor_reports_environment_without_requirements_to_build_from_source() {
+        let report = doctor_report();
+        assert!(report.contains("Nulang doctor"));
+        assert!(report.contains("language version:"));
+        assert!(report.contains("target:"));
+        assert!(report.contains("binary:"));
+        assert!(report.contains("stdlib:"));
+        assert!(report.contains("package:"));
+    }
 
     /// An actor program run through the CLI path must create real actors
     /// and deliver sent messages: with the bare standalone VM the stub

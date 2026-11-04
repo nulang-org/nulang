@@ -38,12 +38,12 @@ nulang --repl
 After installing the compiler, scaffold a project using the bundled `nula` package manager:
 
 ```bash
-nulang nula new hello-app
+nulang new hello-app
 cd hello-app
-nulang nula run
+nulang run
 ```
 
-The command `nulang nula test` runs tests discovered under the project's `tests/` directory. Package management and other non-Core operations require the native runtime, not the limited browser playground.
+Run `nulang test` to execute tests discovered under the project's `tests/` directory. The older `nulang nula <command>` forms remain supported. Use `nulang doctor` to inspect the local binary, compiled features, stdlib location, and current project. Package management and other non-Core operations require the native runtime, not the limited browser playground.
 
 ## Variables and Functions
 
