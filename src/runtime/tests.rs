@@ -8767,3 +8767,123 @@ fn test_actor_pool_reset_clears_cancellation_token() {
     actor.reset(778, "reused", 16);
     assert!(actor.cancellation_token.is_none());
 }
+
+// Before there is a durable cancellation/compensation protocol, opt-in tokens
+// must not be admitted to recoverable workflows or suspended executions.
+#[test]
+fn test_workflow_cancellation_admission_refuses_durable_and_suspended_actors() {
+    use crate::task_cancellation::CancellationToken;
+    use crate::vm::SuspendedVmState;
+
+    let mut rt = Runtime::new();
+    let durable = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
+    let workflow = rt.spawn_workflow_actor(
+        "NoCancelUntilDurableContract",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+    assert_ne!(workflow, 0);
+    let suspended = rt.spawn_actor(Box::new(Vec::new));
+    let normal = rt.spawn_actor(Box::new(Vec::new));
+
+    let token = CancellationToken::default();
+    token.cancel();
+    assert!(!rt.set_actor_cancellation_token(durable, Some(token.clone())));
+    assert!(!rt.set_actor_cancellation_token(workflow, Some(token.clone())));
+
+    rt.actors.get_mut(&suspended).unwrap().suspended_execution =
+        Some(crate::runtime::actor::SuspendedExecution {
+            vm_state: SuspendedVmState {
+                frames: Vec::new(),
+                current_frame_idx: None,
+                handler_stack: Vec::new(),
+                step_count: 0,
+            },
+            behavior_idx: 0,
+            activation: None,
+            step_name: String::new(),
+        });
+    assert_eq!(
+        rt.try_set_actor_cancellation_token(suspended, Some(token.clone())),
+        Err(crate::runtime::ActorCancellationAdmissionError::SuspendedUnsupported)
+    );
+
+    // No cancelled token may be persisted or leak into these actors.
+    for id in [durable, workflow, suspended] {
+        assert!(rt.actors[&id].cancellation_token.is_none());
+    }
+    // A normal, non-durable, non-suspended actor still supports opt-in
+    // cancellation and explicit clearing.
+    assert!(rt.set_actor_cancellation_token(normal, Some(token.clone())));
+    assert!(rt.actors[&normal]
+        .cancellation_token
+        .as_ref()
+        .unwrap()
+        .is_cancelled());
+    assert!(rt.set_actor_cancellation_token(normal, None));
+    assert!(rt.actors[&normal].cancellation_token.is_none());
+}
+
+#[test]
+fn test_actor_cancellation_context_cannot_change_inside_vm_execution() {
+    use crate::task_cancellation::CancellationToken;
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(Vec::new));
+    let first = CancellationToken::default();
+    assert!(rt.set_actor_cancellation_token(actor_id, Some(first.clone())));
+
+    // Prevent token replacement or clearing mid-dispatch, before VM context
+    // restoration can safely reconcile the ownership of in-flight work.
+    rt.vm_exec_begin();
+    let next = CancellationToken::default();
+    next.cancel();
+    assert!(!rt.set_actor_cancellation_token(actor_id, Some(next)));
+    assert!(!rt.set_actor_cancellation_token(actor_id, None));
+    assert!(!rt.actors[&actor_id]
+        .cancellation_token
+        .as_ref()
+        .unwrap()
+        .is_cancelled());
+    rt.vm_exec_end();
+
+    // Scheduler turn ownership must also block mid-turn mutation, even
+    // before the VM execution window opens.
+    rt.current_actor = Some(actor_id);
+    assert_eq!(
+        rt.try_set_actor_cancellation_token(actor_id, None),
+        Err(crate::runtime::ActorCancellationAdmissionError::RuntimeBusy)
+    );
+    rt.current_actor = None;
+    assert!(rt.set_actor_cancellation_token(actor_id, None));
+}
+
+#[test]
+fn test_actor_cancellation_admission_explains_rejection() {
+    use crate::runtime::ActorCancellationAdmissionError as Rejection;
+    use crate::task_cancellation::CancellationToken;
+
+    let mut rt = Runtime::new();
+    let ordinary = rt.spawn_actor(Box::new(Vec::new));
+    let persistent = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
+    let token = CancellationToken::default();
+
+    assert_eq!(
+        rt.try_set_actor_cancellation_token(0, Some(token.clone())),
+        Err(Rejection::ActorNotFound)
+    );
+    assert_eq!(
+        rt.try_set_actor_cancellation_token(persistent, Some(token.clone())),
+        Err(Rejection::DurableUnsupported)
+    );
+    rt.vm_exec_begin();
+    assert_eq!(
+        rt.try_set_actor_cancellation_token(ordinary, Some(token.clone())),
+        Err(Rejection::RuntimeBusy)
+    );
+    rt.vm_exec_end();
+    assert_eq!(
+        rt.try_set_actor_cancellation_token(ordinary, Some(token.clone())),
+        Ok(())
+    );
+    assert_eq!(rt.try_set_actor_cancellation_token(ordinary, None), Ok(()));
+}
