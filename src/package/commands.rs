@@ -510,7 +510,7 @@ fn template_files(name: &str) -> Vec<(&'static str, &'static str)> {
     match name {
         "default" => vec![(
             "src/main.nula",
-            "fn main() {\n  perform IO.print(\"Hello from Nulang!\")\n}\n",
+            "fn main() {\n    perform IO.print(\"Hello from Nulang!\")\n}\n",
         )],
         "cli" => vec![(
             "src/main.nula",
@@ -2718,6 +2718,21 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn test_default_template_is_formatter_clean_for_ci() {
+        // A new package must pass the opt-in formatting gate without edits.
+        let dir =
+            std::env::temp_dir().join(format!("nulang_ci_template_fmt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        scaffold_package(&dir, "fmt-app", "default").expect("default scaffold should succeed");
+        let result = crate::fmt::format_directory(&dir.join("src"), true);
+        assert!(
+            result.is_ok(),
+            "new default package is not formatter-clean: {result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
