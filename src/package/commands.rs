@@ -92,6 +92,26 @@ pub fn run(args: &[String]) -> NuResult<()> {
             }
         }
         Some("build-wasm") => cmd_build_wasm(),
+        Some("ci") => {
+            let mut web = false;
+            let mut fmt = false;
+            for flag in &args[1..] {
+                match flag.as_str() {
+                    "--web" if !web => web = true,
+                    "--fmt" if !fmt => fmt = true,
+                    other => {
+                        return Err(NuError::PackageError {
+                            msg: format!(
+                                "unknown or duplicate nula ci option '{}' (usage: nula ci [--web] [--fmt])",
+                                other
+                            ),
+                            span: Span::default(),
+                        });
+                    }
+                }
+            }
+            cmd_ci(web, fmt)
+        },
         Some("test") => {
             let mut filter: Option<&str> = None;
             let mut verbose = false;
@@ -266,7 +286,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
 
         Some(other) => Err(NuError::PackageError {
             msg: format!(
-                "unknown nula subcommand '{}' (expected new, init, build, build-wasm, test, run, add, remove, publish, deploy, watch, doc, list, or clean)",
+                "unknown nula subcommand '{}' (expected new, init, build, build-wasm, ci, test, run, add, remove, publish, deploy, watch, doc, list, or clean)",
                 other
             ),
             span: Span::default(),
@@ -290,6 +310,7 @@ fn print_usage() {
     println!("  init          Scaffold a new package in the current directory");
     println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
     println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
+    println!("  ci [--web] [--fmt]  Build and test; --web adds web build, --fmt checks formatting");
     println!("  test [--filter <substr>] [--verbose|-v] [--watch|-w]  Run .nula test files");
     println!("  run           Build and run the package entry point");
     println!("  run --watch   Build and re-run on source changes");
@@ -359,6 +380,68 @@ fn run_auth_enable(_args: &[String]) -> NuResult<()> {
     }
     println!("Set the cloud config key AUTH_COOKIE_SECRET on deploy.");
     Ok(())
+}
+
+/// Small, deterministic package CI plan. This is deliberately independent from
+/// compiler repository CI (scripts/ci-local.sh), which has many more gates.
+/// Never interpret passing a package CI plan as a production deploy approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CiStep {
+    Format,
+    Build,
+    Test,
+    BuildWeb,
+}
+
+fn ci_steps(web: bool, fmt: bool) -> &'static [CiStep] {
+    const CORE: &[CiStep] = &[CiStep::Build, CiStep::Test];
+    const CORE_FMT: &[CiStep] = &[CiStep::Format, CiStep::Build, CiStep::Test];
+    const WEB: &[CiStep] = &[CiStep::Build, CiStep::Test, CiStep::BuildWeb];
+    const WEB_FMT: &[CiStep] = &[
+        CiStep::Format,
+        CiStep::Build,
+        CiStep::Test,
+        CiStep::BuildWeb,
+    ];
+    match (web, fmt) {
+        (false, false) => CORE,
+        (false, true) => CORE_FMT,
+        (true, false) => WEB,
+        (true, true) => WEB_FMT,
+    }
+}
+
+fn run_ci_steps(
+    web: bool,
+    fmt: bool,
+    mut execute: impl FnMut(CiStep) -> NuResult<()>,
+) -> NuResult<()> {
+    for &step in ci_steps(web, fmt) {
+        eprintln!("CI gate: {step:?}");
+        execute(step)?;
+    }
+    println!("All requested package CI gates passed.");
+    Ok(())
+}
+
+/// `nula ci [--web] [--fmt]` runs the existing package operations
+/// in a fixed fail-fast sequence. No shell commands are evaluated.
+fn cmd_ci(web: bool, fmt: bool) -> NuResult<()> {
+    let root = package_root()?;
+    // Preflight: reject non-project directories before running any gate.
+    Manifest::load(&root)?;
+    run_ci_steps(web, fmt, |step| match step {
+        CiStep::Format => {
+            crate::fmt::format_directory(&root.join("src"), true)?;
+            if root.join("tests").is_dir() {
+                crate::fmt::format_directory(&root.join("tests"), true)?;
+            }
+            Ok(())
+        }
+        CiStep::Build => cmd_build(false),
+        CiStep::Test => cmd_test(None, false, false),
+        CiStep::BuildWeb => cmd_build_web(),
+    })
 }
 
 /// `nula new <name> [--template <name>]`: scaffold a package directory.
@@ -508,10 +591,16 @@ fn scaffold_package(dir: &Path, name: &str, template: &str) -> NuResult<()> {
 /// Return the list of (relative_path, content) for a named template.
 fn template_files(name: &str) -> Vec<(&'static str, &'static str)> {
     match name {
-        "default" => vec![(
-            "src/main.nula",
-            "fn main() {\n  perform IO.print(\"Hello from Nulang!\")\n}\n",
-        )],
+        "default" => vec![
+            (
+                "src/main.nula",
+                "fn main() {\n    perform IO.print(\"Hello from Nulang!\")\n}\n",
+            ),
+            (
+                "tests/smoke.nula",
+                "fn main() {\n    perform Test.assert_eq(2 + 2, 4)\n}\n",
+            ),
+        ],
         "cli" => vec![(
             "src/main.nula",
             "// CLI template — a starting point for command-line tools.\n//\n// This file demonstrates:\n//   System.arg   — reading command-line arguments (0-indexed)\n//   Env.get      — reading environment variables\n//   FS.write     — writing output to a file\n//   IO.print     — printing to stdout\n//   == nil       — checking whether a value is nil\n\n// ── Helper (defined before `main` so it is in scope) ───────────────────────\n// Print a friendly greeting.  Extracted as a function so the main flow\n// stays readable.\nfn greet(name) {\n  perform IO.print(\"Hello, \" + name + \"!\")\n}\n\n// ── Entry point ────────────────────────────────────────────────────────────\n\nfn main() {\n  // ── 1. Read the target name from the command line ──────────────────────\n  // System.arg(0) = program name; System.arg(1) = script path.\n  // System.arg(2) is the first user argument.\n  let given = perform System.arg(2)\n\n  // ── 2. Fall back to the USER environment variable ─────────────────────\n  // Env.get returns nil when the variable is not set.\n  match given {\n    nil => {\n      let user = perform Env.get(\"USER\")\n      match user {\n        nil => {\n          // ── 3. Hard-coded default when nothing else is available ──────\n          // Both arg and env were nil — use \"World\" as a friendly fallback.\n          let name = \"World\"\n          // Print usage hint because the user didn't supply a name.\n          let prog = perform System.arg(0)\n          perform IO.print(\"Usage: \" + prog + \" <name>\")\n          perform IO.print(\"\")\n          greet(name)\n        }\n        _ => {\n          // Env.get returned a value; use it.\n          greet(user)\n        }\n      }\n    }\n    _ => {\n      // System.arg(2) returned a value; use it.\n      greet(given)\n    }\n  }\n\n  // ── 4. Optional: log the greeting to a file ───────────────────────────\n  // Pass --log <path> to write the greeting to a file.\n  // This shows how to handle optional flags and do file output.\n  let log_path = perform System.arg(3)\n  match log_path {\n    nil => unit,\n    _ => {\n      match log_path {\n        \"--log\" => {\n          let path = perform System.arg(4)\n          match path {\n            nil => {\n              perform IO.print(\"--log requires a file path\")\n            }\n            _ => {\n              // Build the log line with timestamp-like prefix.\n              let ts = perform Env.get(\"NU_TIMESTAMP\")\n              let prefix = match ts {\n                nil => \"[nulang]\",\n                _   => \"[\" + ts + \"]\"\n              }\n              let out_name = match given {\n                nil => match perform Env.get(\"USER\") {\n                  nil => \"World\",\n                  u   => u\n                },\n                n   => n\n              }\n              let line = prefix + \" Greeted \" + out_name\n              let wrote = perform FS.write(path, line)\n              match wrote {\n                nil => perform IO.print(\"Warning: could not write log to \" + path),\n                _   => perform IO.print(\"Logged to \" + path)\n              }\n            }\n          }\n        }\n        _ => unit\n      }\n    }\n  }\n}\n",
@@ -2190,6 +2279,17 @@ struct DeployResponse {
     status: String,
 }
 
+/// Keep cloud deployment diagnostics unchanged when migrating ureq's HTTP
+/// status handling. A rejected request is never treated as a successful deploy.
+#[cfg(feature = "ureq")]
+fn deploy_http_error_message(status: u16, body: &str) -> String {
+    if status == 401 {
+        "Authentication failed. Check your NULANG_CLOUD_TOKEN.".to_string()
+    } else {
+        format!("Deploy failed: {} — {}", status, body)
+    }
+}
+
 /// `nula deploy [--wasm] [--url <url>] [--token <token>] [--adapter <kind>] [--dry-run]`
 /// — build and deploy the current package to Nulang Cloud or another adapter.
 #[cfg(feature = "ureq")]
@@ -2377,32 +2477,37 @@ fn cmd_deploy(
     eprintln!("Deploying {} to {} ...", name, cloud_url);
 
     let url = format!("{}/api/v1/deploy", cloud_url.trim_end_matches('/'));
-    let response: ureq::Response = ureq::post(&url)
-        .set("Authorization", &format!("Bearer {}", token))
-        .set("Content-Type", "application/gzip")
-        .send_bytes(&tarball)
-        .map_err(|e| match e {
-            ureq::Error::Transport(inner) => NuError::PackageError {
-                msg: format!("Failed to connect to {}: {}", cloud_url, inner),
-                span: Span::default(),
-            },
-            ureq::Error::Status(code, resp) => {
-                let body = resp.into_string().unwrap_or_default();
-                NuError::PackageError {
-                    msg: if code == 401 {
-                        "Authentication failed. Check your NULANG_CLOUD_TOKEN.".to_string()
-                    } else {
-                        format!("Deploy failed: {} — {}", code, body)
-                    },
-                    span: Span::default(),
-                }
-            }
+    // ureq 3 returns only the status code on 4xx/5xx errors. Disable that
+    // conversion for this one request so cloud diagnostic bodies and the
+    // special 401 guidance remain available without weakening TLS.
+    let agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+    let mut response = agent
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Content-Type", "application/gzip")
+        .send(&tarball)
+        .map_err(|e| NuError::PackageError {
+            msg: format!("Failed to connect to {}: {}", cloud_url, e),
+            span: Span::default(),
         })?;
-
-    let body = response.into_string().map_err(|e| NuError::PackageError {
-        msg: format!("failed to read response: {}", e),
-        span: Span::default(),
-    })?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        let diagnostic = response.body_mut().read_to_string().unwrap_or_default();
+        return Err(NuError::PackageError {
+            msg: deploy_http_error_message(status, &diagnostic),
+            span: Span::default(),
+        });
+    }
+    let body = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| NuError::PackageError {
+            msg: format!("failed to read response: {}", e),
+            span: Span::default(),
+        })?;
     let deploy: DeployResponse =
         serde_json::from_str(&body).map_err(|e| NuError::PackageError {
             msg: format!("invalid response from cloud: {}", e),
@@ -2607,6 +2712,23 @@ fn cmd_remove(name: Option<&str>) -> NuResult<()> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "ureq")]
+    #[test]
+    fn cloud_deploy_http_errors_preserve_auth_hint_and_server_body() {
+        assert_eq!(
+            deploy_http_error_message(401, "bad-token"),
+            "Authentication failed. Check your NULANG_CLOUD_TOKEN."
+        );
+        assert_eq!(
+            deploy_http_error_message(409, "existing-deployment"),
+            "Deploy failed: 409 — existing-deployment"
+        );
+        assert_eq!(
+            deploy_http_error_message(503, "maintenance"),
+            "Deploy failed: 503 — maintenance"
+        );
+    }
+
     #[test]
     fn test_manifest_language_pin() {
         let dir = std::env::temp_dir().join(format!("nulang_lang_pin_test_{}", std::process::id()));
@@ -2721,6 +2843,38 @@ mod tests {
     }
 
     #[test]
+    fn test_default_template_is_formatter_clean_for_ci() {
+        // A new package must pass the opt-in formatting gate without edits.
+        let dir =
+            std::env::temp_dir().join(format!("nulang_ci_template_fmt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        scaffold_package(&dir, "fmt-app", "default").expect("default scaffold should succeed");
+        for folder in ["src", "tests"] {
+            let result = crate::fmt::format_directory(&dir.join(folder), true);
+            assert!(
+                result.is_ok(),
+                "new default package {folder} is not formatter-clean: {result:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_default_scaffold_includes_a_formatter_clean_smoke_test() {
+        let files = template_files("default");
+        let (_, content) = files
+            .iter()
+            .find(|(path, _)| *path == "tests/smoke.nula")
+            .expect("default scaffold must include a runnable smoke test");
+        assert!(content.contains("Test.assert_eq"));
+        let formatted = crate::fmt::format_source(content).expect("smoke test must format");
+        assert_eq!(
+            &formatted, content,
+            "smoke test must be canonical from creation"
+        );
+    }
+
+    #[test]
     fn test_cmd_new_rejects_unknown_template() {
         let dir = std::env::temp_dir().join(format!("nulang_unk_tmpl_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2752,6 +2906,67 @@ mod tests {
         assert!(matches!(err, NuError::PackageError { msg: _, span: _ }));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_ci_plan_is_deterministic_and_optional_gates_are_explicit() {
+        assert_eq!(ci_steps(false, false), &[CiStep::Build, CiStep::Test]);
+        assert_eq!(
+            ci_steps(false, true),
+            &[CiStep::Format, CiStep::Build, CiStep::Test]
+        );
+        assert_eq!(
+            ci_steps(true, false),
+            &[CiStep::Build, CiStep::Test, CiStep::BuildWeb]
+        );
+        assert_eq!(
+            ci_steps(true, true),
+            &[
+                CiStep::Format,
+                CiStep::Build,
+                CiStep::Test,
+                CiStep::BuildWeb
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ci_stops_on_first_failed_gate() {
+        let mut completed = Vec::new();
+        let error = run_ci_steps(true, false, |step| {
+            completed.push(step);
+            if step == CiStep::Test {
+                Err(NuError::PackageError {
+                    msg: "tests failed".into(),
+                    span: Span::default(),
+                })
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("failed tests must prevent web build");
+        assert!(error.to_string().contains("tests failed"));
+        assert_eq!(completed, [CiStep::Build, CiStep::Test]);
+    }
+
+    #[test]
+    fn test_ci_unknown_and_duplicate_flags_fail_closed() {
+        for args in [
+            vec!["ci".into(), "--skip-tests".into()],
+            vec!["ci".into(), "--web".into(), "--web".into()],
+        ] {
+            let error = run(&args).expect_err("unknown CI flags must not silently weaken gates");
+            assert!(error.to_string().contains("nula ci"));
+        }
+    }
+
+    #[test]
+    fn test_ci_outside_package_fails_before_any_gate() {
+        let dir = std::env::temp_dir().join(format!("nulang_ci_no_package_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = ChangeDir::new(&dir);
+        let error = cmd_ci(false, false).expect_err("CI requires a manifest");
+        assert!(error.to_string().contains("Nulang.toml"));
     }
 
     #[test]
