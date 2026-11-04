@@ -61,7 +61,11 @@ mobile-runtime = []
 # Enables the standalone Savina-style actor benchmark runner without pulling optional subsystems.
 savina-bench = []
 python = ["dep:pyo3"]
-sqlite = ["dep:libsql", "dep:tokio", "dep:hyper", "dep:tokio-rustls", "dep:rustls-native-certs", "dep:tower-service"]
+# Local SQLite stays available without enabling the legacy Hyper 0.14 HTTP/2 client.
+sqlite = ["dep:libsql", "libsql/core", "dep:tokio"]
+# Remote Turso/libSQL compatibility is explicit until its legacy HTTP stack is replaced.
+# WARNING: this opt-in feature still includes h2 0.3.27 (RUSTSEC-2026-0258).
+sqlite-remote = ["sqlite", "libsql/remote", "dep:hyper", "dep:tokio-rustls", "dep:rustls-native-certs", "dep:tower-service"]
 lsp = ["dep:tower-lsp", "dep:tokio", "dep:futures", "dep:tower-service"]
 ai-runtime = ["dep:nulang-ai", "dep:nulang-ai-local", "dep:uuid", "dep:reqwest", "dep:tokio"]
 wasm-backend = ["native-codegen", "dep:wasm-encoder", "dep:wasmtime", "dep:wat", "dep:borsh"]
@@ -156,7 +160,7 @@ pyo3 = { version = "0.29", features = ["auto-initialize", "py-clone"], optional 
 # pulls `replication`/`sync` (embedded-replica gRPC sync via tonic/axum),
 # which nothing in this codebase calls (verified: no `.sync()`/
 # `new_synced_database` usage).
-libsql = { version = "0.10.0-pre.4", optional = true, default-features = false, features = ["core", "remote"] }
+libsql = { version = "0.10.0-pre.4", optional = true, default-features = false, features = ["core"] }
 # libsql's optional `tls` feature locks hyper-rustls 0.25 / rustls 0.22;
 # use its custom Hyper 0.14 connector hook with the patched rustls 0.23 stack.
 hyper = { version = "0.14", features = ["client", "http1", "tcp", "runtime"], optional = true }
