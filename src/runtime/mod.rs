@@ -352,6 +352,18 @@ pub(crate) enum MessageAdmission {
     Rejected,
 }
 
+/// Rejection reason when configuring experimental actor bytecode cancellation.
+///
+/// Durable workflows and suspended executions need a journaled lifecycle
+/// protocol before they can opt in; this enum prevents silent acceptance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorCancellationAdmissionError {
+    ActorNotFound,
+    RuntimeBusy,
+    DurableUnsupported,
+    SuspendedUnsupported,
+}
+
 pub struct Runtime {
     pub actors: HashMap<u64, Actor>,
     pub supervisors: HashMap<u64, Supervisor>,
@@ -730,23 +742,47 @@ impl Runtime {
         }
     }
 
-    /// Attach or clear an opt-in cancellation token for an existing actor.
-    ///
-    /// This is an ephemeral bytecode execution context, not a lifecycle
-    /// command: cancellation returns a VM error and does not terminate the
-    /// actor or remove its mailbox. Native/AOT handlers are not preempted.
-    /// Every runtime VM entry point restores the previous token afterward,
-    /// including error exits and nested actor execution.
+    /// Compatibility convenience API; use try_set_actor_cancellation_token
+    /// when the caller needs a specific rejection reason.
     pub fn set_actor_cancellation_token(
         &mut self,
         actor_id: u64,
         token: Option<crate::task_cancellation::CancellationToken>,
     ) -> bool {
-        let Some(actor) = self.actors.get_mut(&actor_id) else {
-            return false;
-        };
+        self.try_set_actor_cancellation_token(actor_id, token)
+            .is_ok()
+    }
+
+    /// Configure an opt-in, non-durable cancellation context for bytecode
+    /// execution. Never admit cancellation for persistent/workflow actors or
+    /// already-suspended actors: retry, compensation, recovery, and suspension
+    /// semantics are not yet defined for cancelled workflow activations.
+    ///
+    /// Clearing an existing token is permitted while idle, even if the actor
+    /// has become durable or suspended. No context changes are permitted during
+    /// any in-flight VM dispatch, including nested actor execution.
+    pub fn try_set_actor_cancellation_token(
+        &mut self,
+        actor_id: u64,
+        token: Option<crate::task_cancellation::CancellationToken>,
+    ) -> Result<(), ActorCancellationAdmissionError> {
+        if self.vm_execution_depth != 0 || self.current_actor == Some(actor_id) {
+            return Err(ActorCancellationAdmissionError::RuntimeBusy);
+        }
+        let actor = self
+            .actors
+            .get_mut(&actor_id)
+            .ok_or(ActorCancellationAdmissionError::ActorNotFound)?;
+        if token.is_some() {
+            if actor.persistent || actor.is_workflow {
+                return Err(ActorCancellationAdmissionError::DurableUnsupported);
+            }
+            if actor.suspended_execution.is_some() || actor.jit_yield_pending {
+                return Err(ActorCancellationAdmissionError::SuspendedUnsupported);
+            }
+        }
         actor.cancellation_token = token;
-        true
+        Ok(())
     }
 
     /// Compute the BLAKE3 hash of `data` using the configured [`CryptoProvider`].

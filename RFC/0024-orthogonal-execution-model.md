@@ -340,6 +340,45 @@ Phase 1 does not:
   this change only isolates the cancellation context. Native-codegen and
   suspended/async behavior invariants require exact-head hosted validation.
 
+#### Phase 2 durable-workflow cancellation admission gate
+
+Until a journaled cancellation lifecycle is implemented, cancellation token
+admission **fails closed** on persistent actors, workflow actors, already
+suspended actors, and JIT-yield-suspended actors. The runtime also rejects
+token installation/removal during any in-flight shared-VM dispatch or the
+actor's active scheduling turn. The typed
+`Runtime::try_set_actor_cancellation_token` reports `ActorNotFound`,
+`RuntimeBusy`, `DurableUnsupported`, or `SuspendedUnsupported`; the
+existing boolean API delegates to it. Non-durable idle actors retain the
+opt-in cancellation behavior. Clearing an existing token while idle remains
+possible to permit explicit recovery. This is **admission hardening**, not
+full durable cancellation support.
+
+A future durable cancellation contract must specify, test and implement:
+
+1. A durable, activation-fenced `CancelRequested` journal transition before
+   signalling an in-flight workflow or suspended continuation. The request
+   must have a stable identity and be idempotent across restarts and retries.
+2. A distinct terminal `StepCancelled` / `WorkflowCancelled` outcome
+   rather than misreporting explicit cancellation as `StepFailed`. No
+   `StepCompleted` may be committed for the cancelled activation.
+3. Compensation policy: only previously committed successful steps may be
+   compensated; compensation attempts and outcomes require their own durable,
+   replayable records and at-most-once admission, including crash recovery.
+4. Suspended-signal, timer, LLM and selective-receive cleanup: discard or
+   retire exactly one continuation, cancel associated wake timers, and
+   deduplicate late responses without waking a terminal activation.
+5. Recovery replay, cross-node handoff, and cancellation-vs-completion races
+   must agree on one terminal result using durable fencing/epochs. Deadline
+   expiration must be distinguishable from an explicit cancellation.
+6. Backend conformance: interpreter, JIT, WASM, actor scheduler, and
+   workflow storage must agree on cancellation checkpoint and terminal-event
+   semantics. Blocking native effects still cannot be preempted safely.
+
+None of these event schemas or persistence migrations are introduced by the
+admission gate. Actor-scoped tokens remain **ephemeral** and are not restored
+from workflow snapshots.
+
 ### Phase 3 — role decomposition
 
 - migrate virtuality to activation metadata;
