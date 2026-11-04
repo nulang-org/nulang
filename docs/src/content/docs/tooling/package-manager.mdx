@@ -242,6 +242,37 @@ Hello from Nulang!
 entry point. `nulang nula run --watch` (or `nulang nula watch`) re-runs it
 whenever a `.nula` file under `src/` changes.
 
+## Local package CI — `nula ci`
+
+Run the package's existing validation operations in a deterministic, fail-fast
+sequence before opening a pull request:
+
+```bash
+nulang nula ci
+# For a web application, additionally validate its web build:
+nulang nula ci --web
+# Opt into strict formatting checks for supported source:
+nulang nula ci --web --fmt
+```
+
+The default gates run `nula build` and `nula test`. The `--web`
+option adds `nula build --web` afterward. The opt-in `--fmt` gate checks
+Nulang formatting in `src/` and `tests/` (when present) **before** building.
+Formatting is not a default CI gate yet because the experimental formatter
+cannot currently parse every valid generated template, especially Web sources.
+Unknown options fail; there is no `--skip-tests` escape hatch. If a package
+has no tests, `nula test` reports that fact and returns successfully; a
+passing result does not establish test coverage. This command runs in the current directory
+and requires a `Nulang.toml`. It may update the package lockfile and emit
+build artifacts, just like the underlying commands.
+
+**Scope:** `nula ci` validates one Nulang package, not the Nulang compiler
+repository or deployment infrastructure. Passing it does not certify
+security, database/tenant isolation, backend parity, distributed/runtime
+conformance, or deployment readiness. For the compiler repository, use
+`bash scripts/ci-local.sh` (and `--full` for its extended gates), then
+require the exact-head CI results for the proposed commit.
+
 ## Testing — `nula test`
 
 `nula test` discovers `.nula` files under the package's `tests/` directory

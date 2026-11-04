@@ -364,21 +364,25 @@ impl<'a> Lexer<'a> {
     }
 
     /// Run the lexer, producing a vector of tokens. Newlines are preserved
-    /// for semicolon insertion logic but comments are filtered out.
+    /// for semicolon insertion logic but ordinary comments are filtered out.
     pub fn lex(&mut self) -> NuResult<Vec<Token>> {
+        Ok(self
+            .lex_with_trivia()?
+            .into_iter()
+            .filter(|token| !matches!(token.kind, TokenKind::Comment(_)))
+            .collect())
+    }
+
+    /// Lex without discarding comments. Used by source-rewriting tools that
+    /// must not silently drop information absent from the parser AST.
+    pub(crate) fn lex_with_trivia(&mut self) -> NuResult<Vec<Token>> {
         let mut tokens = Vec::new();
         loop {
             let tok = self.next_token()?;
-            match tok.kind {
-                TokenKind::Eof => {
-                    tokens.push(tok);
-                    break;
-                }
-                // Filter out regular comments, keep doc comments as tokens
-                TokenKind::Comment(_) => {
-                    // skip regular comments
-                }
-                _ => tokens.push(tok),
+            let done = matches!(tok.kind, TokenKind::Eof);
+            tokens.push(tok);
+            if done {
+                break;
             }
         }
         Ok(tokens)
