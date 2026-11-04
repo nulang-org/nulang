@@ -1369,11 +1369,15 @@ impl LibsqlStore {
     /// Journal pragmas (`journal_mode`, `synchronous`) are deliberately
     /// skipped: a Turso server manages its own journal and durability
     /// policy.
+    #[cfg(feature = "sqlite-remote")]
     pub fn new_remote(url: &str, auth_token: &str) -> io::Result<Self> {
         let rt =
             tokio::runtime::Runtime::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        crate::runtime::libsql_tls::validate_remote_url(url)?;
+        let tls_connector = crate::runtime::libsql_tls::verified_connector()?;
         let db = rt.block_on(async {
             libsql::Builder::new_remote(url.to_string(), auth_token.to_string())
+                .connector(tls_connector)
                 .build()
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
@@ -1389,6 +1393,18 @@ impl LibsqlStore {
         store.ensure_tables()?;
         Ok(store)
     }
+
+    /// Fail closed when the remote transport and its legacy HTTP stack are absent.
+    /// Retaining this method preserves compile-time API shape for callers while
+    /// making the runtime capability explicit rather than silently connecting.
+    #[cfg(not(feature = "sqlite-remote"))]
+    pub fn new_remote(_url: &str, _auth_token: &str) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "remote libSQL is disabled; rebuild with --features sqlite-remote",
+        ))
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
