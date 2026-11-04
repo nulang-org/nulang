@@ -57,6 +57,67 @@ use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::time::Instant;
 use tracing::instrument;
+
+/// Report the installed CLI environment without changing project state.
+/// Compiled-in features describe availability, not operational readiness.
+fn doctor_report() -> String {
+    use std::fmt::Write as _;
+
+    let mut report = String::new();
+    let executable = std::env::current_exe().ok();
+    let binary = executable
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "unavailable".to_string());
+    let package = std::env::current_dir()
+        .ok()
+        .map(|dir| dir.join("Nulang.toml"))
+        .filter(|p| p.is_file())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "none in current directory".to_string());
+    let stdlib = std::env::var_os("NULANG_STDLIB")
+        .map(PathBuf::from)
+        .or_else(|| {
+            executable
+                .as_ref()
+                .and_then(|p| p.parent())
+                .map(|dir| dir.join("stdlib"))
+        })
+        .map(|p| {
+            if p.is_dir() {
+                format!("{} (found)", p.display())
+            } else {
+                format!("{} (not found; check NULANG_STDLIB for imports)", p.display())
+            }
+        })
+        .unwrap_or_else(|| "not configured".to_string());
+
+    let _ = writeln!(report, "Nulang doctor");
+    let _ = writeln!(report, "compiler version: {VERSION}");
+    let _ = writeln!(
+        report,
+        "language version: {}",
+        nulang::format::constants::LANGUAGE_VERSION_STR
+    );
+    let _ = writeln!(
+        report,
+        "target: {}-{}",
+        std::env::consts::ARCH,
+        std::env::consts::OS
+    );
+    let _ = writeln!(report, "binary: {binary}");
+    let _ = writeln!(report, "stdlib: {stdlib}");
+    let _ = writeln!(report, "package: {package}");
+    let _ = writeln!(
+        report,
+        "compiled features: lsp={}, wasm={}, native={}",
+        cfg!(feature = "lsp"),
+        cfg!(feature = "wasm-backend"),
+        cfg!(feature = "native-codegen")
+    );
+    report
+}
+
 fn main() {
     // Initialize structured tracing (RUST_LOG env var controls verbosity).
     // Default level: warn (silent for normal runs). Users opt in with
@@ -98,7 +159,12 @@ fn main() {
             .init();
     }
 
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    // A simpler spelling for the existing type-check path. Keep its option
+    // parser, diagnostics, and JSON output completely unchanged.
+    if args.get(1).map(String::as_str) == Some("check") {
+        args[1] = "--check".to_string();
+    }
 
     if args.len() <= 1 {
         // If stdin is piped, execute as a script; otherwise start REPL.
@@ -260,8 +326,51 @@ fn main() {
         }
     }
 
-    if args[1] == "nula" {
-        if let Err(e) = nulang::package::commands::run(&args[2..]) {
+    if args[1] == "doctor" {
+        if args.len() != 2 {
+            eprintln!("Usage: nulang doctor");
+            std::process::exit(2);
+        }
+        print!("{}", doctor_report());
+        return;
+    }
+
+    // Reuse the package-manager dispatch instead of implementing duplicate
+    // commands. Retain `nula` and the distinct legacy `init <name>` action.
+    if args[1] == "nula"
+        || matches!(
+            args[1].as_str(),
+            "new"
+                | "build"
+                | "build-wasm"
+                | "test"
+                | "run"
+                | "add"
+                | "remove"
+                | "list"
+                | "clean"
+                | "watch"
+                | "dev"
+                | "doc"
+                | "publish"
+                | "deploy"
+        )
+    {
+        // Do not silently ignore a filename passed to the package runner.
+        // Standalone files already run directly as `nulang file.nula`.
+        if args[1] == "run" && (args.len() > 3 || (args.len() == 3 && args[2] != "--watch")) {
+            eprintln!(
+                "Error: `nulang run` runs the current package; for a standalone file use `nulang {}`",
+                args[2]
+            );
+            std::process::exit(1);
+        }
+        let package_args = if args[1] == "nula" {
+            &args[2..]
+        } else {
+            &args[1..]
+        };
+        if let Err(e) = nulang::package::commands::run(package_args) {
             print_error(&e, true);
             std::process::exit(exit_code(&e));
         }
@@ -1122,7 +1231,8 @@ fn print_help() {
     println!("Usage: nulang [OPTIONS] <FILE>");
     println!("       nulang --repl");
     println!("       nulang --eval <CODE>");
-    println!("       nulang --check <FILE>");
+    println!("       nulang check <FILE>  (or --check <FILE>)");
+    println!("       nulang doctor");
     println!("       nulang --lsp");
     println!("       nulang --dap");
     println!("       nulang fmt [--check] [<file>]");
@@ -1173,9 +1283,10 @@ fn print_help() {
     println!(
         "  --verify <src>   When running a .nbc artifact, verify its source hash against <src>"
     );
-    println!(
-        "  nula <cmd>       Package manager (new, init, build, build-wasm, test, run, add, remove, watch, doc, list, clean)"
-    );
+    println!("  <cmd>            Package commands: new, build, test, run, add, remove,");
+    println!("                   list, clean, watch, dev, doc, publish, deploy");
+    println!("  nula <cmd>       Legacy spelling (also supports init and build-wasm)");
+    println!("  doctor           Show the installed binary and local environment (read-only)");
     println!("  --version, -V    Print version and exit");
     println!("  init <name>      Scaffold experiment");
     println!("  --watch <file>   Re-run on changes");
