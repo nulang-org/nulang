@@ -25,11 +25,36 @@ pub(super) fn validate_remote_url(url: &str) -> io::Result<()> {
             "remote libsql requires an HTTPS or libsql URL; plaintext HTTP is forbidden",
         ));
     }
-    let host = url.split_once("://").map(|(_, rest)| rest).unwrap_or("");
-    if host.is_empty() || host.starts_with('/') || host.contains('@') {
+    // Parse the authority, not the entire tail after `://`: the latter
+    // accepts hostless URLs and mistakes `@` in paths/queries for userinfo.
+    let uri: Uri = url
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid remote libsql URI"))?;
+    let authority = uri.authority().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "remote libsql URI requires a host",
+        )
+    })?;
+    let host = authority.host();
+    if host.is_empty() || authority.as_str().contains('@') || url.contains('#') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "remote libsql URL must specify a host without userinfo",
+            "remote libsql URI requires a host without userinfo or fragments",
+        ));
+    }
+    // Authority's host includes IPv6 brackets but excludes an optional port.
+    // A nonempty suffix therefore must be a valid numeric port, not `:abc`.
+    let suffix = authority.as_str().strip_prefix(host).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid remote libsql authority",
+        )
+    })?;
+    if !suffix.is_empty() && (!suffix.starts_with(':') || authority.port_u16().is_none()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "remote libsql URI has an invalid port",
         ));
     }
     Ok(())
@@ -154,11 +179,17 @@ mod tests {
             "libsql://",
             "https:///foo",
             "https://user:pass@example.com",
+            "https://?token=abc",
+            "https://#fragment",
+            "https://:443/path",
+            "https://example.com/#fragment",
+            "https://example.com:badport/path",
         ] {
             assert!(validate_remote_url(invalid).is_err(), "{invalid}");
         }
         assert!(validate_remote_url("libsql://example.com").is_ok());
         assert!(validate_remote_url("https://example.com").is_ok());
+        assert!(validate_remote_url("https://example.com/path?email=a@b.test").is_ok());
     }
 
     #[tokio::test]
