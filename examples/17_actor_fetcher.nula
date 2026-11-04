@@ -22,7 +22,7 @@
 //   - Builds a text report and writes it to disk with FS.write
 //
 // Run:  nulang examples/17_actor_fetcher.nula
-// Also: /tmp/cargo-target/debug/nulang examples/17_actor_fetcher.nula
+// Also: ./target/debug/nulang examples/17_actor_fetcher.nula
 
 import stdlib::json
 import stdlib::datetime

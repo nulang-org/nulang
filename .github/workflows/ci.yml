@@ -142,6 +142,10 @@ jobs:
     name: Release Build
     runs-on: ubuntu-latest
     timeout-minutes: 75
+    # Keep the compiled CLI and the artifact-check path consistent. This
+    # override also isolates the release lane from any local Cargo cache.
+    env:
+      CARGO_TARGET_DIR: target
     steps:
       - uses: actions/checkout@v7
 
@@ -163,12 +167,12 @@ jobs:
         run: cargo test --locked --release --no-default-features --features release-cli
 
       - name: Verify Linux CLI has no Python ABI linkage
-        run: bash scripts/check_release_linux.sh /tmp/cargo-target/release/nulang
+        run: bash scripts/check_release_linux.sh target/release/nulang
 
       - name: Stage tested release binary
         run: |
           mkdir -p ci-artifacts
-          cp /tmp/cargo-target/release/nulang ci-artifacts/nulang
+          cp target/release/nulang ci-artifacts/nulang
 
       - name: Upload tested release binary
         uses: actions/upload-artifact@v7

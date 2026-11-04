@@ -14,6 +14,26 @@ cargo build --release
 Requires Rust 1.95.0 (pinned by `rust-toolchain.toml`), Linux or macOS.
 Windows is unsupported; use WSL.
 
+### Low-memory and disk-backed development
+
+The default Cargo target is `./target/`, rather than RAM-backed `/tmp`.
+On Linux systems where `/tmp` is tmpfs or quota-limited, invoke the optional
+wrapper so C/C++ compiler scratch files also land on persistent storage:
+
+```bash
+CARGO_BUILD_JOBS=2 bash scripts/cargo-disk.sh check --locked --no-default-features --bin nulang
+# For full default features, with the system OpenSSL development tools installed:
+CARGO_BUILD_JOBS=2 bash scripts/cargo-disk.sh check --locked --bin nulang
+```
+
+The wrapper uses the ignored `./.build-tmp/` directory for compiler
+temporary files, forwards Cargo arguments and failure codes unchanged, and
+does not remove other checkouts' caches. Lowering `CARGO_BUILD_JOBS` trades
+compilation speed for lower peak memory. Full-feature builds require
+OpenSSL development headers and `pkg-config` (or equivalent explicit
+`OPENSSL_INCLUDE_DIR` and `OPENSSL_LIB_DIR` settings).
+
+
 ## Run the tests
 
 ```bash
