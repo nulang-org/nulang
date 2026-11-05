@@ -150,6 +150,23 @@ render_direct_route(...)                   -> path-only compatibility API
 
 `WebDevServer` constructs `RequestBindingValues` from the real HTTP request and selects `render_direct_request(...)` for complete plans. `Ok(None)` deliberately retains the legacy renderer for routes that still depend on ambient `Web.param(...)` behavior. Typed decode failures never silently fall back to legacy execution.
 
+### Repeated URL-encoded inputs
+
+HTTP request capture preserves every occurrence of query and URL-encoded form
+fields, including names that become identical after percent decoding (for
+example `title` and `%74itle`). A direct compiler-bound **scalar** `from query`
+or `from form` parameter accepts exactly one occurrence. Missing inputs produce
+HTTP 400 `missing_request_input`; repeated inputs produce HTTP 400
+`ambiguous_request_input` rather than implicitly choosing the first or last.
+Both errors use the existing `application/problem+json` response.
+
+The legacy `parse_urlencoded` convenience API continues to select the final
+value for compatibility; HTTP capture instead uses `parse_urlencoded_multi`.
+Collection bindings and checkbox-list decoding are **not yet supported** by the
+direct handler ABI. Internal UI-action envelopes and identities also reject
+repeated fields rather than inheriting last-value behavior.
+
+
 Both typed and legacy calls remain inside the existing request context during the migration period. This preserves current request helpers and response-cookie behavior while argument sourcing moves to compiler-owned bindings.
 
 Network-level regression coverage compiles real Nulang handlers and route contracts, starts `WebDevServer` on an ephemeral TCP port, and verifies successful typed query decoding, `400 application/problem+json` decode failures, and legacy route fallback over the wire.
