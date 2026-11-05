@@ -7,10 +7,11 @@ default request pipeline. Importing an authentication package does not make it
 an automatic authorization boundary.
 
 The bundled @nulang/auth module is a development example: it accepts arbitrary
-user identities via login(user), assigns predictable incrementing session
-tokens, and stores sessions in an ephemeral KV namespace. A configured
-AUTH_COOKIE_SECRET does **not** upgrade that module into a verified production
-identity provider.
+user identities via login(user) and stores sessions in an ephemeral KV namespace.
+This integration adds cryptographically random session identifiers and
+development-only synchronizer CSRF tokens, but those improvements do **not**
+turn the module into a verified production identity provider. A configured
+AUTH_COOKIE_SECRET cannot establish identity or tenant authorization.
 
 The package manager now fails closed for deployments that import or depend on
 the known development-only @nulang/auth package. The source scanner uses

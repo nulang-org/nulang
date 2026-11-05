@@ -2205,7 +2205,7 @@ fn validate_deploy_security(root: &Path, manifest: &Manifest) -> NuResult<()> {
 
     if demo_dependency || demo_import {
         return Err(NuError::PackageError {
-            msg: "@nulang/auth is development-only: sequential session tokens and unverified login(user) cannot be deployed. Replace it with verified authentication and server-side authorization before deploying.".to_string(),
+            msg: "@nulang/auth is development-only: arbitrary login(user) and ephemeral sessions are not verified production authentication, even with secure random tokens. Replace it with verified authentication and server-side authorization before deploying.".to_string(),
             span: Span::default(),
         });
     }
@@ -2237,7 +2237,7 @@ fn cmd_deploy(
     let name = manifest.package.name.clone();
     let version = manifest.package.version.clone();
 
-    // Bundled auth uses sequential KV session tokens and unverified login(user).
+    // Bundled auth permits arbitrary demo logins and stores ephemeral sessions.
     validate_deploy_security(&root, &manifest)?;
 
     // Build the web output so dist/ contains the IR and static assets.
