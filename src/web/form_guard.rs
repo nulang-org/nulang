@@ -167,6 +167,19 @@ impl GuardedFormRoute {
             return Err("form guard fields do not match the compiler binding plan".into());
         }
         for (binding, field) in form_bindings.iter().zip(&self.form.fields) {
+            // The VM's direct handler ABI currently materializes only scalar
+            // constants. Optional/repeated host-side form values must not be
+            // passed to it until the compiler emits true variant/array values.
+            if field.shape != crate::web::forms::FormFieldShape::Required {
+                return Err("optional/repeated form inputs need typed VM binding support".into());
+            }
+            // String-backed domain identifiers are still supported, but an
+            // arbitrary structured type cannot be represented by Constant::String.
+            if !crate::web::request_bindings::scalar_binding_supported(binding.ty.as_deref()) {
+                return Err(
+                    "structured form handler type is not supported by scalar VM binding".into(),
+                );
+            }
             if field.name == "__nulang_csrf"
                 || field.name == "__nulang_ui_message"
                 || field.name == "__nulang_action"

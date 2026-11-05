@@ -42,6 +42,16 @@ pub enum FormRule {
     MaxFloat(f64),
 }
 
+/// Host-side field multiplicity. Non-scalar shapes are not yet VM-bindable.
+/// A guarded runtime route must reject them until the compiler/VM supports
+/// representing Option[T] and typed arrays as actual runtime values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormFieldShape {
+    Required,
+    Optional,
+    Repeated { min_items: usize, max_items: usize },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FormFieldContract {
     pub name: String,
@@ -49,6 +59,7 @@ pub struct FormFieldContract {
     pub source_type: Option<String>,
     pub field_type: FormFieldType,
     pub rules: Vec<FormRule>,
+    pub shape: FormFieldShape,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -60,7 +71,11 @@ pub struct FormContract {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedForm {
+    /// Present scalar values; omitted optional fields are absent, never
+    /// silently coerced into empty strings or null-like scalar constants.
     pub values: BTreeMap<String, Constant>,
+    /// Decoded typed groups kept separate from scalar handler ABI values.
+    pub repeated: BTreeMap<String, Vec<Constant>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +147,7 @@ impl FormContract {
                 source_type: binding.ty.clone(),
                 field_type: FormFieldType::from_source_type(binding.ty.as_deref()),
                 rules: Vec::new(),
+                shape: FormFieldShape::Required,
             });
         }
 
@@ -157,6 +173,21 @@ impl FormContract {
         Ok(self)
     }
 
+    /// Configure host-side optional or repeated input, without pretending
+    /// that the current VM scalar handler ABI can consume such values.
+    /// Shape reconfiguration is rejected to make policies reviewable.
+    pub fn with_shape(mut self, name: &str, shape: FormFieldShape) -> Result<Self, String> {
+        let Some(field) = self.fields.iter_mut().find(|field| field.name == name) else {
+            return Err(format!("unknown form field '{name}'"));
+        };
+        if field.shape != FormFieldShape::Required || shape == FormFieldShape::Required {
+            return Err("form field shape may only be configured once".into());
+        }
+        validate_shape(shape)?;
+        field.shape = shape;
+        Ok(self)
+    }
+
     /// Reject mutated, mismatched or contradictory form metadata at the
     /// admission boundary, even if callers bypassed the with_rules builder.
     pub(crate) fn check_configuration(&self) -> Result<(), String> {
@@ -172,57 +203,79 @@ impl FormContract {
                 ));
             }
             check_rules(field.field_type, &field.rules)?;
+            validate_shape(field.shape)?;
         }
         Ok(())
     }
 
-    /// Validate all compiler-declared form fields in deterministic handler order.
-    /// Extra form keys are ignored (e.g. CSRF tokens or application metadata).
-    /// All declared fields are required until optional typed bindings exist.
+    /// Validate declared form fields in handler order. Repeated values are
+    /// decoded individually and preserve order (including encoded key aliases).
+    /// The VM scalar binder remains deliberately separate from this result.
     pub fn validate(
         &self,
         submitted: &HashMap<String, Vec<String>>,
     ) -> Result<ValidatedForm, FormValidationErrors> {
         let mut values = BTreeMap::new();
+        let mut repeated = BTreeMap::new();
         let mut issues = Vec::new();
 
         for field in &self.fields {
-            let raw = match submitted.get(&field.name).map(Vec::as_slice) {
-                None | Some([]) => {
-                    issues.push(issue(field, "required", "This field is required"));
-                    continue;
+            let raw_values = submitted.get(&field.name).map(Vec::as_slice).unwrap_or(&[]);
+            match field.shape {
+                FormFieldShape::Required | FormFieldShape::Optional => {
+                    if raw_values.len() > 1 {
+                        issues.push(issue(field, "multiple", "Expected a single field value"));
+                        continue;
+                    }
+                    let raw = raw_values.first().map(String::as_str);
+                    if raw.is_none() || raw == Some("") {
+                        if field.shape == FormFieldShape::Required {
+                            issues.push(issue(field, "required", "This field is required"));
+                        }
+                        continue;
+                    }
+                    match decode_checked(field, raw.unwrap()) {
+                        Ok(value) => {
+                            values.insert(field.name.clone(), value);
+                        }
+                        Err(error) => issues.push(error),
+                    }
                 }
-                Some([raw]) => raw.as_str(),
-                Some(_) => {
-                    issues.push(issue(field, "multiple", "Expected a single field value"));
-                    continue;
+                FormFieldShape::Repeated {
+                    min_items,
+                    max_items,
+                } => {
+                    if raw_values.len() < min_items {
+                        issues.push(issue(field, "too_few", "Not enough field values"));
+                        continue;
+                    }
+                    if raw_values.len() > max_items {
+                        issues.push(issue(field, "too_many", "Too many field values"));
+                        continue;
+                    }
+                    let mut decoded = Vec::with_capacity(raw_values.len());
+                    let mut first_error = None;
+                    for raw in raw_values {
+                        match decode_checked(field, raw) {
+                            Ok(value) => decoded.push(value),
+                            Err(error) => {
+                                if first_error.is_none() {
+                                    first_error = Some(error);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(error) = first_error {
+                        issues.push(error);
+                    } else {
+                        repeated.insert(field.name.clone(), decoded);
+                    }
                 }
-            };
-
-            // HTML required controls disallow empty strings; enforce the same
-            // property server-side instead of trusting browser validation.
-            if raw.is_empty() {
-                issues.push(issue(field, "required", "This field is required"));
-                continue;
-            }
-
-            let value = match decode_scalar_constant(raw, field.source_type.as_deref()) {
-                Ok(value) => value,
-                Err(_) => {
-                    issues.push(issue(field, "invalid_type", "Invalid field value"));
-                    continue;
-                }
-            };
-
-            if let Some(rule_issue) = check_value(field, &value) {
-                issues.push(rule_issue);
-            } else {
-                values.insert(field.name.clone(), value);
             }
         }
 
         if issues.is_empty() {
-            Ok(ValidatedForm { values })
+            Ok(ValidatedForm { values, repeated })
         } else {
             Err(FormValidationErrors { issues })
         }
@@ -240,66 +293,139 @@ impl FormContract {
         for (index, field) in self.fields.iter().enumerate() {
             let id = format!("nulang-field-{index}");
             let name = escape_html(&field.name);
-            let raw = submitted
-                .get(&field.name)
-                .and_then(|values| (values.len() == 1).then(|| values[0].as_str()))
-                .unwrap_or("");
-            let value = escape_html(raw);
             let error =
                 errors.and_then(|errors| errors.issues.iter().find(|e| e.field == field.name));
-
-            html.push_str(&format!("<label for=\"{id}\">{name}</label>"));
-            let mut attributes = format!("id=\"{id}\" name=\"{name}\" required");
-            if error.is_some() {
-                attributes.push_str(&format!(
-                    " aria-invalid=\"true\" aria-describedby=\"{id}-error\""
-                ));
-            }
-
-            match field.field_type {
-                FormFieldType::Bool => {
-                    html.push_str(&format!("<select {attributes}>"));
-                    html.push_str("<option value=\"\">Select an option</option>");
-                    for choice in ["true", "false"] {
-                        let selected = if raw == choice { " selected" } else { "" };
-                        html.push_str(&format!(
-                            "<option value=\"{choice}\"{selected}>{choice}</option>"
-                        ));
-                    }
-                    html.push_str("</select>");
-                }
-                kind => {
-                    let (input_type, step) = match kind {
-                        FormFieldType::Text => ("text", ""),
-                        FormFieldType::Int => ("number", " step=\"1\""),
-                        FormFieldType::Float => ("number", " step=\"any\""),
-                        FormFieldType::Bool => unreachable!(),
-                    };
-                    for rule in &field.rules {
-                        let attr = match rule {
-                            FormRule::MinLength(value) => format!(" minlength=\"{value}\""),
-                            FormRule::MaxLength(value) => format!(" maxlength=\"{value}\""),
-                            FormRule::MinInt(value) => format!(" min=\"{value}\""),
-                            FormRule::MaxInt(value) => format!(" max=\"{value}\""),
-                            FormRule::MinFloat(value) => format!(" min=\"{value}\""),
-                            FormRule::MaxFloat(value) => format!(" max=\"{value}\""),
-                        };
-                        attributes.push_str(&attr);
-                    }
+            let submitted_values = submitted.get(&field.name).map(Vec::as_slice).unwrap_or(&[]);
+            if let FormFieldShape::Repeated { .. } = field.shape {
+                html.push_str(&format!("<fieldset><legend>{name}</legend>"));
+                // One blank control enables manual progressive enhancement
+                // when the client has not submitted any items yet.
+                let blanks = [String::new()];
+                let display_values = if submitted_values.is_empty() {
+                    blanks.as_slice()
+                } else {
+                    submitted_values
+                };
+                for (item, raw) in display_values.iter().enumerate() {
+                    let input_id = format!("{id}-item-{item}");
                     html.push_str(&format!(
-                        "<input {attributes} type=\"{input_type}\"{step} value=\"{value}\">"
+                        "<label for=\"{input_id}\">{name} {}</label>",
+                        item + 1
                     ));
+                    render_control(&mut html, field, &input_id, raw, error);
                 }
-            }
-
-            if let Some(error) = error {
-                html.push_str(&format!(
-                    "<span id=\"{id}-error\" role=\"alert\">{}</span>",
-                    escape_html(error.message)
-                ));
+                render_error(&mut html, &id, error);
+                html.push_str("</fieldset>");
+            } else {
+                html.push_str(&format!("<label for=\"{id}\">{name}</label>"));
+                let raw = if submitted_values.len() == 1 {
+                    submitted_values[0].as_str()
+                } else {
+                    ""
+                };
+                render_control(&mut html, field, &id, raw, error);
+                render_error(&mut html, &id, error);
             }
         }
         html
+    }
+}
+
+fn validate_shape(shape: FormFieldShape) -> Result<(), String> {
+    if let FormFieldShape::Repeated {
+        min_items,
+        max_items,
+    } = shape
+    {
+        if max_items == 0 || min_items > max_items || max_items > 64 {
+            return Err(
+                "repeated form field requires 1..=64 maximum items and minimum <= maximum".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn decode_checked(field: &FormFieldContract, raw: &str) -> Result<Constant, FormFieldError> {
+    if raw.is_empty() {
+        return Err(issue(
+            field,
+            "required",
+            "This field value must not be empty",
+        ));
+    }
+    let value = decode_scalar_constant(raw, field.source_type.as_deref())
+        .map_err(|_| issue(field, "invalid_type", "Invalid field value"))?;
+    if let Some(problem) = check_value(field, &value) {
+        return Err(problem);
+    }
+    Ok(value)
+}
+
+fn render_control(
+    html: &mut String,
+    field: &FormFieldContract,
+    id: &str,
+    raw: &str,
+    error: Option<&FormFieldError>,
+) {
+    let name = escape_html(&field.name);
+    let value = escape_html(raw);
+    let required = if field.shape == FormFieldShape::Required {
+        " required"
+    } else {
+        ""
+    };
+    let mut attributes = format!("id=\"{id}\" name=\"{name}\"{required}");
+    if error.is_some() {
+        let err_id = id.split("-item-").next().unwrap_or(id);
+        attributes.push_str(&format!(
+            " aria-invalid=\"true\" aria-describedby=\"{err_id}-error\""
+        ));
+    }
+    match field.field_type {
+        FormFieldType::Bool => {
+            html.push_str(&format!("<select {attributes}>"));
+            html.push_str("<option value=\"\">Select an option</option>");
+            for choice in ["true", "false"] {
+                let selected = if raw == choice { " selected" } else { "" };
+                html.push_str(&format!(
+                    "<option value=\"{choice}\"{selected}>{choice}</option>"
+                ));
+            }
+            html.push_str("</select>");
+        }
+        kind => {
+            let (input_type, step) = match kind {
+                FormFieldType::Text => ("text", ""),
+                FormFieldType::Int => ("number", " step=\"1\""),
+                FormFieldType::Float => ("number", " step=\"any\""),
+                FormFieldType::Bool => unreachable!(),
+            };
+            for rule in &field.rules {
+                let attr = match rule {
+                    FormRule::MinLength(value) => format!(" minlength=\"{value}\""),
+                    FormRule::MaxLength(value) => format!(" maxlength=\"{value}\""),
+                    FormRule::MinInt(value) => format!(" min=\"{value}\""),
+                    FormRule::MaxInt(value) => format!(" max=\"{value}\""),
+                    FormRule::MinFloat(value) => format!(" min=\"{value}\""),
+                    FormRule::MaxFloat(value) => format!(" max=\"{value}\""),
+                };
+                attributes.push_str(&attr);
+            }
+            html.push_str(&format!(
+                "<input {attributes} type=\"{input_type}\"{step} value=\"{value}\">"
+            ));
+        }
+    }
+}
+
+fn render_error(html: &mut String, id: &str, error: Option<&FormFieldError>) {
+    if let Some(error) = error {
+        html.push_str(&format!(
+            "<span id=\"{id}-error\" role=\"alert\">{}</span>",
+            escape_html(error.message)
+        ));
     }
 }
 
