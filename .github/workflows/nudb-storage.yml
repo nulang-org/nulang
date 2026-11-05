@@ -52,6 +52,8 @@ jobs:
         run: |
           cargo test --locked --no-default-features --test nudb_wal_budget
           cargo test --locked --no-default-features --test nudb_durable_wal_quota
+          # Includes test-only simulated ENOSPC after partial WAL append.
+          cargo test --locked --no-default-features --lib database::wal::hardening_tests
       # The capacity profile is an intentionally ignored, load-sensitive
       # diagnostic benchmark; do not treat its opt-in timing as a CI gate.
       - name: Batch WAL contract
