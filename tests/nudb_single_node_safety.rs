@@ -9,6 +9,9 @@ use nulang::database::tablet::{KeyRange, TabletDescriptor, TabletId, TabletMutat
 use nulang::database::wal::FileWal;
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
+// Child-process spawning may inherit a live WAL lock between fork and exec.
+// Serialize these owner/reacquire assertions with the process-spawning fixture.
+static WAL_OWNER_PROCESS_BARRIER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn wal_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -44,6 +47,7 @@ fn cleanup(path: &Path) {
 
 #[test]
 fn duplicate_key_in_one_commit_survives_checkpoint_and_restart() {
+    let _process_barrier = WAL_OWNER_PROCESS_BARRIER.lock().unwrap();
     let path = wal_path("duplicate");
     cleanup(&path);
 
@@ -74,6 +78,7 @@ fn duplicate_key_in_one_commit_survives_checkpoint_and_restart() {
 
 #[test]
 fn second_writer_is_excluded_before_mutating_the_wal() {
+    let _process_barrier = WAL_OWNER_PROCESS_BARRIER.lock().unwrap();
     let path = wal_path("exclusive");
     cleanup(&path);
 
@@ -119,6 +124,7 @@ fn child_writer_holds_lock_when_invoked_as_fixture() {
 
 #[test]
 fn competing_process_is_fenced_and_owner_kill_releases_lock() {
+    let _process_barrier = WAL_OWNER_PROCESS_BARRIER.lock().unwrap();
     use std::process::{Command, Stdio};
     use std::thread;
     use std::time::Duration;
@@ -172,6 +178,7 @@ fn competing_process_is_fenced_and_owner_kill_releases_lock() {
 #[cfg(unix)]
 #[test]
 fn symlink_hardlink_and_relative_aliases_cannot_bypass_writer_lock() {
+    let _process_barrier = WAL_OWNER_PROCESS_BARRIER.lock().unwrap();
     use std::os::unix::fs::symlink;
 
     let path = wal_path("aliases");

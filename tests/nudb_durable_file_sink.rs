@@ -19,8 +19,16 @@ impl Sandbox {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir(&p).unwrap();
-        fs::create_dir(p.join("effects")).unwrap();
+        // The sink rejects group/other-writable directories. Use explicit
+        // private modes so the fixture works with umask 0002 as well as 0022.
+        let mut dirs = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            dirs.mode(0o700);
+        }
+        dirs.create(&p).unwrap();
+        dirs.create(p.join("effects")).unwrap();
         Self(p)
     }
     fn registry(&self) -> PathBuf {
@@ -35,6 +43,18 @@ impl Drop for Sandbox {
         fs::remove_dir_all(&self.0).unwrap();
     }
 }
+#[cfg(unix)]
+#[test]
+fn fixture_directories_are_private_independent_of_umask() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let s = Sandbox::new();
+    for path in [&s.0, &s.sink()] {
+        let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "fixture directory must be private: {path:?}");
+    }
+}
+
 fn reg(s: &Sandbox) -> DurableRetentionRegistry {
     DurableRetentionRegistry::open(s.registry(), 201, 4).unwrap()
 }
