@@ -10,17 +10,18 @@ use std::fmt;
 #[derive(Debug)]
 pub struct RequestBindingValues<'a> {
     pub path: &'a HashMap<String, String>,
-    pub query: &'a HashMap<String, String>,
+    pub query: &'a HashMap<String, Vec<String>>,
     pub headers: &'a [(String, String)],
     pub cookies: &'a HashMap<String, String>,
     pub body: Option<&'a str>,
-    pub form: &'a HashMap<String, String>,
+    pub form: &'a HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestDecodeErrorKind {
     Missing,
     InvalidType,
+    Ambiguous,
     DuplicateHandlerSlot,
     InvalidHandlerSlot,
     IncompleteBindingPlan,
@@ -43,7 +44,9 @@ impl RequestDecodeError {
     pub fn is_client_error(&self) -> bool {
         matches!(
             self.kind,
-            RequestDecodeErrorKind::Missing | RequestDecodeErrorKind::InvalidType
+            RequestDecodeErrorKind::Missing
+                | RequestDecodeErrorKind::InvalidType
+                | RequestDecodeErrorKind::Ambiguous
         )
     }
 
@@ -66,6 +69,7 @@ impl RequestDecodeError {
         match self.kind {
             RequestDecodeErrorKind::Missing => "missing_request_input",
             RequestDecodeErrorKind::InvalidType => "invalid_request_input",
+            RequestDecodeErrorKind::Ambiguous => "ambiguous_request_input",
             RequestDecodeErrorKind::DuplicateHandlerSlot => "duplicate_handler_slot",
             RequestDecodeErrorKind::InvalidHandlerSlot => "invalid_handler_slot",
             RequestDecodeErrorKind::IncompleteBindingPlan => "incomplete_binding_plan",
@@ -179,18 +183,31 @@ pub fn bind_request_arguments(
             ));
         }
 
-        let raw = lookup(binding, values).ok_or_else(|| {
-            error(
-                binding,
-                RequestDecodeErrorKind::Missing,
-                format!(
-                    "missing {} input '{}' for handler parameter '{}'",
-                    source_name(binding.source),
-                    binding.source_name,
-                    binding.handler_param
-                ),
-            )
-        })?;
+        let raw = lookup(binding, values)
+            .map_err(|()| {
+                error(
+                    binding,
+                    RequestDecodeErrorKind::Ambiguous,
+                    format!(
+                        "multiple {} values for scalar input '{}' on handler parameter '{}'",
+                        source_name(binding.source),
+                        binding.source_name,
+                        binding.handler_param
+                    ),
+                )
+            })?
+            .ok_or_else(|| {
+                error(
+                    binding,
+                    RequestDecodeErrorKind::Missing,
+                    format!(
+                        "missing {} input '{}' for handler parameter '{}'",
+                        source_name(binding.source),
+                        binding.source_name,
+                        binding.handler_param
+                    ),
+                )
+            })?;
         let value = decode_scalar_constant(raw, binding.ty.as_deref()).map_err(|message| {
             error(
                 binding,
@@ -245,10 +262,10 @@ fn error(
 fn lookup<'a>(
     binding: &RouteBindingContract,
     values: &'a RequestBindingValues<'a>,
-) -> Option<&'a str> {
-    match binding.source {
+) -> Result<Option<&'a str>, ()> {
+    let scalar = match binding.source {
         RouteBindingSource::Path => values.path.get(&binding.source_name).map(String::as_str),
-        RouteBindingSource::Query => values.query.get(&binding.source_name).map(String::as_str),
+        RouteBindingSource::Query => return unique_value(values.query.get(&binding.source_name)),
         RouteBindingSource::Header => values
             .headers
             .iter()
@@ -256,7 +273,19 @@ fn lookup<'a>(
             .map(|(_, value)| value.as_str()),
         RouteBindingSource::Cookie => values.cookies.get(&binding.source_name).map(String::as_str),
         RouteBindingSource::Body => values.body,
-        RouteBindingSource::Form => values.form.get(&binding.source_name).map(String::as_str),
+        RouteBindingSource::Form => return unique_value(values.form.get(&binding.source_name)),
+    };
+    Ok(scalar)
+}
+
+/// A scalar handler binding must not guess which value to choose when a
+/// request contains repeated query or form fields. Future collection bindings
+/// can consume the preserved values without losing information.
+fn unique_value(values: Option<&Vec<String>>) -> Result<Option<&str>, ()> {
+    match values {
+        None => Ok(None),
+        Some(values) if values.len() == 1 => Ok(values.first().map(String::as_str)),
+        Some(_) => Err(()),
     }
 }
 
@@ -297,16 +326,36 @@ pub fn split_request_target(target: &str) -> (String, HashMap<String, String>) {
     (path.to_string(), parse_urlencoded(query.as_bytes()))
 }
 
-pub fn parse_urlencoded(input: &[u8]) -> HashMap<String, String> {
-    let mut out = HashMap::new();
+/// Preserve all occurrences, including encoded aliases of the same field name.
+/// Transport-level values are retained even where the current handler ABI only
+/// supports a scalar, so repeated fields cannot be silently overwritten.
+pub fn parse_urlencoded_multi(input: &[u8]) -> HashMap<String, Vec<String>> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
     for part in String::from_utf8_lossy(input).split('&') {
         if part.is_empty() {
             continue;
         }
         let (key, value) = part.split_once('=').unwrap_or((part, ""));
-        out.insert(percent_decode_form(key), percent_decode_form(value));
+        out.entry(percent_decode_form(key))
+            .or_default()
+            .push(percent_decode_form(value));
     }
     out
+}
+
+/// Legacy last-value projection retained for existing callers. Compiler-bound
+/// routes use parse_urlencoded_multi and fail closed on ambiguous scalar input.
+pub fn parse_urlencoded(input: &[u8]) -> HashMap<String, String> {
+    parse_urlencoded_multi(input)
+        .into_iter()
+        .filter_map(|(key, mut values)| values.pop().map(|value| (key, value)))
+        .collect()
+}
+
+/// Multi-value counterpart of split_request_target for compiler-bound HTTP routes.
+pub fn split_request_target_multi(target: &str) -> (String, HashMap<String, Vec<String>>) {
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    (path.to_string(), parse_urlencoded_multi(query.as_bytes()))
 }
 
 pub fn parse_cookie_header(header: &str) -> HashMap<String, String> {
@@ -387,10 +436,10 @@ mod tests {
     #[test]
     fn binds_all_request_sources() {
         let path = HashMap::from([("id".into(), "42".into())]);
-        let query = HashMap::from([("limit".into(), "25".into())]);
+        let query = HashMap::from([("limit".into(), vec!["25".into()])]);
         let headers = vec![("X-Trace".into(), "abc".into())];
         let cookies = HashMap::from([("session".into(), "s1".into())]);
-        let form = HashMap::from([("title".into(), "hello".into())]);
+        let form = HashMap::from([("title".into(), vec!["hello".into()])]);
         let values = RequestBindingValues {
             path: &path,
             query: &query,
@@ -416,7 +465,8 @@ mod tests {
     #[test]
     fn invalid_scalar_returns_structured_client_error() {
         let empty = HashMap::new();
-        let query = HashMap::from([("limit".into(), "many".into())]);
+        let empty_multi = HashMap::<String, Vec<String>>::new();
+        let query = HashMap::from([("limit".into(), vec!["many".into()])]);
         let headers = Vec::new();
         let values = RequestBindingValues {
             path: &empty,
@@ -424,7 +474,7 @@ mod tests {
             headers: &headers,
             cookies: &empty,
             body: None,
-            form: &empty,
+            form: &empty_multi,
         };
         let err = bind_request_arguments(
             &[binding(RouteBindingSource::Query, "limit", 0, "Int")],
@@ -453,14 +503,15 @@ mod tests {
     #[test]
     fn binding_plan_failures_are_server_errors() {
         let empty = HashMap::new();
+        let empty_multi = HashMap::<String, Vec<String>>::new();
         let headers = Vec::new();
         let values = RequestBindingValues {
             path: &empty,
-            query: &empty,
+            query: &empty_multi,
             headers: &headers,
             cookies: &empty,
             body: None,
-            form: &empty,
+            form: &empty_multi,
         };
         let err = bind_request_arguments(&[], 1, &values).unwrap_err();
         assert_eq!(err.kind, RequestDecodeErrorKind::IncompleteBindingPlan);
@@ -473,14 +524,15 @@ mod tests {
     #[test]
     fn missing_input_is_a_400_problem() {
         let empty = HashMap::new();
+        let empty_multi = HashMap::<String, Vec<String>>::new();
         let headers = Vec::new();
         let values = RequestBindingValues {
             path: &empty,
-            query: &empty,
+            query: &empty_multi,
             headers: &headers,
             cookies: &empty,
             body: None,
-            form: &empty,
+            form: &empty_multi,
         };
         let err = bind_request_arguments(
             &[binding(RouteBindingSource::Header, "X-Trace", 0, "String")],
