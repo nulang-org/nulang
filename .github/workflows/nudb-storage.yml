@@ -107,5 +107,7 @@ jobs:
           cargo test --locked --no-default-features --test nudb_single_node_safety
           cargo test --locked --no-default-features --test nudb_legacy_checkpoint
           cargo test --locked --no-default-features --test nudb_crash_recovery
+          # Linux RLIMIT_FSIZE exercises genuine EFBIG; not ENOSPC or OOM.
+          cargo test --locked --no-default-features --test nudb_kernel_write_limit
       - name: Benchmark harness compiles
         run: cargo bench --locked --no-default-features --bench bench_main --no-run
