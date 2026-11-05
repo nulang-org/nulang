@@ -13,8 +13,10 @@ AUTH_COOKIE_SECRET does **not** upgrade that module into a verified production
 identity provider.
 
 The package manager now fails closed for deployments that import or depend on
-the known development-only @nulang/auth package. This also applies to
-deployment dry runs; local development builds remain available. Deployable
+the known development-only @nulang/auth package. The source scanner uses
+Nulang lexer tokens (not literal import lines) and refuses missing/unreadable or
+symlinked paths under `src/` rather than silently excluding them. This
+also applies to deployment dry runs; local development builds remain available. Deployable
 apps must replace that example with a security-reviewed authentication provider
 and enforce server-side authorization at every mutating handler.
 

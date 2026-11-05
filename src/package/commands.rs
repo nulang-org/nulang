@@ -2197,7 +2197,11 @@ fn validate_deploy_security(root: &Path, manifest: &Manifest) -> NuResult<()> {
         .dependencies
         .keys()
         .any(|name| name == "nulang-auth" || name == "@nulang/auth");
-    let demo_import = crate::web::ir::source_tree_uses_development_auth(&root.join("src"));
+    let demo_import = crate::web::ir::source_tree_uses_development_auth(&root.join("src"))
+        .map_err(|err| NuError::PackageError {
+            msg: format!("cannot verify Web sources for production deploy: {err}"),
+            span: Span::default(),
+        })?;
 
     if demo_dependency || demo_import {
         return Err(NuError::PackageError {
