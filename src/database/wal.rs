@@ -62,6 +62,7 @@ const MAX_WAL_BATCH_BYTES: usize = 64 * 1024 * 1024;
 enum AppendFailPoint {
     AfterHeader,
     AfterPayload,
+    SimulatedEnospcAfterPayload,
     AfterChecksum,
     AfterSync,
 }
@@ -924,6 +925,7 @@ impl FileWal {
         #[cfg(test)]
         {
             self.maybe_fail_append_for_test(AppendFailPoint::AfterPayload)?;
+            self.maybe_fail_append_for_test(AppendFailPoint::SimulatedEnospcAfterPayload)?;
             super::interruption::hit(
                 super::interruption::StorageInterruptionPoint::WalAfterPayload,
             )?;
@@ -1130,6 +1132,14 @@ impl FileWal {
     fn maybe_fail_append_for_test(&mut self, point: AppendFailPoint) -> io::Result<()> {
         if self.append_failpoint == Some(point) {
             self.append_failpoint = None;
+            if point == AppendFailPoint::SimulatedEnospcAfterPayload {
+                // Simulate the kernel returning ENOSPC after payload bytes have
+                // been written. No shared filesystem is actually exhausted.
+                #[cfg(unix)]
+                return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+                #[cfg(not(unix))]
+                return Err(io::Error::from(io::ErrorKind::StorageFull));
+            }
             return Err(io::Error::other(format!(
                 "injected NuDB WAL append failure at {point:?}"
             )));
@@ -1748,6 +1758,50 @@ mod hardening_tests {
 
             let _ = fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn simulated_enospc_after_partial_payload_poison_and_recovery() {
+        // Simulate a filesystem returning ENOSPC after a real partial WAL
+        // write. This is an I/O fault injection, NOT a filled filesystem.
+        let path = temp_wal("simulated_enospc");
+        let _ = fs::remove_file(&path);
+        let mut wal = FileWal::open(&path).unwrap();
+        wal.append_write(&write(0, b"durable")).unwrap();
+        let before = fs::metadata(&path).unwrap().len();
+        wal.set_append_failpoint_for_test(AppendFailPoint::SimulatedEnospcAfterPayload);
+        let result = wal.append_write(&write(1, b"unacknowledged"));
+        assert!(
+            matches!(
+                result,
+                Err(WalError::Io {
+                    kind: io::ErrorKind::StorageFull,
+                    ..
+                })
+            ),
+            "injected no-space failure must preserve the ENOSPC error category: {result:?}"
+        );
+        assert_eq!(wal.last_sequence(), 1, "no unacknowledged commit published");
+        assert_eq!(
+            wal.append_write(&write(1, b"invalid-retry")).unwrap_err(),
+            WalError::Poisoned,
+            "a failed append cannot accept further writes until restart"
+        );
+        let torn_bytes = fs::metadata(&path).unwrap().len();
+        assert!(
+            torn_bytes > before,
+            "the fault must occur after bytes were written"
+        );
+        drop(wal);
+        assert!(FileWal::verify_read_only(&path).is_err());
+        assert_eq!(fs::metadata(&path).unwrap().len(), torn_bytes);
+        let mut reopened = FileWal::open(&path).unwrap();
+        assert_eq!(reopened.last_sequence(), 1);
+        assert!(fs::metadata(&path).unwrap().len() < torn_bytes);
+        reopened.append_write(&write(1, b"recovered")).unwrap();
+        assert_eq!(reopened.last_sequence(), 2);
+        drop(reopened);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
