@@ -44,7 +44,9 @@ Origin or a same-origin Referer, with strict origin-boundary matching. A
 contradictory `Sec-Fetch-Site` or duplicate provenance header is rejected.
 Only direct-listener IP/localhost hosts are accepted by default. Set
 `NULANG_WEB_PUBLIC_ORIGIN` to one canonical `https://host[:port]`
-origin when terminating TLS at a trusted reverse proxy. The code does
+origin when terminating TLS at a trusted reverse proxy. Explicit
+`http://` public origins are rejected; for direct local development,
+leave this setting unset and use loopback. The code does
 not trust arbitrary `X-Forwarded-*` headers. A missing or invalid
 configuration blocks unsafe requests rather than inferring an origin.
 Browser forms send an Origin/Referer automatically; non-browser callers

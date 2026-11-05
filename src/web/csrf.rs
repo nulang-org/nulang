@@ -34,12 +34,13 @@ fn single_header<'a>(
     Ok(found)
 }
 
-/// A configured origin must consist of exactly scheme and authority. Paths,
-/// userinfo, fragments and query strings are never valid trusted origins.
+/// An explicitly configured reverse-proxy origin must use HTTPS and consist
+/// of exactly scheme and authority. Plain HTTP can be used only for direct,
+/// unconfigured localhost development. Userinfo, paths, query and fragments
+/// are never valid trusted origins.
 fn configured_authority(origin: &str) -> Result<&str, OriginCheckError> {
     let rest = origin
         .strip_prefix("https://")
-        .or_else(|| origin.strip_prefix("http://"))
         .ok_or(OriginCheckError::InvalidConfiguration)?;
     if rest.is_empty()
         || rest
@@ -234,6 +235,71 @@ mod tests {
         assert_eq!(
             validate_mutation_origin("POST", &duplicate, Some(loopback()), None),
             Err(OriginCheckError::DuplicateHeader)
+        );
+    }
+
+    #[test]
+    fn configured_proxy_origin_requires_tls_and_ignores_forwarded_spoofing() {
+        let insecure = headers(&[
+            ("Host", "app.example.com"),
+            ("Origin", "http://app.example.com"),
+        ]);
+        assert_eq!(
+            validate_mutation_origin(
+                "POST",
+                &insecure,
+                Some(loopback()),
+                Some("http://app.example.com"),
+            ),
+            Err(OriginCheckError::InvalidConfiguration),
+            "a configured reverse-proxy origin must not opt out of TLS"
+        );
+
+        let forwarded_host_spoof = headers(&[
+            ("Host", "attacker.example"),
+            ("Origin", "https://app.example.com"),
+            ("X-Forwarded-Host", "app.example.com"),
+            ("X-Forwarded-Proto", "https"),
+        ]);
+        assert_eq!(
+            validate_mutation_origin(
+                "POST",
+                &forwarded_host_spoof,
+                Some(loopback()),
+                Some("https://app.example.com"),
+            ),
+            Err(OriginCheckError::UntrustedHost),
+            "untrusted Forwarded headers cannot override the actual Host"
+        );
+
+        let trusted_referer = headers(&[
+            ("Host", "app.example.com"),
+            ("Referer", "https://app.example.com/account/update?x=1"),
+            ("Sec-Fetch-Site", "same-origin"),
+        ]);
+        assert_eq!(
+            validate_mutation_origin(
+                "PATCH",
+                &trusted_referer,
+                Some(loopback()),
+                Some("https://app.example.com"),
+            ),
+            Ok(()),
+            "verified same-origin Referer fallback should work behind TLS termination"
+        );
+
+        let malicious_referer = headers(&[
+            ("Host", "app.example.com"),
+            ("Referer", "https://app.example.com.attacker.test/account"),
+        ]);
+        assert_eq!(
+            validate_mutation_origin(
+                "POST",
+                &malicious_referer,
+                Some(loopback()),
+                Some("https://app.example.com"),
+            ),
+            Err(OriginCheckError::OriginMismatch)
         );
     }
 
