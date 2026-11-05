@@ -296,6 +296,52 @@ let result = form.validate(&http_capture.form);
 This uses the same `RouteContract` produced by the package compilation and
 the multi-value HTTP capture introduced in the request binding layer.
 
+## Opt-in protected form route execution
+
+The experimental Rust-side HTTP server API
+`WebDevServer::bind_runtime_with_form_guards` accepts an explicit
+`GuardedFormRoute` for each state-changing form endpoint. At **server startup**
+it checks the form's method, path, handler-binding fields, and constraint
+metadata against the attached compiler-produced `RuntimeRoutePlan`. Unknown,
+duplicate, mismatched, incomplete or unsafe-method configurations fail before
+the server accepts connections. Ordinary `bind_runtime` routes remain
+**unprotected unless explicitly configured**.
+
+For registered guarded routes, HTTP processing is ordered as follows:
+
+1. Parse the request with existing size and media-type limits, including
+   preserving repeated URL-encoded form fields.
+2. Reject invalid UI-action envelopes.
+3. Verify the unique `__nulang_csrf` form field against a keyed BLAKE3 token
+   derived from the *authenticated session cookie value*, HTTP method and
+   compiler route path. Missing/ambiguous cookies and tokens fail closed with
+   HTTP 403. Compare the complete canonical 64-character token.
+4. Validate all form fields using `FormContract` **before invoking the VM**.
+   Semantic failures become HTTP 422 `application/problem+json` with
+   machine-readable field errors. The 403 and 422 responses are `no-store`.
+5. Invoke the same compiler-bound request handler as before on success.
+
+The caller must establish and authenticate sessions independently, provide a
+cryptographically random 32-byte secret via secret management, issue an
+HTTPS `Secure; HttpOnly; Path=/` session cookie **without** a Domain attribute,
+using a `__Host-` name, and insert the generated token into a hidden field.
+`CsrfPolicy::token_for_session(session, method, path)` can be called by
+authorized server-side rendering code for that authenticated session. A CSRF
+token is **not** authentication and it does not validate session legitimacy.
+Protect token-bearing pages from cross-origin reads and XSS. Retire/rotate
+tokens on session invalidation or key rotation as appropriate.
+
+No automatic CSRF protection is currently installed in `nula dev` or the
+ordinary `WebDevServer::bind_runtime` entry point. Compiler deployment
+metadata listing `csrf` is not evidence of runtime enforcement. The inert
+`Middleware::Csrf` placeholder has been removed, rather than claiming an
+unenforced response-only middleware can prevent request execution.
+
+Optional/default values and repeated typed collections remain deferred because
+the current compiler's handler binding ABI only supports required scalar
+values. This PR does not change the Nulang source grammar, and application
+code must still construct and register the explicit guarded form route.
+
 ## Architectural direction
 
 The Web Contract IR is intended to be the stable seam between language semantics and transports:

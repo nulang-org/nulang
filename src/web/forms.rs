@@ -157,6 +157,25 @@ impl FormContract {
         Ok(self)
     }
 
+    /// Reject mutated, mismatched or contradictory form metadata at the
+    /// admission boundary, even if callers bypassed the with_rules builder.
+    pub(crate) fn check_configuration(&self) -> Result<(), String> {
+        let mut seen = HashSet::new();
+        for field in &self.fields {
+            if !seen.insert(field.name.as_str()) {
+                return Err(format!("duplicate form field '{}'", field.name));
+            }
+            if field.field_type != FormFieldType::from_source_type(field.source_type.as_deref()) {
+                return Err(format!(
+                    "form field '{}' type metadata is inconsistent",
+                    field.name
+                ));
+            }
+            check_rules(field.field_type, &field.rules)?;
+        }
+        Ok(())
+    }
+
     /// Validate all compiler-declared form fields in deterministic handler order.
     /// Extra form keys are ignored (e.g. CSRF tokens or application metadata).
     /// All declared fields are required until optional typed bindings exist.
