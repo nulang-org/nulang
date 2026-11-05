@@ -129,11 +129,98 @@ pub enum FormGuardError {
 pub struct GuardedFormRoute {
     pub form: FormContract,
     pub csrf: CsrfPolicy,
+    // Compiler-owned field layout is kept with the same in-memory CodeModule.
+    // Deserializing a module alone cannot turn on typed form dispatch.
+    typed_module: Option<crate::mir_codegen::CompiledWebModule>,
 }
 
 impl GuardedFormRoute {
     pub fn new(form: FormContract, csrf: CsrfPolicy) -> Self {
-        Self { form, csrf }
+        Self {
+            form,
+            csrf,
+            typed_module: None,
+        }
+    }
+
+    /// Explicit opt-in. The registered executable must be byte-for-byte the
+    /// same module compiled with this authoritative record field layout.
+    pub fn new_typed(
+        form: FormContract,
+        csrf: CsrfPolicy,
+        compiled: crate::mir_codegen::CompiledWebModule,
+    ) -> Self {
+        Self {
+            form,
+            csrf,
+            typed_module: Some(compiled),
+        }
+    }
+
+    pub fn is_typed(&self) -> bool {
+        self.typed_module.is_some()
+    }
+
+    /// Enter a typed VM handler after the ordinary CSRF+422 admission path.
+    /// Only compiler-verified, form-only route plans can reach this method.
+    pub fn render_typed(
+        &self,
+        route: &RuntimeWebRoute,
+        captured: &HttpRequestBindingInputs,
+    ) -> Result<String, String> {
+        let compiled = self
+            .typed_module
+            .as_ref()
+            .ok_or("missing typed compiler layout")?;
+        let plan = route.plan.as_ref().ok_or("missing compiler route plan")?;
+        let submitted = self
+            .form
+            .validate(&captured.form)
+            .map_err(|_| "validated form no longer matches submitted request")?;
+        let mut args = Vec::with_capacity(plan.bindings.len());
+        for binding in &plan.bindings {
+            let field = self
+                .form
+                .fields
+                .iter()
+                .find(|field| field.name == binding.source_name)
+                .ok_or("typed form binding has no validated field")?;
+            let value = match field.shape {
+                crate::web::forms::FormFieldShape::Required => {
+                    crate::web::handler_call::TypedWebValue::Scalar(
+                        submitted
+                            .values
+                            .get(&field.name)
+                            .ok_or("missing required validated value")?
+                            .clone(),
+                    )
+                }
+                crate::web::forms::FormFieldShape::Optional => {
+                    crate::web::handler_call::TypedWebValue::OptionScalar(
+                        submitted.values.get(&field.name).cloned(),
+                    )
+                }
+                crate::web::forms::FormFieldShape::Repeated { .. } => {
+                    crate::web::handler_call::TypedWebValue::ArrayScalars(
+                        submitted
+                            .repeated
+                            .get(&field.name)
+                            .ok_or("missing validated collection")?
+                            .clone(),
+                    )
+                }
+            };
+            args.push(crate::web::handler_call::TypedBoundRouteArgument {
+                handler_index: binding.handler_index,
+                value,
+            });
+        }
+        crate::web::handler_call::render_typed_bound_handler(
+            compiled,
+            route.route.handler_func_idx,
+            plan.handler_param_count,
+            &args,
+        )
     }
 
     /// Validate a guard against exactly one live, compiler-bound route. No
@@ -158,6 +245,23 @@ impl GuardedFormRoute {
         if !crate::web::dispatch::has_complete_request_binding_plan(plan) {
             return Err("guarded form route requires a complete handler binding plan".into());
         }
+        if let Some(compiled) = &self.typed_module {
+            if compiled.module() != &route.route.handler_module {
+                return Err(
+                    "typed form layout and executable were not produced by the same compiler run"
+                        .into(),
+                );
+            }
+            if plan
+                .bindings
+                .iter()
+                .any(|binding| binding.source != RouteBindingSource::Form)
+            {
+                return Err(
+                    "typed form handler currently requires all arguments from form fields".into(),
+                );
+            }
+        }
         let form_bindings: Vec<_> = plan
             .bindings
             .iter()
@@ -167,18 +271,57 @@ impl GuardedFormRoute {
             return Err("form guard fields do not match the compiler binding plan".into());
         }
         for (binding, field) in form_bindings.iter().zip(&self.form.fields) {
-            // The VM's direct handler ABI currently materializes only scalar
-            // constants. Optional/repeated host-side form values must not be
-            // passed to it until the compiler emits true variant/array values.
-            if field.shape != crate::web::forms::FormFieldShape::Required {
-                return Err("optional/repeated form inputs need typed VM binding support".into());
-            }
-            // String-backed domain identifiers are still supported, but an
-            // arbitrary structured type cannot be represented by Constant::String.
-            if !crate::web::request_bindings::scalar_binding_supported(binding.ty.as_deref()) {
-                return Err(
-                    "structured form handler type is not supported by scalar VM binding".into(),
-                );
+            if let Some(compiled) = &self.typed_module {
+                let declaration = binding
+                    .ty
+                    .as_deref()
+                    .ok_or("typed form requires an explicit source type")?;
+                let compiler_type = compiled
+                    .handler_param_type(route.route.handler_func_idx, binding.handler_index)
+                    .ok_or("typed form binding is missing an authoritative MIR parameter type")?;
+                if compiler_type.to_string() != declaration {
+                    return Err(
+                        "typed form contract type differs from compiled MIR handler signature"
+                            .into(),
+                    );
+                }
+                let expected_scalar = match field.shape {
+                    crate::web::forms::FormFieldShape::Required => declaration,
+                    crate::web::forms::FormFieldShape::Optional => {
+                        let inner = declaration
+                            .strip_prefix("Some ")
+                            .and_then(|ty| ty.strip_suffix(" | None"))
+                            .or_else(|| declaration.strip_prefix("Option[").and_then(|ty| ty.strip_suffix(']')))
+                            .ok_or("optional form field requires compiler-resolved Some T | None or Option[T] handler type")?;
+                        if compiled.record_field_id("ctor").is_none()
+                            || compiled.record_field_id("payload").is_none()
+                        {
+                            return Err(
+                                "compiler layout does not expose Option record fields".into()
+                            );
+                        }
+                        inner
+                    }
+                    crate::web::forms::FormFieldShape::Repeated { .. } => declaration
+                        .strip_prefix('[')
+                        .and_then(|ty| ty.strip_suffix(']'))
+                        .ok_or("repeated form field requires [T] handler annotation")?,
+                };
+                if !matches!(expected_scalar, "String" | "Int" | "Float" | "Bool") {
+                    return Err("typed forms only support primitive scalar element types".into());
+                }
+            } else {
+                // The legacy direct binder cannot construct variants or arrays.
+                if field.shape != crate::web::forms::FormFieldShape::Required {
+                    return Err(
+                        "optional/repeated form inputs need typed VM binding support".into(),
+                    );
+                }
+                if !crate::web::request_bindings::scalar_binding_supported(binding.ty.as_deref()) {
+                    return Err(
+                        "structured form handler type is not supported by scalar VM binding".into(),
+                    );
+                }
             }
             if field.name == "__nulang_csrf"
                 || field.name == "__nulang_ui_message"

@@ -22,11 +22,27 @@ pub enum FormFieldType {
 
 impl FormFieldType {
     fn from_source_type(source: Option<&str>) -> Self {
-        match source.map(str::trim) {
+        let type_name = source.map(str::trim).map(|source| {
+            source
+                .strip_prefix("Option[")
+                .and_then(|rest| rest.strip_suffix(']'))
+                .or_else(|| {
+                    source
+                        .strip_prefix('[')
+                        .and_then(|rest| rest.strip_suffix(']'))
+                })
+                .or_else(|| {
+                    source
+                        .strip_prefix("Some ")
+                        .and_then(|rest| rest.strip_suffix(" | None"))
+                })
+                .unwrap_or(source)
+        });
+        match type_name {
             Some("Int") => Self::Int,
             Some("Float") => Self::Float,
             Some("Bool") => Self::Bool,
-            // Domain/opaque types remain string-backed in current Web decoding.
+            // Domain/opaque types remain string-backed in host-side decoding.
             _ => Self::Text,
         }
     }
@@ -354,7 +370,24 @@ fn decode_checked(field: &FormFieldContract, raw: &str) -> Result<Constant, Form
             "This field value must not be empty",
         ));
     }
-    let value = decode_scalar_constant(raw, field.source_type.as_deref())
+    let declared_scalar = match field.shape {
+        FormFieldShape::Required => field.source_type.as_deref(),
+        FormFieldShape::Optional => field.source_type.as_deref().map(|ty| {
+            ty.strip_prefix("Option[")
+                .and_then(|value| value.strip_suffix(']'))
+                .or_else(|| {
+                    ty.strip_prefix("Some ")
+                        .and_then(|value| value.strip_suffix(" | None"))
+                })
+                .unwrap_or(ty)
+        }),
+        FormFieldShape::Repeated { .. } => field.source_type.as_deref().map(|ty| {
+            ty.strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                .unwrap_or(ty)
+        }),
+    };
+    let value = decode_scalar_constant(raw, declared_scalar)
         .map_err(|_| issue(field, "invalid_type", "Invalid field value"))?;
     if let Some(problem) = check_value(field, &value) {
         return Err(problem);

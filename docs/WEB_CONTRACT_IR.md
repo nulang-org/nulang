@@ -363,11 +363,10 @@ They work on the retained multi-value URL-encoded HTTP capture:
   controls and renders repeated fields as a labeled fieldset of indexed
   controls. All submitted values and attribute content remain escaped; errors
   identify the field without echoing submitted content.
-- The opt-in `GuardedFormRoute` **rejects optional and repeated field shapes at
-  server startup**, because the existing direct VM binder cannot construct
-  `Option[T]` variants or typed collections. Applications may use these shapes
-  through the host-side `FormContract` API, but must not register them as
-  typed Nulang route-handler parameters yet.
+- The legacy `GuardedFormRoute::new` **still rejects optional and repeated
+  field shapes** at startup. The separate `GuardedFormRoute::new_typed` API
+  accepts compiler-verified, primitive `Option[T]` and `[T]` handler fields
+  when the in-memory compiler field layout is available. See below.
 - A structured handler annotation, such as `Option[String]` or `List[Int]`,
   cannot be staged by the scalar request binder. Such a binding fails as a
   server-side unsupported-binding-type error instead of silently delivering
@@ -379,10 +378,54 @@ Also, client-facing typed decoding errors no longer embed the raw submitted
 value in the problem message. This matters for sensitive form fields,
 query parameters, and logs.
 
-A future compiler+VM change should add verified variant/array materialization
-and tests for handler-call ABI conformance before allowing these shapes under
-`bind_runtime_with_form_guards`. Do not ship partial conversion through JSON
-strings or last-value selection as a substitute.
+The scalar-only binder is still unchanged and rejects structured handler
+annotations rather than coercing them to JSON strings or selecting a repeated
+field's last value. Native variant/array VM materialization is an explicitly
+opt-in, compiler-owned path described below.
+
+## Compiler-owned typed form handler ABI (opt-in)
+
+`compile_mir_with_web_field_layout` returns `CompiledWebModule`, which couples
+the emitted `CodeModule` with the **same compilation's** module-wide record
+field IDs and MIR handler parameter types. The layout is an opaque, in-memory
+sidecar, not another serialized bytecode field: the frozen `.nbc` format and
+existing `compile_mir` output are unchanged. Loading a bytecode artifact
+without the sidecar **does not** authorize typed form execution.
+
+The host may use `GuardedFormRoute::new_typed(form, csrf, compiled)`, then
+register it via `WebDevServer::bind_runtime_with_form_guards`. Registration
+fails before listening if the compiler-produced module differs from the
+registered handler module, if the binding plan is missing/incomplete or uses
+non-form sources, if mutable contract types disagree with actual MIR parameter
+types, or if form shapes do not exactly match the handler's type algebra.
+
+Supported **only in the explicitly typed path**:
+
+- `String`, `Int`, `Float` and `Bool` required scalar parameters;
+- `Option[T]` where `T` is one of those four primitives, represented in the
+  resolved compiler contract as `Some T | None`. Absent/blank optional fields
+  become the nullary `None` constructor; present values become a **real
+  compiler-layout** `{ ctor: "Some", payload: value }` record, with no guessed
+  field IDs;
+- `[T]` where `T` is one of those primitives. Each retained form occurrence
+  is decoded, validated, and stored in submission order in a real VM-allocated
+  array. The form metadata's existing 64-item bound still applies.
+
+The trampoline checks values **against the actual compiled MIR parameter
+types** before allocating variants or arrays. It rejects mixed element types,
+non-finite floats, integers outside the 48-bit VM payload range, invalid
+argument banks, and missing layout metadata. VM allocation and container
+retention use the existing `RecMk`/`RecS` and `ArrAlloc`/`ArrStore`
+opcodes. No JSON-as-string or last-value fallback is permitted.
+
+The HTTP execution order remains: authenticated-session cookie **and**
+session-bound CSRF token (403), then semantic form validation (422), then the
+type-checked VM handler. Unregistered and legacy guarded routes retain their
+prior execution semantics. Session authentication, secure cookie issuance,
+CSP/XSS defenses, and exposing the typed compiler sidecar through the
+production build pipeline remain the host application's responsibilities.
+This is **not** automatic support in `nula dev`, nor support for arbitrary
+generic/nested collection types or multipart form bodies.
 
 ## Architectural direction
 
