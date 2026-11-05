@@ -622,6 +622,14 @@ impl StdLib {
                     description: "Get a cookie value from the current HTTP request by name.",
                 },
                 BuiltinOp {
+                    name: "Web.secure_token",
+                    effect: "Web",
+                    op: "secure_token",
+                    signature: "secure_token() -> String",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Create a 256-bit cryptographically secure session token, or empty on entropy failure.",
+                },
+                BuiltinOp {
                     name: "Web.set_cookie",
                     effect: "Web",
                     op: "set_cookie",
