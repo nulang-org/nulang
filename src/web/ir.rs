@@ -290,16 +290,68 @@ fn infer_middleware(_source: &str) -> Vec<String> {
 /// A module import is not an auth enforcement guarantee; production deployment
 /// must reject these demo sessions until a verified provider is available.
 fn source_uses_development_auth(source: &str) -> bool {
-    collect_nulang_imports(source).iter().any(|name| {
-        name == "@nulang/auth"
-            || name.starts_with("@nulang/auth/")
-            || name.starts_with("@nulang/auth::")
+    use crate::lexer::{Lexer, TokenKind};
+
+    // Use the language lexer instead of string-prefix matching. The latter
+    // silently missed legal imports such as `import\t@nulang/auth` and
+    // `import @ nulang / auth`, allowing the demo session provider through
+    // the production deployment guard.
+    //
+    // Invalid source cannot be admitted as a safe production configuration.
+    let tokens = match Lexer::new(source).lex() {
+        Ok(tokens) => tokens,
+        Err(_) => return true,
+    };
+
+    tokens.windows(5).any(|tokens| {
+        matches!(tokens[0].kind, TokenKind::Import)
+            && matches!(tokens[1].kind, TokenKind::At)
+            && matches!(&tokens[2].kind, TokenKind::Ident(name) if name == "nulang")
+            && matches!(tokens[3].kind, TokenKind::Slash)
+            && matches!(&tokens[4].kind, TokenKind::Ident(name) if name == "auth")
     })
 }
 
-/// This inspects the entire src/ tree, not only the package entrypoint.
-pub fn source_tree_uses_development_auth(src_root: &Path) -> bool {
-    source_uses_development_auth(&collect_source_text(src_root))
+/// Inspect every source file, rather than only the entrypoint. Unlike the
+/// best-effort deployment IR capability scanner, this security boundary must
+/// fail closed on unreadable directories/files and symlinked source paths.
+pub fn source_tree_uses_development_auth(src_root: &Path) -> std::io::Result<bool> {
+    let source_kind = std::fs::symlink_metadata(src_root)?.file_type();
+    if source_kind.is_symlink() || !source_kind.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "source root is not a real directory: {}",
+                src_root.display()
+            ),
+        ));
+    }
+    let mut entries: Vec<_> = std::fs::read_dir(src_root)?.collect::<Result<_, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let kind = entry.file_type()?;
+        let path = entry.path();
+        if kind.is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "symlinked source path cannot be verified: {}",
+                    path.display()
+                ),
+            ));
+        }
+        if kind.is_dir() {
+            if source_tree_uses_development_auth(&path)? {
+                return Ok(true);
+            }
+        } else if kind.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("nula") {
+            if source_uses_development_auth(&std::fs::read_to_string(&path)?) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Collect all `@nulang/*` import names from the source text.
@@ -452,6 +504,59 @@ mod tests {
         assert!(entries
             .iter()
             .any(|e| e.key == "AUTH_COOKIE_SECRET" && e.required_by == "@nulang/auth"));
+    }
+
+    #[test]
+    fn test_development_auth_imports_follow_language_tokenization() {
+        // The parser accepts tabs and whitespace around @ and / in imports.
+        // The deploy gate must reject them even if source lines are not canonical.
+        for source in [
+            "import\t@nulang/auth\nfn main() {}",
+            "import  @ nulang / auth\nfn main() {}",
+            "import @nulang/auth/session\nfn main() {}",
+            "import @ nulang / auth / session\nfn main() {}",
+        ] {
+            assert!(
+                source_uses_development_auth(source),
+                "development authentication must be detected: {source:?}"
+            );
+        }
+        // Imports mentioned only in comments and strings are not imports.
+        assert!(!source_uses_development_auth(
+            "// import @nulang/auth\nlet text = \"import @nulang/auth\""
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_production_auth_scan_refuses_unreadable_source() {
+        use std::os::unix::fs::symlink;
+
+        let src = std::env::temp_dir().join(format!(
+            "nulang_web_prod_auth_scan_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&src).unwrap();
+        let dangling = src.join("missing.nula");
+        symlink(src.join("not-present"), &dangling).unwrap();
+
+        assert!(
+            source_tree_uses_development_auth(&src).is_err(),
+            "production security scan must fail closed when a .nula file cannot be read"
+        );
+        let real_source = src.join("real");
+        std::fs::create_dir_all(&real_source).unwrap();
+        let source_link = src.join("src-link");
+        symlink(&real_source, &source_link).unwrap();
+        assert!(
+            source_tree_uses_development_auth(&source_link).is_err(),
+            "the source root itself must not be a symlink"
+        );
+        std::fs::remove_dir_all(src).unwrap();
     }
 
     #[test]
