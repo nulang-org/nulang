@@ -254,6 +254,48 @@ the binding plan is equivalent to:
 ]
 ```
 
+## Experimental form contracts
+
+`web::forms::FormContract::from_route(&route)` projects the existing
+compiler-owned request binding plan into an ordered list of form fields. It
+does **not** reparse source or introduce new Frozen Core grammar. The
+transport-neutral Rust API supports:
+
+- Typed scalar `String`, `Int`, `Float`, and `Bool` field decoding;
+  opaque/domain types remain string-backed, consistent with Web Contract IR.
+- Explicit Rust-side `FormRule` constraints: text length and exact integer
+  or finite float bounds. Incompatible, duplicate, and inverted rules are
+  rejected when attached. These rules are **not** compiler source annotations.
+- Aggregated, stable field error codes for missing, empty, repeated,
+  incorrectly typed, and out-of-range inputs; submitted values are not
+  included in error responses.
+- A `422 application/problem+json` adapter through
+  `http_problem::form_validation_problem_response`. This is opt-in for
+  application handlers, not an automatic replacement for the transport's
+  existing `400` request-decode behavior.
+- An escaped, accessible `render_fields` HTML fragment with labels,
+  required controls, constraints, preserved single values, and correlated
+  `aria-describedby` error messages. Boolean fields use a select for
+  explicit `true` / `false` rather than ambiguous checkbox omission.
+
+The renderer deliberately emits **fields only**. Applications must supply
+an authorized `<form>` wrapper, safe action URL, appropriate CSRF token,
+submission/redirect handling, and any draft storage. All fields remain
+required because optional request bindings and typed collection values are
+not yet implemented. Full Nulang-language forms, optional defaults,
+multipart, conditional rules, and browser hydration require later work.
+
+Example in Rust host/tooling code:
+
+```rust
+let form = FormContract::from_route(&validated_route)?
+    .with_rules("company", vec![FormRule::MinLength(2)])?;
+let result = form.validate(&http_capture.form);
+```
+
+This uses the same `RouteContract` produced by the package compilation and
+the multi-value HTTP capture introduced in the request binding layer.
+
 ## Architectural direction
 
 The Web Contract IR is intended to be the stable seam between language semantics and transports:
