@@ -162,6 +162,82 @@ impl TabletMutation {
     }
 }
 
+/// Stable hash of the exact ordered mutation list, including key/value lengths.
+/// The domain separator prevents reuse of this digest for unrelated records.
+pub(crate) fn transaction_digest(mutations: &[TabletMutation]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"nudb/transaction-mutations/v1");
+    hasher.update(&(mutations.len() as u64).to_le_bytes());
+    for mutation in mutations {
+        match mutation {
+            TabletMutation::Put { key, value } => {
+                hasher.update(&[1]);
+                hasher.update(&(key.len() as u64).to_le_bytes());
+                hasher.update(key);
+                hasher.update(&(value.len() as u64).to_le_bytes());
+                hasher.update(value);
+            }
+            TabletMutation::Delete { key } => {
+                hasher.update(&[2]);
+                hasher.update(&(key.len() as u64).to_le_bytes());
+                hasher.update(key);
+            }
+        }
+    }
+    *hasher.finalize().as_bytes()
+}
+
+/// Caller-provided, stable transaction identifier within a single tablet.
+/// Generate a distinct ID for each logical transaction, and reuse it on retry.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct TransactionId([u8; 16]);
+
+impl TransactionId {
+    pub fn new(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+}
+
+/// Durable receipt retained through WAL replay and checkpoint reclamation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TransactionReceipt {
+    id: TransactionId,
+    sequence: u64,
+    digest: [u8; 32],
+}
+
+impl TransactionReceipt {
+    pub fn id(self) -> TransactionId {
+        self.id
+    }
+
+    pub fn sequence(self) -> u64 {
+        self.sequence
+    }
+
+    pub(crate) fn digest(self) -> [u8; 32] {
+        self.digest
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TransactionIdentity {
+    pub(crate) id: TransactionId,
+    pub(crate) digest: [u8; 32],
+}
+
+impl TransactionIdentity {
+    fn receipt(self, sequence: u64) -> TransactionReceipt {
+        TransactionReceipt {
+            id: self.id,
+            sequence,
+            digest: self.digest,
+        }
+    }
+}
+
 /// Immutable, prevalidated tablet write descriptor.
 ///
 /// This is not a WAL record or consensus protocol. It is the admission
@@ -175,6 +251,7 @@ pub struct TabletWrite {
     sequence: u64,
     expected_previous_sequence: u64,
     mutations: Vec<TabletMutation>,
+    identity: Option<TransactionIdentity>,
 }
 
 impl TabletWrite {
@@ -220,6 +297,7 @@ impl TabletWrite {
             sequence,
             expected_previous_sequence,
             mutations,
+            identity: None,
         })
     }
 
@@ -242,6 +320,15 @@ impl TabletWrite {
     pub fn mutations(&self) -> &[TabletMutation] {
         &self.mutations
     }
+
+    pub(crate) fn with_identity(mut self, identity: TransactionIdentity) -> Self {
+        self.identity = Some(identity);
+        self
+    }
+
+    pub(crate) fn identity(&self) -> Option<TransactionIdentity> {
+        self.identity
+    }
 }
 
 /// One committed value version in the in-memory MVCC prototype.
@@ -249,6 +336,21 @@ impl TabletWrite {
 pub(crate) struct VersionedValue {
     pub(crate) sequence: u64,
     pub(crate) value: Option<Vec<u8>>,
+}
+
+/// Find the most recent committed value visible at a requested snapshot.
+/// Most current-state reads take the constant-time latest-version path;
+/// older snapshots use binary search over monotonically ordered versions.
+/// If legacy data retains duplicate sequences, the last value wins.
+fn visible_version_at(versions: &[VersionedValue], snapshot: u64) -> Option<&VersionedValue> {
+    let latest = versions.last()?;
+    if latest.sequence <= snapshot {
+        return Some(latest);
+    }
+    let first_newer = versions.partition_point(|version| version.sequence <= snapshot);
+    first_newer
+        .checked_sub(1)
+        .and_then(|index| versions.get(index))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -261,6 +363,9 @@ pub(crate) struct TabletSnapshotRow {
 pub(crate) struct TabletSnapshotState {
     pub(crate) current_sequence: u64,
     pub(crate) rows: Vec<TabletSnapshotRow>,
+    // Version-1 checkpoints omitted receipts; those remain readable.
+    #[serde(default)]
+    pub(crate) receipts: Vec<TransactionReceipt>,
 }
 
 /// Minimal single-node MVCC tablet used to prove transaction semantics before
@@ -274,6 +379,7 @@ pub struct MemoryTablet {
     descriptor: TabletDescriptor,
     current_sequence: u64,
     rows: BTreeMap<Vec<u8>, Vec<VersionedValue>>,
+    receipts: BTreeMap<TransactionId, TransactionReceipt>,
 }
 
 impl MemoryTablet {
@@ -282,6 +388,7 @@ impl MemoryTablet {
             descriptor,
             current_sequence: 0,
             rows: BTreeMap::new(),
+            receipts: BTreeMap::new(),
         }
     }
 
@@ -291,6 +398,15 @@ impl MemoryTablet {
 
     pub fn current_sequence(&self) -> u64 {
         self.current_sequence
+    }
+
+    /// Compare complete committed MVCC histories and durable receipts without
+    /// cloning values or allocating a second snapshot representation.
+    pub(crate) fn same_committed_state(&self, other: &Self) -> bool {
+        self.descriptor == other.descriptor
+            && self.current_sequence == other.current_sequence
+            && self.rows == other.rows
+            && self.receipts == other.receipts
     }
 
     pub(crate) fn snapshot_state(&self) -> TabletSnapshotState {
@@ -304,6 +420,7 @@ impl MemoryTablet {
                     versions: versions.clone(),
                 })
                 .collect(),
+            receipts: self.receipts.values().copied().collect(),
         }
     }
 
@@ -317,17 +434,44 @@ impl MemoryTablet {
                 return Err(TabletError::KeyOutsideTabletRange);
             }
 
+            // Before duplicate-key batches were normalized on commit, v1
+            // checkpoints could contain consecutive versions with identical
+            // sequences. Accept only that historical representation, and
+            // retain its last value (including a tombstone) for each commit.
+            // Zero, future, or decreasing sequences remain invalid.
+            let mut versions = row.versions;
             let mut previous = 0_u64;
-            for version in &row.versions {
+            for version in &versions {
                 if version.sequence == 0
                     || version.sequence > state.current_sequence
-                    || version.sequence <= previous
+                    || version.sequence < previous
                 {
                     return Err(TabletError::InvalidSnapshotHistory);
                 }
                 previous = version.sequence;
             }
-            if rows.insert(row.key, row.versions).is_some() {
+            // dedup_by passes the later item first. Transfer its value into
+            // the retained earlier item without cloning or reallocating.
+            versions.dedup_by(|later, earlier| {
+                if later.sequence != earlier.sequence {
+                    return false;
+                }
+                earlier.value = later.value.take();
+                true
+            });
+            if rows.insert(row.key, versions).is_some() {
+                return Err(TabletError::InvalidSnapshotHistory);
+            }
+        }
+
+        let mut receipts = BTreeMap::new();
+        let mut receipt_sequences = std::collections::BTreeSet::new();
+        for receipt in state.receipts {
+            if receipt.sequence == 0
+                || receipt.sequence > state.current_sequence
+                || !receipt_sequences.insert(receipt.sequence)
+                || receipts.insert(receipt.id, receipt).is_some()
+            {
                 return Err(TabletError::InvalidSnapshotHistory);
             }
         }
@@ -336,7 +480,12 @@ impl MemoryTablet {
             descriptor,
             current_sequence: state.current_sequence,
             rows,
+            receipts,
         })
+    }
+
+    pub(crate) fn transaction_receipt(&self, id: TransactionId) -> Option<TransactionReceipt> {
+        self.receipts.get(&id).copied()
     }
 
     pub fn prepare_write(
@@ -357,6 +506,19 @@ impl MemoryTablet {
     /// Validate a prepared write against the tablet's current ownership and
     /// committed tail without mutating state.
     pub(crate) fn validate_write(&self, write: &TabletWrite) -> Result<(), TabletError> {
+        self.validate_write_at_sequence(write, self.current_sequence)
+    }
+
+    /// Validate a prepared write against a projected committed sequence.
+    ///
+    /// Group commit uses this to validate a complete consecutive batch before
+    /// any WAL bytes are emitted. The tablet itself is not mutated until the
+    /// entire batch has crossed its durability boundary.
+    pub(crate) fn validate_write_at_sequence(
+        &self,
+        write: &TabletWrite,
+        committed_sequence: u64,
+    ) -> Result<(), TabletError> {
         if write.tablet_id != self.descriptor.id {
             return Err(TabletError::WrongTablet {
                 expected: self.descriptor.id,
@@ -375,9 +537,14 @@ impl MemoryTablet {
                 presented: write.ownership_epoch,
             });
         }
-        if write.expected_previous_sequence != self.current_sequence {
+        if let Some(identity) = write.identity {
+            if self.receipts.contains_key(&identity.id) {
+                return Err(TabletError::DuplicateTransactionId(identity.id));
+            }
+        }
+        if write.expected_previous_sequence != committed_sequence {
             return Err(TabletError::SequenceMismatch {
-                committed: self.current_sequence,
+                committed: committed_sequence,
                 expected_previous: write.expected_previous_sequence,
             });
         }
@@ -389,13 +556,12 @@ impl MemoryTablet {
             return Err(TabletError::KeyOutsideTabletRange);
         }
 
-        let next_sequence = self
-            .current_sequence
+        let next_sequence = committed_sequence
             .checked_add(1)
             .ok_or(TabletError::SequenceOverflow)?;
         if write.sequence != next_sequence {
             return Err(TabletError::SequenceMismatch {
-                committed: self.current_sequence,
+                committed: committed_sequence,
                 expected_previous: write.expected_previous_sequence,
             });
         }
@@ -421,6 +587,10 @@ impl MemoryTablet {
     pub(crate) fn publish_validated(&mut self, write: TabletWrite) -> u64 {
         let sequence = write.sequence;
         self.apply_mutations(sequence, write.mutations);
+        if let Some(identity) = write.identity {
+            self.receipts
+                .insert(identity.id, identity.receipt(sequence));
+        }
         sequence
     }
 
@@ -429,12 +599,18 @@ impl MemoryTablet {
     /// WAL replay intentionally does not re-check historical ownership epochs:
     /// an older owner epoch is valid history. It does re-check sequence order
     /// and current tablet range before mutating state.
-    pub(crate) fn replay_committed(
+    pub(crate) fn replay_committed_with_identity(
         &mut self,
         sequence: u64,
         expected_previous_sequence: u64,
         mutations: Vec<TabletMutation>,
+        identity: Option<TransactionIdentity>,
     ) -> Result<(), TabletError> {
+        if let Some(identity) = identity {
+            if self.receipts.contains_key(&identity.id) {
+                return Err(TabletError::DuplicateTransactionId(identity.id));
+            }
+        }
         if expected_previous_sequence != self.current_sequence {
             return Err(TabletError::SequenceMismatch {
                 committed: self.current_sequence,
@@ -459,25 +635,33 @@ impl MemoryTablet {
         }
 
         self.apply_mutations(sequence, mutations);
+        if let Some(identity) = identity {
+            self.receipts
+                .insert(identity.id, identity.receipt(sequence));
+        }
         Ok(())
     }
 
     fn apply_mutations(&mut self, sequence: u64, mutations: Vec<TabletMutation>) {
+        // Within one committed sequence, the final mutation to each key
+        // wins. Checkpoint restore requires strictly increasing versions.
+        let mut final_values = BTreeMap::new();
         for mutation in mutations {
             match mutation {
                 TabletMutation::Put { key, value } => {
-                    self.rows.entry(key).or_default().push(VersionedValue {
-                        sequence,
-                        value: Some(value),
-                    });
+                    final_values.insert(key, Some(value));
                 }
                 TabletMutation::Delete { key } => {
-                    self.rows.entry(key).or_default().push(VersionedValue {
-                        sequence,
-                        value: None,
-                    });
+                    final_values.insert(key, None);
                 }
             }
+        }
+
+        for (key, value) in final_values {
+            self.rows
+                .entry(key)
+                .or_default()
+                .push(VersionedValue { sequence, value });
         }
         self.current_sequence = sequence;
     }
@@ -495,11 +679,7 @@ impl MemoryTablet {
         }
 
         Ok(self.rows.get(key).and_then(|versions| {
-            versions
-                .iter()
-                .rev()
-                .find(|version| version.sequence <= snapshot)
-                .and_then(|version| version.value.as_deref())
+            visible_version_at(versions, snapshot).and_then(|version| version.value.as_deref())
         }))
     }
 
@@ -548,6 +728,7 @@ pub enum TabletError {
         requested: u64,
     },
     InvalidSnapshotHistory,
+    DuplicateTransactionId(TransactionId),
     KeyOutsideTabletRange,
 }
 
@@ -605,7 +786,10 @@ impl fmt::Display for TabletError {
                 "snapshot {requested} is ahead of committed tablet sequence {committed}"
             ),
             Self::InvalidSnapshotHistory => {
-                f.write_str("tablet snapshot contains invalid MVCC version history")
+                f.write_str("tablet snapshot contains invalid MVCC version history or receipt history")
+            }
+            Self::DuplicateTransactionId(id) => {
+                write!(f, "transaction id {id:?} already committed in this tablet")
             }
             Self::KeyOutsideTabletRange => {
                 f.write_str("tablet mutation key falls outside the owned key range")
@@ -615,3 +799,88 @@ impl fmt::Display for TabletError {
 }
 
 impl std::error::Error for TabletError {}
+
+#[cfg(test)]
+mod snapshot_binary_lookup_tests {
+    use super::{visible_version_at, VersionedValue};
+
+    #[test]
+    fn sparse_versions_and_tombstones_preserve_snapshot_semantics() {
+        let versions = vec![
+            VersionedValue {
+                sequence: 2,
+                value: Some(b"first".to_vec()),
+            },
+            VersionedValue {
+                sequence: 9,
+                value: None,
+            },
+            VersionedValue {
+                sequence: 25,
+                value: Some(b"restored".to_vec()),
+            },
+        ];
+        for (snapshot, expected) in [
+            (0, None),
+            (1, None),
+            (2, Some(&b"first"[..])),
+            (8, Some(&b"first"[..])),
+            (9, None),
+            (24, None),
+            (25, Some(&b"restored"[..])),
+            (u64::MAX, Some(&b"restored"[..])),
+        ] {
+            assert_eq!(
+                visible_version_at(&versions, snapshot).and_then(|v| v.value.as_deref()),
+                expected,
+                "snapshot {snapshot}",
+            );
+        }
+        assert!(visible_version_at(&[], 25).is_none());
+    }
+
+    #[test]
+    fn long_sparse_history_matches_linear_reference_without_copying() {
+        let versions: Vec<_> = (1u64..=4096)
+            .map(|sequence| VersionedValue {
+                sequence: sequence * 3,
+                value: Some(sequence.to_le_bytes().to_vec()),
+            })
+            .collect();
+        for snapshot in (0u64..=4096 * 3 + 1).step_by(17) {
+            let expected = versions.iter().rev().find(|v| v.sequence <= snapshot);
+            let actual = visible_version_at(&versions, snapshot);
+            assert_eq!(actual, expected, "snapshot {snapshot}");
+            if let (Some(a), Some(e)) = (actual, expected) {
+                assert!(
+                    std::ptr::eq(a, e),
+                    "lookup must borrow the existing version"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_duplicate_sequence_uses_last_version() {
+        let versions = vec![
+            VersionedValue {
+                sequence: 1,
+                value: Some(b"a".to_vec()),
+            },
+            VersionedValue {
+                sequence: 1,
+                value: None,
+            },
+            VersionedValue {
+                sequence: 3,
+                value: Some(b"new".to_vec()),
+            },
+        ];
+        assert!(visible_version_at(&versions, 1).unwrap().value.is_none());
+        assert!(visible_version_at(&versions, 2).unwrap().value.is_none());
+        assert_eq!(
+            visible_version_at(&versions, 3).unwrap().value.as_deref(),
+            Some(&b"new"[..])
+        );
+    }
+}

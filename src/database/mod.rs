@@ -4,10 +4,25 @@
 //! separate from actor semantics. Actors may own and coordinate tablets, but
 //! inner storage and query loops remain ordinary local computation.
 
+pub mod backup;
 pub mod checkpoint;
+#[cfg(feature = "postgres")]
+pub mod consumer_postgres;
+pub mod consumer_sink;
+pub mod owner;
+pub mod retention;
+pub(crate) mod retention_admission;
+pub mod retention_store;
 pub mod store;
 pub mod tablet;
 pub mod wal;
+pub mod wal_batch;
 
 #[cfg(test)]
 mod interruption;
+
+#[cfg(test)]
+mod model_tests;
+
+#[cfg(test)]
+mod receipt_tests;

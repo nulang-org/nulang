@@ -1,4 +1,20 @@
 # Nulang Changelog
+
+### October RustSec dependency remediation (validation pending) — 2026-10-25
+- **Updated Wasmtime 48.0.7, compatible Cranelift/Pulley packages, rustls-webpki 0.103.16, webpki-roots 1.0.10 and ctutils 0.4.4** with Cargo's dependency resolver.
+- **Migrated libSQL remote TLS to a custom connector based on supported rustls 0.23 and tokio-rustls 0.26.** This retains libSQL local/remote behavior, native root certificates, server-name verification and Hyper 0.14 protocol compatibility without pulling unsupported rustls-webpki 0.102.
+- **Release status:** tests of the certificate verifier, local SQLite behavior, full cargo audit and exact-head CI are mandatory before promotion. No security advisory is waived. See #2093.
+
+### NuDB legacy checkpoint duplicate-version recovery — 2026-10-25
+- **Valid v1 checkpoints with repeated consecutive sequence numbers for the same key now recover with last-mutation-wins semantics**, matching the historical write path; canonical rewrites contain only one version per key and sequence.
+- **Checksum, descriptor, sequence ordering, and sequence-bound guards remain fail-closed.** This is a narrow compatibility repair, not a generic corrupt-checkpoint salvage mode.
+- **Deterministic on-disk fixture tests** cover legacy replay, canonical re-checkpoint, malformed version histories, and checksum tampering.
+
+### NuDB single-node WAL ownership and duplicate-key recovery — 2026-10-25
+- **NuDB now rejects competing writable WAL handles before file initialization or recovery**, using an exclusive persistent sidecar lock that remains held across checkpoint/WAL replacement. Path aliases are rejected; this is single-host local-filesystem safety, not a distributed lease.
+- **A transaction with repeated mutations to the same key records one MVCC version per committed sequence**, preserving last-write-wins behavior through checkpoint publication and restart.
+- **Dedicated red-to-green regressions and deterministic recovery-model tests** cover duplicate keys, writer contention across processes, owner termination, alias paths, crash interruption, and checkpoint replay. Older checkpoints already written with duplicate-sequence histories still require a separate compatibility/migration policy.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
