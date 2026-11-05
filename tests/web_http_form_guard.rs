@@ -272,3 +272,47 @@ fn multiple_runtime_routes_cannot_share_an_ambiguous_form_guard() {
     )
     .is_err());
 }
+
+#[test]
+fn optional_and_repeated_host_fields_cannot_be_bound_as_scalar_vm_handler_arguments() {
+    use nulang::web::forms::FormFieldShape;
+    let (route, mut guard) = guarded_route();
+    guard.form = guard
+        .form
+        .with_shape("company", FormFieldShape::Optional)
+        .unwrap();
+    assert!(
+        WebDevServer::bind_runtime_with_form_guards(0, None, None, vec![route], vec![guard],)
+            .is_err()
+    );
+
+    let (route, mut guard) = guarded_route();
+    guard.form = guard
+        .form
+        .with_shape(
+            "seats",
+            FormFieldShape::Repeated {
+                min_items: 1,
+                max_items: 3,
+            },
+        )
+        .unwrap();
+    assert!(
+        WebDevServer::bind_runtime_with_form_guards(0, None, None, vec![route], vec![guard],)
+            .is_err()
+    );
+}
+
+#[test]
+fn structured_handler_annotation_is_not_coerced_to_vm_string() {
+    let (mut route, mut guard) = guarded_route();
+    let binding = &mut route.plan.as_mut().unwrap().bindings[0];
+    binding.ty = Some("Option[String]".into());
+    guard.form.fields[0].source_type = Some("Option[String]".into());
+    // Host-side metadata remains string-backed, but cannot execute this
+    // form as a typed VM route without real Option variant construction.
+    assert!(
+        WebDevServer::bind_runtime_with_form_guards(0, None, None, vec![route], vec![guard],)
+            .is_err()
+    );
+}

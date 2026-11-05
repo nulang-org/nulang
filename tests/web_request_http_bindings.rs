@@ -168,3 +168,84 @@ fn web_main() {
     assert_eq!(error.code(), "ambiguous_request_input");
     assert_eq!(error.problem_details()["source"], "query");
 }
+
+#[test]
+fn malformed_scalar_problem_never_echoes_submitted_sensitive_value() {
+    use nulang::web::http_problem::request_decode_problem_response;
+    let source = r#"
+fn endpoint(seats: Int from form("seats")) -> Int { seats }
+fn web_main() { perform Web.route("POST", "/leads", endpoint) }
+"#;
+    let contracts = compile_module_contracts(&parse(source));
+    let bindings = compile_route_bindings(&contracts.routes[0]);
+    assert!(bindings.diagnostics.is_empty());
+    let headers = vec![(
+        "Content-Type".to_string(),
+        "application/x-www-form-urlencoded".to_string(),
+    )];
+    let captured =
+        HttpRequestBindingInputs::capture("/leads", &headers, b"seats=customer-secret-123");
+    let err = bind_request_arguments(
+        &bindings.bindings,
+        1,
+        &captured.values(&HashMap::new(), &headers),
+    )
+    .unwrap_err();
+    let response = request_decode_problem_response(&err);
+    assert_eq!(response.status, 400);
+    let body = String::from_utf8(response.body).unwrap();
+    assert!(!body.contains("customer-secret-123"), "{body}");
+    assert_eq!(err.code(), "invalid_request_input");
+}
+
+#[test]
+fn structured_handler_types_must_not_be_silently_coerced_to_vm_strings() {
+    use nulang::web::bindings::{RouteBindingContract, RouteBindingSource};
+    use nulang::web::request_bindings::RequestDecodeErrorKind;
+    let source = RouteBindingContract {
+        source: RouteBindingSource::Form,
+        source_name: "tags".into(),
+        handler_param: "tags".into(),
+        handler_index: 0,
+        ty: Some("Option[String]".into()),
+    };
+    let headers = vec![(
+        "Content-Type".to_string(),
+        "application/x-www-form-urlencoded".to_string(),
+    )];
+    let captured = HttpRequestBindingInputs::capture("/leads", &headers, b"tags=some-value");
+    let error = bind_request_arguments(&[source], 1, &captured.values(&HashMap::new(), &headers))
+        .unwrap_err();
+    assert_eq!(error.kind, RequestDecodeErrorKind::UnsupportedBindingType);
+    assert_eq!(error.http_status(), 500);
+    assert!(!error.problem_details().to_string().contains("some-value"));
+}
+
+#[test]
+fn real_compiler_option_annotation_is_not_supported_as_scalar_binding() {
+    use nulang::web::request_bindings::scalar_binding_supported;
+    let module = parse(
+        r#"
+fn endpoint(note: Option[String] from form("note")) -> String { "ok" }
+fn web_main() { perform Web.route("POST", "/submit", endpoint) }
+"#,
+    );
+    let contract = compile_module_contracts(&module);
+    assert!(
+        contract.diagnostics.is_empty(),
+        "{:?}",
+        contract.diagnostics
+    );
+    let compiled = compile_route_bindings(&contract.routes[0]);
+    assert!(
+        compiled.diagnostics.is_empty(),
+        "{:?}",
+        compiled.diagnostics
+    );
+    assert_eq!(compiled.bindings.len(), 1);
+    assert!(
+        !scalar_binding_supported(compiled.bindings[0].ty.as_deref()),
+        "Option type was incorrectly classified as VM-bindable scalar: {:?}",
+        compiled.bindings[0].ty
+    );
+}

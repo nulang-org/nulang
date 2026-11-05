@@ -22,6 +22,7 @@ pub enum RequestDecodeErrorKind {
     Missing,
     InvalidType,
     Ambiguous,
+    UnsupportedBindingType,
     DuplicateHandlerSlot,
     InvalidHandlerSlot,
     IncompleteBindingPlan,
@@ -70,6 +71,7 @@ impl RequestDecodeError {
             RequestDecodeErrorKind::Missing => "missing_request_input",
             RequestDecodeErrorKind::InvalidType => "invalid_request_input",
             RequestDecodeErrorKind::Ambiguous => "ambiguous_request_input",
+            RequestDecodeErrorKind::UnsupportedBindingType => "unsupported_binding_type",
             RequestDecodeErrorKind::DuplicateHandlerSlot => "duplicate_handler_slot",
             RequestDecodeErrorKind::InvalidHandlerSlot => "invalid_handler_slot",
             RequestDecodeErrorKind::IncompleteBindingPlan => "incomplete_binding_plan",
@@ -170,6 +172,13 @@ pub fn bind_request_arguments(
                     "binding for '{}' targets invalid handler slot {}",
                     binding.handler_param, binding.handler_index
                 ),
+            ));
+        }
+        if !scalar_binding_supported(binding.ty.as_deref()) {
+            return Err(error(
+                binding,
+                RequestDecodeErrorKind::UnsupportedBindingType,
+                format!("handler parameter '{}' has a structured type that cannot be materialized by the scalar VM binding ABI", binding.handler_param),
             ));
         }
         if slots[binding.handler_index].is_some() {
@@ -300,22 +309,39 @@ fn source_name(source: RouteBindingSource) -> &'static str {
     }
 }
 
+/// The current VM request ABI accepts primitive constants and string-backed
+/// simple nominal identifiers. Parameterized/composite types need a distinct
+/// materializer for variant and array values; treating them as String would
+/// violate the handler's type contract.
+pub fn scalar_binding_supported(ty: Option<&str>) -> bool {
+    match ty.map(str::trim) {
+        None | Some("String" | "Int" | "Float" | "Bool") => true,
+        Some(other) => {
+            let mut bytes = other.bytes();
+            bytes
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic())
+                && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        }
+    }
+}
+
 pub fn decode_scalar_constant(raw: &str, ty: Option<&str>) -> Result<Constant, String> {
     match ty.map(str::trim) {
         Some("Int") => raw
             .parse::<i64>()
             .map(Constant::Int)
-            .map_err(|_| format!("expected Int, got '{raw}'")),
+            .map_err(|_| "expected Int".to_string()),
         Some("Float") => raw
             .parse::<f64>()
             .ok()
             .filter(|value| value.is_finite())
             .map(Constant::Float)
-            .ok_or_else(|| format!("expected finite Float, got '{raw}'")),
+            .ok_or_else(|| "expected finite Float".to_string()),
         Some("Bool") => match raw {
             "true" => Ok(Constant::Bool(true)),
             "false" => Ok(Constant::Bool(false)),
-            _ => Err(format!("expected Bool ('true' or 'false'), got '{raw}'")),
+            _ => Err("expected Bool ('true' or 'false')".to_string()),
         },
         _ => Ok(Constant::String(raw.to_string())),
     }

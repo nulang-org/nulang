@@ -337,10 +337,52 @@ metadata listing `csrf` is not evidence of runtime enforcement. The inert
 `Middleware::Csrf` placeholder has been removed, rather than claiming an
 unenforced response-only middleware can prevent request execution.
 
-Optional/default values and repeated typed collections remain deferred because
-the current compiler's handler binding ABI only supports required scalar
-values. This PR does not change the Nulang source grammar, and application
-code must still construct and register the explicit guarded form route.
+Compiled handler invocation for optional/default values and repeated typed
+collections remains deferred because the current VM request-binding ABI only
+supports required scalar constants. Host-side schema validation for optional
+and repeated inputs is documented below. This work does not change Nulang
+source grammar; applications still explicitly register guarded form routes.
+
+## Host-side optional and repeated form fields (experimental)
+
+`FormContract::with_shape(field, FormFieldShape::Optional)` and
+`FormFieldShape::Repeated { min_items, max_items }` extend form **validation
+metadata**, without implying support in the compiled Nulang handler ABI.
+They work on the retained multi-value URL-encoded HTTP capture:
+
+- Optional scalar inputs decode when provided; an absent or single blank
+  optional input is absent from `ValidatedForm.values`, never coerced to an
+  empty string or a fake `None` VM variant. Two occurrences (including encoded
+  aliases) remain invalid for a scalar.
+- Repeated fields decode each occurrence into the declared scalar element type
+  and preserve order in `ValidatedForm.repeated`. They validate each element,
+  apply existing scalar constraints to every value, and enforce explicit
+  `min_items` / `max_items` bounds (maximum 64). A zero minimum permits an
+  explicitly empty collection.
+- The HTML field-fragment renderer distinguishes optional from required
+  controls and renders repeated fields as a labeled fieldset of indexed
+  controls. All submitted values and attribute content remain escaped; errors
+  identify the field without echoing submitted content.
+- The opt-in `GuardedFormRoute` **rejects optional and repeated field shapes at
+  server startup**, because the existing direct VM binder cannot construct
+  `Option[T]` variants or typed collections. Applications may use these shapes
+  through the host-side `FormContract` API, but must not register them as
+  typed Nulang route-handler parameters yet.
+- A structured handler annotation, such as `Option[String]` or `List[Int]`,
+  cannot be staged by the scalar request binder. Such a binding fails as a
+  server-side unsupported-binding-type error instead of silently delivering
+  `Constant::String` with an incompatible VM type. Simple nominal identifiers
+  remain string-backed for backwards compatibility; their actual runtime
+  representation still requires separate type-system guarantees.
+
+Also, client-facing typed decoding errors no longer embed the raw submitted
+value in the problem message. This matters for sensitive form fields,
+query parameters, and logs.
+
+A future compiler+VM change should add verified variant/array materialization
+and tests for handler-call ABI conformance before allowing these shapes under
+`bind_runtime_with_form_guards`. Do not ship partial conversion through JSON
+strings or last-value selection as a substitute.
 
 ## Architectural direction
 
