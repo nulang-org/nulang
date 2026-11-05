@@ -4,6 +4,7 @@ pub mod bindings;
 pub mod budget;
 pub mod contracts;
 pub mod dispatch;
+pub mod form_guard;
 pub mod forms;
 pub mod handler_call;
 pub mod html_safety;

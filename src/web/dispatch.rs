@@ -179,7 +179,7 @@ pub fn render_direct_request(
 /// `:path` value through ambient `Web.param`. Such a route must stay on the
 /// legacy request-context path rather than being mistaken for a complete direct
 /// call merely because the binding/parameter counts happen to match.
-fn has_complete_request_binding_plan(plan: &RuntimeRoutePlan) -> bool {
+pub(crate) fn has_complete_request_binding_plan(plan: &RuntimeRoutePlan) -> bool {
     if plan.bindings.len() != plan.handler_param_count {
         return false;
     }
