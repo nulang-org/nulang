@@ -4,6 +4,7 @@
 //! boundary that serializes a [`RequestDecodeError`] as a problem response when
 //! an HTTP transport chooses to surface the failure to a client.
 
+use crate::web::forms::FormValidationErrors;
 use crate::web::request_bindings::RequestDecodeError;
 
 pub const PROBLEM_JSON_CONTENT_TYPE: &str = "application/problem+json";
@@ -32,6 +33,23 @@ pub fn request_decode_problem_response(error: &RequestDecodeError) -> ProblemHtt
 
     ProblemHttpResponse {
         status: error.http_status(),
+        headers: vec![(
+            "Content-Type".to_string(),
+            PROBLEM_JSON_CONTENT_TYPE.to_string(),
+        )],
+        body,
+    }
+}
+
+/// Produce the same HTTP Problem Details transport envelope for semantic form
+/// validation errors. Callers opt in explicitly; low-level typed request decode
+/// failures still use their established 400/500 classifications.
+pub fn form_validation_problem_response(errors: &FormValidationErrors) -> ProblemHttpResponse {
+    let body = serde_json::to_vec(&errors.problem_details()).unwrap_or_else(|_| {
+        br#"{"type":"urn:nulang:web:problem-serialization","title":"Internal Server Error","status":500}"#.to_vec()
+    });
+    ProblemHttpResponse {
+        status: 422,
         headers: vec![(
             "Content-Type".to_string(),
             PROBLEM_JSON_CONTENT_TYPE.to_string(),
