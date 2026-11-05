@@ -19,6 +19,7 @@ use std::time::Duration;
 use crate::bytecode::CodeModule;
 use crate::value_layout::PAYLOAD_MASK;
 use crate::vm::{resolve_value_string, Value, CLOSURE_ENV_FLAG, VM};
+use crate::web::csrf::validate_mutation_origin;
 use crate::web::dispatch::{render_direct_request, DirectRequestRenderError};
 use crate::web::http_problem::request_decode_problem_response;
 use crate::web::http_request::HttpRequestBindingInputs;
@@ -358,6 +359,21 @@ impl HttpServerState {
     }
 
     fn write_response(stream: &mut TcpStream, response: &HttpResponse) {
+        // The HTTP writer owns framing. A caller-supplied CRLF or framing
+        // header must not split the response or override Content-Length.
+        // Reuse the same fail-closed response behavior as draft #1927.
+        if response
+            .headers
+            .iter()
+            .any(|(name, value)| !safe_response_header(name, value))
+        {
+            let fallback = HttpResponse {
+                status: 500,
+                headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+                body: b"Internal server error".to_vec(),
+            };
+            return Self::write_response(stream, &fallback);
+        }
         let status_text = match response.status {
             200 => "OK",
             201 => "Created",
@@ -572,6 +588,16 @@ fn valid_cookie_name(name: &str) -> bool {
                         | b'~'
                 )
         })
+}
+
+/// Reject invalid response metadata and caller-owned HTTP framing.
+fn safe_response_header(name: &str, value: &str) -> bool {
+    valid_cookie_name(name)
+        && !name.eq_ignore_ascii_case("content-length")
+        && !name.eq_ignore_ascii_case("transfer-encoding")
+        && value
+            .bytes()
+            .all(|byte| byte == b'\t' || (byte >= 0x20 && byte != 0x7f))
 }
 
 /// Preserve all unquoted RFC 6265 cookie octets, but reject separators,
@@ -875,6 +901,31 @@ pub fn render_route_handler(
     }
 }
 
+/// Experimental Web rejects ambiguous or cross-origin browser mutations before
+/// handler dispatch. This does not replace authentication or authorization.
+fn unsafe_origin_response(
+    request: &HttpRequest,
+    local_addr: Option<std::net::SocketAddr>,
+    public_origin: Option<&str>,
+) -> Option<HttpResponse> {
+    let failure = validate_mutation_origin(
+        request.method.as_str(),
+        &request.headers,
+        local_addr,
+        public_origin,
+    )
+    .err()?;
+    eprintln!("Nulang Web denied state-changing request: {failure:?}");
+    Some(HttpResponse {
+        status: 403,
+        headers: vec![
+            ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+            ("Cache-Control".into(), "no-store".into()),
+        ],
+        body: b"Forbidden: invalid request origin".to_vec(),
+    })
+}
+
 fn invalid_ui_action_response(captured: &HttpRequestBindingInputs) -> Option<HttpResponse> {
     captured
         .ui_message_error
@@ -1173,8 +1224,15 @@ impl WebDevServer {
                 return;
             }
         };
-        // Perform CSRF admission before invoking either legacy or typed
-        // handlers. A forbidden request must not execute any user code.
+        // Both provenance and session synchronizer checks are request-admission
+        // boundaries. Reject before dispatching typed or legacy handlers.
+        let public_origin = std::env::var("NULANG_WEB_PUBLIC_ORIGIN").ok();
+        if let Some(forbidden) =
+            unsafe_origin_response(&request, stream.local_addr().ok(), public_origin.as_deref())
+        {
+            HttpServerState::write_response(&mut stream, &forbidden);
+            return;
+        }
         let captured =
             HttpRequestBindingInputs::capture(&request.path, &request.headers, &request.body);
         if !session_csrf_allowed(&request, &captured) {
@@ -1375,6 +1433,68 @@ fn guess_content_type(path: &Path) -> &'static str {
 mod tests {
     use super::*;
 
+    fn response_wire_for_test(response: HttpResponse) -> String {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            HttpServerState::write_response(&mut socket, &response);
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut raw = String::new();
+        client.read_to_string(&mut raw).unwrap();
+        server.join().unwrap();
+        raw
+    }
+
+    #[test]
+    fn response_writer_rejects_untrusted_headers_and_framing() {
+        for (name, value) in [
+            ("X-Test\r\nX-Injected", "safe"),
+            ("X-Test", "safe\r\nX-Injected: yes"),
+            ("X-Test", "safe\0trailing"),
+            ("Content-Length", "1"),
+            ("Transfer-Encoding", "chunked"),
+        ] {
+            let response = response_wire_for_test(HttpResponse {
+                status: 200,
+                headers: vec![(name.into(), value.into())],
+                body: b"trusted".to_vec(),
+            });
+            assert!(
+                response.starts_with("HTTP/1.1 500 Internal Server Error"),
+                "{response}"
+            );
+            assert!(!response.contains("X-Injected"), "{response}");
+            assert!(!response.contains("trusted"), "{response}");
+            assert_eq!(response.matches("Content-Length:").count(), 1, "{response}");
+        }
+    }
+
+    #[test]
+    fn unauthenticated_cross_origin_post_cannot_reach_web_routing() {
+        let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let request = format!(
+            "POST /unsafe HTTP/1.1\r\nHost: localhost:{}\r\nOrigin: https://attacker.example\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            server.port
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden"),
+            "cross-origin unsafe request was not rejected: {response}"
+        );
+    }
+
     #[test]
     fn secure_session_token_is_unpredictable_and_256_bits() {
         let a = secure_session_token().expect("OS entropy must be available");
@@ -1382,6 +1502,98 @@ mod tests {
         assert_eq!(a.len(), 64); // 32 random bytes in lowercase hex
         assert!(a.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn web_dev_server_fences_cross_origin_mutations_before_dispatch() {
+        fn send(port: u16, raw: &str) -> String {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream.write_all(raw.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        }
+
+        let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
+        let host = format!("localhost:{}", server.port);
+        let foreign = format!(
+            "POST /mutation HTTP/1.1\r\nHost: {host}\r\nOrigin: https://attacker.example\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(send(server.port, &foreign).starts_with("HTTP/1.1 403 Forbidden"));
+
+        let missing =
+            format!("POST /mutation HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\n\r\n");
+        assert!(send(server.port, &missing).starts_with("HTTP/1.1 403 Forbidden"));
+
+        let trusted = format!(
+            "POST /mutation HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(
+            send(server.port, &trusted).starts_with("HTTP/1.1 404 Not Found"),
+            "same-origin requests must reach normal routing"
+        );
+
+        let duplicate = format!(
+            "POST /mutation HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nOrigin: https://attacker.example\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(send(server.port, &duplicate).starts_with("HTTP/1.1 403 Forbidden"));
+
+        let unknown = format!("TRACE / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        assert!(send(server.port, &unknown).starts_with("HTTP/1.1 501 Not Implemented"));
+    }
+
+    #[test]
+    fn web_dev_server_requires_origin_and_csrf_together_over_tcp() {
+        use std::io::{Read, Write};
+        use std::net::{Shutdown, TcpStream};
+
+        let session = secure_session_token().unwrap();
+        let csrf = secure_session_token().unwrap();
+        let key = format!("nulang_auth:csrf:{session}");
+        kv_set(&key, &csrf);
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                kv_delete(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(key);
+        let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
+        let host = format!("localhost:{}", server.port);
+        let send = |origin: Option<&str>, csrf_header: Option<&str>, cookie: bool| {
+            let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = format!("POST /mutate HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\nConnection: close\r\n");
+            if let Some(origin) = origin {
+                request.push_str(&format!("Origin: {origin}\r\n"));
+            }
+            if let Some(token) = csrf_header {
+                request.push_str(&format!("X-CSRF-Token: {token}\r\n"));
+            }
+            if cookie {
+                request.push_str(&format!("Cookie: nulang_session={session}\r\n"));
+            }
+            request.push_str("\r\n");
+            stream.write_all(request.as_bytes()).unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        };
+        let trusted = format!("http://{host}");
+        assert!(send(Some(&trusted), Some(&csrf), true).starts_with("HTTP/1.1 404 Not Found"));
+        assert!(send(Some(&trusted), None, true).starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(send(Some("https://attacker.example"), Some(&csrf), true)
+            .starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(send(None, Some(&csrf), true).starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(send(Some("https://attacker.example"), None, false)
+            .starts_with("HTTP/1.1 403 Forbidden"));
     }
 
     #[test]

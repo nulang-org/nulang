@@ -34,3 +34,28 @@ also rejects malformed names. Values containing delimiters, whitespace, or
 header controls are not emitted. Encode non-token payloads with base64url.
 These safeguards do not imply production readiness or harden arbitrary
 application-provided response headers.
+
+## Request-origin and response-writer integration (draft)
+
+The routed experimental Web server now checks request provenance **before**
+the development-session synchronizer check or any typed/legacy handler
+dispatch. An unsafe request requires a unique Host and either a matching
+Origin or a same-origin Referer, with strict origin-boundary matching. A
+contradictory `Sec-Fetch-Site` or duplicate provenance header is rejected.
+Only direct-listener IP/localhost hosts are accepted by default. Set
+`NULANG_WEB_PUBLIC_ORIGIN` to one canonical `https://host[:port]`
+origin when terminating TLS at a trusted reverse proxy. The code does
+not trust arbitrary `X-Forwarded-*` headers. A missing or invalid
+configuration blocks unsafe requests rather than inferring an origin.
+Browser forms send an Origin/Referer automatically; non-browser callers
+must also provide valid provenance.
+
+The response writer rejects malformed response header names/values and
+caller-supplied Content-Length or Transfer-Encoding, returning a generic
+HTTP 500 instead of interpolating invalid framing. Existing development
+cookie helpers separately enforce RFC cookie-name/value grammar.
+This does **not** establish production authentication or authorization,
+cover state changes implemented through safe HTTP methods, or replace
+general HTTP/1.1 request admission, verified identity, durable session
+expiry/revocation, or per-tenant database isolation. The generic
+`Http.serve` endpoint is not covered by this routed Web origin gate.
