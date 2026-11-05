@@ -36,7 +36,7 @@ fn login_page() -> Html {
 }
 
 fn admin_page() -> Html {
-    require(fn(user: User) -> Html {
+    require(fn(user: String) -> Html {
         layout("Admin", el("div", [], [
             el("p", [], [text("Logged in as: " + user)]),
             el("form", [("method", "POST"), ("action", "/logout")], [
