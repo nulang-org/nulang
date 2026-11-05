@@ -1125,7 +1125,18 @@ impl WebDevServer {
                     request: request.clone(),
                     params: params.clone(),
                 };
-                let rendered =
+                let guard_key = (
+                    route.route.method.as_str().to_string(),
+                    route.route.path.clone(),
+                );
+                let rendered = if let Some(guard) =
+                    form_guards.get(&guard_key).filter(|guard| guard.is_typed())
+                {
+                    guard
+                        .render_typed(route, &captured)
+                        .map(Some)
+                        .map_err(DirectRequestRenderError::Execution)
+                } else {
                     with_request_context(ctx, || match render_direct_request(route, &values) {
                         Ok(Some(rendered)) => Ok(Some(rendered)),
                         Ok(None) => Ok(render_route_handler(
@@ -1134,7 +1145,8 @@ impl WebDevServer {
                             None,
                         )),
                         Err(error) => Err(error),
-                    });
+                    })
+                };
                 match rendered {
                     Ok(Some(html)) => HttpResponse {
                         status: 200,
