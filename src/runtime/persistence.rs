@@ -1283,7 +1283,7 @@ impl PersistenceStore for JsonFileStore {
 }
 
 // ---------------------------------------------------------------------------
-// LibsqlStore — libSQL-backed persistence (local, remote Turso, or replica)
+// LibsqlStore — libSQL-backed local SQLite persistence (remote disabled)
 // ---------------------------------------------------------------------------
 
 /// libSQL-backed persistence store.
@@ -1364,30 +1364,17 @@ impl LibsqlStore {
         Self::new(":memory:")
     }
 
-    /// Connect to a remote Turso database.
+    /// Remote Turso connections are disabled until libSQL can use a patched
+    /// TLS certificate-verification stack. Local SQLite remains supported.
     ///
-    /// Journal pragmas (`journal_mode`, `synchronous`) are deliberately
-    /// skipped: a Turso server manages its own journal and durability
-    /// policy.
-    pub fn new_remote(url: &str, auth_token: &str) -> io::Result<Self> {
-        let rt =
-            tokio::runtime::Runtime::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        let db = rt.block_on(async {
-            libsql::Builder::new_remote(url.to_string(), auth_token.to_string())
-                .build()
-                .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
-        })?;
-        let conn = db
-            .connect()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        let store = LibsqlStore {
-            conn: std::sync::Mutex::new(conn),
-            rt,
-            path: PathBuf::from(url),
-        };
-        store.ensure_tables()?;
-        Ok(store)
+    /// This preserves the API shape and fails explicitly rather than
+    /// accidentally downgrading HTTPS, accepting vulnerable verification, or
+    /// attempting to connect with an unsupported transport.
+    pub fn new_remote(_url: &str, _auth_token: &str) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Remote libSQL/Turso disabled: unpatched TLS chain RUSTSEC-2026-0382",
+        ))
     }
     pub fn path(&self) -> &Path {
         &self.path
