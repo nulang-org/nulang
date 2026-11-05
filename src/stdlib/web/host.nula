@@ -101,6 +101,11 @@ pub fn kv_all() -> [(String, String)] ! {Web, Request} {
     perform Web.kv_all()
 }
 
+/// Generate a cryptographically random 256-bit session secret.
+pub fn secure_token() -> String ! {Web, Request} {
+    perform Web.secure_token()
+}
+
 /// Set a response cookie.
 pub fn set_cookie(name: String, value: String) -> Unit ! {Web, Respond} {
     perform Web.set_cookie(name, value)

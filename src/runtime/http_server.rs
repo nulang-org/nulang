@@ -4,6 +4,8 @@
 //! Handlers are non-capturing `fn(String) -> String` — no closures with env.
 //! Status is always 200; Content-Type is always text/plain.
 
+use rand_core::{OsRng, RngCore};
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -534,15 +536,73 @@ where
     result
 }
 
-/// Add a `Set-Cookie` header for the current response.
+/// Generate a cryptographically random, 256-bit opaque session secret.
+///
+/// This host operation is intentionally nondeterministic and must never be
+/// replayed as a fresh authentication decision in a durable workflow.
+/// Failed OS entropy acquisition is a hard failure, not a counter fallback.
+pub fn secure_session_token() -> Option<String> {
+    let mut bytes = [0u8; 32];
+    let mut rng = OsRng;
+    rng.try_fill_bytes(&mut bytes).ok()?;
+    Some(hex::encode(bytes))
+}
+
+/// RFC 6265 cookie names must be nonempty HTTP tokens. Never allow
+/// attacker-controlled characters to create new header fields or attributes.
+fn valid_cookie_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+/// Preserve all unquoted RFC 6265 cookie octets, but reject separators,
+/// controls, whitespace, and backslash rather than escaping them into a
+/// response header. Callers can encode arbitrary values using base64url.
+fn valid_cookie_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| matches!(byte, 0x21 | 0x23..=0x2B | 0x2D..=0x3A | 0x3C..=0x5B | 0x5D..=0x7E))
+}
+
+/// Add a secure, HTTP-only `Set-Cookie` header for the current response.
+/// Invalid names or values are not emitted. This demo API is not a
+/// production session/identity boundary.
 pub fn set_cookie(name: &str, value: &str) {
-    let cookie = format!("{}={}; Path=/; HttpOnly; SameSite=Lax", name, value);
+    if !valid_cookie_name(name) || !valid_cookie_value(value) {
+        return;
+    }
+    let cookie = format!("{}={}; Path=/; HttpOnly; Secure; SameSite=Lax", name, value);
     RESPONSE_COOKIES.with(|c| c.borrow_mut().push(cookie));
 }
 
 /// Add a `Set-Cookie` header that clears the named cookie.
 pub fn clear_cookie(name: &str) {
-    let cookie = format!("{}=; Path=/; Max-Age=0; SameSite=Lax", name);
+    if !valid_cookie_name(name) {
+        return;
+    }
+    let cookie = format!(
+        "{}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax",
+        name
+    );
     RESPONSE_COOKIES.with(|c| c.borrow_mut().push(cookie));
 }
 
@@ -875,6 +935,97 @@ impl Drop for ConnectionLease {
     }
 }
 
+/// Authorize unsafe HTTP requests carrying a first-party development session.
+///
+/// An anonymous request is left to its route's authentication policy. For a
+/// request with a `nulang_session` cookie, enforce a per-session synchronizer
+/// token stored server-side by `@nulang/auth`. Only one submitted token source
+/// is allowed. This does not replace same-origin admission or authorization.
+fn session_csrf_allowed(request: &HttpRequest, captured: &HttpRequestBindingInputs) -> bool {
+    if matches!(
+        request.method,
+        HttpMethod::Get | HttpMethod::Head | HttpMethod::Options
+    ) {
+        return true;
+    }
+
+    let mut session: Option<&str> = None;
+    for (_, raw) in request
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+    {
+        for cookie in raw.split(';') {
+            let cookie = cookie.trim();
+            let (name, value) = cookie.split_once('=').unwrap_or((cookie, ""));
+            if name.trim() == "nulang_session" {
+                if session.replace(value.trim()).is_some() {
+                    return false; // Duplicate session cookies are ambiguous.
+                }
+            }
+        }
+    }
+    let Some(session) = session else {
+        return true; // Authentication is an independent route boundary.
+    };
+    if session.len() != 64 || !session.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+
+    let expected = kv_get(&format!("nulang_auth:csrf:{session}"));
+    let Some(expected) = expected.filter(|value| value.len() == 64) else {
+        return false;
+    };
+
+    let headers: Vec<&str> = request
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("x-csrf-token"))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    if headers.len() > 1 {
+        return false;
+    }
+
+    // A form token must appear exactly once in the raw body. Decoding the
+    // map alone would silently overwrite duplicate _csrf fields.
+    let form_media = request
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .collect::<Vec<_>>();
+    let mut forms = Vec::new();
+    if form_media.len() == 1
+        && form_media[0].1.split(';').next().is_some_and(|value| {
+            value
+                .trim()
+                .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        })
+    {
+        for part in String::from_utf8_lossy(&request.body).split('&') {
+            let (raw_name, raw_value) = part.split_once('=').unwrap_or((part, ""));
+            if percent_decode_form(raw_name) == "_csrf" {
+                forms.push(percent_decode_form(raw_value));
+            }
+        }
+    }
+
+    let submitted = match (headers.as_slice(), forms.as_slice()) {
+        ([header], []) => *header,
+        ([], [form]) => form.as_str(),
+        _ => return false,
+    };
+    if submitted.len() != 64 || !submitted.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+
+    // The token is random and server-owned; comparison must avoid a
+    // character-by-character early return.
+    use subtle::ConstantTimeEq;
+    let _ = captured; // Input parsing is shared with the typed route binder.
+    bool::from(submitted.as_bytes().ct_eq(expected.as_bytes()))
+}
+
 /// Dev server that dispatches registered `Web.route` handlers and falls back
 /// to static files for unmatched paths.
 #[derive(Debug)]
@@ -1022,6 +1173,26 @@ impl WebDevServer {
                 return;
             }
         };
+        // Perform CSRF admission before invoking either legacy or typed
+        // handlers. A forbidden request must not execute any user code.
+        let captured =
+            HttpRequestBindingInputs::capture(&request.path, &request.headers, &request.body);
+        if !session_csrf_allowed(&request, &captured) {
+            HttpServerState::write_response(
+                &mut stream,
+                &HttpResponse {
+                    status: 403,
+                    headers: vec![
+                        ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+                        ("Cache-Control".into(), "no-store".into()),
+                        ("X-Content-Type-Options".into(), "nosniff".into()),
+                    ],
+                    body: b"Invalid CSRF token".to_vec(),
+                },
+            );
+            return;
+        }
+
         let path = request.path.clone();
 
         let mut response = if path.starts_with(Self::SSE_PATH_PREFIX) {
@@ -1035,8 +1206,6 @@ impl WebDevServer {
                 crate::web::dispatch::match_route(r, &request.path).map(|params| (r, params))
             })
         {
-            let captured =
-                HttpRequestBindingInputs::capture(&request.path, &request.headers, &request.body);
             if let Some(response) = invalid_ui_action_response(&captured) {
                 response
             } else {
@@ -1205,6 +1374,193 @@ fn guess_content_type(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secure_session_token_is_unpredictable_and_256_bits() {
+        let a = secure_session_token().expect("OS entropy must be available");
+        let b = secure_session_token().expect("OS entropy must be available");
+        assert_eq!(a.len(), 64); // 32 random bytes in lowercase hex
+        assert!(a.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn session_mutations_need_a_valid_bound_csrf_token() {
+        let session = secure_session_token().unwrap();
+        let csrf = secure_session_token().unwrap();
+        let key = format!("nulang_auth:csrf:{session}");
+        kv_set(&key, &csrf);
+
+        let request =
+            |method: HttpMethod, headers: Vec<(String, String)>, body: &str| HttpRequest {
+                method,
+                path: "/logout".into(),
+                headers,
+                body: body.as_bytes().to_vec(),
+            };
+        let cookie = ("Cookie".into(), format!("nulang_session={session}"));
+        let form_type = (
+            "Content-Type".into(),
+            "application/x-www-form-urlencoded".into(),
+        );
+
+        let missing = request(HttpMethod::Post, vec![cookie.clone()], "");
+        let captured =
+            HttpRequestBindingInputs::capture(&missing.path, &missing.headers, &missing.body);
+        assert!(!session_csrf_allowed(&missing, &captured));
+
+        let valid_form = request(
+            HttpMethod::Post,
+            vec![cookie.clone(), form_type.clone()],
+            &format!("_csrf={csrf}"),
+        );
+        let captured = HttpRequestBindingInputs::capture(
+            &valid_form.path,
+            &valid_form.headers,
+            &valid_form.body,
+        );
+        assert!(session_csrf_allowed(&valid_form, &captured));
+
+        let header = request(
+            HttpMethod::Post,
+            vec![cookie.clone(), ("X-CSRF-Token".into(), csrf.clone())],
+            "",
+        );
+        let captured =
+            HttpRequestBindingInputs::capture(&header.path, &header.headers, &header.body);
+        assert!(session_csrf_allowed(&header, &captured));
+
+        let duplicate = request(
+            HttpMethod::Post,
+            vec![cookie.clone(), form_type],
+            &format!("_csrf={csrf}&_csrf=forged"),
+        );
+        let captured =
+            HttpRequestBindingInputs::capture(&duplicate.path, &duplicate.headers, &duplicate.body);
+        assert!(!session_csrf_allowed(&duplicate, &captured));
+
+        let forged = request(
+            HttpMethod::Post,
+            vec![cookie.clone(), ("X-CSRF-Token".into(), "forged".into())],
+            "",
+        );
+        let captured =
+            HttpRequestBindingInputs::capture(&forged.path, &forged.headers, &forged.body);
+        assert!(!session_csrf_allowed(&forged, &captured));
+
+        let read = request(HttpMethod::Get, vec![cookie.clone()], "");
+        let captured = HttpRequestBindingInputs::capture(&read.path, &read.headers, &read.body);
+        assert!(session_csrf_allowed(&read, &captured));
+
+        let anonymous = request(HttpMethod::Post, vec![], "");
+        let captured =
+            HttpRequestBindingInputs::capture(&anonymous.path, &anonymous.headers, &anonymous.body);
+        assert!(session_csrf_allowed(&anonymous, &captured));
+
+        kv_delete(&key);
+        let captured =
+            HttpRequestBindingInputs::capture(&header.path, &header.headers, &header.body);
+        assert!(!session_csrf_allowed(&header, &captured));
+    }
+
+    #[test]
+    fn web_dev_server_rejects_missing_session_csrf_over_real_tcp() {
+        use std::io::{Read, Write};
+        use std::net::{Shutdown, TcpStream};
+
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                kv_delete(&self.0);
+            }
+        }
+
+        let session = secure_session_token().unwrap();
+        let csrf = secure_session_token().unwrap();
+        let key = format!("nulang_auth:csrf:{session}");
+        kv_set(&key, &csrf);
+        let _cleanup = Cleanup(key);
+        // Even without a registered route, the admission boundary runs before
+        // dispatch. A valid token reaches the normal 404 fallback instead.
+        let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
+
+        let send = |csrf_header: Option<&str>| {
+            let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = format!(
+                "POST /mutate HTTP/1.1\r\nHost: localhost:{}\r\nOrigin: http://localhost:{}\r\nCookie: nulang_session={}\r\nContent-Length: 0\r\nConnection: close\r\n",
+                server.port, server.port, session
+            );
+            if let Some(value) = csrf_header {
+                request.push_str(&format!("X-CSRF-Token: {value}\r\n"));
+            }
+            request.push_str("\r\n");
+            stream.write_all(request.as_bytes()).unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        };
+
+        assert!(send(None).starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(send(Some("forged")).starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(send(Some(&csrf)).starts_with("HTTP/1.1 404 Not Found"));
+    }
+
+    #[test]
+    fn session_cookies_are_secure_http_only_and_expire_on_clear() {
+        let ctx = RequestContext {
+            request: HttpRequest {
+                method: HttpMethod::Get,
+                path: "/".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+        with_request_context(ctx, || {
+            set_cookie("nulang_session", "random-token");
+            clear_cookie("nulang_session");
+            let cookies = take_response_cookies();
+            assert_eq!(cookies.len(), 2);
+            assert!(cookies.iter().all(|cookie| cookie.contains("; Secure")));
+            assert!(cookies.iter().all(|cookie| cookie.contains("; HttpOnly")));
+            assert!(cookies[0].contains("; SameSite=Lax"));
+            assert!(cookies[1].contains("; Max-Age=0"));
+        });
+    }
+
+    #[test]
+    fn session_cookie_helpers_reject_header_and_attribute_injection() {
+        let ctx = RequestContext {
+            request: HttpRequest {
+                method: HttpMethod::Get,
+                path: "/".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+        with_request_context(ctx, || {
+            set_cookie("good_token", "abc.def_123-xyz");
+            set_cookie("bad\r\nX-Injected", "token");
+            set_cookie("bad; Domain=attacker.test", "token");
+            set_cookie("session", "safe\r\nSet-Cookie: admin=1");
+            set_cookie("session", "safe; SameSite=None");
+            clear_cookie("bad\r\nSet-Cookie: admin=1");
+            clear_cookie("good_token");
+            let cookies = take_response_cookies();
+            assert_eq!(
+                cookies.len(),
+                2,
+                "malformed cookie names and values must not be emitted"
+            );
+            assert!(cookies[0].starts_with("good_token=abc.def_123-xyz;"));
+            assert!(cookies[1].starts_with("good_token=;"));
+        });
+    }
 
     // A deterministic reader forces TCP-like fragmentation without sleeps.
     struct FixedChunkReader<'a> {
