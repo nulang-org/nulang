@@ -1,0 +1,1 @@
+{"exit_code":0,"stdout":"","proves":"A match that transparently returns its directly bound pure callback retains proven empty effects when invoked."}

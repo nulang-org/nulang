@@ -626,15 +626,26 @@ impl EffectChecker {
                 // Preserve its effects. More complex let bodies are unknown.
                 self.known_callable_expr_row(value)
             }
-            Expr::Match { arms, .. } => {
+            Expr::Match {
+                scrutinee, arms, ..
+            } => {
                 // Every arm can return a different callable. Only claim a
                 // closed effect budget when all possible arms are known.
-                // Pattern-bound names shadow outer callback parameters. We
-                // cannot borrow their outer effect rows: the matched value
-                // may carry a different effect budget. Defer to an unknown
-                // open tail if an arm's callable depends on such a binding.
-                // Scrutinee and guard effects are assessed by infer_effects.
+                // A direct pattern variable that is itself returned preserves
+                // the proven callable row of the exact matched scrutinee.
+                // Never resolve that variable against an outer binding:
+                // shadowing could otherwise erase effects. Unknown scrutinees
+                // and all other pattern-bound references remain unresolved.
+                // Scrutinee and guard execution effects are inferred elsewhere.
+                let scrutinee_callable = self.known_callable_expr_row(scrutinee);
                 let arm_row = |pat: &Pattern, arm: &Expr| -> Option<EffectRow> {
+                    if let (Pattern::Var(bound), Expr::Var(returned, _), Some(proven_row)) =
+                        (pat, Self::callable_source(arm), &scrutinee_callable)
+                    {
+                        if bound == returned {
+                            return Some(proven_row.clone());
+                        }
+                    }
                     let mut bound = Vec::new();
                     pat_bound_vars(pat, &mut bound);
                     let mut references = Vec::new();

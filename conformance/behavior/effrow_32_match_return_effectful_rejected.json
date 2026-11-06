@@ -1,0 +1,1 @@
+{"exit_code":5,"stdout":"","stderr":"disallowed effect(s): IO","proves":"A transparent match return must preserve the effectful callback's IO row, not turn it into an unresolved tail or pure callable."}

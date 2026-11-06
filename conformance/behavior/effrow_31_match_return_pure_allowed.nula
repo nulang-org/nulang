@@ -1,0 +1,6 @@
+// A directly bound callback returned from a match retains known purity.
+fn pure() -> Unit ! {} {}
+fn invoke(cb: () -> Unit ! {}) -> Unit ! {} {
+    (match cb with { | f => f })()
+}
+invoke(pure)
