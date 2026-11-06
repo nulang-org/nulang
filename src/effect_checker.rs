@@ -390,10 +390,19 @@ fn free_vars(expr: &Expr, bound: &mut Vec<String>, acc: &mut Vec<String>) {
 fn pat_bound_vars(pat: &Pattern, bound: &mut Vec<String>) {
     match pat {
         Pattern::Wild => {}
-        Pattern::Var(name) | Pattern::Alias(name, _) => {
+        Pattern::Var(name) => {
             if !bound.contains(name) {
                 bound.push(name.clone());
             }
+        }
+        Pattern::Alias(name, inner) => {
+            if !bound.contains(name) {
+                bound.push(name.clone());
+            }
+            // An alias binds both its own name and every nested pattern
+            // variable. Missing these shadows lets an outer pure callback
+            // row be wrongly reused for an effectful matched value.
+            pat_bound_vars(inner, bound);
         }
         Pattern::Lit(_) => {}
         Pattern::Tuple(pats) => {

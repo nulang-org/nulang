@@ -1,0 +1,1 @@
+{"exit_code":5,"stdout":"","stderr":"not a subset of allowed effects","proves":"Nested pattern-bound names within alias patterns shadow outer pure callbacks and cannot silently erase IO effects."}
