@@ -1,0 +1,7 @@
+// Pattern f shadows a pure outer callback name, but binds the effectful scrutinee.
+fn pure() -> Unit ! {} {}
+fn danger() -> Unit ! {IO} { perform IO.print("must not run") }
+fn invoke(f: () -> Unit ! {}, cb: () -> Unit ! {IO}) -> Unit ! {} {
+    (match cb with { | f => f })()
+}
+invoke(pure, danger)

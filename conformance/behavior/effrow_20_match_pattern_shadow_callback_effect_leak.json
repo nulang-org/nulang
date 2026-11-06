@@ -1,1 +1,1 @@
-{"exit_code":5,"stdout":"","stderr":"not a subset of allowed effects","proves":"A match-pattern variable shadows a same-named outer pure callback; the pattern-bound effectful callback must not inherit the outer pure effect row."}
+{"exit_code":5,"stdout":"","stderr":"disallowed effect(s): IO","proves":"A match-pattern variable shadows a same-named outer pure callback; the pattern-bound effectful callback must not inherit the outer pure effect row."}

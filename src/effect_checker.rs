@@ -390,10 +390,19 @@ fn free_vars(expr: &Expr, bound: &mut Vec<String>, acc: &mut Vec<String>) {
 fn pat_bound_vars(pat: &Pattern, bound: &mut Vec<String>) {
     match pat {
         Pattern::Wild => {}
-        Pattern::Var(name) | Pattern::Alias(name, _) => {
+        Pattern::Var(name) => {
             if !bound.contains(name) {
                 bound.push(name.clone());
             }
+        }
+        Pattern::Alias(name, inner) => {
+            if !bound.contains(name) {
+                bound.push(name.clone());
+            }
+            // An alias binds both its own name and every nested pattern
+            // variable. Missing these shadows lets an outer pure callback
+            // row be wrongly reused for an effectful matched value.
+            pat_bound_vars(inner, bound);
         }
         Pattern::Lit(_) => {}
         Pattern::Tuple(pats) => {
@@ -626,15 +635,26 @@ impl EffectChecker {
                 // Preserve its effects. More complex let bodies are unknown.
                 self.known_callable_expr_row(value)
             }
-            Expr::Match { arms, .. } => {
+            Expr::Match {
+                scrutinee, arms, ..
+            } => {
                 // Every arm can return a different callable. Only claim a
                 // closed effect budget when all possible arms are known.
-                // Pattern-bound names shadow outer callback parameters. We
-                // cannot borrow their outer effect rows: the matched value
-                // may carry a different effect budget. Defer to an unknown
-                // open tail if an arm's callable depends on such a binding.
-                // Scrutinee and guard effects are assessed by infer_effects.
+                // A direct pattern variable that is itself returned preserves
+                // the proven callable row of the exact matched scrutinee.
+                // Never resolve that variable against an outer binding:
+                // shadowing could otherwise erase effects. Unknown scrutinees
+                // and all other pattern-bound references remain unresolved.
+                // Scrutinee and guard execution effects are inferred elsewhere.
+                let scrutinee_callable = self.known_callable_expr_row(scrutinee);
                 let arm_row = |pat: &Pattern, arm: &Expr| -> Option<EffectRow> {
+                    if let (Pattern::Var(bound), Expr::Var(returned, _), Some(proven_row)) =
+                        (pat, Self::callable_source(arm), &scrutinee_callable)
+                    {
+                        if bound == returned {
+                            return Some(proven_row.clone());
+                        }
+                    }
                     let mut bound = Vec::new();
                     pat_bound_vars(pat, &mut bound);
                     let mut references = Vec::new();
@@ -815,20 +835,35 @@ impl EffectChecker {
                 Ok(row)
             }
 
-            // Match: union of scrutinee and all arm effects. Pattern-bound
-            // variables shadow same-named module functions inside their arm.
+            // Match: union of scrutinee and all arm effects. A direct
+            // variable pattern binds the scrutinee value itself, so it may
+            // preserve a *proven* callable row. Unknown scrutinee rows and
+            // destructuring patterns remain conservatively unresolved.
             Expr::Match {
                 scrutinee, arms, ..
             } => {
                 let mut row = self.infer_effects(ctx, scrutinee)?;
+                let scrutinee_callable = self.known_callable_expr_row(scrutinee);
                 for (pat, guard, arm_expr) in arms {
                     let mut names = Vec::new();
                     pat_bound_vars(pat, &mut names);
+                    let infer_arm = |checker: &mut Self, expr: &Expr| {
+                        if let (Pattern::Var(name), Some(effects)) = (pat, &scrutinee_callable) {
+                            checker.infer_with_callable_bound(
+                                ctx,
+                                name,
+                                Some(effects.clone()),
+                                expr,
+                            )
+                        } else {
+                            checker.infer_with_bound(ctx, &names, expr)
+                        }
+                    };
                     if let Some(guard_expr) = guard {
-                        let guard_row = self.infer_with_bound(ctx, &names, guard_expr)?;
+                        let guard_row = infer_arm(self, guard_expr)?;
                         row = effect_row_union(&row, &guard_row);
                     }
-                    let arm_row = self.infer_with_bound(ctx, &names, arm_expr)?;
+                    let arm_row = infer_arm(self, arm_expr)?;
                     row = effect_row_union(&row, &arm_row);
                 }
                 Ok(row)

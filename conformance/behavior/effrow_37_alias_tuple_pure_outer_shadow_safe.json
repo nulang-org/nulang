@@ -1,0 +1,1 @@
+{"exit_code":5,"stdout":"","stderr":"not a subset of allowed effects","proves":"Until type-backed provenance is available for destructuring, nested aliases conservatively reject even pure callback invocations."}

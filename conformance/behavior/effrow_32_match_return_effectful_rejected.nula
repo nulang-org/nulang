@@ -1,0 +1,6 @@
+// Calling an IO callback returned by a match must violate a pure contract.
+fn danger() -> Unit ! {IO} { perform IO.print("must not run") }
+fn invoke(cb: () -> Unit ! {IO}) -> Unit ! {} {
+    (match cb with { | f => f })()
+}
+invoke(danger)

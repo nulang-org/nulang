@@ -1,0 +1,9 @@
+// The nested cb bound in an alias-pattern tuple shadows outer pure cb.
+fn good() -> Unit ! {} {}
+fn danger() -> Unit ! {IO} { perform IO.print("must not run") }
+fn invoke(cb: () -> Unit ! {}, unsafe_cb: () -> Unit ! {IO}) -> Unit ! {} {
+    match (unsafe_cb, 1) with {
+        | pair @ (cb, _) => cb()
+    }
+}
+invoke(good, danger)
