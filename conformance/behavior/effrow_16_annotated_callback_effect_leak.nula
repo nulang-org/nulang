@@ -1,0 +1,5 @@
+fn invoke(cb: () -> Unit ! {IO}) -> Unit ! {} {
+    (cb : () -> Unit ! {IO})()
+}
+fn io() -> Unit ! {IO} { perform IO.print("should not execute") }
+invoke(io)

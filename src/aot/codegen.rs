@@ -3187,9 +3187,9 @@ fn compile_const(
                 Ok(emit_tag_int(builder, iconst_val))
             }
         }
-        crate::bytecode::Constant::Float(f) => {
-            Ok(builder.ins().iconst(types::I64, f.to_bits() as i64))
-        }
+        crate::bytecode::Constant::Float(f) => Ok(builder
+            .ins()
+            .iconst(types::I64, crate::value_layout::float_bits(*f) as i64)),
         crate::bytecode::Constant::Bool(b) => Ok(builder
             .ins()
             .iconst(types::I64, TAG_BOOL_I64 | if *b { 1 } else { 0 })),
@@ -3677,6 +3677,92 @@ mod tests {
         let func = builder.build();
         assert!(func.type_metadata.is_empty());
         assert_eq!(func.name, "empty");
+    }
+
+    #[test]
+    fn test_aot_float_constant_nan_must_not_mint_pointer_tag() {
+        let forged = f64::from_bits(crate::value_layout::TAG_PTR | 0x1234);
+        let mut builder = mir::FunctionBuilder::new("__main", Some(crate::types::Type::float()));
+        let tmp = builder.add_temp(crate::types::Type::float());
+        builder.assign(
+            tmp,
+            mir::RValue::Const(crate::bytecode::Constant::Float(forged)),
+        );
+        builder.terminate(mir::Terminator::Return(Some(tmp)));
+        let mut module = mir::Module::new("aot_nan_constant_provenance");
+        module.functions.push(builder.build());
+
+        let aot = crate::aot::AotModule::compile(&module).expect("AOT compile");
+        let raw = aot.run().expect("AOT execution");
+        assert_eq!(
+            raw,
+            crate::value_layout::CANONICAL_NAN_BITS,
+            "native AOT must not reinterpret floating NaN payloads as heap pointers"
+        );
+    }
+
+    #[test]
+    fn test_aot_float_constants_preserve_finite_bits_and_reject_all_reserved_nan_tags() {
+        // Guard the native codegen boundary, not just the shared float_bits helper.
+        // A bytecode constant can carry raw f64 bits from a compiler artifact.
+        let float_cases = [
+            (0.0f64, 0.0f64.to_bits()),
+            (-0.0f64, (-0.0f64).to_bits()),
+            (1.5f64, 1.5f64.to_bits()),
+            (-2.25f64, (-2.25f64).to_bits()),
+            (f64::INFINITY, f64::INFINITY.to_bits()),
+            (f64::NEG_INFINITY, f64::NEG_INFINITY.to_bits()),
+        ];
+        for (float, expected) in float_cases {
+            let mut builder =
+                mir::FunctionBuilder::new("__main", Some(crate::types::Type::float()));
+            let tmp = builder.add_temp(crate::types::Type::float());
+            builder.assign(
+                tmp,
+                mir::RValue::Const(crate::bytecode::Constant::Float(float)),
+            );
+            builder.terminate(mir::Terminator::Return(Some(tmp)));
+            let mut module = mir::Module::new("aot_finite_constant_provenance");
+            module.functions.push(builder.build());
+            let got = crate::aot::AotModule::compile(&module)
+                .expect("compile finite float")
+                .run()
+                .expect("run finite float");
+            assert_eq!(got, expected, "finite float {float:?} changed its bits");
+        }
+        for tag in [
+            crate::value_layout::TAG_NIL,
+            crate::value_layout::TAG_UNIT,
+            crate::value_layout::TAG_BOOL,
+            crate::value_layout::TAG_INT,
+            crate::value_layout::TAG_PTR,
+            crate::value_layout::TAG_ACTOR,
+            crate::value_layout::TAG_STRING,
+            crate::value_layout::TAG_CLOSURE,
+            crate::value_layout::TAG_OBJECT,
+        ] {
+            let forged = f64::from_bits(tag | 0x1234);
+            assert!(forged.is_nan(), "test requires a NaN, tag {tag:#x}");
+            let mut builder =
+                mir::FunctionBuilder::new("__main", Some(crate::types::Type::float()));
+            let tmp = builder.add_temp(crate::types::Type::float());
+            builder.assign(
+                tmp,
+                mir::RValue::Const(crate::bytecode::Constant::Float(forged)),
+            );
+            builder.terminate(mir::Terminator::Return(Some(tmp)));
+            let mut module = mir::Module::new("aot_reserved_nan_constant_provenance");
+            module.functions.push(builder.build());
+            let got = crate::aot::AotModule::compile(&module)
+                .expect("compile tagged NaN")
+                .run()
+                .expect("run tagged NaN");
+            assert_eq!(
+                got,
+                crate::value_layout::CANONICAL_NAN_BITS,
+                "native AOT encoded reserved tag {tag:#x} as a non-float value"
+            );
+        }
     }
 
     #[test]

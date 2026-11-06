@@ -1,0 +1,1 @@
+{"exit_code":0,"stdout":"","proves":"A match-variable alias of a statically pure callback can be called from a pure function without losing its proven effect row."}

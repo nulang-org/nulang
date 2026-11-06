@@ -1,0 +1,1 @@
+{"exit_code":5,"stdout":"","stderr":"disallowed effect(s): IO","proves":"Transparent match return uses the matched effectful scrutinee, not a shadowed outer pure callback of the same name."}

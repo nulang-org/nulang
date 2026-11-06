@@ -31,7 +31,7 @@
 //!
 //! Floats are stored as their raw IEEE-754 bit pattern. Any bit pattern whose
 //! upper 16 bits do not match a known type tag is interpreted as a float
-//! (the current tag set occupies the quiet-NaN range 0x7FF6–0x7FFE, so no
+//! (the current tag set occupies the quiet-NaN range 0x7FF4–0x7FFE, so no
 //! valid non-NaN float will collide).
 // ---------------------------------------------------------------------------
 // Masks
@@ -71,6 +71,8 @@ pub const TAG_STRING: u64 = 0x7FFE_0000_0000_0000;
 pub const TAG_CLOSURE: u64 = 0x7FF7_0000_0000_0000;
 /// Tag for shared object-store references (immutable `val` buffers).
 pub const TAG_OBJECT: u64 = 0x7FF5_0000_0000_0000;
+/// Opaque foreign C pointer: NOT a VM heap object, never read an OrcaHeader.
+pub const TAG_FOREIGN_PTR: u64 = 0x7FF4_0000_0000_0000;
 
 // ---------------------------------------------------------------------------
 // Integer range
@@ -104,7 +106,7 @@ pub fn int48_in_range(n: i64) -> bool {
 ///
 /// Layout requirements (verified by tests below):
 /// - upper 16 bits (`0xFFF8`) must not equal any tag's upper 16 bits
-///   (tags occupy `0x7FF6`–`0x7FFE`), and
+///   (tags occupy `0x7FF4`–`0x7FFE`), and
 /// - the mantissa must be non-zero so the pattern is a genuine NaN.
 pub const CANONICAL_NAN_BITS: u64 = 0xFFF8_0000_0000_0001;
 
@@ -228,7 +230,7 @@ const MANTISSA_MASK: u64 = 0x000F_FFFF_FFFF_FFFF;
 /// reserved `CANONICAL_NAN_BITS` pattern, which `float_bits()` substitutes for
 /// any NaN result so that float NaNs survive in the boxed representation.
 ///
-/// All tagged values (0x7FF6–0x7FFE) occupy the quiet-NaN range, so this
+/// All tagged values (0x7FF4–0x7FFE) occupy the quiet-NaN range, so this
 /// integer bitmask test is equivalent to `!f64::from_bits(raw).is_nan()` (plus
 /// the canonical-NaN exception) but avoids the FPU domain-crossing penalty of
 /// `vmovq` + `ucomisd`.
@@ -261,6 +263,7 @@ mod tests {
             TAG_STRING,
             TAG_CLOSURE,
             TAG_OBJECT,
+            TAG_FOREIGN_PTR,
         ];
         for i in 0..tags.len() {
             for j in (i + 1)..tags.len() {
@@ -284,6 +287,7 @@ mod tests {
             (TAG_STRING, "string"),
             (TAG_CLOSURE, "closure"),
             (TAG_OBJECT, "object"),
+            (TAG_FOREIGN_PTR, "foreign_ptr"),
         ];
         let mut seen = std::collections::HashSet::new();
         for &(tag, name) in tags {
@@ -379,6 +383,7 @@ mod tests {
         assert!(!is_float_raw(TAG_NIL));
         assert!(!is_float_raw(TAG_PTR | 0x1000));
         assert!(!is_float_raw(TAG_CLOSURE | 0x10));
+        assert!(!is_float_raw(TAG_FOREIGN_PTR | 0x1000));
         // NaN values (even with upper bits outside the known tag range) are NOT floats.
         assert!(!is_float_raw(0x7FF5_0000_0000_0000)); // NaN, not a tag, still NaN
         assert!(!is_float_raw(0x7FF8_0000_0000_0000)); // hardware quiet NaN == TAG_NIL
@@ -402,6 +407,7 @@ mod tests {
             TAG_STRING,
             TAG_CLOSURE,
             TAG_OBJECT,
+            TAG_FOREIGN_PTR,
         ] {
             assert_ne!(upper, tag >> TAG_SHIFT, "canonical NaN aliases a tag");
         }

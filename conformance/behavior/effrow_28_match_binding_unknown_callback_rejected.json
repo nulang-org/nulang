@@ -1,0 +1,1 @@
+{"exit_code":5,"stdout":"","stderr":"not a subset of allowed effects","proves":"A match-variable alias of an unresolved callback remains an open effect row, not implicitly pure."}

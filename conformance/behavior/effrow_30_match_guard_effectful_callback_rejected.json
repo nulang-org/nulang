@@ -1,0 +1,1 @@
+{"exit_code":5,"stdout":"","stderr":"disallowed effect(s): IO","proves":"A match guard retains and charges the known effectful callback's IO effect, rejecting closed purity."}
