@@ -815,20 +815,35 @@ impl EffectChecker {
                 Ok(row)
             }
 
-            // Match: union of scrutinee and all arm effects. Pattern-bound
-            // variables shadow same-named module functions inside their arm.
+            // Match: union of scrutinee and all arm effects. A direct
+            // variable pattern binds the scrutinee value itself, so it may
+            // preserve a *proven* callable row. Unknown scrutinee rows and
+            // destructuring patterns remain conservatively unresolved.
             Expr::Match {
                 scrutinee, arms, ..
             } => {
                 let mut row = self.infer_effects(ctx, scrutinee)?;
+                let scrutinee_callable = self.known_callable_expr_row(scrutinee);
                 for (pat, guard, arm_expr) in arms {
                     let mut names = Vec::new();
                     pat_bound_vars(pat, &mut names);
+                    let infer_arm = |checker: &mut Self, expr: &Expr| {
+                        if let (Pattern::Var(name), Some(effects)) = (pat, &scrutinee_callable) {
+                            checker.infer_with_callable_bound(
+                                ctx,
+                                name,
+                                Some(effects.clone()),
+                                expr,
+                            )
+                        } else {
+                            checker.infer_with_bound(ctx, &names, expr)
+                        }
+                    };
                     if let Some(guard_expr) = guard {
-                        let guard_row = self.infer_with_bound(ctx, &names, guard_expr)?;
+                        let guard_row = infer_arm(self, guard_expr)?;
                         row = effect_row_union(&row, &guard_row);
                     }
-                    let arm_row = self.infer_with_bound(ctx, &names, arm_expr)?;
+                    let arm_row = infer_arm(self, arm_expr)?;
                     row = effect_row_union(&row, &arm_row);
                 }
                 Ok(row)

@@ -1,0 +1,8 @@
+// Direct binding of a statically pure callback preserves its empty effect row.
+fn pure() -> Unit ! {} {}
+fn invoke(cb: () -> Unit ! {}) -> Unit ! {} {
+    match cb with {
+        | f => f()
+    }
+}
+invoke(pure)
