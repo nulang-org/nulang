@@ -339,29 +339,30 @@ f(10).1              // → 11
 
 Stdlib `list` functions fall into two categories:
 
-- **Polymorphic** (no `[Int]` annotation): `map`, `filter`, `reverse`,
-  `take`, `drop`, `range` — work with any element type (strings,
-  records, tuples, etc.).
+- **Polymorphic** (no `[Int]` parameter annotation): `length`, `contains`,
+  `index_of`, `find`, `any`, `all`, `map`, `filter`, `reverse`, `take`,
+  `drop`, `sort_by`, `min_by`, `max_by`, `range`. These infer element types
+  from their inputs, subject to the operations each helper performs.
+  `range(n)` is special: it constructs an array of integers.
 
-- **Int-only** (annotated `[Int]`): `length`, `sum`, `contains`,
-  `index_of`, `find`, `any`, `all`, `fold`, `max_of`, `min_of`,
-  `sort`, `append`, `zip`, `enumerate` — produce a type error when
-  passed non-Int arrays.
+- **Int-only** (annotated `[Int]`): `sum`, `fold`, `max_of`, `min_of`,
+  `sort`, `append`, `zip`, `enumerate`, `uniq`. These reject non-Int
+  arrays until their signatures and implementations are generalized.
 
 ```nula
 import stdlib::list
 
-// ❌ length expects [Int]
-let n = length(["x", "y", "z"])
-// Error: Type mismatch: expected Int, found String
+// ✅ length and contains accept arrays of strings
+let n = length(["x", "y", "z"])                  // 3
+let has_y = contains("y", ["x", "y", "z"])      // true
 
-// ❌ fold expects init: Int, xs: [Int]
+// ❌ fold currently requires an Int accumulator and [Int] elements
 let r = fold(fn(acc, s) { acc + " " + s }, "hello", ["world"])
-// Error: Type mismatch: expected Int, found String
+// Type mismatch: expected Int, found String
 
-// ✅ polymorphic functions work with any type
-let excited = map(fn(s) { s + "!" }, ["a", "b", "c"])  // ["a!", "b!", "c!"]
-let pos = filter(fn(r) { r.x > 0 }, [{x: 1}, {x: -1}, {x: 2}])  // [{x:1}, {x:2}]
+// ✅ inference works for non-Int element types when operations support them
+let excited = map(fn(s) { s + "!" }, ["a", "b", "c"])
+let pos = filter(fn(r) { r.x > 0 }, [{x: 1}, {x: -1}, {x: 2}])
 ```
 
 ---
