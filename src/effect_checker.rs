@@ -2968,8 +2968,12 @@ fn format_row(row: &EffectRow) -> String {
 fn add_pat_bindings(pat: &Pattern, ctx: &mut CapContext, cap: Capability) {
     match pat {
         Pattern::Wild => {}
-        Pattern::Var(name) | Pattern::Alias(name, _) => {
+        Pattern::Var(name) => {
             ctx.bindings.push((name.clone(), cap));
+        }
+        Pattern::Alias(name, inner) => {
+            ctx.bindings.push((name.clone(), cap));
+            add_pat_bindings(inner, ctx, cap);
         }
         Pattern::Lit(_) => {}
         Pattern::Tuple(pats) => {
@@ -2994,7 +2998,11 @@ fn add_pat_bindings(pat: &Pattern, ctx: &mut CapContext, cap: Capability) {
 fn pat_binding_names(pat: &Pattern, acc: &mut Vec<String>) {
     match pat {
         Pattern::Wild | Pattern::Lit(_) => {}
-        Pattern::Var(name) | Pattern::Alias(name, _) => acc.push(name.clone()),
+        Pattern::Var(name) => acc.push(name.clone()),
+        Pattern::Alias(name, inner) => {
+            acc.push(name.clone());
+            pat_binding_names(inner, acc);
+        }
         Pattern::Tuple(pats) => {
             for p in pats {
                 pat_binding_names(p, acc);
@@ -3145,6 +3153,77 @@ mod tests {
     // Helper to create a zero span.
     fn s() -> Span {
         Span::default()
+    }
+
+    #[test]
+    fn test_nested_alias_pattern_registers_all_capability_bindings() {
+        let pattern = Pattern::Alias(
+            "pair".to_string(),
+            Box::new(Pattern::Tuple(vec![
+                Pattern::Var("x".to_string()),
+                Pattern::Wild,
+            ])),
+        );
+        let mut ctx = CapContext::new().with_binding("x", Capability::LinearIso);
+        add_pat_bindings(&pattern, &mut ctx, Capability::Val);
+        assert_eq!(ctx.lookup("pair"), Capability::Val);
+        assert_eq!(
+            ctx.lookup("x"),
+            Capability::Val,
+            "nested pattern variable must shadow an outer linear binding"
+        );
+
+        let mut names = Vec::new();
+        pat_binding_names(&pattern, &mut names);
+        assert_eq!(
+            names,
+            vec!["pair", "x"],
+            "consumption tracking must include the nested binding"
+        );
+    }
+
+    #[test]
+    fn test_match_nested_alias_shadow_does_not_consume_outer_linear() {
+        let mut analyzer = CapabilityAnalyzer::new();
+        let ctx = CapContext::new().with_binding("x", Capability::LinearIso);
+        let expr = Expr::Match {
+            scrutinee: Box::new(Expr::Tuple(
+                vec![
+                    Expr::Literal(Literal::Int(1), s()),
+                    Expr::Literal(Literal::Int(2), s()),
+                ],
+                s(),
+            )),
+            arms: vec![(
+                Pattern::Alias(
+                    "pair".to_string(),
+                    Box::new(Pattern::Tuple(vec![
+                        Pattern::Var("x".to_string()),
+                        Pattern::Wild,
+                    ])),
+                ),
+                None,
+                Expr::Block {
+                    exprs: vec![
+                        Expr::Var("x".to_string(), s()),
+                        Expr::Var("x".to_string(), s()),
+                    ],
+                    span: s(),
+                },
+            )],
+            span: s(),
+        };
+        // The outer linear x still has an exactly-once obligation, so
+        // consume it after the match. The inner x must not spend that use.
+        let complete = Expr::Block {
+            exprs: vec![expr, Expr::Var("x".to_string(), s())],
+            span: s(),
+        };
+        let result = analyzer.infer_cap(&ctx, &complete);
+        assert!(
+            result.is_ok(),
+            "the inner immutable x is reusable and must not consume outer linear x: {result:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
