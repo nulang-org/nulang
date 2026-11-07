@@ -6021,7 +6021,36 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
     };
     assert!(
         delivered,
-        "remote delivery across the healed 5-node split-brain boundary failed"
+        concat!(
+            "remote delivery across the healed 5-node split-brain boundary failed; ",
+            "observed={:?}, sender_status={:?}, receiver_status={:?}, ",
+            "sender_membership_addr={:?}, authoritative_addr={:?}, ",
+            "sender_connection_addr={:?}, receiver_connection_addr={:?}"
+        ),
+        nodes[0]
+            .actors
+            .get(&actor_id)
+            .and_then(|actor| actor.get_state_field("received"))
+            .and_then(|value| value.as_int()),
+        cluster_status(&nodes[4], ids[0]),
+        cluster_status(&nodes[0], ids[4]),
+        nodes[4]
+            .distributed
+            .cluster
+            .as_ref()
+            .and_then(|cluster| cluster.get_node(ids[0]))
+            .map(|node| node.address),
+        addrs[0],
+        nodes[4]
+            .distributed
+            .transport
+            .as_ref()
+            .and_then(|transport| transport.connection_addr(ids[0])),
+        nodes[0]
+            .distributed
+            .transport
+            .as_ref()
+            .and_then(|transport| transport.connection_addr(ids[4])),
     );
 
     shutdown_nodes(&mut nodes.iter_mut().collect::<Vec<_>>());
