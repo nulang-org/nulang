@@ -149,6 +149,20 @@ execute the VM's live `PerformAsync` callback, kill a process, verify provider
 side-effect deduplication, or prove atomic actor-turn completion. Those require
 separate integration and crash tests.
 
+## Process-kill acceptance regression (trusted Rust host)
+
+`tests/durable_effect_process_kill.rs` extends the SQLite-backed coordinator
+proof with actual subprocess termination at three acknowledged boundaries:
+committed Prepared before external dispatch, provider commit before local
+Completed receipt, and committed Completed before actor continuation. A
+separate handoff case rejects a stale activation and recovers using the same
+provider idempotency key. The fake provider persists a deduplicated receipt
+locally; its cooperation is required for the effectively-once observation.
+
+This validates neither power loss during an SQLite commit nor the standard
+`.nula` VM callback, distributed owner races, or a remote provider without
+idempotency. The script runs this regression on Unix with the `sqlite` feature.
+
 ## What is not yet a production-wide guarantee
 
 Passing this gate does **not** prove that every `perform`, workflow activity,
