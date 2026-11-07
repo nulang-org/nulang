@@ -202,6 +202,12 @@ jobs:
       - name: Smoke test (eval)
         run: ./target/release/nulang --eval 'perform IO.print("hello")'
 
+      # This uses the tested release artifact, not a mock VM. It exercises
+      # host effects only in actor-backed main() (ambient host authority),
+      # while Rust unit tests cover exact permissions inside actor behaviors.
+      - name: Smoke actor-backed standard host effects
+        run: python3 scripts/smoke_actor_host_effects.py --nulang-bin ./target/release/nulang
+
       - name: Scaffold test package
         run: ./target/release/nulang nula new test-pkg
 
