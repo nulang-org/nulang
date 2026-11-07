@@ -34,6 +34,14 @@ nulang examples/NN_name.nula
 | 16 | `16_realworld.nula` | Real-world CLI: HTTP fetch, JSON parse, datetime, FS write, env, args | `nulang examples/16_realworld.nula <url>` |
 | 17 | `17_actor_fetcher.nula` | URL fetcher & reporter: Http.get, JSON pattern matching, datetime, FS | `nulang examples/17_actor_fetcher.nula` |
 
+## Crash/restart reference application
+
+[Durable job](durable_job/README.md) exercises native persistent actor state across a real process SIGKILL, fresh CLI restarts, and an independent Python/SQLite baseline. This is an alpha, single-actor durability smoke test, **not** a guarantee for distributed recovery or external side effects.
+
+~~~bash
+python3 examples/durable_job/run_demo.py --nulang-bin ./target/release/nulang
+~~~
+
 ## Notes
 
 - Use `//` for line comments. `--` is NOT a standalone line comment (only valid
