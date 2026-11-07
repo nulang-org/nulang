@@ -168,7 +168,9 @@ fn durability_crash_worker() {
             // writing it would race the parent's observation.
             let pending_marker = root.join("ready.pending");
             let mut ready = File::create(&pending_marker).expect("create crash marker");
-            ready.write_all(stage.as_bytes()).expect("write crash marker");
+            ready
+                .write_all(stage.as_bytes())
+                .expect("write crash marker");
             ready.sync_all().expect("sync crash marker");
             drop(ready);
             fs::rename(pending_marker, root.join("ready")).expect("publish crash marker");
@@ -217,10 +219,17 @@ fn durability_crash_worker() {
             };
             assert_eq!(result, RECEIPT.to_vec());
             assert!(matches!(
-                store.load_durable_effect(ACTOR_ID, payment.id).unwrap().unwrap().effect(),
+                store
+                    .load_durable_effect(ACTOR_ID, payment.id)
+                    .unwrap()
+                    .unwrap()
+                    .effect(),
                 DurableEffectRecord::Completed { .. }
             ));
-            assert_eq!(store.latest_sequence(ACTOR_ID), if epoch == 2 { 3 } else { 2 });
+            assert_eq!(
+                store.latest_sequence(ACTOR_ID),
+                if epoch == 2 { 3 } else { 2 }
+            );
         }
         _ => panic!("unknown process-kill stage {stage}"),
     }
@@ -239,7 +248,9 @@ fn spawn_worker(stage: &str, fixture: &Fixture) -> Command {
 }
 
 fn kill_at_checkpoint(stage: &str, fixture: &Fixture) {
-    let mut child = spawn_worker(stage, fixture).spawn().expect("start crash worker");
+    let mut child = spawn_worker(stage, fixture)
+        .spawn()
+        .expect("start crash worker");
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if fixture.root.join("ready").exists() {
