@@ -7,7 +7,7 @@ This is a *single persistent actor state-machine* demonstration on the **native 
 
 - Linux or macOS with POSIX `SIGKILL` and standard input pipes.
 - Python 3.10+ (stdlib only) to run the verification harness and SQLite baseline.
-- A full-featured `nulang` CLI binary built for your platform (for example, `target/release/nulang`). The browser playground and WASM backend do not execute this demo.
+- A native `nulang` CLI binary with the bytecode runtime (a standard release or a `--no-default-features` build). The browser playground and WASM backend do not execute this demo.
 - The checkpoint-gate implementation blocks on standard input with `IO.read` after the durable state is read back. No filesystem or OS capability grant is needed for the application.
 
 From the repository root:
@@ -18,6 +18,16 @@ python3 examples/durable_job/run_demo.py --baseline-only
 ./target/release/nulang --check examples/durable_job/job.nula
 python3 examples/durable_job/run_demo.py --nulang-bin ./target/release/nulang
 ~~~
+
+For a smaller, bytecode-only build (also useful on development hosts without the system OpenSSL build dependencies), run the following from the repository root instead:
+
+~~~bash
+cargo build --locked --no-default-features --bin nulang
+./target/debug/nulang --check examples/durable_job/job.nula
+python3 examples/durable_job/run_demo.py --nulang-bin ./target/debug/nulang
+~~~
+
+These commands exercise the same persistent actor and JSON-store scenario, but they do **not** validate the full-featured release build, optional backends, or network/TLS functionality.
 
 The harness creates separate temporary persistence directories for Nulang and SQLite. It makes no HTTP requests and never touches `.nulang/store/` or application data in the checkout.
 
