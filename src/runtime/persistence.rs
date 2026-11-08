@@ -1370,6 +1370,9 @@ impl LibsqlStore {
     /// skipped: a Turso server manages its own journal and durability
     /// policy.
     pub fn new_remote(url: &str, auth_token: &str) -> io::Result<Self> {
+        // Upstream libSQL attaches the bearer token to requests regardless of
+        // scheme. Enforce TLS before creating a client or opening a socket.
+        crate::runtime::libsql_tls::validate_authenticated_remote_transport(url, auth_token)?;
         let rt =
             tokio::runtime::Runtime::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let db = rt.block_on(async {
