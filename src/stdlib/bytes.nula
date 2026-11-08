@@ -1,0 +1,69 @@
+// Nulang standard library — bounded in-memory binary buffers.
+// Import: `import stdlib::bytes`
+// Every byte is an Int in 0..255. No text conversions or OS I/O occur here.
+// These are pure in-memory adapters, NOT file/socket streaming interfaces.
+
+pub type ByteIoError = InvalidLimit | InvalidReadSize | InvalidByte(Int) | LimitExceeded | InvalidState
+pub type ByteReader = {bytes: [Int], offset: Int}
+pub type ByteWriter = {bytes: [Int], limit: Int}
+pub type ReadChunk = {bytes: [Int], reader: ByteReader, eof: Bool}
+
+/// Create a bounded reader, validating all bytes before accepting data.
+pub fn new_reader(bytes: [Int], max_bytes: Int) -> Result[ByteReader, ByteIoError] {
+    if max_bytes < 0 then { return Error(InvalidLimit) } else {};
+    if perform Array.length(bytes) > max_bytes then { return Error(LimitExceeded) } else {};
+    for byte in bytes {
+        if byte < 0 || byte > 255 then { return Error(InvalidByte(byte)) } else {}
+    };
+    Ok({bytes: bytes, offset: 0})
+}
+
+/// Read at most requested bytes, returning the advanced reader and EOF state.
+/// Zero-byte reads do not advance the offset.
+pub fn read_chunk(reader: ByteReader, requested: Int) -> Result[ReadChunk, ByteIoError] {
+    if requested < 0 then { return Error(InvalidReadSize) } else {};
+    let total = perform Array.length(reader.bytes);
+    if reader.offset < 0 || reader.offset > total then {
+        return Error(InvalidState)
+    } else {};
+    for byte in reader.bytes {
+        if byte < 0 || byte > 255 then { return Error(InvalidByte(byte)) } else {}
+    };
+    let remaining = total - reader.offset;
+    let size = if requested < remaining then requested else remaining;
+    var chunk = [];
+    var i = 0;
+    while i < size {
+        chunk = perform Array.push(chunk, reader.bytes[reader.offset + i]);
+        i = i + 1
+    };
+    let offset = reader.offset + size;
+    Ok({bytes: chunk, reader: {bytes: reader.bytes, offset: offset}, eof: offset == total})
+}
+
+/// Create a writer with a strict maximum total byte count.
+pub fn new_writer(max_bytes: Int) -> Result[ByteWriter, ByteIoError] {
+    if max_bytes < 0 then Error(InvalidLimit)
+    else Ok({bytes: [], limit: max_bytes})
+}
+
+/// Append an entire byte chunk or fail without modifying the old writer.
+/// Capacity is checked before allocation; invalid byte values are rejected.
+pub fn write_chunk(writer: ByteWriter, chunk: [Int]) -> Result[ByteWriter, ByteIoError] {
+    let used = perform Array.length(writer.bytes);
+    let incoming = perform Array.length(chunk);
+    if writer.limit < 0 || used > writer.limit then { return Error(InvalidState) } else {};
+    for byte in writer.bytes {
+        if byte < 0 || byte > 255 then { return Error(InvalidByte(byte)) } else {}
+    };
+    if incoming > writer.limit - used then { return Error(LimitExceeded) } else {};
+    for byte in chunk {
+        if byte < 0 || byte > 255 then { return Error(InvalidByte(byte)) } else {}
+    };
+    var output = writer.bytes;
+    for byte in chunk { output = perform Array.push(output, byte) };
+    Ok({bytes: output, limit: writer.limit})
+}
+
+/// Obtain bytes in writer order; never interprets them as UTF-8 text.
+pub fn to_bytes(writer: ByteWriter) -> [Int] { writer.bytes }

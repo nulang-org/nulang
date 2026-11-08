@@ -236,6 +236,39 @@ pub fn parse(json: String) -> JsonValue {
     r.value
 }
 
+fn strict_char(src: String, p: Int) -> Int {
+    if p < 0 || p >= perform String.length(src) then -1
+    else perform String.charAt(src, p)
+}
+
+// Validate and decode a UTF-8 scalar without splitting byte-indexed strings.
+fn strict_utf8(src: String, p: Int) {
+    let first = strict_char(src, p);
+    if first >= 0 && first < 128 then {
+        return {ok: true, codepoint: first, width: 1}
+    } else {};
+    var width = 0;
+    var cp = 0;
+    if first >= 194 && first <= 223 then { width = 2; cp = first - 192 }
+    else if first >= 224 && first <= 239 then { width = 3; cp = first - 224 }
+    else if first >= 240 && first <= 244 then { width = 4; cp = first - 240 }
+    else { return {ok: false, codepoint: 0, width: 1} };
+    var i = 1;
+    while i < width {
+        let byte = strict_char(src, p + i);
+        if byte < 128 || byte > 191 then {
+            return {ok: false, codepoint: 0, width: 1}
+        } else {};
+        cp = cp * 64 + (byte - 128);
+        i = i + 1
+    };
+    if width == 2 && cp < 128 || width == 3 && cp < 2048 ||
+       width == 4 && cp < 65536 || cp > 1114111 ||
+       cp >= 55296 && cp <= 57343 then {
+        {ok: false, codepoint: 0, width: 1}
+    } else { {ok: true, codepoint: cp, width: width} }
+}
+
 /// Convert a JsonValue back to a JSON string.
 ///
 /// Full fidelity for all types including nested arrays and objects.
@@ -285,6 +318,16 @@ pub fn stringify(value: JsonValue) -> String {
                 result = perform String.concat(result, "\\u00");
                 result = perform String.concat(result, hex_char(hi));
                 result = perform String.concat(result, hex_char(lo))
+            }
+            else if c >= 128 then {
+                let u = strict_utf8(s, i);
+                if u.ok then {
+                    result = perform String.concat(result, perform String.from_char(u.codepoint));
+                    i = i + u.width - 1
+                } else {
+                    // Avoid a panic even if a host passes an invalid byte string.
+                    result = perform String.concat(result, perform String.from_char(65533))
+                }
             }
             else {
                 result = perform String.concat(result, perform String.substring(s, i, 1))
@@ -399,4 +442,239 @@ pub fn get_bool(obj: JsonValue, key: String, default: Bool) -> Bool {
         },
         _ => default,
     }
+}
+
+// Strict parsing deliberately coexists with parse(), whose permissive behavior
+// is retained for compatibility. Callers handling untrusted data should use
+// parse_strict() and handle Error instead of silently accepting partial input.
+pub type JsonParseError = { offset: Int, reason: String }
+
+fn strict_space(src: String, start: Int) -> Int {
+    var p = start;
+    var c = strict_char(src, p);
+    while c == 32 || c == 9 || c == 10 || c == 13 {
+        p = p + 1;
+        c = strict_char(src, p)
+    };
+    p
+}
+
+fn strict_hex(c: Int) -> Int {
+    if c >= 48 && c <= 57 then c - 48
+    else if c >= 65 && c <= 70 then c - 55
+    else if c >= 97 && c <= 102 then c - 87
+    else -1
+}
+
+fn strict_codepoint(src: String, start: Int) {
+    var cp = 0;
+    var j = 0;
+    while j < 4 {
+        let digit = strict_hex(strict_char(src, start + j));
+        if digit < 0 then { return {ok: false, codepoint: 0} } else {};
+        cp = cp * 16 + digit;
+        j = j + 1
+    };
+    {ok: true, codepoint: cp}
+}
+
+fn strict_string(src: String, start: Int) {
+    var p = start + 1;
+    var output = "";
+    while true {
+        let c = strict_char(src, p);
+        if c == -1 then {
+            return {ok: false, text: "", pos: p, reason: "unterminated string"}
+        } else {};
+        if c == 34 then {
+            return {ok: true, text: output, pos: p + 1, reason: ""}
+        } else {};
+        if c < 32 then {
+            return {ok: false, text: "", pos: p, reason: "control character in string"}
+        } else {};
+        if c == 92 then {
+            let esc = strict_char(src, p + 1);
+            if esc == 34 || esc == 92 || esc == 47 then {
+                output = perform String.concat(output, perform String.from_char(esc));
+                p = p + 2
+            }
+            else if esc == 98 || esc == 102 || esc == 110 || esc == 114 || esc == 116 then {
+                let decoded = if esc == 98 then 8 else if esc == 102 then 12
+                    else if esc == 110 then 10 else if esc == 114 then 13 else 9;
+                output = perform String.concat(output, perform String.from_char(decoded));
+                p = p + 2
+            }
+            else if esc == 117 then {
+                let first = strict_codepoint(src, p + 2);
+                if !first.ok then {
+                    return {ok: false, text: "", pos: p, reason: "invalid unicode escape"}
+                } else {};
+                var cp = first.codepoint;
+                p = p + 6;
+                if cp >= 55296 && cp <= 56319 then {
+                    if strict_char(src, p) != 92 || strict_char(src, p + 1) != 117 then {
+                        return {ok: false, text: "", pos: p, reason: "invalid surrogate pair"}
+                    } else {};
+                    let second = strict_codepoint(src, p + 2);
+                    if !second.ok || second.codepoint < 56320 || second.codepoint > 57343 then {
+                        return {ok: false, text: "", pos: p, reason: "invalid surrogate pair"}
+                    } else {};
+                    cp = 65536 + (cp - 55296) * 1024 + (second.codepoint - 56320);
+                    p = p + 6
+                }
+                else if cp >= 56320 && cp <= 57343 then {
+                    return {ok: false, text: "", pos: p - 6, reason: "unexpected low surrogate"}
+                } else {};
+                output = perform String.concat(output, perform String.from_char(cp))
+            }
+            else {
+                return {ok: false, text: "", pos: p, reason: "invalid escape"}
+            }
+        }
+        else if c >= 128 then {
+            let u = strict_utf8(src, p);
+            if !u.ok then {
+                return {ok: false, text: "", pos: p, reason: "invalid utf-8"}
+            } else {};
+            output = perform String.concat(output, perform String.from_char(u.codepoint));
+            p = p + u.width
+        }
+        else {
+            output = perform String.concat(output, perform String.substring(src, p, 1));
+            p = p + 1
+        }
+    };
+    {ok: false, text: "", pos: p, reason: "unterminated string"}
+}
+
+fn strict_success(value: JsonValue, pos: Int) {
+    {ok: true, value: value, pos: pos, reason: ""}
+}
+
+fn strict_failure(pos: Int, reason: String) {
+    {ok: false, value: JsonNull, pos: pos, reason: reason}
+}
+
+fn strict_number(src: String, start: Int) {
+    var p = start;
+    if strict_char(src, p) == 45 then { p = p + 1 } else {};
+    let first = strict_char(src, p);
+    if first == 48 then { p = p + 1 }
+    else if first >= 49 && first <= 57 then {
+        while strict_char(src, p) >= 48 && strict_char(src, p) <= 57 { p = p + 1 }
+    }
+    else { return strict_failure(p, "invalid number") };
+    if strict_char(src, p) == 46 then {
+        p = p + 1;
+        if strict_char(src, p) < 48 || strict_char(src, p) > 57 then {
+            return strict_failure(p, "invalid number")
+        } else {};
+        while strict_char(src, p) >= 48 && strict_char(src, p) <= 57 { p = p + 1 }
+    } else {};
+    if strict_char(src, p) == 101 || strict_char(src, p) == 69 then {
+        p = p + 1;
+        if strict_char(src, p) == 43 || strict_char(src, p) == 45 then { p = p + 1 } else {};
+        if strict_char(src, p) < 48 || strict_char(src, p) > 57 then {
+            return strict_failure(p, "invalid number")
+        } else {};
+        while strict_char(src, p) >= 48 && strict_char(src, p) <= 57 { p = p + 1 }
+    } else {};
+    let number = perform String.to_float(perform String.substring(src, start, p - start));
+    let repr = perform Float.to_string(number);
+    if repr == "inf" || repr == "-inf" || repr == "NaN" || repr == "Infinity" || repr == "-Infinity" then {
+        strict_failure(start, "number out of range")
+    } else { strict_success(JsonNumber(number), p) }
+}
+
+fn strict_value(src: String, start: Int, depth: Int, max_depth: Int) {
+    let p = strict_space(src, start);
+    if depth > max_depth then { return strict_failure(p, "maximum depth exceeded") } else {};
+    let c = strict_char(src, p);
+    if c == -1 then { return strict_failure(p, "unexpected end of input") } else {};
+    if c == 34 then {
+        let r = strict_string(src, p);
+        if r.ok then strict_success(JsonString(r.text), r.pos)
+        else strict_failure(r.pos, r.reason)
+    }
+    else if c == 110 && perform String.substring(src, p, 4) == "null" then {
+        strict_success(JsonNull, p + 4)
+    }
+    else if c == 116 && perform String.substring(src, p, 4) == "true" then {
+        strict_success(JsonBool(true), p + 4)
+    }
+    else if c == 102 && perform String.substring(src, p, 5) == "false" then {
+        strict_success(JsonBool(false), p + 5)
+    }
+    else if c == 45 || (c >= 48 && c <= 57) then {
+        strict_number(src, p)
+    }
+    else if c == 91 then {
+        var at = strict_space(src, p + 1);
+        var elements = [];
+        if strict_char(src, at) == 93 then {
+            return strict_success(JsonArray(elements), at + 1)
+        } else {};
+        while true {
+            let item = strict_value(src, at, depth + 1, max_depth);
+            if !item.ok then { return item } else {};
+            elements = perform Array.push(elements, item.value);
+            at = strict_space(src, item.pos);
+            let sep = strict_char(src, at);
+            if sep == 93 then { return strict_success(JsonArray(elements), at + 1) }
+            else if sep == 44 then { at = strict_space(src, at + 1) }
+            else { return strict_failure(at, "expected ',' or ']'") }
+        };
+        strict_failure(at, "unexpected token")
+    }
+    else if c == 123 then {
+        var at = strict_space(src, p + 1);
+        var fields = [];
+        if strict_char(src, at) == 125 then {
+            return strict_success(JsonObject(fields), at + 1)
+        } else {};
+        while true {
+            if strict_char(src, at) != 34 then {
+                return strict_failure(at, "expected object key")
+            } else {};
+            let key = strict_string(src, at);
+            if !key.ok then { return strict_failure(key.pos, key.reason) } else {};
+            for previous in fields {
+                if previous.0 == key.text then {
+                    return strict_failure(key.pos, "duplicate object key")
+                } else {}
+            };
+            at = strict_space(src, key.pos);
+            if strict_char(src, at) != 58 then {
+                return strict_failure(at, "expected ':'")
+            } else {};
+            let item = strict_value(src, at + 1, depth + 1, max_depth);
+            if !item.ok then { return item } else {};
+            fields = perform Array.push(fields, (key.text, item.value));
+            at = strict_space(src, item.pos);
+            let sep = strict_char(src, at);
+            if sep == 125 then { return strict_success(JsonObject(fields), at + 1) }
+            else if sep == 44 then { at = strict_space(src, at + 1) }
+            else { return strict_failure(at, "expected ',' or '}'") }
+        };
+        strict_failure(at, "unexpected token")
+    }
+    else { strict_failure(p, "unexpected token") }
+}
+
+/// Parse a complete bounded JSON document or return a structured error.
+/// Error offsets are byte offsets. Duplicate object keys are rejected.
+/// Existing parse() remains lenient for backwards compatibility.
+/// The default cap is 64 KiB and 64 nested levels; large documents should use
+/// streaming facilities once available instead of buffering untrusted data.
+/// JSON numbers use Float and may lose integer precision above 2^53.
+pub fn parse_strict(json: String) -> Result[JsonValue, JsonParseError] {
+    if perform String.length(json) > 65536 then {
+        return Error({offset: 65536, reason: "input exceeds 64 KiB limit"})
+    } else {};
+    let r = strict_value(json, 0, 0, 64);
+    if !r.ok then { return Error({offset: r.pos, reason: r.reason}) } else {};
+    let end_pos = strict_space(json, r.pos);
+    if end_pos != perform String.length(json) then {
+        Error({offset: end_pos, reason: "trailing content"})
+    } else { Ok(r.value) }
 }

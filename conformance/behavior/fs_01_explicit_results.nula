@@ -1,0 +1,41 @@
+// Additive, typed filesystem wrappers without changing legacy FS effects.
+import stdlib::fs
+
+fn main() {
+    let path = "/tmp/nulang_fs_results_20261026.txt";
+    match try_write_text(path, "one") {
+        Ok(_) => perform IO.print("write=ok"),
+        Error(_) => perform IO.print("write=unexpected-error"),
+    };
+    match try_append_text(path, "+two") {
+        Ok(_) => perform IO.print("append=ok"),
+        Error(_) => perform IO.print("append=unexpected-error"),
+    };
+    match try_read_text(path) {
+        Ok(contents) => perform IO.print("read=" + contents),
+        Error(_) => perform IO.print("read=unexpected-error"),
+    };
+    match try_write_text(path, "") {
+        Ok(_) => perform IO.print("empty_write=ok"),
+        Error(_) => perform IO.print("empty_write=unexpected-error"),
+    };
+    match try_read_text(path) {
+        Ok(contents) => perform IO.print("empty_read=" + (if contents == "" then "ok" else "wrong")),
+        Error(_) => perform IO.print("empty_read=unexpected-error"),
+    };
+    match try_read_text("/tmp/nulang_fs_results_20261026_missing/no-such-file") {
+        Ok(_) => perform IO.print("missing=unexpected-ok"),
+        Error(ReadFailed(failed_path)) => perform IO.print("missing=" + (if failed_path == "/tmp/nulang_fs_results_20261026_missing/no-such-file" then "read-failed" else "wrong-path")),
+        Error(_) => perform IO.print("missing=other-error"),
+    };
+    match try_write_text("/tmp", "invalid") {
+        Ok(_) => perform IO.print("write_dir=unexpected-ok"),
+        Error(WriteFailed(_)) => perform IO.print("write_dir=write-failed"),
+        Error(_) => perform IO.print("write_dir=other-error"),
+    };
+    match try_append_text("/tmp", "invalid") {
+        Ok(_) => perform IO.print("append_dir=unexpected-ok"),
+        Error(AppendFailed(_)) => perform IO.print("append_dir=append-failed"),
+        Error(_) => perform IO.print("append_dir=other-error"),
+    }
+}
