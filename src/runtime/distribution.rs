@@ -195,10 +195,16 @@ pub(crate) fn take_spawn_response(rt: &mut Runtime, request_id: u64) -> Option<O
 pub(crate) fn is_acked(rt: &Runtime, seq: u64) -> bool {
     rt.acked_packets.contains(&seq)
 }
+/// Check whether a specific peer acknowledged a packet sequence.
+pub(crate) fn is_acked_from(rt: &Runtime, peer: NodeId, seq: u64) -> bool {
+    rt.acked_packets_by_peer.contains(&(peer.0, seq))
+}
 
 /// Drain all acknowledged packet sequence numbers.
 pub(crate) fn drain_acked(rt: &mut Runtime) -> std::collections::HashSet<u64> {
-    std::mem::take(&mut rt.acked_packets)
+    let drained = std::mem::take(&mut rt.acked_packets);
+    let _ = std::mem::take(&mut rt.acked_packets_by_peer);
+    drained
 }
 
 /// Send a message to a (possibly remote) actor through location-transparent

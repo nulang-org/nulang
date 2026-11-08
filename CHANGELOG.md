@@ -1,5 +1,14 @@
 # Nulang Changelog
 
+### Post-partition peer readiness and TCP writer fencing (review-only) — 2026-10-26
+- **Post-heal delivery readiness requires two-way peer-attributed heartbeat acknowledgments and Healthy membership on both peers.** An unrelated node's ACK cannot satisfy the intended peer's recovery probe.
+- **Failed TCP writer cleanup fences by connection generation** so an old writer cannot evict a replacement connection. Deterministic regressions cover wrong-peer ACKs, membership rearming, and replacement delivery.
+- **No implicit message retries or stronger delivery guarantee are added.** The post-partition actor-message assertion remains one-shot and fail-closed; exact-head native/WASM/release testing and independent review are required before promotion. This stack preserves the patched libSQL/TLS security baseline.
+
+### Monotonic authoritative cluster address correction (review-only) — 2026-10-26
+- **Authoritative self-gossip correcting peer status or listen address now advances its incarnation beyond the highest observed version.** Simultaneous Joining-to-Healthy status and stale source-port correction must propagate to third parties; newer relayed address-only changes report a membership mutation.
+- **Two deterministic regression cases** preserve the real listen address across relayed gossip and reject incarnation rollback. No additional actor-message retries or timeout increases are introduced. Concurrent real-TCP stress exposed address-convergence failures in the preceding peer-bound ACK-only integration; full retesting remains required.
+
 ### October RustSec dependency remediation (validation pending) — 2026-10-25
 - **Updated Wasmtime 48.0.7, compatible Cranelift/Pulley packages, rustls-webpki 0.103.16, webpki-roots 1.0.10 and ctutils 0.4.4** with Cargo's dependency resolver.
 - **Migrated libSQL remote TLS to a custom connector based on supported rustls 0.23 and tokio-rustls 0.26.** This retains libSQL local/remote behavior, native root certificates, server-name verification and Hyper 0.14 protocol compatibility without pulling unsupported rustls-webpki 0.102.
