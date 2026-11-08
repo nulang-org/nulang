@@ -210,7 +210,10 @@ fn resolve_path(base: &Path, import: &str) -> PathBuf {
         return resolve_module_path(module);
     }
 
-    let p = Path::new(import);
+    // Project-relative module names use the same `::` segment separator as
+    // stdlib imports; normal slash paths and explicit file extensions still work.
+    let normalized_import = import.replace("::", std::path::MAIN_SEPARATOR_STR);
+    let p = Path::new(&normalized_import);
     let resolved = if p.is_absolute() {
         p.to_path_buf()
     } else {
@@ -374,6 +377,37 @@ mod tests {
         let r = filter_decls(vec![fn_decl("a"), fn_decl("b")], &["a".into()]);
         assert_eq!(r.len(), 1);
         assert_eq!(decl_name(&r[0]), Some("a"));
+    }
+
+    #[test]
+    fn test_resolve_project_relative_namespaced_import() {
+        let base = Path::new("some_project/src");
+        assert_eq!(
+            resolve_path(base, "subpkg::helper"),
+            base.join("subpkg").join("helper.nula")
+        );
+        assert_eq!(
+            resolve_path(base, "subpkg::helper.nula"),
+            base.join("subpkg").join("helper.nula")
+        );
+        // Slash paths keep their pre-existing behavior.
+        assert_eq!(
+            resolve_path(base, "subpkg/helper"),
+            base.join("subpkg").join("helper.nula")
+        );
+    }
+
+    #[test]
+    fn test_resolve_conformance_subdirectory_module() {
+        // Pinned by conformance/behavior/modimport_13_subdirectory_package.nula.
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/behavior");
+        let resolved = resolve_path(&base, "subpkg::helper");
+        assert_eq!(resolved, base.join("subpkg").join("helper.nula"));
+        assert!(
+            resolved.is_file(),
+            "expected existing nested module: {}",
+            resolved.display()
+        );
     }
 
     #[test]
