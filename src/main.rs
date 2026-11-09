@@ -317,7 +317,7 @@ fn main() {
                     eprintln!(
                         "Error: --backend requires an argument (bytecode | native{})",
                         if cfg!(feature = "wasm-backend") {
-                            " | wasm | wasm-run | wasm-aot"
+                            " | wasm | wasm-run | wasm-sandbox-run | wasm-aot"
                         } else {
                             ""
                         }
@@ -1142,7 +1142,7 @@ fn print_help() {
         print!(" | native");
     }
     if cfg!(feature = "wasm-backend") {
-        print!(" | wasm | wasm-run | wasm-aot");
+        print!(" | wasm | wasm-run | wasm-sandbox-run | wasm-aot");
     }
     println!();
     println!("                   core-vm: frozen Core interpreter (Stage 3 bootstrap)");
@@ -1154,6 +1154,8 @@ fn print_help() {
     if cfg!(feature = "wasm-backend") {
         println!("                   wasm*: IO.print/read only (no user-defined effect");
         println!("                   handlers, no actor mailbox)");
+        println!("                   wasm-sandbox-run: pure WASM with fuel/memory limits;");
+        println!("                   denies host IO, native FFI, and effect dispatch");
     }
     if cfg!(feature = "wasmfx-backend") {
         println!("                   wasmfx*: suspending effects lower to WasmFX stack");
@@ -1824,7 +1826,7 @@ fn run_source(
             return Ok(());
         }
         #[cfg(feature = "wasm-backend")]
-        "wasm-run" => {
+        "wasm-run" | "wasm-sandbox-run" => {
             let wasm_file = out_file.unwrap_or("out.wasm");
             let hir = nulang::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
             let mir = nulang::mir_lower::lower_module(&hir)?;
@@ -1844,7 +1846,14 @@ fn run_source(
             // the Wasmtime store stays alive while the program result is
             // stringified — a string result's bytes live in linear memory
             // and would otherwise print as a raw `#Value(...)` repr.
-            let mut runtime = nulang::wasm_runtime::WasmRuntime::new(&wasm_bytes, None)?;
+            let mut runtime = if backend == "wasm-sandbox-run" {
+                nulang::wasm_runtime::WasmRuntime::new_sandboxed(
+                    &wasm_bytes,
+                    nulang::wasm_runtime::WasmSandboxLimits::default(),
+                )?
+            } else {
+                nulang::wasm_runtime::WasmRuntime::new(&wasm_bytes, None)?
+            };
             let result = runtime.run()?;
             let result_str = runtime
                 .string_value(&result)
@@ -1934,10 +1943,12 @@ fn run_source(
             })
         }
         #[cfg(not(feature = "wasm-backend"))]
-        "wasm" | "wasm-run" | "wasm-aot" => Err(nulang::types::NuError::VMError {
-            msg: "wasm backend not compiled in (enable 'wasm-backend' feature)".into(),
-            span: Span::default(),
-        }),
+        "wasm" | "wasm-run" | "wasm-sandbox-run" | "wasm-aot" => {
+            Err(nulang::types::NuError::VMError {
+                msg: "wasm backend not compiled in (enable 'wasm-backend' feature)".into(),
+                span: Span::default(),
+            })
+        }
         #[cfg(feature = "native-codegen")]
         "native" => {
             let hir = nulang::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
@@ -2170,7 +2181,7 @@ fn run_source(
                 "unknown backend '{}' (expected bytecode | native | core-vm{})",
                 backend,
                 if cfg!(feature = "wasm-backend") {
-                    " | wasm | wasm-run | wasm-aot"
+                    " | wasm | wasm-run | wasm-sandbox-run | wasm-aot"
                 } else {
                     ""
                 }
