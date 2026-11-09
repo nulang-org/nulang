@@ -47,9 +47,12 @@ Only direct-listener IP/localhost hosts are accepted by default. Set
 origin when terminating TLS at a trusted reverse proxy. Explicit
 `http://` public origins are rejected; for direct local development,
 leave this setting unset and use loopback. The code does
-not trust arbitrary `X-Forwarded-*` headers. A missing or invalid
-configuration blocks unsafe requests rather than inferring an origin.
-Browser forms send an Origin/Referer automatically; non-browser callers
+not trust arbitrary `X-Forwarded-*` headers. The setting is validated
+once before binding the Web listener and remains fixed for that listener's
+lifetime; invalid, empty, or non-Unicode values fail startup instead of
+allowing a partially usable server. An unset setting continues to require a
+direct localhost/listener host for unsafe requests. Browser forms send an
+Origin/Referer automatically; non-browser callers
 must also provide valid provenance.
 
 The response writer rejects malformed response header names/values and

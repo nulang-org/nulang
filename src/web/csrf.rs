@@ -49,11 +49,52 @@ fn configured_authority(origin: &str) -> Result<&str, OriginCheckError> {
         || rest
             .bytes()
             .any(|byte| matches!(byte, b'/' | b'?' | b'#' | b'@' | 92))
-        || rest.starts_with(':')
     {
         return Err(OriginCheckError::InvalidConfiguration);
     }
+
+    let port = if let Some(bracketed) = rest.strip_prefix('[') {
+        let (ip, suffix) = bracketed
+            .split_once(']')
+            .ok_or(OriginCheckError::InvalidConfiguration)?;
+        if ip.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(OriginCheckError::InvalidConfiguration);
+        }
+        if suffix.is_empty() {
+            None
+        } else {
+            Some(
+                suffix
+                    .strip_prefix(':')
+                    .ok_or(OriginCheckError::InvalidConfiguration)?,
+            )
+        }
+    } else {
+        let (host, port) = rest
+            .split_once(':')
+            .map_or((rest, None), |(host, port)| (host, Some(port)));
+        if host.is_empty()
+            || host.starts_with('.')
+            || host.contains("..")
+            || !host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+        {
+            return Err(OriginCheckError::InvalidConfiguration);
+        }
+        port
+    };
+
+    if port.is_some_and(|port| port.parse::<u16>().map_or(true, |value| value == 0)) {
+        return Err(OriginCheckError::InvalidConfiguration);
+    }
     Ok(rest)
+}
+
+/// Validate a trusted public origin before accepting connections. An invalid
+/// deployment configuration must not leave a partially usable Web listener.
+pub(crate) fn validate_public_origin(origin: &str) -> Result<(), OriginCheckError> {
+    configured_authority(origin).map(|_| ())
 }
 
 fn direct_host_allowed(host: &str, local: SocketAddr) -> bool {
