@@ -1,4 +1,9 @@
 # Nulang Changelog
+
+### Bundled SQLite WAL memory disclosure remediation — 2026-11-09
+- **Updated `nulang-ai-local` from `rusqlite` 0.32 to 0.41**, resolving to `rusqlite` 0.41.1 and `libsqlite3-sys` 0.39.1 with bundled SQLite 3.54.1. This addresses [RUSTSEC-2026-0459](https://rustsec.org/advisories/RUSTSEC-2026-0459.html) / CVE-2026-119375 without exempting the audit gate.
+- **Added a runtime version and persistent-store regression.** The test checks that the bundled SQLite is at least 3.54.0 and verifies a goal survives a database close/reopen. Local `cargo audit` reports zero vulnerabilities; three existing warnings (Tokio unsoundness and two yanked dependencies) remain separate review items. Production promotion still requires exact-head CI and platform tests.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
