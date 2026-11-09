@@ -2,9 +2,12 @@
 
 The default Web runtime currently enforces response security headers and
 request logging. **It does not provide production authentication or CSRF
-middleware.** Deployment IR must list only middleware actually wired into the
-default request pipeline. Importing an authentication package does not make it
-an automatic authorization boundary.
+middleware.** Routed Web request admission also validates a trusted Host for
+all methods, including reads, static responses and SSE, and checks origin
+provenance for mutations. These controls do not establish user identity,
+session authorization, or tenant isolation. Deployment IR must list only
+middleware actually wired into the default request pipeline. Importing an
+authentication package does not make it an automatic authorization boundary.
 
 The bundled @nulang/auth module is a development example: it accepts arbitrary
 user identities via login(user) and stores sessions in an ephemeral KV namespace.
