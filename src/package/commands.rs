@@ -1415,6 +1415,15 @@ fn cmd_build_web() -> NuResult<()> {
         span: Span::default(),
     })?;
 
+    // A static builder cannot authenticate a principal or authorize a tenant.
+    // Fail before running route handlers; never publish a public scope page.
+    crate::web::ir::validate_static_scope_routes(&validated_contracts).map_err(|msg| {
+        NuError::PackageError {
+            msg,
+            span: Span::default(),
+        }
+    })?;
+
     eprintln!("  Rendering {} route(s)...", routes.len());
     for route in &routes {
         let html = render_route_handler(&route.handler_module, route.handler_func_idx, None)
