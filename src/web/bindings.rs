@@ -50,6 +50,32 @@ pub fn compile_route_bindings(contract: &RouteContract) -> BindingCompilation {
             continue;
         };
 
+        if request.source == RouteBindingSource::Scope {
+            // Scope values originate exclusively from the authenticated host,
+            // never request-supplied path/query/header/cookie/body/form data.
+            if !matches!(request.source_name.as_str(), "principal_id" | "tenant_id") {
+                out.diagnostics.push(format!(
+                    "{} {}: unsupported trusted scope field '{}' for handler parameter '{}'",
+                    contract.method, contract.path, request.source_name, handler_param.name
+                ));
+                continue;
+            }
+            if handler_param.ty.as_deref() != Some("String") {
+                out.diagnostics.push(format!(
+                    "{} {}: trusted scope parameter '{}' must declare type String",
+                    contract.method, contract.path, handler_param.name
+                ));
+                continue;
+            }
+            if matches!(contract.placement.as_deref(), Some("static" | "client")) {
+                out.diagnostics.push(format!(
+                    "{} {}: trusted scope binding requires server execution",
+                    contract.method, contract.path
+                ));
+                continue;
+            }
+        }
+
         if request.source == RouteBindingSource::Body {
             if let Some(first_param) = body_binding {
                 out.diagnostics.push(format!(
@@ -187,6 +213,21 @@ mod tests {
             source,
             source_name: source_name.to_string(),
         }
+    }
+
+    #[test]
+    fn rejects_unknown_scope_names_and_non_string_targets() {
+        let mut contract = route("/users/:id");
+        contract.params.clear();
+        contract.handler_params[0].request = Some(request(RouteBindingSource::Scope, "admin"));
+        assert!(
+            compile_route_bindings(&contract).diagnostics[0].contains("unsupported trusted scope")
+        );
+        contract.handler_params[0].request = Some(request(RouteBindingSource::Scope, "tenant_id"));
+        contract.handler_params[0].ty = Some("Int".to_string());
+        assert!(
+            compile_route_bindings(&contract).diagnostics[0].contains("must declare type String")
+        );
     }
 
     #[test]

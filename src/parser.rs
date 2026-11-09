@@ -6781,10 +6781,11 @@ impl Parser {
             "cookie" => WebRequestParamSource::Cookie,
             "body" => WebRequestParamSource::Body,
             "form" => WebRequestParamSource::Form,
+            "scope" => WebRequestParamSource::Scope,
             other => {
                 return Err(NuError::parse_error(
                     format!(
-                        "unknown request source '{other}'; expected path, query, header, cookie, body, or form"
+                        "unknown request source '{other}'; expected path, query, header, cookie, body, form, or scope"
                     ),
                     self.current_span(),
                 ));
@@ -6798,6 +6799,13 @@ impl Parser {
         } else {
             None
         };
+        if source == WebRequestParamSource::Scope && explicit_name.is_none() {
+            return Err(NuError::parse_error(
+                "scope bindings require scope(\"principal_id\") or scope(\"tenant_id\")"
+                    .to_string(),
+                self.current_span(),
+            ));
+        }
         if source == WebRequestParamSource::Body && explicit_name.is_some() {
             return Err(NuError::parse_error(
                 "body bindings do not accept a source name".to_string(),

@@ -553,6 +553,8 @@ pub enum WebRequestParamSource {
     Cookie,
     Body,
     Form,
+    /// Host-verified principal / tenant scope. Never extracted from HTTP input.
+    Scope,
 }
 
 #[derive(Debug, Clone, PartialEq)]
