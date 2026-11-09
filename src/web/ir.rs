@@ -73,13 +73,36 @@ pub struct DeploymentIr {
     pub signals: serde_json::Value,
     pub capabilities: Vec<String>,
     pub budgets: BudgetsIr,
+    /// Middleware actually installed by the current Web runtime. Do not
+    /// include auth/CSRF placeholders or infer enforcement from module imports.
     pub middleware: Vec<String>,
+    /// Security requirements inferred from dependencies but not verifiably
+    /// enforced by the current Web runtime. Production deploy must fail closed
+    /// until these are replaced by audited, compiler-bound enforcement.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unverified_security_controls: Vec<String>,
     pub cloud_config: Vec<CloudConfigEntry>,
 }
 
 impl DeploymentIr {
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Conservatively reject deployment when a required security boundary is
+    /// only metadata. Dry-run builds may still inspect the generated IR.
+    pub fn validate_production_security(&self) -> Result<(), String> {
+        if self.unverified_security_controls.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            concat!(
+                "cannot deploy: unverified security controls [{}]. ",
+                "@nulang/auth is development-only; configure and verify production ",
+                "authentication, session management, and mutation CSRF enforcement first"
+            ),
+            self.unverified_security_controls.join(", ")
+        ))
     }
 }
 
@@ -163,6 +186,7 @@ pub fn generate_deployment_ir(
 
     let cloud_config = infer_module_cloud_config(&source_text);
     let middleware = infer_middleware(&source_text);
+    let unverified_security_controls = infer_unverified_security_controls(&source_text);
 
     DeploymentIr {
         // This is an additive v1 extension: every new per-route field is
@@ -174,6 +198,7 @@ pub fn generate_deployment_ir(
         capabilities,
         budgets: budgets_ir,
         middleware,
+        unverified_security_controls,
         cloud_config,
     }
 }
@@ -276,19 +301,24 @@ fn infer_module_cloud_config(source: &str) -> Vec<CloudConfigEntry> {
     entries
 }
 
-/// Infer default middleware stack, extending it when imported modules
-/// contribute security concerns (e.g., auth sessions).
-fn infer_middleware(source: &str) -> Vec<String> {
-    let mut stack = vec![
-        "security_headers".to_string(),
-        "request_log".to_string(),
-        "csrf".to_string(),
-    ];
-    let imports = collect_nulang_imports(source);
-    if imports.iter().any(|name| name == "@nulang/auth") {
-        stack.push("auth".to_string());
+/// Only the post-dispatch middleware actually installed by WebDevServer.
+/// Importing a module is not evidence of request-time security enforcement.
+fn infer_middleware(_source: &str) -> Vec<String> {
+    vec!["security_headers".to_string(), "request_log".to_string()]
+}
+
+/// Track unresolved security controls separately from enforced middleware.
+/// This conservative gate applies to the development-only auth module;
+/// absence of inferred requirements is *not* a production-security audit.
+fn infer_unverified_security_controls(source: &str) -> Vec<String> {
+    if collect_nulang_imports(source)
+        .iter()
+        .any(|name| name == "@nulang/auth")
+    {
+        vec!["auth".to_string(), "csrf".to_string()]
+    } else {
+        Vec::new()
     }
-    stack
 }
 
 /// Collect all `@nulang/*` import names from the source text.
@@ -444,20 +474,78 @@ mod tests {
     }
 
     #[test]
-    fn test_infer_middleware_adds_auth_when_imported() {
+    fn test_ir_never_reports_unenforced_auth_or_csrf_as_active_middleware() {
         let src = r#"
             import @nulang/auth
             fn main() {}
         "#;
         let stack = infer_middleware(src);
-        assert!(stack.contains(&"auth".to_string()));
-        assert!(stack.contains(&"csrf".to_string()));
+        assert_eq!(
+            stack,
+            vec!["security_headers".to_string(), "request_log".to_string()],
+            "importing development auth must not claim that auth or CSRF is enforced"
+        );
 
         let src_no_auth = r#"
             import stdlib::web::html
             fn main() {}
         "#;
         let stack_no_auth = infer_middleware(src_no_auth);
-        assert!(!stack_no_auth.contains(&"auth".to_string()));
+        assert_eq!(stack_no_auth, stack);
+    }
+
+    #[test]
+    fn test_generated_ir_separates_unverified_auth_from_runtime_middleware() {
+        let root = std::env::temp_dir().join(format!(
+            "nulang_web_ir_auth_security_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("main.nula"), "import @nulang/auth\nfn main() {}").unwrap();
+
+        let ir = generate_deployment_ir(
+            &[],
+            None,
+            &root,
+            &BudgetsSection::default(),
+            &ContractCompilation::default(),
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(ir.middleware, vec!["security_headers", "request_log"]);
+        assert_eq!(ir.unverified_security_controls, vec!["auth", "csrf"]);
+        assert!(ir.validate_production_security().is_err());
+    }
+
+    #[test]
+    fn test_auth_import_security_requirements_are_explicit_and_block_production_deploy() {
+        let src = "import @nulang/auth\nfn main() {}";
+        let controls = infer_unverified_security_controls(src);
+        assert_eq!(controls, vec!["auth".to_string(), "csrf".to_string()]);
+        assert!(infer_unverified_security_controls("fn main() {}").is_empty());
+
+        let mut ir = DeploymentIr::default();
+        ir.version = 1;
+        ir.unverified_security_controls = controls;
+
+        assert!(ir
+            .validate_production_security()
+            .unwrap_err()
+            .contains("auth"));
+        let restored: DeploymentIr = serde_json::from_str(&ir.to_json()).unwrap();
+        assert_eq!(
+            restored.unverified_security_controls,
+            ir.unverified_security_controls
+        );
+
+        // The new field is optional: published v1 consumers and producers remain compatible.
+        let legacy = r#"{"version":1,"routes":[],"signals":{},"capabilities":[],"budgets":{},"middleware":[],"cloud_config":[]}"#;
+        let old: DeploymentIr = serde_json::from_str(legacy).unwrap();
+        assert!(old.unverified_security_controls.is_empty());
+        assert!(old.validate_production_security().is_ok());
     }
 }

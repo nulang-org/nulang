@@ -258,6 +258,34 @@ Nulang source
 
 The runtime should ultimately execute each route under lightweight supervised request execution with structured cancellation and backpressure. Request-scoped dependencies should move from ambient state toward effect handlers. Stateful realtime/domain coordination should continue to use explicit persistent or virtual actors rather than making every model object an actor.
 
+## Security enforcement versus deployment metadata
+
+The current Web runtime applies `security_headers` and `request_log` after
+ordinary non-SSE HTTP dispatch. The `DeploymentIr.middleware` field describes
+these actual runtime hooks; it is **not** a declaration that middleware listed
+in source is automatically enforced. In particular, importing `@nulang/auth`
+does not authenticate requests or provide CSRF protection. The built-in
+`@nulang/auth` package is development-only and has predictable session IDs.
+
+Deployment IR v1 carries an optional `unverified_security_controls` list,
+separate from `middleware`. Imports of the development auth package produce
+`["auth", "csrf"]` there; importing a package never promotes those entries to
+enforced middleware. `nula deploy` (for all adapters) rejects a non-dry-run
+deployment with those unresolved controls. `nula deploy --dry-run` still
+builds and prints the blocker so developers can diagnose it.
+
+This is a narrow **fail-closed guard**, not a production readiness
+certification. An empty unverified list proves only that this specific
+development auth import was not detected. It does **not** prove that other
+routes, sessions, mutation endpoints, SSE channels, or adapters have been
+audited. Existing IR v1 documents without the optional field deserialize as
+before; production deployments must use a newly built, validated IR, and
+missing or malformed IR must never silently become an empty contract.
+
+Do not remove the guard until request-time authentication, authorization,
+session management and mutation CSRF checks are both implemented and tested at
+the exact compiled handler/HTTP boundary. See issue #2178.
+
 ## Remaining implementation priorities
 
 1. Define an explicit request/response algebra (`Json[T]`, `Html`, bytes, streams, typed bodies/media) so Contract IR and OpenAPI can represent payloads without guessing.

@@ -2222,23 +2222,24 @@ fn cmd_deploy(
 
     // Generate adapter-specific files in dist/.
     let ir_path = dist_dir.join("nulang-app.ir.json");
-    let ir: crate::web::ir::DeploymentIr = if ir_path.exists() {
-        let s = std::fs::read_to_string(&ir_path).map_err(|e| NuError::PackageError {
-            msg: format!("cannot read {}: {}", ir_path.display(), e),
+    // The build must produce a valid IR. A missing or malformed document is
+    // never an empty (and therefore apparently safe) deployment contract.
+    let ir_text = std::fs::read_to_string(&ir_path).map_err(|e| NuError::PackageError {
+        msg: format!("cannot read deployment IR {}: {}", ir_path.display(), e),
+        span: Span::default(),
+    })?;
+    let ir: crate::web::ir::DeploymentIr =
+        serde_json::from_str(&ir_text).map_err(|e| NuError::PackageError {
+            msg: format!("invalid deployment IR {}: {}", ir_path.display(), e),
             span: Span::default(),
         })?;
-        serde_json::from_str(&s).unwrap_or_default()
-    } else {
-        crate::web::ir::DeploymentIr {
-            version: 1,
-            routes: Vec::new(),
-            signals: serde_json::Value::Object(Default::default()),
-            capabilities: Vec::new(),
-            budgets: Default::default(),
-            middleware: Vec::new(),
-            cloud_config: Vec::new(),
-        }
-    };
+    if !dry_run {
+        ir.validate_production_security()
+            .map_err(|msg| NuError::PackageError {
+                msg,
+                span: Span::default(),
+            })?;
+    }
     match adapter {
         crate::web::adapters::AdapterKind::NulangCloud => {}
         crate::web::adapters::AdapterKind::StaticHost => {
@@ -2353,6 +2354,12 @@ fn cmd_deploy(
             for entry in &ir.cloud_config {
                 println!("  {} (required by {})", entry.key, entry.required_by);
             }
+        }
+        if !ir.unverified_security_controls.is_empty() {
+            println!(
+                "SECURITY BLOCKER: unresolved {}. Real deployment will be refused.",
+                ir.unverified_security_controls.join(", ")
+            );
         }
         println!(
             "Dry-run: would deploy {} bytes (adapter: {})",
