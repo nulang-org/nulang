@@ -14,6 +14,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Match Swatinem/rust-cache's workspace target path. The repository's
+  # local Cargo config uses a temp build directory, which is not cached.
+  # Absolute path also covers the standalone browser-playground crate.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
 
 jobs:
   # -----------------------------------------------------------------------
@@ -159,16 +163,25 @@ jobs:
       - name: Build (public CLI release profile)
         run: cargo build --locked --release --no-default-features --features release-cli --bin nulang
 
+      # Compile the production-profile test harness on main, where the full
+      # optimized suite is release-blocking. On PRs we already run default,
+      # minimal, and WASM tests; building all release test binaries adds ~45 min
+      # despite the actual test execution taking under a minute (Nov 2026 CI).
       - name: Test (same profile as public release artifacts)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: cargo test --locked --release --no-default-features --features release-cli
 
+      # Keep an executable production-profile regression check on every PR.
+      - name: Smoke test optimized CLI
+        run: ./target/release/nulang --eval 'perform IO.print("hello")'
+
       - name: Verify Linux CLI has no Python ABI linkage
-        run: bash scripts/check_release_linux.sh /tmp/cargo-target/release/nulang
+        run: bash scripts/check_release_linux.sh target/release/nulang
 
       - name: Stage tested release binary
         run: |
           mkdir -p ci-artifacts
-          cp /tmp/cargo-target/release/nulang ci-artifacts/nulang
+          cp target/release/nulang ci-artifacts/nulang
 
       - name: Upload tested release binary
         uses: actions/upload-artifact@v7
