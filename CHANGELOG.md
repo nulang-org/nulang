@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Five-node split-brain post-heal readiness regression — 2026-11-09
+- **The five-node TCP cluster chaos test now waits for healthy peer statuses as well as active-view convergence after a healed network partition.** The address resolver refuses one-shot sends when peers still have `Suspect` or `Failed` status; merely appearing in the active view is not sufficient to establish post-heal send readiness.
+- **Tighten diagnostics before cross-boundary delivery.** The test asserts A/E agree they are healthy, then preserves the original one-shot send and delivery assertion; no runtime transport/retry semantics are changed.
+- **Evidence:** the original test failed on one of two repeated local runs with the same remote-delivery assertion seen on PR #2540; the stricter test passed 12 consecutive local runs. Further high-contention CI confirmation remains necessary.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.

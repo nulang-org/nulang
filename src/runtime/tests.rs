@@ -5552,6 +5552,20 @@ fn active_views_converged(nodes: &[&Runtime], ids: &[NodeId]) -> bool {
     })
 }
 
+/// Active peer membership is not sufficient to show a healed partition:
+/// the address resolver rejects one-shot messages to peers whose status
+/// remains Suspect or Failed. Require both active-view convergence and
+/// healthy peer statuses before post-heal delivery assertions.
+#[cfg(feature = "tcp")]
+fn healthy_active_views_converged(nodes: &[&Runtime], ids: &[NodeId]) -> bool {
+    active_views_converged(nodes, ids)
+        && nodes.iter().all(|rt| {
+            let local = rt.distributed.node_id.expect("node id");
+            ids.iter()
+                .all(|id| *id == local || cluster_status(rt, *id) == Some(NodeStatus::Healthy))
+        })
+}
+
 #[cfg(feature = "tcp")]
 /// PLAN.md Phase 1 bullet 4 (chaos suite): split-brain — two mutually
 /// invisible healthy sub-clusters, NOT one node dying. Three real
@@ -5964,12 +5978,15 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
     let mut healed = false;
     for _ in 0..400 {
         advance_all(&mut nodes.iter_mut().collect::<Vec<_>>(), step);
-        if active_views_converged(&nodes.iter().collect::<Vec<_>>(), &ids) {
+        if healthy_active_views_converged(&nodes.iter().collect::<Vec<_>>(), &ids) {
             healed = true;
             break;
         }
     }
-    assert!(healed, "5-node cluster did not heal after the split-brain");
+    assert!(
+        healed,
+        "5-node cluster did not regain healthy active peer views after the split-brain"
+    );
 
     // Membership convergence alone does not guarantee that every peer has
     // relearned the authoritative listen address after a partition. The
@@ -5988,6 +6005,20 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
         let (first_four, last) = nodes.split_at_mut(4);
         pump_until_peer_roundtrip(&mut last[0], &mut first_four[0], Duration::from_secs(15));
     }
+
+    // A healthy active view is a necessary precondition for sending a
+    // one-shot message. Address/ACK convergence alone does not prove that
+    // the address resolver considers the target peer healthy.
+    assert_eq!(
+        cluster_status(&nodes[4], ids[0]),
+        Some(NodeStatus::Healthy),
+        "E must see A healthy before cross-boundary delivery"
+    );
+    assert_eq!(
+        cluster_status(&nodes[0], ids[4]),
+        Some(NodeStatus::Healthy),
+        "A must see E healthy before cross-boundary delivery"
+    );
 
     // Cross-boundary delivery after healing: E (node 4) -> actor on A
     // (node 0).
