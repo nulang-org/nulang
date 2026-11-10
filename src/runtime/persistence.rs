@@ -1698,34 +1698,24 @@ impl PersistenceStore for LibsqlStore {
         actor_id: u64,
         effect_id: DurableEffectId,
     ) -> io::Result<Option<DurableEffectPersistenceRecord>> {
+        // Recovery only needs the newest row for this effect ID.
+        // Scan under the existing connection mutex instead of buffering the
+        // entire actor history through the async compatibility adapter.
         let conn = self.conn();
-        self.rt.block_on(async {
-            let mut rows = conn
-                .query(
-                    "SELECT record FROM durable_effect_records
-                     WHERE actor_id = ?1
-                     ORDER BY sequence DESC, ordinal DESC",
-                    libsql::params![actor_id as i64],
-                )
-                .await
-                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
-
-            while let Some(row) = rows
-                .next()
-                .await
-                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
-            {
+        conn.scan_rows(
+            "SELECT record FROM durable_effect_records
+             WHERE actor_id = ?1
+             ORDER BY sequence DESC, ordinal DESC",
+            libsql::params![actor_id as i64],
+            |row| {
                 let json: String = row.get(0).map_err(|error| {
                     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
                 })?;
                 let record = DurableEffectPersistenceRecord::from_json(json.as_bytes())
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                if record.effect().spec().id == effect_id {
-                    return Ok(Some(record));
-                }
-            }
-            Ok(None)
-        })
+                Ok((record.effect().spec().id == effect_id).then_some(record))
+            },
+        )
     }
 
     fn commit_transition(&mut self, transition: DurableTransition) -> io::Result<DurableCommit> {

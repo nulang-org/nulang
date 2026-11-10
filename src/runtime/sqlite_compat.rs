@@ -61,6 +61,26 @@ impl Connection {
         collect_rows(&self.inner, sql, params)
     }
 
+    /// Visit database rows in cursor order without buffering the complete
+    /// result set. The callback may terminate the scan when it finds a match.
+    /// Keep this synchronous: the borrowed SQLite cursor must not outlive the
+    /// statement or the caller's connection mutex guard.
+    pub fn scan_rows<P: rusqlite::Params, T>(
+        &self,
+        sql: &str,
+        params: P,
+        mut visit: impl FnMut(&rusqlite::Row<'_>) -> std::io::Result<Option<T>>,
+    ) -> std::io::Result<Option<T>> {
+        let mut stmt = self.inner.prepare(sql).map_err(std::io::Error::other)?;
+        let mut rows = stmt.query(params).map_err(std::io::Error::other)?;
+        while let Some(row) = rows.next().map_err(std::io::Error::other)? {
+            if let Some(matched) = visit(row)? {
+                return Ok(Some(matched));
+            }
+        }
+        Ok(None)
+    }
+
     pub async fn transaction_with_behavior(
         &self,
         behavior: TransactionBehavior,
@@ -157,5 +177,42 @@ impl Row {
             .get(index)
             .cloned()
             .ok_or(rusqlite::Error::InvalidColumnIndex(index))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_stops_before_evaluating_unneeded_rows() {
+        let conn = Connection {
+            inner: rusqlite::Connection::open_in_memory().unwrap(),
+        };
+        conn.inner
+            .execute_batch(
+                "CREATE TABLE effects (sequence INTEGER PRIMARY KEY);
+                 INSERT INTO effects VALUES (1), (2);",
+            )
+            .unwrap();
+
+        // The second row deliberately fails if SQLite evaluates it.
+        // A durable recovery lookup should be able to stop after the
+        // matching newest row instead of materializing the whole cursor.
+        let matched: Option<String> = conn
+            .scan_rows(
+                "SELECT CASE WHEN sequence = 1 THEN 'matched'
+                             ELSE json_extract('{', '$') END
+                 FROM effects ORDER BY sequence",
+                (),
+                |row| {
+                    let value: String = row.get(0).map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                    })?;
+                    Ok(Some(value))
+                },
+            )
+            .unwrap();
+        assert_eq!(matched.as_deref(), Some("matched"));
     }
 }
