@@ -2,8 +2,8 @@
 ### Security dependency refresh — 2026-11-09
 - **Patch the WASM runtime:** update Wasmtime and its Cranelift dependencies from 48.0.6 to 48.0.8, addressing the newly reported RustSec findings including the critical AArch64 branch-table issue.
 - **Update TLS, compression, and cryptographic dependencies:** update lockfile entries for rustls-webpki 0.103.16, webpki-roots 1.0.10, libz-sys 1.1.31, and ctutils 0.4.4.
-- **Refresh local SQLite persistence:** update nulang-ai-local to rusqlite 0.41.1 and bundled libsqlite3-sys 0.39.1, keeping its existing SQLite cache support.
-- **Residual security gate:** cargo-audit still detects RUSTSEC-2026-0382 in rustls-webpki 0.102.8, which remains transitively pinned by libsql 0.10.0-pre.4 through rustls 0.22.4. Do not mistake this patch for an advisory-free dependency graph.
+- **Do not upgrade SQLite blindly:** rusqlite 0.41.1 / bundled libsqlite3-sys 0.39.1 was rejected after full-feature CI linked it together with libsql-ffi's separate bundled SQLite, producing duplicate `sqlite3_*` symbols. Preserve the working rusqlite 0.32.1 compatibility baseline until a unified SQLite linkage is designed and tested.
+- **Residual security gate:** cargo-audit still detects RUSTSEC-2026-0382 (rustls-webpki 0.102.8 through legacy libsql TLS) and RUSTSEC-2026-0459 (libsqlite3-sys 0.30.1). Do not mistake this patch for an advisory-free dependency graph.
 
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
