@@ -1477,11 +1477,14 @@ impl WebDevServer {
                 .peer_addr()
                 .ok()
                 .is_some_and(|peer| ui_stream_local_request_allowed(&request, peer.ip()));
-            let permitted = scope.as_ref().is_some_and(|(app, room)| {
-                authorizer
-                    .as_ref()
-                    .is_some_and(|verify| verify(&request, app, room))
-            });
+            // Never invoke host authorization code for an origin/Host/peer
+            // that failed transport admission.
+            let permitted = allowed_local
+                && scope.as_ref().is_some_and(|(app, room)| {
+                    authorizer
+                        .as_ref()
+                        .is_some_and(|verify| verify(&request, app, room))
+                });
             if !allowed_local || !permitted {
                 HttpResponse {
                     status: 403,
@@ -2212,6 +2215,39 @@ mod tests {
         let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
         let mut client = scoped_tcp_connect(server.port, "billing", "invoices", "");
         assert!(sse_tcp_frame(&mut client).starts_with("HTTP/1.1 403 Forbidden"));
+    }
+
+    #[test]
+    fn scoped_ui_sse_does_not_call_host_authorizer_for_untrusted_origin() {
+        // Transport-origin admission must precede any host authorization code.
+        // The callback may have externally visible side effects or touch a DB.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let authorize: UiStreamAuthorizer = Arc::new(move |_, _, _| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+        let server =
+            WebDevServer::bind_with_ui_authorizer(0, None, None, vec![], authorize).unwrap();
+
+        for untrusted_headers in [
+            "Origin: https://attacker.example\r\n",
+            "Host: attacker.example\r\n",
+            "Sec-Fetch-Site: cross-site\r\n",
+        ] {
+            let mut hostile =
+                scoped_tcp_connect(server.port, "billing", "invoices", untrusted_headers);
+            assert!(sse_tcp_frame(&mut hostile).starts_with("HTTP/1.1 403 Forbidden"));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "untrusted requests must not execute the host authorization callback: {untrusted_headers:?}"
+            );
+        }
+
+        let mut trusted = scoped_tcp_connect(server.port, "billing", "invoices", "");
+        assert!(sse_tcp_frame(&mut trusted).starts_with("HTTP/1.1 200 OK"));
+        assert!(calls.load(Ordering::SeqCst) > 0);
     }
 
     #[test]
