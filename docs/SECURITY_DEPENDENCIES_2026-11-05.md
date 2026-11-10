@@ -11,13 +11,15 @@ webpki-roots. A subsequent lockfile update also removes an obsolete h2
 advisory and addresses unsound tokio and yanked packages where compatible
 patches are available.
 
-The remaining rustls-webpki 0.102.x is pulled only by the **remote** libSQL
-feature (`hyper-rustls 0.25` → `rustls 0.22`). The latest published libSQL
-0.10.0 still pins this obsolete TLS stack; no compatible patch release
-exists. Nulang currently builds libSQL with only `core`, retaining
-**local file/in-memory SQLite persistence**. The public
-`LibsqlStore::new_remote(url, auth_token)` method remains available as
-an API shape but returns `io::ErrorKind::Unsupported` deterministically.
+The original TLS finding was pulled through the **remote** libSQL
+feature (`hyper-rustls 0.25` → `rustls 0.22`). Published libSQL 0.10
+dependencies pinned this obsolete TLS stack. As of the November 10 draft
+SQLite-provider consolidation, Nulang removes the embedded libSQL FFI
+backend entirely. Local actor and AI persistence now share one
+`rusqlite 0.41.1` / `libsqlite3-sys 0.39.1` provider (bundled SQLite 3.54.1).
+The historic public `LibsqlStore` type name remains for compatibility;
+`LibsqlStore::new_remote(url, auth_token)` still returns
+`io::ErrorKind::Unsupported` deterministically.
 
 **Breaking change:** Connecting to a Turso/libSQL remote database through
 this constructor is deliberately disabled. Host applications depending on
@@ -25,6 +27,29 @@ remote libSQL must continue using an external adapter with an independently
 patched TLS stack until Nulang implements and tests a secure remote client.
 Never fall back to HTTP/plaintext, weaken certificate validation, or enable
 `libsql/remote` and `libsql/tls` just to restore the old behavior.
+
+## November 10 follow-up: one verified local SQLite engine
+
+The original `libsql-ffi 0.10.0-pre.4` also bundled SQLite 3.47.0,
+predating the 3.54.0 upstream fix for the crafted database/WAL
+memory-disclosure advisory (CVE-2026-119375). Adding patched `rusqlite`
+alongside it produced duplicate `sqlite3_*` symbols in default and
+release builds (issue #2549). The consolidation removes `libsql`
+and its own FFI bundle rather than suppressing linker or security checks.
+
+The adapter in `src/runtime/sqlite_compat.rs` maps the existing
+`LibsqlStore` local operations to `rusqlite`, preserving transactional
+atomicity and SQL schema compatibility while allowing the public API
+to migrate separately. The adapter currently buffers each result set
+into owned rows, matching the store's materialized query API but
+adding transient allocation pressure for large queries. Avoid
+unbounded queries in security-sensitive use.
+
+Required release evidence: the same patched SQLite runtime version
+for both stores, legacy-schema migrations, atomic rollback and
+recovery tests, default-feature/feature-combination builds,
+full release linker validation, RustSec audit, and terminal exact-head
+CI. A successful `cargo audit` **alone is not merge authorization**.
 
 ## Remaining audit warnings
 
