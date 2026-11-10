@@ -7,6 +7,7 @@
 use crate::web::bindings::{compile_route_bindings, RouteBindingContract, RouteBindingSource};
 use crate::web::contracts::{ContractCompilation, RouteContract, RouteParamContract};
 use serde_json::{json, Map, Value};
+use std::collections::{HashMap, HashSet};
 
 pub const OPENAPI_VERSION: &str = "3.1.0";
 
@@ -18,11 +19,12 @@ pub const OPENAPI_VERSION: &str = "3.1.0";
 /// media types and schemas must never be guessed from source-level type names.
 pub fn generate_openapi(contracts: &ContractCompilation, title: &str, version: &str) -> Value {
     let mut paths = Map::new();
+    let operation_ids = unique_operation_ids(&contracts.routes);
 
-    for route in &contracts.routes {
+    for (route, operation_id) in contracts.routes.iter().zip(operation_ids.iter()) {
         let path = openapi_path(&route.path);
         let method = route.method.to_ascii_lowercase();
-        let operation = operation_for(route);
+        let operation = operation_for(route, operation_id);
 
         let entry = paths
             .entry(path)
@@ -43,7 +45,91 @@ pub fn generate_openapi(contracts: &ContractCompilation, title: &str, version: &
     })
 }
 
-fn operation_for(route: &RouteContract) -> Value {
+/// A single handler can serve multiple paths or methods. OpenAPI operation IDs
+/// are unique per operation, not per handler, and generated SDK names must not
+/// depend on source registration order.
+fn unique_operation_ids(routes: &[RouteContract]) -> Vec<String> {
+    let preferred: Vec<String> = routes.iter().map(preferred_operation_id).collect();
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for name in &preferred {
+        *counts.entry(name.as_str()).or_default() += 1;
+    }
+
+    let mut ids = vec![String::new(); routes.len()];
+    let mut used = HashSet::new();
+
+    // Preserve existing names for the common, non-conflicting case.
+    // Reserve them before generating suffixed names so a collision never
+    // renames an otherwise unique operation.
+    for (index, name) in preferred.iter().enumerate() {
+        if counts[name.as_str()] == 1 {
+            used.insert(name.clone());
+            ids[index] = name.clone();
+        }
+    }
+
+    let mut conflicting: Vec<usize> = (0..routes.len())
+        .filter(|&index| counts[preferred[index].as_str()] > 1)
+        .collect();
+    conflicting.sort_by_key(|&index| {
+        (
+            openapi_path(&routes[index].path),
+            routes[index].method.to_ascii_lowercase(),
+            routes[index].path.clone(),
+        )
+    });
+
+    for index in conflicting {
+        let route = &routes[index];
+        let path = openapi_path(&route.path);
+        let stem = format!(
+            "{}__{}_{}",
+            preferred[index],
+            route.method.to_ascii_lowercase(),
+            operation_path_slug(&path)
+        );
+        let mut candidate = stem.clone();
+        let mut number = 2;
+        while used.contains(&candidate) {
+            candidate = format!("{stem}_{number}");
+            number += 1;
+        }
+        used.insert(candidate.clone());
+        ids[index] = candidate;
+    }
+    ids
+}
+
+fn preferred_operation_id(route: &RouteContract) -> String {
+    route.handler.clone().unwrap_or_else(|| {
+        let suffix = route
+            .path
+            .trim_matches('/')
+            .replace(|c: char| matches!(c, '/' | ':' | '{' | '}' | ' '), "_");
+        format!("{}_{}", route.method.to_ascii_lowercase(), suffix)
+            .trim_end_matches('_')
+            .to_string()
+    })
+}
+
+fn operation_path_slug(path: &str) -> String {
+    let mut slug = String::new();
+    for character in path.chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character.to_ascii_lowercase());
+        } else if !slug.ends_with('_') {
+            slug.push('_');
+        }
+    }
+    let slug = slug.trim_matches('_');
+    if slug.is_empty() {
+        "root".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
+fn operation_for(route: &RouteContract, operation_id: &str) -> Value {
     // Path parameters continue to come directly from the route contract so
     // legacy routes that still use ambient `Web.param` remain accurately
     // described. Additional request parameters come from compiler binding IR.
@@ -55,16 +141,6 @@ fn operation_for(route: &RouteContract) -> Value {
             .iter()
             .filter_map(binding_parameter),
     );
-
-    let operation_id = route.handler.clone().unwrap_or_else(|| {
-        let suffix = route
-            .path
-            .trim_matches('/')
-            .replace(|c: char| matches!(c, '/' | ':' | '{' | '}' | ' '), "_");
-        format!("{}_{}", route.method.to_ascii_lowercase(), suffix)
-            .trim_end_matches('_')
-            .to_string()
-    });
 
     let mut success = Map::new();
     success.insert(
@@ -115,7 +191,10 @@ fn operation_for(route: &RouteContract) -> Value {
     }
 
     let mut operation = Map::new();
-    operation.insert("operationId".to_string(), Value::String(operation_id));
+    operation.insert(
+        "operationId".to_string(),
+        Value::String(operation_id.to_string()),
+    );
     if !parameters.is_empty() {
         operation.insert("parameters".to_string(), Value::Array(parameters));
     }
@@ -589,6 +668,102 @@ mod tests {
             document["paths"]["/users/{id}"]["get"]["responses"]["200"]["content"]
                 ["application/json"]["schema"]["type"],
             "string"
+        );
+    }
+
+    #[test]
+    fn reused_handlers_have_distinct_order_independent_operation_ids() {
+        let mut first = route();
+        first.handler = Some("shared_handler".into());
+        let mut second = route();
+        second.handler = Some("shared_handler".into());
+        second.path = "/accounts/{id: UserId}".into();
+
+        let forward = generate_openapi(
+            &ContractCompilation {
+                routes: vec![first.clone(), second.clone()],
+                diagnostics: Vec::new(),
+            },
+            "Test",
+            "1",
+        );
+        let reversed = generate_openapi(
+            &ContractCompilation {
+                routes: vec![second, first],
+                diagnostics: Vec::new(),
+            },
+            "Test",
+            "1",
+        );
+        let first_id = forward["paths"]["/users/{id}"]["get"]["operationId"]
+            .as_str()
+            .unwrap();
+        let second_id = forward["paths"]["/accounts/{id}"]["get"]["operationId"]
+            .as_str()
+            .unwrap();
+
+        assert_ne!(
+            first_id, second_id,
+            "OpenAPI operationId values must be unique"
+        );
+        assert_eq!(
+            forward, reversed,
+            "contract order must not rename SDK operations"
+        );
+    }
+
+    #[test]
+    fn shared_handler_ids_preserve_independent_nested_json_response_schemas() {
+        let mut person = route();
+        person.handler = Some("shared_read".into());
+        person.response_type = Some("Json[{ profile: { name: String, age: Int } }]".into());
+
+        let mut organization = person.clone();
+        organization.path = "/organizations/{id: UserId}".into();
+        organization.response_type =
+            Some("Json[{ organization: { name: String, active: Bool } }]".into());
+
+        let document = generate_openapi(
+            &ContractCompilation {
+                routes: vec![person, organization],
+                diagnostics: Vec::new(),
+            },
+            "Test",
+            "1",
+        );
+        let person_op = &document["paths"]["/users/{id}"]["get"];
+        let org_op = &document["paths"]["/organizations/{id}"]["get"];
+        assert_ne!(person_op["operationId"], org_op["operationId"]);
+        assert_eq!(
+            person_op["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
+                ["profile"]["properties"]["age"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            org_op["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
+                ["organization"]["properties"]["active"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            org_op["responses"]["200"]["content"]["application/json"]["schema"]
+                ["additionalProperties"],
+            false
+        );
+    }
+
+    #[test]
+    fn leaves_a_unique_explicit_handler_operation_id_unchanged() {
+        let document = generate_openapi(
+            &ContractCompilation {
+                routes: vec![route()],
+                diagnostics: Vec::new(),
+            },
+            "Test",
+            "1",
+        );
+        assert_eq!(
+            document["paths"]["/users/{id}"]["get"]["operationId"],
+            "show_user"
         );
     }
 

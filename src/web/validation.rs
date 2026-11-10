@@ -6,10 +6,11 @@
 //! they have one authoritative diagnostic list instead of reimplementing policy.
 
 use crate::web::bindings::compile_route_bindings;
-use crate::web::contracts::ContractCompilation;
+use crate::web::contracts::{ContractCompilation, RouteContract};
+use crate::web::openapi::openapi_path;
 use crate::web::package_contracts::compile_contracts_from_tree;
 use crate::web::runtime_bindings::{compare_route_patterns, RoutePatternRelation};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 /// Compile and validate every statically extractable route contract in a
@@ -64,6 +65,7 @@ pub fn validation_diagnostics(compilation: &ContractCompilation) -> Vec<String> 
     for route in &compilation.routes {
         diagnostics.extend(compile_route_bindings(route).diagnostics);
     }
+    diagnostics.extend(route_identity_diagnostics(&compilation.routes));
 
     // Apply the same specificity relation used by HTTP dispatch. A literal
     // subroute can safely shadow a parameter route; two overlapping routes
@@ -87,6 +89,47 @@ pub fn validation_diagnostics(compilation: &ContractCompilation) -> Vec<String> 
     let mut seen = HashSet::new();
     diagnostics.retain(|diagnostic| seen.insert(diagnostic.clone()));
     diagnostics.sort();
+    diagnostics
+}
+
+/// OpenAPI cannot represent two templates with the same hierarchy but
+/// different parameter names. The HTTP router must not silently dispatch one
+/// route while generated API metadata describes another.
+fn route_identity_diagnostics(routes: &[RouteContract]) -> Vec<String> {
+    let mut normalized: Vec<(String, String)> = routes
+        .iter()
+        .map(|route| (route.method.to_ascii_uppercase(), openapi_path(&route.path)))
+        .collect();
+    normalized.sort();
+
+    let mut templates: BTreeMap<String, (String, String)> = BTreeMap::new();
+    let mut diagnostics = Vec::new();
+    for (method, path) in normalized {
+        let shape = path
+            .split('/')
+            .map(|segment| {
+                if segment.starts_with('{') && segment.ends_with('}') {
+                    "{}"
+                } else {
+                    segment
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+
+        // Same-method overlap is already rejected by compare_route_patterns.
+        // Only add the distinct OpenAPI restriction: different HTTP methods
+        // cannot describe the same route shape with different capture names.
+        if let Some((first_method, first_path)) = templates.get(&shape) {
+            if first_method != &method && first_path != &path {
+                diagnostics.push(format!(
+                    "ambiguous OpenAPI route templates '{first_path}' and '{path}':                      parameter names cannot distinguish routes across HTTP methods"
+                ));
+            }
+        } else {
+            templates.insert(shape, (method, path));
+        }
+    }
     diagnostics
 }
 
@@ -154,6 +197,74 @@ mod tests {
             diagnostics: Vec::new(),
         };
         assert!(validation_diagnostics(&compilation).is_empty());
+    }
+
+    #[test]
+    fn rejects_same_method_routes_with_equivalent_path_templates() {
+        let a = contract("/users/:id", vec![]);
+        let mut b = a.clone();
+        b.path = "/users/{id: UserId}".into();
+
+        let diagnostics = validation_diagnostics(&ContractCompilation {
+            routes: vec![a, b],
+            diagnostics: Vec::new(),
+        });
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.contains("duplicate") || d.contains("ambiguous")),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_differently_named_templates_for_same_route_shape() {
+        let a = contract("/users/{id: UserId}", vec![]);
+        let mut b = a.clone();
+        b.path = "/users/{user_id: UserId}".into();
+
+        let diagnostics = validation_diagnostics(&ContractCompilation {
+            routes: vec![a, b],
+            diagnostics: Vec::new(),
+        });
+        assert!(
+            diagnostics.iter().any(|d| d.contains("ambiguous")),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn differently_named_templates_across_http_methods_are_invalid_openapi() {
+        let mut get = contract("/accounts/{account_id}", Vec::new());
+        get.params.clear();
+        let mut post = contract("/accounts/{id}", Vec::new());
+        post.params.clear();
+        post.method = "POST".into();
+
+        let diagnostics = validation_diagnostics(&ContractCompilation {
+            routes: vec![get, post],
+            diagnostics: Vec::new(),
+        });
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.contains("OpenAPI") && d.contains("ambiguous")),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn shared_template_across_different_methods_is_allowed() {
+        let mut get = contract("/accounts/{id}", Vec::new());
+        get.params.clear();
+        let mut post = get.clone();
+        post.method = "POST".into();
+
+        let diagnostics = validation_diagnostics(&ContractCompilation {
+            routes: vec![get, post],
+            diagnostics: Vec::new(),
+        });
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     #[test]
