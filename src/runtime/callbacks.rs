@@ -3052,3 +3052,49 @@ mod host_authority_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod web_missing_string_tests {
+    use super::{perform_web_builtin, RuntimeVmCallbacks};
+    use crate::bytecode::Constant;
+    use crate::runtime::http_server::{
+        with_request_context, HttpMethod, HttpRequest, RequestContext,
+    };
+    use crate::runtime::Runtime;
+    use crate::vm::{resolve_value_string, Value};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    #[test]
+    fn missing_web_string_values_are_not_nil() {
+        let ctx = RequestContext {
+            request: HttpRequest {
+                method: HttpMethod::Get,
+                path: "/".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+        with_request_context(ctx, || {
+            let rt = Rc::new(RefCell::new(Runtime::new()));
+            let mut callback = RuntimeVmCallbacks::new(rt);
+            let constants = vec![Constant::String("missing-session".into())];
+            let args = [Value::string(0)];
+            for operation in ["cookie", "kv_get", "form_value", "header", "param"] {
+                let value = perform_web_builtin(&mut callback, Some(operation), &constants, &args)
+                    .expect("Web host must handle a typed String operation");
+                assert!(
+                    !value.is_nil(),
+                    "{operation} returned Nil for a declared String"
+                );
+                assert_eq!(
+                    resolve_value_string(&constants, value),
+                    "",
+                    "{operation} must return an empty String for a missing value"
+                );
+            }
+        });
+    }
+}
