@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Remote actor cache respects live cluster membership — 2026-11-09
+- **The address resolver now checks a remote node's current health and membership before consulting a cached actor route.** Previously a populated cache returned a remote route even for Failed or unknown nodes, bypassing the resolver's own documented fail-closed contract.
+- **Rejected peers have stale cache entries invalidated; genuinely healed peers can resolve again.** Tests reproduce both bypasses before the change and verify rejection, cache invalidation, and recovery afterward. This changes runtime send admission, not transport retries or cluster status transitions.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
