@@ -13,6 +13,8 @@ use crate::durable_effect::DurableEffectId;
 use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
 use crate::vm::Value;
 
+#[cfg(feature = "sqlite")]
+use super::sqlite_compat as libsql;
 use tracing::warn;
 
 /// How a state field is persisted / replicated.
@@ -1283,10 +1285,11 @@ impl PersistenceStore for JsonFileStore {
 }
 
 // ---------------------------------------------------------------------------
-// LibsqlStore — libSQL-backed local SQLite persistence (remote disabled)
+// LibsqlStore — rusqlite-backed SQLite persistence (legacy API name)
 // ---------------------------------------------------------------------------
 
-/// libSQL-backed persistence store.
+/// Local SQLite persistence, backed by patched rusqlite.
+/// The LibsqlStore name is retained for source compatibility.
 ///
 /// Each actor gets one row in the `snapshots` table and zero or more rows in
 /// the `journal` and `workflow_events` tables, same schema as the old SQLite
@@ -1364,16 +1367,16 @@ impl LibsqlStore {
         Self::new(":memory:")
     }
 
-    /// Remote Turso connections are disabled until libSQL can use a patched
-    /// TLS certificate-verification stack. Local SQLite remains supported.
+    /// Remote Turso connections are disabled: this build intentionally
+    /// links only a patched local SQLite engine and no remote client.
     ///
     /// This preserves the API shape and fails explicitly rather than
-    /// accidentally downgrading HTTPS, accepting vulnerable verification, or
-    /// attempting to connect with an unsupported transport.
+    /// restoring the former libSQL TLS chain (RUSTSEC-2026-0382), using
+    /// plaintext, or weakening certificate verification.
     pub fn new_remote(_url: &str, _auth_token: &str) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "Remote libSQL/Turso disabled: unpatched TLS chain RUSTSEC-2026-0382",
+            "Remote libSQL/Turso disabled: no vetted remote client (legacy TLS risk RUSTSEC-2026-0382)",
         ))
     }
     pub fn path(&self) -> &Path {
@@ -4232,6 +4235,36 @@ mod libsql_atomic_transition_tests {
             numbers.as_slice() >= &[3, 54, 0],
             "outdated local SQLite provider: {version}"
         );
+    }
+
+    #[cfg(feature = "ai-runtime")]
+    #[test]
+    fn agent_and_actor_stores_share_patched_sqlite_engine() {
+        let actor = LibsqlStore::in_memory().expect("actor DB opens");
+        let actor_version: Vec<String> =
+            serde_json::from_str(&actor.query("SELECT sqlite_version()", &[]).unwrap()[0]).unwrap();
+
+        let test_dir = std::env::temp_dir().join(format!(
+            "nulang_single_sqlite_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let agent = nulang_ai_local::SqliteStore::open(&test_dir).expect("agent DB opens");
+        let conn = rusqlite::Connection::open(agent.db_path()).expect("agent DB readable");
+        let agent_version: String = conn
+            .query_row("SELECT sqlite_version()", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            actor_version,
+            vec![agent_version],
+            "actor and agent persistence must use the same SQLite runtime version"
+        );
+        drop(conn);
+        drop(agent);
+        std::fs::remove_dir_all(&test_dir).unwrap();
     }
 
     #[test]
