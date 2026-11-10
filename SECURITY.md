@@ -60,3 +60,12 @@ upgrades or whose vulnerable APIs are not used by the current implementation.
 Those suppressions are accepted risks, not a claim that the dependency graph is
 advisory-free. Release decisions should review that file and the relevant
 reachable feature paths.
+
+As of the 2026-11-09 dependency-refresh branch, `cargo audit` still fails on
+`RUSTSEC-2026-0382` in `rustls-webpki 0.102.8`. This legacy version is
+transitive through `libsql 0.10.0-pre.4 → hyper-rustls 0.25 → rustls 0.22.4`.
+The maintained `rustls-webpki 0.103.x` branch has been patched separately.
+The legacy version requires an upstream libsql/TLS migration or removal of
+the affected dependency path; the finding is intentionally **not ignored**.
+Before enabling remote libsql connections in security-sensitive production
+deployments, resolve and verify this remaining TLS certificate-validation risk.
