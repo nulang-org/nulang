@@ -386,6 +386,14 @@ pub(crate) fn perform_web_builtin(
             None => crate::vm::Value::nil(),
         }
     }
+    // These Web host operations are declared as returning String.
+    // Nil stringifies to "nil", making missing auth values appear nonempty.
+    fn string_or_empty(
+        callbacks: &mut dyn crate::vm::ActorVmCallbacks,
+        value: Option<String>,
+    ) -> crate::vm::Value {
+        callbacks.alloc_string(value.as_deref().unwrap_or(""))
+    }
     match op_name {
         Some("html") => {
             let tag = resolve(constants, *regs.first()?);
@@ -434,28 +442,33 @@ pub(crate) fn perform_web_builtin(
         }
         Some("param") => {
             let name = resolve(constants, *regs.first()?);
-            crate::runtime::http_server::current_request_param(&name)
-                .map(|s| callbacks.alloc_string(&s))
-                .or(Some(crate::vm::Value::nil()))
+            Some(string_or_empty(
+                callbacks,
+                crate::runtime::http_server::current_request_param(&name),
+            ))
         }
         Some("header") => {
             let name = resolve(constants, *regs.first()?);
-            crate::runtime::http_server::current_request_header(&name)
-                .map(|s| callbacks.alloc_string(&s))
-                .or(Some(crate::vm::Value::nil()))
+            Some(string_or_empty(
+                callbacks,
+                crate::runtime::http_server::current_request_header(&name),
+            ))
         }
         Some("cookie") => {
             let name = resolve(constants, *regs.first()?);
-            crate::runtime::http_server::current_request_cookie(&name)
-                .map(|s| callbacks.alloc_string(&s))
-                .or(Some(crate::vm::Value::nil()))
+            Some(string_or_empty(
+                callbacks,
+                crate::runtime::http_server::current_request_cookie(&name),
+            ))
         }
-        Some("read_body") => crate::runtime::http_server::current_request_body()
-            .map(|b| callbacks.alloc_string(&String::from_utf8_lossy(&b)))
-            .or(Some(crate::vm::Value::nil())),
-        Some("method") => crate::runtime::http_server::current_request_method()
-            .map(|s| callbacks.alloc_string(&s))
-            .or(Some(crate::vm::Value::nil())),
+        Some("read_body") => {
+            let body = crate::runtime::http_server::current_request_body().unwrap_or_default();
+            Some(callbacks.alloc_string(&String::from_utf8_lossy(&body)))
+        }
+        Some("method") => Some(string_or_empty(
+            callbacks,
+            crate::runtime::http_server::current_request_method(),
+        )),
         Some("form") => {
             let pairs = crate::runtime::http_server::current_request_body()
                 .map(|b| crate::runtime::http_server::parse_form_urlencoded(&b))
@@ -470,15 +483,17 @@ pub(crate) fn perform_web_builtin(
         }
         Some("form_value") => {
             let name = resolve(constants, *regs.first()?);
-            crate::runtime::http_server::form_value(&name)
-                .map(|s| callbacks.alloc_string(&s))
-                .or(Some(crate::vm::Value::nil()))
+            Some(string_or_empty(
+                callbacks,
+                crate::runtime::http_server::form_value(&name),
+            ))
         }
         Some("kv_get") => {
             let key = resolve(constants, *regs.first()?);
-            crate::runtime::http_server::kv_get(&key)
-                .map(|s| callbacks.alloc_string(&s))
-                .or(Some(crate::vm::Value::nil()))
+            Some(string_or_empty(
+                callbacks,
+                crate::runtime::http_server::kv_get(&key),
+            ))
         }
         Some("kv_set") => {
             let key = resolve(constants, *regs.first()?);
