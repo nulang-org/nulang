@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Remote libSQL endpoint transport guard — 2026-11-09
+- **`LibsqlStore::new_remote` rejects cleartext, ambiguous, and credential-bearing URLs before constructing a transport or passing the bearer token to libsql.** Only validated `https://` and `libsql://` endpoints with a host are accepted; user-info, fragments, leading/trailing whitespace, and malformed schemes fail closed with `InvalidInput`.
+- **Security boundary is deliberately limited:** this mitigates plaintext credential transport at the Nulang entry point; it does not patch `rustls-webpki 0.102.8` (RUSTSEC-2026-0382) in libsql's legacy TLS client, or guarantee upstream redirect/connection behavior. Test secure-format acceptance and fail-closed validation before network access.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
