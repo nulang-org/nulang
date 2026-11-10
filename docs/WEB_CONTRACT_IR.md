@@ -183,6 +183,19 @@ OpenAPI 3.1 generation consumes the same `ContractCompilation` and binding IR; i
 
 This keeps runtime dispatch and generated API metadata on the same compiler-owned contract.
 
+The web build writes an experimental dist/openapi.json from the same validated
+ContractCompilation used by runtime dispatch and deployment IR. Existing unique
+handler-based operation IDs are preserved; when the same handler is reused by
+multiple routes, deterministic route-based suffixes keep operation IDs distinct
+for client generators regardless of route registration order.
+
+Validation rejects duplicate HTTP method/path operations after path-template
+normalization and rejects parameter-renamed templates with the same path shape
+(even across methods), rather than silently overwriting or ambiguously
+publishing an OpenAPI operation. This does not imply that typed JSON
+request/response bodies are complete: opaque/raw bodies continue to retain
+extensions rather than fabricated media types.
+
 ## Binding example
 
 For:

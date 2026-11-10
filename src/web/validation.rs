@@ -6,9 +6,10 @@
 //! they have one authoritative diagnostic list instead of reimplementing policy.
 
 use crate::web::bindings::compile_route_bindings;
-use crate::web::contracts::ContractCompilation;
+use crate::web::contracts::{ContractCompilation, RouteContract};
+use crate::web::openapi::openapi_path;
 use crate::web::package_contracts::compile_contracts_from_tree;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 /// Compile and validate every statically extractable route contract in a
@@ -63,10 +64,56 @@ pub fn validation_diagnostics(compilation: &ContractCompilation) -> Vec<String> 
     for route in &compilation.routes {
         diagnostics.extend(compile_route_bindings(route).diagnostics);
     }
+    diagnostics.extend(route_identity_diagnostics(&compilation.routes));
 
     let mut seen = HashSet::new();
     diagnostics.retain(|diagnostic| seen.insert(diagnostic.clone()));
     diagnostics.sort();
+    diagnostics
+}
+
+/// OpenAPI cannot represent two templates with the same hierarchy but
+/// different parameter names. The HTTP router must not silently dispatch one
+/// route while generated API metadata describes another.
+fn route_identity_diagnostics(routes: &[RouteContract]) -> Vec<String> {
+    let mut normalized: Vec<(String, String)> = routes
+        .iter()
+        .map(|route| (route.method.to_ascii_uppercase(), openapi_path(&route.path)))
+        .collect();
+    normalized.sort();
+
+    let mut templates: BTreeMap<String, String> = BTreeMap::new();
+    let mut registered = HashSet::new();
+    let mut diagnostics = Vec::new();
+    for (method, path) in normalized {
+        let shape = path
+            .split('/')
+            .map(|segment| {
+                if segment.starts_with('{') && segment.ends_with('}') {
+                    "{}"
+                } else {
+                    segment
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+
+        if let Some(first_path) = templates.get(&shape) {
+            if first_path != &path {
+                diagnostics.push(format!(
+                    "ambiguous web route templates '{first_path}' and '{path}': parameter names cannot distinguish routes"
+                ));
+            }
+        } else {
+            templates.insert(shape, path.clone());
+        }
+
+        if !registered.insert((method.clone(), path.clone())) {
+            diagnostics.push(format!(
+                "duplicate web route {method} {path}: multiple registrations normalize to the same operation"
+            ));
+        }
+    }
     diagnostics
 }
 
@@ -134,6 +181,40 @@ mod tests {
             diagnostics: Vec::new(),
         };
         assert!(validation_diagnostics(&compilation).is_empty());
+    }
+
+    #[test]
+    fn rejects_same_method_routes_with_equivalent_path_templates() {
+        let a = contract("/users/:id", vec![]);
+        let mut b = a.clone();
+        b.path = "/users/{id: UserId}".into();
+
+        let diagnostics = validation_diagnostics(&ContractCompilation {
+            routes: vec![a, b],
+            diagnostics: Vec::new(),
+        });
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.contains("duplicate") || d.contains("ambiguous")),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_differently_named_templates_for_same_route_shape() {
+        let a = contract("/users/{id: UserId}", vec![]);
+        let mut b = a.clone();
+        b.path = "/users/{user_id: UserId}".into();
+
+        let diagnostics = validation_diagnostics(&ContractCompilation {
+            routes: vec![a, b],
+            diagnostics: Vec::new(),
+        });
+        assert!(
+            diagnostics.iter().any(|d| d.contains("ambiguous")),
+            "{diagnostics:?}"
+        );
     }
 
     #[test]
