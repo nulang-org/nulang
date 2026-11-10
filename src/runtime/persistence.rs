@@ -1319,6 +1319,58 @@ pub struct LibsqlStore {
     path: PathBuf,
 }
 
+/// Reject insecure remote libSQL/Turso URLs before creating a connection.
+///
+/// This is an ingress-scheme guard only. It does not repair vulnerabilities in
+/// the legacy libsql/rustls dependency chain, nor does it validate a redirect
+/// policy outside this constructor.
+#[cfg(feature = "sqlite")]
+fn validate_libsql_remote_url(endpoint: &str) -> io::Result<()> {
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "remote libsql endpoint requires an HTTPS or libsql URL with a host and no credentials",
+        )
+    };
+    // Url::parse normalizes leading/trailing whitespace; reject that input
+    // instead of accepting a silently changed authority.
+    if endpoint.trim() != endpoint {
+        return Err(invalid());
+    }
+    let url = url::Url::parse(endpoint).map_err(|_| invalid())?;
+    if !matches!(url.scheme(), "https" | "libsql")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "sqlite", test))]
+mod libsql_remote_url_tests {
+    use super::validate_libsql_remote_url;
+
+    #[test]
+    fn secure_libsql_remote_schemes_are_accepted_without_network_access() {
+        for endpoint in [
+            "https://example.org",
+            "https://example.org:443/path?mode=ro",
+            "libsql://example.org",
+            "https://[::1]:8443",
+        ] {
+            validate_libsql_remote_url(endpoint).expect("secure endpoint should pass validation");
+        }
+    }
+
+    #[test]
+    fn remote_url_fragments_are_rejected() {
+        assert!(validate_libsql_remote_url("https://example.org/#fragment").is_err());
+    }
+}
+
 #[cfg(feature = "sqlite")]
 impl LibsqlStore {
     /// Open (or create) a local file database with the default
@@ -1370,6 +1422,9 @@ impl LibsqlStore {
     /// skipped: a Turso server manages its own journal and durability
     /// policy.
     pub fn new_remote(url: &str, auth_token: &str) -> io::Result<Self> {
+        // libsql's hyper-rustls connector also supports plaintext HTTP.
+        // Never send the bearer token to a cleartext or ambiguous endpoint.
+        validate_libsql_remote_url(url)?;
         let rt =
             tokio::runtime::Runtime::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let db = rt.block_on(async {
