@@ -1,4 +1,8 @@
 # Nulang Changelog
+### ARM64 release runner stability — 2026-11-09
+- **Pin the Linux ARM64 cross-compilation rehearsal to Ubuntu 24.04** while GitHub's `ubuntu-latest` rolls to 26.04. The 26.04 multiarchitecture setup attempted 38 package downgrades when installing `libssl-dev:arm64` and the cross-toolchain, aborting before any Rust build. Leave the other release matrix targets untouched and assert this policy in the release-preflight regression test.
+- **This is a runner provisioning correction, not proof of successful cross-compilation.** Retain draft status until the exact-head ARM64 release job completes successfully.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.

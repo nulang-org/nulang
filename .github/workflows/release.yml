@@ -75,7 +75,10 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: nulang-linux-x86_64
-          - os: ubuntu-latest
+          # Pin the multiarch apt cross-toolchain: ubuntu-latest moved to 26.04
+          # and its amd64/arm64 package candidates attempted 38 downgrades.
+          # Revisit after the 26.04 ports mirrors and packages are aligned.
+          - os: ubuntu-24.04
             target: aarch64-unknown-linux-gnu
             artifact: nulang-linux-aarch64
           - os: macos-latest

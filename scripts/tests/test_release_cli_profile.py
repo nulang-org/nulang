@@ -49,6 +49,23 @@ class ReleaseCliProfileTests(unittest.TestCase):
         )
 
 
+    def test_linux_arm64_cross_package_install_uses_pinned_ubuntu_lts(self):
+        """A multiarch apt install must not inherit ubuntu-latest OS migrations."""
+        workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        matrix = workflow.split("        include:\n", 1)[1].split(
+            "    permissions:\n", 1
+        )[0]
+        arm64_entry = next(
+            entry
+            for entry in matrix.split("          - os: ")
+            if "target: aarch64-unknown-linux-gnu" in entry
+        )
+        self.assertTrue(
+            arm64_entry.startswith("ubuntu-24.04\n"),
+            "pin the Linux ARM64 cross-toolchain job to ubuntu-24.04; "
+            "ubuntu-latest now migrates to 26.04 and mixes ports/amd64 apt versions",
+        )
+
     def test_linux_arm64_release_installs_libc_headers_and_probes_cross_compiler(self):
         """Cross GCC must find target stdint.h before the costly Rust build."""
         workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
