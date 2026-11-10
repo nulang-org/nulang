@@ -60,3 +60,20 @@ upgrades or whose vulnerable APIs are not used by the current implementation.
 Those suppressions are accepted risks, not a claim that the dependency graph is
 advisory-free. Release decisions should review that file and the relevant
 reachable feature paths.
+
+As of the 2026-11-09 dependency-refresh branch, `cargo audit` still fails on
+two **unignored** advisories:
+
+- `RUSTSEC-2026-0382` in `rustls-webpki 0.102.8`, inherited through
+  `libsql 0.10.0-pre.4 → hyper-rustls 0.25 → rustls 0.22.4`. The maintained
+  `rustls-webpki 0.103.x` branch has been patched, but fixing the legacy
+  chain requires an upstream libsql/TLS migration or removal of that path.
+- `RUSTSEC-2026-0459` in `libsqlite3-sys 0.30.1`, inherited through
+  `nulang-ai-local → rusqlite 0.32.1`. A straightforward move to bundled
+  rusqlite 0.41.1 failed the full-feature CI linker: its embedded SQLite
+  conflicts with the separately bundled SQLite in `libsql-ffi`. Resolve the
+  duplicate-symbol linkage and verify all release targets before upgrading.
+
+Neither finding is suppressed to make CI green. Before enabling remote libsql
+connections in security-sensitive production deployments, resolve and verify
+the remaining TLS certificate-validation risk.
