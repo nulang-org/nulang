@@ -52,6 +52,14 @@ security guarantee merely because they compile or have conformance coverage.
 See `docs/threat-model.md` for the current threat model and feature-specific
 limits.
 
+Raw tagged values from C, native FFI, and WASM cannot establish host authority
+or ownership merely by encoding a matching tag. The untrusted `Value` decoder
+rejects pointer, actor, closure, and shared-object tags; trusted runtime-created
+values remain supported. External callers needing to retain actor or object
+handles should use a dedicated validated handle registry, not reinterpret raw
+bits as authorized live references. Interned-string IDs remain context-local
+and should not be treated as portable global identities.
+
 ## Dependency advisories
 
 CI runs `cargo audit`, but `.cargo/audit.toml` contains narrowly documented
