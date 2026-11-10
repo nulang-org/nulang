@@ -4219,6 +4219,22 @@ mod libsql_atomic_transition_tests {
     }
 
     #[test]
+    fn local_sqlite_provider_uses_patched_wal_engine() {
+        let store = LibsqlStore::in_memory().expect("SQLite opens");
+        let rows = store
+            .query("SELECT sqlite_version()", &[])
+            .expect("SQLite version");
+        let version: String = serde_json::from_str::<Vec<String>>(&rows[0])
+            .expect("version query returns a JSON row")[0]
+            .clone();
+        let numbers: Vec<u32> = version.split('.').map(|v| v.parse().unwrap()).collect();
+        assert!(
+            numbers.as_slice() >= &[3, 54, 0],
+            "outdated local SQLite provider: {version}"
+        );
+    }
+
+    #[test]
     fn libsql_atomic_transition_commits_all_components() {
         let mut store = LibsqlStore::in_memory().unwrap();
         let committed = store.commit_transition(transition(42, 1, 1)).unwrap();
