@@ -42,6 +42,7 @@ pub fn validate_parallel_branches(
         .collect();
 
     for branch in &summaries {
+        let diagnostic_span = branch_error_span(exprs.get(branch.index as usize), span);
         if !branch.control_escapes.is_empty() {
             return Err(par_error(
                 format!(
@@ -54,7 +55,7 @@ pub fn validate_parallel_branches(
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
-                span,
+                diagnostic_span,
             ));
         }
         if branch.uses_defer {
@@ -63,7 +64,7 @@ pub fn validate_parallel_branches(
                     "par branch {} uses defer/errdefer; concurrent cleanup ordering is not defined yet",
                     branch.index
                 ),
-                span,
+                diagnostic_span,
             ));
         }
         if !branch.state_writes.is_empty() {
@@ -78,7 +79,7 @@ pub fn validate_parallel_branches(
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
-                span,
+                diagnostic_span,
             ));
         }
     }
@@ -91,13 +92,21 @@ pub fn validate_parallel_branches(
                         "par branches {} and {} are not independent: {} '{}'",
                         summaries[i].index, summaries[j].index, kind, name
                     ),
-                    span,
+                    branch_error_span(exprs.get(summaries[j].index as usize), span),
                 ));
             }
         }
     }
 
     Ok(summaries)
+}
+
+/// Point the error at the offending branch rather than the whole `par`.
+/// Synthetic/zero-width expressions retain the enclosing span as fallback.
+fn branch_error_span(expr: Option<&Expr>, enclosing: Span) -> Span {
+    expr.map(Expr::span)
+        .filter(|candidate| candidate.start < candidate.end)
+        .unwrap_or(enclosing)
 }
 
 pub fn summarize_branch(index: u32, expr: &Expr) -> ParallelBranchSummary {
@@ -568,6 +577,71 @@ mod tests {
 
     fn int(n: i64) -> Expr {
         Expr::Literal(Literal::Int(n), sp())
+    }
+
+    #[test]
+    fn actor_state_violation_highlights_the_mutating_branch() {
+        let bad_span = Span::new(25, 46);
+        let branches = vec![
+            int(1),
+            Expr::Assign {
+                target: Box::new(Expr::FieldAccess {
+                    expr: Box::new(Expr::SelfRef(sp())),
+                    field: "items".to_string(),
+                    span: sp(),
+                }),
+                value: Box::new(int(2)),
+                span: bad_span,
+            },
+        ];
+        let err = validate_parallel_branches(&branches, Span::new(0, 80)).unwrap_err();
+        match err {
+            NuError::TypeError { span, .. } => assert_eq!(span, bad_span),
+            other => panic!("expected ownership error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn dependency_violation_highlights_the_conflicting_branch() {
+        let conflicting_span = Span::new(38, 39);
+        let branches = vec![
+            Expr::Assign {
+                target: Box::new(var("shared")),
+                value: Box::new(int(1)),
+                span: Span::new(9, 27),
+            },
+            Expr::Var("shared".to_string(), conflicting_span),
+        ];
+        let err = validate_parallel_branches(&branches, Span::new(0, 80)).unwrap_err();
+        match err {
+            NuError::TypeError { span, .. } => assert_eq!(span, conflicting_span),
+            other => panic!("expected ownership error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn control_flow_violation_highlights_the_escaping_branch() {
+        let escaping_span = Span::new(14, 22);
+        let err = validate_parallel_branches(
+            &[int(1), Expr::Return(None, escaping_span)],
+            Span::new(0, 70),
+        )
+        .unwrap_err();
+        match err {
+            NuError::TypeError { span, .. } => assert_eq!(span, escaping_span),
+            other => panic!("expected control-flow error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn synthetic_branch_uses_enclosing_parallel_span() {
+        let par_span = Span::new(3, 45);
+        let err = validate_parallel_branches(&[Expr::Return(None, Span::default())], par_span)
+            .unwrap_err();
+        match err {
+            NuError::TypeError { span, .. } => assert_eq!(span, par_span),
+            other => panic!("expected control-flow error, got {other}"),
+        }
     }
 
     #[test]
