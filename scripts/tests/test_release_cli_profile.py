@@ -49,6 +49,22 @@ class ReleaseCliProfileTests(unittest.TestCase):
         )
 
 
+    def test_arm64_release_runner_is_pinned_to_stable_multiarch_image(self):
+        """Do not silently migrate the cross-toolchain to unqualified ubuntu-latest."""
+        import re
+
+        workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        match = re.search(
+            r"(?m)^\s+- os: (\S+)\n\s+target: aarch64-unknown-linux-gnu$",
+            workflow,
+        )
+        self.assertIsNotNone(match, "aarch64 Linux release matrix entry missing")
+        self.assertEqual(
+            match.group(1),
+            "ubuntu-24.04",
+            "multiarch packages must be validated before moving the release runner",
+        )
+
     def test_linux_arm64_release_installs_libc_headers_and_probes_cross_compiler(self):
         """Cross GCC must find target stdint.h before the costly Rust build."""
         workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
