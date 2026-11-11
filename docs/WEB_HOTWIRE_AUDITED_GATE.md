@@ -56,6 +56,23 @@ cargo fmt --check
 cargo audit
 ```
 
+The isolated browser regression exercises the actual guarded WebDevServer
+with the official Turbo client (pinned to 8.0.23) and Chromium/Playwright:
+
+```bash
+npm ci --prefix scripts/tests/hotwire-browser
+scripts/tests/hotwire-browser/node_modules/.bin/playwright install chromium
+cargo build --locked --no-default-features --example web_hotwire_browser_test_server
+node scripts/tests/web_hotwire_browser_e2e.cjs
+```
+
+The dedicated `Hotwire browser acceptance` workflow runs that regression
+on changes to the relevant Web files. Dependencies live only in
+`scripts/tests/hotwire-browser`, not Nulang's product runtime. Tests cover
+same-origin POST create/update/delete, Frame navigation, hostile HTML
+escaping, origin/CSRF refusals and a no-JavaScript navigation fallback.
+This is **not** a substitute for authenticated tenant/stream testing.
+
 The audit **currently fails** on this parent lockfile with
 `RUSTSEC-2026-0459`: `nulang-ai-local → rusqlite 0.32.1 →
 libsqlite3-sys 0.30.1`. This is not caused by Hotwire, but is a genuine
