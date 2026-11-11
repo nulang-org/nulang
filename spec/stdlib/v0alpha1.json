@@ -20,7 +20,7 @@
       "import": "stdlib::bytes",
       "source": "src/stdlib/bytes.nula",
       "stability": "experimental",
-      "description": "Bounded in-memory binary readers and writers with explicit Result errors."
+      "description": "Bounded in-memory binary readers, writers, and atomic copies with explicit Result errors."
     },
     {
       "name": "list",

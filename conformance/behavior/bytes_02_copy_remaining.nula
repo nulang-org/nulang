@@ -1,0 +1,59 @@
+// Copy from a validated in-memory reader into a bounded writer atomically.
+import stdlib::bytes
+
+fn main() {
+    let source = match new_reader([0, 127, 255], 3) {
+        Ok(r) => r,
+        Error(_) => {bytes: [], offset: 0},
+    };
+    let first = match read_chunk(source, 1) {
+        Ok(part) => part,
+        Error(_) => {bytes: [], reader: source, eof: false},
+    };
+    let writer = match new_writer(3) {
+        Ok(w) => w,
+        Error(_) => {bytes: [], limit: 0},
+    };
+    let prefix = match write_chunk(writer, [42]) {
+        Ok(w) => w,
+        Error(_) => writer,
+    };
+    match copy_remaining(first.reader, prefix) {
+        Ok(done) => {
+            perform IO.print("copy_count=" + perform Int.to_string(done.copied));
+            perform IO.print("copy_payload=" + perform Int.to_string(done.writer.bytes[0]) + ","
+                + perform Int.to_string(done.writer.bytes[1]) + ","
+                + perform Int.to_string(done.writer.bytes[2]));
+            perform IO.print("copy_eof=" + (if done.reader.offset == 3 then "true" else "false"));
+            perform IO.print("copy_preserves_source=" + (if perform Array.length(prefix.bytes) == 1 then "true" else "false"))
+        },
+        Error(_) => perform IO.print("copy=unexpected-error"),
+    };
+    match copy_remaining(first.reader, {bytes: [42], limit: 2}) {
+        Error(LimitExceeded) => perform IO.print("over_capacity=ok"),
+        _ => perform IO.print("over_capacity=unexpected"),
+    };
+    match copy_remaining({bytes: [1], offset: 2}, {bytes: [], limit: 1}) {
+        Error(InvalidState) => perform IO.print("invalid_reader=ok"),
+        _ => perform IO.print("invalid_reader=unexpected"),
+    };
+    match copy_remaining({bytes: [1], offset: 0}, {bytes: [2, 3], limit: 1}) {
+        Error(InvalidState) => perform IO.print("invalid_writer=ok"),
+        _ => perform IO.print("invalid_writer=unexpected"),
+    };
+    match copy_remaining({bytes: [0, 300], offset: 1}, {bytes: [], limit: 2}) {
+        Error(InvalidByte(300)) => perform IO.print("invalid_read_byte=ok"),
+        _ => perform IO.print("invalid_read_byte=unexpected"),
+    };
+    match copy_remaining({bytes: [], offset: 0}, {bytes: [999], limit: 1}) {
+        Error(InvalidByte(999)) => perform IO.print("invalid_writer_byte=ok"),
+        _ => perform IO.print("invalid_writer_byte=unexpected"),
+    };
+    match copy_remaining({bytes: [], offset: 0}, {bytes: [], limit: 0}) {
+        Ok(done) => {
+            perform IO.print("empty_count=" + perform Int.to_string(done.copied));
+            perform IO.print("empty_eof=" + (if done.reader.offset == 0 then "true" else "false"))
+        },
+        Error(_) => perform IO.print("empty=unexpected"),
+    }
+}

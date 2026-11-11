@@ -25,7 +25,7 @@ pub const STDLIB_MODULES: &[StdlibModule] = &[
         import_path: "stdlib::bytes",
         source_path: "src/stdlib/bytes.nula",
         stability: StabilityTier::Experimental,
-        description: "Bounded in-memory binary readers and writers with explicit Result errors.",
+        description: "Bounded in-memory binary readers, writers, and atomic copies with explicit Result errors.",
         package_mirror: None,
     },
     StdlibModule {

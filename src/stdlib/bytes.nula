@@ -65,5 +65,36 @@ pub fn write_chunk(writer: ByteWriter, chunk: [Int]) -> Result[ByteWriter, ByteI
     Ok({bytes: output, limit: writer.limit})
 }
 
+
+/// Transfer all unread bytes to a bounded writer, preserving caller values.
+///
+/// This is a pure, all-or-nothing in-memory adapter, NOT a file/socket stream.
+/// On error, the input reader and writer are unchanged (value semantics).
+/// Rejects insufficient writer capacity before copying or allocating data.
+/// The returned reader is advanced to EOF, and copied counts appended bytes.
+pub type ByteCopy = {reader: ByteReader, writer: ByteWriter, copied: Int}
+
+pub fn copy_remaining(reader: ByteReader, writer: ByteWriter) -> Result[ByteCopy, ByteIoError] {
+    let total = perform Array.length(reader.bytes);
+    let used = perform Array.length(writer.bytes);
+    if reader.offset < 0 || reader.offset > total then {
+        return Error(InvalidState)
+    } else {};
+    if writer.limit < 0 || used > writer.limit then {
+        return Error(InvalidState)
+    } else {};
+    let remaining = total - reader.offset;
+    if remaining > writer.limit - used then {
+        return Error(LimitExceeded)
+    } else {};
+    match read_chunk(reader, remaining) {
+        Error(e) => Error(e),
+        Ok(part) => match write_chunk(writer, part.bytes) {
+            Error(e) => Error(e),
+            Ok(next) => Ok({reader: part.reader, writer: next, copied: remaining}),
+        },
+    }
+}
+
 /// Obtain bytes in writer order; never interprets them as UTF-8 text.
 pub fn to_bytes(writer: ByteWriter) -> [Int] { writer.bytes }

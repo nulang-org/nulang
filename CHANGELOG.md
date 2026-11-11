@@ -1,4 +1,9 @@
 # Nulang Changelog
+
+### Bounded in-memory byte copying — 2026-11-10
+- **The experimental `stdlib::bytes` adds `copy_remaining(reader, writer)`**, transferring unread bytes into a capacity-bounded writer and returning an advanced reader plus the number of copied bytes. It validates malformed reader/writer states and values, fails without returning a mutated writer when capacity is insufficient, and preserves inputs through immutable value semantics.
+- **This is not OS or network streaming.** Buffers are backed by `[Int]`, so the helper is a reference composition primitive, not a zero-copy, packed-byte, or high-throughput promise. The behavior is pinned in conformance fixtures.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.

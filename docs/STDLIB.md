@@ -78,6 +78,29 @@ let r = sqrt(25.0)       // ~5.0
 
 ---
 
+## Module: bytes (Experimental)
+
+`stdlib::bytes` provides bounded, immutable in-memory readers and writers over
+arrays of integer bytes (`0..255`). These are **not** packed-byte or file/socket
+stream implementations. Every constructor validates its data; the read/write
+operations reject malformed state with typed `ByteIoError` results.
+
+| Function | Contract |
+|---|---|
+| `new_reader(bytes, max_bytes)` | Validate and create a bounded byte reader. |
+| `read_chunk(reader, n)` | Return up to `n` bytes, an advanced reader, and EOF state. |
+| `new_writer(max_bytes)` | Create a capacity-bounded byte writer. |
+| `write_chunk(writer, bytes)` | Append all bytes or fail without changing the input value. |
+| `copy_remaining(reader, writer)` | Copy all unread bytes atomically into the writer, returning `{reader, writer, copied}` or a typed error. |
+| `to_bytes(writer)` | Return the writer's byte array without text decoding. |
+
+`copy_remaining` checks destination capacity before copying; it never returns a
+partially updated writer on failure. The current `[Int]` representation and
+immutable updates can incur allocations, so this is a reference composability
+API rather than a high-throughput/zero-copy transport implementation.
+
+---
+
 ## Module: list
 
 List/array operations over native arrays. Functions fall into two categories:
