@@ -38,18 +38,45 @@ request_url(req)
 | `url_encode(s)` | percent-encode (space becomes `+`) |
 | `build_query(params)` | `k1=v1&k2=v2` from `(key, value)` pairs |
 
-### Sending (requires a runtime host)
+### Sending
+
+The experimental Http.request operation is available in native builds with
+the `ureq` Cargo feature (included in the full/default build). The package
+serializes headers using the standard JSON encoder before invoking that
+effect, so headers are **actually transmitted**.
 
 ```nulang
-let body = send_request(req)   // performs Http.get / Http.post
+let req = with_header("Authorization", "Bearer example-token",
+          get_request("https://api.example.com", "/health"))
+let raw = send_response(req)  // JSON string: {status, ok, headers, body}
+let body = send_request(req)   // body-only compatibility shortcut
 ```
 
-`send_request` uses the built-in `Http` effect and is only available under a
-runtime host, not the standalone VM — the package tests therefore cover
-only the pure builder and encoding parts.
+Each call above performs **its own HTTP request**; choose one or the other.
+Do not call both on a non-idempotent operation.
+
+- `send_response` preserves status (including 4xx/5xx), headers, and
+  UTF-8 response body. `send_request` returns `nil` on non-2xx status to
+  preserve the legacy body-only behavior. Both functions return `nil` for invalid requests,
+  transport failures, binary responses, or body-size limits.
+- Supported methods: GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS.
+- No automatic redirects or retries, including on requests carrying credentials.
+- Header name/value validation rejects control characters, duplicates, and
+  transport-managed fields such as Host or Content-Length.
+- Each request has a 15-second timeout and 4 MiB request/response text limit.
+- The base builder's URL encoder currently handles ASCII reliably; **non-ASCII
+  query values should be percent-encoded by a Unicode-aware caller** pending a
+  dedicated UTF-8 encoding fix. Existing `Http.get` / `Http.post` retain their old semantics.
+- No streaming, multipart uploads, cancellation or user-configurable timeouts
+  in this first iteration. Those need an expanded typed request contract.
 
 ## Tests
 
 ```bash
+cargo test --locked --features ureq --test http_outbound_request
 nula test
 ```
+
+The Rust tests use loopback HTTP servers to assert that authorization and
+custom headers cross the wire and that response status, redirect policy and
+request validation match the contract. They do not require public internet.

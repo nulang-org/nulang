@@ -1547,6 +1547,52 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
         }
         if effect_name == "Http" {
             match op_name {
+                Some("request") => {
+                    // Experimental structured HTTP operation:
+                    // Http.request(method, url, headers_json, body).
+                    // A successful *HTTP* response is JSON (including non-2xx);
+                    // transport/validation failures return nil. No retries or redirects.
+                    let arg =
+                        |idx: usize| regs.get(idx).map(|v| resolve_value_string(constants, *v));
+                    let (Some(method), Some(url), Some(headers), Some(body)) =
+                        (arg(0), arg(1), arg(2), arg(3))
+                    else {
+                        return Some(Value::nil());
+                    };
+                    #[cfg(feature = "ureq")]
+                    {
+                        let data = match crate::http_outbound::request_text(
+                            &method, &url, &headers, &body,
+                        ) {
+                            Ok(data) => data,
+                            Err(_) => return Some(Value::nil()),
+                        };
+                        let bytes = data.into_bytes();
+                        return Some(
+                            match self.heap.alloc(bytes.len() + 1, HeapTypeTag::String) {
+                                Some(ptr) => {
+                                    unsafe {
+                                        std::ptr::copy_nonoverlapping(
+                                            bytes.as_ptr(),
+                                            ptr,
+                                            bytes.len(),
+                                        );
+                                        *ptr.add(bytes.len()) = 0;
+                                        // SAFETY: ptr is allocated from this VM-owned heap and
+                                        // remains live for the resulting Value's lifetime.
+                                        Value::ptr(ptr)
+                                    }
+                                }
+                                None => Value::nil(),
+                            },
+                        );
+                    }
+                    #[cfg(not(feature = "ureq"))]
+                    {
+                        let _ = (method, url, headers, body);
+                        return Some(Value::nil());
+                    }
+                }
                 Some("get") => {
                     let url = regs
                         .first()
@@ -8488,6 +8534,43 @@ mod vm_tests {
             result.unwrap().is_nil(),
             "Http.post on non-connectable port should return nil"
         );
+    }
+
+    /// The experimental four-argument request must dispatch through the same
+    /// standalone VM path as Http.get/post (and fail closed on invalid inputs).
+    #[cfg(feature = "ureq")]
+    #[test]
+    fn test_standalone_http_request_dispatches_without_unhandled_effect() {
+        let mut module = CodeModule::new("test_http_request");
+        let indices = [
+            module.add_constant(Constant::String("TRACE".to_string())),
+            module.add_constant(Constant::String("http://127.0.0.1:1/".to_string())),
+            module.add_constant(Constant::String("[]".to_string())),
+            module.add_constant(Constant::String(String::new())),
+        ];
+        let effect = module.add_constant(Constant::String("Http.request".to_string()));
+        for (register, index) in indices.iter().enumerate() {
+            module.emit(Instruction::new3(
+                OpCode::ConstU,
+                ((*index >> 8) & 0xFF) as u8,
+                (*index & 0xFF) as u8,
+                register as u8,
+            ));
+        }
+        module.emit(Instruction::new3(
+            OpCode::Perform,
+            ((effect >> 8) & 0xFF) as u8,
+            (effect & 0xFF) as u8,
+            4,
+        ));
+        module.emit(Instruction::new2(OpCode::Move, 4, 0));
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
+        let mut vm = VM::new();
+        vm.load_module(module);
+        vm.set_actor_callbacks(Box::new(StandaloneVmCallbacks::new()));
+        let result = vm.run().expect("Http.request must be a handled effect");
+        assert!(result.is_nil(), "unsupported TRACE must fail closed");
     }
 
     /// Regression: effect dispatch must match on the (effect, op) pair —
