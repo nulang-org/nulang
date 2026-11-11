@@ -370,10 +370,13 @@ fn rejected_html_in_path_bound_handler_is_execution_error_not_rendered_nil() {
 fn turbo_stream_web_effect_sets_mime_and_preserves_escaped_html_over_http() {
     let server = WebDevServer::bind(0, None, None, vec![turbo_route(), legacy_route()])
         .expect("bind Turbo WebDevServer");
-    let stream_response = send_raw_request(
-        server.port,
-        "POST /todos HTTP/1.1\r\nHost: localhost\r\nAccept: text/vnd.turbo-stream.html\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    // The audited Web ingress requires an exact loopback Host and matching
+    // Origin for every browser mutation, including Turbo form submissions.
+    let host = format!("localhost:{}", server.port);
+    let stream_request = format!(
+        "POST /todos HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nAccept: text/vnd.turbo-stream.html\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
+    let stream_response = send_raw_request(server.port, &stream_request);
     assert!(
         stream_response.starts_with("HTTP/1.1 200 OK\r\n"),
         "{stream_response}"
@@ -388,6 +391,40 @@ fn turbo_stream_web_effect_sets_mime_and_preserves_escaped_html_over_http() {
         response_body(&stream_response),
         "<turbo-stream action=\"append\" target=\"todos\"><template>Tea &amp; toast &lt;/template&gt;&lt;script&gt;alert(1)&lt;/script&gt;</template></turbo-stream>"
     );
+
+    // A valid Turbo response must not become a bypass for origin checks.
+    for request in [
+        format!(
+            "POST /todos HTTP/1.1\r\nHost: {host}\r\nAccept: text/vnd.turbo-stream.html\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ),
+        format!(
+            "POST /todos HTTP/1.1\r\nHost: {host}\r\nOrigin: https://attacker.example\r\nAccept: text/vnd.turbo-stream.html\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ),
+        format!(
+            "POST /todos HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nSec-Fetch-Site: cross-site\r\nAccept: text/vnd.turbo-stream.html\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ),
+    ] {
+        let forbidden = send_raw_request(server.port, &request);
+        assert!(
+            forbidden.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+            "{forbidden}"
+        );
+        assert!(!forbidden.contains("<turbo-stream"), "{forbidden}");
+        assert!(!forbidden.contains("text/vnd.turbo-stream.html"), "{forbidden}");
+    }
+
+    // A nominal session cookie is not a CSRF bypass: an absent/unknown
+    // synchronizer token must be rejected before Turbo handler execution.
+    let fake_session = "a".repeat(64);
+    let forged_session_request = format!(
+        "POST /todos HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nCookie: nulang_session={fake_session}\r\nAccept: text/vnd.turbo-stream.html\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    let denied_session = send_raw_request(server.port, &forged_session_request);
+    assert!(
+        denied_session.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+        "{denied_session}"
+    );
+    assert!(!denied_session.contains("<turbo-stream"));
 
     let html_response = send_raw_request(
         server.port,
