@@ -1,0 +1,36 @@
+// Standard Hotwire Turbo Frames markup generated through Nulang's existing
+// escaped Html renderer. Use the official Turbo browser runtime for navigation.
+// Import: import stdlib::web::frames
+import stdlib::web::types
+
+/// Wrap server-rendered HTML in an independently navigable Turbo Frame.
+/// The id should be stable and unique within the page.
+pub fn frame(id: String, children: [Html]) -> Html ! {Web, Render} {
+    perform Web.html("turbo-frame", [("id", perform Web.text(id))], children)
+}
+
+/// Defer loading a frame until it becomes visible in the browser.
+/// The existing host HTML serializer validates the src URL scheme.
+pub fn lazy_frame(id: String, src: String) -> Html ! {Web, Render} {
+    perform Web.html("turbo-frame", [
+        ("id", perform Web.text(id)),
+        ("src", perform Web.text(src)),
+        ("loading", perform Web.text("lazy"))
+    ], [])
+}
+
+/// Request a frame immediately; Turbo does this eagerly by default.
+pub fn eager_frame(id: String, src: String) -> Html ! {Web, Render} {
+    perform Web.html("turbo-frame", [
+        ("id", perform Web.text(id)),
+        ("src", perform Web.text(src))
+    ], [])
+}
+
+/// Control where links inside a frame navigate (for example "_top").
+pub fn targeted_frame(id: String, target: String, children: [Html]) -> Html ! {Web, Render} {
+    perform Web.html("turbo-frame", [
+        ("id", perform Web.text(id)),
+        ("target", perform Web.text(target))
+    ], children)
+}
