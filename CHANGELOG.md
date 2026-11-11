@@ -1,4 +1,8 @@
 # Nulang Changelog
+### NUL0 TCP partial-frame recovery across read timeouts — 2026-11-10
+- **Preserve bytes already consumed from NUL0 frame prefixes and payloads when socket reads return `WouldBlock`, `TimedOut`, or `Interrupted`.** Retry from the unconsumed offset rather than restarting `read_exact` with a fresh buffer, preventing frame misalignment and lost actor packets.
+- **Cover fragmented reads, shutdown and premature EOF with deterministic regressions.** Existing maximum-frame-size limits and transport failure semantics are retained. The intermittent five-node post-heal delivery problem still requires separate qualification; this change does not establish that it is fully resolved.
+
 ### Five-node split-brain post-heal readiness regression — 2026-11-09
 - **The five-node TCP cluster chaos test now waits for healthy peer statuses as well as active-view convergence after a healed network partition.** The address resolver refuses one-shot sends when peers still have `Suspect` or `Failed` status; merely appearing in the active view is not sufficient to establish post-heal send readiness.
 - **Tighten diagnostics before cross-boundary delivery.** The test asserts A/E agree they are healthy, then preserves the original one-shot send and delivery assertion; no runtime transport/retry semantics are changed.
