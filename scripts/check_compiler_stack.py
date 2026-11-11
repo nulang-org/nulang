@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = (
     "spill_03_wide_spill_correct_sum.nula",
     "spill_04_nested_lets_correct_sum.nula",
+    "spill_05_large_function_compiler_stack_overflow.nula",
 )
 STACK_BYTES = 8 * 1024 * 1024
 
