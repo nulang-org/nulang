@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os, subprocess, json, sys
+from fixture_options import build_command
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)) + "/..")
 subprocess.run(["cargo", "build", "--quiet"], check=True)
@@ -24,7 +25,9 @@ for file in os.listdir("conformance/behavior"):
     with open(json_path) as f:
         expected = json.load(f)
         
-    res = subprocess.run([nulang_bin, nula_path], capture_output=True, text=True)
+    # Default is no grants. Only checked-in fixtures with explicit, allowlisted
+    # capabilities receive narrowly scoped --with values.
+    res = subprocess.run(build_command(nulang_bin, nula_path, expected), capture_output=True, text=True)
     out = res.stdout.strip()
     err = res.stderr.strip()
     code = res.returncode

@@ -1,20 +1,24 @@
 // Nulang standard library — HTTP client via built-in Http effect.
 // Import: `import stdlib::http`
 //
-// The `Http` effect is wired into both the standalone VM and the runtime host.
-// Operations: `perform Http.get(url)` and `perform Http.post(url, body)`.
+// The raw `Http` effect remains backwards-compatible and returns `nil` on
+// request failure. These wrappers convert that convention into typed `Result`
+// values without introducing a second HTTP executor.
 
-/// Error type for HTTP operations.
-pub type HttpError = Timeout | ConnectionRefused | BadStatus(Int) | Other(String)
+/// HTTP error surfaced by the stdlib wrappers.
+///
+/// The raw Http effect currently erases transport/status details, so the
+/// wrapper records which operation failed and the target URL.
+pub type HttpError = GetFailed(String) | PostFailed(String)
 
-/// Perform an HTTP GET request. Returns the response body as a String.
-/// Requires the runtime host (not available in standalone VM).
-pub fn get(url: String) -> String ! {Http} {
-    perform Http.get(url)
+/// Perform an HTTP GET request.
+pub fn get(url: String) -> Result[String, HttpError] ! {Http} {
+    let value = perform Http.get(url);
+    if value == nil then Error(GetFailed(url)) else Ok(value)
 }
 
-/// Perform an HTTP POST request with a body. Returns the response body as a String.
-/// Requires the runtime host (not available in standalone VM).
-pub fn post(url: String, body: String) -> String ! {Http} {
-    perform Http.post(url, body)
+/// Perform an HTTP POST request with a body.
+pub fn post(url: String, body: String) -> Result[String, HttpError] ! {Http} {
+    let value = perform Http.post(url, body);
+    if value == nil then Error(PostFailed(url)) else Ok(value)
 }

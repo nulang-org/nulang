@@ -1,0 +1,15 @@
+// stdlib::http — wrappers convert raw nil-on-error effects into Result.
+// Loopback port 1 is intentionally closed on conformance hosts.
+import stdlib::http
+
+fn main() {
+    match get("http://127.0.0.1:1/") {
+        Ok(_) => perform IO.print("get=ok"),
+        Error(_) => perform IO.print("get=error"),
+    }
+
+    match post("http://127.0.0.1:1/", "{}") {
+        Ok(_) => perform IO.print("post=ok"),
+        Error(_) => perform IO.print("post=error"),
+    }
+}
