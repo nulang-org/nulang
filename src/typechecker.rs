@@ -1174,15 +1174,23 @@ impl TypeChecker {
         // before ordinary Algorithm-W inference. Dynamic actor references
         // remain permissive for compatibility; explicit ActorRef<P> values
         // are checked structurally below.
-        let annotated = match crate::actor_protocol::annotate_module(module) {
-            Ok(module) => module,
-            Err(err) if self.collect_errors => {
-                self.collected_errors.push(err);
-                module.clone()
+        // Actor protocol annotation clones and recursively visits the AST.
+        // Avoid that work entirely when the module declares no actor
+        // protocols: deep ordinary let chains must not exhaust the compiler
+        // stack before Algorithm-W inference even starts.
+        let annotated = if crate::actor_protocol::has_actor_protocols(module) {
+            match crate::actor_protocol::annotate_module(module) {
+                Ok(annotated) => Some(annotated),
+                Err(err) if self.collect_errors => {
+                    self.collected_errors.push(err);
+                    None
+                }
+                Err(err) => return Err(err),
             }
-            Err(err) => return Err(err),
+        } else {
+            None
         };
-        let module = &annotated;
+        let module = annotated.as_ref().unwrap_or(module);
 
         self.register_class_decls(module);
         let mut ctx = TypeContext::new();
