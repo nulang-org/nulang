@@ -4,6 +4,7 @@
 //! boundary that serializes a [`RequestDecodeError`] as a problem response when
 //! an HTTP transport chooses to surface the failure to a client.
 
+use crate::web::forms::FormValidationErrors;
 use crate::web::request_bindings::RequestDecodeError;
 
 pub const PROBLEM_JSON_CONTENT_TYPE: &str = "application/problem+json";
@@ -40,6 +41,23 @@ pub fn request_decode_problem_response(error: &RequestDecodeError) -> ProblemHtt
     }
 }
 
+/// Produce the same HTTP Problem Details transport envelope for semantic form
+/// validation errors. Callers opt in explicitly; low-level typed request decode
+/// failures still use their established 400/500 classifications.
+pub fn form_validation_problem_response(errors: &FormValidationErrors) -> ProblemHttpResponse {
+    let body = serde_json::to_vec(&errors.problem_details()).unwrap_or_else(|_| {
+        br#"{"type":"urn:nulang:web:problem-serialization","title":"Internal Server Error","status":500}"#.to_vec()
+    });
+    ProblemHttpResponse {
+        status: 422,
+        headers: vec![(
+            "Content-Type".to_string(),
+            PROBLEM_JSON_CONTENT_TYPE.to_string(),
+        )],
+        body,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -52,7 +70,8 @@ mod tests {
     #[test]
     fn malformed_query_becomes_client_problem_response() {
         let empty = HashMap::new();
-        let query = HashMap::from([("limit".to_string(), "many".to_string())]);
+        let empty_multi = HashMap::<String, Vec<String>>::new();
+        let query = HashMap::from([("limit".to_string(), vec!["many".to_string()])]);
         let headers = Vec::new();
         let values = RequestBindingValues {
             path: &empty,
@@ -60,7 +79,7 @@ mod tests {
             headers: &headers,
             cookies: &empty,
             body: None,
-            form: &empty,
+            form: &empty_multi,
         };
         let binding = RouteBindingContract {
             source: RouteBindingSource::Query,
