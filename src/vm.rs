@@ -3336,6 +3336,8 @@ impl VM {
     /// Returns the value in register 0 of the final frame, or unit if no frame.
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn run(&mut self) -> NuResult<Value> {
+        // Refuse an already-cancelled scope before replacing activation state.
+        self.check_cancellation()?;
         let module_idx = self.modules.len().saturating_sub(1);
         let entry_point = self
             .modules
@@ -3411,6 +3413,9 @@ impl VM {
     /// reuse it; otherwise create a fresh frame. This lets actor behavior
     /// handlers receive their arguments.
     pub fn run_from(&mut self, module_idx: usize, pc: usize) -> NuResult<Value> {
+        // Actor callers can supply an existing frame; cancellation must not
+        // overwrite its PC, module or pending yield state before rejecting.
+        self.check_cancellation()?;
         self.yield_pending = false;
 
         if self.frames.is_empty() {
@@ -3500,6 +3505,7 @@ impl VM {
                 span: Span::default(),
             });
         }
+        self.check_cancellation()?;
         self.yield_pending = false;
         self.frames.clear();
         self.current_frame_idx = Some(0);
@@ -3517,6 +3523,7 @@ impl VM {
     /// Continues from the current frame state (set by `restore_suspended_state`)
     /// until the program halts, yields again, or errors.
     pub fn resume(&mut self) -> NuResult<Value> {
+        self.check_cancellation()?;
         self.yield_pending = false;
         loop {
             self.check_cancellation()?;
