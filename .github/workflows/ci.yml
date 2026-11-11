@@ -163,12 +163,9 @@ jobs:
       - name: Build (public CLI release profile)
         run: cargo build --locked --release --no-default-features --features release-cli --bin nulang
 
-      # Compile the production-profile test harness on main, where the full
-      # optimized suite is release-blocking. On PRs we already run default,
-      # minimal, and WASM tests; building all release test binaries adds ~45 min
-      # despite the actual test execution taking under a minute (Nov 2026 CI).
+      # Keep production-profile regressions merge-blocking on PRs as well as main.
+      # A cache-path correction must not silently reduce test coverage.
       - name: Test (same profile as public release artifacts)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: cargo test --locked --release --no-default-features --features release-cli
 
       # Keep an executable production-profile regression check on every PR.

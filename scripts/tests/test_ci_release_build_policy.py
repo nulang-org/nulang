@@ -20,15 +20,15 @@ class CiReleaseBuildPolicyTests(unittest.TestCase):
         self.assertNotIn("/tmp/cargo-target", self.workflow)
         self.assertIn("      - name: Cache cargo\n        uses: Swatinem/rust-cache@v2", self.release)
 
-    def test_prs_build_and_smoke_test_optimized_cli_without_compiling_release_test_harnesses(self):
+    def test_prs_build_smoke_and_execute_full_optimized_release_tests(self):
         self.assertIn("cargo build --locked --release --no-default-features --features release-cli --bin nulang", self.release)
         self.assertIn("./target/release/nulang --eval", self.release)
         self.assertIn("./target/release/nulang", self.release)
-        self.assertIn("      - name: Test (same profile as public release artifacts)\n        if: github.event_name == 'push' && github.ref == 'refs/heads/main'\n", self.release)
+        self.assertIn("      - name: Test (same profile as public release artifacts)\n        run: cargo test --locked --release --no-default-features --features release-cli\n", self.release)
 
     def test_main_keeps_full_optimized_release_tests(self):
         self.assertIn("        run: cargo test --locked --release --no-default-features --features release-cli", self.release)
-        self.assertIn("        if: github.event_name == 'push' && github.ref == 'refs/heads/main'", self.release)
+        self.assertNotIn("if: github.event_name == 'push' && github.ref == 'refs/heads/main'", self.release)
 
     def test_release_binary_checks_and_artifact_upload_use_same_target(self):
         self.assertIn("bash scripts/check_release_linux.sh target/release/nulang", self.release)
