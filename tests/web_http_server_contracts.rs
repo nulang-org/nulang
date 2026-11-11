@@ -165,3 +165,172 @@ fn legacy_route_still_falls_back_over_real_http() {
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
     assert!(response_body(&response).starts_with("legacy"), "{response}");
 }
+
+fn html_src_route() -> RuntimeWebRoute {
+    let (module, function_index) = compile_handler(
+        r#"fn endpoint(src: String) {
+    perform Web.html("turbo-frame", [
+        ("id", perform Web.text("activities")),
+        ("src", perform Web.text(src))
+    ], [])
+}"#,
+        "endpoint",
+    );
+    let contract_source = r#"
+fn endpoint(src: String from query) {
+    perform Web.html("turbo-frame", [
+        ("id", perform Web.text("activities")),
+        ("src", perform Web.text(src))
+    ], [])
+}
+fn web_main() { perform Web.route("GET", "/frame", endpoint) }
+"#;
+    let tokens = Lexer::new(contract_source).lex().expect("lex contract");
+    let ast = Parser::new(tokens).parse_module().expect("parse contract");
+    let contracts = compile_module_contracts(&ast);
+    assert!(
+        contracts.diagnostics.is_empty(),
+        "{:?}",
+        contracts.diagnostics
+    );
+    let plan = compile_runtime_route_plan(&contracts.routes[0]).expect("compile plan");
+    RuntimeWebRoute {
+        route: WebRoute {
+            method: HttpMethod::Get,
+            path: "/frame".into(),
+            handler_module: module,
+            handler_func_idx: function_index,
+        },
+        plan: Some(plan),
+    }
+}
+
+#[test]
+fn rejected_html_in_legacy_route_is_http_500_not_successful_nil() {
+    let (module, handler_func_idx) = compile_handler(
+        r#"fn invalid() {
+    perform Web.html("turbo-frame", [
+        ("id", perform Web.text("activities")),
+        ("src", perform Web.text("javascript:alert(1)"))
+    ], [])
+}"#,
+        "invalid",
+    );
+    let server = WebDevServer::bind(
+        0,
+        None,
+        None,
+        vec![
+            WebRoute {
+                method: HttpMethod::Get,
+                path: "/invalid".into(),
+                handler_module: module,
+                handler_func_idx,
+            },
+            legacy_route(),
+        ],
+    )
+    .expect("bind");
+    let invalid = send_raw_request(
+        server.port,
+        "GET /invalid HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        invalid.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+        "{invalid}"
+    );
+    assert_eq!(response_body(&invalid), "Internal server error");
+    assert!(!invalid.contains("javascript:alert(1)"));
+
+    let valid = send_raw_request(
+        server.port,
+        "GET /legacy HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(valid.starts_with("HTTP/1.1 200 OK\r\n"), "{valid}");
+    assert!(response_body(&valid).starts_with("legacy"));
+}
+
+#[test]
+fn nil_string_body_is_not_mistaken_for_vm_nil() {
+    let (module, handler_func_idx) =
+        compile_handler(r#"fn literal_nil() -> String { "nil" }"#, "literal_nil");
+    let server = WebDevServer::bind(
+        0,
+        None,
+        None,
+        vec![WebRoute {
+            method: HttpMethod::Get,
+            path: "/literal".into(),
+            handler_module: module,
+            handler_func_idx,
+        }],
+    )
+    .expect("bind");
+    let response = send_raw_request(
+        server.port,
+        "GET /literal HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(response_body(&response).starts_with("nil"), "{response}");
+}
+
+#[test]
+fn rejected_html_in_compiler_bound_route_is_http_500_not_successful_nil() {
+    let server = WebDevServer::bind_runtime(0, None, None, vec![html_src_route()])
+        .expect("bind typed WebDevServer");
+    let invalid = send_raw_request(
+        server.port,
+        "GET /frame?src=javascript%3Aalert%281%29 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        invalid.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+        "{invalid}"
+    );
+    assert_eq!(response_body(&invalid), "Internal server error");
+    assert!(!invalid.contains("javascript:alert(1)"));
+
+    let valid = send_raw_request(
+        server.port,
+        "GET /frame?src=%2Factivities HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(valid.starts_with("HTTP/1.1 200 OK\r\n"), "{valid}");
+    assert!(response_body(&valid).starts_with("<turbo-frame"), "{valid}");
+    assert!(
+        response_body(&valid).contains("src=\"/activities\""),
+        "{valid}"
+    );
+}
+
+#[test]
+fn rejected_html_in_path_bound_handler_is_execution_error_not_rendered_nil() {
+    use nulang::web::bindings::{RouteBindingContract, RouteBindingSource};
+    use nulang::web::runtime_bindings::render_bound_route_handler;
+    use std::collections::HashMap;
+
+    let (module, index) = compile_handler(
+        r#"fn endpoint(src: String) {
+    perform Web.html("turbo-frame", [
+        ("id", perform Web.text("activities")),
+        ("src", perform Web.text(src))
+    ], [])
+}"#,
+        "endpoint",
+    );
+    let binding = RouteBindingContract {
+        source: RouteBindingSource::Path,
+        source_name: "src".into(),
+        handler_param: "src".into(),
+        handler_index: 0,
+        ty: Some("String".into()),
+    };
+    let mut captures = HashMap::new();
+    captures.insert("src".into(), "javascript:alert(1)".into());
+    let error = render_bound_route_handler(&module, index, &[binding.clone()], 1, &captures)
+        .expect_err("a VM nil is not a renderable response");
+    assert!(error.contains("returned nil"), "{error}");
+    captures.insert("src".into(), "/activities".into());
+    let html = render_bound_route_handler(&module, index, &[binding], 1, &captures)
+        .expect("valid Html must render");
+    assert!(html.starts_with("<turbo-frame"), "{html}");
+    assert!(html.contains("src=\"/activities\""), "{html}");
+}
