@@ -230,6 +230,39 @@ It runs the route registrations, renders every route to `dist/<path>/index.html`
 
 For a pure static response without the `app` machinery, `Web.text`/`Web.raw` are enough on their own — any `fn() -> Html` can be rendered by the same pipeline.
 
+## Experimental client-side derived state
+
+The compiler-generated `/app.client.js` runtime exposes a small browser API for
+fine-grained local updates. After hydration, `window.nulang.signal(name)` can read,
+write, or subscribe to a signal already bound by `data-signal` in server-rendered
+HTML. `subscribe(listener)` returns an idempotent unsubscribe function. Assigning
+the same value (according to `Object.is`) does not refresh the DOM or notify
+subscribers.
+
+For values derived from existing signals, `computed(dependencies, calculate)`
+accepts explicit signal-name dependencies and a **synchronous** calculation:
+
+```js
+const count = window.nulang.signal('count');
+const doubled = window.nulang.computed(['count'], value => Number(value) * 2);
+const stop = doubled.subscribe(value => console.log('double:', value));
+
+count.set('3');             // doubled.get() is now 6
+stop();                     // remove this observer
+doubled.dispose();          // detach all source signal subscriptions
+```
+
+Computed values are read-only; `get()` reads the latest calculated value and
+`subscribe()` observes changes. After `dispose()`, the value stays at its last
+calculation and new subscriptions are rejected. The dependency list is copied at
+creation, so changes to the caller's array cannot retarget observers.
+
+This is a **browser-only, experimental** convenience, not a new Nulang language
+primitive or a compiler-generated dependency graph. Derived values do not
+automatically bind to DOM nodes; subscribe and update them explicitly when
+needed. Clean up computations when their associated UI is removed. It does not
+introduce batching, asynchronous computation, or cross-request state.
+
 ## Realtime Broadcast
 
 `Realtime` currently has a single operation:
