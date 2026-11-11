@@ -177,7 +177,6 @@ wasmtime = { version = "48.0.8", optional = true, default-features = false, feat
 wat = { version = "1.254", optional = true }
 blake3 = "1.8"
 rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "ring", "logging"] }
-rustls-pemfile = { version = "2" }
 ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
 hex = "0.4.3"
 rand_core = { version = "0.6.4", features = ["getrandom"] }

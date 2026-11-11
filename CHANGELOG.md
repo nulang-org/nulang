@@ -1,4 +1,8 @@
 # Nulang Changelog
+### TLS PEM parser maintenance — 2026-11-10 (draft)
+- **Replace the unmaintained `rustls-pemfile` crate with `rustls::pki_types::pem::PemObject`.** Preserve certificate chain order, fail-closed parsing of malformed certificate chains, PKCS#8/RSA/EC private-key support, and TLS node identity derivation. Add parser regressions; exact-head multi-platform TLS/release validation remains required.
+- **Security audit visibility:** removes the RUSTSEC-2025-0134 unmaintained-crate warning without adding any audit suppression; the separate memmap2 0.2.3 unsoundness warning remains outstanding.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
