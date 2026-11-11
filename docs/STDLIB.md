@@ -87,7 +87,8 @@ List/array operations over native arrays. Functions fall into two categories:
 
 - **Polymorphic** (no element-type annotation): `length`, `contains`, `index_of`,
   `find`, `any`, `all`, `map`, `filter`, `reverse`, `take`, `drop`,
-  and `range`. These accept arrays of any compatible element type.
+  `range`, `take_while`, `drop_while`, `scan`, and `chunk_every`.
+  These accept arrays of any compatible element type.
 
 ### Traversal functions
 
@@ -114,6 +115,10 @@ List/array operations over native arrays. Functions fall into two categories:
 | `take` | `fn take(n, xs)` | Take first `n` elements. |
 | `drop` | `fn drop(n, xs)` | Drop first `n` elements. |
 | `range` | `fn range(n)` | Array of `[0, 1, ..., n-1]`. |
+| `take_while` | `fn take_while(pred, xs)` | Longest initial prefix satisfying `pred`; stops evaluating it on first failure. |
+| `drop_while` | `fn drop_while(pred, xs)` | Suffix after first predicate failure. |
+| `scan` | `fn scan(f, init, xs)` | Successive accumulators, excluding `init` itself. |
+| `chunk_every` | `fn chunk_every(size: Int, xs) -> Result[[[T]], ChunkError]` | Consecutive non-overlapping chunks, including a partial tail; rejects non-positive sizes. |
 
 ### Usage
 
@@ -136,7 +141,18 @@ let rev     = reverse(xs)        // [5, 4, 3, 2, 1]
 let first3  = take(3, xs)        // [1, 2, 3]
 let rest    = drop(2, xs)        // [3, 4, 5]
 let r       = range(4)           // [0, 1, 2, 3]
+let prefix  = take_while(fn(x) { x < 3 }, xs) // [1, 2]
+let suffix  = drop_while(fn(x) { x < 3 }, xs) // [3, 4, 5]
+let totals  = scan(fn(acc, x) { acc + x }, 0, [1, 2, 3]) // [1, 3, 6]
+let groups  = chunk_every(2, xs) // Ok([[1, 2], [3, 4], [5]])
+let invalid = chunk_every(0, xs) // Error(InvalidChunkSize)
 ```
+
+`chunk_every` is eager and allocates nested arrays. `size` must be positive,
+including for an empty input. For large or unbounded inputs, prefer a bounded
+pull-stream interface once its language and runtime contracts are qualified.
+These functions currently use `Array.push` and do not guarantee zero-copy or
+linear total allocation cost.
 
 Polymorphic functions work with strings, records, and any element type:
 
@@ -182,6 +198,26 @@ fn my_tests() {
 
 ---
 
+## Module: http
+
+The original `get(url)` and `post(url, body)` wrappers preserve their
+legacy string-or-`nil` behavior. For new callers, use the additive
+`try_get` and `try_post` functions, which report failures as
+`Result[String, HttpRequestError]` without inventing transport error kinds.
+
+| Function | Contract |
+|---|---|
+| `get(url)` / `post(url, body)` | Legacy body or `nil` on error |
+| `try_get(url)` | `Result[String, HttpRequestError] ! {Http}` |
+| `try_post(url, body)` | `Result[String, HttpRequestError] ! {Http}` |
+
+`HttpRequestError = GetFailed(url) | PostFailed(url)`. The raw effects
+currently erase details such as timeouts, status codes, and DNS failures;
+the new errors therefore intentionally identify only the operation and URL.
+The preexisting `HttpError` declaration is unchanged for compatibility.
+
+---
+
 ## Module: fs
 
 Filesystem I/O via the built-in `FS` effect. Operations are `perform FS.read`,
@@ -196,6 +232,14 @@ effect.
 | `write` | `fn write(path: String, content: String) -> Unit ! {FS}` | Write a string to a file, overwriting existing content. Creates the file if needed. Returns nil on failure. |
 | `append` | `fn append(path: String, content: String) -> Unit ! {FS}` | Append a string to the end of a file. Creates the file if needed. Returns nil on failure. |
 | `exists` | `fn exists(path: String) -> Bool ! {FS}` | Check whether a file or directory exists at the given path. |
+| `try_read` | `Result[String, FsError] ! {FS}` | Returns `Error(ReadFailed(path))` instead of `nil`. |
+| `try_write` | `Result[Unit, FsError] ! {FS}` | Returns `Error(WriteFailed(path))` instead of `nil`. |
+| `try_append` | `Result[Unit, FsError] ! {FS}` | Returns `Error(AppendFailed(path))` instead of `nil`. |
+
+`FsError` contains the failed operation and path only. The FS host effect
+does not currently expose specific underlying OS errors. The original
+`read`, `write`, `append`, and `exists` functions remain unchanged.
+
 
 ### Usage
 
@@ -243,6 +287,48 @@ let n = negate(true)               // false
 let cl = clamp(15, 0, 10)          // 10
 let b = between(0, 10, 5)          // true
 ```
+
+---
+
+## Module: option
+
+`Option[T] = Some(T) | None` is defined once in the auto-imported prelude.
+`stdlib::option` provides operations on that canonical type.
+
+| Function | Description |
+|---|---|
+| `map(opt, f)` | Transform a present value. |
+| `and_then(opt, f)` | Chain an Option-returning function. |
+| `or_else(opt, f)` | Lazily recover from `None`. |
+| `unwrap_or(opt, default)` | Return the value or an eager default. |
+| `unwrap_or_else(opt, f)` | Return the value or compute a default lazily. |
+| `filter(opt, pred)` | Keep a present value only if it satisfies the predicate. |
+| `ok_or(opt, err)` | Convert to `Result[T, E]`. |
+| `is_some(opt)` / `is_none(opt)` | Test the variant. |
+| `unwrap(opt)` | Legacy aborting unwrap. Prefer total alternatives in portable code. |
+
+---
+
+## Module: result
+
+`Result[T, E] = Ok(T) | Error(E)` is defined once in the auto-imported
+prelude. `stdlib::result` provides operations on that canonical type.
+
+| Function | Description |
+|---|---|
+| `map(r, f)` | Transform a successful value. |
+| `map_err(r, f)` | Transform the error channel. |
+| `and_then(r, f)` | Chain a Result-returning function. |
+| `or_else(r, f)` | Recover from an error, optionally changing its type. |
+| `unwrap_or(r, default)` | Return success or an eager default. |
+| `unwrap_or_else(r, f)` | Return success or compute a fallback from the error. |
+| `to_option(r)` | Discard the error and convert to `Option[T]`. |
+| `is_ok(r)` / `is_err(r)` | Test the variant. |
+| `unwrap(r)` | Legacy aborting unwrap. Prefer total alternatives in portable code. |
+
+Higher-order collection operations such as `map2`, `sequence`, and
+`traverse` remain in the official `result-ext` package rather than growing
+the permanent standard library surface.
 
 ---
 

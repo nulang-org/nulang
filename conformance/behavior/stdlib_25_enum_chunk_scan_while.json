@@ -1,0 +1,1 @@
+{"exit_code": 0, "stdout": "chunks=3\nfirst_len=2\nfirst0=1\nlast_len=1\nlast0=5\nempty_chunks=0\nzero=rejected\nnegative=rejected\nexact=2\ntake_len=2\ntake_last=2\ndrop_len=2\ndrop_first=4\ndrop_after_first_miss=1\ntake_empty=0\ndrop_all=0\ntake_none=0\nscan_len=3\nscan0=9\nscan1=7\nscan2=4\nscan_empty=0", "stderr": ""}

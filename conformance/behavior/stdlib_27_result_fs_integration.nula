@@ -1,0 +1,33 @@
+// Cross-module proof: a fallible FS effect remains a typed Result and
+// composes with pure Result helpers; capabilities remain explicit.
+import stdlib::fs
+import stdlib::result
+
+fn main() {
+    let path = "/tmp/nulang_stdlib_27_result_fs_integration.txt"
+    match try_write(path, "hello") {
+        Ok(_) => perform IO.print("write=ok"),
+        Error(_) => perform IO.print("write=error"),
+    }
+
+    let decorated = map(try_read(path), fn(s) { perform String.concat(s, "!") })
+    match decorated {
+        Ok(s) => perform IO.print("map=" + s),
+        Error(_) => perform IO.print("map=error"),
+    }
+
+    let missing = "/tmp/nulang_stdlib_27_no_such_directory/test.txt"
+    let recovered = unwrap_or(try_read(missing), "fallback")
+    perform IO.print("fallback=" + recovered)
+
+    let identified = map_err(try_read(missing), fn(e) {
+        match e {
+            ReadFailed(_) => "read-failed",
+            _ => "other",
+        }
+    })
+    match identified {
+        Ok(_) => perform IO.print("error=ok"),
+        Error(label) => perform IO.print("error=" + label),
+    }
+}

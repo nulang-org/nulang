@@ -1,0 +1,1 @@
+{"exit_code":0,"stdout":"map=Some(6)\nand_then=Some(4)\nand_then_none=None\nor_else=Some(7)\nfilter_yes=Some(8)\nfilter_no=None\nunwrap_or=11\nunwrap_or_else=12\nok_or_some=Ok(5)\nok_or_none=Error(missing)\nis_some=yes\nis_none=yes","stderr":""}
