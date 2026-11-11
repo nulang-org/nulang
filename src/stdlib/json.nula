@@ -661,6 +661,31 @@ fn strict_value(src: String, start: Int, depth: Int, max_depth: Int) {
     else { strict_failure(p, "unexpected token") }
 }
 
+/// Parse strict JSON with a smaller caller-specified input and nesting budget.
+///
+/// Both limits are capped by parse_strict's existing resource ceilings:
+/// max_bytes must be 1..65536 (UTF-8 byte length) and max_depth 0..64.
+/// The root is depth 0; a zero depth permits scalars and empty containers,
+/// but not values nested inside arrays or objects.
+/// Invalid limits return Error without inspecting the document.
+pub fn parse_strict_limited(json: String, max_bytes: Int, max_depth: Int) -> Result[JsonValue, JsonParseError] {
+    if max_bytes <= 0 || max_bytes > 65536 then {
+        return Error({offset: 0, reason: "invalid max_bytes limit"})
+    } else {};
+    if max_depth < 0 || max_depth > 64 then {
+        return Error({offset: 0, reason: "invalid max_depth limit"})
+    } else {};
+    if perform String.length(json) > max_bytes then {
+        return Error({offset: max_bytes, reason: "input exceeds byte limit"})
+    } else {};
+    let r = strict_value(json, 0, 0, max_depth);
+    if !r.ok then { return Error({offset: r.pos, reason: r.reason}) } else {};
+    let end_pos = strict_space(json, r.pos);
+    if end_pos != perform String.length(json) then {
+        Error({offset: end_pos, reason: "trailing content"})
+    } else { Ok(r.value) }
+}
+
 /// Parse a complete bounded JSON document or return a structured error.
 /// Error offsets are byte offsets. Duplicate object keys are rejected.
 /// Existing parse() remains lenient for backwards compatibility.
