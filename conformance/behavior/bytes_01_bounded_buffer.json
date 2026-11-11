@@ -1,0 +1,1 @@
+{"exit_code": 0, "stdout": "over_limit=ok\nfirst=0,128\nfirst_eof=false\ntail=255\ntail_eof=true\nbad_byte=ok\nbad_length=ok\nbad_limit=ok\ninvalid_reader=ok\ninvalid_writer_byte=ok\ninvalid_writer_limit=ok\ninvalid_reader_offset=ok\nnegative_read=ok\nbad_write=ok", "stderr": ""}

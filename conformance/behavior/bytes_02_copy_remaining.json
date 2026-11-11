@@ -1,0 +1,1 @@
+{"exit_code":0,"stdout":"copy_count=2\ncopy_payload=42,127,255\ncopy_eof=true\ncopy_preserves_source=true\nover_capacity=ok\ninvalid_reader=ok\ninvalid_writer=ok\ninvalid_read_byte=ok\ninvalid_writer_byte=ok\nempty_count=0\nempty_eof=true","stderr":""}

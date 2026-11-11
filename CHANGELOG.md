@@ -1943,6 +1943,10 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Bounded in-memory byte copying — 2026-11-10
+- **The experimental `stdlib::bytes` adds `copy_remaining(reader, writer)`**, transferring unread bytes into a capacity-bounded writer and returning an advanced reader plus the number of copied bytes. It validates malformed reader/writer states and values, fails without returning a mutated writer when capacity is insufficient, and preserves inputs through immutable value semantics.
+- **This is not OS or network streaming.** Buffers are backed by `[Int]`, so the helper is a reference composition primitive, not a zero-copy, packed-byte, or high-throughput promise. The behavior is pinned in conformance fixtures.
+
 ### ORCA deferred reclamation scan reduction — 2026-09-21
 - **Deferred ORCA reclamation avoids redundant linear scans.** Foreign-ref reclamation no longer searches the deferred list twice, and `process_deferred` skips the self-removal lookup after it already `swap_remove`s the current header. Recursive child cleanup keeps the defensive removal path.
 ### Cloud control-plane placement foundation — 2026-09-24
