@@ -1,0 +1,32 @@
+// Generic elements, non-integer accumulators, and source preservation.
+import stdlib::list
+
+fn main() {
+    let names = ["a", "bb", "c", "ddd"]
+    match chunk_every(2, names) {
+        Ok(chunks) => {
+            perform IO.print("strings_chunks=" + perform Int.to_string(length(chunks)))
+            perform IO.print("strings_first=" + chunks[0][0])
+            perform IO.print("strings_last=" + chunks[1][1])
+        },
+        Error(_) => perform IO.print("unexpected_error"),
+    }
+    perform IO.print("original_len=" + perform Int.to_string(length(names)))
+    perform IO.print("original_first=" + names[0])
+
+    let is_short = fn(s) { perform String.length(s) == 1 }
+    let taken = take_while(is_short, ["a", "b", "long", "c"])
+    let dropped = drop_while(is_short, ["a", "b", "long", "c"])
+    perform IO.print("strings_taken=" + perform Int.to_string(length(taken)))
+    perform IO.print("strings_dropped_first=" + dropped[0])
+    perform IO.print("strings_dropped_second=" + dropped[1])
+
+    let combine = fn(acc, s) { perform String.concat(acc, s) }
+    let output = scan(combine, "start", ["-", "end"])
+    perform IO.print("strings_scan0=" + output[0])
+    perform IO.print("strings_scan1=" + output[1])
+
+    let sum_lengths = fn(acc, s) { acc + perform String.length(s) }
+    let lengths = scan(sum_lengths, 0, ["a", "bb", "ccc"])
+    perform IO.print("mixed_scan=" + perform Int.to_string(lengths[2]))
+}
