@@ -102,6 +102,15 @@ jobs:
       - name: Build
         run: cargo build --locked --all-targets
 
+      - name: Selected stdlib behavioral conformance
+        run: |
+          python3 -m unittest -q conformance.test_fixture_options conformance.test_runner_subset
+          python3 conformance/run.py --no-build --only \
+          stdlib_25_enum_chunk_scan_while stdlib_26_enum_polymorphic \
+          stdlib_27_result_fs_integration stdlib_datetime_calendar_validation \
+          stdlib_fs_try_result_contract stdlib_http_try_result_contract \
+          stdlib_option_combinators stdlib_result_combinators
+
       - name: Test
         # nextest isolates individual tests in their own processes and schedules
         # test binaries concurrently, reducing wall-clock time without changing
@@ -235,6 +244,15 @@ jobs:
       # no-default-features build has zero PyO3/SQLite/LSP dependencies.
       - name: Build
         run: cargo build --locked --all-targets --no-default-features
+
+      - name: Selected stdlib behavioral conformance (transport disabled)
+        run: |
+          python3 -m unittest -q conformance.test_fixture_options conformance.test_runner_subset
+          python3 conformance/run.py --no-build --only \
+          stdlib_25_enum_chunk_scan_while stdlib_26_enum_polymorphic \
+          stdlib_27_result_fs_integration stdlib_datetime_calendar_validation \
+          stdlib_fs_try_result_contract stdlib_http_try_result_contract \
+          stdlib_option_combinators stdlib_result_combinators
 
       - name: Test
         run: cargo test --locked --no-default-features

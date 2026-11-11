@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
+import argparse
 import os, subprocess, json, sys
+from fixture_options import build_command, select_fixture_names
+
+parser = argparse.ArgumentParser(description="Validate Nulang behavioral conformance fixtures")
+parser.add_argument("--no-build", action="store_true", help="reuse the CLI already built by CI")
+parser.add_argument("--only", nargs="+", metavar="FIXTURE", help="run exact fixture basenames")
+args = parser.parse_args()
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)) + "/..")
-subprocess.run(["cargo", "build", "--quiet"], check=True)
+if not args.no_build:
+    subprocess.run(["cargo", "build", "--quiet"], check=True)
 # Resolve the binary through cargo so the repo's `target-dir` override in
 # `.cargo/config.toml` (currently `/tmp/cargo-target`) is respected — a
 # hardcoded `./target/debug/nulang` runs a stale or missing binary.
@@ -14,17 +22,27 @@ nulang_bin = os.path.join(target_dir, "debug", "nulang")
 passed = 0
 failed = 0
 
-for file in os.listdir("conformance/behavior"):
-    if not file.endswith(".nula"): continue
-    base = file[:-5]
+available = [
+    name[:-5]
+    for name in os.listdir("conformance/behavior")
+    if name.endswith(".nula") and os.path.isfile(f"conformance/behavior/{name[:-5]}.json")
+]
+try:
+    selected = select_fixture_names(available, args.only)
+except ValueError as exc:
+    parser.error(str(exc))
+
+for base in selected:
+    file = f"{base}.nula"
     json_path = f"conformance/behavior/{base}.json"
     nula_path = f"conformance/behavior/{file}"
-    if not os.path.exists(json_path): continue
     
     with open(json_path) as f:
         expected = json.load(f)
         
-    res = subprocess.run([nulang_bin, nula_path], capture_output=True, text=True)
+    # Default is no grants. Only checked-in fixtures with explicit, allowlisted
+    # capabilities receive narrowly scoped --with values.
+    res = subprocess.run(build_command(nulang_bin, nula_path, expected), capture_output=True, text=True)
     out = res.stdout.strip()
     err = res.stderr.strip()
     code = res.returncode
