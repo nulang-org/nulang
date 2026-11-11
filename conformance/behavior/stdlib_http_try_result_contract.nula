@@ -13,6 +13,8 @@ fn main() {
         Error(PostFailed(_)) => perform IO.print("post=error"),
         Error(_) => perform IO.print("post=wrong_error"),
     }
-    let legacy = get("::not-a-url::")
-    perform IO.print("legacy_nil=" + (if legacy == nil then "yes" else "no"))
+    // Test the raw effect sentinel, not the legacy String wrapper, which
+    // may coerce nil at the return boundary. The try_* API is authoritative.
+    let raw = perform Http.get("::not-a-url::")
+    perform IO.print("raw_nil=" + (if raw == nil then "yes" else "no"))
 }
