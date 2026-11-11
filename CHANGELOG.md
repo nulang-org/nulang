@@ -2,6 +2,11 @@
 ### Isolated compiler-stage timing probe — 2026-10-13
 - **A feature-independent `nulang-compile-bench` runner measures lexing, parsing, type/effect/capability checks, HIR/MIR lowering, and bytecode generation separately.** JSONL records include total compiler wall time, individual stage times, source size, workload, and repetition, with correctness/schema regressions for the benchmark harness.
 - **The probe explicitly excludes CLI startup, prelude/import handling, native linking, and JIT execution.** No production compiler semantics, optimization thresholds, or cache behavior change; native Go comparisons still require matched end-to-end build measurements.
+
+### Native float division/modulo nil parity — 2026-10-19
+- **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
+- **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
+
 ### Fabric on-demand mailbox scoring — 2026-10-18
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
 - **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
