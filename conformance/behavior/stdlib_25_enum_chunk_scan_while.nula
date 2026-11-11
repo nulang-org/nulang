@@ -1,0 +1,55 @@
+// Enum-inspired eager collection helpers: type-safe chunking, scan and prefix predicates.
+import stdlib::list
+
+fn main() {
+    let show_chunk = fn(xs) {
+        match chunk_every(2, xs) {
+            Ok(chunks) => {
+                perform IO.print("chunks=" + perform Int.to_string(length(chunks)))
+                perform IO.print("first_len=" + perform Int.to_string(length(chunks[0])))
+                perform IO.print("first0=" + perform Int.to_string(chunks[0][0]))
+                perform IO.print("last_len=" + perform Int.to_string(length(chunks[2])))
+                perform IO.print("last0=" + perform Int.to_string(chunks[2][0]))
+            },
+            Error(_) => perform IO.print("unexpected_error"),
+        }
+    }
+    show_chunk([1, 2, 3, 4, 5])
+
+    match chunk_every(4, []) {
+        Ok(chunks) => perform IO.print("empty_chunks=" + perform Int.to_string(length(chunks))),
+        Error(_) => perform IO.print("unexpected_empty_error"),
+    }
+    match chunk_every(0, [1]) {
+        Ok(_) => perform IO.print("zero=accepted"),
+        Error(_) => perform IO.print("zero=rejected"),
+    }
+    match chunk_every(-1, []) {
+        Ok(_) => perform IO.print("negative=accepted"),
+        Error(_) => perform IO.print("negative=rejected"),
+    }
+    match chunk_every(2, [1, 2, 3, 4]) {
+        Ok(chunks) => perform IO.print("exact=" + perform Int.to_string(length(chunks[1]))),
+        Error(_) => perform IO.print("unexpected_exact_error"),
+    }
+
+    let lt3 = fn(x) { x < 3 }
+    let prefix = take_while(lt3, [1, 2, 4, 1])
+    let suffix = drop_while(lt3, [1, 2, 4, 1])
+    perform IO.print("take_len=" + perform Int.to_string(length(prefix)))
+    perform IO.print("take_last=" + perform Int.to_string(prefix[1]))
+    perform IO.print("drop_len=" + perform Int.to_string(length(suffix)))
+    perform IO.print("drop_first=" + perform Int.to_string(suffix[0]))
+    perform IO.print("drop_after_first_miss=" + perform Int.to_string(suffix[1]))
+    perform IO.print("take_empty=" + perform Int.to_string(length(take_while(lt3, []))))
+    perform IO.print("drop_all=" + perform Int.to_string(length(drop_while(lt3, [0, 1]))))
+    perform IO.print("take_none=" + perform Int.to_string(length(take_while(lt3, [9]))))
+
+    let subtract = fn(acc, x) { acc - x }
+    let scanned = scan(subtract, 10, [1, 2, 3])
+    perform IO.print("scan_len=" + perform Int.to_string(length(scanned)))
+    perform IO.print("scan0=" + perform Int.to_string(scanned[0]))
+    perform IO.print("scan1=" + perform Int.to_string(scanned[1]))
+    perform IO.print("scan2=" + perform Int.to_string(scanned[2]))
+    perform IO.print("scan_empty=" + perform Int.to_string(length(scan(subtract, 0, []))))
+}
