@@ -1,12 +1,39 @@
 use nulang::bytecode::CodeModule;
 use nulang::lexer::Lexer;
 use nulang::parser::Parser;
-use nulang::runtime::{HttpMethod, WebDevServer, WebRoute};
+use nulang::runtime::{HttpMethod, HttpServerState, WebDevServer, WebRoute};
 use nulang::typechecker::TypeChecker;
 use nulang::web::contracts::compile_module_contracts;
 use nulang::web::runtime_bindings::{compile_runtime_route_plan, RuntimeWebRoute};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
+
+#[test]
+fn dropping_web_dev_server_interrupts_an_incomplete_http_request() {
+    let server = WebDevServer::bind_runtime(0, None, None, Vec::new())
+        .expect("bind development HTTP listener");
+    let mut stream =
+        TcpStream::connect(("127.0.0.1", server.port)).expect("connect to development server");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .expect("bound read duration");
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+        .expect("send incomplete headers to keep worker awaiting input");
+    // Give the listener a chance to accept the connection before shutdown.
+    std::thread::sleep(Duration::from_millis(100));
+
+    drop(server);
+
+    let mut data = [0_u8; 1];
+    let read = stream.read(&mut data);
+    assert!(
+        matches!(read, Ok(0))
+            || matches!(read, Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset),
+        "shutdown must close an accepted idle connection, got {read:?}"
+    );
+}
+
 use std::time::Duration;
 
 fn compile_handler(source: &str, handler_name: &str) -> (CodeModule, usize) {
@@ -36,6 +63,66 @@ fn compile_handler(source: &str, handler_name: &str) -> (CodeModule, usize) {
         .unwrap_or_else(|| panic!("missing function-table entry for {handler_name}"));
 
     (module, function_index)
+}
+
+#[test]
+fn standalone_http_host_serves_another_request_while_headers_are_incomplete() {
+    let (module, function_index) =
+        compile_handler("fn echo(body: String) -> String { \"ok\" }", "echo");
+    let server =
+        HttpServerState::bind(0, module, function_index).expect("bind standalone HTTP host");
+
+    // The first connection deliberately never terminates its header block.
+    let mut stalled = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    stalled
+        .write_all(b"GET /stalled HTTP/1.1\r\nHost: localhost\r\n")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+
+    // The second connection must progress despite the first read blocking.
+    let mut second = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    second
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    second
+        .write_all(b"GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    second.shutdown(Shutdown::Write).unwrap();
+    let mut response = Vec::new();
+    second
+        .read_to_end(&mut response)
+        .expect("unrelated completed request must not wait for stalled headers");
+    assert!(
+        response.starts_with(b"HTTP/1.1 200 OK\r\n"),
+        "standalone HTTP host should serve second client"
+    );
+    assert!(response.ends_with(b"ok"));
+}
+
+#[test]
+fn standalone_http_host_shutdown_interrupts_idle_connections() {
+    let (module, function_index) =
+        compile_handler("fn echo(body: String) -> String { \"ok\" }", "echo");
+    let server =
+        HttpServerState::bind(0, module, function_index).expect("bind standalone HTTP host");
+    let mut stalled = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    stalled
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    stalled
+        .write_all(b"GET /stalled HTTP/1.1\r\nHost: localhost\r\n")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+
+    drop(server);
+
+    let mut data = [0_u8; 1];
+    let read = stalled.read(&mut data);
+    assert!(
+        matches!(read, Ok(0))
+            || matches!(read, Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset),
+        "shutdown must interrupt the incomplete request, got {read:?}"
+    );
 }
 
 fn typed_query_route() -> RuntimeWebRoute {
