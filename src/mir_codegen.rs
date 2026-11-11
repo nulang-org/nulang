@@ -2240,6 +2240,77 @@ pub fn compile_mir(mir: &mut mir::Module, module_name: impl Into<String>) -> NuR
     Ok(codegen.finish())
 }
 
+/// Compiler-produced, in-memory Web argument ABI metadata.
+///
+/// Record field IDs are assigned during MIR code generation, not by source
+/// order or the HTTP dispatcher. This sidecar is intentionally outside the
+/// serialized CodeModule schema: legacy NBC artifacts continue to load, but
+/// cannot invoke typed Web handlers without an authenticated compile-side
+/// mapping. Missing or stale mappings must fail closed.
+#[derive(Debug, Clone)]
+pub struct CompiledWebModule {
+    module: CodeModule,
+    record_field_ids: std::collections::BTreeMap<String, u8>,
+    /// Typed handler parameter signatures from the same lowered MIR.
+    /// The order corresponds exactly to CodeModule.function_table indices.
+    handler_param_types: Vec<Vec<Type>>,
+}
+
+impl CompiledWebModule {
+    pub fn module(&self) -> &CodeModule {
+        &self.module
+    }
+
+    pub fn handler_param_type(&self, func_idx: usize, param_idx: usize) -> Option<&Type> {
+        self.handler_param_types.get(func_idx)?.get(param_idx)
+    }
+
+    pub fn record_field_id(&self, field: &str) -> Option<u8> {
+        self.record_field_ids.get(field).copied()
+    }
+}
+
+/// Compile code and its authoritative module-wide record-field layout in
+/// the same MIR pass. Never reconstruct these IDs from bytecode patterns.
+pub fn compile_mir_with_web_field_layout(
+    mir: &mut mir::Module,
+    module_name: impl Into<String>,
+) -> NuResult<CompiledWebModule> {
+    let mut codegen = MirCodegen::new(module_name);
+    codegen.compile_module(mir)?;
+    let record_field_ids = codegen
+        .field_map
+        .iter()
+        .map(|(name, id)| (name.clone(), *id))
+        .collect();
+    let mut handler_param_types = Vec::with_capacity(mir.functions.len());
+    for function in &mir.functions {
+        let mut parameter_types = Vec::with_capacity(function.params.len());
+        for parameter in &function.params {
+            let local = function
+                .locals
+                .iter()
+                .find(|local| local.id == *parameter)
+                .ok_or_else(|| {
+                    compile_err(
+                        format!(
+                            "missing MIR parameter local {:?} in function '{}'",
+                            parameter, function.name
+                        ),
+                        Span::default(),
+                    )
+                })?;
+            parameter_types.push(local.ty.clone());
+        }
+        handler_param_types.push(parameter_types);
+    }
+    Ok(CompiledWebModule {
+        module: codegen.finish(),
+        record_field_ids,
+        handler_param_types,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Liveness-based Drop planning
 // ---------------------------------------------------------------------------
