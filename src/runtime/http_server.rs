@@ -21,7 +21,8 @@ use crate::value_layout::PAYLOAD_MASK;
 use crate::vm::{resolve_value_string, Value, CLOSURE_ENV_FLAG, VM};
 use crate::web::csrf::validate_mutation_origin;
 use crate::web::dispatch::{render_direct_request, DirectRequestRenderError};
-use crate::web::http_problem::request_decode_problem_response;
+use crate::web::form_guard::{FormGuardError, GuardedFormRoute};
+use crate::web::http_problem::{form_validation_problem_response, request_decode_problem_response};
 use crate::web::http_request::HttpRequestBindingInputs;
 use crate::web::reactivity::inject_client_runtime_script;
 use crate::web::request_bindings::percent_decode_form;
@@ -930,8 +931,6 @@ pub fn realtime_subscribe(room: &str) -> (Vec<String>, Receiver<String>) {
 pub enum Middleware {
     SecurityHeaders,
     RequestLog,
-    #[allow(dead_code)]
-    Csrf,
 }
 
 impl Middleware {
@@ -958,9 +957,6 @@ impl Middleware {
                     request.path,
                     response.status
                 );
-            }
-            Middleware::Csrf => {
-                // Phase 2: generate CSRF token cookie and validate on POST.
             }
         }
     }
@@ -1250,6 +1246,18 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
     ) -> std::io::Result<Self> {
+        Self::bind_runtime_with_form_guards(port, static_dir, output_dir, routes, Vec::new())
+    }
+
+    /// Attach compiler-validated form guards before opening a listening socket.
+    /// Public-origin configuration is validated before accepting connections.
+    pub fn bind_runtime_with_form_guards(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        guarded_forms: Vec<GuardedFormRoute>,
+    ) -> std::io::Result<Self> {
         let public_origin = match std::env::var("NULANG_WEB_PUBLIC_ORIGIN") {
             Ok(value) => Some(value),
             Err(std::env::VarError::NotPresent) => None,
@@ -1260,14 +1268,42 @@ impl WebDevServer {
                 ));
             }
         };
-        Self::bind_runtime_configured(port, static_dir, output_dir, routes, public_origin)
+        Self::bind_runtime_guarded_configured(
+            port,
+            static_dir,
+            output_dir,
+            routes,
+            guarded_forms,
+            public_origin,
+        )
     }
 
+    // Keep the explicit-configuration entry point for the existing startup
+    // regression tests without bypassing the common guarded admission path.
+    #[cfg(test)]
     fn bind_runtime_configured(
         port: u16,
         static_dir: Option<PathBuf>,
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
+        public_origin: Option<String>,
+    ) -> std::io::Result<Self> {
+        Self::bind_runtime_guarded_configured(
+            port,
+            static_dir,
+            output_dir,
+            routes,
+            Vec::new(),
+            public_origin,
+        )
+    }
+
+    fn bind_runtime_guarded_configured(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        guarded_forms: Vec<GuardedFormRoute>,
         public_origin: Option<String>,
     ) -> std::io::Result<Self> {
         if let Some(origin) = public_origin.as_deref() {
@@ -1278,11 +1314,44 @@ impl WebDevServer {
                 )
             })?;
         }
+
+        let mut form_guards = HashMap::new();
+        for guard in guarded_forms {
+            let mut matches = routes.iter().filter(|route| {
+                route.route.method.as_str() == guard.form.method
+                    && route.route.path == guard.form.path
+            });
+            let route = matches.next().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "form guard references an unknown runtime route",
+                )
+            })?;
+            if matches.next().is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "guarded form route has duplicate runtime registrations",
+                ));
+            }
+            guard.check_route(route).map_err(|message| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+            })?;
+            let key = (guard.form.method.clone(), guard.form.path.clone());
+            if form_guards.insert(key, guard).is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "multiple guards target the same form route",
+                ));
+            }
+        }
+
         let listener = TcpListener::bind(("0.0.0.0", port))?;
         let actual_port = listener.local_addr()?.port();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
         let routes_clone = routes;
+        let form_guards = Arc::new(form_guards);
+        let guards_clone = Arc::clone(&form_guards);
         let static_dir_clone = static_dir.clone();
         let output_dir_clone = output_dir.clone();
 
@@ -1295,6 +1364,7 @@ impl WebDevServer {
                     output_dir_clone,
                     routes_clone,
                     public_origin,
+                    guards_clone,
                     shutdown_clone,
                 );
             })?;
@@ -1312,6 +1382,7 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
         public_origin: Option<String>,
+        form_guards: Arc<HashMap<(String, String), GuardedFormRoute>>,
         shutdown: Arc<AtomicBool>,
     ) {
         listener.set_nonblocking(true).ok();
@@ -1345,6 +1416,7 @@ impl WebDevServer {
                     let output_dir = output_dir.clone();
                     let routes = Arc::clone(&routes);
                     let public_origin = public_origin.clone();
+                    let form_guards = Arc::clone(&form_guards);
                     let shutdown = Arc::clone(&shutdown);
                     // A failed spawn drops the closure and lease, returning capacity.
                     if let Err(error) = std::thread::Builder::new()
@@ -1357,6 +1429,7 @@ impl WebDevServer {
                                 output_dir,
                                 routes,
                                 public_origin,
+                                form_guards,
                                 shutdown,
                             );
                         })
@@ -1378,6 +1451,7 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Arc<Vec<RuntimeWebRoute>>,
         public_origin: Option<String>,
+        form_guards: Arc<HashMap<(String, String), GuardedFormRoute>>,
         shutdown: Arc<AtomicBool>,
     ) {
         let request = match read_http_request(&mut stream) {
@@ -1429,13 +1503,55 @@ impl WebDevServer {
         {
             if let Some(response) = invalid_ui_action_response(&captured) {
                 response
+            } else if let Some(error) = form_guards
+                .get(&(
+                    route.route.method.as_str().to_string(),
+                    route.route.path.clone(),
+                ))
+                .and_then(|guard| {
+                    guard
+                        .preflight(request.method.as_str(), &request.headers, &captured)
+                        .err()
+                })
+            {
+                match error {
+                    FormGuardError::Forbidden => HttpResponse {
+                        status: 403,
+                        headers: vec![
+                            ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+                            ("Cache-Control".into(), "no-store".into()),
+                        ],
+                        body: b"Forbidden".to_vec(),
+                    },
+                    FormGuardError::Validation(errors) => {
+                        let problem = form_validation_problem_response(&errors);
+                        let mut headers = problem.headers;
+                        headers.push(("Cache-Control".into(), "no-store".into()));
+                        HttpResponse {
+                            status: problem.status,
+                            headers,
+                            body: problem.body,
+                        }
+                    }
+                }
             } else {
                 let values = captured.values(&params, &request.headers);
                 let ctx = RequestContext {
                     request: request.clone(),
                     params: params.clone(),
                 };
-                let rendered =
+                let guard_key = (
+                    route.route.method.as_str().to_string(),
+                    route.route.path.clone(),
+                );
+                let rendered = if let Some(guard) =
+                    form_guards.get(&guard_key).filter(|guard| guard.is_typed())
+                {
+                    guard
+                        .render_typed(route, &captured)
+                        .map(Some)
+                        .map_err(DirectRequestRenderError::Execution)
+                } else {
                     with_request_context(ctx, || match render_direct_request(route, &values) {
                         Ok(Some(rendered)) => Ok(Some(rendered)),
                         Ok(None) => Ok(render_route_handler(
@@ -1444,7 +1560,8 @@ impl WebDevServer {
                             None,
                         )),
                         Err(error) => Err(error),
-                    });
+                    })
+                };
                 match rendered {
                     Ok(Some(html)) => HttpResponse {
                         status: 200,
