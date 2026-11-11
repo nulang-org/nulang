@@ -1585,21 +1585,9 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                     #[cfg(not(feature = "ureq"))]
                     {
                         let _ = url;
-                        let msg = b"HTTP client disabled (feature 'ureq' not enabled)";
-                        match self.heap.alloc(msg.len() + 1, HeapTypeTag::String) {
-                            Some(ptr) => {
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(msg.as_ptr(), ptr, msg.len());
-                                    *ptr.add(msg.len()) = 0;
-                                }
-                                return Some(unsafe {
-                                    // SAFETY: `ptr` was returned by `self.heap.alloc`
-                                    // in this branch and remains owned by this VM heap.
-                                    Value::ptr(ptr)
-                                });
-                            }
-                            None => return Some(Value::nil()),
-                        }
+                        // Transport is unavailable: return the same failure sentinel
+                        // as a failed request, never a success-shaped error string.
+                        return Some(Value::nil());
                     }
                 }
                 Some("post") => {
@@ -1644,21 +1632,9 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                     #[cfg(not(feature = "ureq"))]
                     {
                         let _ = (url, body);
-                        let msg = b"HTTP client disabled (feature 'ureq' not enabled)";
-                        match self.heap.alloc(msg.len() + 1, HeapTypeTag::String) {
-                            Some(ptr) => {
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(msg.as_ptr(), ptr, msg.len());
-                                    *ptr.add(msg.len()) = 0;
-                                }
-                                return Some(unsafe {
-                                    // SAFETY: `ptr` was returned by `self.heap.alloc`
-                                    // in this branch and remains owned by this VM heap.
-                                    Value::ptr(ptr)
-                                });
-                            }
-                            None => return Some(Value::nil()),
-                        }
+                        // Do not misrepresent a disabled transport as a successful
+                        // HTTP response body; typed wrappers must receive failure.
+                        return Some(Value::nil());
                     }
                 }
                 _ => return None,
@@ -8397,7 +8373,6 @@ mod vm_tests {
 
     /// Http.get and Http.post must be handled as built-in effects in the
     /// standalone VM; they must not produce "Unhandled effect" errors.
-    #[cfg(feature = "ureq")]
     #[test]
     fn test_standalone_http_get_builtin() {
         let mut module = CodeModule::new("test_http_get");
@@ -8442,7 +8417,6 @@ mod vm_tests {
     }
 
     /// Http.post must also dispatch in the standalone VM without error.
-    #[cfg(feature = "ureq")]
     #[test]
     fn test_standalone_http_post_builtin() {
         let mut module = CodeModule::new("test_http_post");

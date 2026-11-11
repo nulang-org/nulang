@@ -1,4 +1,10 @@
 # Nulang Changelog
+
+### Additive typed filesystem and HTTP results — 2026-11-10
+- **Experimental `stdlib::fs` and `stdlib::http` offer recoverable `Result` APIs.** `try_read`, `try_write`, `try_append`, `try_get`, and `try_post` report operation-specific failures without changing legacy call signatures or raw effect ABI.
+- **The standalone VM fails closed when HTTP transport is disabled.** Without the `ureq` feature, `Http.get` and `Http.post` return the raw failure sentinel rather than success-shaped diagnostic text; regression tests run in both transport configurations.
+- **Error detail is intentionally limited.** Underlying FS and HTTP effects do not yet expose errno, HTTP response metadata, or exact transport failure types. The new wrappers therefore do not invent status or timeout classifications.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
