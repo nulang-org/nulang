@@ -1,5 +1,10 @@
 # Nulang Changelog
 
+### Additive typed filesystem and HTTP results — 2026-11-10
+- **Experimental `stdlib::fs` and `stdlib::http` offer recoverable `Result` APIs.** `try_read`, `try_write`, `try_append`, `try_get`, and `try_post` report operation-specific failures without changing legacy call signatures or raw effect ABI.
+- **The standalone VM fails closed when HTTP transport is disabled.** Without the `ureq` feature, `Http.get` and `Http.post` return the raw failure sentinel rather than success-shaped diagnostic text; regression tests run in both transport configurations.
+- **Error detail is intentionally limited.** Underlying FS and HTTP effects do not yet expose errno, HTTP response metadata, or exact transport failure types. The new wrappers therefore do not invent status or timeout classifications.
+
 ### Canonical Option/Result combinators — 2026-11-10
 - **`stdlib::option` and `stdlib::result` use prelude-owned algebraic types.** Add `and_then`, `or_else`, `unwrap_or`, `unwrap_or_else`, Option `filter` and `ok_or`, and Result `map_err` and `to_option`. End-to-end conformance tests cover success, error, and fallback paths. Existing aborting `unwrap` is unchanged pending cross-backend panic parity.
 

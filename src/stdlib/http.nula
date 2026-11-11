@@ -8,13 +8,34 @@
 pub type HttpError = Timeout | ConnectionRefused | BadStatus(Int) | Other(String)
 
 /// Perform an HTTP GET request. Returns the response body as a String.
-/// Requires the runtime host (not available in standalone VM).
+/// Standalone VM support requires the 'ureq' feature; runtime-host support
+/// depends on the configured outbound HTTP provider.
 pub fn get(url: String) -> String ! {Http} {
     perform Http.get(url)
 }
 
 /// Perform an HTTP POST request with a body. Returns the response body as a String.
-/// Requires the runtime host (not available in standalone VM).
+/// Standalone VM support requires the 'ureq' feature; runtime-host support
+/// depends on the configured outbound HTTP provider.
 pub fn post(url: String, body: String) -> String ! {Http} {
     perform Http.post(url, body)
+}
+
+/// Broad transport failure surfaced by the new try_* wrappers.
+/// The raw Http effect returns nil on transport/status failure and when the
+/// standalone client is compiled without the 'ureq' transport feature.
+/// It cannot honestly distinguish a timeout from a connection failure.
+/// Prefer try_get/try_post over legacy String wrappers for failure detection.
+pub type HttpRequestError = GetFailed(String) | PostFailed(String)
+
+/// GET with explicit failure handling, without changing legacy get(url).
+pub fn try_get(url: String) -> Result[String, HttpRequestError] ! {Http} {
+    let value = perform Http.get(url);
+    if value == nil then Error(GetFailed(url)) else Ok(value)
+}
+
+/// POST with explicit failure handling, without changing legacy post(url, body).
+pub fn try_post(url: String, body: String) -> Result[String, HttpRequestError] ! {Http} {
+    let value = perform Http.post(url, body);
+    if value == nil then Error(PostFailed(url)) else Ok(value)
 }
