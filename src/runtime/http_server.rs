@@ -1018,6 +1018,11 @@ pub fn render_route_handler(
     module.emit(Instruction::new0(OpCode::Ret));
     vm.load_module(module);
     let mut run = || match vm.run_from(0, entry_offset) {
+        // An invalid HTML host operation returns a VM nil. It is not a valid
+        // rendered response and must not become a successful "nil" document.
+        // Check the actual tagged Value, not its string representation:
+        // returning the legitimate String "nil" still means HTTP 200.
+        Ok(result) if result.is_nil() => None,
         Ok(result) => Some(vm.value_to_string(0, result)),
         Err(_) => None,
     };
