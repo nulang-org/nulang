@@ -187,7 +187,8 @@ fn my_tests() {
 
 Filesystem I/O wrappers over the built-in `FS` effect. The raw effect keeps its
 legacy nil-on-host-error behavior; the stdlib wrappers convert that into
-`Result` values.
+`Result` values. Programs must still hold the appropriate filesystem
+resource capability; `Result` does not bypass effect checks.
 
 | Function | Signature | Description |
 |---|---|---|
@@ -213,6 +214,7 @@ match read("data.txt") {
 
 HTTP client wrappers over the built-in `Http` effect. The raw effect still
 returns `nil` on request failure; these wrappers make that failure explicit.
+Network resource capability checks remain mandatory.
 
 | Function | Signature | Description |
 |---|---|---|

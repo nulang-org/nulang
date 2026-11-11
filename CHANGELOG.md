@@ -1,4 +1,7 @@
 # Nulang Changelog
+
+### Result-based filesystem and HTTP wrappers — 2026-11-10
+- **Experimental `stdlib::fs` and `stdlib::http` return typed `Result` values for ordinary host failures**, preserving the legacy raw-effect ABI. Only operation/path or operation/URL errors are exposed until host-level causes are available. Focused tests receive only their explicitly declared `fs` or `net` capability; other fixtures remain unprivileged.
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.

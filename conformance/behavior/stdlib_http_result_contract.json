@@ -1,1 +1,1 @@
-{"exit_code":0,"stdout":"get=error\npost=error","stderr":""}
+{"exit_code":0,"stdout":"get=error\npost=error","stderr":"","capabilities":["net"]}
