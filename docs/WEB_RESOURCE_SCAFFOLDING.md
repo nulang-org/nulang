@@ -56,3 +56,35 @@ or read-only pages as authorization.** A real service still needs
 authenticated identity, tenant membership, resource permission checks,
 storage transactions, CSRF and input validation, with negative tests.
 Neither generator supplies production CRUD.
+
+## Optional PostgreSQL migration scaffold
+
+To generate a reviewable migration from the **same field declaration** as the typed model, add `--migration`:
+
+    nulang nula generate model BillboardFace --field name:String --field active:Bool --field impressions:Int --migration
+
+This additionally creates `migrations/create_billboard_face.sql` (not applied automatically).
+The generator refuses existing files and symlinked output directories, uses deterministic
+field ordering and quoted SQL identifiers, and never overwrites application migrations.
+
+The SQL scaffold declares a `public.billboard_face` table with a composite
+`(tenant_id, id)` UUID primary key, enables and forces PostgreSQL row-level
+security, and creates a tenant equality policy using `app.tenant_id`.
+It deliberately grants no database privileges. Fields are required by default:
+`String` maps to `TEXT`, `Int` to `BIGINT`, `Bool` to `BOOLEAN`,
+and `Float` to `DOUBLE PRECISION` (which **must not** be used for money).
+
+**This is not production-ready CRUD or an access-control system.**
+Review and apply the SQL only with a separate trusted migration identity.
+Application code must obtain tenant identity from verified auth/membership,
+run tenant-local transactions, and use a restricted non-`BYPASSRLS` database
+role. PostgreSQL custom settings can be set by the connected role, so
+`app.tenant_id` is not a defense against arbitrary SQL execution or SQL
+injection. Add tenant foreign keys and explicit least-privilege grants only
+when the application's real schema and operational roles are known. Verify
+cross-tenant read/write denial in a disposable PostgreSQL integration test
+before opening any mutation endpoint.
+
+The generator does not inspect subsequent edits to the model; migrations are
+historical application-owned snapshots. Generating both files is best-effort
+rollback on errors, not an atomic filesystem transaction across two paths.

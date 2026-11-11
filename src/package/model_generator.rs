@@ -22,6 +22,7 @@ struct Field {
 struct Resource {
     name: String,
     fields: Vec<Field>,
+    migration: bool,
 }
 
 fn invalid(msg: impl Into<String>) -> NuError {
@@ -76,8 +77,17 @@ impl Resource {
 
         let mut fields = Vec::new();
         let mut seen = HashSet::new();
+        let mut migration = false;
         let mut index = 2;
         while index < args.len() {
+            if args[index] == "--migration" {
+                if migration {
+                    return Err(invalid("--migration may only appear once"));
+                }
+                migration = true;
+                index += 1;
+                continue;
+            }
             if args[index] != "--field" {
                 return Err(invalid(format!(
                     "unexpected argument '{}' (expected --field name:Type)",
@@ -118,6 +128,7 @@ impl Resource {
         Ok(Self {
             name: name.clone(),
             fields,
+            migration,
         })
     }
 
@@ -166,6 +177,57 @@ impl Resource {
         ));
         code
     }
+
+    /// Emit application-owned SQL without activating a database connection or
+    /// granting privileges. A source model and its migration come from the
+    /// same validated field specification.
+    fn render_migration(&self) -> NuResult<String> {
+        let table = self.file_stem();
+        // PostgreSQL truncates identifiers to 63 bytes by default. Truncation
+        // would silently change the table being created.
+        if table.len() > 63 {
+            return Err(invalid(format!(
+                "migration table name '{table}' exceeds PostgreSQL's 63-byte identifier limit"
+            )));
+        }
+
+        let qualified = format!(r#""public"."{table}""#);
+        let mut sql = format!(
+            r#"-- Generated SQL scaffold; review before applying. Not automatically executed.
+-- Use a separate migration role; runtime access remains ungranted.
+-- app.tenant_id must come from trusted authentication inside a transaction.
+CREATE TABLE {qualified} (
+    "tenant_id" UUID NOT NULL,
+    "id" UUID NOT NULL"#
+        );
+        for field in &self.fields {
+            let database_type = match field.ty.as_str() {
+                "String" => "TEXT",
+                "Int" => "BIGINT",
+                "Float" => "DOUBLE PRECISION",
+                "Bool" => "BOOLEAN",
+                _ => unreachable!("Resource::parse validates model types"),
+            };
+            sql.push_str(&format!(
+                r#",
+    "{}" {database_type} NOT NULL"#,
+                field.name
+            ));
+        }
+        sql.push_str(&format!(
+            r#",
+    PRIMARY KEY ("tenant_id", "id")
+);
+
+ALTER TABLE {qualified} ENABLE ROW LEVEL SECURITY;
+ALTER TABLE {qualified} FORCE ROW LEVEL SECURITY;
+CREATE POLICY "tenant_isolation" ON {qualified} FOR ALL
+  USING ("tenant_id" = NULLIF(current_setting('app.tenant_id', true), '')::uuid)
+  WITH CHECK ("tenant_id" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+"#
+        ));
+        Ok(sql)
+    }
 }
 
 /// Generate one resource module without overwriting existing source.
@@ -173,8 +235,13 @@ impl Resource {
 /// Safe by default: this creates type declarations and deny-all policy hooks,
 /// but never installs routes or persistence operations implicitly.
 pub fn run(args: &[String], root: &Path) -> NuResult<PathBuf> {
-    // Validate every argument before performing filesystem writes.
+    // Validate the entire declaration before performing filesystem writes.
     let resource = Resource::parse(args)?;
+    let migration_sql = if resource.migration {
+        Some(resource.render_migration()?)
+    } else {
+        None
+    };
     if !root.join(MANIFEST_FILE).is_file() {
         return Err(invalid(format!(
             "no {MANIFEST_FILE} found in {} — initialize a package first",
@@ -186,13 +253,22 @@ pub fn run(args: &[String], root: &Path) -> NuResult<PathBuf> {
     let source_dir = root.join("src");
     let dest_dir = source_dir.join("resources");
     let output = dest_dir.join(format!("{}.nula", resource.file_stem()));
-    // A pre-existing src/ or src/resources/ symlink can redirect generation
-    // outside the package. Reject it instead of following it implicitly.
-    for dir in [&source_dir, &dest_dir] {
+    let migration_dir = root.join("migrations");
+    let migration_path = migration_sql
+        .as_ref()
+        .map(|_| migration_dir.join(format!("create_{}.sql", resource.file_stem())));
+
+    // Do not traverse pre-existing symlink directories, including migrations/.
+    // This is not a sandbox against concurrent hostile filesystem mutation.
+    let mut directories = vec![&source_dir, &dest_dir];
+    if migration_path.is_some() {
+        directories.push(&migration_dir);
+    }
+    for dir in directories {
         match fs::symlink_metadata(dir) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 return Err(invalid(format!(
-                    "cannot generate resources through symlinked directory {}",
+                    "resource generation refuses a symlinked directory {}",
                     dir.display()
                 )));
             }
@@ -212,22 +288,57 @@ pub fn run(args: &[String], root: &Path) -> NuResult<PathBuf> {
             }
         }
     }
+
+    // Refuse both collisions before creating either output; use create_new
+    // below as a second check against races and preserve all existing files.
+    if let Some(path) = &migration_path {
+        for candidate in [&output, path] {
+            match fs::symlink_metadata(candidate) {
+                Ok(_) => {
+                    return Err(invalid(format!(
+                        "cannot overwrite existing resource output {}",
+                        candidate.display()
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(invalid(format!(
+                        "cannot inspect resource output {}: {error}",
+                        candidate.display()
+                    )));
+                }
+            }
+        }
+    }
+
     fs::create_dir_all(&dest_dir)
         .map_err(|error| invalid(format!("cannot create {}: {error}", dest_dir.display())))?;
-    // Defense in depth: verify the effective directory is still inside the
-    // package root after it has been created. This is not a concurrent-write
-    // sandbox, but it prevents ordinary pre-existing redirect mistakes.
+    if migration_path.is_some() {
+        fs::create_dir_all(&migration_dir).map_err(|error| {
+            invalid(format!(
+                "cannot create {}: {error}",
+                migration_dir.display()
+            ))
+        })?;
+    }
+    // Refuse output directories that resolve outside the package root.
     let canonical_root = fs::canonicalize(root)
         .map_err(|error| invalid(format!("cannot resolve {}: {error}", root.display())))?;
-    let canonical_dest = fs::canonicalize(&dest_dir)
-        .map_err(|error| invalid(format!("cannot resolve {}: {error}", dest_dir.display())))?;
-    if !canonical_dest.starts_with(&canonical_root) {
-        return Err(invalid(format!(
-            "resource output directory {} resolves outside the package",
-            dest_dir.display()
-        )));
+    for dir in [&dest_dir, &migration_dir] {
+        if dir == &migration_dir && migration_path.is_none() {
+            continue;
+        }
+        let canonical = fs::canonicalize(dir)
+            .map_err(|error| invalid(format!("cannot resolve {}: {error}", dir.display())))?;
+        if !canonical.starts_with(&canonical_root) {
+            return Err(invalid(format!(
+                "resource output directory {} resolves outside the package",
+                dir.display()
+            )));
+        }
     }
-    let mut file = OpenOptions::new()
+
+    let mut model_file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&output)
@@ -238,14 +349,42 @@ pub fn run(args: &[String], root: &Path) -> NuResult<PathBuf> {
             ))
         })?;
 
-    if let Err(error) = file.write_all(resource.render().as_bytes()) {
-        drop(file);
+    if let Err(error) = model_file
+        .write_all(resource.render().as_bytes())
+        .and_then(|_| model_file.sync_all())
+    {
+        drop(model_file);
         let _ = fs::remove_file(&output);
         return Err(invalid(format!(
             "cannot write {}: {error}",
             output.display()
         )));
     }
+    drop(model_file);
+
+    if let (Some(sql), Some(path)) = (migration_sql, migration_path) {
+        let mut migration_file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = fs::remove_file(&output);
+                return Err(invalid(format!(
+                    "cannot create {} without overwriting: {error}",
+                    path.display()
+                )));
+            }
+        };
+        if let Err(error) = migration_file
+            .write_all(sql.as_bytes())
+            .and_then(|_| migration_file.sync_all())
+        {
+            drop(migration_file);
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(&output);
+            return Err(invalid(format!("cannot write {}: {error}", path.display())));
+        }
+        println!("Created SQL migration scaffold at {}", path.display());
+    }
+
     println!("Created typed model scaffold at {}", output.display());
     Ok(output)
 }
@@ -276,6 +415,133 @@ mod tests {
         )
         .unwrap();
         dir
+    }
+
+    #[test]
+    fn migration_scaffold_generates_tenant_scoped_sql_without_grants() {
+        let root = test_package("migration_sql");
+        let args = argv(&[
+            "model",
+            "BillboardFace",
+            "--field",
+            "name:String",
+            "--field",
+            "active:Bool",
+            "--field",
+            "daily_rate:Float",
+            "--field",
+            "impressions:Int",
+            "--migration",
+        ]);
+
+        let model = run(&args, &root).expect("model and migration should generate");
+        assert!(model.ends_with("src/resources/billboard_face.nula"));
+        let sql = fs::read_to_string(root.join("migrations/create_billboard_face.sql"))
+            .expect("reviewable migration should exist");
+        assert!(sql.contains("CREATE TABLE \"public\".\"billboard_face\" ("));
+        assert!(sql.contains("\"tenant_id\" UUID NOT NULL"));
+        assert!(sql.contains("\"id\" UUID NOT NULL"));
+        assert!(sql.contains("\"active\" BOOLEAN NOT NULL"));
+        assert!(sql.contains("\"daily_rate\" DOUBLE PRECISION NOT NULL"));
+        assert!(sql.contains("\"impressions\" BIGINT NOT NULL"));
+        assert!(sql.contains("\"name\" TEXT NOT NULL"));
+        assert!(sql.contains("PRIMARY KEY (\"tenant_id\", \"id\")"));
+        assert!(sql.contains("ENABLE ROW LEVEL SECURITY"));
+        assert!(sql.contains("FORCE ROW LEVEL SECURITY"));
+        assert!(sql.contains("WITH CHECK"));
+        assert!(sql.contains("current_setting('app.tenant_id', true)"));
+        assert!(!sql.contains("GRANT "));
+        assert!(!sql.contains("BYPASSRLS"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn migration_collision_preserves_existing_sql_and_does_not_write_model() {
+        let root = test_package("migration_collision");
+        let migration_dir = root.join("migrations");
+        fs::create_dir_all(&migration_dir).unwrap();
+        let migration = migration_dir.join("create_billboard.sql");
+        fs::write(&migration, "-- application-owned migration\n").unwrap();
+        let args = argv(&[
+            "model",
+            "Billboard",
+            "--field",
+            "name:String",
+            "--migration",
+        ]);
+        assert!(run(&args, &root).is_err());
+        assert_eq!(
+            fs::read_to_string(migration).unwrap(),
+            "-- application-owned migration\n"
+        );
+        assert!(!root.join("src/resources/billboard.nula").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_directory_symlink_is_rejected_before_model_write() {
+        use std::os::unix::fs::symlink;
+        let root = test_package("migration_symlink");
+        let outside = test_package("migration_symlink_outside");
+        symlink(&outside, root.join("migrations")).unwrap();
+        let args = argv(&[
+            "model",
+            "Billboard",
+            "--field",
+            "name:String",
+            "--migration",
+        ]);
+        assert!(run(&args, &root).is_err());
+        assert!(!root.join("src/resources/billboard.nula").exists());
+        assert!(!outside.join("create_billboard.sql").exists());
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn migration_rejects_postgres_identifier_truncation_before_writing() {
+        let root = test_package("migration_long_name");
+        let name = format!("A{}", "b".repeat(63));
+        let args = vec![
+            "model".to_string(),
+            name,
+            "--field".to_string(),
+            "name:String".to_string(),
+            "--migration".to_string(),
+        ];
+        assert!(run(&args, &root).is_err());
+        assert!(!root.join("src").exists());
+        assert!(!root.join("migrations").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn migration_quotes_reserved_postgres_identifiers() {
+        let resource = Resource::parse(&argv(&[
+            "model",
+            "Order",
+            "--field",
+            "user:String",
+            "--migration",
+        ]))
+        .unwrap();
+        let sql = resource.render_migration().unwrap();
+        assert!(sql.contains(r#"CREATE TABLE "public"."order" ("#));
+        assert!(sql.contains(r#""user" TEXT NOT NULL"#));
+    }
+
+    #[test]
+    fn migration_flag_must_be_unique() {
+        assert!(Resource::parse(&argv(&[
+            "model",
+            "Billboard",
+            "--field",
+            "name:String",
+            "--migration",
+            "--migration",
+        ]))
+        .is_err());
     }
 
     #[test]
