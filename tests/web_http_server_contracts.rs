@@ -111,6 +111,32 @@ fn response_body(response: &str) -> &str {
 }
 
 #[test]
+fn dns_rebound_read_and_sse_requests_are_rejected_before_dispatch() {
+    let server = WebDevServer::bind(0, None, None, vec![]).expect("bind unprivileged WebDevServer");
+
+    for path in ["/", "/__nulang/sse/private-room"] {
+        let response = send_raw_request(
+            server.port,
+            &format!(
+                "GET {path} HTTP/1.1\r\nHost: attacker.example:{}\r\nConnection: close\r\n\r\n",
+                server.port
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+            "untrusted Host must be rejected before {path} dispatch: {response}"
+        );
+    }
+
+    let expected_host = format!("localhost:{}", server.port);
+    let read = send_raw_request(
+        server.port,
+        &format!("GET / HTTP/1.1\r\nHost: {expected_host}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(read.starts_with("HTTP/1.1 404 Not Found\r\n"), "{read}");
+}
+
+#[test]
 fn compiler_bound_query_executes_over_real_http() {
     let server = WebDevServer::bind_runtime(0, None, None, vec![typed_query_route()])
         .expect("bind typed WebDevServer");
@@ -129,15 +155,27 @@ fn absolute_form_routes_a_typed_query_over_real_http() {
     let server = WebDevServer::bind_runtime(0, None, None, vec![typed_query_route()])
         .expect("bind typed WebDevServer");
 
-    // The absolute request-target's authority overrides the mismatched Host,
-    // and the normalized path/query must reach compiler-backed dispatch.
-    let response = send_raw_request(
+    // HTTP request parsing honors the absolute target's authority over Host,
+    // but routed Web still requires that authority to be trusted. An attacker
+    // cannot bypass read/SSE Host admission using absolute-form requests.
+    let rebound = send_raw_request(
         server.port,
-        "GET http://example.test/users?limit=31 HTTP/1.1\r\nHost: misleading.test\r\nConnection: close\r\n\r\n",
+        "GET http://attacker.test/users?limit=31 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        rebound.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+        "{rebound}"
     );
 
-    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
-    assert!(response_body(&response).starts_with("31"), "{response}");
+    let trusted = send_raw_request(
+        server.port,
+        &format!(
+            "GET http://localhost:{}/users?limit=31 HTTP/1.1\r\nHost: misleading.test\r\nConnection: close\r\n\r\n",
+            server.port
+        ),
+    );
+    assert!(trusted.starts_with("HTTP/1.1 200 OK\r\n"), "{trusted}");
+    assert!(response_body(&trusted).starts_with("31"), "{trusted}");
 }
 
 #[test]

@@ -1042,14 +1042,14 @@ fn unsafe_origin_response(
         public_origin,
     )
     .err()?;
-    eprintln!("Nulang Web denied state-changing request: {failure:?}");
+    eprintln!("Nulang Web denied request admission: {failure:?}");
     Some(HttpResponse {
         status: 403,
         headers: vec![
             ("Content-Type".into(), "text/plain; charset=utf-8".into()),
             ("Cache-Control".into(), "no-store".into()),
         ],
-        body: b"Forbidden: invalid request origin".to_vec(),
+        body: b"Forbidden: invalid request authority or origin".to_vec(),
     })
 }
 
@@ -1250,6 +1250,34 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
     ) -> std::io::Result<Self> {
+        let public_origin = match std::env::var("NULANG_WEB_PUBLIC_ORIGIN") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid NULANG_WEB_PUBLIC_ORIGIN: {error}"),
+                ));
+            }
+        };
+        Self::bind_runtime_configured(port, static_dir, output_dir, routes, public_origin)
+    }
+
+    fn bind_runtime_configured(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        public_origin: Option<String>,
+    ) -> std::io::Result<Self> {
+        if let Some(origin) = public_origin.as_deref() {
+            crate::web::csrf::validate_public_origin(origin).map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid NULANG_WEB_PUBLIC_ORIGIN: {error:?}"),
+                )
+            })?;
+        }
         let listener = TcpListener::bind(("0.0.0.0", port))?;
         let actual_port = listener.local_addr()?.port();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1266,6 +1294,7 @@ impl WebDevServer {
                     static_dir_clone,
                     output_dir_clone,
                     routes_clone,
+                    public_origin,
                     shutdown_clone,
                 );
             })?;
@@ -1282,6 +1311,7 @@ impl WebDevServer {
         static_dir: Option<PathBuf>,
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
+        public_origin: Option<String>,
         shutdown: Arc<AtomicBool>,
     ) {
         listener.set_nonblocking(true).ok();
@@ -1314,6 +1344,7 @@ impl WebDevServer {
                     let static_dir = static_dir.clone();
                     let output_dir = output_dir.clone();
                     let routes = Arc::clone(&routes);
+                    let public_origin = public_origin.clone();
                     let shutdown = Arc::clone(&shutdown);
                     // A failed spawn drops the closure and lease, returning capacity.
                     if let Err(error) = std::thread::Builder::new()
@@ -1321,7 +1352,12 @@ impl WebDevServer {
                         .spawn(move || {
                             let _lease = lease;
                             Self::handle_connection(
-                                stream, static_dir, output_dir, routes, shutdown,
+                                stream,
+                                static_dir,
+                                output_dir,
+                                routes,
+                                public_origin,
+                                shutdown,
                             );
                         })
                     {
@@ -1341,6 +1377,7 @@ impl WebDevServer {
         static_dir: Option<PathBuf>,
         output_dir: Option<PathBuf>,
         routes: Arc<Vec<RuntimeWebRoute>>,
+        public_origin: Option<String>,
         shutdown: Arc<AtomicBool>,
     ) {
         let request = match read_http_request(&mut stream) {
@@ -1353,7 +1390,6 @@ impl WebDevServer {
         };
         // Both provenance and session synchronizer checks are request-admission
         // boundaries. Reject before dispatching typed or legacy handlers.
-        let public_origin = std::env::var("NULANG_WEB_PUBLIC_ORIGIN").ok();
         if let Some(forbidden) =
             unsafe_origin_response(&request, stream.local_addr().ok(), public_origin.as_deref())
         {
@@ -1602,6 +1638,88 @@ mod tests {
     }
 
     #[test]
+    fn configured_public_origin_is_validated_before_listener_startup() {
+        for invalid in [
+            "http://app.example.com",
+            "https://app.example.com/path",
+            "https://app.example.com:wrong",
+            "https://app.example.com:",
+            "https://app.example.com:00000",
+            "https://[::1]:bad",
+            "https://",
+        ] {
+            let result = WebDevServer::bind_runtime_configured(
+                0,
+                None,
+                None,
+                vec![],
+                Some(invalid.to_string()),
+            );
+            assert!(
+                result.is_err(),
+                "invalid origin {invalid:?} must fail startup"
+            );
+        }
+
+        for origin in [
+            "https://app.example.com",
+            "https://app.example.com:8443",
+            "https://[::1]:8443",
+        ] {
+            let valid = WebDevServer::bind_runtime_configured(
+                0,
+                None,
+                None,
+                vec![],
+                Some(origin.to_string()),
+            );
+            assert!(valid.is_ok(), "valid HTTPS origin {origin:?} should bind");
+        }
+    }
+
+    #[test]
+    fn configured_public_origin_is_pinned_for_real_http_requests() {
+        let server = WebDevServer::bind_runtime_configured(
+            0,
+            None,
+            None,
+            vec![],
+            Some("https://app.example.com".to_string()),
+        )
+        .expect("valid proxy origin should allow startup");
+
+        let send = |host: &str, origin: &str| {
+            let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request = format!(
+                "POST /missing HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(request.as_bytes()).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        };
+
+        assert!(
+            send("app.example.com", "https://app.example.com")
+                .starts_with("HTTP/1.1 404 Not Found"),
+            "correctly scoped request should reach routing"
+        );
+        assert!(
+            send("app.example.com", "https://attacker.example")
+                .starts_with("HTTP/1.1 403 Forbidden"),
+            "foreign Origin must fail closed"
+        );
+        assert!(
+            send("attacker.example", "https://app.example.com")
+                .starts_with("HTTP/1.1 403 Forbidden"),
+            "foreign Host must fail closed"
+        );
+    }
+
+    #[test]
     fn unauthenticated_cross_origin_post_cannot_reach_web_routing() {
         let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
         let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
@@ -1647,6 +1765,38 @@ mod tests {
 
         let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
         let host = format!("localhost:{}", server.port);
+        // A cross-origin script can DNS-rebind attacker.example to localhost.
+        // Read-only routes must reject that Host before any page or SSE dispatch.
+        let rebound_read = format!(
+            "GET / HTTP/1.1\r\nHost: attacker.example:{}\r\n\r\n",
+            server.port
+        );
+        assert!(
+            send(server.port, &rebound_read).starts_with("HTTP/1.1 403 Forbidden"),
+            "read routes must reject DNS-rebound hosts"
+        );
+
+        let trusted_read = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        assert!(
+            send(server.port, &trusted_read).starts_with("HTTP/1.1 404 Not Found"),
+            "valid read requests must reach normal routing"
+        );
+
+        let rebound_sse = format!(
+            "GET /__nulang/sse/room HTTP/1.1\r\nHost: attacker.example:{}\r\n\r\n",
+            server.port
+        );
+        assert!(
+            send(server.port, &rebound_sse).starts_with("HTTP/1.1 403 Forbidden"),
+            "SSE must reject an untrusted Host before subscribing"
+        );
+
+        let missing_host = "GET / HTTP/1.1\r\nConnection: close\r\n\r\n";
+        assert!(
+            send(server.port, missing_host).starts_with("HTTP/1.1 400 Bad Request"),
+            "HTTP/1.1 framing must reject missing Host before Web admission"
+        );
+
         let foreign = format!(
             "POST /mutation HTTP/1.1\r\nHost: {host}\r\nOrigin: https://attacker.example\r\nContent-Length: 0\r\n\r\n"
         );

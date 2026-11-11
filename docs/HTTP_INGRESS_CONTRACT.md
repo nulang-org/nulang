@@ -30,12 +30,21 @@ and `Expect: 100-continue` remain unsupported.
 
 `read_http_request` is shared by the standalone `Http.serve` listener and
 the experimental routed Web server, so HTTP version, target, and Host admission
-apply to both. The later Origin/Referer and development-session CSRF checks
-are **routed-Web only**; they are not a general-purpose authorization layer for
-`Http.serve`. HTTP/1.1 Host syntax validation alone does not authenticate a
-host, prevent DNS rebinding for safe-method handlers, or provide an origin
-trust policy at a reverse proxy. A deployment must enforce trusted proxy
-routing and application authorization separately.
+apply to both. The later routed-Web Host policy rejects untrusted hosts for **all methods**,
+including GET, HEAD, OPTIONS, static files, and SSE, before dispatch. For direct
+loopback development, read-only requests may retain the legacy `Host: localhost`
+form without a port; unsafe methods require their strict authority.
+An explicitly configured `NULANG_WEB_PUBLIC_ORIGIN` must use HTTPS and is
+the trusted authority for **both** reads and mutations. Absolute-form HTTP
+targets still override a conflicting Host field as required by RFC 9112, but
+the resulting authority must pass routed-Web admission.
+
+Origin/Referer, Fetch Metadata and development-session CSRF checks remain
+**routed-Web only** and are required for unsafe methods; they are not a
+general-purpose authorization layer for `Http.serve`. Host admission does not
+authenticate users, enforce tenant permissions, or make SSE safe for private
+data. Deployments still require a trusted proxy configuration and independent
+application authorization.
 
 The normative reference is
 [HTTP/1.1 RFC 9112](https://www.rfc-editor.org/rfc/rfc9112.html),
