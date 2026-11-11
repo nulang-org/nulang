@@ -44,6 +44,69 @@ fn pre_cancelled_scope_rejects_halt_before_execution_on_both_hosts() {
 }
 
 #[test]
+fn native_precancelled_entrypoints_do_not_allocate_execution_frames() {
+    let token = CancellationToken::default();
+    token.cancel();
+    let mut native = VM::new_without_jit();
+    native.load_module(module_with_halt());
+    native.set_cancellation_token(Some(token));
+
+    let err = native.run().expect_err("cancelled run must fail");
+    assert!(format!("{err}").contains("Task cancelled"));
+    assert!(native.frames().is_empty(), "cancelled run created a frame");
+
+    let err = native
+        .run_from(0, 0)
+        .expect_err("cancelled run_from must fail");
+    assert!(format!("{err}").contains("Task cancelled"));
+    assert!(
+        native.frames().is_empty(),
+        "cancelled run_from created a frame"
+    );
+
+    let err = native
+        .call_function(0, 0, &[])
+        .expect_err("cancelled call_function must fail");
+    assert!(format!("{err}").contains("Task cancelled"));
+    assert!(
+        native.frames().is_empty(),
+        "cancelled call_function created a frame"
+    );
+}
+
+#[test]
+fn native_precancelled_entrypoints_preserve_existing_activation() {
+    let token = CancellationToken::default();
+    let mut native = VM::new_without_jit();
+    native.load_module(module_with_halt());
+    native
+        .run()
+        .expect("baseline run should create a completed frame");
+    let before_pc = native.frames()[0].pc;
+    let before_register = native.frames()[0].regs[0];
+
+    token.cancel();
+    native.set_cancellation_token(Some(token));
+    for name in ["run", "run_from", "call_function", "resume"] {
+        let result = match name {
+            "run" => native.run(),
+            "run_from" => native.run_from(0, 0),
+            "call_function" => native.call_function(0, 0, &[]),
+            _ => native.resume(),
+        };
+        let err = result.expect_err("cancelled scope must reject execution");
+        assert!(format!("{err}").contains("Task cancelled"), "{name}: {err}");
+        assert_eq!(native.frames().len(), 1, "{name} changed frame count");
+        assert_eq!(native.frames()[0].pc, before_pc, "{name} changed pc");
+        assert_eq!(
+            native.frames()[0].regs[0],
+            before_register,
+            "{name} changed register"
+        );
+    }
+}
+
+#[test]
 fn expired_deadline_rejects_program_on_both_hosts() {
     let token = CancellationToken::with_deadline(Instant::now() - Duration::from_secs(1));
     let module = module_with_halt();
@@ -53,6 +116,10 @@ fn expired_deadline_rejects_program_on_both_hosts() {
     native.set_cancellation_token(Some(token.clone()));
     let err = native.run().unwrap_err();
     assert!(format!("{err}").contains("Task deadline exceeded"), "{err}");
+    assert!(
+        native.frames().is_empty(),
+        "an expired deadline must not create a native activation frame"
+    );
 
     let mut portable = CoreVM::new();
     let idx = portable.load_module_from_code(&module).unwrap();
