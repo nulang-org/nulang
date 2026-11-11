@@ -86,6 +86,21 @@ fn legacy_route() -> WebRoute {
     }
 }
 
+fn turbo_route() -> WebRoute {
+    let (module, function_index) = compile_handler(
+        r#"fn turbo() {
+    perform Web.turbo_stream("append", "todos", perform Web.text("Tea & toast </template><script>alert(1)</script>"))
+}"#,
+        "turbo",
+    );
+    WebRoute {
+        method: HttpMethod::Post,
+        path: "/todos".to_string(),
+        handler_module: module,
+        handler_func_idx: function_index,
+    }
+}
+
 fn send_raw_request(port: u16, request: &str) -> String {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to WebDevServer");
     stream
@@ -349,4 +364,62 @@ fn rejected_html_in_path_bound_handler_is_execution_error_not_rendered_nil() {
         .expect("valid Html must render");
     assert!(html.starts_with("<turbo-frame"), "{html}");
     assert!(html.contains("src=\"/activities\""), "{html}");
+}
+
+#[test]
+fn turbo_stream_web_effect_sets_mime_and_preserves_escaped_html_over_http() {
+    let server = WebDevServer::bind(0, None, None, vec![turbo_route(), legacy_route()])
+        .expect("bind Turbo WebDevServer");
+    let stream_response = send_raw_request(
+        server.port,
+        "POST /todos HTTP/1.1\r\nHost: localhost\r\nAccept: text/vnd.turbo-stream.html\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        stream_response.starts_with("HTTP/1.1 200 OK\r\n"),
+        "{stream_response}"
+    );
+    assert!(
+        stream_response
+            .to_ascii_lowercase()
+            .contains("content-type: text/vnd.turbo-stream.html; charset=utf-8\r\n"),
+        "{stream_response}"
+    );
+    assert_eq!(
+        response_body(&stream_response),
+        "<turbo-stream action=\"append\" target=\"todos\"><template>Tea &amp; toast &lt;/template&gt;&lt;script&gt;alert(1)&lt;/script&gt;</template></turbo-stream>"
+    );
+
+    let html_response = send_raw_request(
+        server.port,
+        "GET /legacy HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        html_response
+            .to_ascii_lowercase()
+            .contains("content-type: text/html; charset=utf-8\r\n"),
+        "{html_response}"
+    );
+    assert!(
+        response_body(&html_response).starts_with("legacy"),
+        "{html_response}"
+    );
+}
+
+#[test]
+fn turbo_stdlib_helpers_typecheck_with_import_resolution() {
+    use std::collections::HashSet;
+    use std::path::Path;
+    let source_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/behavior/web_19_turbo_stream.nula");
+    let source = std::fs::read_to_string(&source_path).expect("read Turbo conformance fixture");
+    let tokens = Lexer::new(&source).lex().expect("lex Turbo fixture");
+    let mut ast = Parser::new(tokens)
+        .parse_module()
+        .expect("parse Turbo fixture");
+    let mut visited = HashSet::new();
+    nulang::resolver::resolve_imports(&mut ast, &source_path, &mut visited)
+        .expect("resolve stdlib web turbo imports");
+    TypeChecker::new()
+        .check_module(&ast)
+        .expect("typecheck imported Turbo helpers");
 }
