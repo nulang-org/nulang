@@ -37,6 +37,14 @@ pub const STDLIB_MODULES: &[StdlibModule] = &[
         package_mirror: None,
     },
     StdlibModule {
+        name: "bytes",
+        import_path: "stdlib::bytes",
+        source_path: "src/stdlib/bytes.nula",
+        stability: StabilityTier::Experimental,
+        description: "UTF-8 octet extraction and strict hexadecimal encoding/decoding over [Int]; in-memory only.",
+        package_mirror: None,
+    },
+    StdlibModule {
         name: "map",
         import_path: "stdlib::map",
         source_path: "src/stdlib/map.nula",
