@@ -1,8 +1,9 @@
-//! HTTP/1.1 server built on std::net::TcpListener with httparse.
+//! Experimental HTTP/1.1 server built on std::net::TcpListener with httparse.
 //!
-//! Phase 1: each request dispatches to a standalone VM on the listener thread.
+//! Accepted connections run on bounded worker threads; handler dispatch uses
+//! a standalone VM per request. Connections close after one HTTP request.
 //! Handlers are non-capturing `fn(String) -> String` — no closures with env.
-//! Status is always 200; Content-Type is always text/plain.
+//! This transport does not yet support persistent HTTP connections or HTTP/2.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -263,6 +264,8 @@ pub struct HttpServerState {
     pub handler_func_idx: usize,
     /// True while the server is running; set to false to signal shutdown.
     shutdown_flag: Arc<AtomicBool>,
+    /// Bounded worker admission and handles for orderly connection shutdown.
+    connection_slots: Arc<ConnectionSlots>,
     /// Listener thread handle.
     listener_thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -280,14 +283,30 @@ impl std::fmt::Debug for HttpServerState {
 
 impl Drop for HttpServerState {
     fn drop(&mut self) {
-        self.shutdown_flag.store(true, Ordering::Relaxed);
+        self.shutdown_flag.store(true, Ordering::Release);
         if let Some(handle) = self.listener_thread.take() {
             let _ = handle.join();
+        }
+        // Let ordinary requests finish before interrupting stalled socket
+        // reads. Non-cooperative application code is not forcibly killed.
+        if !self
+            .connection_slots
+            .wait_for_drain(Duration::from_millis(500))
+        {
+            self.connection_slots.interrupt_active();
+            if !self
+                .connection_slots
+                .wait_for_drain(Duration::from_millis(1500))
+            {
+                eprintln!("standalone HTTP server shutdown: workers exceeded drain deadline");
+            }
         }
     }
 }
 
 impl HttpServerState {
+    const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+
     pub fn bind(
         port: u16,
         handler_module: CodeModule,
@@ -297,12 +316,20 @@ impl HttpServerState {
         let actual_port = listener.local_addr()?.port();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
+        let connection_slots = Arc::new(ConnectionSlots::new(Self::MAX_CONCURRENT_CONNECTIONS));
+        let slots_for_listener = Arc::clone(&connection_slots);
         let module_clone = handler_module.clone();
 
         let handle = std::thread::Builder::new()
             .name("nulang-http-listener".into())
             .spawn(move || {
-                Self::listener_loop(listener, module_clone, handler_func_idx, shutdown_clone);
+                Self::listener_loop(
+                    listener,
+                    module_clone,
+                    handler_func_idx,
+                    shutdown_clone,
+                    slots_for_listener,
+                );
             })?;
 
         Ok(HttpServerState {
@@ -310,6 +337,7 @@ impl HttpServerState {
             handler_module,
             handler_func_idx,
             shutdown_flag: shutdown,
+            connection_slots,
             listener_thread: Some(handle),
         })
     }
@@ -319,16 +347,49 @@ impl HttpServerState {
         handler_module: CodeModule,
         handler_func_idx: usize,
         shutdown: Arc<AtomicBool>,
+        slots: Arc<ConnectionSlots>,
     ) {
         listener.set_nonblocking(true).ok();
+        let handler_module = Arc::new(handler_module);
         loop {
             if shutdown.load(Ordering::Relaxed) {
                 break;
             }
             match listener.accept() {
-                Ok((stream, _)) => {
+                Ok((mut stream, _)) => {
+                    let lease = match slots.try_acquire_socket(&stream) {
+                        Ok(Some(lease)) => lease,
+                        Ok(None) => {
+                            let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+                            Self::write_response(
+                                &mut stream,
+                                &HttpResponse {
+                                    status: 503,
+                                    headers: vec![
+                                        ("Content-Type".into(), "text/plain".into()),
+                                        ("Retry-After".into(), "1".into()),
+                                    ],
+                                    body: b"Server at connection capacity".to_vec(),
+                                },
+                            );
+                            continue;
+                        }
+                        Err(error) => {
+                            eprintln!("failed to track HTTP connection for shutdown: {error}");
+                            continue;
+                        }
+                    };
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-                    Self::handle_connection(stream, &handler_module, handler_func_idx);
+                    let module = Arc::clone(&handler_module);
+                    if let Err(error) = std::thread::Builder::new()
+                        .name("nulang-http-connection".into())
+                        .spawn(move || {
+                            let _lease = lease;
+                            Self::handle_connection(stream, &module, handler_func_idx);
+                        })
+                    {
+                        eprintln!("failed to spawn HTTP connection worker: {error}");
+                    }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(10));
