@@ -1,5 +1,8 @@
 # Nulang Changelog
 
+### Canonical Option/Result combinators — 2026-11-10
+- **`stdlib::option` and `stdlib::result` use prelude-owned algebraic types.** Add `and_then`, `or_else`, `unwrap_or`, `unwrap_or_else`, Option `filter` and `ok_or`, and Result `map_err` and `to_option`. End-to-end conformance tests cover success, error, and fallback paths. Existing aborting `unwrap` is unchanged pending cross-backend panic parity.
+
 ### Gregorian datetime validation — 2026-11-10
 - **`stdlib::datetime.is_valid` now rejects impossible calendar dates.** Validation checks actual Gregorian month lengths, leap-year centuries, and existing time-field bounds. The constructor remains unchanged; focused Nulang and `datetime-ext` regression fixtures cover invalid dates.
 ### TLS PEM parser maintenance — 2026-11-10 (draft)

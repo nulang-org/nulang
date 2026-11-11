@@ -1,0 +1,1 @@
+{"exit_code":0,"stdout":"map=Ok(6)\nmap_error_passthrough=Error(bad)\nmap_err=Error(bad!)\nand_then=Ok(4)\nand_then_error=Error(bad)\nor_else=Ok(9)\nunwrap_or=11\nunwrap_or_else=12\nto_option_ok=Some(4)\nto_option_error=None\nis_ok=yes\nis_err=yes","stderr":""}
