@@ -25,7 +25,11 @@ pub fn lower_module(
     // Preserve statically-known nominal actor identity before HIR erases the
     // protocol environment. The pass is idempotent because the canonical
     // compiler pipeline already runs it during type checking.
-    let annotated_ast = crate::actor_protocol::annotate_module(ast).ok();
+    let annotated_ast = if crate::actor_protocol::has_actor_protocols(ast) {
+        crate::actor_protocol::annotate_module(ast).ok()
+    } else {
+        None
+    };
     let ast = annotated_ast.as_ref().unwrap_or(ast);
 
     let mut module = hir::Module::new(&ast.name);
@@ -1860,23 +1864,40 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
             });
             hir::Operand::Var(temp, ty)
         }
-        Expr::Binary {
-            op,
-            left,
-            right,
-            span,
-        } => {
-            let l = lower_expr(left, body);
-            let r = lower_expr(right, body);
-            let ty = binary_type(op, &l, &r);
-            let temp = fresh_temp_name();
-            body.push(hir::Stmt::Let {
-                name: temp.clone(),
-                ty: ty.clone(),
-                value: hir::RValue::Binary(*op, l, r, ty.clone()),
-                span: *span,
-            });
-            hir::Operand::Var(temp, ty)
+        Expr::Binary { .. } => {
+            // Pratt parsing produces a left-nested AST for sequences such as
+            // a + b + c. Lower this left spine iteratively to avoid one Rust
+            // stack frame per operator. Preserve left-to-right evaluation and
+            // leave assignment/range to their dedicated lowering branches.
+            let mut chain = Vec::new();
+            let mut cursor = expr;
+            while let Expr::Binary {
+                op,
+                left,
+                right,
+                span,
+            } = cursor
+            {
+                if matches!(op, BinOp::Assign | BinOp::Range) {
+                    break;
+                }
+                chain.push((*op, right.as_ref(), *span));
+                cursor = left;
+            }
+            let mut result = lower_expr(cursor, body);
+            for (op, right, span) in chain.into_iter().rev() {
+                let r = lower_expr(right, body);
+                let ty = binary_type(&op, &result, &r);
+                let temp = fresh_temp_name();
+                body.push(hir::Stmt::Let {
+                    name: temp.clone(),
+                    ty: ty.clone(),
+                    value: hir::RValue::Binary(op, result, r, ty.clone()),
+                    span,
+                });
+                result = hir::Operand::Var(temp, ty);
+            }
+            result
         }
         Expr::Unary { op, expr, span } => {
             let e = lower_expr(expr, body);
