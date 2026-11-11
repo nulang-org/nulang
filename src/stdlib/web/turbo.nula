@@ -1,0 +1,35 @@
+// Turbo Stream helpers. These are progressive-enhancement responses;
+// the browser uses the official Turbo client. No custom JS runtime is needed.
+import stdlib::web::types
+
+pub fn append(target: String, content: Html) -> Html ! {Web, Render, Respond} {
+    perform Web.turbo_stream("append", target, content)
+}
+
+pub fn prepend(target: String, content: Html) -> Html ! {Web, Render, Respond} {
+    perform Web.turbo_stream("prepend", target, content)
+}
+
+pub fn replace(target: String, content: Html) -> Html ! {Web, Render, Respond} {
+    perform Web.turbo_stream("replace", target, content)
+}
+
+pub fn update(target: String, content: Html) -> Html ! {Web, Render, Respond} {
+    perform Web.turbo_stream("update", target, content)
+}
+
+pub fn before(target: String, content: Html) -> Html ! {Web, Render, Respond} {
+    perform Web.turbo_stream("before", target, content)
+}
+
+pub fn after(target: String, content: Html) -> Html ! {Web, Render, Respond} {
+    perform Web.turbo_stream("after", target, content)
+}
+
+pub fn remove(target: String) -> Html ! {Web, Render, Respond} {
+    perform Web.turbo_stream("remove", target, perform Web.text(""))
+}
+
+pub fn refresh() -> Html ! {Web, Render, Respond} {
+    perform Web.turbo_stream("refresh", "", perform Web.text(""))
+}

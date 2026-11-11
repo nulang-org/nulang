@@ -665,6 +665,7 @@ pub struct RequestContext {
 thread_local! {
     static CURRENT_REQUEST: RefCell<Option<RequestContext>> = const { RefCell::new(None) };
     static RESPONSE_COOKIES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static RESPONSE_MEDIA_TYPE: RefCell<Option<&'static str>> = const { RefCell::new(None) };
 }
 
 /// Set the request context for the current thread, run `f`, then clear it.
@@ -674,9 +675,24 @@ where
 {
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = Some(ctx));
     RESPONSE_COOKIES.with(|c| c.borrow_mut().clear());
+    RESPONSE_MEDIA_TYPE.with(|c| *c.borrow_mut() = None);
     let result = f();
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = None);
     result
+}
+
+/// Select the Turbo Stream media type only inside a live Web request.
+pub fn mark_turbo_stream_response() {
+    CURRENT_REQUEST.with(|ctx| {
+        if ctx.borrow().is_some() {
+            RESPONSE_MEDIA_TYPE
+                .with(|media| *media.borrow_mut() = Some(crate::web::turbo::TURBO_STREAM_MIME));
+        }
+    });
+}
+
+fn take_response_media_type() -> Option<&'static str> {
+    RESPONSE_MEDIA_TYPE.with(|media| media.borrow_mut().take())
 }
 
 /// Generate a cryptographically random, 256-bit opaque session secret.
@@ -1018,6 +1034,11 @@ pub fn render_route_handler(
     module.emit(Instruction::new0(OpCode::Ret));
     vm.load_module(module);
     let mut run = || match vm.run_from(0, entry_offset) {
+        // An invalid HTML host operation returns a VM nil. It is not a valid
+        // rendered response and must not become a successful "nil" document.
+        // Check the actual tagged Value, not its string representation:
+        // returning the legitimate String "nil" still means HTTP 200.
+        Ok(result) if result.is_nil() => None,
         Ok(result) => Some(vm.value_to_string(0, result)),
         Err(_) => None,
     };
@@ -1409,12 +1430,33 @@ impl WebDevServer {
                         )),
                         Err(error) => Err(error),
                     });
+                // Stream markup must not be modified by the Nulang client
+                // script injector, and must carry Turbo's dedicated MIME.
+                let response_media_type = take_response_media_type();
                 match rendered {
-                    Ok(Some(html)) => HttpResponse {
-                        status: 200,
-                        headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())],
-                        body: inject_client_runtime_script(&html).into_bytes(),
-                    },
+                    Ok(Some(html)) => {
+                        let is_turbo =
+                            response_media_type == Some(crate::web::turbo::TURBO_STREAM_MIME);
+                        HttpResponse {
+                            status: 200,
+                            headers: vec![(
+                                "Content-Type".into(),
+                                if is_turbo {
+                                    format!(
+                                        "{}; charset=utf-8",
+                                        crate::web::turbo::TURBO_STREAM_MIME
+                                    )
+                                } else {
+                                    "text/html; charset=utf-8".into()
+                                },
+                            )],
+                            body: if is_turbo {
+                                html.into_bytes()
+                            } else {
+                                inject_client_runtime_script(&html).into_bytes()
+                            },
+                        }
+                    }
                     Ok(None) => HttpResponse {
                         status: 500,
                         headers: vec![("Content-Type".into(), "text/plain".into())],
@@ -2320,6 +2362,42 @@ mod tests {
         assert!(String::from_utf8(response.body)
             .unwrap()
             .contains("Invalid UI action envelope"));
+    }
+
+    #[test]
+    fn turbo_mime_is_only_selected_inside_the_current_request() {
+        fn context() -> RequestContext {
+            RequestContext {
+                request: HttpRequest {
+                    method: HttpMethod::Post,
+                    path: "/todos".to_string(),
+                    headers: vec![],
+                    body: vec![],
+                },
+                params: HashMap::new(),
+            }
+        }
+
+        mark_turbo_stream_response();
+        assert_eq!(take_response_media_type(), None);
+
+        with_request_context(context(), || {
+            mark_turbo_stream_response();
+            assert_eq!(
+                take_response_media_type(),
+                Some(crate::web::turbo::TURBO_STREAM_MIME)
+            );
+            mark_turbo_stream_response();
+        });
+        assert_eq!(
+            take_response_media_type(),
+            Some(crate::web::turbo::TURBO_STREAM_MIME)
+        );
+
+        with_request_context(context(), || {
+            assert_eq!(take_response_media_type(), None);
+        });
+        assert_eq!(take_response_media_type(), None);
     }
 
     #[test]
