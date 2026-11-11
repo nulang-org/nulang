@@ -40,6 +40,18 @@ fn package_root() -> NuResult<PathBuf> {
     })
 }
 
+/// Require a non-empty value after a CLI option, rather than accidentally
+/// consuming another option or dispatching with a missing value.
+fn option_value<'a>(args: &'a [String], index: usize, option: &str) -> NuResult<&'a str> {
+    args.get(index + 1)
+        .filter(|value| !value.is_empty() && !value.starts_with('-'))
+        .map(String::as_str)
+        .ok_or_else(|| NuError::PackageError {
+            msg: format!("{option} requires a value"),
+            span: Span::default(),
+        })
+}
+
 /// Dispatch a `nula` invocation (`args` excludes the leading `nula`).
 pub fn run(args: &[String]) -> NuResult<()> {
     // Module-contributed subcommands (`@nulang/auth enable`, etc.) take
@@ -56,10 +68,8 @@ pub fn run(args: &[String]) -> NuResult<()> {
             while i < args.len() {
                 match args[i].as_str() {
                     "--template" => {
+                        template = Some(option_value(args, i, "--template")?);
                         i += 1;
-                        if i < args.len() {
-                            template = Some(args[i].as_str());
-                        }
                     }
                     other => {
                         if path_arg.is_some() {
@@ -77,17 +87,29 @@ pub fn run(args: &[String]) -> NuResult<()> {
         }
         Some("init") => cmd_init(),
         Some("build") => {
-            let web = args.get(1).map(String::as_str) == Some("--web");
+            let mut web = false;
+            let mut json = false;
+            for flag in &args[1..] {
+                match flag.as_str() {
+                    "--web" => web = true,
+                    "--json" => json = true,
+                    other => {
+                        return Err(NuError::PackageError {
+                            msg: format!("unknown flag '{}' for nula build", other),
+                            span: Span::default(),
+                        });
+                    }
+                }
+            }
+            if web && json {
+                return Err(NuError::PackageError {
+                    msg: "--json cannot be combined with --web".into(),
+                    span: Span::default(),
+                });
+            }
             if web {
                 cmd_build_web()
             } else {
-                let json = args[1..].iter().any(|a| a == "--json");
-                if args.len() > 1 && !json {
-                    return Err(NuError::PackageError {
-                        msg: format!("unknown flag '{}' for nula build", args[1]),
-                        span: Span::default(),
-                    });
-                }
                 cmd_build(json)
             }
         }
@@ -101,10 +123,8 @@ pub fn run(args: &[String]) -> NuResult<()> {
             while i < args.len() {
                 match args[i].as_str() {
                     "--filter" => {
+                        filter = Some(option_value(args, i, "--filter")?);
                         i += 1;
-                        if i < args.len() {
-                            filter = Some(args[i].as_str());
-                        }
                     }
                     "--verbose" | "-v" => verbose = true,
                     "--watch" | "-w" => watch = true,
@@ -138,13 +158,12 @@ pub fn run(args: &[String]) -> NuResult<()> {
             while i < args.len() {
                 match args[i].as_str() {
                     "--port" => {
+                        let value = option_value(args, i, "--port")?;
+                        port = Some(value.parse().map_err(|_| NuError::PackageError {
+                            msg: format!("invalid port '{}'", value),
+                            span: Span::default(),
+                        })?);
                         i += 1;
-                        if i < args.len() {
-                            port = Some(args[i].parse().map_err(|_| NuError::PackageError {
-                                msg: format!("invalid port '{}'", args[i]),
-                                span: Span::default(),
-                            })?);
-                        }
                     }
                     other => {
                         return Err(NuError::PackageError {
@@ -166,22 +185,16 @@ pub fn run(args: &[String]) -> NuResult<()> {
             while i < args.len() {
                 match args[i].as_str() {
                     "--path" => {
+                        path = Some(option_value(args, i, "--path")?.to_string());
                         i += 1;
-                        if i < args.len() {
-                            path = Some(args[i].clone());
-                        }
                     }
                     "--git" => {
+                        git = Some(option_value(args, i, "--git")?.to_string());
                         i += 1;
-                        if i < args.len() {
-                            git = Some(args[i].clone());
-                        }
                     }
                     "--version" => {
+                        version = Some(option_value(args, i, "--version")?.to_string());
                         i += 1;
-                        if i < args.len() {
-                            version = Some(args[i].clone());
-                        }
                     }
                     other => {
                         return Err(NuError::PackageError {
@@ -208,12 +221,12 @@ pub fn run(args: &[String]) -> NuResult<()> {
             while i < args.len() {
                 match args[i].as_str() {
                     "--registry" => {
+                        registry_url = Some(option_value(args, i, "--registry")?.to_string());
                         i += 1;
-                        if i < args.len() { registry_url = Some(args[i].clone()); }
                     }
                     "--token" => {
+                        token = Some(option_value(args, i, "--token")?.to_string());
                         i += 1;
-                        if i < args.len() { token = Some(args[i].clone()); }
                     }
                     other => {
                         return Err(NuError::PackageError {
@@ -237,17 +250,17 @@ pub fn run(args: &[String]) -> NuResult<()> {
             while i < args.len() {
                 match args[i].as_str() {
                     "--token" => {
+                        token = Some(option_value(args, i, "--token")?.to_string());
                         i += 1;
-                        if i < args.len() { token = Some(args[i].clone()); }
                     }
                     "--url" => {
+                        url = Some(option_value(args, i, "--url")?.to_string());
                         i += 1;
-                        if i < args.len() { url = Some(args[i].clone()); }
                     }
                     "--wasm" => wasm = true,
                     "--adapter" => {
+                        adapter = Some(option_value(args, i, "--adapter")?.to_string());
                         i += 1;
-                        if i < args.len() { adapter = Some(args[i].clone()); }
                     }
                     "--dry-run" => dry_run = true,
                     other => return Err(NuError::PackageError {
@@ -257,10 +270,17 @@ pub fn run(args: &[String]) -> NuResult<()> {
                 }
                 i += 1;
             }
-            let adapter = adapter
-                .as_deref()
-                .and_then(crate::web::adapters::AdapterKind::from_str)
-                .unwrap_or(crate::web::adapters::AdapterKind::NulangCloud);
+            let adapter = match adapter.as_deref() {
+                Some(value) => crate::web::adapters::AdapterKind::from_str(value).ok_or_else(|| {
+                    NuError::PackageError {
+                        msg: format!(
+                            "unknown deployment adapter '{value}' (expected cloud, static, or docker)"
+                        ),
+                        span: Span::default(),
+                    }
+                })?,
+                None => crate::web::adapters::AdapterKind::NulangCloud,
+            };
             cmd_deploy(wasm, url, token, adapter, dry_run)
         }
 
@@ -288,9 +308,11 @@ fn print_usage() {
     println!("                Scaffold a new package directory");
     println!("                Templates: default, cli, lib, full");
     println!("  init          Scaffold a new package in the current directory");
-    println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
+    println!("  build [--json] Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
+    println!("  build --web   Build the web application (not combined with --json)");
     println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
-    println!("  test [--filter <substr>] [--verbose|-v] [--watch|-w]  Run .nula test files");
+    println!("  test [--filter <substr>] [--verbose|-v] [--watch|-w] [--json]");
+    println!("                Run .nula test files");
     println!("  run           Build and run the package entry point");
     println!("  run --watch   Build and re-run on source changes");
     println!("  watch         Alias for 'run --watch'");
@@ -301,6 +323,8 @@ fn print_usage() {
     println!("                --token <token>   Auth token (or set NULA_TOKEN)");
     println!("  deploy        Build and deploy the package to Nulang Cloud");
     println!("                --wasm          Also bundle .wasm + .cwasm artifacts");
+    println!("                --adapter <kind>  cloud, static, or docker (default: cloud)");
+    println!("                --dry-run       Prepare without submitting deployment");
     println!("                --url <url>     Cloud API URL (or set NULANG_CLOUD_URL)");
     println!("                --token <token> Auth token (or set NULANG_CLOUD_TOKEN)");
     println!("  list          List resolved dependencies from Nulang.lock");
@@ -2752,6 +2776,74 @@ mod tests {
         assert!(matches!(err, NuError::PackageError { msg: _, span: _ }));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_nula_rejects_missing_option_values_before_dispatch() {
+        for (args, expected) in [
+            (vec!["test", "--filter"], "--filter requires a value"),
+            (
+                vec!["test", "--filter", "--json"],
+                "--filter requires a value",
+            ),
+            (vec!["new", "--template"], "--template requires a value"),
+            (vec!["deploy", "--adapter"], "--adapter requires a value"),
+            (
+                vec!["deploy", "--adapter", "--dry-run"],
+                "--adapter requires a value",
+            ),
+            (vec!["deploy", "--url"], "--url requires a value"),
+            (vec!["deploy", "--token"], "--token requires a value"),
+            (vec!["dev", "--port"], "--port requires a value"),
+            (vec!["add", "pkg", "--path"], "--path requires a value"),
+            (vec!["add", "pkg", "--git"], "--git requires a value"),
+            (
+                vec!["add", "pkg", "--version"],
+                "--version requires a value",
+            ),
+            (vec!["publish", "--registry"], "--registry requires a value"),
+            (vec!["publish", "--token"], "--token requires a value"),
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_string).collect();
+            let err = run(&args).expect_err("incomplete flags must fail before execution");
+            assert!(
+                err.to_string().contains(expected),
+                "args={args:?}, expected={expected:?}, got={err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nula_build_rejects_unknown_flags_even_with_json() {
+        let args = ["build", "--json", "--bogus"].map(str::to_string);
+        let err = run(&args).expect_err("unknown build flags must be rejected");
+        assert!(
+            err.to_string().contains("unknown flag '--bogus'"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn test_nula_build_rejects_incompatible_output_modes() {
+        for args in [["build", "--web", "--json"], ["build", "--json", "--web"]] {
+            let args = args.map(str::to_string);
+            let err = run(&args).expect_err("web build cannot silently ignore JSON output");
+            assert!(
+                err.to_string()
+                    .contains("--json cannot be combined with --web"),
+                "got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nula_deploy_rejects_unknown_adapter_without_fallback() {
+        let args = ["deploy", "--adapter", "not-a-real-adapter"].map(str::to_string);
+        let err = run(&args).expect_err("unknown adapters must not silently become cloud");
+        assert!(
+            err.to_string().contains("unknown deployment adapter"),
+            "got {err}"
+        );
     }
 
     #[test]
