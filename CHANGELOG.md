@@ -1,4 +1,8 @@
 # Nulang Changelog
+### NUL0 TCP partial-frame recovery across read timeouts — 2026-11-10
+- **Preserve bytes already consumed from NUL0 frame prefixes and payloads when socket reads return `WouldBlock`, `TimedOut`, or `Interrupted`.** Retry from the unconsumed offset rather than restarting `read_exact` with a fresh buffer, preventing frame misalignment and lost actor packets.
+- **Cover fragmented reads, shutdown and premature EOF with deterministic regressions.** Existing maximum-frame-size limits and transport failure semantics are retained. The intermittent five-node post-heal delivery problem still requires separate qualification; this change does not establish that it is fully resolved.
+
 ### SQLite local database pathname integrity — 2026-11-11
 - **Preserve native filesystem path bytes when opening local actor SQLite stores.** The security-migration adapter previously converted paths through lossy UTF-8, potentially opening a different file for a non-UTF-8 Unix pathname. The constructor now forwards Path directly, preserving database-file identity; the in-memory special name remains supported.
 - **Added a Unix filesystem regression checking exact filename bytes and no accidental replacement-name database.** Keep the patched SQLite/security integration and remote Turso fail-closed behavior separate; there are no new audit exclusions.
