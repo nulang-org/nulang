@@ -59,6 +59,8 @@ use crate::protocol::ProtocolId;
 use crate::vm::Value;
 
 #[cfg(feature = "tcp")]
+use rustls::pki_types::pem::PemObject;
+#[cfg(feature = "tcp")]
 use tracing::warn;
 
 // ---------------------------------------------------------------------------
@@ -202,7 +204,7 @@ impl TlsConfig {
             TlsConfig::MutualTls {
                 server_cert_pem, ..
             } => {
-                let certs = rustls_pemfile::certs(&mut server_cert_pem.as_slice())
+                let certs = rustls::pki_types::CertificateDer::pem_slice_iter(server_cert_pem)
                     .collect::<Result<Vec<_>, _>>()
                     .ok()?;
                 certs.first().map(|c| c.clone().to_vec())
@@ -216,7 +218,7 @@ impl TlsConfig {
 #[cfg(feature = "tcp")]
 fn parse_pem_cert(pem: &[u8]) -> io::Result<rustls::pki_types::CertificateDer<'static>> {
     let certs: Vec<rustls::pki_types::CertificateDer> =
-        rustls_pemfile::certs(&mut std::io::BufReader::new(pem))
+        rustls::pki_types::CertificateDer::pem_slice_iter(pem)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("PEM cert: {e}")))?;
     certs
@@ -229,7 +231,7 @@ fn parse_pem_cert(pem: &[u8]) -> io::Result<rustls::pki_types::CertificateDer<'s
 #[cfg(feature = "tcp")]
 fn parse_pem_cert_chain(pem: &[u8]) -> io::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
     let certs: Vec<rustls::pki_types::CertificateDer> =
-        rustls_pemfile::certs(&mut std::io::BufReader::new(pem))
+        rustls::pki_types::CertificateDer::pem_slice_iter(pem)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| {
                 io::Error::new(io::ErrorKind::InvalidData, format!("PEM cert chain: {e}"))
@@ -245,7 +247,9 @@ fn parse_pem_cert_chain(pem: &[u8]) -> io::Result<Vec<rustls::pki_types::Certifi
 /// Parse a PEM-encoded private key (PKCS#8 or RSA).
 #[cfg(feature = "tcp")]
 fn parse_pem_key(pem: &[u8]) -> io::Result<rustls::pki_types::PrivateKeyDer<'static>> {
-    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(pem))
+    let key = rustls::pki_types::PrivateKeyDer::pem_slice_iter(pem)
+        .next()
+        .transpose()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("PEM key: {e}")))?
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty PEM key"))?;
     Ok(key)
@@ -2849,6 +2853,74 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     #[cfg(feature = "tcp")]
     use std::thread::sleep;
+
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn pem_certificate_chain_retains_order_and_node_identity() {
+        let chain = b"-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nBAUG\n-----END CERTIFICATE-----\n";
+        let certs = parse_pem_cert_chain(chain).expect("two valid PEM sections");
+        assert_eq!(certs.len(), 2);
+        assert_eq!(certs[0].as_ref(), &[1, 2, 3]);
+        assert_eq!(certs[1].as_ref(), &[4, 5, 6]);
+        assert_eq!(parse_pem_cert(chain).unwrap().as_ref(), &[1, 2, 3]);
+
+        let config = TlsConfig::MutualTls {
+            ca_cert_pem: chain.to_vec(),
+            server_cert_pem: chain.to_vec(),
+            server_key_pem: vec![],
+            server_name: None,
+        };
+        assert_eq!(config.server_cert_der(), Some(vec![1, 2, 3]));
+    }
+
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn pem_certificate_parser_rejects_malformed_trailing_certificate() {
+        let bad_chain = b"-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\n%%%\n-----END CERTIFICATE-----\n";
+        assert!(parse_pem_cert_chain(bad_chain).is_err());
+        assert!(parse_pem_cert(bad_chain).is_err());
+        let config = TlsConfig::MutualTls {
+            ca_cert_pem: vec![],
+            server_cert_pem: bad_chain.to_vec(),
+            server_key_pem: vec![],
+            server_name: None,
+        };
+        assert!(config.server_cert_der().is_none());
+        assert_eq!(
+            parse_pem_cert_chain(b"not a certificate")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn pem_private_key_parser_recognizes_pkcs8_rsa_and_ec() {
+        use rustls::pki_types::PrivateKeyDer;
+        let pkcs8 = b"-----BEGIN PRIVATE KEY-----\nAQID\n-----END PRIVATE KEY-----\n";
+        let rsa = b"-----BEGIN RSA PRIVATE KEY-----\nAQID\n-----END RSA PRIVATE KEY-----\n";
+        let ec = b"-----BEGIN EC PRIVATE KEY-----\nAQID\n-----END EC PRIVATE KEY-----\n";
+        assert!(matches!(
+            parse_pem_key(pkcs8).unwrap(),
+            PrivateKeyDer::Pkcs8(_)
+        ));
+        assert!(matches!(
+            parse_pem_key(rsa).unwrap(),
+            PrivateKeyDer::Pkcs1(_)
+        ));
+        assert!(matches!(parse_pem_key(ec).unwrap(), PrivateKeyDer::Sec1(_)));
+        assert_eq!(
+            parse_pem_key(b"no key").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            parse_pem_key(b"-----BEGIN PRIVATE KEY-----\n%%%\n-----END PRIVATE KEY-----\n")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
 
     // ------------------------------------------------------------------
     // 1. NodeId hashing

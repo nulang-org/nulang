@@ -54,15 +54,20 @@ CI. A successful `cargo audit` **alone is not merge authorization**.
 ## Remaining audit warnings
 
 The local audit uses `cargo audit` without any advisory `ignore` entries.
-It reports **zero vulnerabilities** and still surfaces maintenance warnings:
+The original single-provider integration reported **zero vulnerabilities** and two warnings.
+The follow-up PEM-parser draft reports **zero vulnerabilities** and one warning:
 
 - `RUSTSEC-2026-0186`: `memmap2 0.2.3`, pulled through
   `cranelift-jit 0.132.x`. The audited unsound operations are not exercised
   in known Nulang JIT paths, but this is not equivalent to an upstream fix.
   Reassess when Cranelift migrates to a patched memmap2.
-- `RUSTSEC-2025-0134`: `rustls-pemfile 2.2.0` is unmaintained and still
-  used by Nulang's own TLS material loader. Migrate to the maintained
-  rustls-pki-types PEM API with certificate and key parsing regression tests.
+The direct `rustls-pemfile 2.2.0` dependency (RUSTSEC-2025-0134,
+previously an unmaintained-crate warning) is removed in the follow-up PEM
+parser draft. Nulang's TLS material loader now uses the already-resolved
+`rustls::pki_types::pem::PemObject` API, retaining error handling for malformed
+certificate chains, recognized private-key encodings, and certificate-derived
+node identities. This change requires exact-head hosted CI and mutual TLS
+integration testing before promotion.
 
 The security gate intentionally does not use `--deny warnings`. Do not
 claim that warning-only findings have been remediated. Keep monitoring new
