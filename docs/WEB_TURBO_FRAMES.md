@@ -67,9 +67,10 @@ Security considerations:
 - Authorize the initial page **and each frame endpoint** separately.
   Turbo Frame requests are ordinary HTTP requests; their `Turbo-Frame`
   header is not proof of identity or authorization.
-- Current experimental Web error behavior may send HTTP 200 with a body
-  of `nil` when `Web.html` rejects an element. This prevents unsafe HTML
-  from being emitted, but is **not** a correct client-error response.
+- Baseline Web may return HTTP 200 with a `nil` body when the HTML
+  serializer rejects an element. Draft PR #2583 fixes this to return HTTP
+  500 instead; the test temporarily covers both shapes until #2583 merges.
+  That is a server rendering error, not a user-facing validation response.
   Typed response/error handling, CSRF and production ingress hardening
   remain separate open Web work.
 - Frames and Turbo Streams are independent interoperable surfaces.

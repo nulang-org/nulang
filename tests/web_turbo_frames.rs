@@ -128,10 +128,14 @@ fn frame_url_rejects_script_protocol() {
     )
     .expect("bind");
     let response = request(server.port, "/unsafe");
-    // The current experimental Web host renders invalid Html as the string
-    // "nil" with 200; response-status hardening is tracked in separate PRs.
-    // This regression guarantees no unsafe URL is sent to the browser.
-    assert_eq!(response.split_once("\r\n\r\n").unwrap().1, "nil");
+    // Keep this HTML-escaping test compatible with both baseline main and
+    // the fail-closed handler-status fix proposed in #2583. Once #2583 is
+    // merged, tighten this test to 500-only and remove the legacy case.
+    let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    let legacy_result = head.starts_with("HTTP/1.1 200 OK") && body == "nil";
+    let fixed_result =
+        head.starts_with("HTTP/1.1 500 Internal Server Error") && body == "Internal server error";
+    assert!(legacy_result || fixed_result, "{response}");
     assert!(!response.contains("javascript:alert"), "{response}");
     assert!(!response.contains("<turbo-frame"), "{response}");
 }
