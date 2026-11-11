@@ -75,7 +75,8 @@ fn compile_resolved(
     let mut ast = Parser::new(tokens).parse_module().map_err(error_code)?;
     let mut stack = HashSet::new();
     let snapshot =
-        resolve_imports_with_snapshot(&mut ast, root, &mut stack, context).map_err(error_code)?;
+        resolve_imports_with_snapshot(&mut ast, root, &mut stack, source.as_bytes(), context)
+            .map_err(error_code)?;
 
     let mut checker = TypeChecker::new();
     checker.check_module(&ast).map_err(error_code)?;
@@ -244,4 +245,45 @@ fn changed_compilation_context_forces_rebuild_on_resolved_graph() {
         invalidated_modules(&before, &after),
         Invalidation::FullRebuild { .. }
     ));
+}
+
+#[test]
+fn refuses_snapshot_when_root_changed_after_parsing() {
+    let ws = Workspace::new();
+    let root = ws.file("main");
+    let old_source = fs::read_to_string(&root).unwrap();
+    let tokens = Lexer::new(&old_source).lex().unwrap();
+    let mut parsed = Parser::new(tokens).parse_module().unwrap();
+    // Same import graph, different implementation: stale AST must never be
+    // associated with a digest of source bytes that it did not parse.
+    ws.write("main", "import api\nfn entry() -> Int { 100 }\n");
+    let mut stack = HashSet::new();
+    let err = resolve_imports_with_snapshot(
+        &mut parsed,
+        &root,
+        &mut stack,
+        old_source.as_bytes(),
+        b"compiler-v1",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("changed since parsing"),
+        "unexpected mismatch error: {err}"
+    );
+}
+
+#[test]
+fn canonical_snapshot_digests_match_exact_parsed_bytes() {
+    let ws = Workspace::new();
+    let (snapshot, _) = compile_resolved(&ws.file("main"), b"compiler-v1").unwrap();
+    for name in ["core", "api", "main"] {
+        let path = ws.file(name).canonicalize().unwrap();
+        let key = path.to_string_lossy().into_owned();
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(
+            snapshot.modules[&key].source_digest,
+            *blake3::hash(&bytes).as_bytes(),
+            "wrong observed source for {name}"
+        );
+    }
 }

@@ -19,7 +19,7 @@ pub fn resolve_imports(
     current_file: &Path,
     stack: &mut HashSet<PathBuf>,
 ) -> NuResult<()> {
-    resolve_imports_inner(module, current_file, stack, &mut None)
+    resolve_imports_inner(module, current_file, stack, &mut None, None)
 }
 
 /// Resolve imports using the normal compiler path and additionally record the
@@ -28,15 +28,56 @@ pub fn resolve_imports(
 /// Diagnostic-only: the trace does not prove a complete compiler input closure
 /// (stdlib version, target, FFI, capabilities, feature flags, etc.). It cannot
 /// authorize reuse of typechecking results, executable code or Cloud caches.
-/// The current_file argument must refer to an actual, readable source file.
+/// `parsed_source` must be the exact bytes the caller used to parse `module`;
+/// the source file must still contain those bytes. A mismatch fails closed.
+/// This is still a diagnostic-only observation, NOT a cache/reuse key.
 pub fn resolve_imports_with_snapshot(
     module: &mut AstModule,
     current_file: &Path,
     stack: &mut HashSet<PathBuf>,
+    parsed_source: &[u8],
     context_bytes: &[u8],
 ) -> NuResult<ModuleSnapshot> {
+    let disk_source = std::fs::read(current_file).map_err(|e| NuError::RuntimeError {
+        msg: format!("cannot read '{}': {e}", current_file.display()),
+        span: Span::default(),
+    })?;
+    if disk_source != parsed_source {
+        return Err(NuError::RuntimeError {
+            msg: format!(
+                "source '{}' changed since parsing; snapshot refused",
+                current_file.display()
+            ),
+            span: Span::default(),
+        });
+    }
+
     let mut snapshot = ModuleSnapshot::new(context_bytes);
-    resolve_imports_inner(module, current_file, stack, &mut Some(&mut snapshot))?;
+    resolve_imports_inner(
+        module,
+        current_file,
+        stack,
+        &mut Some(&mut snapshot),
+        Some(parsed_source),
+    )?;
+
+    // Fail closed if a dependency changes during resolution. Parsed bytes and
+    // snapshot digests must not disagree due to a subsequent filesystem edit.
+    for (file, input) in &snapshot.modules {
+        let current = std::fs::read(file).map_err(|e| NuError::RuntimeError {
+            msg: format!("cannot verify snapshot source '{}': {e}", file),
+            span: Span::default(),
+        })?;
+        if *blake3::hash(&current).as_bytes() != input.source_digest {
+            return Err(NuError::RuntimeError {
+                msg: format!(
+                    "source '{}' changed during import resolution; snapshot refused",
+                    file
+                ),
+                span: Span::default(),
+            });
+        }
+    }
     Ok(snapshot)
 }
 
@@ -45,6 +86,7 @@ fn resolve_imports_inner(
     current_file: &Path,
     stack: &mut HashSet<PathBuf>,
     recording: &mut Option<&mut ModuleSnapshot>,
+    parsed_source: Option<&[u8]>,
 ) -> NuResult<()> {
     if stack.is_empty() {
         IMPORT_CACHE.with(|c| c.borrow_mut().clear());
@@ -84,8 +126,13 @@ fn resolve_imports_inner(
                 msg: format!("cannot canonicalize '{}': {e}", canonical_file.display()),
                 span: Span::default(),
             })?;
-        let source = std::fs::read(&path).map_err(|e| NuError::RuntimeError {
-            msg: format!("cannot read '{}': {e}", path.display()),
+        // Observe the SAME bytes that the parser consumed, rather than
+        // silently hashing a newer copy of the file from disk.
+        let source = parsed_source.ok_or_else(|| NuError::RuntimeError {
+            msg: format!(
+                "missing parsed source bytes for '{}'; snapshot refused",
+                path.display()
+            ),
             span: Span::default(),
         })?;
         let mut edges = BTreeSet::new();
@@ -97,7 +144,7 @@ fn resolve_imports_inner(
             })?;
             edges.insert(dependency.to_string_lossy().into_owned());
         }
-        snapshot.insert(path.to_string_lossy().into_owned(), &source, edges);
+        snapshot.insert(path.to_string_lossy().into_owned(), source, edges);
     }
 
     for (import_path, items) in &imports {
@@ -137,7 +184,13 @@ fn resolve_imports_inner(
                     span: Span::default(),
                 })?;
 
-        resolve_imports_inner(&mut imported, &resolved_canonical, stack, recording)?;
+        resolve_imports_inner(
+            &mut imported,
+            &resolved_canonical,
+            stack,
+            recording,
+            Some(source.as_bytes()),
+        )?;
 
         let imported_decls = if items.is_empty() {
             imported.decls
