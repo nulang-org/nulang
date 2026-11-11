@@ -67,7 +67,7 @@ The release archive contains a platform-qualified executable that must be rename
 ldd "$HOME/.local/bin/nulang" | grep -E 'python|ssl|crypto|not found'
 ```
 
-For a missing dependency, install the matching **system-provided, ABI-compatible** shared library where available, or build Nulang from source for your distribution. **Do not** symlink an incompatible Python library version (for example, Python 3.13 to a Python 3.12 SONAME). For a compiler/runtime build without the Python integration and its linkage, use `cargo build --locked --release --no-default-features`, recognizing that optional features will be unavailable. The specific shared-library dependencies of macOS and Windows archives may differ; test those binaries on clean supported machines before considering their portability verified.
+For a missing dependency, install the matching **system-provided, ABI-compatible** shared library where available, or build Nulang from source for your distribution. **Do not** symlink an incompatible Python library version (for example, Python 3.13 to a Python 3.12 SONAME). For a source build without Python shared-library linkage, use `cargo build --locked --release --no-default-features --features release-cli`. Use only `--no-default-features` for the smaller core compiler/runtime profile, which excludes many optional integrations. The specific shared-library dependencies of macOS and Windows archives may differ; test those binaries on clean supported machines before considering their portability verified.
 
 **Support boundary:** Releases are CI-built for the listed platforms, not guaranteed to start on every distribution or OS revision. Nulang is alpha software, not yet a production compatibility guarantee.
 
@@ -76,18 +76,36 @@ For a missing dependency, install the matching **system-provided, ABI-compatible
 A source build requires:
 
 - **Rust 1.95.0**, pinned by `rust-toolchain.toml` ([rustup](https://rustup.rs))
-- **Python 3** development headers for the default PyO3 interop feature
-- A native C compiler and linker (plus other native dependencies of enabled features)
+- A native C compiler and linker (plus any native libraries required by your selected features)
 - Linux or macOS. On Windows, the documented source-build route is **WSL**; the Windows prebuilt executable above is separate.
+
+For the public CLI feature profile, which intentionally excludes version-specific
+Python shared-library linkage:
 
 ```bash
 git clone https://github.com/nulang-org/nulang.git
 cd nulang
-cargo build --locked --release
+cargo build --locked --release --no-default-features --features release-cli
 ./target/release/nulang --eval 'perform IO.print("Hello, Nulang!")'
 ```
 
-Source builds with all default features can be costly. For a smaller compiler/runtime build, use `--no-default-features`; this changes which optional integrations are available.
+The default `full` build still enables Python/PyO3 interoperability and requires
+compatible Python development headers. It is substantially more expensive to compile.
+The `release-cli` profile may still require system native libraries such as OpenSSL;
+a successful source build is not proof of distribution-wide binary portability.
+
+If you are working only on the minimal compiler/runtime, start with the lighter
+core development checks. They intentionally do **not** require `mise`, `mbx`,
+Python or `pkg-config`:
+
+```bash
+bash scripts/dev-doctor.sh --profile core
+cargo build --locked --no-default-features
+```
+
+Use `bash scripts/dev-doctor.sh --profile full` (the default profile) before
+full-featured contributor/build-farm work. The core profile does not certify
+full-featured, WASM, cloud, or production compatibility.
 
 ### Feature Flags
 

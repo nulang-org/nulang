@@ -4,6 +4,33 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+profile=full
+case "${1:-}" in
+  "")
+    ;;
+  --profile)
+    if [[ "$#" -ne 2 ]]; then
+      echo "usage: $0 [--profile core|full]" >&2
+      exit 2
+    fi
+    profile="$2"
+    ;;
+  -h|--help)
+    printf 'usage: %s [--profile core|full]\n' "$0"
+    printf '  --profile core: minimal no-default-features compiler build (Rust, Git, C compiler)\n'
+    printf '  --profile full: all contributor/build-farm prerequisites (default)\n'
+    exit 0
+    ;;
+  *)
+    echo "usage: $0 [--profile core|full]" >&2
+    exit 2
+    ;;
+esac
+if [[ "$profile" != core && "$profile" != full ]]; then
+  echo "unknown development profile: $profile" >&2
+  exit 2
+fi
+
 errors=0
 warnings=0
 
@@ -20,20 +47,26 @@ need() {
   fi
 }
 
-printf 'Nulang development environment doctor\n\n'
+printf 'Nulang development environment doctor (%s profile)\n\n' "$profile"
 
-for cmd in git rustup rustc cargo python3 cc pkg-config mbx; do
-  need "$cmd"
-done
-
-if command -v mise >/dev/null 2>&1; then
-  if mise doctor >/dev/null 2>&1; then
-    ok "mise doctor"
-  else
-    fail "mise doctor reported a problem (run: mise doctor)"
-  fi
+if [[ "$profile" == core ]]; then
+  for cmd in git rustup rustc cargo cc; do
+    need "$cmd"
+  done
 else
-  fail "missing required command: mise"
+  for cmd in git rustup rustc cargo python3 cc pkg-config mbx; do
+    need "$cmd"
+  done
+
+  if command -v mise >/dev/null 2>&1; then
+    if mise doctor >/dev/null 2>&1; then
+      ok "mise doctor"
+    else
+      fail "mise doctor reported a problem (run: mise doctor)"
+    fi
+  else
+    fail "missing required command: mise"
+  fi
 fi
 
 if command -v rustc >/dev/null 2>&1; then
@@ -58,7 +91,7 @@ if command -v findmnt >/dev/null 2>&1; then
   fs_type="$(findmnt -no FSTYPE --target "$ROOT" 2>/dev/null || true)"
   case "$fs_type" in
     nfs|nfs4|cifs|smb3|fuse.sshfs)
-      fail "repository is on $fs_type; use local storage for Cargo/mbx build data"
+      fail "repository is on $fs_type; use local storage for Cargo build data"
       ;;
     "")
       warn "could not determine repository filesystem type"
@@ -74,10 +107,16 @@ fi
 available_kb="$(df -Pk "$ROOT" | awk 'NR==2 {print $4}')"
 if [[ "$available_kb" =~ ^[0-9]+$ ]]; then
   available_gb=$((available_kb / 1024 / 1024))
-  if (( available_gb < 10 )); then
-    fail "low free disk space: ${available_gb} GiB (10 GiB minimum)"
-  elif (( available_gb < 25 )); then
-    warn "free disk space is only ${available_gb} GiB; full matrices/benchmarks may need more"
+  minimum_gb=10
+  recommended_gb=25
+  if [[ "$profile" == core ]]; then
+    minimum_gb=5
+    recommended_gb=10
+  fi
+  if (( available_gb < minimum_gb )); then
+    fail "low free disk space: ${available_gb} GiB (${minimum_gb} GiB minimum for ${profile})"
+  elif (( available_gb < recommended_gb )); then
+    warn "free disk space is only ${available_gb} GiB; ${profile} builds may need more"
   else
     ok "free disk space: ${available_gb} GiB"
   fi
