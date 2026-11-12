@@ -51,14 +51,13 @@ fn noalloc_forbidden_opcode(opcode: OpCode) -> Option<&'static str> {
         SpillLoad | SpillStore => Some("register spill requires dynamic frame storage"),
         // Exhaustive allowlist: adding an opcode requires reviewing its VM
         // allocation behavior before it can be accepted under @noalloc.
-        Nop | Halt | Const0 | Const1 | Const2 | ConstM1 | ConstU | ConstL | Load | Store
-        | Move | Pop | Dup | Swap | IAdd | ISub | IMul | IDiv | IMod | INeg | IInc | IDec
-        | IPow | Xor | Shl | Shr | BitAnd | BitOr | FAdd | FSub | FMul | FDiv | FNeg | FMod
-        | IToF | FToI | FPow | ICmpEq | ICmpLt | ICmpGt | ICmpLe | ICmpGe | FCmpEq | FCmpLt
-        | FCmpGt | Not | And | Or | Jmp | JmpT | JmpF | Switch | Call | TailCall | Ret
-        | RetVal | Closure | CapLoad | FreeVar | ClosureCall | FieldL | FieldS | ArrLoad
-        | ArrStore | ArrLen | TupleL | RecL | RecS | IsTag | Unpack | Drop | SelfOp
-        | NodeId => None,
+        Nop | Halt | Const0 | Const1 | Const2 | ConstM1 | ConstU | ConstL | Load | Store | Move
+        | Pop | Dup | Swap | IAdd | ISub | IMul | IDiv | IMod | INeg | IInc | IDec | IPow | Xor
+        | Shl | Shr | BitAnd | BitOr | FAdd | FSub | FMul | FDiv | FNeg | FMod | IToF | FToI
+        | FPow | ICmpEq | ICmpLt | ICmpGt | ICmpLe | ICmpGe | FCmpEq | FCmpLt | FCmpGt | Not
+        | And | Or | Jmp | JmpT | JmpF | Switch | Call | TailCall | Ret | RetVal | Closure
+        | CapLoad | FreeVar | ClosureCall | FieldL | FieldS | ArrLoad | ArrStore | ArrLen
+        | TupleL | RecL | RecS | IsTag | Unpack | Drop | SelfOp | NodeId => None,
     }
 }
 

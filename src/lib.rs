@@ -75,9 +75,9 @@ pub mod mir_wasm;
 pub mod mir_wasm_simd;
 #[cfg(feature = "native-codegen")]
 pub mod native_abi;
+pub mod noalloc;
 #[cfg(feature = "otel")]
 pub mod observability;
-pub mod noalloc;
 pub mod package;
 pub mod parallel_analysis;
 pub mod parallel_marker;
