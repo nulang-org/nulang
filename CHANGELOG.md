@@ -1,5 +1,11 @@
 # Nulang Changelog
 
+### Experimental read-only SQLite Query IR executor — 2026-11-12
+- **Added an opt-in, read-only libsql-backed query executor** behind the existing `sqlite` Cargo feature, using the existing validated Query IR and typed SQL binding instead of exposing arbitrary SQL. No additional dependencies or changes to Nulang syntax/ABI.
+- **Fail-closed live SQLite admission and decoding:** require exact table/column/type agreement, explicit non-null declarations, stable binary text equality, valid Boolean/Int48/Text values, and bounded materialization. SQLite's nullable `INTEGER PRIMARY KEY DESC` corner case has a dedicated regression test.
+- **Expanded database-backed and SQL-emitter regression tests** for injection-shaped literals, nullable rows hidden by filters, column collation, schema drift, row/text limits, and invalid stored values. Production authorization, timeouts, isolation, PostgreSQL execution and full CI qualification remain outstanding.
+
+
 ### Experimental Query IR compiler-type bridge and prepared SQL lowering — 2026-11-12
 - **Schema-only SQL sources and typed query results:** query catalog may register column metadata without in-memory rows; query result schemas map into existing closed Nulang record-array compiler types, without changing the parser or type-checker.
 - **Parameterized SQL for SQLite and PostgreSQL:** generated SELECT/WHERE/ORDER BY/LIMIT statements bind all values separately and quote source identifiers. Unsafe phase ordering, unknown fields, incompatible expression types, unsupported text collation, and LIMIT without sorting fail closed.

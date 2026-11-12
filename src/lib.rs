@@ -88,6 +88,8 @@ pub mod protocol_wire;
 pub mod python;
 pub mod query;
 pub mod query_sql;
+#[cfg(feature = "sqlite")]
+pub mod query_sqlite;
 pub mod query_types;
 pub mod registry;
 pub mod repl;

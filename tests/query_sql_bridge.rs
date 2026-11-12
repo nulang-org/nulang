@@ -59,7 +59,7 @@ fn sqlite_compiles_quoted_identifiers_and_binds_untrusted_literals() {
     let statement = compile_prepared(&plan, &schema(), SqlDialect::Sqlite).unwrap();
     assert_eq!(
         statement.sql,
-        "SELECT \"name\" AS \"person\" FROM \"u\"\"sers\" WHERE ((\"age\" > CAST(? AS INTEGER)) AND (\"name\" = CAST(? AS TEXT))) ORDER BY \"age\" ASC"
+        "SELECT \"name\" AS \"person\" FROM \"u\"\"sers\" WHERE ((\"age\" > CAST(? AS INTEGER)) AND (\"name\" COLLATE BINARY = CAST(? AS TEXT))) ORDER BY \"age\" ASC"
     );
     assert_eq!(
         statement.parameters,
@@ -185,4 +185,25 @@ fn sorting_then_projecting_same_name_is_rejected_to_avoid_sql_alias_shadowing() 
         .sort("age", false)
         .project(vec![("age", Expr::int(1))]);
     assert!(compile_prepared(&plan, &schema(), SqlDialect::Sqlite).is_err());
+}
+
+#[test]
+fn text_equality_uses_deterministic_binary_collation_in_both_sql_dialects() {
+    let plan = Plan::scan("u\"sers").filter(Expr::eq(Expr::field("name"), Expr::text("MiXeD")));
+    let sqlite = compile_prepared(&plan, &schema(), SqlDialect::Sqlite).unwrap();
+    assert!(
+        sqlite
+            .sql
+            .contains("(\"name\" COLLATE BINARY = CAST(? AS TEXT))"),
+        "{}",
+        sqlite.sql
+    );
+    let postgres = compile_prepared(&plan, &schema(), SqlDialect::Postgres).unwrap();
+    assert!(
+        postgres
+            .sql
+            .contains("(\"name\" COLLATE \"C\" = CAST($1 AS TEXT))"),
+        "{}",
+        postgres.sql
+    );
 }

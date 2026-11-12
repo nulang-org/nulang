@@ -89,24 +89,87 @@ are rejected rather than rewritten.
 
 **Important boundaries:**
 
-- The SQL module emits prepared-statement metadata only; **it does not
-  connect to or execute SQLite/PostgreSQL databases**.
-- Schema registration is not authentication, authorization, live SQL catalog
-  introspection, RLS enforcement, or proof of tenant isolation.
+- `compile_prepared` emits SQL metadata only; the separate opt-in SQLite
+  adapter executes plans, but no PostgreSQL executor is implemented.
+- Schema registration alone is not authorization or live catalog
+  introspection. The SQLite adapter checks live table metadata but does
+  not enforce tenant isolation, RLS, or connection privileges.
 - External SQL sources have no inherent row ordering; even with ORDER BY,
   ties are not stable. Callers requiring deterministic pagination must use
   a guaranteed unique sort key verified by the DB adapter.
-- Text ordering and greater-than comparisons reject absent explicit
-  collation contracts. The emitted integer/Boolean/text types still require
-  backend-specific result decoding and nullability validation.
-- The eventual execution adapter must verify driver parameter binding,
-  resource/time limits, schema drift, transaction isolation, and backend
-  parity against concrete test databases before exposure to applications.
+- Text sorting and greater-than comparisons reject absent explicit
+  collation contracts. Text equality uses binary collation; the SQLite
+  adapter validates result types/nullability while PostgreSQL decoding remains
+  unimplemented.
+- Production database adapters still require verified authority, timeouts,
+  scan/cost limits, transaction isolation, schema drift handling, and backend
+  parity before exposing these APIs to applications.
+
+## Opt-in read-only SQLite execution (stacked draft)
+
+With the existing Cargo `sqlite` feature enabled,
+`query_sqlite::execute_sqlite(&connection, &plan, &catalog, limits).await`
+executes the restricted, schema-checked Query IR against a caller-owned
+`libsql::Connection`. There is no public raw-SQL execution entry point.
+It returns the existing `Vec<Row>` of strictly typed
+`Int`, `Bool`, and `Text` values.
+
+**Safeguards and limits:**
+
+- SQL literals, including hostile strings, are bound as their native
+  libsql values. Table/column identifiers are quoted and source metadata
+  must match a real table in the main SQLite database.
+- Live metadata is checked using the bound table name and
+  `pragma_table_xinfo`, including exact column/type coverage and
+  explicit non-null declarations. For now even `INTEGER PRIMARY KEY`
+  without an explicit `NOT NULL` is rejected: SQLite has a historic
+  `INTEGER PRIMARY KEY DESC` exception that permits NULL despite the
+  PRAGMA primary-key flag. Views, generated/hidden fields, unsupported
+  types, schema drift, and nullable columns fail closed.
+- Text equality forces `COLLATE BINARY` in SQLite, and the PostgreSQL
+  SQL emitter forces `COLLATE "C"`, overriding potentially incompatible
+  column collations. Text sorting/greater-than remains unsupported.
+- SQLite dynamic values are checked on read: valid Nulang Int48 range,
+  Boolean integers exactly 0/1, UTF-8 Text only. SQL NULL and type
+  mismatches are rejected rather than coerced.
+- `QueryLimits` caps the number of materialized rows and total UTF-8
+  text bytes. Exceeding a cap returns an error, never partial results.
+
+**Not provided:** authentication, tenant admission, RLS, connection
+ownership, SQL statement execution timeouts, interrupt handling, snapshot
+consistency between the metadata check and SELECT, query-cost/scan bounds,
+deterministic ordering on non-unique sort keys, or distributed execution.
+The caller must pass an authorized connection and provide those controls.
+The adapter is tested against disposable local SQLite databases; remote
+Turso/libSQL and other SQLite deployments are not yet qualified.
+
+Example for a caller that already created a `people` table with
+`id INTEGER NOT NULL` and `name TEXT NOT NULL`, and owns the connection:
+
+```rust
+use nulang::query::{Catalog, Column, DataType, Expr, Plan};
+use nulang::query_sqlite::{execute_sqlite, QueryLimits};
+
+async fn run(conn: &libsql::Connection) -> Result<(), Box<dyn std::error::Error>> {
+    let mut catalog = Catalog::new();
+    catalog.register_schema("people", vec![
+        Column::new("id", DataType::Int),
+        Column::new("name", DataType::Text),
+    ])?;
+    let plan = Plan::scan("people")
+        .filter(Expr::gt(Expr::field("id"), Expr::int(18)))
+        .sort("id", false)
+        .limit(100);
+    let rows = execute_sqlite(conn, &plan, &catalog, QueryLimits::default()).await?;
+    println!("{} rows", rows.len());
+    Ok(())
+}
+```
 
 ## Explicit limitations
 
 - Rust host-side API only; no new lexer keywords or `.nula` syntax.
-- No `Join`, `Aggregate`, database execution, index selection,
+- No `Join`, `Aggregate`, PostgreSQL execution, index selection,
   adaptive costing, incremental views, or MVCC query integration yet.
 - The local executor clones scans and materializes intermediate results; do
   not use this prototype for unbounded or untrusted data.
@@ -123,7 +186,11 @@ that source syntax requires separate parser, compiler and backend work.
 
 ```sh
 cargo test --locked --no-default-features --test query_ir
+cargo test --locked --no-default-features --test query_sql_bridge
+cargo test --locked --no-default-features --features sqlite --test query_sqlite_executor
 ```
 
 The tests pin interpreter behavior, strict schema/type errors, filter/sort
-optimizer equivalence, `Limit` optimization barriers and stable explain text.
+optimizer equivalence, `Limit` optimization barriers, stable explain text,
+SQL bind ordering, binary text equality, live SQLite decoding and schema
+admission, and fail-closed handling of NULL and resource limits.
