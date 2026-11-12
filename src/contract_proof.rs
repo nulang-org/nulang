@@ -304,13 +304,23 @@ fn eval_bool(expr: &Expr, bounds: &Bounds) -> Option<bool> {
             left,
             right,
             ..
-        } => Some(eval_bool(left, bounds)? && eval_bool(right, bounds)?),
+        } => {
+            // Analyze both operands even if the truth value is already
+            // determined: unknown syntax can hide effects or unsafe code.
+            let lhs = eval_bool(left, bounds)?;
+            let rhs = eval_bool(right, bounds)?;
+            Some(lhs && rhs)
+        }
         Expr::Binary {
             op: BinOp::Or,
             left,
             right,
             ..
-        } => Some(eval_bool(left, bounds)? || eval_bool(right, bounds)?),
+        } => {
+            let lhs = eval_bool(left, bounds)?;
+            let rhs = eval_bool(right, bounds)?;
+            Some(lhs || rhs)
+        }
         Expr::Binary {
             op, left, right, ..
         } => {
@@ -405,8 +415,10 @@ mod tests {
 
     #[test]
     fn boolean_shortcut_does_not_hide_unsupported_effects_or_calls() {
-        let results = proof("fn suspicious() -> Int ensures true || mystery() { 1 }");
-        assert_eq!(results[0].status, ProofStatus::Unknown);
+        let either = proof("fn suspicious() -> Int ensures true || mystery() { 1 }");
+        assert_eq!(either[0].status, ProofStatus::Unknown);
+        let both = proof("fn suspicious() -> Int ensures false && mystery() { 1 }");
+        assert_eq!(both[0].status, ProofStatus::Unknown);
     }
 
     #[test]

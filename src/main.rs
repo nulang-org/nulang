@@ -3037,7 +3037,7 @@ fn run_prove_cmd(args: &[String]) -> i32 {
         }
     }
 
-    if counterexamples > 0 || (strict && unknown > 0) {
+    if counterexamples > 0 || (strict && (unknown > 0 || results.is_empty())) {
         1
     } else {
         0

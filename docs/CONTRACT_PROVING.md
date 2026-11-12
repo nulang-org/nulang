@@ -49,7 +49,8 @@ parity and conformance testing.
 - Ordinary `nulang file.nula`, `nulang --check`, package builds, and tests
   never run this optional analyzer or require an SMT solver.
 - `unknown` is advisory (exit 0); `counterexample` returns exit 1.
-  `--strict` additionally returns exit 1 when results are `unknown`.
+  `--strict` additionally returns exit 1 when results are `unknown` or no
+  postconditions were found.
 - Syntax/frontend errors and invalid command arguments return exit 2.
 - Functions without `ensures` are not reported; `requires` only protects
   calls at runtime and is not itself a postcondition.
