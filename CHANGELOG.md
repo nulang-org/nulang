@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Opt-in verified Web tenant admission and PostgreSQL RLS negatives — 2026-11-11
+- **Experimental protected routes resolve an opaque session through a trusted server callback**, denying malformed, unknown or duplicate cookies before Web handler invocation. `Web.verified_tenant_id()` is scoped to admitted requests. Application authentication and membership verification remain mandatory resolver responsibilities.
+- **Generated read-only views no longer accept a tenant String argument.** They use only the verified host identity, exact record tenant equality and the existing deny-by-default read hook.
+- **Added a disposable PostgreSQL RLS negative fixture and CI service** validating non-BYPASSRLS read/write isolation and transaction-local tenant context reset. This is not a production RLS migration.
+
 ### Web resource views: mandatory tenant boundary — 2026-11-11
 - **Generated read-only table/detail helpers now require a nonempty server-provided tenant ID and exact record tenant equality before the application read-policy hook.** This prevents cross-tenant rendering when the application's read policy is accidentally too permissive. It does not authenticate the tenant ID or replace database RLS.
 - **Real HTTP regression tests reproduce and then prevent cross-tenant/blank-identity data leakage** while retaining own-tenant display when explicitly allowed and deny-by-default behavior.

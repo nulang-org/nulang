@@ -18,8 +18,8 @@ nulang nula generate model BillboardFace --field name:String \
 This generates a model with the existing deny-all `can_read_billboard_face`
 and `can_write_billboard_face` hooks plus two read-only helpers:
 
-- `billboard_face_readonly_table(actor_tenant_id, records)`
-- `billboard_face_readonly_detail(actor_tenant_id, record)`
+- `billboard_face_readonly_table(records)`
+- `billboard_face_readonly_detail(record)`
 
 The helpers use the **same validated field declarations** as the model, convert
 primitive values (`String`, `Bool`, `Int`, `Float`) to escaped HTML via
@@ -34,14 +34,13 @@ The `--read-only-views` flag is opt-in; the original `nula generate model`
 command produces unchanged model-only source. Existing output is never
 overwritten. The generated Nulang source remains application-owned.
 
-**Security:** The `actor_tenant_id` argument must be derived from a verified
-server-side identity and organization membership, never a path, form, or query
-parameter. A custom `can_read_*` implementation must check resource permissions and
-membership of the authenticated actor; matching tenant strings are not a
-sufficient policy. The mandatory view-level tenant check is defense-in-depth,
-not proof of identity. A caller supplying an attacker-controlled
-`actor_tenant_id` can still bypass this check, so the ID must originate from
-server-side verified session context.
+**Security:** Generated helpers no longer accept a user-supplied tenant ID.
+They read `Web.verified_tenant_id()` from the active protected request.
+Outside an authenticated request this returns empty, and the generated views
+deny every record even if an application read policy is permissive. A trusted
+session resolver must verify identity, expiry, revocation and tenant membership;
+matching tenant strings alone are insufficient authorization.
+
 Database queries must also be tenant-scoped, and rows must not be fetched or
 sent to untrusted clients before authorization. Rendering is not a substitute
 for a server-side access-control boundary. A denied detail is a rendered HTML fragment,

@@ -70,6 +70,13 @@ pub fn header(name: String) -> String ! {Web, Request} {
     perform Web.header(name)
 }
 
+/// Obtain the tenant ID exclusively from an opt-in trusted session resolver.
+/// Empty outside a protected, successfully authenticated route.
+/// This does not grant database or resource permissions by itself.
+pub fn verified_tenant_id() -> String ! {Web, Request} {
+    perform Web.verified_tenant_id()
+}
+
 /// Get a cookie value from the current HTTP request by name.
 pub fn cookie(name: String) -> String ! {Web, Request} {
     perform Web.cookie(name)

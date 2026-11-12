@@ -622,6 +622,14 @@ impl StdLib {
                     description: "Get a request header from the current HTTP request.",
                 },
                 BuiltinOp {
+                    name: "Web.verified_tenant_id",
+                    effect: "Web",
+                    op: "verified_tenant_id",
+                    signature: "verified_tenant_id() -> String",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Return the tenant id verified by a trusted server session resolver, or empty outside a protected request.",
+                },
+                BuiltinOp {
                     name: "Web.cookie",
                     effect: "Web",
                     op: "cookie",

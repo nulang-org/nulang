@@ -28,6 +28,7 @@ use crate::web::http_request::HttpRequestBindingInputs;
 use crate::web::reactivity::inject_client_runtime_script;
 use crate::web::request_bindings::percent_decode_form;
 use crate::web::runtime_bindings::RuntimeWebRoute;
+use crate::web::tenant_auth::{TenantAuthGuard, VerifiedTenant};
 
 /// HTTP method — must match the Nulang-level variant type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -726,6 +727,7 @@ pub struct RequestContext {
 
 thread_local! {
     static CURRENT_REQUEST: RefCell<Option<RequestContext>> = const { RefCell::new(None) };
+    static VERIFIED_TENANT: RefCell<Option<VerifiedTenant>> = const { RefCell::new(None) };
     static RESPONSE_COOKIES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static RESPONSE_MEDIA_TYPE: RefCell<Option<&'static str>> = const { RefCell::new(None) };
 }
@@ -741,6 +743,26 @@ where
     let result = f();
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = None);
     result
+}
+
+/// Access only the tenant identity resolved from a server-side opaque session.
+pub fn current_verified_tenant_id() -> Option<String> {
+    VERIFIED_TENANT.with(|ctx| ctx.borrow().as_ref().map(|id| id.tenant_id().to_owned()))
+}
+
+fn with_verified_tenant<F, R>(identity: Option<VerifiedTenant>, operation: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    struct Restore(Option<VerifiedTenant>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            VERIFIED_TENANT.with(|ctx| *ctx.borrow_mut() = self.0.take());
+        }
+    }
+    let previous = VERIFIED_TENANT.with(|ctx| ctx.replace(identity));
+    let _restore = Restore(previous);
+    operation()
 }
 
 /// Select the Turbo Stream media type only inside a live Web request.
@@ -1337,6 +1359,17 @@ fn session_csrf_allowed(request: &HttpRequest, captured: &HttpRequestBindingInpu
     bool::from(submitted.as_bytes().ct_eq(expected.as_bytes()))
 }
 
+fn configured_web_public_origin() -> std::io::Result<Option<String>> {
+    match std::env::var("NULANG_WEB_PUBLIC_ORIGIN") {
+        Ok(origin) => Ok(Some(origin)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid NULANG_WEB_PUBLIC_ORIGIN: {error}"),
+        )),
+    }
+}
+
 /// Dev server that dispatches registered `Web.route` handlers and falls back
 /// to static files for unmatched paths.
 #[derive(Debug)]
@@ -1402,6 +1435,48 @@ impl WebDevServer {
         Self::bind_runtime_with_form_guards(port, static_dir, output_dir, routes, Vec::new())
     }
 
+    /// Opt-in, independently verified session admission on explicitly guarded routes.
+    pub fn bind_with_tenant_guard(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<WebRoute>,
+        tenant_guard: TenantAuthGuard,
+    ) -> std::io::Result<Self> {
+        let routes = routes
+            .into_iter()
+            .map(|route| RuntimeWebRoute { route, plan: None })
+            .collect();
+        Self::bind_runtime_with_tenant_guard(
+            port,
+            static_dir,
+            output_dir,
+            routes,
+            Vec::new(),
+            tenant_guard,
+        )
+    }
+
+    /// Composes tenant session admission with compiler-validated guarded forms.
+    pub fn bind_runtime_with_tenant_guard(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        guarded_forms: Vec<GuardedFormRoute>,
+        tenant_guard: TenantAuthGuard,
+    ) -> std::io::Result<Self> {
+        Self::bind_runtime_guarded_configured(
+            port,
+            static_dir,
+            output_dir,
+            routes,
+            guarded_forms,
+            configured_web_public_origin()?,
+            Some(tenant_guard),
+        )
+    }
+
     /// Attach compiler-validated form guards before opening a listening socket.
     /// Public-origin configuration is validated before accepting connections.
     pub fn bind_runtime_with_form_guards(
@@ -1411,16 +1486,7 @@ impl WebDevServer {
         routes: Vec<RuntimeWebRoute>,
         guarded_forms: Vec<GuardedFormRoute>,
     ) -> std::io::Result<Self> {
-        let public_origin = match std::env::var("NULANG_WEB_PUBLIC_ORIGIN") {
-            Ok(value) => Some(value),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(error) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("invalid NULANG_WEB_PUBLIC_ORIGIN: {error}"),
-                ));
-            }
-        };
+        let public_origin = configured_web_public_origin()?;
         Self::bind_runtime_guarded_configured(
             port,
             static_dir,
@@ -1428,6 +1494,7 @@ impl WebDevServer {
             routes,
             guarded_forms,
             public_origin,
+            None,
         )
     }
 
@@ -1448,6 +1515,7 @@ impl WebDevServer {
             routes,
             Vec::new(),
             public_origin,
+            None,
         )
     }
 
@@ -1458,6 +1526,7 @@ impl WebDevServer {
         routes: Vec<RuntimeWebRoute>,
         guarded_forms: Vec<GuardedFormRoute>,
         public_origin: Option<String>,
+        tenant_guard: Option<TenantAuthGuard>,
     ) -> std::io::Result<Self> {
         if let Some(origin) = public_origin.as_deref() {
             crate::web::csrf::validate_public_origin(origin).map_err(|error| {
@@ -1498,6 +1567,15 @@ impl WebDevServer {
             }
         }
 
+        if let Some(guard) = &tenant_guard {
+            guard
+                .validate_routes(&routes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+            let form_keys = form_guards.keys().cloned().collect();
+            guard
+                .validate_mutation_routes(&form_keys)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        }
         let listener = TcpListener::bind(("0.0.0.0", port))?;
         let actual_port = listener.local_addr()?.port();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1507,6 +1585,7 @@ impl WebDevServer {
         let routes_clone = routes;
         let form_guards = Arc::new(form_guards);
         let guards_clone = Arc::clone(&form_guards);
+        let tenant_guard = tenant_guard.map(Arc::new);
         let static_dir_clone = static_dir.clone();
         let output_dir_clone = output_dir.clone();
 
@@ -1520,6 +1599,7 @@ impl WebDevServer {
                     routes_clone,
                     public_origin,
                     guards_clone,
+                    tenant_guard,
                     shutdown_clone,
                     slots_for_listener,
                 );
@@ -1540,6 +1620,7 @@ impl WebDevServer {
         routes: Vec<RuntimeWebRoute>,
         public_origin: Option<String>,
         form_guards: Arc<HashMap<(String, String), GuardedFormRoute>>,
+        tenant_guard: Option<Arc<TenantAuthGuard>>,
         shutdown: Arc<AtomicBool>,
         slots: Arc<ConnectionSlots>,
     ) {
@@ -1581,6 +1662,7 @@ impl WebDevServer {
                     let routes = Arc::clone(&routes);
                     let public_origin = public_origin.clone();
                     let form_guards = Arc::clone(&form_guards);
+                    let tenant_guard = tenant_guard.clone();
                     let shutdown = Arc::clone(&shutdown);
                     // A failed spawn drops the closure and lease, returning capacity.
                     if let Err(error) = std::thread::Builder::new()
@@ -1594,6 +1676,7 @@ impl WebDevServer {
                                 routes,
                                 public_origin,
                                 form_guards,
+                                tenant_guard,
                                 shutdown,
                             );
                         })
@@ -1616,6 +1699,7 @@ impl WebDevServer {
         routes: Arc<Vec<RuntimeWebRoute>>,
         public_origin: Option<String>,
         form_guards: Arc<HashMap<(String, String), GuardedFormRoute>>,
+        tenant_guard: Option<Arc<TenantAuthGuard>>,
         shutdown: Arc<AtomicBool>,
     ) {
         let request = match read_http_request(&mut stream) {
@@ -1665,7 +1749,23 @@ impl WebDevServer {
                 crate::web::dispatch::match_route(r, &request.path).map(|params| (r, params))
             })
         {
-            if let Some(response) = invalid_ui_action_response(&captured) {
+            // Only a registered guarded route can acquire a tenant identity.
+            // A raw tenant header, query value or cookie payload is never trusted.
+            let authenticated = tenant_guard
+                .as_deref()
+                .filter(|guard| guard.protects(route.route.method, &route.route.path))
+                .map(|guard| guard.resolve(&request.headers));
+            if matches!(authenticated, Some(None)) {
+                HttpResponse {
+                    status: 401,
+                    headers: vec![
+                        ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+                        ("Cache-Control".into(), "no-store".into()),
+                        ("WWW-Authenticate".into(), "Session".into()),
+                    ],
+                    body: b"Authentication required".to_vec(),
+                }
+            } else if let Some(response) = invalid_ui_action_response(&captured) {
                 response
             } else if let Some(error) = form_guards
                 .get(&(
@@ -1710,25 +1810,28 @@ impl WebDevServer {
                 );
                 // Typed and legacy handlers share one request scope. Without it,
                 // typed form VM calls cannot mark Turbo Stream response metadata.
+                let verified_tenant = authenticated.flatten();
                 let rendered = with_request_context(ctx, || {
-                    if let Some(guard) =
-                        form_guards.get(&guard_key).filter(|guard| guard.is_typed())
-                    {
-                        guard
-                            .render_typed(route, &captured)
-                            .map(Some)
-                            .map_err(DirectRequestRenderError::Execution)
-                    } else {
-                        match render_direct_request(route, &values) {
-                            Ok(Some(rendered)) => Ok(Some(rendered)),
-                            Ok(None) => Ok(render_route_handler(
-                                &route.route.handler_module,
-                                route.route.handler_func_idx,
-                                None,
-                            )),
-                            Err(error) => Err(error),
+                    with_verified_tenant(verified_tenant, || {
+                        if let Some(guard) =
+                            form_guards.get(&guard_key).filter(|guard| guard.is_typed())
+                        {
+                            guard
+                                .render_typed(route, &captured)
+                                .map(Some)
+                                .map_err(DirectRequestRenderError::Execution)
+                        } else {
+                            match render_direct_request(route, &values) {
+                                Ok(Some(rendered)) => Ok(Some(rendered)),
+                                Ok(None) => Ok(render_route_handler(
+                                    &route.route.handler_module,
+                                    route.route.handler_func_idx,
+                                    None,
+                                )),
+                                Err(error) => Err(error),
+                            }
                         }
-                    }
+                    })
                 });
                 // Turbo responses must retain their own MIME and avoid
                 // normal client-runtime injection.
