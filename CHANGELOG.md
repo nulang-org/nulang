@@ -2,7 +2,8 @@
 ### Mutable binding type safety and module-level preservation — 2026-11-11
 - **Module-level `var` declarations retain mutability** when the parser wraps them into an explicit `main` or synthetic `__main` entry body, including declaration-only modules.
 - **Mutable local bindings remain monomorphic across reassignment**, even when initialized by an inferred lambda. Immutable `let` retains its existing generalization behavior.
-- **Regressions cover synthetic-entry parser wrapping, valid mutable reassignment, and incompatible typed reuse.** Explicit `main` parsing with preceding top-level bindings needs separate fixture coverage; exact-head CI remains required before promotion.
+- **Regressions cover synthetic-entry parser wrapping, valid mutable reassignment, and incompatible typed reuse.**
+- **Explicit `main` now accepts preceding top-level `var` as a mutable declaration** (including the equivalent `let var` form), with both valid and invalid reassignment tests; expression-position `var ... in ...` continues to parse. Exact-head CI remains required before promotion.
 
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
