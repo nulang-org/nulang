@@ -25,6 +25,24 @@ fn compose[A, B, C](f: B -> C, g: A -> B) -> A -> C {
 }
 ```
 
+Immutable `let` bindings can be generalized into polymorphic type schemes, subject
+to the value restriction for mutable storage. Mutable `var` bindings instead
+keep one inferred type for the entire lifetime of their storage location:
+reassignment cannot give the same variable independently instantiated types,
+even when the initial value is a function.
+
+At module level, `var` can precede an explicit `fn main` without
+being treated as a script expression. The binding is scoped into that entry
+function. The older `let var` spelling remains accepted:
+
+```nulang
+var counter = 0
+fn main() {
+    counter = counter + 1
+    counter
+}
+```
+
 ## Primitive Types
 
 | Type | Description | Example |
