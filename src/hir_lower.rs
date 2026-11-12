@@ -22,6 +22,9 @@ pub fn lower_module(
     ast: &ast::AstModule,
     inferred_decl_types: &FxHashMap<String, Type>,
 ) -> hir::Module {
+    // Each lowering invocation starts its own deterministic temporary-name
+    // sequence. Nested lowering restores the outer sequence on exit.
+    let _temporary_scope = TempNameScope::new();
     // Preserve statically-known nominal actor identity before HIR erases the
     // protocol environment. The pass is idempotent because the canonical
     // compiler pipeline already runs it during type checking.
@@ -2608,11 +2611,56 @@ fn infer_type_arg(args: &[ast::Expr], _tv: &TypeVar) -> Option<String> {
     None
 }
 
-static TEMP_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+thread_local! {
+    // Scoped to one compiler invocation, not to process lifetime. These
+    // counters influence serialized debugger metadata, so a global atomic
+    // made identical sequential and concurrent builds emit different bytes.
+    static TEMP_NAME_SCOPES: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+    // Public lower_body/lower_expr helpers also work outside lower_module.
+    // Their legacy stand-alone numbering is not an artifact-cache identity.
+    static STANDALONE_TEMP_COUNTER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+struct TempNameScope;
+
+impl TempNameScope {
+    fn new() -> Self {
+        TEMP_NAME_SCOPES.with(|scopes| scopes.borrow_mut().push(0));
+        Self
+    }
+}
+
+impl Drop for TempNameScope {
+    fn drop(&mut self) {
+        TEMP_NAME_SCOPES.with(|scopes| {
+            scopes.borrow_mut().pop();
+        });
+    }
+}
 
 fn fresh_temp_name() -> String {
-    let n = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("__tmp{}", n)
+    let index = TEMP_NAME_SCOPES.with(|scopes| {
+        let mut scopes = scopes.borrow_mut();
+        scopes.last_mut().map(|next| {
+            let value = *next;
+            *next = next
+                .checked_add(1)
+                .expect("HIR temporary name counter exhausted");
+            value
+        })
+    });
+    let index = index.unwrap_or_else(|| {
+        STANDALONE_TEMP_COUNTER.with(|counter| {
+            let value = counter.get();
+            counter.set(
+                value
+                    .checked_add(1)
+                    .expect("HIR temporary name counter exhausted"),
+            );
+            value
+        })
+    });
+    format!("__tmp{index}")
 }
 
 /// Thread-local apply handlers for the entity currently being lowered.
