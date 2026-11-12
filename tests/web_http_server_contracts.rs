@@ -1,7 +1,7 @@
 use nulang::bytecode::CodeModule;
 use nulang::lexer::Lexer;
 use nulang::parser::Parser;
-use nulang::runtime::{HttpMethod, HttpServerState, WebDevServer, WebRoute};
+use nulang::runtime::{HttpMethod, HttpServerState, WebDevServer, WebRoute, WebServerOptions};
 use nulang::typechecker::TypeChecker;
 use nulang::web::contracts::compile_module_contracts;
 use nulang::web::runtime_bindings::{compile_runtime_route_plan, RuntimeWebRoute};
@@ -209,6 +209,41 @@ fn compiler_bound_query_executes_over_real_http() {
 
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
     assert!(response_body(&response).starts_with("25"), "{response}");
+}
+
+#[test]
+fn absolute_form_routes_a_typed_query_over_real_http() {
+    let server = WebDevServer::bind_runtime(0, None, None, vec![typed_query_route()])
+        .expect("bind typed WebDevServer");
+
+    // The absolute request-target's authority overrides the mismatched Host,
+    // and the normalized path/query must reach compiler-backed dispatch.
+    let response = send_raw_request(
+        server.port,
+        "GET http://example.test/users?limit=31 HTTP/1.1\r\nHost: misleading.test\r\nConnection: close\r\n\r\n",
+    );
+
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(response_body(&response).starts_with("31"), "{response}");
+}
+
+#[test]
+fn configured_host_rejects_duplicate_authority_before_dispatch() {
+    let options = WebServerOptions {
+        max_concurrent_connections: 2,
+        ..WebServerOptions::default()
+    };
+    let server = WebDevServer::bind_runtime_with_options(0, None, None, vec![], options)
+        .expect("bind validated host");
+
+    let response = send_raw_request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: legitimate.example\r\nHost: attacker.example\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+        "duplicate Host must be rejected even with custom host limits: {response}"
+    );
 }
 
 #[test]

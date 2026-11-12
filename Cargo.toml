@@ -181,6 +181,8 @@ rustls-pemfile = { version = "2" }
 ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
 hex = "0.4.3"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
+# Constant-time CSRF/session token comparison; no extra transport stack.
+subtle = "2.6.1"
 target-lexicon = { version = "0.13", optional = true }
 
 flate2 = "1"
