@@ -363,6 +363,9 @@ pub fn render_bound_route_handler(
     let result = vm
         .run_from(0, entry_offset)
         .map_err(|error| format!("route handler execution failed: {error}"))?;
+    if result.is_nil() {
+        return Err("route handler returned nil instead of a renderable response".into());
+    }
     Ok(vm.value_to_string(0, result))
 }
 

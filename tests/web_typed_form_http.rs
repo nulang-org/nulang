@@ -291,3 +291,61 @@ fn typed_route_registration_rejects_forged_handler_type_despite_matching_form_me
         "compiler-produced MIR signature must win over mutable route metadata",
     );
 }
+
+// Integration regression: typed form VM calls must participate in the same
+// request-scoped Turbo response marker as ordinary Web handlers.
+const TURBO_OPTION_SOURCE: &str = r#"
+type Option[T] = Some(T) | None
+fn endpoint(note: Option[String] from form("note")) {
+    match note with {
+        | Some(value) => perform Web.turbo_stream("replace", "flash", perform Web.text(value))
+        | None => perform Web.turbo_stream("replace", "flash", perform Web.text("missing"))
+    }
+}
+fn web_main() { perform Web.route("POST", "/leads", endpoint) }
+"#;
+
+#[test]
+fn typed_form_can_return_guarded_turbo_stream_and_preserve_csrf() {
+    let (route, guard) =
+        compile_typed_guard(TURBO_OPTION_SOURCE, &[("note", FormFieldShape::Optional)]);
+    let token = guard
+        .csrf
+        .token_for_session("user-session", "POST", "/leads");
+    let server =
+        WebDevServer::bind_runtime_with_form_guards(0, None, None, vec![route], vec![guard])
+            .unwrap();
+
+    let (status, forbidden) = send(server.port, "note=hello", Some("user-session"));
+    assert_eq!(status, 403, "{forbidden}");
+    assert!(!forbidden.contains("turbo-stream"), "{forbidden}");
+
+    let (status, response) = send(
+        server.port,
+        &format!("note=hello&__nulang_csrf={token}"),
+        Some("user-session"),
+    );
+    assert_eq!(status, 200, "{response}");
+    assert!(
+        response.contains("Content-Type: text/vnd.turbo-stream.html; charset=utf-8"),
+        "{response}"
+    );
+    assert!(
+        response.contains("<turbo-stream action=\"replace\" target=\"flash\"><template>hello</template></turbo-stream>"),
+        "{response}"
+    );
+    assert!(!response.contains("/app.client.js"), "{response}");
+
+    // The real typed form value must remain escaped inside Turbo's template.
+    let (status, hostile) = send(
+        server.port,
+        &format!("note=%3Cscript%3Ealert(1)%3C%2Fscript%3E&__nulang_csrf={token}"),
+        Some("user-session"),
+    );
+    assert_eq!(status, 200, "{hostile}");
+    assert!(
+        hostile.contains("<template>&lt;script&gt;alert(1)&lt;/script&gt;</template>"),
+        "{hostile}"
+    );
+    assert!(!hostile.contains("<template><script>"), "{hostile}");
+}
