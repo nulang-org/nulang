@@ -1,4 +1,9 @@
 # Nulang Changelog
+
+### Conservative ML-style match diagnostics and constructor validation — 2026-11-11
+- **Finite-domain pattern coverage is diagnosed, not blindly rejected.** `W0201` reports provably missing cases for declared variants and `Bool`; `W0202` reports provably redundant arms. Guarded or opaque cases retain runtime fallbacks unless strict warnings are opted into.
+- **Known closed-variant constructor names and payload shapes are type-checked.** Unknown constructors, missing required payload patterns, and extraneous nullary payloads are rejected regardless of warning policy.
+- **CLI, LSP, and browser playground share the same analyzer.** This forward-port reconciles the conservative warning design of PR #1081 with the constructor-shape checks of PR #1997, without adopting an incompatible default exhaustive-match error policy. Exact-head CI and backend parity remain required before promotion.
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
