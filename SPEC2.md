@@ -1350,11 +1350,13 @@ fn map_option[A, B](opt: Option[A], f: (A) -> B ! {| row}) -> Option[B] ! {| row
 }
 ```
 
-The function `map_option` preserves the effect row of its callback function `f`. If `f` is pure, `map_option` is pure. If `f` performs `Console` effects, so does `map_option`.
+The `map_option` signature expresses effect-row pass-through: the two occurrences of `row` refer to **the same abstract effect tail within this function signature**. Different names in one signature, or the same name in separate functions, denote independent tails. This binding does not grant effects or permit unrelated tails to satisfy one another.
+
+The checker currently treats unresolved rows conservatively; it does **not** implement full row-variable substitution at arbitrary call sites. As a result, a caller requiring a closed/pure row may still need a statically known concrete effect signature or a handler. The annotation itself is checked without executing the callback.
 
 ### 4.5.3 Effect Row Subtyping
 
-A function whose inferred effect row is a subset of the expected row can be used where that row is expected. The checker is deliberately conservative: a closed row is a subtype of another row only if all of its effects are listed; an open row on the expected side may absorb additional effects through its row variable, while an open row on the actual side is assumed to possibly contain any unlisted effect.
+A function whose inferred effect row is a subset of the expected row can be used where that row is expected. The current checker is deliberately conservative: a closed row fits a closed or open allowance only when **all of its effects are explicitly listed** in that allowance. An unresolved expected row tail is not a wildcard for unlisted effects. An actual open row fits an allowed open row only when the two tails have the **same bound identity** and its known effects are permitted; unrelated tails cannot be equated without row-substitution evidence.
 
 When a function or lambda carries an explicit `! {Row}` annotation, the effect checker infers the body's row and verifies it is a subset of the annotation, reporting an `EffectError` naming the offending effects otherwise.
 
