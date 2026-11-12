@@ -1,4 +1,8 @@
 # Nulang Changelog
+### WASM non-exhaustive match fail-closed parity — 2026-11-12
+- **Reject the synthetic unhandled match effect in the restricted WASM backend** instead of silently returning nil; native AOT already preserves the interpreter's EffectError category in the P0 integration branch.
+- **Pin a regression checking an explicit compiler rejection** until WASM supports typed error propagation. Exact-head host validation is required.
+
 ### Native AOT unhandled-effect error-category parity — 2026-10-16
 - **Native AOT preserves the interpreter's `EffectError` category for unhandled effects.** Its pending native-error slot carries a typed runtime/effect distinction while retaining first-error-wins semantics for operations that continue after a compiled helper reports failure.
 - **Deterministic differential and helper-level regressions cover the observed October 16 mismatch and preserve both error categories.** Standalone and runtime-backed AOT entry points consume the same typed channel; the JIT message-only adapter remains compatible.
