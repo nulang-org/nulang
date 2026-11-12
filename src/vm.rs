@@ -6447,6 +6447,70 @@ mod vm_tests {
         assert!(format!("{err}").contains("integer overflow"), "{err}");
     }
 
+    /// The optimized JIT must report helper-recorded arithmetic errors
+    /// through VM::step, not silently continue with the nil replacement.
+    #[cfg(feature = "native-codegen")]
+    #[test]
+    fn test_idiv_int48_boundary_overflow_after_jit_tierup() {
+        let mut module = CodeModule::new("idiv_overflow_after_jit_tierup");
+        let eight = module.add_constant(Constant::Int(8));
+        let two = module.add_constant(Constant::Int(2));
+        let limit = module.add_constant(Constant::Int(3000));
+        let min = module.add_constant(Constant::Int(crate::value_layout::INT48_MIN));
+        let neg_one = module.add_constant(Constant::Int(-1));
+        for (constant, reg) in [(eight, 0u8), (two, 1), (limit, 3), (min, 4), (neg_one, 5)] {
+            module.emit(Instruction::new3(
+                OpCode::ConstU,
+                (constant >> 8) as u8,
+                constant as u8,
+                reg,
+            ));
+        }
+        module.emit(Instruction::new1(OpCode::Const0, 2)); // counter
+
+        let loop_start = module.current_offset();
+        module.emit(Instruction::new3(OpCode::IDiv, 0, 1, 7));
+        module.emit(Instruction::new1(OpCode::IInc, 2));
+        module.emit(Instruction::new3(OpCode::ICmpLt, 2, 3, 6));
+
+        let loop_tail = module.current_offset();
+        let back = (loop_start as i16 - loop_tail as i16) as u16;
+        module.emit(Instruction::new3(
+            OpCode::JmpT,
+            6,
+            (back >> 8) as u8,
+            back as u8,
+        ));
+
+        // After the hot loop has tiered up, switch to the boundary operands
+        // and execute the same loop entry once more.
+        module.emit(Instruction::new2(OpCode::Move, 4, 0));
+        module.emit(Instruction::new2(OpCode::Move, 5, 1));
+        let jump_pc = module.current_offset();
+        let back = (loop_start as i16 - jump_pc as i16) as u16;
+        module.emit(Instruction::new3(
+            OpCode::Jmp,
+            (back >> 8) as u8,
+            back as u8,
+            0,
+        ));
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
+
+        let mut vm = VM::new();
+        vm.load_module(module);
+        let err = vm
+            .run()
+            .expect_err("JIT division overflow must surface as VM error");
+        assert!(format!("{err}").contains("integer overflow"), "{err}");
+        let compiled = vm
+            .jit_session
+            .as_ref()
+            .map(|jit| jit.compiled_count())
+            .unwrap_or(0);
+        assert!(compiled > 0, "hot loop must execute a compiled region");
+    }
+
     /// Test 1: Basic integer arithmetic.
     #[test]
     fn test_basic_arithmetic() {
