@@ -5,6 +5,7 @@
 
 pub mod keyed;
 pub use keyed::{document_from_keyed_tree, KeyedNode, KeyedTreeError};
+pub mod testing;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
