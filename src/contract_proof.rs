@@ -196,21 +196,21 @@ fn prove_function(
 }
 
 fn int_literal(expr: &Expr) -> Option<i128> {
-    match expr {
-        Expr::Literal(Literal::Int(value), _) => {
-            let value = i128::from(*value);
-            (MIN_INT..=MAX_INT).contains(&value).then_some(value)
-        }
+    let value = match expr {
+        Expr::Literal(Literal::Int(value), _) => i128::from(*value),
         Expr::Unary {
             op: UnOp::Neg,
             expr,
             ..
-        } => {
-            let value = int_literal(expr)?.checked_neg()?;
-            (MIN_INT..=MAX_INT).contains(&value).then_some(value)
-        }
-        _ => None,
-    }
+        } => match expr.as_ref() {
+            // Permit the signed minimum even though its positive magnitude
+            // is outside the Int payload range.
+            Expr::Literal(Literal::Int(value), _) => -i128::from(*value),
+            other => -int_literal(other)?,
+        },
+        _ => return None,
+    };
+    (MIN_INT..=MAX_INT).contains(&value).then_some(value)
 }
 
 /// Constrain a named integer parameter using conjunctions of var/literal
@@ -304,21 +304,13 @@ fn eval_bool(expr: &Expr, bounds: &Bounds) -> Option<bool> {
             left,
             right,
             ..
-        } => match (eval_bool(left, bounds), eval_bool(right, bounds)) {
-            (Some(false), _) | (_, Some(false)) => Some(false),
-            (Some(true), Some(true)) => Some(true),
-            _ => None,
-        },
+        } => Some(eval_bool(left, bounds)? && eval_bool(right, bounds)?),
         Expr::Binary {
             op: BinOp::Or,
             left,
             right,
             ..
-        } => match (eval_bool(left, bounds), eval_bool(right, bounds)) {
-            (Some(true), _) | (_, Some(true)) => Some(true),
-            (Some(false), Some(false)) => Some(false),
-            _ => None,
-        },
+        } => Some(eval_bool(left, bounds)? || eval_bool(right, bounds)?),
         Expr::Binary {
             op, left, right, ..
         } => {
@@ -408,6 +400,12 @@ mod tests {
     fn signed_min_negation_must_not_be_proved() {
         let results =
             proof("fn bad(x: Int) -> Int requires x == -140737488355328 ensures result > 0 { -x }");
+        assert_eq!(results[0].status, ProofStatus::Unknown);
+    }
+
+    #[test]
+    fn boolean_shortcut_does_not_hide_unsupported_effects_or_calls() {
+        let results = proof("fn suspicious() -> Int ensures true || mystery() { 1 }");
         assert_eq!(results[0].status, ProofStatus::Unknown);
     }
 
