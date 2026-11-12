@@ -1,4 +1,5 @@
-fn f() -> Unit ! {IO, FS, | row} {
+// Keep a wider open effect row without requiring an ungranted FS capability.
+fn f() -> Unit ! {IO, Rand, | row} {
     perform IO.print("subset")
 }
 f()
