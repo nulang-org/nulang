@@ -1303,6 +1303,30 @@ point_eq({ x: 1, y: 2 }, { x: 1, y: 3 })
     }
 
     #[test]
+    fn test_derive_eq_odd_width_executes_balanced_tree_correctly() {
+        // Five fields force a different boolean-tree shape than the previous
+        // left-associated lowering; both early and late mismatches must fail.
+        for (first, last, expected) in [(1, 5, true), (9, 5, false), (1, 9, false)] {
+            let source = format!(
+                r#"
+@derive(eq)
+type Five = {{ a: Int, b: Int, c: Int, d: Int, e: Int }}
+five_eq(
+    {{ a: 1, b: 2, c: 3, d: 4, e: 5 }},
+    {{ a: {first}, b: 2, c: 3, d: 4, e: {last} }}
+)
+"#
+            );
+            let value = run_source_new(&source).expect("generated equality should execute");
+            assert_eq!(
+                value.as_bool(),
+                Some(expected),
+                "unexpected comparison result for first={first}, last={last}"
+            );
+        }
+    }
+
+    #[test]
     fn test_contracts_requires_ensures() {
         // Satisfied pre/postconditions: the call succeeds.
         let ok_source = r#"
