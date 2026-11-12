@@ -279,6 +279,8 @@ impl Parser {
                                     error_type,
                                     effect,
                                     cap,
+                                    requires,
+                                    ensures,
                                     annotations,
                                     public,
                                     span,
@@ -296,8 +298,10 @@ impl Parser {
                                         error_type,
                                         effect,
                                         cap,
-                                        requires: vec![],
-                                        ensures: vec![],
+                                        // Preserve metadata used by the prover, docs and tooling.
+                                        // Runtime guards are already lowered into the body.
+                                        requires,
+                                        ensures,
                                         body: wrapped_body,
                                         annotations,
                                         public,
@@ -817,7 +821,7 @@ impl Parser {
                 })
             }
             TokenKind::Class => self.parse_class(),
-            TokenKind::Let => self.parse_module_let(public),
+            TokenKind::Let | TokenKind::Var => self.parse_module_let(public),
             TokenKind::Impl => self.parse_impl(),
             TokenKind::Given => self.parse_given(public),
             TokenKind::Signal => self.parse_signal(),
@@ -2586,11 +2590,13 @@ impl Parser {
         Ok(Decl::Import { path, items, span })
     }
 
-    /// Parse a module-level let binding: `let name [: Type] = value`
+    /// Parse a module-level binding: `let name = value` or `var name = value`.
+    /// The legacy `let var name = value` spelling remains accepted.
     fn parse_module_let(&mut self, _public: bool) -> NuResult<Decl> {
         let span = self.current_span();
         let saved_pos = self.pos;
-        self.advance(); // consume 'let'
+        let starts_mutable = self.peek_kind() == &TokenKind::Var;
+        self.advance(); // consume 'let' or 'var'
         self.skip_newlines();
         // `rec` is accepted for backward compatibility but is a no-op:
         // self-recursion is inferred automatically for any lambda-valued
@@ -2598,9 +2604,11 @@ impl Parser {
         // typechecker.rs), matching the same acceptance already present
         // for expression-position `let` (see the TokenKind::Let arm in
         // parse_primary's `let` handling).
-        self.consume_if(&TokenKind::Rec);
-        self.skip_newlines();
-        let mutable = self.consume_if(&TokenKind::Var);
+        if !starts_mutable {
+            self.consume_if(&TokenKind::Rec);
+            self.skip_newlines();
+        }
+        let mutable = starts_mutable || self.consume_if(&TokenKind::Var);
         self.skip_newlines();
         let name = self.expect_ident("binding name")?;
         self.skip_newlines();
