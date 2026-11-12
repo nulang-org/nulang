@@ -52,11 +52,19 @@ type Bounds = HashMap<String, Interval>;
 /// can be marked `proved`. Everything else is `unknown`.
 pub fn prove_module(module: &AstModule) -> Vec<ProofResult> {
     let mut results = Vec::new();
-    visit_decls(&module.decls, &mut results);
+    visit_decls(&module.decls, &mut results, false);
     results
 }
 
-fn visit_decls(decls: &[Decl], results: &mut Vec<ProofResult>) {
+/// Explicit opt-in SMT mode; the interval checker remains the default.
+/// Z3 is invoked only for contracts that the interval checker could not prove.
+pub fn prove_module_with_z3(module: &AstModule) -> Vec<ProofResult> {
+    let mut results = Vec::new();
+    visit_decls(&module.decls, &mut results, true);
+    results
+}
+
+fn visit_decls(decls: &[Decl], results: &mut Vec<ProofResult>, use_z3: bool) {
     for decl in decls {
         match decl {
             Decl::Function {
@@ -67,9 +75,21 @@ fn visit_decls(decls: &[Decl], results: &mut Vec<ProofResult>) {
                 body,
                 ..
             } if !ensures.is_empty() => {
-                results.push(prove_function(name, params, requires, ensures, body));
+                let mut result = prove_function(name, params, requires, ensures, body);
+                if use_z3 && result.status == ProofStatus::Unknown {
+                    match smt::prove_with_z3(params, requires, ensures, body) {
+                        smt::SmtOutcome::Proved => {
+                            result.status = ProofStatus::Proved;
+                            result.detail = "postconditions proved by optional SMT analysis over overflow-safe Int expressions".to_owned();
+                        }
+                        smt::SmtOutcome::Unknown(reason) => {
+                            result.detail = format!("{}; {reason}", result.detail);
+                        }
+                    }
+                }
+                results.push(result);
             }
-            Decl::Module { decls, .. } => visit_decls(decls, results),
+            Decl::Module { decls, .. } => visit_decls(decls, results, use_z3),
             _ => {}
         }
     }

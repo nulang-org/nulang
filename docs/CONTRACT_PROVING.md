@@ -7,6 +7,8 @@ Nulang can check a **small subset** of the existing `requires` and
 nulang prove example.nula
 nulang prove example.nula --json
 nulang prove example.nula --strict
+# Optional: use an installed Z3 executable for relational contracts:
+nulang prove example.nula --solver z3 --json
 # The nested package-manager CLI accepts the same operation:
 nulang nula prove example.nula
 ```
@@ -56,6 +58,30 @@ parity and conformance testing.
   calls at runtime and is not itself a postcondition.
 - JSON results use schema `nulang.contract-proof/v1` for tooling integration.
 
-This first step intentionally uses **no new dependencies**. An optional SMT
-backend can be introduced later behind the same command/report schema, with
-solver timeouts always reported as `unknown`.
+## Optional SMT verification
+
+`--solver z3` (or `--solver=z3`) invokes an installed Z3 executable **only
+when the default interval checker cannot establish a postcondition**.
+No Z3 installation or runtime cost is required for `nulang prove` without
+the option, nor for any normal Nulang build, run, or type check.
+
+The SMT mode translates restricted *pure* integer expressions and supported
+conjunctive parameter preconditions to SMT-LIB2. Every source-level
+arithmetic subexpression must independently pass conservative 48-bit
+overflow analysis before it is translated. The solver may prove correlated
+relationships such as `result == x + 1` when interval ranges overlap.
+It does not support arbitrary calls, effectful checks, branch-dependent
+arithmetic, or unconstrained overflow-prone operations.
+
+- `unsat` for the negated postcondition means **proved in the restricted model**.
+- `sat` indicates a possible violation, but is **unknown** until an input
+  witness is extracted and independently checked.
+- Z3 missing, timeout, malformed output, unsupported syntax, or `unknown`
+  from Z3 all produce **unknown**, never **proved**.
+- The subprocess is restricted to a small SMT input and a bounded runtime.
+- Normal runtime contracts and the existing proof-report JSON schema remain
+  unchanged; `--strict` still makes unknown coverage a failure.
+
+This feature adds **no Rust dependencies**. Z3 is an optional external tool,
+not bundled with Nulang. Future refined types and durable-state invariants
+should build on the same contract model, in separate experimental changes.
