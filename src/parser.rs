@@ -251,6 +251,7 @@ impl Parser {
                                         name,
                                         type_ann,
                                         value,
+                                        mutable,
                                         ..
                                     } = let_decl
                                     {
@@ -258,7 +259,7 @@ impl Parser {
                                             name: name.clone(),
                                             ty: type_ann.clone(),
                                             value: Box::new(value.clone()),
-                                            mutable: false,
+                                            mutable: *mutable,
                                             body: Box::new(wrapped_body),
                                             let_in: false,
                                             span: Span::default(),
@@ -422,6 +423,7 @@ impl Parser {
                             name,
                             type_ann,
                             value,
+                            mutable,
                             ..
                         } = let_decl
                         {
@@ -429,7 +431,7 @@ impl Parser {
                                 name: name.clone(),
                                 ty: type_ann.clone(),
                                 value: Box::new(value.clone()),
-                                mutable: false,
+                                mutable: *mutable,
                                 body: Box::new(body),
                                 let_in: false,
                                 span: Span::default(),
@@ -468,6 +470,7 @@ impl Parser {
                     name,
                     type_ann,
                     value,
+                    mutable,
                     ..
                 } = let_decl
                 {
@@ -475,7 +478,7 @@ impl Parser {
                         name: name.clone(),
                         ty: type_ann.clone(),
                         value: Box::new(value.clone()),
-                        mutable: false,
+                        mutable: *mutable,
                         body: Box::new(body),
                         let_in: false,
                         span: Span::default(),
@@ -8152,6 +8155,28 @@ mod tests {
             "Error should mention the missing brace, got: {}",
             msg
         );
+    }
+
+    #[test]
+    fn test_module_var_wrap_preserves_mutability_in_synthetic_entry_paths() {
+        for source in ["var counter = 0", "var counter = 0\ncounter = 1\ncounter"] {
+            let ast =
+                parse(source).unwrap_or_else(|err| panic!("source {source:?} must parse: {err:?}"));
+            let body = ast
+                .decls
+                .iter()
+                .find_map(|decl| match decl {
+                    Decl::Function { name, body, .. } if name == "__main" || name == "main" => {
+                        Some(body)
+                    }
+                    _ => None,
+                })
+                .expect("wrapped entry function");
+            assert!(
+                matches!(body, Expr::Let { mutable: true, name, .. } if name == "counter"),
+                "module var lost mutability: {source}: {body:?}"
+            );
+        }
     }
 
     #[test]
