@@ -7007,6 +7007,56 @@ mod tests {
     }
 
     #[test]
+    fn test_named_effect_row_reuses_tail_within_one_function_signature() {
+        let ast = parse(
+            "fn forward(f: (Int) -> Int ! {| row}) -> Int ! {| row} { f(1) }",
+        )
+        .expect("valid named effect-row signature");
+        let Decl::Function {
+            params,
+            effect: Some(outer_row),
+            ..
+        } = &ast.decls[0]
+        else {
+            panic!("expected function with effect annotation");
+        };
+        let Some(Type::Function {
+            effect: callback_row,
+            ..
+        }) = params[0].ty.as_ref()
+        else {
+            panic!("expected function-typed callback");
+        };
+        assert_eq!(
+            callback_row, outer_row,
+            "same named row must retain its identity across callback and function result",
+        );
+    }
+
+    #[test]
+    fn test_named_effect_row_keeps_independent_names_and_functions_separate() {
+        let ast = parse(
+            "fn first(f: (Int) -> Int ! {| row}, g: (Int) -> Int ! {| other}) -> Int ! {| row} { f(1) }\n\
+             fn second(f: (Int) -> Int ! {| row}) -> Int ! {| row} { f(1) }",
+        )
+        .expect("valid distinct row signatures");
+        let get_callback = |decl: &Decl, i: usize| -> EffectRow {
+            let Decl::Function { params, .. } = decl else {
+                panic!("expected function");
+            };
+            let Some(Type::Function { effect, .. }) = params[i].ty.as_ref() else {
+                panic!("expected callback type");
+            };
+            effect.clone()
+        };
+        let first = get_callback(&ast.decls[0], 0);
+        let other = get_callback(&ast.decls[0], 1);
+        let second = get_callback(&ast.decls[1], 0);
+        assert_ne!(first, other, "different names are independent");
+        assert_ne!(first, second, "same spelling in another function is independent");
+    }
+
+    #[test]
     fn test_parse_effect_row_builtin_event_and_ffi() {
         // SPEC2 §4.6 lists Event and FFI as built-in effects; annotation
         // parsing must map them to the built-in variants (not UserDefined),
