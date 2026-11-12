@@ -99,3 +99,52 @@ capture canonical output bytes for all compilation paths, expand the edit corpus
 to imports, effects, authority, actor protocols, durable schemas and backend
 configurations, and run the oracle as a CI parity gate. Only then measure
 whether caching justifies its memory, disk and maintenance costs.
+
+## Standalone clean bytecode observations (stacked follow-up)
+
+`package::clean_observation::observe_unlinked_bytecode_sources` now provides
+compiler-produced stage observations for **standalone pure-function modules**.
+It takes a complete fixture of named source byte slices; each source goes
+through Nulang's real lexer, parser, effect/type checker, function capability
+analysis, HIR/MIR lowering, canonical MIR serialization, and bytecode
+generation. The input snapshot and the observation share a diagnostic-only
+compiler recipe and source-byte fingerprints. Modules are compiled from
+scratch and cannot import one another.
+
+The collector **rejects** missing/duplicate module names, non-UTF-8 bytes,
+parse/type/effect/capability errors, imports, actors, workflows and every
+non-function declaration. It deliberately has no knowledge of the user's
+filesystem, imported modules, package graph or resource grants; these require
+the production resolver's compiler-owned dependency closure.
+
+Integration tests compare real before/after compiler observations for
+private-body edits, exported-signature changes, unchanged independent modules,
+and stale candidate bytecode. They verify the oracle's rejection and
+consistency paths, rather than relying on fabricated compiler fingerprints.
+
+```sh
+cargo test --no-default-features --test incremental_clean_observation
+```
+
+**Limit:** This remains a diagnostic test fixture, not the general Nulang CLI
+frontend or an incremental compiler. In particular, successful standalone
+observations neither authorize skipping normal frontend checks nor establish
+equivalence for imports, effects, authority, actor protocols, durable schema
+changes, backend flags, or failed compilations. The diagnostic context digest
+is not a production artifact/cache key. These categories must be covered by a
+compiler-owned multi-module collector before cache reuse can be proposed.
+
+### Stable temporary naming for repeatable artifacts
+
+The clean-observation regression detected a genuine nondeterministic output:
+`hir_lower::fresh_temp_name` previously used a process-global atomic counter.
+Recompiling the exact same function generated different compiler-only names
+(`__tmp0` versus `__tmp1`) in `debug_functions.locals`, changing the
+serialized NBC bytes while canonical typed/MIR semantics stayed identical.
+
+HIR lowering now scopes generated temporary names to each `lower_module`
+invocation, including re-entrant nested lowering, with a separate fallback
+counter for standalone helper calls outside a module. The wire encoding and
+debug metadata schema are unchanged. The bytecode-determinism regression test
+checks exact debugger metadata and serialized NBC byte equality across
+repeated clean compiles; the oracle corpus also checks independent observations.
