@@ -1356,7 +1356,7 @@ The checker currently treats unresolved rows conservatively; it does **not** imp
 
 ### 4.5.3 Effect Row Subtyping
 
-A function whose inferred effect row is a subset of the expected row can be used where that row is expected. The checker is deliberately conservative: a closed row is a subtype of another row only if all of its effects are listed; an open row on the expected side may absorb additional effects through its row variable, while an open row on the actual side is assumed to possibly contain any unlisted effect.
+A function whose inferred effect row is a subset of the expected row can be used where that row is expected. The current checker is deliberately conservative: a closed row fits a closed or open allowance only when **all of its effects are explicitly listed** in that allowance. An unresolved expected row tail is not a wildcard for unlisted effects. An actual open row fits an allowed open row only when the two tails have the **same bound identity** and its known effects are permitted; unrelated tails cannot be equated without row-substitution evidence.
 
 When a function or lambda carries an explicit `! {Row}` annotation, the effect checker infers the body's row and verifies it is a subset of the annotation, reporting an `EffectError` naming the offending effects otherwise.
 
