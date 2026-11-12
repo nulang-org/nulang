@@ -4,7 +4,11 @@
 //! polling, and non-blocking suspension for `perform LLM.ask` in bytecode
 //! behaviors.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+
+const LLM_REQUEST_QUEUE_CAPACITY: usize = 64;
+const MAX_CONCURRENT_LLM_REQUESTS: usize = 16;
 
 use nulang_ai::{LlmClient, LlmError, LlmRequest, LlmResponse, TokenBudget};
 
@@ -14,9 +18,6 @@ pub(crate) struct LlmWorkItem {
     pub(crate) request: LlmRequest,
     pub(crate) client: Arc<dyn LlmClient>,
 }
-
-// Safety: LlmWorkItem is Send because all fields are Send.
-unsafe impl Send for LlmWorkItem {}
 
 /// Consolidated LLM subsystem state.
 ///
@@ -40,24 +41,21 @@ pub struct LlmState {
     /// decremented when the completion is stored.
     pub inflight_count: usize,
 
-    /// Channel to dispatch work to the persistent LLM worker thread.
-    /// `None` after the runtime is dropped (sender half is owned by the
-    /// worker thread, which outlives the runtime).
-    pub(crate) request_tx: Option<crossbeam::channel::Sender<LlmWorkItem>>,
+    /// Bounded, nonblocking request admission; the Tokio worker owns the receiver.
+    pub(crate) request_tx: Option<tokio::sync::mpsc::Sender<LlmWorkItem>>,
 }
 
 impl LlmState {
-    /// Create the LLM subsystem, spawning the persistent worker thread.
-    ///
-    /// The worker thread owns its own single-threaded tokio runtime and
-    /// processes requests sequentially. Results are sent back through the
-    /// `rx` channel.
+    /// Create one Tokio worker thread per runtime shard. Each worker overlaps
+    /// up to MAX_CONCURRENT_LLM_REQUESTS async provider calls; mutable actor
+    /// state and VM callbacks remain entirely on the shard scheduler thread.
     pub fn new() -> Self {
         let (llm_tx, llm_rx) = std::sync::mpsc::channel();
-        let llm_tx_worker = llm_tx.clone();
-        let (llm_request_tx, llm_request_rx) = crossbeam::channel::unbounded::<LlmWorkItem>();
+        let (llm_request_tx, llm_request_rx) =
+            tokio::sync::mpsc::channel::<LlmWorkItem>(LLM_REQUEST_QUEUE_CAPACITY);
 
-        // Spawn a persistent LLM worker thread.
+        // An async mpsc receiver is essential here: a blocking recv() on the
+        // Tokio thread would prevent already-started futures from progressing.
         let _worker = std::thread::Builder::new()
             .name("nulang-llm".to_string())
             .spawn(move || {
@@ -68,13 +66,7 @@ impl LlmState {
                     Ok(rt) => rt,
                     Err(_) => return,
                 };
-                while let Ok(item) = llm_request_rx.recv() {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        tokio_rt.block_on(item.client.complete(item.request))
-                    }))
-                    .unwrap_or_else(|_| Err(LlmError::from_string("LLM worker thread panicked")));
-                    let _ = llm_tx_worker.send((item.actor_id, result));
-                }
+                tokio_rt.block_on(run_llm_worker(llm_request_rx, llm_tx));
             });
 
         LlmState {
@@ -85,7 +77,56 @@ impl LlmState {
             request_tx: Some(llm_request_tx),
         }
     }
+}
 
+/// Execute asynchronous requests concurrently on the worker's Tokio thread.
+/// A task panic must still produce a completion for its actor, otherwise the
+/// scheduler's inflight count would never drain and suspension could hang.
+async fn run_llm_worker(
+    mut requests: tokio::sync::mpsc::Receiver<LlmWorkItem>,
+    completions: std::sync::mpsc::Sender<(u64, Result<LlmResponse, LlmError>)>,
+) {
+    let mut active = tokio::task::JoinSet::new();
+    let mut actor_by_task = HashMap::new();
+    let mut accepting = true;
+
+    while accepting || !active.is_empty() {
+        tokio::select! {
+            biased;
+            finished = active.join_next_with_id(), if !active.is_empty() => {
+                match finished {
+                    Some(Ok((task_id, (actor_id, response)))) => {
+                        actor_by_task.remove(&task_id);
+                        let _ = completions.send((actor_id, response));
+                    }
+                    Some(Err(join_error)) => {
+                        if let Some(actor_id) = actor_by_task.remove(&join_error.id()) {
+                            let _ = completions.send((
+                                actor_id,
+                                Err(LlmError::from_string("LLM worker task panicked")),
+                            ));
+                        }
+                    }
+                    None => {}
+                }
+            }
+            next = requests.recv(), if accepting && active.len() < MAX_CONCURRENT_LLM_REQUESTS => {
+                match next {
+                    Some(item) => {
+                        let actor_id = item.actor_id;
+                        let handle = active.spawn(async move {
+                            (actor_id, item.client.complete(item.request).await)
+                        });
+                        actor_by_task.insert(handle.id(), actor_id);
+                    }
+                    None => accepting = false,
+                }
+            }
+        }
+    }
+}
+
+impl LlmState {
     /// Set the LLM client provider.
     pub fn set_client(&mut self, client: Box<dyn LlmClient>) {
         self.client = Some(Arc::from(client));
@@ -368,17 +409,24 @@ pub(crate) fn dispatch_llm_request(
     let Some(tx) = rt.llm.request_tx.as_ref() else {
         return false;
     };
+    // Try admission before touching actor state. A saturated queue must not
+    // block the owning scheduler or decrement another actor's inflight count.
+    if tx
+        .try_send(LlmWorkItem {
+            actor_id,
+            request,
+            client,
+        })
+        .is_err()
+    {
+        return false;
+    }
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.llm_inflight = true;
         actor.llm_pending_prompt = Some(prompt.to_string());
     }
     rt.llm.inflight_count += 1;
-    tx.send(LlmWorkItem {
-        actor_id,
-        request,
-        client,
-    })
-    .is_ok()
+    true
 }
 
 /// Prune an agent's episodic memory to fit within `max_tokens`, using a
@@ -523,4 +571,165 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
     // up while the behavior was suspended, schedule the actor to drain
     // them — step_actor leaves mail untouched while a suspension is live.
     rt.requeue_if_mail_pending(actor_id);
+}
+
+#[cfg(test)]
+mod llm_concurrency_tests {
+    use super::*;
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+
+    struct GatedAsyncClient {
+        started: mpsc::Sender<()>,
+        gate: Arc<Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for GatedAsyncClient {
+        async fn complete(&self, _request: LlmRequest) -> Result<LlmResponse, LlmError> {
+            self.started.send(()).expect("test receiver dropped");
+            let _permit = self
+                .gate
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("test gate closed");
+            Ok(LlmResponse {
+                content: Some("ok".to_string()),
+                tool_calls: vec![],
+                model: "test".to_string(),
+                finish_reason: "stop".to_string(),
+                usage: Default::default(),
+            })
+        }
+    }
+
+    struct PanickingAsyncClient;
+
+    #[async_trait::async_trait]
+    impl LlmClient for PanickingAsyncClient {
+        async fn complete(&self, _request: LlmRequest) -> Result<LlmResponse, LlmError> {
+            panic!("deliberate test-only provider panic")
+        }
+    }
+
+    #[test]
+    fn worker_queue_is_bounded_without_unsafe_message_transfer() {
+        fn assert_send<T: Send>() {}
+        assert_send::<LlmWorkItem>();
+        let state = LlmState::new();
+        assert_eq!(state.request_tx.as_ref().unwrap().max_capacity(), 64);
+    }
+
+    #[test]
+    fn rejected_llm_work_never_changes_inflight_accounting() {
+        let mut runtime = Runtime::new();
+        runtime.llm.client = Some(Arc::new(nulang_ai::MockLlmClient::text("ok")));
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        runtime.llm.request_tx = Some(tx);
+        assert!(dispatch_llm_request(
+            &mut runtime,
+            100,
+            LlmRequest::default(),
+            "accepted",
+        ));
+        assert_eq!(runtime.llm.inflight_count, 1);
+        assert!(!dispatch_llm_request(
+            &mut runtime,
+            101,
+            LlmRequest::default(),
+            "full",
+        ));
+        assert_eq!(runtime.llm.inflight_count, 1);
+
+        drop(rx);
+        assert!(!dispatch_llm_request(
+            &mut runtime,
+            102,
+            LlmRequest::default(),
+            "disconnected",
+        ));
+        assert_eq!(runtime.llm.inflight_count, 1);
+    }
+
+    #[test]
+    fn a_panicking_request_returns_an_error_without_stopping_the_worker() {
+        let mut state = LlmState::new();
+        let normal: Arc<dyn LlmClient> = Arc::new(nulang_ai::MockLlmClient::text("still alive"));
+        let panicking: Arc<dyn LlmClient> = Arc::new(PanickingAsyncClient);
+        for (actor_id, client) in [(21, panicking), (22, normal)] {
+            state
+                .request_tx
+                .as_ref()
+                .unwrap()
+                .try_send(LlmWorkItem {
+                    actor_id,
+                    request: LlmRequest::default(),
+                    client,
+                })
+                .expect("request admitted");
+        }
+        let mut responses = Vec::new();
+        for _ in 0..2 {
+            responses.push(
+                state
+                    .rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("every started request must complete, even after panic"),
+            );
+        }
+        responses.sort_unstable_by_key(|(actor_id, _)| *actor_id);
+        assert_eq!(responses[0].0, 21);
+        assert!(responses[0].1.is_err());
+        assert_eq!(responses[1].0, 22);
+        assert_eq!(
+            responses[1].1.as_ref().unwrap().content.as_deref(),
+            Some("still alive")
+        );
+        state.request_tx.take();
+    }
+
+    #[test]
+    fn independent_async_llm_requests_make_progress_concurrently() {
+        let mut state = LlmState::new();
+        let (started_tx, started_rx) = mpsc::channel();
+        let gate = Arc::new(Semaphore::new(0));
+        let client: Arc<dyn LlmClient> = Arc::new(GatedAsyncClient {
+            started: started_tx,
+            gate: Arc::clone(&gate),
+        });
+        for actor_id in [11, 12] {
+            state
+                .request_tx
+                .as_ref()
+                .unwrap()
+                .try_send(LlmWorkItem {
+                    actor_id,
+                    request: LlmRequest::default(),
+                    client: Arc::clone(&client),
+                })
+                .expect("request admitted");
+        }
+        // A serial worker can enter only the first provider call while the
+        // gate is held; a bounded async worker enters both before release.
+        let concurrent = (0..2).all(|_| started_rx.recv_timeout(Duration::from_secs(5)).is_ok());
+        gate.add_permits(2);
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let (actor_id, result) = state
+                .rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("completion after gate release");
+            assert_eq!(
+                result.expect("provider response").content.as_deref(),
+                Some("ok")
+            );
+            ids.push(actor_id);
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, [11, 12]);
+        assert!(concurrent, "two independent async requests must overlap");
+        state.request_tx.take();
+    }
 }
