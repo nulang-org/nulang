@@ -366,22 +366,39 @@ impl EffectRow {
         EffectRow::Closed(vec![e])
     }
 
-    /// Row concatenation.
+    /// Combine effect rows as sets, retaining the first occurrence's order.
+    ///
+    /// Repeated interprocedural inference revisits the same effects; blindly
+    /// concatenating these lists can grow them exponentially and exhaust the
+    /// compiler's memory. Most rows contain only a few effects, so a linear
+    /// membership check avoids adding a hash-table allocation to every union.
     pub fn combine(self, other: EffectRow) -> EffectRow {
+        fn extend_unique(target: &mut Vec<Effect>, additions: Vec<Effect>) {
+            for effect in additions {
+                if !target.contains(&effect) {
+                    target.push(effect);
+                }
+            }
+        }
+
         match (self, other) {
             (EffectRow::Closed(mut a), EffectRow::Closed(b)) => {
-                a.extend(b);
+                extend_unique(&mut a, b);
                 EffectRow::Closed(a)
             }
             (EffectRow::Closed(mut a), EffectRow::Open(b, r))
             | (EffectRow::Open(mut a, r), EffectRow::Closed(b)) => {
-                a.extend(b);
+                extend_unique(&mut a, b);
                 EffectRow::Open(a, r)
             }
-            (EffectRow::Open(mut a, r1), EffectRow::Open(b, _)) => {
-                // Open rows share the same row variable convention
-                a.extend(b);
-                EffectRow::Open(a, r1)
+            (EffectRow::Open(mut a, r1), EffectRow::Open(b, r2)) => {
+                extend_unique(&mut a, b);
+                // Distinct row tails must not be silently identified. Until
+                // the typechecker carries row substitutions, a fresh unknown
+                // tail conservatively over-approximates their union. It must
+                // not be treated as equal to either input variable.
+                let merged_tail = if r1 == r2 { r1 } else { Region::fresh() };
+                EffectRow::Open(a, merged_tail)
             }
         }
     }
@@ -2642,6 +2659,42 @@ mod tests {
             ret: Box::new(prim(PrimitiveType::Int)),
             effect,
             cap: Capability::Ref,
+        }
+    }
+
+    #[test]
+    fn test_combine_independent_open_effect_tails_does_not_alias_either_input() {
+        let left_tail = Region::fresh();
+        let right_tail = Region::fresh();
+        let left = EffectRow::Open(vec![Effect::IO], left_tail);
+        let right = EffectRow::Open(vec![Effect::FS], right_tail);
+
+        let merged = left.combine(right);
+        match merged {
+            EffectRow::Open(effects, merged_tail) => {
+                assert!(effects.contains(&Effect::IO));
+                assert!(effects.contains(&Effect::FS));
+                assert_ne!(merged_tail, left_tail);
+                assert_ne!(merged_tail, right_tail);
+            }
+            other => panic!("independent open tails must remain conservatively open: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_combine_same_open_effect_tail_preserves_identity() {
+        let tail = Region::fresh();
+        let left = EffectRow::Open(vec![Effect::IO], tail);
+        let right = EffectRow::Open(vec![Effect::FS], tail);
+
+        let merged = left.combine(right);
+        match merged {
+            EffectRow::Open(effects, merged_tail) => {
+                assert_eq!(merged_tail, tail);
+                assert!(effects.contains(&Effect::IO));
+                assert!(effects.contains(&Effect::FS));
+            }
+            other => panic!("same-tail union must remain open: {other:?}"),
         }
     }
 
