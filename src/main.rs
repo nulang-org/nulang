@@ -1679,6 +1679,23 @@ fn run_frontend(
     // 3. Type check
     let mut type_checker = TypeChecker::new();
     let module_type = type_checker.check_module(&ast)?;
+    let type_warnings = type_checker.take_warnings();
+    if !type_warnings.is_empty() {
+        let use_color = std::io::stderr().is_terminal();
+        for w in &type_warnings {
+            eprintln!("{}", nulang::diagnostic::format_warning(w, use_color));
+        }
+        if deny_warnings {
+            return Err(nulang::types::NuError::parse_error(
+                format!(
+                    "aborting due to {} warning{} (--deny-warnings)",
+                    type_warnings.len(),
+                    if type_warnings.len() == 1 { "" } else { "s" }
+                ),
+                type_warnings[0].span,
+            ));
+        }
+    }
 
     if verbose {
         println!("=== Inferred Type ===");

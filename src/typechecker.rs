@@ -1076,6 +1076,9 @@ pub struct TypeChecker {
     pub collect_errors: bool,
     /// Errors collected when `collect_errors` is set (empty otherwise).
     pub collected_errors: Vec<crate::types::NuError>,
+    /// Non-fatal semantic diagnostics collected during type inference.
+    /// Includes finite-domain pattern coverage and discarded Result values.
+    pub warnings: Vec<NuWarning>,
 }
 
 /// Pre-computed class and instance tables extracted from an AST module.
@@ -1157,7 +1160,13 @@ impl TypeChecker {
             rigid_vars: FxHashSet::default(),
             collect_errors: false,
             collected_errors: Vec::new(),
+            warnings: Vec::new(),
         }
+    }
+
+    /// Consume and return non-fatal semantic warnings collected by type checking.
+    pub fn take_warnings(&mut self) -> Vec<NuWarning> {
+        std::mem::take(&mut self.warnings)
     }
 
     /// Type-check an entire module, returning the type of the last declaration.
@@ -1170,6 +1179,7 @@ impl TypeChecker {
 
     /// Type-check an entire module, returning the type of the last declaration.
     pub fn check_module(&mut self, module: &AstModule) -> NuResult<Type> {
+        self.warnings.clear();
         // Enrich statically known actor sends/asks with protocol constraints
         // before ordinary Algorithm-W inference. Dynamic actor references
         // remain permissive for compatibility; explicit ActorRef<P> values
@@ -1918,13 +1928,13 @@ impl TypeChecker {
             } => self.infer_match(ctx, scrutinee, arms, *span),
 
             // Block: sequence of expressions
-            Expr::Block { exprs, span } => self.infer_block(ctx, exprs, *span),
+            Expr::Block { exprs, span } => self.infer_block(ctx, exprs, *span, true),
 
             // Par: validate independence now, even though execution remains
             // sequential until RFC 0024's scoped-concurrency backend lands.
             Expr::Par { exprs, span } => {
                 crate::parallel_analysis::validate_parallel_branches(exprs, *span)?;
-                self.infer_block(ctx, exprs, *span)
+                self.infer_block(ctx, exprs, *span, false)
             }
 
             // Spawn actor
@@ -3456,6 +3466,21 @@ impl TypeChecker {
             final_subst = compose_subst(&s, &final_subst);
         }
 
+        // Coverage analysis runs only after ordinary pattern/guard/body typing
+        // succeeds and uses the fully substituted scrutinee type. Guarded arms
+        // cannot close a coverage hole because their predicate may be false.
+        let coverage_ty = apply_subst(&scrut_ty, &final_subst);
+        let coverage_arms: Vec<(Pattern, bool)> = arms
+            .iter()
+            .map(|(pattern, guard, _)| (pattern.clone(), guard.is_some()))
+            .collect();
+        self.warnings
+            .extend(crate::pattern_coverage::warnings_for_match(
+                &coverage_ty,
+                &coverage_arms,
+                span,
+            ));
+
         Ok((final_subst.clone(), apply_subst(&first_arm, &final_subst)))
     }
 
@@ -3529,13 +3554,29 @@ impl TypeChecker {
             },
             Pattern::Variant(name, pat) => match scrut_ty {
                 Type::Variant(variants) => {
-                    let mut new_ctx = ctx.clone();
-                    if let Some((_, Some(ty))) = variants.iter().find(|(n, _)| n == name) {
-                        if let Some(p) = pat {
-                            new_ctx = self.bind_pattern(&new_ctx, p, ty)?;
-                        }
+                    // A statically closed variant gives enough information to
+                    // reject impossible constructors and payload-shape errors.
+                    // Unknown/abstract scrutinee types retain their existing
+                    // inference fallback below.
+                    let (_, payload) =
+                        variants.iter().find(|(n, _)| n == name).ok_or_else(|| {
+                            NuError::type_error(
+                                format!("unknown variant constructor '{name}' in match"),
+                                Span::default(),
+                            )
+                        })?;
+                    match (payload.as_ref(), pat.as_deref()) {
+                        (Some(ty), Some(inner)) => self.bind_pattern(ctx, inner, ty),
+                        (None, None) => Ok(ctx.clone()),
+                        (Some(_), None) => Err(NuError::type_error(
+                            format!("variant constructor '{name}' requires a payload pattern"),
+                            Span::default(),
+                        )),
+                        (None, Some(_)) => Err(NuError::type_error(
+                            format!("variant constructor '{name}' has no payload"),
+                            Span::default(),
+                        )),
                     }
-                    Ok(new_ctx)
                 }
                 _ => {
                     if let Some(p) = pat {
@@ -3555,11 +3596,15 @@ impl TypeChecker {
         }
     }
 
+    /// Detect Result values that are discarded as ordinary block statements.
+    /// A `par` region is excluded: its branches may become independently
+    /// observable child results under RFC 0024's structured task semantics.
     fn infer_block(
         &mut self,
         ctx: &TypeContext,
         exprs: &[Expr],
         _span: Span,
+        warn_discarded: bool,
     ) -> NuResult<(Substitution, Type)> {
         if exprs.is_empty() {
             return Ok((vec![], Type::unit()));
@@ -3567,13 +3612,44 @@ impl TypeChecker {
 
         let mut subst = vec![];
         let mut last_ty = Type::unit();
-        for expr in exprs {
+        let mut discarded = Vec::new();
+        for (index, expr) in exprs.iter().enumerate() {
             let ctx_sub = apply_subst_to_ctx(ctx, &subst);
             let (s, ty) = self.infer_expr(&ctx_sub, expr)?;
             subst = compose_subst(&s, &subst);
+            if warn_discarded && index + 1 != exprs.len() {
+                discarded.push((expr.span(), ty.clone()));
+            }
             last_ty = ty;
         }
+        // Infer *all* expressions first: a later unification may specialize
+        // the type of an earlier expression. Never diagnose an unresolved
+        // type variable as a Result merely because it might become one.
+        for (span, ty) in discarded {
+            if Self::is_result_variant(&apply_subst(&ty, &subst))
+                && !self
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "W0301" && w.span == span)
+            {
+                self.warnings.push(NuWarning::discarded_result(span));
+            }
+        }
         Ok((subst.clone(), apply_subst(&last_ty, &subst)))
+    }
+
+    fn is_result_variant(ty: &Type) -> bool {
+        match ty {
+            Type::Variant(variants) if variants.len() == 2 => {
+                variants
+                    .iter()
+                    .any(|(name, payload)| name == "Ok" && payload.is_some())
+                    && variants
+                        .iter()
+                        .any(|(name, payload)| name == "Error" && payload.is_some())
+            }
+            _ => false,
+        }
     }
 
     fn declared_actor_protocol(behaviors: &[Behavior]) -> Type {
@@ -4883,6 +4959,93 @@ mod tests {
         };
         let (s, ty) = tc.infer_expr(&ctx, &expr).unwrap();
         assert_eq!(apply_subst(&ty, &s), Type::int());
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: discarded Result values must be diagnosed after inference.
+    // -----------------------------------------------------------------------
+
+    fn result_returning_context() -> TypeContext {
+        let result = Type::Variant(vec![
+            ("Ok".to_string(), Some(Type::int())),
+            ("Error".to_string(), Some(Type::string())),
+        ]);
+        ctx_with(
+            "try_op",
+            Type::Function {
+                param: Box::new(Type::int()),
+                ret: Box::new(result),
+                effect: EffectRow::empty(),
+                cap: Capability::Ref,
+            },
+        )
+    }
+
+    #[test]
+    fn test_discarded_result_statement_emits_warning() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Block {
+            exprs: vec![app(var("try_op"), int_lit(1)), int_lit(2)],
+            span: sp(),
+        };
+        tc.infer_expr(&result_returning_context(), &expr).unwrap();
+        assert_eq!(tc.warnings.len(), 1);
+        assert_eq!(tc.warnings[0].code, "W0301");
+    }
+
+    #[test]
+    fn test_returned_result_is_not_discarded() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Block {
+            exprs: vec![int_lit(1), app(var("try_op"), int_lit(2))],
+            span: sp(),
+        };
+        tc.infer_expr(&result_returning_context(), &expr).unwrap();
+        assert!(tc.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_discarded_non_result_variant_is_not_warned() {
+        let mut tc = TypeChecker::new();
+        let ctx = ctx_with(
+            "maybe",
+            Type::Variant(vec![
+                ("Some".to_string(), Some(Type::int())),
+                ("None".to_string(), None),
+            ]),
+        );
+        let expr = Expr::Block {
+            exprs: vec![var("maybe"), int_lit(1)],
+            span: sp(),
+        };
+        tc.infer_expr(&ctx, &expr).unwrap();
+        assert!(tc.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_par_branches_do_not_trigger_discard_warning() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Par {
+            exprs: vec![app(var("try_op"), int_lit(1)), int_lit(2)],
+            span: sp(),
+        };
+        tc.infer_expr(&result_returning_context(), &expr).unwrap();
+        assert!(tc.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_discarded_result_in_parsed_module_emits_warning() {
+        let source = "type Result[Ok, Err] = Ok(Ok) | Error(Err)\nfn f() -> Int { Ok(1); 42 }";
+        let tokens = crate::lexer::Lexer::new(source).lex().unwrap();
+        let mut parser = crate::parser::Parser::new(tokens);
+        let module = parser.parse_module().unwrap();
+        let mut tc = TypeChecker::new();
+        tc.check_module(&module).unwrap();
+        assert_eq!(
+            tc.warnings.iter().filter(|w| w.code == "W0301").count(),
+            1,
+            "actual Result constructor should be recognized after inference"
+        );
     }
 
     // -----------------------------------------------------------------------
