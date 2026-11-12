@@ -38,6 +38,13 @@ pub fn raw(s: String) -> Html ! {Web, Render} {
     perform Web.raw(s)
 }
 
+/// Render a Turbo Stream action for a DOM id. The content must be an Html
+/// value constructed through safe HTML helpers, not unescaped user input.
+/// On a Web request, this selects the Turbo Stream response MIME type.
+pub fn turbo_stream(action: String, target: String, content: Html) -> Html ! {Web, Render, Respond} {
+    perform Web.turbo_stream(action, target, content)
+}
+
 /// Produce a redirect response to the given URL.
 pub fn redirect(url: String) -> Html ! {Web, Respond} {
     perform Web.redirect(url)
