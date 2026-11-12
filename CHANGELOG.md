@@ -1,4 +1,8 @@
 # Nulang Changelog
+### SQLite local database pathname integrity — 2026-11-11
+- **Preserve native filesystem path bytes when opening local actor SQLite stores.** The security-migration adapter previously converted paths through lossy UTF-8, potentially opening a different file for a non-UTF-8 Unix pathname. The constructor now forwards Path directly, preserving database-file identity; the in-memory special name remains supported.
+- **Added a Unix filesystem regression checking exact filename bytes and no accidental replacement-name database.** Keep the patched SQLite/security integration and remote Turso fail-closed behavior separate; there are no new audit exclusions.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
