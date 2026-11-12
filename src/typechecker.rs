@@ -3204,8 +3204,32 @@ impl TypeChecker {
                                     similar_names: None,
                                 });
                             }
+                            // Report concrete alternatives for the same class, not
+                            // unrelated implementations. Sorting makes diagnostics
+                            // deterministic despite FxHashMap iteration order.
+                            let mut available_types: Vec<&str> = instance_table
+                                .keys()
+                                .filter_map(|(registered_class, registered_type)| {
+                                    (registered_class == class_name)
+                                        .then_some(registered_type.as_str())
+                                })
+                                .collect();
+                            available_types.sort_unstable();
+                            available_types.dedup();
+                            let available = if available_types.is_empty() {
+                                format!("no {} implementations registered", class_name)
+                            } else {
+                                format!(
+                                    "available {} implementations: {}",
+                                    class_name,
+                                    available_types.join(", ")
+                                )
+                            };
                             return Err(NuError::TypeError {
-                                msg: format!("no impl {}[{}]", class_name, current_ty),
+                                msg: format!(
+                                    "no impl {}[{}] for method .{}; {}; hint: add `impl {} {} {{ ... }}`",
+                                    class_name, current_ty, field, available, class_name, current_ty
+                                ),
                                 span,
                                 expected_type: None,
                                 found_type: None,

@@ -11048,6 +11048,49 @@ match { a: 2, b: 9 } with {
     }
 
     #[test]
+    fn test_missing_class_impl_lists_available_types_in_stable_order() {
+        let result = check_source(
+            r#"
+            class Eq[T] {
+                fn eq(self: T, other: T) -> Bool
+            }
+            impl Eq Int {
+                fn eq(self: Int, other: Int) = self == other
+            }
+            impl Eq Bool {
+                fn eq(self: Bool, other: Bool) = self == other
+            }
+            "hello".eq("world")
+            "#,
+        );
+        let err = format!("{}", result.expect_err("String has no Eq implementation"));
+        assert!(err.contains("no impl Eq[String]"), "{}", err);
+        assert!(err.contains("method .eq"), "{}", err);
+        assert!(
+            err.contains("available Eq implementations: Bool, Int"),
+            "{}",
+            err
+        );
+        assert!(err.contains("impl Eq String"), "{}", err);
+    }
+
+    #[test]
+    fn test_missing_class_impl_without_candidates_gives_concrete_hint() {
+        let result = check_source(
+            r#"
+            class Eq[T] {
+                fn eq(self: T, other: T) -> Bool
+            }
+            "hello".eq("world")
+            "#,
+        );
+        let err = format!("{}", result.expect_err("String has no Eq implementation"));
+        assert!(err.contains("no impl Eq[String]"), "{}", err);
+        assert!(err.contains("no Eq implementations registered"), "{}", err);
+        assert!(err.contains("impl Eq String"), "{}", err);
+    }
+
+    #[test]
     fn test_class_method_with_two_param_impl() {
         // Method call with additional parameters resolves correctly.
         let result = check_source(
