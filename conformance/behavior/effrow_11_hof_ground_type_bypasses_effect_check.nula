@@ -1,3 +1,0 @@
-fn only_io() -> Unit ! {IO} { perform IO.print("only io") }
-fn accepts_pure(cb: () -> Unit ! {}) -> Unit { cb() }
-accepts_pure(only_io)
