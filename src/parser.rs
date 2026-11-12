@@ -8180,6 +8180,59 @@ mod tests {
     }
 
     #[test]
+    fn test_module_var_before_explicit_main_keeps_mutability() {
+        // A module-level mutable binding must not be parsed as a script
+        // expression that prevents discovery of the following declaration.
+        for source in [
+            "var counter = 0\nfn main() { counter }",
+            "let var counter = 0\nfn main() { counter }",
+        ] {
+            let ast =
+                parse(source).unwrap_or_else(|err| panic!("source {source:?} must parse: {err:?}"));
+            let body = ast
+                .decls
+                .iter()
+                .find_map(|decl| match decl {
+                    Decl::Function { name, body, .. } if name == "main" => Some(body),
+                    _ => None,
+                })
+                .expect("explicit main function");
+            assert!(
+                matches!(body, Expr::Let { mutable: true, name, .. } if name == "counter"),
+                "module-level var lost mutability: {source}: {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_module_var_before_explicit_main_still_rejects_malformed_binding() {
+        let error = parse("var counter =\nfn main() { counter }");
+        assert!(error.is_err(), "incomplete module var must fail parsing");
+    }
+
+    #[test]
+    fn test_module_binding_before_explicit_main_preserves_contract_metadata() {
+        let source =
+            "let limit = 1\nfn main() -> Int requires limit > 0 ensures result >= 0 { limit }";
+        let ast = parse(source).expect("module let followed by contracted main");
+        let (requires, ensures) = ast
+            .decls
+            .iter()
+            .find_map(|decl| match decl {
+                Decl::Function {
+                    name,
+                    requires,
+                    ensures,
+                    ..
+                } if name == "main" => Some((requires, ensures)),
+                _ => None,
+            })
+            .expect("explicit contracted main");
+        assert_eq!(requires.len(), 1, "main lost its requires metadata");
+        assert_eq!(ensures.len(), 1, "main lost its ensures metadata");
+    }
+
+    #[test]
     fn test_parse_top_level_expression_still_works() {
         // Zero tokens consumed by the decl parse → expression fallback.
         let ast = parse("42").unwrap();
