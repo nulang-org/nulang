@@ -11048,6 +11048,77 @@ match { a: 2, b: 9 } with {
     }
 
     #[test]
+    fn test_missing_class_impl_lists_available_types_in_stable_order() {
+        let result = check_source(
+            r#"
+            class Eq[T] {
+                fn eq(self: T, other: T) -> Bool
+            }
+            impl Eq Int {
+                fn eq(self: Int, other: Int) = self == other
+            }
+            impl Eq Bool {
+                fn eq(self: Bool, other: Bool) = self == other
+            }
+            "hello".eq("world")
+            "#,
+        );
+        let err = format!("{}", result.expect_err("String has no Eq implementation"));
+        assert!(err.contains("no impl Eq[String]"), "{}", err);
+        assert!(err.contains("method .eq"), "{}", err);
+        assert!(
+            err.contains("available Eq implementations: Bool, Int"),
+            "{}",
+            err
+        );
+        assert!(err.contains("impl Eq String"), "{}", err);
+    }
+
+    #[test]
+    fn test_missing_class_impl_without_candidates_gives_concrete_hint() {
+        let result = check_source(
+            r#"
+            class Eq[T] {
+                fn eq(self: T, other: T) -> Bool
+            }
+            "hello".eq("world")
+            "#,
+        );
+        let err = format!("{}", result.expect_err("String has no Eq implementation"));
+        assert!(err.contains("no impl Eq[String]"), "{}", err);
+        assert!(err.contains("no Eq implementations registered"), "{}", err);
+        assert!(err.contains("impl Eq String"), "{}", err);
+    }
+
+    #[test]
+    fn test_class_method_uses_matching_impl_when_classes_share_method_name() {
+        // Whichever class appears first in the hash table, both calls
+        // must resolve their own registered implementation.
+        let declarations = r#"
+            class IntSame[T] {
+                fn same(self: T, other: T) -> Bool
+            }
+            class StringSame[T] {
+                fn same(self: T, other: T) -> Bool
+            }
+            impl IntSame Int {
+                fn same(self: Int, other: Int) = self == other
+            }
+            impl StringSame String {
+                fn same(self: String, other: String) = true
+            }
+        "#;
+        for call in ["1.same(2)", "\"hello\".same(\"world\")"] {
+            let source = format!("{declarations}\n{call}");
+            let result = check_source(&source);
+            assert!(
+                result.is_ok(),
+                "{call} should select its matching impl regardless of class order: {result:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_class_method_with_two_param_impl() {
         // Method call with additional parameters resolves correctly.
         let result = check_source(
