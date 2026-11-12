@@ -148,3 +148,37 @@ counter for standalone helper calls outside a module. The wire encoding and
 debug metadata schema are unchanged. The bytecode-determinism regression test
 checks exact debugger metadata and serialized NBC byte equality across
 repeated clean compiles; the oracle corpus also checks independent observations.
+
+## Canonical resolver import observation (diagnostic-only)
+
+`package::import_observation::observe_resolved_imports` parses the supplied
+root source bytes and calls the **same import resolver** used by the Nulang
+frontend. The resolver now has an optional, explicit trace sink. As it loads
+each imported file, the trace captures the canonical path, BLAKE3 hash of the
+**exact bytes actually read by the compiler**, and the canonical import edge.
+No second module scanner or guessed dependency mapping is involved.
+Resolver-local import-cache hits still retain their previously observed
+transitive edges. The existing `resolve_imports` call signature and normal
+compiler behavior are unchanged.
+
+`ResolvedImportObservation.snapshot` can be given to the conservative
+invalidation planner to measure impact of source or import edits; the
+observation also retains the resolver-produced AST. The root file must exist
+and canonicalize, but callers may pass unsaved root source bytes, which are
+parsed and hashed as supplied rather than read a second time.
+
+This is **not** a complete compilation cache identity. The diagnostic graph
+does not include the injected prelude, full package/manifest resolution
+conditions, dependency versions, toolchain/environment, target flags,
+effect/capability policy, or backend inputs. The context digest is caller
+supplied and not independently certified. Missing/cyclic imports and
+incomplete graph entries fail closed; these observations never authorize
+cached compilation.
+
+```sh
+cargo test --no-default-features --test import_graph_observation
+```
+
+Full compiler-owned input closure, before/after compiler outputs for imported
+modules, and differential equivalence across the complete edit corpus remain
+future prerequisites for production incremental compilation.

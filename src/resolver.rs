@@ -3,8 +3,45 @@ use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::types::{NuError, NuResult, Span};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+
+/// Diagnostic input graph recorded from bytes read by the actual compiler
+/// resolver. This does not authorize code caching or cover other compiler inputs.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ResolvedImportTrace {
+    pub(crate) source_digests: BTreeMap<PathBuf, [u8; 32]>,
+    pub(crate) edges: BTreeMap<PathBuf, BTreeSet<PathBuf>>,
+}
+
+impl ResolvedImportTrace {
+    pub(crate) fn record_source(&mut self, path: &Path, source: &[u8]) -> NuResult<()> {
+        let digest = *blake3::hash(source).as_bytes();
+        if let Some(old) = self.source_digests.get(path) {
+            if *old != digest {
+                return Err(NuError::RuntimeError {
+                    msg: format!(
+                        "source changed during import observation: {}",
+                        path.display()
+                    ),
+                    span: Span::default(),
+                });
+            }
+        } else {
+            self.source_digests.insert(path.to_path_buf(), digest);
+        }
+        self.edges.entry(path.to_path_buf()).or_default();
+        Ok(())
+    }
+
+    fn record_edge(&mut self, source: &Path, import: &Path) {
+        self.edges
+            .entry(source.to_path_buf())
+            .or_default()
+            .insert(import.to_path_buf());
+        self.edges.entry(import.to_path_buf()).or_default();
+    }
+}
 
 thread_local! {
     /// Cache of fully resolved import declarations keyed by canonical file path.
@@ -17,6 +54,26 @@ pub fn resolve_imports(
     module: &mut AstModule,
     current_file: &Path,
     stack: &mut HashSet<PathBuf>,
+) -> NuResult<()> {
+    resolve_imports_inner(module, current_file, stack, None)
+}
+
+/// Resolve imports using the canonical resolver while capturing input edges
+/// and exact imported source bytes. Does not change normal compiler behavior.
+pub fn resolve_imports_traced(
+    module: &mut AstModule,
+    current_file: &Path,
+    stack: &mut HashSet<PathBuf>,
+    trace: &mut ResolvedImportTrace,
+) -> NuResult<()> {
+    resolve_imports_inner(module, current_file, stack, Some(trace))
+}
+
+fn resolve_imports_inner(
+    module: &mut AstModule,
+    current_file: &Path,
+    stack: &mut HashSet<PathBuf>,
+    mut trace: Option<&mut ResolvedImportTrace>,
 ) -> NuResult<()> {
     if stack.is_empty() {
         IMPORT_CACHE.with(|c| c.borrow_mut().clear());
@@ -49,6 +106,9 @@ pub fn resolve_imports(
     for (import_path, items) in &imports {
         let resolved = resolve_path(&canonical_base, import_path);
         let resolved_canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.record_edge(&canonical_file, &resolved_canonical);
+        }
 
         // If the file has already been fully resolved in this compilation,
         // reuse its cached declarations.
@@ -69,6 +129,9 @@ pub fn resolve_imports(
             msg: format!("cannot read '{}': {}", import_path, e),
             span: Span::default(),
         })?;
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.record_source(&resolved_canonical, source.as_bytes())?;
+        }
         let tokens = Lexer::new(&source)
             .lex()
             .map_err(|e| NuError::RuntimeError {
@@ -83,7 +146,12 @@ pub fn resolve_imports(
                     span: Span::default(),
                 })?;
 
-        resolve_imports(&mut imported, &resolved_canonical, stack)?;
+        resolve_imports_inner(
+            &mut imported,
+            &resolved_canonical,
+            stack,
+            trace.as_deref_mut(),
+        )?;
 
         let imported_decls = if items.is_empty() {
             imported.decls
