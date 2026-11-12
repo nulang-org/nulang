@@ -7,8 +7,14 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 
 const source = readFileSync(new URL('../../src/web/reactivity.rs', import.meta.url), 'utf8');
-const match = source.match(/pub fn generate_client_runtime\(\) -> String \{\s*r#"(.*?)"#\s*\.to_string\(\)/s);
-assert.ok(match, 'expected compiler-generated client runtime');
+const start = source.indexOf('pub fn generate_client_runtime() -> String {');
+assert.notEqual(start, -1, 'expected compiler-generated client runtime');
+// The generator can concatenate the IIFE with the renderer-neutral DOM host
+// via format!(..., include_str!(...)), rather than returning the IIFE with
+// r#"... "#.to_string(). Extract the compiler-authored IIFE in either case.
+const match = source.slice(start).match(/r#"(.*?)"#/s);
+assert.ok(match && match[1].trimStart().startsWith('(function () {'),
+  'expected compiler-authored client runtime IIFE');
 
 function element(tagName, action) {
   const listeners = new Map();

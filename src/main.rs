@@ -2460,6 +2460,25 @@ fn compile_source_to_nbc(
         for msg in &effect_checker.diagnostics {
             eprintln!("{}", msg);
         }
+        // Export only the compiler-verified, side-effect-free JSX template
+        // subset. Other views continue through the existing HTML renderer.
+        // Keep this renderer-neutral plan separate from the browser JS bundle.
+        let ui_templates = nulang::web::ui_template::UiTemplateManifest::compile_supported(&ast);
+        let ui_manifest_json = serde_json::to_string_pretty(&ui_templates).map_err(|error| {
+            nulang::types::NuError::VMError {
+                msg: format!("failed to encode UI template manifest: {error}"),
+                span: Span::default(),
+            }
+        })?;
+        // Server-only metadata: do not publish with client assets in dist/.
+        let ui_manifest_path =
+            std::path::Path::new(out_path).with_file_name("app.ui-templates.json");
+        std::fs::write(&ui_manifest_path, ui_manifest_json).map_err(|error| {
+            nulang::types::NuError::VMError {
+                msg: format!("failed to write {}: {error}", ui_manifest_path.display()),
+                span: Span::default(),
+            }
+        })?;
         nulang::web::reactivity::rewrite_module(&mut ast, Some(&effect_checker));
         let client_js = nulang::web::reactivity::generate_client_runtime();
         std::fs::write(client_js_path, client_js).map_err(|e| nulang::types::NuError::VMError {

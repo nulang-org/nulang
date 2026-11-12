@@ -1,0 +1,137 @@
+{
+  "form": [
+    {
+      "document": {
+        "document_id": "editor-doc",
+        "nodes": [
+          {
+            "children": [
+              "root/p0"
+            ],
+            "id": "root",
+            "kind": "form"
+          },
+          {
+            "id": "root/p0",
+            "kind": "input",
+            "properties": {
+              "value": {
+                "type": "string",
+                "value": ""
+              }
+            }
+          }
+        ],
+        "protocol": "nulang-ui/1",
+        "revision": "1",
+        "root": "root"
+      },
+      "protocol": "nulang-ui-msg/1",
+      "type": "snapshot"
+    },
+    {
+      "patch": {
+        "acknowledged_inputs": [
+          {
+            "node_id": "root/p0",
+            "property": "value",
+            "sequence": "1"
+          }
+        ],
+        "base_revision": "1",
+        "document_id": "editor-doc",
+        "operations": [
+          {
+            "name": "value",
+            "node_id": "root/p0",
+            "op": "set_property",
+            "value": {
+              "type": "string",
+              "value": "approved"
+            }
+          }
+        ],
+        "protocol": "nulang-ui/1",
+        "revision": "2"
+      },
+      "protocol": "nulang-ui-msg/1",
+      "type": "patch"
+    }
+  ],
+  "keyed": [
+    {
+      "document": {
+        "document_id": "editor-doc",
+        "nodes": [
+          {
+            "children": [
+              "root/k61",
+              "root/k62"
+            ],
+            "id": "root",
+            "kind": "ul"
+          },
+          {
+            "id": "root/k61",
+            "kind": "li",
+            "properties": {
+              "text": {
+                "type": "string",
+                "value": "a"
+              }
+            }
+          },
+          {
+            "id": "root/k62",
+            "kind": "li",
+            "properties": {
+              "text": {
+                "type": "string",
+                "value": "b"
+              }
+            }
+          }
+        ],
+        "protocol": "nulang-ui/1",
+        "revision": "1",
+        "root": "root"
+      },
+      "protocol": "nulang-ui-msg/1",
+      "type": "snapshot"
+    },
+    {
+      "patch": {
+        "base_revision": "1",
+        "document_id": "editor-doc",
+        "operations": [
+          {
+            "children": [
+              "root/k62",
+              "root/k61",
+              "root/k63"
+            ],
+            "node_id": "root",
+            "op": "replace_children"
+          },
+          {
+            "node": {
+              "id": "root/k63",
+              "kind": "li",
+              "properties": {
+                "text": {
+                  "type": "string",
+                  "value": "c"
+                }
+              }
+            },
+            "op": "upsert_node"
+          }
+        ],
+        "protocol": "nulang-ui/1",
+        "revision": "2"
+      },
+      "protocol": "nulang-ui-msg/1",
+      "type": "patch"
+    }
+  ]
+}
