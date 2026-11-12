@@ -817,7 +817,7 @@ impl Parser {
                 })
             }
             TokenKind::Class => self.parse_class(),
-            TokenKind::Let => self.parse_module_let(public),
+            TokenKind::Let | TokenKind::Var => self.parse_module_let(public),
             TokenKind::Impl => self.parse_impl(),
             TokenKind::Given => self.parse_given(public),
             TokenKind::Signal => self.parse_signal(),
@@ -2586,21 +2586,20 @@ impl Parser {
         Ok(Decl::Import { path, items, span })
     }
 
-    /// Parse a module-level let binding: `let name [: Type] = value`
+    /// Parse a module-level `let`, `let var`, or `var` binding.
     fn parse_module_let(&mut self, _public: bool) -> NuResult<Decl> {
         let span = self.current_span();
         let saved_pos = self.pos;
-        self.advance(); // consume 'let'
+        let starts_with_var = self.consume_if(&TokenKind::Var);
+        if !starts_with_var {
+            self.expect(TokenKind::Let)?;
+            self.skip_newlines();
+            // `rec` is accepted for backward compatibility but is a no-op:
+            // self-recursion is inferred automatically for lambda bindings.
+            self.consume_if(&TokenKind::Rec);
+        }
         self.skip_newlines();
-        // `rec` is accepted for backward compatibility but is a no-op:
-        // self-recursion is inferred automatically for any lambda-valued
-        // `let` binding (see infer_letrec / the Expr::Lambda check in
-        // typechecker.rs), matching the same acceptance already present
-        // for expression-position `let` (see the TokenKind::Let arm in
-        // parse_primary's `let` handling).
-        self.consume_if(&TokenKind::Rec);
-        self.skip_newlines();
-        let mutable = self.consume_if(&TokenKind::Var);
+        let mutable = starts_with_var || self.consume_if(&TokenKind::Var);
         self.skip_newlines();
         let name = self.expect_ident("binding name")?;
         self.skip_newlines();
@@ -8177,6 +8176,66 @@ mod tests {
                 "module var lost mutability: {source}: {body:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_module_var_before_explicit_main_preserves_mutability() {
+        // A top-level var must be a declaration, not a script expression that
+        // tries to interpret the following named fn as an anonymous lambda.
+        for source in [
+            "var counter = 0\nfn main() { counter = 1; counter }",
+            "let var counter = 0\nfn main() { counter = 1; counter }",
+        ] {
+            let ast =
+                parse(source).unwrap_or_else(|err| panic!("source {source:?} must parse: {err:?}"));
+            let body = ast
+                .decls
+                .iter()
+                .find_map(|decl| match decl {
+                    Decl::Function { name, body, .. } if name == "main" => Some(body),
+                    _ => None,
+                })
+                .expect("explicit main retained");
+            assert!(
+                matches!(body, Expr::Let { name, mutable: true, .. } if name == "counter"),
+                "module-level mutable binding must wrap explicit main: {body:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_module_var_explicit_main_typechecks_same_type_assignment() {
+        let tokens = Lexer::new("var counter = 0\nfn main() { counter = 1; counter }")
+            .lex()
+            .expect("valid tokens");
+        let ast = Parser::new(tokens).parse_module().expect("valid module");
+        crate::typechecker::TypeChecker::new()
+            .check_module(&ast)
+            .expect("a mutable top-level binding may retain its Int type");
+    }
+
+    #[test]
+    fn test_module_var_explicit_main_rejects_type_changing_assignment() {
+        let source = "var counter = 0\nfn main() { counter = \"wrong\"; counter }";
+        let tokens = Lexer::new(source).lex().expect("valid tokens");
+        let ast = Parser::new(tokens).parse_module().expect("valid module");
+        assert!(
+            crate::typechecker::TypeChecker::new()
+                .check_module(&ast)
+                .is_err(),
+            "a mutable location cannot change from Int to String",
+        );
+    }
+
+    #[test]
+    fn test_var_in_expression_still_uses_script_entry_fallback() {
+        let ast = parse("var counter = 0 in counter")
+            .expect("expression-level mutable binding remains valid");
+        assert!(
+            ast.decls.iter().any(|decl| matches!(decl,
+                Decl::Function { name, .. } if name == "__main")),
+            "in-expression var should remain a script entry",
+        );
     }
 
     #[test]
