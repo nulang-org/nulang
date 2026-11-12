@@ -211,10 +211,24 @@ impl FfiRegistry {
         symbol: &str,
         signature: Signature,
     ) -> Result<NativeFunction, String> {
-        if let Some(func) = self.resolve(Some(library), symbol) {
-            return Ok(func);
+        // Enforce policy before any cached or host-registered resolution. The
+        // load_library check alone cannot protect pre-registered symbols.
+        if !self.is_lib_allowed(library) {
+            return Err(format!("FFI: library '{}' not in allowlist", library));
         }
-        if let Some(func) = self.resolve(None, symbol) {
+
+        if let Some(func) = self
+            .resolve(Some(library), symbol)
+            .or_else(|| self.resolve(None, symbol))
+        {
+            // A mismatched declaration at the C ABI boundary is unsafe even
+            // when the host registered the function itself.
+            if func.signature != signature {
+                return Err(format!(
+                    "FFI signature mismatch for '{}' in library '{}': requested {:?}, registered {:?}",
+                    symbol, library, signature, func.signature
+                ));
+            }
             return Ok(func);
         }
         let lib = self.load_library(library)?;
@@ -288,6 +302,109 @@ mod tests {
 
     use crate::ffi::marshal::{CType, Signature};
     use std::ffi::c_void;
+
+    #[test]
+    fn cached_ffi_function_must_obey_tightened_library_policy() {
+        let mut registry = FfiRegistry::new();
+        let signature = Signature::new(vec![], CType::Unit);
+        // SAFETY: Test never invokes the native pointer.
+        registry.register(unsafe {
+            NativeFunction::new(
+                std::ptr::null::<c_void>(),
+                signature.clone(),
+                Some("libblocked.so".to_string()),
+                "existing_symbol".to_string(),
+            )
+        });
+        // SAFETY: Test never invokes the native pointer.
+        registry.register(unsafe {
+            NativeFunction::new(
+                std::ptr::null::<c_void>(),
+                signature.clone(),
+                Some("liballowed.so".to_string()),
+                "existing_symbol".to_string(),
+            )
+        });
+
+        registry.set_policy(FfiPolicy::Allowlist(
+            ["liballowed.so".to_string()].into_iter().collect(),
+        ));
+
+        // SAFETY: Only resolves a dummy pointer; never executes it.
+        let denied = unsafe {
+            registry.resolve_or_load("libblocked.so", "existing_symbol", signature.clone())
+        };
+        assert_eq!(
+            denied.unwrap_err(),
+            "FFI: library 'libblocked.so' not in allowlist"
+        );
+
+        // SAFETY: Only resolves a dummy pointer; never executes it.
+        let allowed =
+            unsafe { registry.resolve_or_load("liballowed.so", "existing_symbol", signature) };
+        assert!(allowed.is_ok(), "allowed cached function remains available");
+    }
+
+    #[test]
+    fn host_registered_symbol_cannot_bypass_callsite_library_policy() {
+        let mut registry = FfiRegistry::new();
+        let signature = Signature::new(vec![], CType::Unit);
+        // SAFETY: Test never invokes the native pointer.
+        registry.register(unsafe {
+            NativeFunction::new(
+                std::ptr::null::<c_void>(),
+                signature.clone(),
+                None,
+                "host_symbol".to_string(),
+            )
+        });
+        registry.set_policy(FfiPolicy::Allowlist(HashSet::new()));
+
+        // SAFETY: Only resolves a dummy pointer; never executes it.
+        let denied = unsafe { registry.resolve_or_load("libblocked.so", "host_symbol", signature) };
+        assert_eq!(
+            denied.unwrap_err(),
+            "FFI: library 'libblocked.so' not in allowlist"
+        );
+    }
+
+    #[test]
+    fn cached_ffi_function_rejects_mismatched_abi_signature() {
+        let mut registry = FfiRegistry::new();
+        let registered_signature = Signature::new(vec![CType::I64], CType::I64);
+        // SAFETY: Test never invokes the native pointer.
+        registry.register(unsafe {
+            NativeFunction::new(
+                std::ptr::null::<c_void>(),
+                registered_signature.clone(),
+                None,
+                "registered_callback".to_string(),
+            )
+        });
+
+        // SAFETY: Test only resolves a dummy pointer and must reject before calling it.
+        let mismatched = unsafe {
+            registry.resolve_or_load(
+                "__nulang_registered__",
+                "registered_callback",
+                Signature::new(vec![], CType::I64),
+            )
+        };
+        assert!(
+            mismatched.unwrap_err().contains("FFI signature mismatch"),
+            "a conflicting callsite ABI must not invoke a cached native pointer"
+        );
+
+        // SAFETY: Test only resolves, never calls, the registered pointer.
+        assert!(unsafe {
+            registry.resolve_or_load(
+                "__nulang_registered__",
+                "registered_callback",
+                registered_signature,
+            )
+        }
+        .is_ok());
+    }
 
     #[test]
     fn test_ffi_registry_new() {

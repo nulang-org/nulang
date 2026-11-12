@@ -1,4 +1,9 @@
 # Nulang Changelog
+### FFI allowlist and cached native ABI enforcement — 2026-11-12
+- **FFI library admission now precedes both cached-library and host-registered symbol resolution.** Tightening the allowlist cannot be bypassed by a previously registered native pointer.
+- **Previously registered native functions require an exact ABI signature match** with the callsite declaration, avoiding unsafe reinterpretation of pointers and argument layouts.
+- **CLI `--ffi-allow <lib>` implies `--ffi-sandbox`.** Omitting `--ffi-sandbox` no longer silently disables the explicitly requested allowlist; standalone development runs without either flag retain historical behavior. Embedders must still apply their own runtime authority policies.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
