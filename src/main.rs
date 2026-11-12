@@ -5,7 +5,7 @@
 //!   nulang --repl
 //!   nulang --eval <CODE>
 //!   nulang --check <FILE>
-//!   nulang prove <FILE> [--json] [--strict]
+//!   nulang prove <FILE> [--json] [--strict] [--solver z3]
 //!   nulang --lsp
 //!   nulang --dap [FILE]
 //!   nulang agent <init|run|chat|goals|graph>
@@ -1141,7 +1141,9 @@ fn print_help() {
     println!("  -r, --repl       Start interactive REPL");
     println!("  -e, --eval       Evaluate a code string");
     println!("  -c, --check      Type-check a file (don't run)");
-    println!("  prove <file>     Opt-in function postcondition analysis (--json, --strict)");
+    println!(
+        "  prove <file>     Opt-in function postcondition analysis (--json, --strict, --solver z3)"
+    );
     println!("  --doc            Generate Markdown API docs (docs/api.md)");
     println!("  --emit-stdlib-docs <dir>  Generate per-effect stdlib Markdown docs into <dir>");
     println!("  --lsp            Start Language Server (stdio)");
@@ -2943,19 +2945,34 @@ mod tests {
 /// Opt-in SPARK-inspired proof diagnostics. Normal builds, runs, and `--check`
 /// never invoke the analyzer. Unknown is informative unless --strict is set.
 fn run_prove_cmd(args: &[String]) -> i32 {
-    use nulang::contract_proof::{prove_module, ProofStatus};
+    use nulang::contract_proof::{prove_module, prove_module_with_z3, ProofStatus};
 
     let mut file = None;
     let mut json = false;
     let mut strict = false;
-    for arg in args {
+    let mut solver = "interval";
+    let mut input = args.iter();
+    while let Some(arg) = input.next() {
         match arg.as_str() {
             "--json" => json = true,
             "--strict" => strict = true,
+            "--solver=z3" => solver = "z3",
+            "--solver=interval" => solver = "interval",
+            "--solver" => match input.next().map(String::as_str) {
+                Some("z3") => solver = "z3",
+                Some("interval") => solver = "interval",
+                _ => {
+                    eprintln!("--solver must be 'interval' or 'z3'");
+                    return 2;
+                }
+            },
             "-h" | "--help" => {
-                println!("Usage: nulang prove <FILE> [--json] [--strict]");
+                println!("Usage: nulang prove <FILE> [--json] [--strict] [--solver z3]");
                 println!(
                     "Check existing requires/ensures without changing builds or runtime behavior."
+                );
+                println!(
+                    "Interval analysis is the default; --solver z3 optionally uses installed Z3."
                 );
                 println!("Unknown results are advisory by default; --strict fails on unknown.");
                 return 0;
@@ -2991,7 +3008,11 @@ fn run_prove_cmd(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let results = prove_module(&module);
+    let results = if solver == "z3" {
+        prove_module_with_z3(&module)
+    } else {
+        prove_module(&module)
+    };
     let proved = results
         .iter()
         .filter(|r| r.status == ProofStatus::Proved)
