@@ -5,6 +5,7 @@
 //!   nulang --repl
 //!   nulang --eval <CODE>
 //!   nulang --check <FILE>
+//!   nulang prove <FILE> [--json] [--strict]
 //!   nulang --lsp
 //!   nulang --dap [FILE]
 //!   nulang agent <init|run|chat|goals|graph>
@@ -15,6 +16,7 @@
 //!   -r, --repl               Start interactive REPL
 //!   -e, --eval <CODE>        Evaluate a code string
 //!   -c, --check <FILE>       Type-check a file (don't run)
+//!   prove <FILE>              Opt-in, conservative contract proof diagnostics
 //!   --doc                    Generate Markdown API docs (docs/api.md)
 //!   --emit-stdlib-docs <dir> Generate per-effect stdlib docs into <dir>
 //!   --lsp                    Start Language Server (stdio)
@@ -260,6 +262,12 @@ fn main() {
         }
     }
 
+    if args[1] == "prove" {
+        std::process::exit(run_prove_cmd(&args[2..]));
+    }
+    if args[1] == "nula" && args.get(2).is_some_and(|arg| arg == "prove") {
+        std::process::exit(run_prove_cmd(&args[3..]));
+    }
     if args[1] == "nula" {
         if let Err(e) = nulang::package::commands::run(&args[2..]) {
             print_error(&e, true);
@@ -2928,5 +2936,104 @@ mod tests {
             Some(2),
             "both inc messages must be delivered by run_scheduler"
         );
+    }
+}
+
+/// Opt-in SPARK-inspired proof diagnostics. Normal builds, runs, and `--check`
+/// never invoke the analyzer. Unknown is informative unless --strict is set.
+fn run_prove_cmd(args: &[String]) -> i32 {
+    use nulang::contract_proof::{prove_module, ProofStatus};
+
+    let mut file = None;
+    let mut json = false;
+    let mut strict = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--strict" => strict = true,
+            "-h" | "--help" => {
+                println!("Usage: nulang prove <FILE> [--json] [--strict]");
+                println!(
+                    "Check existing requires/ensures without changing builds or runtime behavior."
+                );
+                println!("Unknown results are advisory by default; --strict fails on unknown.");
+                return 0;
+            }
+            option if option.starts_with('-') => {
+                eprintln!("Unknown prove option: {option}");
+                return 2;
+            }
+            path if file.is_none() => file = Some(path),
+            _ => {
+                eprintln!("Usage: nulang prove <FILE> [--json] [--strict]");
+                return 2;
+            }
+        }
+    }
+    let Some(path) = file else {
+        eprintln!("Usage: nulang prove <FILE> [--json] [--strict]");
+        return 2;
+    };
+    let source = match std::fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(err) => {
+            eprintln!("Cannot read {path}: {err}");
+            return 2;
+        }
+    };
+    // Reuse the same semantic frontend as --check. Never prove malformed or
+    // untyped code by analyzing only its parsed syntax.
+    let (module, _) = match run_frontend(&source, Some(path), false, &[], false) {
+        Ok(result) => result,
+        Err(err) => {
+            print_error(&err, true);
+            return 2;
+        }
+    };
+    let results = prove_module(&module);
+    let proved = results
+        .iter()
+        .filter(|r| r.status == ProofStatus::Proved)
+        .count();
+    let unknown = results
+        .iter()
+        .filter(|r| r.status == ProofStatus::Unknown)
+        .count();
+    let counterexamples = results
+        .iter()
+        .filter(|r| r.status == ProofStatus::Counterexample)
+        .count();
+
+    if json {
+        let report = serde_json::json!({
+            "schema": "nulang.contract-proof/v1",
+            "results": results,
+            "summary": {
+                "proved": proved,
+                "unknown": unknown,
+                "counterexample": counterexamples
+            }
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).expect("serializable proof report")
+        );
+    } else {
+        for result in &results {
+            println!("{:?} {}: {}", result.status, result.function, result.detail);
+            if let Some(witness) = &result.witness {
+                println!("  witness: {witness:?}");
+            }
+        }
+        println!("Contract proofs: {proved} proved, {unknown} unknown, {counterexamples} counterexample(s)");
+        if results.is_empty() {
+            println!("No function postconditions found; normal compilation is unchanged.");
+        }
+    }
+
+    if counterexamples > 0 || (strict && unknown > 0) {
+        1
+    } else {
+        0
     }
 }
