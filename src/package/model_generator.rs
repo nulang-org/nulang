@@ -176,15 +176,15 @@ impl Resource {
             self.name, self.name
         ));
         if self.read_only_views {
-            code = format!("import stdlib::web::types\nimport stdlib::web::admin\n\n{code}");
+            code = format!("import stdlib::web::types\nimport stdlib::web::admin\nimport stdlib::web::host\n\n{code}");
             code.push_str(&self.render_read_only_views());
         }
         code
     }
 
     /// Render opt-in views from the same validated fields as the domain type.
-    /// Caller must obtain records and tenant identity from a trusted server
-    /// context; authorization hooks still deny every record until implemented.
+    /// Identity is obtained only from a trusted request-scoped host effect;
+    /// authorization hooks still deny every record until implemented.
     fn render_read_only_views(&self) -> String {
         let stem = self.file_stem();
         let mut column_names = vec!["ID".to_string()];
@@ -210,8 +210,10 @@ impl Resource {
             "\n// Presentation helpers only. Do not derive actor_tenant_id from request input.\n\
              // Nonempty tenant and record tenant equality are mandatory before policy.
 \
-             // A matching tenant alone is not authorization. The actor MUST be server-verified.\n\
-             pub fn {stem}_readonly_table(actor_tenant_id: String, records: [{}]) -> Html {{\n\
+             // The only identity source is Web.verified_tenant_id in an authenticated request.\n\
+             // A matching tenant alone is not authorization: also apply custom policy.\n\
+             pub fn {stem}_readonly_table(records: [{}]) -> Html {{\n\
+                 let actor_tenant_id = verified_tenant_id();\n\
                  var rows = [];\n\
                  for record in records {{\n\
                      if actor_tenant_id != \"\" && record.tenant_id == actor_tenant_id && can_read_{stem}(actor_tenant_id, record) then {{\n\
@@ -220,7 +222,8 @@ impl Resource {
                  }};\n\
                  readonly_table([{columns}], rows)\n\
              }}\n\n\
-             pub fn {stem}_readonly_detail(actor_tenant_id: String, record: {}) -> Html {{\n\
+             pub fn {stem}_readonly_detail(record: {}) -> Html {{\n\
+                 let actor_tenant_id = verified_tenant_id();\n\
                  if actor_tenant_id != \"\" && record.tenant_id == actor_tenant_id && can_read_{stem}(actor_tenant_id, record) then {{\n\
                      readonly_detail([{columns}], [{row}])\n\
                  }} else {{\n\
@@ -400,6 +403,25 @@ mod tests {
     }
 
     #[test]
+    fn generated_view_identity_is_server_owned_not_a_caller_argument() {
+        let resource = Resource::parse(&argv(&[
+            "model",
+            "BillboardFace",
+            "--field",
+            "name:String",
+            "--read-only-views",
+        ]))
+        .unwrap();
+        let code = resource.render();
+        assert!(code.contains("import stdlib::web::host"));
+        assert!(code.contains("pub fn billboard_face_readonly_table(records: [BillboardFace])"));
+        assert!(code.contains("pub fn billboard_face_readonly_detail(record: BillboardFace)"));
+        assert!(code.contains("let actor_tenant_id = verified_tenant_id()"));
+        assert!(!code.contains("pub fn billboard_face_readonly_table(actor_tenant_id: String"));
+        assert!(!code.contains("pub fn billboard_face_readonly_detail(actor_tenant_id: String"));
+    }
+
+    #[test]
     fn generated_read_only_views_resolve_imports_and_typecheck() {
         let resource = Resource::parse(&argv(&[
             "model",
@@ -432,6 +454,10 @@ mod tests {
     // Exercise the generated code over the real experimental Web HTTP host,
     // not just parser/typechecker or string assertions.
     fn generated_http_view(source: &str) -> String {
+        generated_http_view_authenticated(source, None)
+    }
+
+    fn generated_http_view_authenticated(source: &str, verified_tenant: Option<&str>) -> String {
         use crate::runtime::{HttpMethod, WebDevServer, WebRoute};
         use std::io::{Read, Write};
         use std::net::{Shutdown, TcpStream};
@@ -464,27 +490,45 @@ mod tests {
             .iter()
             .position(|code_offset| *code_offset == offset)
             .expect("compiled show handler slot");
-        let server = WebDevServer::bind(
-            0,
-            None,
-            None,
-            vec![WebRoute {
-                method: HttpMethod::Get,
-                path: "/resource-view".into(),
-                handler_module: compiled,
-                handler_func_idx: idx,
-            }],
-        )
-        .expect("bind resource-view HTTP server");
+        let route = WebRoute {
+            method: HttpMethod::Get,
+            path: "/resource-view".into(),
+            handler_module: compiled,
+            handler_func_idx: idx,
+        };
+        let server = if let Some(tenant_id) = verified_tenant {
+            use crate::web::tenant_auth::{TenantAuthGuard, VerifiedTenant};
+            let tenant_id = tenant_id.to_owned();
+            let resolver = std::sync::Arc::new(move |token: &str| {
+                if token == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+                    VerifiedTenant::new("test-user", &tenant_id)
+                } else {
+                    None
+                }
+            });
+            let guard = TenantAuthGuard::new(
+                "__Host-nulang_tenant",
+                vec![(HttpMethod::Get, "/resource-view".into())],
+                resolver,
+            )
+            .unwrap();
+            WebDevServer::bind_with_tenant_guard(0, None, None, vec![route], guard)
+                .expect("bind guarded model-view HTTP server")
+        } else {
+            WebDevServer::bind(0, None, None, vec![route])
+                .expect("bind unguarded model-view HTTP server")
+        };
         let mut stream = TcpStream::connect(("127.0.0.1", server.port)).expect("connect");
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        stream
-            .write_all(
-                b"GET /resource-view HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-            )
-            .unwrap();
+        let mut request =
+            "GET /resource-view HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n".to_owned();
+        if verified_tenant.is_some() {
+            request.push_str("Cookie: __Host-nulang_tenant=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+        }
+        request.push_str("\r\n");
+        stream.write_all(request.as_bytes()).unwrap();
         stream.shutdown(Shutdown::Write).unwrap();
         let mut bytes = Vec::new();
         stream.read_to_end(&mut bytes).expect("read HTTP response");
@@ -517,11 +561,11 @@ mod tests {
 fn show() {
     let own = {id: "1", tenant_id: "tenant-a", name: "VISIBLE-OWN", active: true} in
     let foreign = {id: "2", tenant_id: "tenant-b", name: "SECRET-FOREIGN", active: true} in
-    billboard_face_readonly_table("tenant-a", [own, foreign])
+    billboard_face_readonly_table([own, foreign])
 }
 "#,
         );
-        let response = generated_http_view(&source);
+        let response = generated_http_view_authenticated(&source, Some("tenant-a"));
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         assert!(response.contains("VISIBLE-OWN"), "{response}");
         assert!(!response.contains("SECRET-FOREIGN"), "{response}");
@@ -534,11 +578,11 @@ fn show() {
             r#"
 fn show() {
     let foreign = {id: "2", tenant_id: "tenant-b", name: "SECRET-FOREIGN", active: true} in
-    billboard_face_readonly_detail("tenant-a", foreign)
+    billboard_face_readonly_detail(foreign)
 }
 "#,
         );
-        let response = generated_http_view(&source);
+        let response = generated_http_view_authenticated(&source, Some("tenant-a"));
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         assert!(response.contains("Access denied"), "{response}");
         assert!(!response.contains("SECRET-FOREIGN"), "{response}");
@@ -551,7 +595,7 @@ fn show() {
             r#"
 fn show() {
     let unscoped = {id: "1", tenant_id: "", name: "SECRET-NO-IDENTITY", active: true} in
-    billboard_face_readonly_detail("", unscoped)
+    billboard_face_readonly_detail(unscoped)
 }
 "#,
         );
@@ -568,7 +612,7 @@ fn show() {
             r#"
 fn show() {
     let unscoped = {id: "1", tenant_id: "", name: "SECRET-NO-IDENTITY", active: true} in
-    billboard_face_readonly_table("", [unscoped])
+    billboard_face_readonly_table([unscoped])
 }
 "#,
         );
@@ -584,11 +628,11 @@ fn show() {
             r#"
 fn show() {
     let own = {id: "1", tenant_id: "tenant-a", name: "VISIBLE-OWN", active: true} in
-    billboard_face_readonly_detail("tenant-a", own)
+    billboard_face_readonly_detail(own)
 }
 "#,
         );
-        let response = generated_http_view(&source);
+        let response = generated_http_view_authenticated(&source, Some("tenant-a"));
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         assert!(response.contains("VISIBLE-OWN"), "{response}");
     }
@@ -611,11 +655,11 @@ fn show() {
             r#"
 fn show() {
     let own = {id: "1", tenant_id: "tenant-a", name: "SECRET-OWN", active: true} in
-    billboard_face_readonly_detail("tenant-a", own)
+    billboard_face_readonly_detail(own)
 }
 "#
         );
-        let response = generated_http_view(&source);
+        let response = generated_http_view_authenticated(&source, Some("tenant-a"));
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         assert!(response.contains("Access denied"), "{response}");
         assert!(!response.contains("SECRET-OWN"), "{response}");

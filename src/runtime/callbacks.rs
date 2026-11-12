@@ -466,6 +466,10 @@ pub(crate) fn perform_web_builtin(
                 crate::runtime::http_server::current_request_header(&name),
             ))
         }
+        Some("verified_tenant_id") => Some(string_or_empty(
+            callbacks,
+            crate::runtime::http_server::current_verified_tenant_id(),
+        )),
         Some("cookie") => {
             let name = resolve(constants, *regs.first()?);
             Some(string_or_empty(
