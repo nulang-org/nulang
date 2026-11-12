@@ -15,5 +15,6 @@ pub mod package_contracts;
 pub mod reactivity;
 pub mod request_bindings;
 pub mod route_check;
+pub mod route_links;
 pub mod runtime_bindings;
 pub mod validation;
