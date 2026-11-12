@@ -1336,15 +1336,13 @@ impl LibsqlStore {
     /// store.
     pub fn with_sync_mode<P: AsRef<Path>>(path: P, sync_mode: SqliteSyncMode) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let db_path = if path == Path::new(":memory:") {
-            ":memory:".to_string()
-        } else {
-            path.to_string_lossy().into_owned()
-        };
+        // Preserve the native filesystem path. Lossy UTF-8 conversion
+        // silently opens a different database for non-UTF-8 Unix filenames.
+        // rusqlite accepts Path directly, including the special ":memory:".
         let rt =
             tokio::runtime::Runtime::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let db = rt.block_on(async {
-            libsql::Builder::new_local(&db_path)
+            libsql::Builder::new_local(&path)
                 .build()
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))

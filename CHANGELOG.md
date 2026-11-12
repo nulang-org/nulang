@@ -1,4 +1,8 @@
 # Nulang Changelog
+### SQLite local database pathname integrity — 2026-11-11
+- **Preserve native filesystem path bytes when opening local actor SQLite stores.** The security-migration adapter previously converted paths through lossy UTF-8, potentially opening a different file for a non-UTF-8 Unix pathname. The constructor now forwards Path directly, preserving database-file identity; the in-memory special name remains supported.
+- **Added a Unix filesystem regression checking exact filename bytes and no accidental replacement-name database.** Keep the patched SQLite/security integration and remote Turso fail-closed behavior separate; there are no new audit exclusions.
+
 ### Callback effect soundness on stack-safe compiler — 2026-11-11
 - **Closed effect budgets now reject unresolved callable tails**, including untyped parameters and computed callbacks through match branches, annotations, blocks, record fields, and indices. Pure callbacks with statically known rows remain admissible.
 - **Right-nested let-effect inference remains iterative and now preserves scoped callback provenance** through long binding chains, including same-name shadowing. Effect-row combinations deduplicate repeated effects and preserve distinct unknown tail identities.
