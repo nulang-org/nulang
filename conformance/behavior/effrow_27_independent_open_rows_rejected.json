@@ -1,0 +1,1 @@
+{"exit_code":5,"stdout":"","stderr":"effects {..} are not a subset","proves":"Independent named effect row tails must remain distinct and cannot discharge one another's effects."}
