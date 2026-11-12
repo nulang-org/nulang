@@ -1415,6 +1415,27 @@ fn cmd_build_web() -> NuResult<()> {
         span: Span::default(),
     })?;
 
+    // Optional browser-client route link modules share the validated compiler
+    // contract with dispatch, deployment IR, and OpenAPI.
+    let link_modules = crate::web::route_links::generate_route_link_modules(&validated_contracts)
+        .map_err(|diagnostics| NuError::PackageError {
+        msg: format!(
+            "invalid browser route contracts:\n{}",
+            diagnostics.join("\n")
+        ),
+        span: Span::default(),
+    })?;
+    for (filename, content) in [
+        ("app.routes.mjs", link_modules.javascript),
+        ("app.routes.d.mts", link_modules.declarations),
+    ] {
+        let path = output_dir.join(filename);
+        std::fs::write(&path, content).map_err(|e| NuError::PackageError {
+            msg: format!("cannot write {}: {}", path.display(), e),
+            span: Span::default(),
+        })?;
+    }
+
     eprintln!("  Rendering {} route(s)...", routes.len());
     for route in &routes {
         let html = render_route_handler(&route.handler_module, route.handler_func_idx, None)
@@ -3113,6 +3134,13 @@ app "counter" {
             .expect("app.client.js should exist");
         assert!(js.contains("window.nulang"), "nulang global missing");
         assert!(js.contains("hydrate"), "hydrate missing");
+
+        let link_js = std::fs::read_to_string(dir.join("dist/app.routes.mjs"))
+            .expect("browser route URL module should exist");
+        assert!(link_js.contains("export function urlFor"));
+        let link_types = std::fs::read_to_string(dir.join("dist/app.routes.d.mts"))
+            .expect("browser route URL declarations should exist");
+        assert!(link_types.contains("export declare function urlFor"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
