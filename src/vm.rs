@@ -4892,6 +4892,11 @@ impl VM {
                 Value::nil()
             };
         } else {
+            // Preserve legacy nil defaults, but never turn unrelated dynamic
+            // values (Bool, String, mixed Int/Float) into numeric operands.
+            if !(a.is_int() || a.is_nil()) || !(b.is_int() || b.is_nil()) {
+                return Err(arith_type_error("div", a, b));
+            }
             let ai = a.as_int().unwrap_or(0);
             let bi = b.as_int().unwrap_or(1);
             self.frames[frame_idx].regs[instr.op3 as usize] = if bi != 0 {
@@ -4922,6 +4927,11 @@ impl VM {
                 Value::nil()
             };
         } else {
+            // Preserve legacy nil defaults, but never turn unrelated dynamic
+            // values (Bool, String, mixed Int/Float) into numeric operands.
+            if !(a.is_int() || a.is_nil()) || !(b.is_int() || b.is_nil()) {
+                return Err(arith_type_error("mod", a, b));
+            }
             let ai = a.as_int().unwrap_or(0);
             let bi = b.as_int().unwrap_or(1);
             self.frames[frame_idx].regs[instr.op3 as usize] = if bi != 0 {
@@ -6509,6 +6519,70 @@ mod vm_tests {
             .map(|jit| jit.compiled_count())
             .unwrap_or(0);
         assert!(compiled > 0, "hot loop must execute a compiled region");
+    }
+
+    // An ordinary dynamic arithmetic operation must never silently coerce
+    // a boolean or mixed numeric type into an integer operand.
+    fn run_binary_arithmetic(op: OpCode, left: Constant, right: Constant) -> NuResult<Value> {
+        let mut module = CodeModule::new("binary_arithmetic_type_check");
+        let left_idx = module.add_constant(left);
+        let right_idx = module.add_constant(right);
+        for (idx, dst) in [(left_idx, 0), (right_idx, 1)] {
+            module.emit(Instruction::new3(
+                OpCode::ConstU,
+                ((idx >> 8) & 0xff) as u8,
+                (idx & 0xff) as u8,
+                dst,
+            ));
+        }
+        module.emit(Instruction::new3(op, 0, 1, 2));
+        module.emit(Instruction::new2(OpCode::Move, 2, 0));
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
+        let mut vm = VM::new();
+        vm.load_module(module);
+        vm.run()
+    }
+
+    #[test]
+    fn test_divmod_reject_nonnumeric_operands() {
+        for op in [OpCode::IDiv, OpCode::IMod] {
+            for (left, right) in [
+                (Constant::Int(8), Constant::Bool(true)),
+                (Constant::Bool(true), Constant::Int(2)),
+                (Constant::Int(8), Constant::Float(2.0)),
+            ] {
+                let err = run_binary_arithmetic(op, left, right)
+                    .expect_err("non-numeric or mixed division/modulo must fail");
+                assert!(
+                    format!("{err}").contains("requires numeric operands"),
+                    "unexpected error: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_divmod_legacy_nil_zero_and_float() {
+        // Preserve established VM nil/zero handling until a separate RFC
+        // changes the legacy opcode contract.
+        assert_eq!(
+            run_binary_arithmetic(OpCode::IDiv, Constant::Int(8), Constant::Nil)
+                .unwrap()
+                .as_int(),
+            Some(8)
+        );
+        assert!(
+            run_binary_arithmetic(OpCode::IMod, Constant::Int(8), Constant::Int(0))
+                .unwrap()
+                .is_nil()
+        );
+        assert_eq!(
+            run_binary_arithmetic(OpCode::IDiv, Constant::Float(8.0), Constant::Float(2.0))
+                .unwrap()
+                .as_float(),
+            Some(4.0)
+        );
     }
 
     /// Test 1: Basic integer arithmetic.

@@ -110,6 +110,13 @@ pub extern "C" fn nulang_idiv(a: u64, b: u64) -> u64 {
         }
         return Value::float(f64::from_bits(a) / bv).as_raw();
     }
+    // Runtime helper for dynamic operands: mirror the reference VM's
+    // acceptance of legacy nil without coercing arbitrary values to integers.
+    let av = unsafe { Value::from_raw(a) };
+    let bv_value = unsafe { Value::from_raw(b) };
+    if !(av.is_int() || av.is_nil()) || !(bv_value.is_int() || bv_value.is_nil()) {
+        return record_arith_error(crate::vm::arith_type_error("div", av, bv_value));
+    }
     let bv = as_int_or_one(b);
     if bv == 0 {
         return Value::nil().as_raw();
@@ -131,6 +138,13 @@ pub extern "C" fn nulang_imod(a: u64, b: u64) -> u64 {
             return Value::nil().as_raw();
         }
         return Value::float(f64::from_bits(a) % bv).as_raw();
+    }
+    // Runtime helper for dynamic operands: mirror the reference VM's
+    // acceptance of legacy nil without coercing arbitrary values to integers.
+    let av = unsafe { Value::from_raw(a) };
+    let bv_value = unsafe { Value::from_raw(b) };
+    if !(av.is_int() || av.is_nil()) || !(bv_value.is_int() || bv_value.is_nil()) {
+        return record_arith_error(crate::vm::arith_type_error("mod", av, bv_value));
     }
     let bv = as_int_or_one(b);
     if bv == 0 {
@@ -2221,6 +2235,44 @@ mod tests {
         });
         left.join().unwrap();
         right.join().unwrap();
+    }
+
+    #[test]
+    fn test_divmod_dynamic_helpers_reject_non_numeric() {
+        use crate::vm::Value;
+        let _ = super::aot_take_pending_error();
+        for (op, f) in [
+            ("div", super::nulang_idiv as extern "C" fn(u64, u64) -> u64),
+            ("mod", super::nulang_imod as extern "C" fn(u64, u64) -> u64),
+        ] {
+            for (left, right) in [
+                (Value::int(8), Value::bool(true)),
+                (Value::bool(true), Value::int(2)),
+                (Value::int(8), Value::float(2.0)),
+            ] {
+                let result = f(left.as_raw(), right.as_raw());
+                assert_eq!(result, Value::nil().as_raw());
+                let error = super::aot_take_pending_error()
+                    .expect("native arithmetic must record a type error");
+                assert!(
+                    error.contains("requires numeric operands") && error.contains(op),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_divmod_dynamic_helpers_preserve_nil_and_zero() {
+        use crate::vm::Value;
+        let _ = super::aot_take_pending_error();
+        let div = super::nulang_idiv(Value::int(8).as_raw(), Value::nil().as_raw());
+        assert_eq!(div, Value::int(8).as_raw());
+        let rem = super::nulang_imod(Value::int(8).as_raw(), Value::int(0).as_raw());
+        assert_eq!(rem, Value::nil().as_raw());
+        let quotient = super::nulang_idiv(Value::float(8.0).as_raw(), Value::float(2.0).as_raw());
+        assert_eq!(quotient, Value::float(4.0).as_raw());
+        assert_eq!(super::aot_take_pending_error(), None);
     }
 
     #[test]
