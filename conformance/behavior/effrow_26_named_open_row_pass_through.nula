@@ -1,0 +1,3 @@
+fn pass_through(f: (Int) -> Int ! {| row}) -> Int ! {| row} { f(1) }
+fn pure() -> Unit ! {} {}
+pure()
