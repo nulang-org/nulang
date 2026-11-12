@@ -261,11 +261,47 @@ fn bench_selective_receive(c: &mut Criterion) {
     group.finish();
 }
 
+/// Cost of publishing to an unmatched Fabric topic as unrelated idle actors
+/// accumulate. There is intentionally no matching subscription: old runtimes
+/// scanned every local mailbox merely to determine that no recipient exists.
+/// Actor construction, scheduler drain, and teardown are not timed.
+fn bench_fabric_publish_unmatched(c: &mut Criterion) {
+    let mut group = c.benchmark_group("actor/fabric_publish_unmatched");
+    for actor_count in [0usize, 1_000, 10_000] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(actor_count),
+            &actor_count,
+            |b, &actor_count| {
+                let mut rt = Runtime::new();
+                for _ in 0..actor_count {
+                    rt.spawn_actor(Box::new(Vec::new));
+                }
+                rt.run_scheduler();
+
+                // Verify the fixture does not accidentally benchmark delivery.
+                let first = rt
+                    .fabric_publish_report("bench.unmatched", &[])
+                    .expect("unmatched Fabric publication");
+                assert_eq!(first.selected, 0);
+
+                b.iter(|| {
+                    black_box(
+                        rt.fabric_publish_report(black_box("bench.unmatched"), &[])
+                            .expect("unmatched Fabric publication"),
+                    );
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_spawn_idle_batch,
     bench_spawn_send_receive,
     bench_message_enqueue,
     bench_message_drain,
-    bench_selective_receive
+    bench_selective_receive,
+    bench_fabric_publish_unmatched
 );
