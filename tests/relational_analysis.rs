@@ -412,7 +412,8 @@ fn proof_dag_deduplicates_shared_premises_and_limits_expansion() {
             &target,
             ProofLimits {
                 max_nodes: 2,
-                max_depth: 12
+                max_depth: 12,
+                ..ProofLimits::default()
             },
         ),
         Err(LogicError::LimitExceeded("max_proof_nodes"))
@@ -422,7 +423,8 @@ fn proof_dag_deduplicates_shared_premises_and_limits_expansion() {
             &target,
             ProofLimits {
                 max_nodes: 12,
-                max_depth: 1
+                max_depth: 1,
+                ..ProofLimits::default()
             },
         ),
         Err(LogicError::LimitExceeded("max_proof_depth"))
@@ -461,5 +463,129 @@ fn indexed_join_avoids_quadratic_candidate_scanning() {
     assert!(
         statistics.candidate_rows < 4_000,
         "indexed join should avoid scanning all 400 edges per join: {statistics:?}"
+    );
+}
+
+#[test]
+fn proof_dag_refuses_too_many_edges_or_too_many_payload_bytes() {
+    use nulang::relational_analysis::ProofLimits;
+    let program = LogicProgram::new(
+        vec![
+            relation("base", vec![ColumnType::Symbol]),
+            relation("result", vec![ColumnType::Symbol]),
+        ],
+        vec![Rule::new(
+            "duplication",
+            atom("result", vec![var("name")]),
+            vec![
+                atom("base", vec![var("name")]),
+                atom("base", vec![var("name")]),
+            ],
+        )],
+    )
+    .unwrap();
+
+    let target = Fact::new("result", vec![symbol("A")]);
+    let result = program
+        .evaluate([Fact::new("base", vec![symbol("A")])], Limits::default())
+        .unwrap();
+
+    let too_few_edges = ProofLimits {
+        max_edges: 1,
+        ..ProofLimits::default()
+    };
+    assert_eq!(
+        result.explain_dag(&target, too_few_edges),
+        Err(LogicError::LimitExceeded("max_proof_edges"))
+    );
+    let too_few_bytes = ProofLimits {
+        max_bytes: 1,
+        ..ProofLimits::default()
+    };
+    assert_eq!(
+        result.explain_dag(&target, too_few_bytes),
+        Err(LogicError::LimitExceeded("max_proof_bytes"))
+    );
+    let enough = ProofLimits::default();
+    let dag = result.explain_dag(&target, enough).unwrap().unwrap();
+    assert_eq!(dag.nodes.len(), 2);
+    assert_eq!(dag.nodes[dag.root].fact, target);
+}
+
+#[test]
+fn proof_bytes_limit_counts_large_symbol_values() {
+    use nulang::relational_analysis::ProofLimits;
+    let program =
+        LogicProgram::new(vec![relation("source", vec![ColumnType::Symbol])], vec![]).unwrap();
+    let fact = Fact::new("source", vec![symbol(&"a".repeat(6_000))]);
+    let result = program.evaluate([fact.clone()], Limits::default()).unwrap();
+    let limit = ProofLimits {
+        max_bytes: 1_024,
+        ..ProofLimits::default()
+    };
+    assert_eq!(
+        result.explain_dag(&fact, limit),
+        Err(LogicError::LimitExceeded("max_proof_bytes"))
+    );
+}
+
+#[test]
+fn proof_depth_checks_longest_path_when_premises_are_shared() {
+    use nulang::relational_analysis::ProofLimits;
+    let symbols = vec![
+        relation("base", vec![ColumnType::Symbol]),
+        relation("shallow", vec![ColumnType::Symbol]),
+        relation("medium", vec![ColumnType::Symbol]),
+        relation("root", vec![ColumnType::Symbol]),
+    ];
+    let rules = vec![
+        Rule::new(
+            "shallow",
+            atom("shallow", vec![var("x")]),
+            vec![atom("base", vec![var("x")])],
+        ),
+        Rule::new(
+            "medium",
+            atom("medium", vec![var("x")]),
+            vec![atom("shallow", vec![var("x")])],
+        ),
+        Rule::new(
+            "root",
+            atom("root", vec![var("x")]),
+            vec![
+                atom("shallow", vec![var("x")]),
+                atom("medium", vec![var("x")]),
+            ],
+        ),
+    ];
+    let result = LogicProgram::new(symbols, rules)
+        .unwrap()
+        .evaluate([Fact::new("base", vec![symbol("A")])], Limits::default())
+        .unwrap();
+    let root = Fact::new("root", vec![symbol("A")]);
+    assert_eq!(
+        result.explain_dag(
+            &root,
+            ProofLimits {
+                max_depth: 2,
+                ..ProofLimits::default()
+            }
+        ),
+        Err(LogicError::LimitExceeded("max_proof_depth"))
+    );
+    assert_eq!(
+        result
+            .explain_dag(
+                &root,
+                ProofLimits {
+                    max_depth: 3,
+                    ..ProofLimits::default()
+                }
+            )
+            .unwrap()
+            .unwrap()
+            .nodes
+            .len(),
+        4
     );
 }

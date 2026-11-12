@@ -14,9 +14,12 @@ bytecode, WASM, actor runtime, or authorization decisions.
   evaluates joins with at least one newly derived tuple.
 - One deterministic derivation tree per result (legacy `explain` API), plus
   a bounded, shared proof DAG via `explain_dag(fact, ProofLimits::default())`.
-  Proof DAGs are topologically ordered, with node and depth limits.
+  Proof DAGs are topologically ordered, with node, depth, premise-edge, and
+  estimated output-byte limits. A proof budget failure returns no partial DAG.
 - Equality indexes only for columns constrained by constants or earlier atoms;
   indexed buckets use hash lookups but facts and proof choices stay deterministic.
+  Multiple indexed columns of one tuple share a reference-counted allocation
+  within each index table instead of cloning the complete tuple per bucket.
   `statistics()` exposes candidate examinations and index-lookup counts.
 - Fail-closed budget errors for maximum facts, join candidate steps, and rounds.
   A failed analysis never returns an incomplete relation as though it were complete.
@@ -70,14 +73,19 @@ effect/capability checker. Do not use it for security decisions until its
 data extraction, cross-module symbol identity, and soundness guarantees are
 independently verified.
 
-This prototype still uses unoptimized left-to-right rule ordering and copies
-tuples into index buckets. It is **not** a production large-scale Datalog engine.
+This prototype still uses unoptimized left-to-right rule ordering. Tuple data
+are shared across index buckets, but core relation sets, delta indexes and
+proof provenance retain additional copies. It is **not** a production
+large-scale Datalog engine.
 Index creation has a fixed overhead; for small graphs or specialized raw-integer
 algorithms it can be slower despite scanning fewer candidates. The legacy
 `explain` method recursively expands trees without budgets: prefer
 `explain_dag` for arbitrary analysis graphs. The new bounded DAG also does not
-impose a byte-level or total-edge memory limit. Do not expose this API directly
-to untrusted inputs before resource accounting is strengthened.
+provide estimated output-byte and total premise-edge limits, but these are
+**not hard process-memory limits**: temporary traversal structures, lookup
+maps, allocator overhead, and evaluation facts/derivations are excluded.
+Untrusted input must not be allowed to control queries without separate input
+size caps and end-to-end resource limits.
 
 No negation, aggregation, general Prolog unification/backtracking, persistent
 fact store, or rule DSL is provided.
@@ -85,7 +93,7 @@ fact store, or rule DSL is provided.
 Before promotion, require the main CI gates (including no-default-features,
 default, optional WASM, lint and format), adversarial resource tests, and
 larger-graph profiling. The next step is measured join-order planning,
-stronger memory budgets, and bounded diagnostic rendering *before* automatic
+whole-evaluation byte budgets, and bounded diagnostic rendering *before* automatic
 whole-program analysis or public Nulang syntax.
 
 ## Performance smoke benchmark

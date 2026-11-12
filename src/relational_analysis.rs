@@ -13,6 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ColumnType {
@@ -178,6 +179,12 @@ pub enum Evidence {
 pub struct ProofLimits {
     pub max_nodes: usize,
     pub max_depth: usize,
+    /// Maximum number of premise references in the materialized DAG.
+    pub max_edges: usize,
+    /// Approximate payload budget for emitted nodes, strings, values and edges.
+    /// This is not a hard peak allocator limit: temporary traversal and map
+    /// structures are excluded.
+    pub max_bytes: usize,
 }
 
 impl Default for ProofLimits {
@@ -185,6 +192,8 @@ impl Default for ProofLimits {
         Self {
             max_nodes: 2_048,
             max_depth: 256,
+            max_edges: 16_384,
+            max_bytes: 4 * 1024 * 1024,
         }
     }
 }
@@ -241,6 +250,11 @@ impl QueryResult {
         }
         let mut nodes = Vec::new();
         let mut ids: BTreeMap<Fact, usize> = BTreeMap::new();
+        // Depth here means the longest derivation path (not only the first
+        // DFS path). Shared subproofs may be reachable at multiple depths.
+        let mut heights: Vec<usize> = Vec::new();
+        let mut emitted_edges: usize = 0;
+        let mut emitted_bytes: usize = 0;
         // Explicit postorder DFS: dependencies are always emitted first.
         let mut stack = vec![(fact.clone(), false, 0usize)];
         while let Some((current, exiting, depth)) = stack.pop() {
@@ -255,6 +269,64 @@ impl QueryResult {
                 if nodes.len() >= limits.max_nodes {
                     return Err(LogicError::LimitExceeded("max_proof_nodes"));
                 }
+                let proof_height = match justification {
+                    Justification::Input => 0,
+                    Justification::Derived { premises, .. } => {
+                        let mut longest = 0usize;
+                        for premise in premises {
+                            let step = heights[ids[premise]]
+                                .checked_add(1)
+                                .ok_or(LogicError::LimitExceeded("max_proof_depth"))?;
+                            longest = longest.max(step);
+                        }
+                        longest
+                    }
+                };
+                if proof_height > limits.max_depth {
+                    return Err(LogicError::LimitExceeded("max_proof_depth"));
+                }
+                let (new_edges, rule_bytes) = match justification {
+                    Justification::Input => (0usize, 0usize),
+                    Justification::Derived { rule, premises } => (premises.len(), rule.len()),
+                };
+                emitted_edges = emitted_edges
+                    .checked_add(new_edges)
+                    .ok_or(LogicError::LimitExceeded("max_proof_edges"))?;
+                if emitted_edges > limits.max_edges {
+                    return Err(LogicError::LimitExceeded("max_proof_edges"));
+                }
+
+                // Account for the emitted structure, not for temporary BTreeMap,
+                // DFS stack or allocator metadata. This is an approximate output
+                // payload cap, deliberately separate from the evaluation budget.
+                let mut node_bytes = std::mem::size_of::<ProofNode>()
+                    .checked_add(current.relation.len())
+                    .and_then(|n| n.checked_add(rule_bytes))
+                    .and_then(|n| {
+                        n.checked_add(
+                            current
+                                .values
+                                .len()
+                                .checked_mul(std::mem::size_of::<Value>())?,
+                        )
+                    })
+                    .and_then(|n| {
+                        n.checked_add(new_edges.checked_mul(std::mem::size_of::<usize>())?)
+                    })
+                    .ok_or(LogicError::LimitExceeded("max_proof_bytes"))?;
+                for value in &current.values {
+                    if let Value::Symbol(symbol) = value {
+                        node_bytes = node_bytes
+                            .checked_add(symbol.len())
+                            .ok_or(LogicError::LimitExceeded("max_proof_bytes"))?;
+                    }
+                }
+                emitted_bytes = emitted_bytes
+                    .checked_add(node_bytes)
+                    .ok_or(LogicError::LimitExceeded("max_proof_bytes"))?;
+                if emitted_bytes > limits.max_bytes {
+                    return Err(LogicError::LimitExceeded("max_proof_bytes"));
+                }
                 let evidence = match justification {
                     Justification::Input => ProofEvidence::Input,
                     Justification::Derived { rule, premises } => ProofEvidence::Derived {
@@ -263,6 +335,7 @@ impl QueryResult {
                     },
                 };
                 ids.insert(current.clone(), nodes.len());
+                heights.push(proof_height);
                 nodes.push(ProofNode {
                     fact: current,
                     evidence,
@@ -338,7 +411,9 @@ pub struct LogicProgram {
 #[derive(Debug, Clone, Default)]
 struct TupleIndex {
     columns: BTreeMap<String, BTreeSet<usize>>,
-    entries: HashMap<(String, usize, Value), BTreeSet<Vec<Value>>>,
+    // One reference-counted tuple per insertion, referenced from all indexes.
+    // Ordered sets keep derivation order deterministic across input shuffles.
+    entries: HashMap<(String, usize, Value), BTreeSet<Arc<[Value]>>>,
 }
 
 impl TupleIndex {
@@ -351,11 +426,15 @@ impl TupleIndex {
 
     fn insert(&mut self, fact: &Fact) {
         if let Some(columns) = self.columns.get(&fact.relation) {
+            if columns.is_empty() {
+                return;
+            }
+            let shared: Arc<[Value]> = Arc::from(fact.values.clone());
             for &column in columns {
                 self.entries
                     .entry((fact.relation.clone(), column, fact.values[column].clone()))
                     .or_default()
-                    .insert(fact.values.clone());
+                    .insert(Arc::clone(&shared));
             }
         }
     }
@@ -364,8 +443,8 @@ impl TupleIndex {
         &'a self,
         atom: &Atom,
         bindings: &BTreeMap<String, Value>,
-    ) -> Option<Option<&'a BTreeSet<Vec<Value>>>> {
-        let mut best: Option<&BTreeSet<Vec<Value>>> = None;
+    ) -> Option<Option<&'a BTreeSet<Arc<[Value]>>>> {
+        let mut best: Option<&BTreeSet<Arc<[Value]>>> = None;
         for (column, term) in atom.args.iter().enumerate() {
             if !self
                 .columns
@@ -389,6 +468,23 @@ impl TupleIndex {
             }
         }
         best.map(Some)
+    }
+}
+
+/// Iterate over either indexed shared tuples or the unindexed relation.
+enum Candidates<'a> {
+    Indexed(std::collections::btree_set::Iter<'a, Arc<[Value]>>),
+    Unindexed(std::collections::btree_set::Iter<'a, Vec<Value>>),
+}
+
+impl<'a> Iterator for Candidates<'a> {
+    type Item = &'a [Value];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Indexed(rows) => rows.next().map(AsRef::as_ref),
+            Self::Unindexed(rows) => rows.next().map(Vec::as_slice),
+        }
     }
 }
 
@@ -711,9 +807,9 @@ fn join(
     }
     let candidates = if let Some(Some(bucket)) = indexed {
         stats.index_lookups = stats.index_lookups.saturating_add(1);
-        bucket
+        Candidates::Indexed(bucket.iter())
     } else {
-        &source[&atom.relation]
+        Candidates::Unindexed(source[&atom.relation].iter())
     };
     for tuple in candidates {
         stats.candidate_rows = stats
@@ -746,7 +842,7 @@ fn join(
             }
         }
         if compatible {
-            premises.push(Fact::new(&atom.relation, tuple.clone()));
+            premises.push(Fact::new(&atom.relation, tuple.to_vec()));
             let result = join(
                 rule,
                 position + 1,
@@ -775,4 +871,34 @@ fn join(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod index_allocation_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn multiple_indexes_share_one_backing_tuple_allocation() {
+        let mut columns = BTreeMap::new();
+        columns.insert("multi".to_string(), [0, 1, 2].into_iter().collect());
+        let mut index = TupleIndex::new(&columns);
+        let values = vec![
+            Value::Symbol("very long value".repeat(200)),
+            Value::Int(17),
+            Value::Bool(true),
+        ];
+        index.insert(&Fact::new("multi", values.clone()));
+        let entry = |column| {
+            index
+                .entries
+                .get(&("multi".to_string(), column, values[column].clone()))
+                .unwrap()
+                .iter()
+                .next()
+                .unwrap()
+        };
+        assert!(Arc::ptr_eq(entry(0), entry(1)));
+        assert!(Arc::ptr_eq(entry(1), entry(2)));
+    }
 }
