@@ -2232,8 +2232,7 @@ mod tests {
             "Unhandled effect: 'non-exhaustive match.raise'".to_string(),
         );
         super::aot_set_pending_error("subsequent arithmetic failure".to_string());
-        let pending =
-            super::aot_take_pending_native_error().expect("first error must be recorded");
+        let pending = super::aot_take_pending_native_error().expect("first error must be recorded");
         assert!(matches!(
             pending.into_nu_error(),
             crate::types::NuError::EffectError { msg, .. }
@@ -2247,8 +2246,7 @@ mod tests {
         let _ = super::aot_take_pending_native_error();
         super::aot_set_pending_error("integer overflow".to_string());
         super::aot_set_pending_effect_error("later unhandled effect".to_string());
-        let pending =
-            super::aot_take_pending_native_error().expect("first error must be recorded");
+        let pending = super::aot_take_pending_native_error().expect("first error must be recorded");
         assert!(matches!(
             pending.into_nu_error(),
             crate::types::NuError::RuntimeError { msg, .. }
