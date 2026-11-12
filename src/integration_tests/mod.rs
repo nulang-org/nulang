@@ -11091,6 +11091,34 @@ match { a: 2, b: 9 } with {
     }
 
     #[test]
+    fn test_class_method_uses_matching_impl_when_classes_share_method_name() {
+        // Whichever class appears first in the hash table, both calls
+        // must resolve their own registered implementation.
+        let declarations = r#"
+            class IntSame[T] {
+                fn same(self: T, other: T) -> Bool
+            }
+            class StringSame[T] {
+                fn same(self: T, other: T) -> Bool
+            }
+            impl IntSame Int {
+                fn same(self: Int, other: Int) = self == other
+            }
+            impl StringSame String {
+                fn same(self: String, other: String) = true
+            }
+        "#;
+        for call in ["1.same(2)", "\"hello\".same(\"world\")"] {
+            let source = format!("{declarations}\n{call}");
+            let result = check_source(&source);
+            assert!(
+                result.is_ok(),
+                "{call} should select its matching impl regardless of class order: {result:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_class_method_with_two_param_impl() {
         // Method call with additional parameters resolves correctly.
         let result = check_source(

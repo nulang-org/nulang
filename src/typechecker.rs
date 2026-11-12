@@ -3161,71 +3161,91 @@ impl TypeChecker {
                 let concrete = !matches!(&current_ty, Type::Var(_) | Type::Skolem(_));
                 if concrete {
                     let type_key = format!("{}", current_ty);
-                    let class_table = self.class_table.clone();
-                    let instance_table = self.instance_table.clone();
-                    for (class_name, class_info) in &class_table {
-                        if class_info.methods.iter().any(|m| m.name == field) {
-                            let key = (class_name.clone(), type_key.clone());
-                            if instance_table.contains_key(&key) {
-                                let dict_name = format!("_impl_{}_{}", class_name, type_key);
-                                if let Some((dict_ty, _, _)) = ctx.lookup(&dict_name) {
-                                    if let Type::Record(fields) = dict_ty {
-                                        if let Some((_, field_ty)) =
-                                            fields.iter().find(|(n, _)| n == field)
+                    // Resolve a registered implementation before reporting a
+                    // missing one. A different class may define the same
+                    // method without implementing it for this receiver type.
+                    // Sort to avoid hash-table-order-dependent resolution.
+                    let mut method_classes: Vec<&String> = self
+                        .class_table
+                        .iter()
+                        .filter_map(|(name, info)| {
+                            info.methods
+                                .iter()
+                                .any(|method| method.name == field)
+                                .then_some(name)
+                        })
+                        .collect();
+                    method_classes.sort_unstable();
+                    let selected_class = method_classes
+                        .iter()
+                        .copied()
+                        .find(|name| {
+                            self.instance_table
+                                .contains_key(&((*name).clone(), type_key.clone()))
+                        })
+                        .or_else(|| method_classes.first().copied());
+                    if let Some(class_name) = selected_class {
+                        let key = (class_name.clone(), type_key.clone());
+                        if self.instance_table.contains_key(&key) {
+                            let dict_name = format!("_impl_{}_{}", class_name, type_key);
+                            if let Some((dict_ty, _, _)) = ctx.lookup(&dict_name) {
+                                if let Type::Record(fields) = dict_ty {
+                                    if let Some((_, field_ty)) =
+                                        fields.iter().find(|(n, _)| n == field)
+                                    {
+                                        if let Type::Function {
+                                            param,
+                                            ret,
+                                            effect,
+                                            cap,
+                                        } = field_ty
                                         {
-                                            if let Type::Function {
-                                                param,
-                                                ret,
-                                                effect,
-                                                cap,
-                                            } = field_ty
-                                            {
-                                                let remaining = strip_first_param(param);
-                                                return Ok((
-                                                    s1.clone(),
-                                                    Type::Function {
-                                                        param: Box::new(remaining),
-                                                        ret: ret.clone(),
-                                                        effect: effect.clone(),
-                                                        cap: *cap,
-                                                    },
-                                                ));
-                                            }
+                                            let remaining = strip_first_param(param);
+                                            return Ok((
+                                                s1.clone(),
+                                                Type::Function {
+                                                    param: Box::new(remaining),
+                                                    ret: ret.clone(),
+                                                    effect: effect.clone(),
+                                                    cap: *cap,
+                                                },
+                                            ));
                                         }
                                     }
                                 }
-                                // Instance registered but dict not in
-                                // context (should not happen).
-                                return Err(NuError::TypeError {
-                                    msg: format!("internal: dict '{}' not in scope", dict_name),
-                                    span,
-                                    expected_type: None,
-                                    found_type: None,
-                                    similar_names: None,
-                                });
                             }
-                            // Report concrete alternatives for the same class, not
-                            // unrelated implementations. Sorting makes diagnostics
-                            // deterministic despite FxHashMap iteration order.
-                            let mut available_types: Vec<&str> = instance_table
-                                .keys()
-                                .filter_map(|(registered_class, registered_type)| {
-                                    (registered_class == class_name)
-                                        .then_some(registered_type.as_str())
-                                })
-                                .collect();
-                            available_types.sort_unstable();
-                            available_types.dedup();
-                            let available = if available_types.is_empty() {
-                                format!("no {} implementations registered", class_name)
-                            } else {
-                                format!(
-                                    "available {} implementations: {}",
-                                    class_name,
-                                    available_types.join(", ")
-                                )
-                            };
+                            // Instance registered but dict not in
+                            // context (should not happen).
                             return Err(NuError::TypeError {
+                                msg: format!("internal: dict '{}' not in scope", dict_name),
+                                span,
+                                expected_type: None,
+                                found_type: None,
+                                similar_names: None,
+                            });
+                        }
+                        // Report concrete alternatives for the same class, not
+                        // unrelated implementations. Sorting makes diagnostics
+                        // deterministic despite FxHashMap iteration order.
+                        let mut available_types: Vec<&str> = self
+                            .instance_table
+                            .keys()
+                            .filter_map(|(registered_class, registered_type)| {
+                                (registered_class == class_name).then_some(registered_type.as_str())
+                            })
+                            .collect();
+                        available_types.sort_unstable();
+                        available_types.dedup();
+                        let available = if available_types.is_empty() {
+                            format!("no {} implementations registered", class_name)
+                        } else {
+                            format!(
+                                "available {} implementations: {}",
+                                class_name,
+                                available_types.join(", ")
+                            )
+                        };
+                        return Err(NuError::TypeError {
                                 msg: format!(
                                     "no impl {}[{}] for method .{}; {}; hint: add `impl {} {} {{ ... }}`",
                                     class_name, current_ty, field, available, class_name, current_ty
@@ -3235,7 +3255,6 @@ impl TypeChecker {
                                 found_type: None,
                                 similar_names: None,
                             });
-                        }
                     }
                 }
 
