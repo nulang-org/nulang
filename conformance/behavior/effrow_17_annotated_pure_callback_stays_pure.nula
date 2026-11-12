@@ -1,0 +1,5 @@
+fn invoke(cb: () -> Unit ! {}) -> Unit ! {} {
+    (cb : () -> Unit ! {})()
+}
+fn pure() -> Unit ! {} {}
+invoke(pure)

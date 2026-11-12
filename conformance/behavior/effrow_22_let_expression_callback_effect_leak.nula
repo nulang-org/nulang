@@ -1,0 +1,5 @@
+fn io() -> Unit ! {IO} { perform IO.print("should not execute") }
+fn invoke(cb: () -> Unit ! {IO}) -> Unit ! {} {
+    (let wrapped = cb in wrapped)()
+}
+invoke(io)

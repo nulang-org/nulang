@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Callback effect soundness on stack-safe compiler — 2026-11-11
+- **Closed effect budgets now reject unresolved callable tails**, including untyped parameters and computed callbacks through match branches, annotations, blocks, record fields, and indices. Pure callbacks with statically known rows remain admissible.
+- **Right-nested let-effect inference remains iterative and now preserves scoped callback provenance** through long binding chains, including same-name shadowing. Effect-row combinations deduplicate repeated effects and preserve distinct unknown tail identities.
+- **Conformance additions cover eleven positive/negative callback cases**, alongside direct Rust tests and a 600-binding regression. This is conservative checking, not full row-variable constraint solving, and host/backend parity remains subject to exact-head CI.
+- **This integration inherits the audited single-SQLite security branch** which deliberately rejects legacy remote libSQL/Turso; it requires explicit compatibility review before any production promotion.
+
 ### Compiler let-chain stack boundedness — 2026-11-11
 - **Type, effect, and capability analyses now walk right-nested ordinary `let` sequences iteratively.** They preserve ordered substitutions, effect shadowing, and linear consumption restoration while avoiding process-stack exhaustion for conformance spill fixtures.
 - **HIR lowering now walks left-associative binary expression spines iteratively** while retaining left-to-right evaluation; actor-protocol annotation skips unnecessary full-module cloning when no actor protocols exist.
