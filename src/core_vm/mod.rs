@@ -83,6 +83,8 @@ pub struct CoreVM {
     pub strings: Vec<String>,
     pub halted: bool,
     pub exit_code: i64,
+    /// Optional cooperative cancellation shared with the native VM.
+    cancellation_token: Option<crate::task_cancellation::CancellationToken>,
     /// Optional capture sink for `IO.print` output. When set (e.g. by the
     /// browser playground), printed lines are appended to the buffer
     /// *instead of* going to process stdout.
@@ -99,8 +101,30 @@ impl CoreVM {
             strings: Vec::new(),
             halted: false,
             exit_code: 0,
+            cancellation_token: None,
             output_sink: None,
         }
+    }
+
+    /// Opt in to shared cooperative cancellation for this interpreter.
+    /// No JIT is involved in CoreVM; checks run at each instruction boundary.
+    pub fn set_cancellation_token(
+        &mut self,
+        token: Option<crate::task_cancellation::CancellationToken>,
+    ) {
+        self.cancellation_token = token;
+    }
+
+    #[inline]
+    fn check_cancellation(&self) -> Result<(), String> {
+        if let Some(token) = &self.cancellation_token {
+            if let Err(reason) = token.checkpoint() {
+                return Err(
+                    crate::task_cancellation::cancellation_error_message(reason).to_string()
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Emit one line of `IO.print` output: to the capture sink when one is
@@ -162,6 +186,8 @@ impl CoreVM {
         self.run_inner(module_idx, entry_pc)
     }
     fn run_inner(&mut self, module_idx: usize, entry_pc: usize) -> Result<Value, String> {
+        // An already-cancelled scope must not allocate an activation frame.
+        self.check_cancellation()?;
         let frame = Frame::new(None, module_idx);
         self.frames.push(frame);
         let frame_idx = self.frames.len() - 1;
@@ -169,6 +195,7 @@ impl CoreVM {
         self.halted = false;
 
         loop {
+            self.check_cancellation()?;
             if self.halted || self.frames.is_empty() {
                 break;
             }

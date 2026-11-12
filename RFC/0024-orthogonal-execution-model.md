@@ -277,6 +277,50 @@ Phase 1 does not:
 - implement concurrent execution on capable backends;
 - add conformance tests proving sequential and concurrent hosts are semantically equivalent.
 
+#### Phase 2 reference slice (2026-11-04)
+
+- `src/scoped_tasks.rs` provides a std-only **reference executor** for
+  lexically scoped child tasks: cooperative cancellation, fail-fast sibling
+  notification, typed failure/panic reporting, ordered results, and mandatory
+  child joins. A follow-up reference slice uses a fixed per-scope worker
+  budget (1–64 threads, default capped at 32), a FIFO child queue,
+  monotonic deadlines, explicit cancellation checkpoints, deterministic
+  lowest-index failure reporting, and a guard against unbounded thread
+  creation. The executor is **not connected** to source-level `par` or to
+  production actor-scheduler workers.
+- `src/parallel_analysis.rs` now rejects actor-state mutations through nested
+  fields and indexed paths, including `self.items[0] = value`, before
+  attempting future concurrent lowering.
+- Source-level `par` remains sequential. Real parallel execution is blocked
+  on backend integration, effect/authority compatibility, runtime-wide
+  (not just per-scope) worker budgeting, VM/WASM cancellation safe points,
+  and differential VM/WASM conformance tests.
+- Cancellation is cooperative: a child performing uninterruptible blocking I/O
+  can still delay scope completion. No arbitrary task preemption is promised.
+
+#### Phase 2 portable cancellation and admission slice
+
+- The cancellation token and monotonic-deadline logic now live in the portable
+  `src/task_cancellation.rs` module, shared by the task executor, native VM,
+  and CoreVM (including the browser playground's source-included compiler).
+- Both interpreters accept an **optional** cancellation token, check it before
+  every instruction/early termination path, and distinguish cancellation from
+  deadline expiration. Pre-cancelled CoreVM runs do not allocate a frame.
+- Native VM disables JIT execution when a cancellation token is present:
+  compiled regions lack cancellation safe points. The ordinary uncancelled
+  JIT path remains unchanged. Native callbacks or blocking effects cannot be
+  preempted by these interpreter-level checks.
+- Reference scoped-task calls share one process-local worker admission budget
+  (default maximum 64 reserved worker slots). An optional `SharedTaskBudget`
+  can also be passed explicitly across cooperating scopes, with fail-fast
+  admission if full and RAII permit release after joins. Native actor workers,
+  independently configured custom budgets, and other VM work **do not yet**
+  participate in this process-local reference-executor budget.
+- Cross-host native/CoreVM cancellation contract tests and
+  `wasm32-unknown-unknown` compilation cover the portable implementation.
+  They **do not** establish live WASM scheduling or JIT/bytecode equivalence
+  under cancellation.
+
 ### Phase 3 — role decomposition
 
 - migrate virtuality to activation metadata;

@@ -42,6 +42,7 @@ pub fn validate_parallel_branches(
         .collect();
 
     for branch in &summaries {
+        let diagnostic_span = branch_error_span(exprs.get(branch.index as usize), span);
         if !branch.control_escapes.is_empty() {
             return Err(par_error(
                 format!(
@@ -54,7 +55,7 @@ pub fn validate_parallel_branches(
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
-                span,
+                diagnostic_span,
             ));
         }
         if branch.uses_defer {
@@ -63,7 +64,7 @@ pub fn validate_parallel_branches(
                     "par branch {} uses defer/errdefer; concurrent cleanup ordering is not defined yet",
                     branch.index
                 ),
-                span,
+                diagnostic_span,
             ));
         }
         if !branch.state_writes.is_empty() {
@@ -78,7 +79,7 @@ pub fn validate_parallel_branches(
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
-                span,
+                diagnostic_span,
             ));
         }
     }
@@ -91,13 +92,21 @@ pub fn validate_parallel_branches(
                         "par branches {} and {} are not independent: {} '{}'",
                         summaries[i].index, summaries[j].index, kind, name
                     ),
-                    span,
+                    branch_error_span(exprs.get(summaries[j].index as usize), span),
                 ));
             }
         }
     }
 
     Ok(summaries)
+}
+
+/// Point the error at the offending branch rather than the whole `par`.
+/// Synthetic/zero-width expressions retain the enclosing span as fallback.
+fn branch_error_span(expr: Option<&Expr>, enclosing: Span) -> Span {
+    expr.map(Expr::span)
+        .filter(|candidate| candidate.start < candidate.end)
+        .unwrap_or(enclosing)
 }
 
 pub fn summarize_branch(index: u32, expr: &Expr) -> ParallelBranchSummary {
@@ -244,11 +253,10 @@ fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranch
                 summarize_expr(value, bound, out);
             }
         }
-        Expr::FieldAccess {
-            expr: base, field, ..
-        } => {
+        Expr::FieldAccess { expr: base, .. } => {
             if rooted_at_self(base) {
-                out.state_reads.insert(state_path(base, field));
+                out.state_reads.insert(state_path(expr));
+                summarize_index_expressions(expr, bound, out);
             } else {
                 summarize_expr(base, bound, out);
             }
@@ -423,16 +431,18 @@ fn summarize_assignment_target(
     bound: &HashSet<String>,
     out: &mut ParallelBranchSummary,
 ) {
+    // Nested indexed/field writes still mutate the owning actor's state.
+    // Check the root before the generic walkers mistake them for reads.
+    if rooted_at_self(target) {
+        out.state_writes.insert(state_path(target));
+        summarize_index_expressions(target, bound, out);
+        return;
+    }
     match target {
         Expr::Var(name, _) => {
             if !bound.contains(name) {
                 out.writes.insert(name.clone());
             }
-        }
-        Expr::FieldAccess {
-            expr: base, field, ..
-        } if rooted_at_self(base) => {
-            out.state_writes.insert(state_path(base, field));
         }
         Expr::FieldAccess { expr: base, .. } => {
             summarize_expr(base, bound, out);
@@ -482,22 +492,49 @@ fn rooted_at_self(expr: &Expr) -> bool {
     }
 }
 
-fn state_path(base: &Expr, leaf: &str) -> String {
-    fn collect(expr: &Expr, parts: &mut Vec<String>) {
+/// Subscripts may read outer variables even when the aggregate is actor-owned.
+fn summarize_index_expressions(
+    expr: &Expr,
+    bound: &HashSet<String>,
+    out: &mut ParallelBranchSummary,
+) {
+    match expr {
+        Expr::Index { arr, idx, .. } => {
+            summarize_index_expressions(arr, bound, out);
+            summarize_expr(idx, bound, out);
+        }
+        Expr::FieldAccess { expr, .. }
+        | Expr::CapAnnotate { expr, .. }
+        | Expr::TypeAnnotate { expr, .. } => summarize_index_expressions(expr, bound, out),
+        _ => {}
+    }
+}
+
+fn state_path(expr: &Expr) -> String {
+    fn collect(expr: &Expr, path: &mut String) {
         match expr {
             Expr::SelfRef(_) => {}
             Expr::FieldAccess { expr, field, .. } => {
-                collect(expr, parts);
-                parts.push(field.clone());
+                collect(expr, path);
+                if !path.is_empty() {
+                    path.push('.');
+                }
+                path.push_str(field);
+            }
+            Expr::Index { arr, .. } => {
+                collect(arr, path);
+                path.push_str("[*]");
+            }
+            Expr::CapAnnotate { expr, .. } | Expr::TypeAnnotate { expr, .. } => {
+                collect(expr, path);
             }
             _ => {}
         }
     }
 
-    let mut parts = Vec::new();
-    collect(base, &mut parts);
-    parts.push(leaf.to_string());
-    parts.join(".")
+    let mut path = String::new();
+    collect(expr, &mut path);
+    path
 }
 
 fn pattern_bindings(pattern: &Pattern, bound: &mut HashSet<String>) {
@@ -540,6 +577,71 @@ mod tests {
 
     fn int(n: i64) -> Expr {
         Expr::Literal(Literal::Int(n), sp())
+    }
+
+    #[test]
+    fn actor_state_violation_highlights_the_mutating_branch() {
+        let bad_span = Span::new(25, 46);
+        let branches = vec![
+            int(1),
+            Expr::Assign {
+                target: Box::new(Expr::FieldAccess {
+                    expr: Box::new(Expr::SelfRef(sp())),
+                    field: "items".to_string(),
+                    span: sp(),
+                }),
+                value: Box::new(int(2)),
+                span: bad_span,
+            },
+        ];
+        let err = validate_parallel_branches(&branches, Span::new(0, 80)).unwrap_err();
+        match err {
+            NuError::TypeError { span, .. } => assert_eq!(span, bad_span),
+            other => panic!("expected ownership error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn dependency_violation_highlights_the_conflicting_branch() {
+        let conflicting_span = Span::new(38, 39);
+        let branches = vec![
+            Expr::Assign {
+                target: Box::new(var("shared")),
+                value: Box::new(int(1)),
+                span: Span::new(9, 27),
+            },
+            Expr::Var("shared".to_string(), conflicting_span),
+        ];
+        let err = validate_parallel_branches(&branches, Span::new(0, 80)).unwrap_err();
+        match err {
+            NuError::TypeError { span, .. } => assert_eq!(span, conflicting_span),
+            other => panic!("expected ownership error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn control_flow_violation_highlights_the_escaping_branch() {
+        let escaping_span = Span::new(14, 22);
+        let err = validate_parallel_branches(
+            &[int(1), Expr::Return(None, escaping_span)],
+            Span::new(0, 70),
+        )
+        .unwrap_err();
+        match err {
+            NuError::TypeError { span, .. } => assert_eq!(span, escaping_span),
+            other => panic!("expected control-flow error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn synthetic_branch_uses_enclosing_parallel_span() {
+        let par_span = Span::new(3, 45);
+        let err = validate_parallel_branches(&[Expr::Return(None, Span::default())], par_span)
+            .unwrap_err();
+        match err {
+            NuError::TypeError { span, .. } => assert_eq!(span, par_span),
+            other => panic!("expected control-flow error, got {other}"),
+        }
     }
 
     #[test]
@@ -589,6 +691,73 @@ mod tests {
             int(2),
         ];
         assert!(validate_parallel_branches(&branches, sp()).is_err());
+    }
+
+    #[test]
+    fn indexed_actor_state_mutation_is_rejected() {
+        let actor_items = Expr::FieldAccess {
+            expr: Box::new(Expr::SelfRef(sp())),
+            field: "items".to_string(),
+            span: sp(),
+        };
+        let branches = vec![
+            Expr::Assign {
+                target: Box::new(Expr::Index {
+                    arr: Box::new(actor_items),
+                    idx: Box::new(int(0)),
+                    span: sp(),
+                }),
+                value: Box::new(int(99)),
+                span: sp(),
+            },
+            int(2),
+        ];
+        let err = validate_parallel_branches(&branches, sp()).unwrap_err();
+        assert!(format!("{err}").contains("items[*]"));
+    }
+
+    #[test]
+    fn indexed_actor_field_mutation_is_rejected() {
+        let target = Expr::FieldAccess {
+            expr: Box::new(Expr::Index {
+                arr: Box::new(Expr::FieldAccess {
+                    expr: Box::new(Expr::SelfRef(sp())),
+                    field: "items".to_string(),
+                    span: sp(),
+                }),
+                idx: Box::new(var("index")),
+                span: sp(),
+            }),
+            field: "count".to_string(),
+            span: sp(),
+        };
+        let summary = summarize_branch(
+            0,
+            &Expr::Assign {
+                target: Box::new(target),
+                value: Box::new(int(3)),
+                span: sp(),
+            },
+        );
+        assert!(summary.state_writes.contains("items[*].count"));
+        assert!(summary.reads.contains("index"));
+    }
+
+    #[test]
+    fn indexed_actor_state_reads_remain_allowed() {
+        let branches = vec![
+            Expr::Index {
+                arr: Box::new(Expr::FieldAccess {
+                    expr: Box::new(Expr::SelfRef(sp())),
+                    field: "items".to_string(),
+                    span: sp(),
+                }),
+                idx: Box::new(int(0)),
+                span: sp(),
+            },
+            int(2),
+        ];
+        assert!(validate_parallel_branches(&branches, sp()).is_ok());
     }
 
     #[test]
