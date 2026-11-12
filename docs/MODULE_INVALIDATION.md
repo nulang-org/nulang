@@ -52,3 +52,50 @@ cargo fmt --all --check
 
 Nulang Cloud remains unchanged; this module cannot authorize shared cache
 entries, admission, placement, or metering.
+
+## Diagnostic incremental correctness oracle
+
+The `package::incremental_oracle` module provides a **non-production audit**
+for proposed incremental builds. It is intentionally independent of the CLI,
+package resolution, cache, VM, JIT, AOT, and WASM backends.
+
+The caller supplies five things:
+
+1. Exact before and after `ModuleSnapshot` values, with compiler-owned
+   resolved imports and a complete compiler-context digest.
+2. `BuildObservation` from a **clean compilation of the before tree**.
+3. `BuildObservation` from an **independent clean compilation of the after tree**.
+4. Optionally, a `BuildObservation` from the proposed incremental build.
+5. Canonical, deterministic compiler-output bytes at each stage: diagnostics,
+   typed/effect/authority facts, MIR, and final artifact. The oracle stores
+   BLAKE3 digests of those bytes, not their unverified source-level guesses.
+
+The oracle verifies that all observed module names and context digests match the
+claimed snapshots. A missing, extra, or structurally incomplete output is an
+error. The oracle rejects an invalidation frontier if any allegedly reusable
+module's clean-before and clean-after observations differ at any stage. When a
+candidate is supplied, it additionally compares **every** candidate module to
+its independently compiled clean-after result, including dirty modules.
+
+Possible over-invalidation is reported separately as a performance lead, not
+as permission to skip compilation. A full-rebuild decision stays a full
+rebuild; the oracle cannot bypass it. A consistent report is **not proof of a
+complete compiler input closure** and never authorizes cache reuse or runtime
+deployment.
+
+The test corpus exercises missed semantic changes, stale artifacts, incomplete
+and wrong-context observations, over-invalidation reporting, and a real
+lexer → parser → typechecker → HIR → MIR → bytecode compilation pair. It does not
+yet exercise multi-module compilation through a complete compiler-owned
+resolved dependency graph, because that collection/wiring has not landed.
+
+```sh
+cargo test --no-default-features --test incremental_oracle
+cargo test --no-default-features --lib package::module_invalidation::tests
+```
+
+Before production incremental reuse, integrate compiler-owned input collection,
+capture canonical output bytes for all compilation paths, expand the edit corpus
+to imports, effects, authority, actor protocols, durable schemas and backend
+configurations, and run the oracle as a CI parity gate. Only then measure
+whether caching justifies its memory, disk and maintenance costs.
