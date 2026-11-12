@@ -3980,14 +3980,11 @@ impl VM {
         // The MIR pipeline encodes the performed operation as
         // "Effect.op" (e.g. "IO.print"); hand-built modules may
         // carry a bare name with no operation.
-        let (effect_name, op_name) = match qualified_name.split_once('.') {
-            Some((effect, op)) => (effect.to_string(), Some(op.to_string())),
-            None => (qualified_name.clone(), None),
-        };
+        let (effect_name, op_name) = split_effect_key(&qualified_name);
         // ---- Test effect: assertion primitives ----
         // Handled inline so assertion failures produce RuntimeError.
         if effect_name == "Test" {
-            match op_name.as_deref() {
+            match op_name {
                 Some("assert") => {
                     let cond = self.frames[frame_idx]
                         .regs
@@ -4063,14 +4060,14 @@ impl VM {
         if self.handler_stack.is_empty() {
             let result = match self.modules.get(module_idx) {
                 Some(module) => self.actor_callbacks.perform_builtin_effect_in_module(
-                    &effect_name,
-                    op_name.as_deref(),
+                    effect_name,
+                    op_name,
                     module,
                     &self.frames[frame_idx].regs,
                 ),
                 None => self.actor_callbacks.perform_builtin_effect(
-                    &effect_name,
-                    op_name.as_deref(),
+                    effect_name,
+                    op_name,
                     &[],
                     &self.frames[frame_idx].regs,
                 ),
@@ -4144,14 +4141,14 @@ impl VM {
             // performing module's constant pool.
             let result = match self.modules.get(module_idx) {
                 Some(module) => self.actor_callbacks.perform_builtin_effect_in_module(
-                    &effect_name,
-                    op_name.as_deref(),
+                    effect_name,
+                    op_name,
                     module,
                     &self.frames[frame_idx].regs,
                 ),
                 None => self.actor_callbacks.perform_builtin_effect(
-                    &effect_name,
-                    op_name.as_deref(),
+                    effect_name,
+                    op_name,
                     &[],
                     &self.frames[frame_idx].regs,
                 ),
@@ -6279,6 +6276,19 @@ fn module_with_handler_table(bindings: Vec<crate::bytecode::HandlerBinding>) -> 
 // VM Tests
 // ---------------------------------------------------------------------------
 
+/// Borrows both sides of an effect key from its resolved constant.
+///
+/// Perform is a VM hot path: allocating the effect and operation substrings
+/// separately would add up to two avoidable heap allocations per dispatch.
+/// Only the first dot separates the effect from its (possibly dotted) operation.
+#[inline]
+fn split_effect_key(qualified_name: &str) -> (&str, Option<&str>) {
+    match qualified_name.split_once('.') {
+        Some((effect, operation)) => (effect, Some(operation)),
+        None => (qualified_name, None),
+    }
+}
+
 #[cfg(test)]
 mod vm_tests {
     use super::*;
@@ -6407,6 +6417,31 @@ mod vm_tests {
             .to_str()
             .unwrap();
         assert_eq!(s, "hello ffi");
+    }
+
+    // Splitting an effect key must borrow both parts from the one
+    // already-resolved constant rather than allocating on every Perform.
+    #[test]
+    fn effect_key_split_borrows_qualified_parts() {
+        let qualified = String::from("Actor.send");
+        let (effect, operation) = split_effect_key(&qualified);
+        assert_eq!(effect, "Actor");
+        assert_eq!(operation, Some("send"));
+        assert_eq!(effect.as_ptr(), qualified.as_ptr());
+        assert_eq!(
+            operation.unwrap().as_ptr(),
+            qualified[("Actor.".len())..].as_ptr()
+        );
+    }
+
+    #[test]
+    fn effect_key_split_preserves_bare_and_multi_dot_names() {
+        let (effect, operation) = split_effect_key("Timer");
+        assert_eq!((effect, operation), ("Timer", None));
+        let (effect, operation) = split_effect_key("Web.render.partial");
+        assert_eq!((effect, operation), ("Web", Some("render.partial")));
+        let (effect, operation) = split_effect_key(".empty");
+        assert_eq!((effect, operation), ("", Some("empty")));
     }
 
     /// Test 1: Basic integer arithmetic.
