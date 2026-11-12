@@ -83,7 +83,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
                 crate::package::model_generator::run(&args[1..], &package_root()?).map(|_| ())
             }
             _ => Err(NuError::PackageError {
-                msg: "usage: nula generate resource <PascalCaseName> OR nula generate model <PascalCaseName> --field name:Type [--field ...]".into(),
+                msg: "usage: nula generate resource <PascalCaseName> OR nula generate model <PascalCaseName> --field name:Type [--field ...] [--read-only-views]".into(),
                 span: Span::default(),
             }),
         },
@@ -302,7 +302,7 @@ fn print_usage() {
     println!(
         "  generate resource <PascalCaseName>  Add GET-only resource routes to a web template"
     );
-    println!("  generate model <PascalCaseName> --field name:Type [...]  Create typed model and deny-all policy hooks");
+    println!("  generate model <PascalCaseName> --field name:Type [...]  Create typed model and deny-all policy hooks (add --read-only-views for HTML helpers)");
     println!("  init          Scaffold a new package in the current directory");
     println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
     println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");

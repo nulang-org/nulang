@@ -22,6 +22,7 @@ struct Field {
 struct Resource {
     name: String,
     fields: Vec<Field>,
+    read_only_views: bool,
 }
 
 fn invalid(msg: impl Into<String>) -> NuError {
@@ -62,7 +63,7 @@ impl Resource {
     fn parse(args: &[String]) -> NuResult<Self> {
         if args.first().map(String::as_str) != Some("model") {
             return Err(invalid(
-                "usage: nula generate model <PascalCase> --field name:String [--field rate:Float ...]",
+                "usage: nula generate model <PascalCase> --field name:String [--field rate:Float ...] [--read-only-views]",
             ));
         }
         let name = args
@@ -76,8 +77,17 @@ impl Resource {
 
         let mut fields = Vec::new();
         let mut seen = HashSet::new();
+        let mut read_only_views = false;
         let mut index = 2;
         while index < args.len() {
+            if args[index] == "--read-only-views" {
+                if read_only_views {
+                    return Err(invalid("--read-only-views may only appear once"));
+                }
+                read_only_views = true;
+                index += 1;
+                continue;
+            }
             if args[index] != "--field" {
                 return Err(invalid(format!(
                     "unexpected argument '{}' (expected --field name:Type)",
@@ -118,6 +128,7 @@ impl Resource {
         Ok(Self {
             name: name.clone(),
             fields,
+            read_only_views,
         })
     }
 
@@ -164,7 +175,58 @@ impl Resource {
              pub fn can_write_{stem}(_actor_tenant_id: String, _record: {}) -> Bool {{ false }}\n",
             self.name, self.name
         ));
+        if self.read_only_views {
+            code = format!("import stdlib::web::types\nimport stdlib::web::admin\n\n{code}");
+            code.push_str(&self.render_read_only_views());
+        }
         code
+    }
+
+    /// Render opt-in views from the same validated fields as the domain type.
+    /// Caller must obtain records and tenant identity from a trusted server
+    /// context; authorization hooks still deny every record until implemented.
+    fn render_read_only_views(&self) -> String {
+        let stem = self.file_stem();
+        let mut column_names = vec!["ID".to_string()];
+        let mut values = vec!["record.id".to_string()];
+        for field in &self.fields {
+            column_names.push(field.name.clone());
+            let value = match field.ty.as_str() {
+                "String" => format!("record.{}", field.name),
+                "Int" => format!("perform Int.to_string(record.{})", field.name),
+                "Float" => format!("perform Float.to_string(record.{})", field.name),
+                "Bool" => format!("if record.{} then \"true\" else \"false\"", field.name),
+                _ => unreachable!("validated model field type"),
+            };
+            values.push(value);
+        }
+        let columns = column_names
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let row = values.join(", ");
+        format!(
+            "\n// Presentation helpers only. Do not derive actor_tenant_id from request input.\n\
+             // Every record is checked with can_read_{stem} before rendering.\n\
+             pub fn {stem}_readonly_table(actor_tenant_id: String, records: [{}]) -> Html {{\n\
+                 var rows = [];\n\
+                 for record in records {{\n\
+                     if can_read_{stem}(actor_tenant_id, record) then {{\n\
+                         rows = perform Array.push(rows, [{row}])\n\
+                     }} else {{}}\n\
+                 }};\n\
+                 readonly_table([{columns}], rows)\n\
+             }}\n\n\
+             pub fn {stem}_readonly_detail(actor_tenant_id: String, record: {}) -> Html {{\n\
+                 if can_read_{stem}(actor_tenant_id, record) then {{\n\
+                     readonly_detail([{columns}], [{row}])\n\
+                 }} else {{\n\
+                     denied_view()\n\
+                 }}\n\
+             }}\n",
+            self.name, self.name
+        )
     }
 }
 
@@ -305,6 +367,82 @@ mod tests {
         TypeChecker::new()
             .check_module(&module)
             .expect("generated source typechecks");
+    }
+
+    #[test]
+    fn opt_in_read_only_views_are_generated_from_model_fields_with_denied_policy() {
+        let resource = Resource::parse(&argv(&[
+            "model",
+            "BillboardFace",
+            "--field",
+            "name:String",
+            "--field",
+            "daily_rate:Float",
+            "--field",
+            "active:Bool",
+            "--field",
+            "impressions:Int",
+            "--read-only-views",
+        ]))
+        .expect("parse opt-in views");
+        let output = resource.render();
+        assert!(output.contains("import stdlib::web::admin"));
+        assert!(output.contains("pub fn billboard_face_readonly_table("));
+        assert!(output.contains("pub fn billboard_face_readonly_detail("));
+        assert!(output.contains("can_read_billboard_face(actor_tenant_id, record)"));
+        assert!(output.contains("perform Float.to_string(record.daily_rate)"));
+        assert!(output.contains("perform Int.to_string(record.impressions)"));
+        assert!(output.contains(r#"if record.active then "true" else "false""#));
+        assert!(!output.contains("Web.route"));
+        assert!(!output.contains("can_write_billboard_face(actor_tenant_id, record)"));
+    }
+
+    #[test]
+    fn generated_read_only_views_resolve_imports_and_typecheck() {
+        let resource = Resource::parse(&argv(&[
+            "model",
+            "BillboardFace",
+            "--field",
+            "name:String",
+            "--field",
+            "daily_rate:Float",
+            "--field",
+            "active:Bool",
+            "--field",
+            "impressions:Int",
+            "--read-only-views",
+        ]))
+        .unwrap();
+        let source = resource.render();
+        let mut module = Parser::new(Lexer::new(&source).lex().unwrap())
+            .parse_module()
+            .expect("generated resource views parse");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("conformance/behavior/web_21_admin_views.nula");
+        let mut visited = HashSet::new();
+        crate::resolver::resolve_imports(&mut module, &path, &mut visited)
+            .expect("generated views import admin stdlib");
+        TypeChecker::new()
+            .check_module(&module)
+            .expect("generated views typecheck against the model");
+    }
+
+    #[test]
+    fn view_generation_is_explicit_and_rejects_duplicate_options() {
+        let default = Resource::parse(&argv(&["model", "BillboardFace", "--field", "name:String"]))
+            .unwrap()
+            .render();
+        assert!(!default.contains("readonly_table"));
+        assert!(!default.contains("import stdlib::web::admin"));
+        assert!(Resource::parse(&argv(&[
+            "model",
+            "BillboardFace",
+            "--field",
+            "name:String",
+            "--read-only-views",
+            "--read-only-views",
+        ]))
+        .is_err());
     }
 
     #[test]
