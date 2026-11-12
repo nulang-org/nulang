@@ -8158,7 +8158,7 @@ mod tests {
     }
 
     #[test]
-    fn test_module_var_wrap_preserves_mutability_in_all_entry_paths() {
+    fn test_module_var_wrap_preserves_mutability_in_synthetic_entry_paths() {
         for source in ["var counter = 0", "var counter = 0\ncounter = 1\ncounter"] {
             let ast =
                 parse(source).unwrap_or_else(|err| panic!("source {source:?} must parse: {err:?}"));
