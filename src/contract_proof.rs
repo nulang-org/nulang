@@ -1,5 +1,7 @@
 //! Optional, conservative static analysis of existing Nulang function contracts.
 //! This tool never runs during normal compilation.
+mod smt;
+
 use crate::ast::{AstModule, BinOp, Decl, Expr, Literal, Param, UnOp};
 use crate::types::{PrimitiveType, Type};
 use serde::Serialize;
