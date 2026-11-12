@@ -6470,11 +6470,10 @@ mod vm_tests {
                 .as_int(),
             Some(8)
         );
-        assert_eq!(
+        assert!(
             run_binary_arithmetic(OpCode::IMod, Constant::Int(8), Constant::Int(0))
                 .unwrap()
-                .is_nil(),
-            true
+                .is_nil()
         );
         assert_eq!(
             run_binary_arithmetic(OpCode::IDiv, Constant::Float(8.0), Constant::Float(2.0))
