@@ -83,5 +83,12 @@ arithmetic, or unconstrained overflow-prone operations.
   unchanged; `--strict` still makes unknown coverage a failure.
 
 This feature adds **no Rust dependencies**. Z3 is an optional external tool,
-not bundled with Nulang. Future refined types and durable-state invariants
-should build on the same contract model, in separate experimental changes.
+not bundled with Nulang. An end-to-end Rust regression can be explicitly
+enabled when Z3 is installed:
+
+```sh
+NULANG_TEST_Z3=1 cargo test --locked --no-default-features --lib real_z3_verifies_correlation
+```
+
+Future refined types and durable-state invariants should build on the same
+contract model, in separate experimental changes.

@@ -391,6 +391,31 @@ mod tests {
     }
 
     #[test]
+    fn real_z3_verifies_correlation_only_when_explicitly_requested() {
+        if std::env::var_os("NULANG_TEST_Z3").is_none() {
+            return; // CI does not need an installed solver for normal tests.
+        }
+        let source =
+            "fn inc(x: Int) -> Int requires x >= 0 && x <= 10 ensures result == x + 1 { x + 1 }";
+        let tokens = Lexer::new(source).lex().expect("valid tokens");
+        let ast = Parser::new(tokens).parse_module().expect("valid source");
+        let Decl::Function {
+            params,
+            requires,
+            ensures,
+            body,
+            ..
+        } = &ast.decls[0]
+        else {
+            panic!("expected function");
+        };
+        assert_eq!(
+            prove_with_z3(params, requires, ensures, body),
+            SmtOutcome::Proved
+        );
+    }
+
+    #[test]
     fn alpha_renaming_and_let_shadowing_are_preserved_in_solver_model() {
         let source = "fn inc(x: Int) -> Int requires x >= 0 && x <= 10 ensures result == x + 2 { let x = x + 1 in x + 1 }";
         let result = analyze(source, |script| {
