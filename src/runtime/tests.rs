@@ -3,6 +3,8 @@
 //! 84 tests total (see AGENTS.md "Testing & QA" for the suite-wide counts).
 //! Full history in local commit 1c2cde9.
 
+#[cfg(feature = "sqlite")]
+use super::sqlite_compat as libsql;
 use super::*;
 use crate::bytecode::{ActorMeta, CodeModule, Constant};
 use crate::runtime::gc::OrcaGc;

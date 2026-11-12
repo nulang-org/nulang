@@ -1,0 +1,1 @@
+{"exit_code":5,"stdout":"","stderr":"not a subset of allowed effects","proves":"A callback invoked from an unresolved record-field expression cannot discharge a closed pure effect contract."}

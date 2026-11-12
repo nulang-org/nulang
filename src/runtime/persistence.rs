@@ -13,6 +13,8 @@ use crate::durable_effect::DurableEffectId;
 use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
 use crate::vm::Value;
 
+#[cfg(feature = "sqlite")]
+use super::sqlite_compat as libsql;
 use tracing::warn;
 
 /// How a state field is persisted / replicated.
@@ -1283,10 +1285,11 @@ impl PersistenceStore for JsonFileStore {
 }
 
 // ---------------------------------------------------------------------------
-// LibsqlStore — libSQL-backed persistence (local, remote Turso, or replica)
+// LibsqlStore — rusqlite-backed SQLite persistence (legacy API name)
 // ---------------------------------------------------------------------------
 
-/// libSQL-backed persistence store.
+/// Local SQLite persistence, backed by patched rusqlite.
+/// The LibsqlStore name is retained for source compatibility.
 ///
 /// Each actor gets one row in the `snapshots` table and zero or more rows in
 /// the `journal` and `workflow_events` tables, same schema as the old SQLite
@@ -1333,15 +1336,13 @@ impl LibsqlStore {
     /// store.
     pub fn with_sync_mode<P: AsRef<Path>>(path: P, sync_mode: SqliteSyncMode) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let db_path = if path == Path::new(":memory:") {
-            ":memory:".to_string()
-        } else {
-            path.to_string_lossy().into_owned()
-        };
+        // Preserve the native filesystem path. Lossy UTF-8 conversion
+        // silently opens a different database for non-UTF-8 Unix filenames.
+        // rusqlite accepts Path directly, including the special ":memory:".
         let rt =
             tokio::runtime::Runtime::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let db = rt.block_on(async {
-            libsql::Builder::new_local(&db_path)
+            libsql::Builder::new_local(&path)
                 .build()
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
@@ -1364,30 +1365,17 @@ impl LibsqlStore {
         Self::new(":memory:")
     }
 
-    /// Connect to a remote Turso database.
+    /// Remote Turso connections are disabled: this build intentionally
+    /// links only a patched local SQLite engine and no remote client.
     ///
-    /// Journal pragmas (`journal_mode`, `synchronous`) are deliberately
-    /// skipped: a Turso server manages its own journal and durability
-    /// policy.
-    pub fn new_remote(url: &str, auth_token: &str) -> io::Result<Self> {
-        let rt =
-            tokio::runtime::Runtime::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        let db = rt.block_on(async {
-            libsql::Builder::new_remote(url.to_string(), auth_token.to_string())
-                .build()
-                .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
-        })?;
-        let conn = db
-            .connect()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        let store = LibsqlStore {
-            conn: std::sync::Mutex::new(conn),
-            rt,
-            path: PathBuf::from(url),
-        };
-        store.ensure_tables()?;
-        Ok(store)
+    /// This preserves the API shape and fails explicitly rather than
+    /// restoring the former libSQL TLS chain (RUSTSEC-2026-0382), using
+    /// plaintext, or weakening certificate verification.
+    pub fn new_remote(_url: &str, _auth_token: &str) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Remote libSQL/Turso disabled: no vetted remote client (legacy TLS risk RUSTSEC-2026-0382)",
+        ))
     }
     pub fn path(&self) -> &Path {
         &self.path
@@ -4229,6 +4217,52 @@ mod libsql_atomic_transition_tests {
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }],
         }
+    }
+
+    #[test]
+    fn local_sqlite_provider_uses_patched_wal_engine() {
+        let store = LibsqlStore::in_memory().expect("SQLite opens");
+        let rows = store
+            .query("SELECT sqlite_version()", &[])
+            .expect("SQLite version");
+        let version: String = serde_json::from_str::<Vec<String>>(&rows[0])
+            .expect("version query returns a JSON row")[0]
+            .clone();
+        let numbers: Vec<u32> = version.split('.').map(|v| v.parse().unwrap()).collect();
+        assert!(
+            numbers.as_slice() >= &[3, 54, 0],
+            "outdated local SQLite provider: {version}"
+        );
+    }
+
+    #[cfg(feature = "ai-runtime")]
+    #[test]
+    fn agent_and_actor_stores_share_patched_sqlite_engine() {
+        let actor = LibsqlStore::in_memory().expect("actor DB opens");
+        let actor_version: Vec<String> =
+            serde_json::from_str(&actor.query("SELECT sqlite_version()", &[]).unwrap()[0]).unwrap();
+
+        let test_dir = std::env::temp_dir().join(format!(
+            "nulang_single_sqlite_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let agent = nulang_ai_local::SqliteStore::open(&test_dir).expect("agent DB opens");
+        let conn = rusqlite::Connection::open(agent.db_path()).expect("agent DB readable");
+        let agent_version: String = conn
+            .query_row("SELECT sqlite_version()", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            actor_version,
+            vec![agent_version],
+            "actor and agent persistence must use the same SQLite runtime version"
+        );
+        drop(conn);
+        drop(agent);
+        std::fs::remove_dir_all(&test_dir).unwrap();
     }
 
     #[test]

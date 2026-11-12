@@ -1,0 +1,1 @@
+{"exit_code":5,"stdout":"","stderr":"not a subset of allowed effects","proves":"Calling a callback retrieved by array index must not discard unknown invocation effects in a pure function."}

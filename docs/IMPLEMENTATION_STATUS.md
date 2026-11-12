@@ -116,7 +116,7 @@ Current backends:
 |---|---|
 | `MemoryStore` | Always available; test/ephemeral durable state |
 | `JsonFileStore` | Always available; file-backed development/debugging |
-| `LibsqlStore` | `sqlite` feature; libSQL/SQLite and remote libSQL/Turso path |
+| `LibsqlStore` | `sqlite` feature; local libSQL/SQLite available; remote Turso constructor intentionally returns `Unsupported` pending patched TLS dependencies (RUSTSEC-2026-0382) |
 | `RocksDbStore` | Optional `rocksdb` feature |
 | `PostgresStore` | Optional `postgres` feature |
 
