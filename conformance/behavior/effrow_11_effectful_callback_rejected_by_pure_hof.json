@@ -1,0 +1,1 @@
+{"exit_code":4,"stdout":"","stderr":"expected function with effects {}, found function with effects {IO}","proves":"An IO-effectful callback cannot be passed to a higher-order function requiring a closed pure callback; type checking rejects the call."}
