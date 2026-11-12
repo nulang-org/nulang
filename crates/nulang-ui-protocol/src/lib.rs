@@ -3,6 +3,8 @@
 //! `nulang-ui/1` defines semantic UI documents and patches.
 //! `nulang-ui-msg/1` defines runtime/host message envelopes.
 
+pub mod testing;
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
