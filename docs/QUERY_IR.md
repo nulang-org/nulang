@@ -63,10 +63,50 @@ adapter must first validate schema, authorization, data ownership, and
 backend semantic compatibility; it must not push arbitrary Nulang closures
 onto remote nodes.
 
+## Experimental compiler types and SQL lowering (stacked draft)
+
+A new `query_types::result_collection_type(plan, catalog)` maps validated
+Query IR projections into the compiler's existing closed
+`Type::Array(Type::Record(...))` representation. This bridges the Rust
+host IR to existing compiler **types**, not to Nulang's source parser,
+effect checker, or bytecode backends.
+
+`Catalog::register_schema(name, columns)` registers metadata-only sources
+for SQL planning without loading records. Calling the local `execute`
+reference interpreter on a metadata-only source explicitly fails.
+
+`query_sql::compile_prepared(plan, catalog, dialect)` produces
+`PreparedQuery { sql, parameters, output_columns }` for SQLite and
+PostgreSQL. Literal values are **always bound**, never interpolated into SQL;
+identifiers are quoted and embedded quotes escaped. Parameter order reflects
+SQL textual order, including projection expressions before WHERE and LIMIT.
+
+The supported SQL shape is deliberately restricted:
+`Scan -> Filter* -> Project?/Sort? -> Limit?`, with projection/sort in
+either order subject to alias shadowing restrictions. `Limit` requires
+`Sort`. Operations with ambiguous ordering or unsafe collation assumptions
+are rejected rather than rewritten.
+
+**Important boundaries:**
+
+- The SQL module emits prepared-statement metadata only; **it does not
+  connect to or execute SQLite/PostgreSQL databases**.
+- Schema registration is not authentication, authorization, live SQL catalog
+  introspection, RLS enforcement, or proof of tenant isolation.
+- External SQL sources have no inherent row ordering; even with ORDER BY,
+  ties are not stable. Callers requiring deterministic pagination must use
+  a guaranteed unique sort key verified by the DB adapter.
+- Text ordering and greater-than comparisons reject absent explicit
+  collation contracts. The emitted integer/Boolean/text types still require
+  backend-specific result decoding and nullability validation.
+- The eventual execution adapter must verify driver parameter binding,
+  resource/time limits, schema drift, transaction isolation, and backend
+  parity against concrete test databases before exposure to applications.
+
 ## Explicit limitations
 
 - Rust host-side API only; no new lexer keywords or `.nula` syntax.
-- No `Join`, `Aggregate`, parameterized SQL generation, index selection,
+- No `Join`, `Aggregate`, database execution, index selection,
   adaptive costing, incremental views, or MVCC query integration yet.
 - The local executor clones scans and materializes intermediate results; do
   not use this prototype for unbounded or untrusted data.
