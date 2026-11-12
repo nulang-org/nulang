@@ -35,12 +35,19 @@ Do not bypass or weaken these checks for browser-driven mutations.
   substitute for fresh CI-based security audit.
 - Form-specific regression confirms typed Turbo MIME, CSRF 403 admission,
   no Nulang client script injection, and escaped hostile form values.
+- Local Chromium/Playwright acceptance against the actual merged WebDevServer
+  passed with pinned official Turbo 8: Frames, create/update/delete Streams,
+  exact Host/Origin rejection, escaped malicious markup, no browser JS errors,
+  and no-JavaScript navigation fallback. The first browser build hit the
+  isolated tmpfs quota; after clearing only this worktree's incremental
+  compiler cache, the retry built and completed successfully.
 
 ## Outstanding release gates
 
 - Keep **draft** pending *exact-head hosted* default and no-default features,
   Clippy, fresh cargo-audit, browser/Playwright, WASM, release, and relevant
-  security CI; treat pending or red gates as blockers.
+  security CI; treat pending or red gates as blockers. Local browser evidence
+  does not replace hosted browser CI on the published exact head.
 - The inherited patched SQLite change intentionally refuses remote
   libSQL/Turso connections. This is a breaking capability limitation for
   remote-libSQL deployments and must be resolved or explicitly approved.
@@ -49,5 +56,4 @@ Do not bypass or weaken these checks for browser-driven mutations.
   independently audited Internet-facing production boundary.
 - The official Turbo JavaScript client is optional and pinned by the browser
   test harness; do not introduce a second browser runtime or public private-data
-  SSE path. Complete no-JavaScript navigation and browser-level security
-  acceptance on the exact integration commit.
+  SSE path. Keep the browser acceptance as a required hosted CI gate.
