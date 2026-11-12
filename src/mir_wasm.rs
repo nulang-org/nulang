@@ -257,6 +257,7 @@ impl WasmBackend {
     // ── Compile ───────────────────────────────────────────────────
 
     pub fn compile(&mut self, mir: &mir::Module, _module_name: &str) -> NuResult<Vec<u8>> {
+        crate::noalloc::prove_noalloc_contracts(mir)?;
         if mir.actor_metadata.iter().any(|meta| meta.is_workflow) {
             return Err(crate::types::NuError::VMError {
                 msg: "WASM backend does not yet support durable workflow semantics; use the bytecode/native runtime until workflow journaling, suspension, recovery, and compensation are implemented for WASM".into(),
@@ -3070,6 +3071,24 @@ mod tests {
                 .to_string()
                 .contains("WASM backend does not yet support durable workflow semantics"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_wasm_backend_cannot_bypass_noalloc_contract() {
+        let err = compile_source(
+            r#"
+@noalloc
+fn make() { [1, 2, 3] }
+
+fn main() -> Int { 0 }
+"#,
+        )
+        .expect_err("WASM backend must enforce the canonical @noalloc proof");
+
+        assert!(
+            err.to_string().contains("noalloc contract violation"),
+            "unexpected WASM @noalloc diagnostic: {err}"
         );
     }
 
