@@ -1,4 +1,9 @@
 # Nulang Changelog
+
+### Experimental host-side relational Query IR — 2026-11-11
+- **Added a pure, typed relational IR and reference interpreter** with Scan, Filter, Project, Sort and Limit operations, strict table schema validation, and deterministic logical-plan explanations. This is an Experimental Rust embedder API, not `.nula` syntax or a SQL engine.
+- **Added a conservative filter-below-sort rewrite** gated by whole-plan typechecking. Optimizations cannot cross Limit or Project; no arbitrary callbacks or effects are permitted in expressions. Black-box tests cover rewrite equivalence, invalid types, missing fields, Limit boundaries, and explain output.
+- **No new dependencies, database integrations, wire/bytecode formats, or language keywords.** SQL pushdown, joins, aggregation, incremental views, and a language frontend remain future work.
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
