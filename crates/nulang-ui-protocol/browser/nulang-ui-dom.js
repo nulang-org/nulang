@@ -83,8 +83,12 @@
       if (node.id.length > 1024) fail("node id too long");
       tagFor(node.kind);
       if (map.has(node.id)) fail("duplicate node " + node.id);
-      if (!Array.isArray(node.children)) fail("missing children");
+      // Rust skips serializing empty collections. Only absent fields default
+      // to empty; explicit null or malformed collection types still fail.
+      if (node.children === undefined) node.children = [];
+      if (!Array.isArray(node.children)) fail("invalid children");
       if (node.kind === "text" && node.children.length) fail("text node cannot have children");
+      if (node.properties === undefined) node.properties = {};
       if (!node.properties || typeof node.properties !== "object" || Array.isArray(node.properties)) fail("invalid properties");
       for (const [name, value] of Object.entries(node.properties)) validateProperty(name, value, node.kind);
       map.set(node.id, node);

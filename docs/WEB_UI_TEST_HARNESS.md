@@ -53,3 +53,27 @@ The next stage should connect compiler-backed views and authenticated UI
 session coordinators to this test API *after their existing draft integration
 stack has passed its own exact-head tests*. Avoid duplicating the draft
 `UiHostState` reducer or creating a second patch protocol.
+
+## Compiler-to-browser wire contract (stacked integration only)
+
+The session integration stack includes a checked-in browser fixture at
+`crates/nulang-ui-protocol/browser/live-session-fixture.json`. It is generated
+from real parsed Nulang JSX views and `UiLiveSession` output, not handwritten
+protocol samples. A Rust regression verifies the fixture against the current
+compiler-produced snapshot, keyed list patch and input-acknowledged form patch.
+Chromium then replays those same messages using the dependency-free DOM host.
+
+```sh
+cargo test --locked --no-default-features -p nulang \
+  --test web_ui_harness_integration
+python3 crates/nulang-ui-protocol/browser/test_dom_host.py
+```
+
+These tests guard the Rust/JavaScript serialization boundary: `UiNode` omits
+empty `properties` and `children` collections on the wire; the browser
+normalizes only absent collections to empty values, while rejecting explicit
+`null`, arrays where objects are expected, and other malformed fields.
+
+The existing `Docs site & browser playground` CI job already invokes the
+Chromium browser runner. **It does not validate authenticated HTTP/SSE
+subscriptions**; the host verifier and transport security are separate gates.

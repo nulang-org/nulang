@@ -185,3 +185,76 @@ fn edit() -> Html { <form><input value={title}/></form> }
     ));
     assert_eq!(host.document(), &before);
 }
+
+#[test]
+fn compiler_live_session_wire_messages_match_browser_fixture() {
+    // The checked-in fixture is replayed in real Chromium. Compare its parsed
+    // wire shape to an actual compiler-produced session, not hand-written JSON.
+    let list = compile_view(
+        "list",
+        r#"
+import stdlib::web::html
+import stdlib::web::types
+fn list() -> Html {
+    <ul>{for item in rows { <li key={item.id}>{item.label}</li> }}</ul>
+}
+"#,
+    );
+    let mut list_session =
+        UiLiveSession::open(&list, "list", scope(), &rows(&["a", "b"]), &authorized).unwrap();
+    let list_snapshot = list_session.snapshot(&authorized).unwrap();
+    let list_patch = list_session
+        .commit(&rows(&["b", "a", "c"]), &[], &authorized, &|_| true)
+        .unwrap();
+
+    let edit = compile_view(
+        "edit",
+        r#"
+import stdlib::web::html
+import stdlib::web::types
+fn edit() -> Html { <form><input value={title}/></form> }
+"#,
+    );
+    let mut edit_session = UiLiveSession::open(
+        &edit,
+        "edit",
+        scope(),
+        &BTreeMap::from([("title".into(), WireValue::from(""))]),
+        &authorized,
+    )
+    .unwrap();
+    let edit_snapshot = edit_session.snapshot(&authorized).unwrap();
+    let accepted_input = UiInputCommit {
+        node_id: NodeId::from("root/p0"),
+        property: "value".into(),
+        sequence: Revision(1),
+        value: WireValue::from("approved"),
+    };
+    let edit_patch = edit_session
+        .commit(
+            &BTreeMap::from([("title".into(), WireValue::from("approved"))]),
+            &[accepted_input],
+            &authorized,
+            &|items| items.len() == 1,
+        )
+        .unwrap();
+
+    let actual = serde_json::json!({
+        "keyed": [list_snapshot, list_patch],
+        "form": [edit_snapshot, edit_patch],
+    });
+    if std::env::var_os("NULANG_SHOW_LIVE_UI_BROWSER_FIXTURE").is_some() {
+        println!(
+            "NULANG_BROWSER_FIXTURE_BEGIN\n{}\nNULANG_BROWSER_FIXTURE_END",
+            serde_json::to_string_pretty(&actual).unwrap()
+        );
+    }
+    let expected: serde_json::Value = serde_json::from_str(include_str!(
+        "../crates/nulang-ui-protocol/browser/live-session-fixture.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        expected, actual,
+        "browser fixture diverged from compiled session wire output"
+    );
+}
