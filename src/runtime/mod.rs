@@ -67,6 +67,7 @@ pub mod crdt_reg;
 mod distribution;
 mod exit;
 mod http_server;
+pub mod inspector;
 #[cfg(feature = "ai-runtime")]
 mod llm;
 mod metrics;

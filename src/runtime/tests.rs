@@ -8710,3 +8710,87 @@ fn confirmed_node_removal_forgets_crdt_receiver_knowledge() {
         "a peer that rejoins after confirmed removal must receive full state"
     );
 }
+
+#[test]
+fn actor_inspection_is_read_only_and_redacts_state_and_messages() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| {
+        vec![("secret_api_key".to_string(), Value::int(987_654))]
+    }));
+    {
+        let actor = rt.actors.get_mut(&actor_id).expect("spawned actor");
+        actor.name = "AuditWorker".into();
+        actor.state = ActorState::Waiting;
+        actor.priority = ActorPriority::High;
+        actor.persistent = true;
+        actor.is_workflow = true;
+        actor.parent = Some(11);
+        actor.children = vec![13, 12];
+        actor.links = vec![14];
+        actor.monitors = vec![15, 16];
+        actor.sequence = 27;
+        actor.activation_epoch = 3;
+        actor.register_behavior("work", noop_test_behavior);
+    }
+    rt.send_message_by_id(actor_id, 0, &[Value::int(123_456)]);
+
+    let before = rt.actors[&actor_id].mailbox.len();
+    let snapshot = rt.inspect_actor(actor_id).expect("actor inspectable");
+    assert_eq!(snapshot.actor_id, actor_id);
+    assert_eq!(snapshot.name, "AuditWorker");
+    assert_eq!(snapshot.lifecycle, "waiting");
+    assert_eq!(snapshot.scheduling, "queued");
+    assert_eq!(snapshot.priority, "high");
+    assert_eq!(snapshot.mailbox_depth, before);
+    assert_eq!(snapshot.parent, Some(11));
+    assert_eq!(snapshot.children, vec![12, 13]);
+    assert_eq!(snapshot.link_count, 1);
+    assert_eq!(snapshot.monitor_count, 2);
+    assert!(snapshot.persistent);
+    assert!(snapshot.workflow);
+    assert_eq!(snapshot.persisted_sequence, 27);
+    assert_eq!(snapshot.activation_epoch, 3);
+    assert_eq!(
+        rt.actors[&actor_id].mailbox.len(),
+        before,
+        "inspection must not dequeue"
+    );
+
+    let json = serde_json::to_string(&snapshot).expect("serializable inspection");
+    assert!(
+        !json.contains("secret_api_key"),
+        "must not expose state field names"
+    );
+    assert!(!json.contains("987654"), "must not expose state contents");
+    assert!(!json.contains("123456"), "must not expose message payloads");
+    assert!(
+        !json.contains("authority"),
+        "must not expose capabilities or grants"
+    );
+}
+
+#[test]
+fn actor_inspection_lists_living_actors_in_stable_order_and_is_a_snapshot() {
+    let mut rt = Runtime::new();
+    assert!(rt.inspect_actors().is_empty());
+    assert!(rt.inspect_actor(u64::MAX).is_none());
+
+    let b = rt.spawn_actor(Box::new(Vec::new));
+    let a = rt.spawn_actor(Box::new(Vec::new));
+    let first = rt.inspect_actors();
+    assert_eq!(first.len(), 2);
+    assert_eq!(
+        first.iter().map(|item| item.actor_id).collect::<Vec<_>>(),
+        vec![b, a]
+    );
+    assert_eq!(first[0].mailbox_depth, 0);
+
+    rt.actors.get_mut(&b).unwrap().name = "Changed".to_owned();
+    assert_ne!(
+        first[0].name, rt.actors[&b].name,
+        "snapshots must be detached"
+    );
+    rt.actors.remove(&b);
+    assert!(rt.inspect_actor(b).is_none());
+    assert_eq!(rt.inspect_actors().len(), 1);
+}
