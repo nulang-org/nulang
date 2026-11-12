@@ -875,6 +875,54 @@ impl Drop for ConnectionLease {
     }
 }
 
+/// Host-level HTTP limits, validated before a Web listener binds.
+///
+/// Defaults preserve the existing development server behavior. This is a
+/// runtime-host configuration surface, not a new language or Web DSL feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebServerOptions {
+    /// Maximum simultaneous connections, including long-lived SSE streams.
+    pub max_concurrent_connections: usize,
+    /// Maximum time to wait for data on an individual connection.
+    pub read_timeout: Duration,
+    /// Maximum time to block writing a response to a slow client.
+    pub write_timeout: Duration,
+}
+
+impl Default for WebServerOptions {
+    fn default() -> Self {
+        Self {
+            max_concurrent_connections: WebDevServer::MAX_CONCURRENT_CONNECTIONS,
+            read_timeout: Duration::from_secs(30),
+            write_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+impl WebServerOptions {
+    /// Reject unsafe or unsupported limits before opening a listening socket.
+    pub fn validate(&self) -> std::io::Result<()> {
+        if !(1..=512).contains(&self.max_concurrent_connections) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "max_concurrent_connections must be between 1 and 512",
+            ));
+        }
+        for (name, timeout) in [
+            ("read_timeout", self.read_timeout),
+            ("write_timeout", self.write_timeout),
+        ] {
+            if !(Duration::from_millis(1)..=Duration::from_secs(300)).contains(&timeout) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{name} must be between 1ms and 300s"),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Dev server that dispatches registered `Web.route` handlers and falls back
 /// to static files for unmatched paths.
 #[derive(Debug)]
@@ -921,6 +969,24 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
     ) -> std::io::Result<Self> {
+        Self::bind_runtime_with_options(
+            port,
+            static_dir,
+            output_dir,
+            routes,
+            WebServerOptions::default(),
+        )
+    }
+
+    /// Bind with validated host limits. Invalid options never open a socket.
+    pub fn bind_runtime_with_options(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        options: WebServerOptions,
+    ) -> std::io::Result<Self> {
+        options.validate()?;
         let listener = TcpListener::bind(("0.0.0.0", port))?;
         let actual_port = listener.local_addr()?.port();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -938,6 +1004,7 @@ impl WebDevServer {
                     output_dir_clone,
                     routes_clone,
                     shutdown_clone,
+                    options,
                 );
             })?;
 
@@ -954,9 +1021,10 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
         shutdown: Arc<AtomicBool>,
+        options: WebServerOptions,
     ) {
         listener.set_nonblocking(true).ok();
-        let slots = Arc::new(ConnectionSlots::new(Self::MAX_CONCURRENT_CONNECTIONS));
+        let slots = Arc::new(ConnectionSlots::new(options.max_concurrent_connections));
         // Route tables contain compiled modules; share them rather than
         // cloning the full vector for every incoming connection.
         let routes = Arc::new(routes);
@@ -981,7 +1049,13 @@ impl WebDevServer {
                         );
                         continue;
                     };
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+                    // Do not dispatch an unbounded connection if the OS
+                    // refuses to apply the validated socket timeouts.
+                    if stream.set_read_timeout(Some(options.read_timeout)).is_err()
+                        || stream.set_write_timeout(Some(options.write_timeout)).is_err()
+                    {
+                        continue;
+                    }
                     let static_dir = static_dir.clone();
                     let output_dir = output_dir.clone();
                     let routes = Arc::clone(&routes);
@@ -1359,6 +1433,79 @@ mod tests {
         let raw = b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nokGET / HTTP/1.1\r\n\r\n";
         let request = read_http_request(&mut chunks(raw, 128)).unwrap().unwrap();
         assert_eq!(request.body, b"ok");
+    }
+
+    #[test]
+    fn web_host_options_reject_invalid_capacity_before_binding() {
+        let options = WebServerOptions {
+            max_concurrent_connections: 0,
+            ..WebServerOptions::default()
+        };
+        let error = WebDevServer::bind_runtime_with_options(
+            0,
+            None,
+            None,
+            vec![],
+            options,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn web_host_options_reject_zero_and_excessive_timeouts() {
+        let defaults = WebServerOptions::default();
+        assert!(defaults.validate().is_ok());
+
+        assert!(WebServerOptions {
+            read_timeout: Duration::ZERO,
+            ..defaults
+        }
+        .validate()
+        .is_err());
+        assert!(WebServerOptions {
+            write_timeout: Duration::from_secs(301),
+            ..defaults
+        }
+        .validate()
+        .is_err());
+        assert!(WebServerOptions {
+            max_concurrent_connections: 513,
+            ..defaults
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn web_host_options_enforce_custom_connection_capacity_over_http() {
+        let options = WebServerOptions {
+            max_concurrent_connections: 1,
+            ..WebServerOptions::default()
+        };
+        let server =
+            WebDevServer::bind_runtime_with_options(0, None, None, vec![], options).unwrap();
+        let mut first = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        first.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        first
+            .write_all(b"GET /__nulang/sse/lease HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut buffer = [0; 128];
+        let read = first.read(&mut buffer).unwrap();
+        assert!(
+            String::from_utf8_lossy(&buffer[..read]).starts_with("HTTP/1.1 200"),
+            "the SSE worker must own the capacity lease"
+        );
+
+        let mut second = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        second.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        second.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        let read = second.read(&mut buffer).unwrap();
+        assert!(
+            String::from_utf8_lossy(&buffer[..read]).starts_with("HTTP/1.1 503"),
+            "custom capacity must reject excess requests"
+        );
+        drop(server);
     }
 
     #[test]
