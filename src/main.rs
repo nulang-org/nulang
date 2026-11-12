@@ -591,8 +591,9 @@ fn main() {
         std::env::set_var("NULANG_ISO_ARENA", "1");
     }
 
-    // Apply FFI policy
-    if opts.ffi_sandbox {
+    // Apply FFI policy. An explicit allowlist must never be ignored merely
+    // because the caller omitted the redundant --ffi-sandbox flag.
+    if opts.ffi_policy_requested() {
         use nulang::ffi::native::FfiPolicy;
         use std::collections::HashSet;
 
@@ -1118,6 +1119,13 @@ impl Default for Options {
         }
     }
 }
+
+impl Options {
+    fn ffi_policy_requested(&self) -> bool {
+        self.ffi_sandbox || !self.ffi_allow.is_empty()
+    }
+}
+
 fn print_help() {
     println!("Usage: nulang [OPTIONS] <FILE>");
     println!("       nulang --repl");
@@ -1187,6 +1195,8 @@ fn print_help() {
     println!("  fmt [--check] [<file>]  Format file(s); no file → all src/**/*.nula");
     println!("  -v, --verbose    Show bytecode and AST");
     println!("  --metrics-port <N>  Start Prometheus metrics server on port N");
+    println!("  --ffi-sandbox  Restrict native FFI to explicitly allowed libraries");
+    println!("  --ffi-allow <lib>  Allow an FFI library (also activates the sandbox)");
     println!("  --emit-signals <file> Emit signal graph JSON for the web framework");
     println!("  --rewrite-signals <file> Rewrite HTML for signals and emit client JS");
     println!("  --store <uri>    Durable store URI for programs declaring durable");
@@ -2807,6 +2817,28 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ffi_allowlist_alone_activates_sandbox_policy() {
+        let mut opts = Options::default();
+        assert!(
+            !opts.ffi_policy_requested(),
+            "legacy development mode stays unchanged"
+        );
+
+        opts.ffi_allow.push("libexplicit.so".to_string());
+        assert!(
+            opts.ffi_policy_requested(),
+            "--ffi-allow must not be a no-op"
+        );
+
+        opts.ffi_allow.clear();
+        opts.ffi_sandbox = true;
+        assert!(
+            opts.ffi_policy_requested(),
+            "explicit deny-all sandbox remains active"
+        );
+    }
 
     /// An actor program run through the CLI path must create real actors
     /// and deliver sent messages: with the bare standalone VM the stub
