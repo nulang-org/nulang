@@ -1,0 +1,228 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Nulang UI DOM host regression tests</title>
+<div id="mount"></div><pre id="results">running</pre>
+<script src="nulang-ui-dom.js"></script>
+<script>
+"use strict";
+const tests = [];
+function test(name, fn) { tests.push({name, fn}); }
+function assert(condition, detail) { if (!condition) throw Error(detail || "assertion failed"); }
+const str = value => ({type:"string", value});
+const bool = value => ({type:"bool", value});
+const entry = (id, kind, properties={}, children=[]) => ({id,kind,properties,children});
+function snapshot(revision, nodes, root="root") {
+  return {protocol:"nulang-ui/1",document_id:"test",revision:String(revision),root,nodes};
+}
+function patch(from,to,operations,acknowledged_inputs=[]) {
+  return {protocol:"nulang-ui/1",document_id:"test",base_revision:String(from),revision:String(to),operations,acknowledged_inputs};
+}
+function setup(nodes) {
+  const container=document.getElementById("mount"); container.replaceChildren();
+  return window.nulangUiDom.createHost(container,snapshot(1,nodes));
+}
+
+test("keyed reorder retains original row nodes and focus", () => {
+  const host=setup([entry("root","div",{},["a","b","c"]),entry("a","button",{text:str("A")}),entry("b","input",{value:str("bbb")}),entry("c","button",{text:str("C")})]);
+  const before=host.element("b"), a=host.element("a"), c=host.element("c");
+  before.focus(); before.setSelectionRange(1,2);
+  host.applyPatch(patch(1,2,[{op:"replace_children",node_id:"root",children:["c","a","b"]}]));
+  assert(host.element("b")===before && host.element("a")===a && host.element("c")===c,"row identity changed");
+  assert(document.activeElement===before,"focus lost");
+  assert(before.selectionStart===1 && before.selectionEnd===2,"selection lost");
+  assert([...document.getElementById("mount").firstElementChild.children].map(n=>n.dataset.nulangNodeId).join(",")==="c,a,b","incorrect keyed order");
+});
+
+test("local typing wins over old patch, then acknowledgement releases ownership", () => {
+  const received=[];
+  const host=setup([entry("root","form",{},["title"]),entry("title","input",{value:str("")})]);
+  host.onInput = detail => received.push(detail);
+  const input=host.element("title");
+  input.value="abc";input.dispatchEvent(new Event("input",{bubbles:true}));
+  assert(received.length===1 && received[0].sequence==="1","input event sequence missing");
+  host.applyPatch(patch(1,2,[{op:"set_property",node_id:"title",name:"value",value:str("old")}]));
+  assert(input.value==="abc","local input overwritten");
+  host.applyPatch(patch(2,3,[{op:"set_property",node_id:"title",name:"value",value:str("ABC")}],[{node_id:"title",property:"value",sequence:"1"}]));
+  assert(input.value==="ABC","acknowledged value not applied");
+});
+
+test("composition defers patches until IME finishes", () => {
+  const host=setup([entry("root","form",{},["title"]),entry("title","input",{value:str("")})]);
+  const input=host.element("title");
+  input.dispatchEvent(new CompositionEvent("compositionstart",{bubbles:true}));
+  assert(host.applyPatch(patch(1,2,[{op:"set_property",node_id:"title",name:"placeholder",value:str("new")}]))==="deferred","composing input patched");
+  assert(!input.placeholder,"composition modified DOM");
+  input.dispatchEvent(new CompositionEvent("compositionend",{bubbles:true}));
+  assert(input.placeholder==="new" && host.document.revision==="2","queued patch not applied");
+});
+
+test("rejects revision gaps, duplicates, malicious URLs and markup without mutation", () => {
+  const host=setup([entry("root","div",{},["link"]),entry("link","a",{href:str("/ok"),text:str("safe")})]);
+  const existing=host.element("link");
+  assert(host.applyPatch(patch(1,2,[]))==="applied","valid patch rejected");
+  assert(host.applyPatch(patch(1,2,[]))==="stale","duplicate patch not ignored");
+  let failed=false;
+  try {host.applyPatch(patch(3,4,[]));} catch(e) {failed=true;}
+  assert(failed && host.document.revision==="2","gap advanced state");
+  failed=false;
+  try {host.applyPatch(patch(2,3,[{op:"set_property",node_id:"link",name:"href",value:str("javascript:alert(1)")}]))} catch(e) {failed=true;}
+  assert(failed && host.document.revision==="2" && existing.getAttribute("href")==="/ok","unsafe URL committed");
+  host.applyPatch(patch(2,3,[{op:"set_property",node_id:"link",name:"text",value:str("<img src=x onerror=alert(1)>")}]));
+  assert(existing.textContent==="<img src=x onerror=alert(1)>" && !existing.querySelector("img"),"markup executed");
+});
+
+test("root replacement and removed inputs do not resurrect removed controls", () => {
+  const host=setup([entry("root","form",{},["title"]),entry("title","input",{value:str("")})]);
+  const original=host.element("title");original.value="local";original.dispatchEvent(new Event("input"));
+  host.applyPatch(patch(1,2,[{op:"replace_children",node_id:"root",children:[]},{op:"remove_node",node_id:"title"}]));
+  assert(host.element("title")===undefined && !original.isConnected,"old input was retained");
+  host.applyPatch(patch(2,3,[{op:"upsert_node",node:entry("title","input",{value:str("server")})},{op:"replace_children",node_id:"root",children:["title"]}]));
+  assert(host.element("title").value==="server","stale local input resurrected");
+});
+
+test("SSR hydration adopts keyed markup with the same scoped NodeIds as Rust", () => {
+  const container=document.getElementById("mount");
+  container.innerHTML='<div><ul data-nulang-key="left"><li data-nulang-key="é">Unicode</li><li data-nulang-key="same">One</li></ul><ul data-nulang-key="right"><li data-nulang-key="same">Two</li></ul></div>';
+  const original=container.querySelector("li");
+  const host=window.nulangUiDom.createHostFromDom(container,{documentId:"test",revision:"1"});
+  assert(host.element("root/k6c656674/kc3a9")===original,"SSR node was recreated");
+  assert(host.element("root/k7269676874/k73616d65").textContent==="Two","key scope not respected");
+  assert(host.element("root/k6c656674/k73616d65").textContent==="One","wrong sibling identity");
+  assert(host.document.nodes.some(n=>n.id==="root/k6c656674/kc3a9" && n.properties.text.value==="Unicode"),"missing SSR snapshot property");
+  assert(container.querySelector("[data-nulang-node-id='root/k6c656674/kc3a9']")===original,"missing adoption marker");
+});
+
+test("SSR hydration refuses duplicate or unsafe keyed nodes atomically", () => {
+  const container=document.getElementById("mount");
+  container.innerHTML='<ul><li data-nulang-key="duplicate">A</li><li data-nulang-key="duplicate">B</li></ul>';
+  const before=container.firstElementChild;
+  let rejected=false;
+  try { window.nulangUiDom.createHostFromDom(container,{documentId:"test",revision:"1"}); } catch (_) {rejected=true}
+  assert(rejected && container.firstElementChild===before,"duplicate sibling keys accepted or DOM mutated");
+
+  container.innerHTML='<ul><a data-nulang-key="ok" href="javascript:alert(1)">Bad</a></ul>';
+  rejected=false;
+  try { window.nulangUiDom.createHostFromDom(container,{documentId:"test",revision:"1"}); } catch (_) {rejected=true}
+  assert(rejected,"unsafe SSR URL accepted");
+
+  container.innerHTML='<ul data-nulang-key="ignored"><li>A</li></ul>';
+  rejected=false;
+  try { window.nulangUiDom.createHostFromDom(container,{documentId:"test",revision:"1"}); } catch (_) {rejected=true}
+  assert(rejected,"root key silently ignored");
+
+  container.innerHTML='<ul><li data-nulang-key="x&#10;y">Invalid</li></ul>';
+  rejected=false;
+  try { window.nulangUiDom.createHostFromDom(container,{documentId:"test",revision:"1"}); } catch (_) {rejected=true}
+  assert(rejected,"control-character key accepted");
+});
+
+test("explicit resync rejects drafts and wrong-document or older snapshots", () => {
+  const host=setup([entry("root","div",{},["a"]),entry("a","input",{value:str("")})]);
+  const input=host.element("a");
+  input.value="draft";input.dispatchEvent(new Event("input"));
+  const next=snapshot(3,[entry("root","div",{},["a"]),entry("a","input",{value:str("server")})]);
+  let rejected=false;
+  try {host.resync(next)} catch (_) {rejected=true}
+  assert(rejected && input.value==="draft","unacknowledged edit silently discarded");
+  const other={...next,document_id:"other"};
+  rejected=false;
+  try {host.resync(other,{discardPending:true})} catch (_) {rejected=true}
+  assert(rejected && host.document.revision==="1","cross-document snapshot accepted");
+  const stale={...next,revision:"0"};
+  rejected=false;
+  try {host.resync(stale,{discardPending:true})} catch (_) {rejected=true}
+  assert(rejected,"old snapshot accepted");
+  assert(host.resync(next,{discardPending:true})==="resynced","explicit resync failed");
+  assert(host.element("a").value==="server","stale draft survived explicit replacement");
+  host.applyPatch(patch(3,4,[{op:"set_property",node_id:"a",name:"value",value:str("new")}]));
+  assert(host.element("a").value==="new","state was not reset after resync");
+});
+
+test("SSR hydrated keyed reorder applies server patches without replacing nodes", () => {
+  const container=document.getElementById("mount");
+  container.innerHTML='<ul><li data-nulang-key="a">A</li><li data-nulang-key="b">B</li></ul>';
+  const oldB=container.querySelectorAll("li")[1];
+  const host=window.nulangUiDom.createHostFromDom(container,{documentId:"test",revision:"1"});
+  assert(host.applyMessage({protocol:"nulang-ui-msg/1",type:"patch",
+    patch:patch(1,2,[{op:"replace_children",node_id:"root",children:["root/k62","root/k61"]}])})==="applied","patch not applied");
+  assert(container.firstElementChild.firstElementChild===oldB,"keyed SSR element replaced");
+});
+
+test("compiled Nulang keyed session snapshot and patch render in Chromium", async () => {
+  const response=await fetch("live-session-fixture.json", {cache:"no-store"});
+  assert(response.ok,"compiler fixture unavailable");
+  const fixture=await response.json();
+  const [initial,update]=fixture.keyed;
+  const container=document.getElementById("mount");
+  container.replaceChildren();
+  const host=window.nulangUiDom.createHost(container,initial.document);
+  const first=host.element("root/k61"), second=host.element("root/k62");
+  assert(first && second && first.textContent==="a" && second.textContent==="b","compiled snapshot did not render");
+  assert(host.applyMessage(update)==="applied","compiled patch failed");
+  assert(host.element("root/k61")===first && host.element("root/k62")===second,"keyed node identity lost");
+  assert([...container.firstElementChild.children].map(node=>node.textContent).join(",")==="b,a,c","compiled keyed order wrong");
+  assert(host.element("root/k63").textContent==="c","compiled inserted node missing");
+  assert(host.document.revision==="2","compiled patch revision not applied");
+});
+
+test("compiled Nulang form acknowledgement clears draft and preserves input sequence", async () => {
+  const response=await fetch("live-session-fixture.json", {cache:"no-store"});
+  assert(response.ok,"compiler fixture unavailable");
+  const fixture=await response.json();
+  const [initial,update]=fixture.form;
+  const container=document.getElementById("mount");
+  container.replaceChildren();
+  const host=window.nulangUiDom.createHost(container,initial.document);
+  const input=host.element("root/p0"), received=[];
+  assert(input && input.tagName==="INPUT","compiled form input missing");
+  host.onInput=detail=>received.push(detail);
+  input.value="approved";
+  input.dispatchEvent(new Event("input",{bubbles:true}));
+  assert(received.length===1 && received[0].sequence==="1","local edit sequence missing");
+  assert(host.applyMessage(update)==="applied","compiled form patch failed");
+  assert(input.value==="approved" && host.document.revision==="2","authoritative input value missing");
+  assert(host.pending.size===0,"compiled acknowledgement failed to release pending edit");
+  input.value="next";
+  input.dispatchEvent(new Event("input",{bubbles:true}));
+  assert(received[1].sequence==="2","client reused acknowledged input sequence");
+});
+
+test("Rust's omitted empty UI fields default to empty, not null or malformed values", () => {
+  const container=document.getElementById("mount");
+  container.replaceChildren();
+  const minimal=snapshot(1,[{id:"root",kind:"div",children:["child"]},{id:"child",kind:"span"}]);
+  const host=window.nulangUiDom.createHost(container,minimal);
+  assert(host.element("child") && host.document.nodes.find(node=>node.id==="child").children.length===0,"omitted children did not default");
+  assert(Object.keys(host.document.nodes.find(node=>node.id==="child").properties).length===0,"omitted properties did not default");
+
+  const original=container.firstChild;
+  const invalidFields=[
+    {id:"child",kind:"span",children:null},
+    {id:"child",kind:"span",children:{}},
+    {id:"child",kind:"span",properties:null},
+    {id:"child",kind:"span",properties:[]}
+  ];
+  for (const bad of invalidFields) {
+    let rejected=false;
+    try {window.nulangUiDom.createHost(container,snapshot(1,[{id:"root",kind:"div",children:["child"]},bad]));}
+    catch (_) {rejected=true;}
+    assert(rejected && container.firstChild===original,"malformed explicit UI fields accepted or mutated DOM");
+  }
+
+  assert(host.applyPatch(patch(1,2,[
+    {op:"upsert_node",node:{id:"fresh",kind:"span"}},
+    {op:"replace_children",node_id:"root",children:["child","fresh"]}
+  ]))==="applied","sparse Rust upsert rejected");
+  assert(host.element("fresh") && host.element("fresh").tagName==="SPAN","sparse upsert not rendered");
+});
+
+(async () => {
+ const out=[];
+ for(const {name,fn} of tests) {
+   try {await fn();out.push("PASS "+name)} catch(e){out.push("FAIL "+name+": "+e.message)}
+ }
+ const failed=out.filter(s=>s.startsWith("FAIL")).length;
+ document.getElementById("results").textContent=out.join("\n")+"\n"+(failed?"FAILURES "+failed:"ALL PASS");
+ document.documentElement.setAttribute("data-test-status",failed?"failed":"passed");
+})();
+</script>
