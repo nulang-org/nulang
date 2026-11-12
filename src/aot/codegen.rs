@@ -3759,6 +3759,37 @@ mod tests {
     }
 
     #[test]
+    fn test_aot_checked_div_int48_min_overflow() {
+        let mut builder = mir::FunctionBuilder::new("__main", Some(crate::types::Type::int()));
+        let min = builder.add_temp(crate::types::Type::int());
+        builder.assign(
+            min,
+            mir::RValue::Const(crate::bytecode::Constant::Int(
+                crate::value_layout::INT48_MIN,
+            )),
+        );
+        let neg_one = builder.add_temp(crate::types::Type::int());
+        builder.assign(
+            neg_one,
+            mir::RValue::Const(crate::bytecode::Constant::Int(-1)),
+        );
+        let quotient = builder.add_temp(crate::types::Type::int());
+        builder.assign(
+            quotient,
+            mir::RValue::Binary(crate::ast::BinOp::Div, min, neg_one),
+        );
+        builder.terminate(mir::Terminator::Return(Some(quotient)));
+        let mut module = mir::Module::new("checked_div");
+        module.functions.push(builder.build());
+
+        let aot = crate::aot::AotModule::compile(&module).expect("AOT compile");
+        let error = aot
+            .run()
+            .expect_err("AOT division must not truncate INT48 overflow");
+        assert!(error.to_string().contains("integer overflow"), "{error}");
+    }
+
+    #[test]
     fn test_is_all_int_false_with_bool_param() {
         let mut builder = mir::FunctionBuilder::new("mixed", Some(crate::types::Type::int()));
         builder.add_param("x", crate::types::Type::int());

@@ -3661,6 +3661,10 @@ impl VM {
             }
         }
 
+        // A prior JIT or AOT invocation must not poison this region. A
+        // compiled arithmetic helper cannot unwind, so retrieve its first
+        // recorded error after native execution and surface it via VM::step.
+        let _ = crate::jit::runtime::aot_take_pending_error();
         let action = if requires_vm_reentry {
             jit.execute_compiled(module_idx, pc, &mut detached_regs, &constants)
         } else {
@@ -3682,6 +3686,7 @@ impl VM {
             jit.execute_compiled(module_idx, pc, regs, &constants)
         };
 
+        let arithmetic_error = crate::jit::runtime::aot_take_pending_error();
         if requires_vm_reentry {
             crate::jit::runtime::clear_jit_vm();
         } else {
@@ -3711,7 +3716,8 @@ impl VM {
 
             // A re-entrant callee raised a runtime error. Surface it before
             // normal branch-exit or safepoint handling.
-            if let Some(msg) = crate::jit::runtime::take_jit_pending_vm_error() {
+            if let Some(msg) = crate::jit::runtime::take_jit_pending_vm_error().or(arithmetic_error)
+            {
                 self.jit_pending_error = Some(msg);
                 return true;
             }
@@ -4889,6 +4895,12 @@ impl VM {
             let ai = a.as_int().unwrap_or(0);
             let bi = b.as_int().unwrap_or(1);
             self.frames[frame_idx].regs[instr.op3 as usize] = if bi != 0 {
+                // Int values are 48-bit signed in the current tagged VM.
+                // The quotient +2^47 cannot be represented and must not
+                // silently wrap back to INT48_MIN.
+                if ai == crate::value_layout::INT48_MIN && bi == -1 {
+                    return Err(int_overflow_error("div", ai, bi));
+                }
                 Value::int(ai / bi)
             } else {
                 Value::nil()
@@ -6407,6 +6419,32 @@ mod vm_tests {
             .to_str()
             .unwrap();
         assert_eq!(s, "hello ffi");
+    }
+
+    #[test]
+    fn test_idiv_int48_boundary_overflow_vm() {
+        let mut module = CodeModule::new("idiv_48bit_overflow_vm");
+        let min = module.add_constant(Constant::Int(crate::value_layout::INT48_MIN));
+        let minus_one = module.add_constant(Constant::Int(-1));
+        for (constant, register) in [(min, 0u8), (minus_one, 1u8)] {
+            module.emit(Instruction::new3(
+                OpCode::ConstU,
+                (constant >> 8) as u8,
+                constant as u8,
+                register,
+            ));
+        }
+        module.emit(Instruction::new3(OpCode::IDiv, 0, 1, 2));
+        module.emit(Instruction::new2(OpCode::Move, 2, 0));
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
+
+        let mut vm = VM::new();
+        vm.load_module(module);
+        let err = vm
+            .run()
+            .expect_err("dividing Int48 min by -1 must not wrap to min");
+        assert!(format!("{err}").contains("integer overflow"), "{err}");
     }
 
     /// Test 1: Basic integer arithmetic.
