@@ -4387,7 +4387,9 @@ impl VM {
     ) -> NuResult<()> {
         let effect_op_idx = instr.imm16() as usize;
         let dst_reg = instr.op3 as usize;
-        let effect_op = self.module_const_string(module_idx, effect_op_idx);
+        // Borrow a string constant for the lifetime of the host callback.
+        // Unknown/non-string constants keep the existing owned fallback text.
+        let effect_op = module_constant_name(&self.modules, module_idx, effect_op_idx);
         // Pass the full frame register slice and the module's constant pool
         // so the callback can resolve string-id arguments from registers.
         let args = &self.frames[frame_idx].regs;
@@ -4398,11 +4400,11 @@ impl VM {
             .unwrap_or(&[]);
         match self
             .actor_callbacks
-            .perform_async(&effect_op, constants, args)
+            .perform_async(effect_op.as_ref(), constants, args)
         {
             PerformAsyncResult::Ready(result) => {
                 let value = match result {
-                    Some(ref content) => self.add_runtime_string(module_idx, content.clone()),
+                    Some(content) => self.add_runtime_string(module_idx, content),
                     None => Value::nil(),
                 };
                 self.frames[frame_idx].regs[dst_reg] = value;
@@ -6378,6 +6380,149 @@ mod vm_tests {
         ) -> PerformAsyncResult {
             PerformAsyncResult::ReadyValue(Value::int(73))
         }
+    }
+
+    // Records the actual callback and returned-string allocation addresses to
+    // guard against cloning on the PerformAsync hot path. The byte buffers
+    // remain live until the end of the assertion, so comparing addresses is safe.
+    #[derive(Debug)]
+    struct AsyncPointerProbe {
+        inner: ReadyValueCallbacks,
+        effect_ptr: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        result_ptr: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ActorVmCallbacks for AsyncPointerProbe {
+        fn alloc(&mut self, size: usize, type_tag: HeapTypeTag) -> Option<*mut u8> {
+            self.inner.alloc(size, type_tag)
+        }
+        fn drop_ref(&mut self, ptr: *mut u8) {
+            self.inner.drop_ref(ptr)
+        }
+        fn retain_ref(&mut self, ptr: *mut u8) {
+            self.inner.retain_ref(ptr)
+        }
+        fn array_len(&self, ptr: *mut u8) -> Option<usize> {
+            self.inner.array_len(ptr)
+        }
+        fn spawn_actor(
+            &mut self,
+            module: &CodeModule,
+            spawn_pc: usize,
+            behavior_idx: usize,
+            init: Vec<(String, Value)>,
+        ) -> Value {
+            self.inner.spawn_actor(module, spawn_pc, behavior_idx, init)
+        }
+        fn send_message(&mut self, target: Value, behavior_id: u16, args: &[Value]) {
+            self.inner.send_message(target, behavior_id, args)
+        }
+        fn perform_async(
+            &mut self,
+            effect_op: &str,
+            _constants: &[Constant],
+            _args: &[Value],
+        ) -> PerformAsyncResult {
+            use std::sync::atomic::Ordering;
+            self.effect_ptr
+                .store(effect_op.as_ptr() as usize, Ordering::SeqCst);
+            let response = String::from("async response");
+            self.result_ptr
+                .store(response.as_ptr() as usize, Ordering::SeqCst);
+            PerformAsyncResult::Ready(Some(response))
+        }
+    }
+
+    #[test]
+    fn perform_async_borrows_constant_name_through_callback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let mut vm = VM::new_without_jit();
+        let mut module = CodeModule::new("perform_async_name_borrow");
+        let effect_idx = module.add_string_constant("Network.fetch");
+        vm.load_module(module);
+
+        let effect_ptr = Arc::new(AtomicUsize::new(0));
+        let result_ptr = Arc::new(AtomicUsize::new(0));
+        vm.set_actor_callbacks(Box::new(AsyncPointerProbe {
+            inner: ReadyValueCallbacks::new(),
+            effect_ptr: Arc::clone(&effect_ptr),
+            result_ptr,
+        }));
+
+        let mut frame = Frame::new(None, 0);
+        frame.pc = 1;
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+
+        let instr = Instruction::new3(
+            OpCode::PerformAsync,
+            ((effect_idx >> 8) & 0xff) as u8,
+            (effect_idx & 0xff) as u8,
+            7,
+        );
+        vm.step_perform_async(0, 0, instr)
+            .expect("async effect must complete");
+
+        let expected_ptr = match &vm.modules[0].constants[effect_idx] {
+            Constant::String(name) => name.as_ptr() as usize,
+            _ => panic!("effect name must remain a string"),
+        };
+        assert_ne!(effect_ptr.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            effect_ptr.load(Ordering::SeqCst),
+            expected_ptr,
+            "effect dispatch must borrow the module's string buffer"
+        );
+    }
+
+    #[test]
+    fn perform_async_moves_owned_ready_string_into_constant_pool() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let mut vm = VM::new_without_jit();
+        let mut module = CodeModule::new("perform_async_move_result");
+        let effect_idx = module.add_string_constant("Network.fetch");
+        vm.load_module(module);
+
+        let effect_ptr = Arc::new(AtomicUsize::new(0));
+        let result_ptr = Arc::new(AtomicUsize::new(0));
+        vm.set_actor_callbacks(Box::new(AsyncPointerProbe {
+            inner: ReadyValueCallbacks::new(),
+            effect_ptr,
+            result_ptr: Arc::clone(&result_ptr),
+        }));
+
+        let mut frame = Frame::new(None, 0);
+        frame.pc = 1;
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+
+        let instr = Instruction::new3(
+            OpCode::PerformAsync,
+            ((effect_idx >> 8) & 0xff) as u8,
+            (effect_idx & 0xff) as u8,
+            7,
+        );
+        vm.step_perform_async(0, 0, instr)
+            .expect("async effect must complete");
+
+        let returned_id = vm.frames[0].regs[7]
+            .as_string_id()
+            .expect("ready result must be interned");
+        let stored = match &vm.modules[0].constants[returned_id as usize] {
+            Constant::String(s) => s,
+            _ => panic!("ready result must remain a string"),
+        };
+        assert_eq!(stored, "async response");
+        assert_ne!(result_ptr.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            stored.as_ptr() as usize,
+            result_ptr.load(Ordering::SeqCst),
+            "the VM must take ownership of the returned string buffer without cloning"
+        );
     }
 
     #[test]
