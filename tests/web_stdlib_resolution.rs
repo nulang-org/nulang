@@ -94,6 +94,7 @@ fn generated_resource_and_model_build_outside_checkout() {
             "title:String",
             "--field",
             "published:Bool",
+            "--read-only-views",
         ],
     ] {
         let result = Command::new(cli)
@@ -114,6 +115,9 @@ fn generated_resource_and_model_build_outside_checkout() {
     assert!(model.contains("pub type BlogPostInput"));
     assert!(model.contains("can_read_blog_post"));
     assert!(model.contains("-> Bool { false }"));
+    assert!(model.contains("pub fn blog_post_readonly_table("));
+    assert!(model.contains("pub fn blog_post_readonly_detail("));
+    assert!(model.contains("can_read_blog_post(actor_tenant_id, record)"));
 
     let build = Command::new(cli)
         .args(["nula", "build", "--web"])

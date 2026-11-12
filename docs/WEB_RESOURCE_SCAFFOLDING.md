@@ -56,3 +56,11 @@ or read-only pages as authorization.** A real service still needs
 authenticated identity, tenant membership, resource permission checks,
 storage transactions, CSRF and input validation, with negative tests.
 Neither generator supplies production CRUD.
+
+## Optional read-only table/detail views
+
+To generate type-driven, policy-gated HTML helpers alongside a model, add
+`--read-only-views` to `nula generate model` (see [WEB_ADMIN_VIEWS.md](WEB_ADMIN_VIEWS.md)).
+These are presentation functions, **not** new HTTP routes or a database admin
+interface. Every record defaults to denied until the application implements
+its own authenticated read policy and tenant-scoped data access.

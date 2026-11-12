@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Experimental read-only Web resource views — 2026-11-11
+- **Added `stdlib::web::admin` presentation helpers** for escaped read-only tables, accessible column headers, record details, and denied-view fallback. Malformed row and field lengths never render submitted data.
+- **Added opt-in `nula generate model ... --read-only-views`** using the existing validated model fields. Generated helpers filter each record through the existing deny-by-default read-policy hook; they do not register routes, load data, or create mutations. Production authorization and tenant-scoped database reads remain application responsibilities.
+- **Added real HTTP presentation regressions and generated-source parsing/typechecking tests.** This experimental addition is stacked on the draft model/resource generator and remains subject to exact-head security and release qualification.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
