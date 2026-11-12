@@ -108,6 +108,10 @@ pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     local_type_params: FxHashMap<String, TypeVar>,
+    /// Named effect-row variables bound within the current function.
+    /// None outside a function, so independently parsed types cannot
+    /// accidentally share an unresolved effect tail.
+    function_effect_row_scope: Option<FxHashMap<String, Region>>,
     global_type_constructors: FxHashMap<String, TypeVar>,
     /// Accumulated parse errors from error-recovery. Callers that want
     /// all errors (not just the first) call `consumed_diagnostics()`.
@@ -149,6 +153,7 @@ impl Parser {
             pos: 0,
             global_type_constructors: FxHashMap::default(),
             local_type_params: FxHashMap::default(),
+            function_effect_row_scope: None,
             imported_type_cache: FxHashMap::default(),
             handler_registry: FxHashMap::default(),
             diagnostics: Vec::new(),
@@ -931,6 +936,23 @@ impl Parser {
     }
 
     fn parse_function(
+        &mut self,
+        public: bool,
+        annotations: Vec<FunctionAnnotation>,
+    ) -> NuResult<Decl> {
+        // An effect row named `row` in the callback parameter and function
+        // annotation must refer to the same abstract row. Keep names local
+        // to this function; unrelated declarations and nested functions
+        // must never acquire the same effect authority by spelling alone.
+        // Restore the enclosing scope even if parsing returns an error.
+        let outer_scope = self.function_effect_row_scope.take();
+        self.function_effect_row_scope = Some(FxHashMap::default());
+        let result = self.parse_function_scoped(public, annotations);
+        self.function_effect_row_scope = outer_scope;
+        result
+    }
+
+    fn parse_function_scoped(
         &mut self,
         public: bool,
         mut annotations: Vec<FunctionAnnotation>,
@@ -6443,8 +6465,15 @@ impl Parser {
             let mut region = Region(0);
             while self.peek_kind() != &TokenKind::RBrace && !self.is_at_end() {
                 if self.consume_if(&TokenKind::Pipe) {
-                    let _rname = self.expect_ident("row variable")?;
-                    region = Region::fresh();
+                    let row_name = self.expect_ident("row variable")?;
+                    region = if let Some(scope) = self.function_effect_row_scope.as_mut() {
+                        *scope.entry(row_name).or_insert_with(Region::fresh)
+                    } else {
+                        // Outside a function signature there is no lexical
+                        // binder; never invent a relation between independent
+                        // type expressions merely because names match.
+                        Region::fresh()
+                    };
                     is_open = true;
                     break;
                 }
