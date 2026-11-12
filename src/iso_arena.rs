@@ -749,6 +749,37 @@ mod tests {
     }
 
     #[test]
+    fn pointer_analysis_joins_pointer_and_scalar_branches_after_empty_prefix() {
+        // A branch that allocates a child must taint the store after the join,
+        // even when its alternate branch leaves the register scalar and both
+        // branches originate behind a pointer-free entry prefix.
+        let m = send_module(
+            vec![
+                Instruction::new1(OpCode::Const0, 0),         // 0: array length
+                jmp_t(0, 3),                                  // 1: true -> 4, false -> 2
+                arr_alloc(0, 2),                              // 2: child pointer on one path
+                jmp_t(0, 2),                                  // 3: true -> 5, false -> 4
+                Instruction::new1(OpCode::Const0, 2),         // 4: scalar on other paths
+                arr_alloc(0, 1),                              // 5: outer array
+                Instruction::new3(OpCode::ArrStore, 1, 0, 2), // 6: join
+                Instruction::new1(OpCode::Drop, 1),
+                Instruction::new1(OpCode::Drop, 2),
+                Instruction::new0(OpCode::Halt),
+            ],
+            0,
+        );
+        let state = may_ptr_sets(&m);
+        assert!(
+            regset_contains(&state[6], 2),
+            "pointer possibility from either branch must survive at the join"
+        );
+        assert!(
+            !qualifying_alloc_sites(&m).contains(&5),
+            "an arena container cannot receive an optionally pointer-valued child"
+        );
+    }
+
+    #[test]
     fn qualifies_when_dropped_before_halt() {
         // r1 = array(r0-len); read its length; drop it; halt. r0 is an int.
         let m = send_module(
