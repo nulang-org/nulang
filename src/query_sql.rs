@@ -65,11 +65,22 @@ impl SqlEmitter {
         match expression {
             Expr::Field(name) => quote_identifier(name),
             Expr::Literal(value) => self.parameter(value.clone()),
-            Expr::Eq(a, b) => Ok(format!(
-                "({} = {})",
-                self.expression(a, schema)?,
-                self.expression(b, schema)?
-            )),
+            Expr::Eq(a, b) => {
+                let is_text = operand_type(a, schema) == Some(DataType::Text);
+                let lhs = self.expression(a, schema)?;
+                let rhs = self.expression(b, schema)?;
+                // Respect Rust/Query IR's byte-exact String equality even when
+                // a database column has a NOCASE/nondeterministic collation.
+                let collation = if is_text {
+                    match self.dialect {
+                        SqlDialect::Sqlite => " COLLATE BINARY",
+                        SqlDialect::Postgres => " COLLATE \"C\"",
+                    }
+                } else {
+                    ""
+                };
+                Ok(format!("({lhs}{collation} = {rhs})"))
+            }
             Expr::Gt(a, b) => {
                 if operand_type(a, schema) == Some(DataType::Text) {
                     return Err(QueryError(
