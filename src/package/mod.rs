@@ -14,6 +14,7 @@ pub mod clean_observation;
 pub mod commands;
 pub mod identity;
 mod identity_verify;
+pub mod import_observation;
 pub mod incremental_oracle;
 pub mod lockfile;
 pub mod manifest;
