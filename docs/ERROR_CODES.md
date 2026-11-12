@@ -102,11 +102,13 @@ by `render_warning`/`format_warning` (src/diagnostic.rs) with a
 | Range   | Category                                  |
 |---------|-------------------------------------------|
 | `W01xx` | Deprecations                              |
+| `W03xx` | Unused values and error-handling lints     |
 
 | Code    | Meaning                                   | Replacement (RFC)        |
 |---------|-------------------------------------------|--------------------------|
 | `W0101` | Deprecated `catch` expression (all forms) | `match` on `Ok`/`Error`, `?` under `T ! E` (RFC 0015) |
 | `W0102` | Deprecated `fail` expression              | `return Error(...)` under `T ! E` (RFC 0015) |
+| `W0301` | Discarded `Result` in a block statement | Handle, return, or explicitly bind the result |
 
 See `docs/MIGRATION_RFC_0015.md` for the `catch`/`fail` migration guide.
 
