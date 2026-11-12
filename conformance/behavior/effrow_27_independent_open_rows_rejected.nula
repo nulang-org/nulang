@@ -1,0 +1,3 @@
+fn invalid(f: (Int) -> Int ! {| input}) -> Int ! {| output} { f(1) }
+fn pure() -> Unit ! {} {}
+pure()
