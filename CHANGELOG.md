@@ -1,4 +1,13 @@
 # Nulang Changelog
+### Web resource views: mandatory tenant boundary — 2026-11-11
+- **Generated read-only table/detail helpers now require a nonempty server-provided tenant ID and exact record tenant equality before the application read-policy hook.** This prevents cross-tenant rendering when the application's read policy is accidentally too permissive. It does not authenticate the tenant ID or replace database RLS.
+- **Real HTTP regression tests reproduce and then prevent cross-tenant/blank-identity data leakage** while retaining own-tenant display when explicitly allowed and deny-by-default behavior.
+
+### Experimental read-only Web resource views — 2026-11-11
+- **Added `stdlib::web::admin` presentation helpers** for escaped read-only tables, accessible column headers, record details, and denied-view fallback. Malformed row and field lengths never render submitted data.
+- **Added opt-in `nula generate model ... --read-only-views`** using the existing validated model fields. Generated helpers filter each record through the existing deny-by-default read-policy hook; they do not register routes, load data, or create mutations. Production authorization and tenant-scoped database reads remain application responsibilities.
+- **Added real HTTP presentation regressions and generated-source parsing/typechecking tests.** This experimental addition is stacked on the draft model/resource generator and remains subject to exact-head security and release qualification.
+
 ### Five-node split-brain post-heal readiness regression — 2026-11-09
 - **The five-node TCP cluster chaos test now waits for healthy peer statuses as well as active-view convergence after a healed network partition.** The address resolver refuses one-shot sends when peers still have `Suspect` or `Failed` status; merely appearing in the active view is not sufficient to establish post-heal send readiness.
 - **Tighten diagnostics before cross-boundary delivery.** The test asserts A/E agree they are healthy, then preserves the original one-shot send and delivery assertion; no runtime transport/retry semantics are changed.
