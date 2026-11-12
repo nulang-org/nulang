@@ -107,6 +107,12 @@ source tree
        -> tests / tooling
 ```
 
+## Client placement effect isolation
+
+An explicit `@placement(client)` function must have a closed effect row containing only `Client` effects, or be pure. Nulang checks the function's inferred effects, including direct and transitive calls to module functions. A server-only effect such as `IO`, `FS`, `Net`, or `Request`, or an open row that cannot prove its authority, produces an effect error at the annotated declaration. Omitted placement annotations retain the existing conservative server-side fallback.
+
+This compiler check does not substitute for server-side authentication, CSRF protections, or tenant isolation, nor does it promise arbitrary JavaScript sandboxing.
+
 ## Runtime binding and dispatch
 
 Runtime registration remains method/path/module/function. Compiler metadata is attached as a sidecar so the low-level `Web.route` host effect does not need source-level type information.

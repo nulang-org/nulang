@@ -1155,9 +1155,63 @@ impl EffectChecker {
         for decl in &flat {
             self.check_decl(decl)?;
         }
+        self.check_client_placement_effects(&flat)?;
         check_durable_determinism(&flat)?;
         crate::migration_purity::check_module(decls)?;
         self.check_resource_grants()?;
+        Ok(())
+    }
+
+    /// Explicit browser placement is only safe for closed, browser-local
+    /// effect rows. Inferred function rows include transitive module calls.
+    fn check_client_placement_effects(&self, decls: &[&Decl]) -> NuResult<()> {
+        for decl in decls {
+            let Decl::Function {
+                name,
+                annotations,
+                span,
+                ..
+            } = decl
+            else {
+                continue;
+            };
+            if !annotations.iter().any(|annotation| {
+                matches!(annotation, FunctionAnnotation::Placement(Placement::Client))
+            }) {
+                continue;
+            }
+            let Some(row) = self.fn_rows.get(name) else {
+                return Err(NuError::EffectError {
+                    msg: format!("@placement(client) function '{name}' has no inferred effect row"),
+                    span: *span,
+                    missing_effects: None,
+                    allowed_effects: Some("closed Client effects or pure".into()),
+                });
+            };
+            if matches!(row, EffectRow::Closed(effects) if effects.iter().all(|effect| *effect == Effect::Client))
+            {
+                continue;
+            }
+            let mut disallowed: Vec<String> = row
+                .effects()
+                .iter()
+                .filter(|effect| **effect != Effect::Client)
+                .map(ToString::to_string)
+                .collect();
+            disallowed.sort();
+            disallowed.dedup();
+            let detail = if matches!(row, EffectRow::Open(_, _)) {
+                "open effect row cannot be proven browser-safe".to_string()
+            } else {
+                format!("disallowed effects: {}", disallowed.join(", "))
+            };
+            return Err(NuError::EffectError {
+                msg: format!("@placement(client) function '{name}': {detail}; only a closed row of Client effects (or purity) is allowed"),
+                span: *span,
+                missing_effects: if disallowed.is_empty() { None } else { Some(disallowed) },
+                allowed_effects: Some("closed Client effects or pure".into()),
+            });
+        }
         Ok(())
     }
 
@@ -4998,5 +5052,58 @@ mod tests {
         let mut checker = EffectChecker::new();
         assert!(checker.check_module(&ast.decls).is_ok());
         assert!(checker.diagnostics.is_empty());
+    }
+    #[test]
+    fn client_placement_rejects_direct_server_effects() {
+        let ast =
+            parse_module("@placement(client)\nfn browser() { perform IO.print(\"private\") }");
+        let mut checker = EffectChecker::new();
+        let error = checker.check_module(&ast.decls).unwrap_err().to_string();
+        assert!(
+            error.contains("@placement(client)") && error.contains("IO"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn client_placement_rejects_transitive_server_effects() {
+        let ast = parse_module(
+            "fn backend() { perform IO.print(\"secret\") }\n\
+             fn middle() { backend() }\n\
+             @placement(client)\nfn browser() { middle() }",
+        );
+        let mut checker = EffectChecker::new();
+        let error = checker.check_module(&ast.decls).unwrap_err().to_string();
+        assert!(error.contains("browser") && error.contains("IO"), "{error}");
+    }
+
+    #[test]
+    fn client_placement_accepts_pure_functions_and_server_remains_unchanged() {
+        let ast = parse_module(
+            "fn helper() { 42 }\n\
+             @placement(client)\nfn browser() { helper() }\n\
+             @placement(server)\nfn backend() { perform IO.print(\"ok\") }",
+        );
+        let mut checker = EffectChecker::new();
+        checker.check_module(&ast.decls).unwrap();
+    }
+
+    #[test]
+    fn client_placement_rejects_open_effect_rows() {
+        let mut ast = parse_module("@placement(client)\nfn browser() { 42 }");
+        let decl = ast
+            .decls
+            .iter_mut()
+            .find(|decl| matches!(decl, Decl::Function { name, .. } if name == "browser"))
+            .unwrap();
+        if let Decl::Function { effect, .. } = decl {
+            *effect = Some(EffectRow::Open(Vec::new(), Region::fresh()));
+        }
+        let mut checker = EffectChecker::new();
+        let error = checker.check_module(&ast.decls).unwrap_err().to_string();
+        assert!(
+            error.contains("@placement(client)") && error.contains("open"),
+            "{error}"
+        );
     }
 }
