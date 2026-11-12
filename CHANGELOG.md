@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Five-node post-heal healthy-peer readiness — 2026-11-12
+- **Require every peer to be Healthy, not merely present in the active membership view, before the split-brain recovery test sends its one-shot cross-boundary actor message.** The address resolver rejects non-healthy routes.
+- **Retain the original delivery assertion and add explicit A/E health diagnostics.** Test-only change from #2543; high-contention CI must verify it does not mask actual transport defects.
+
 ### WASM non-exhaustive match fail-closed parity — 2026-11-12
 - **Reject the synthetic unhandled match effect in the restricted WASM backend** instead of silently returning nil; native AOT already preserves the interpreter's EffectError category in the P0 integration branch.
 - **Pin a regression checking an explicit compiler rejection** until WASM supports typed error propagation. Exact-head host validation is required.
