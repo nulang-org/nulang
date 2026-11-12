@@ -7037,10 +7037,8 @@ mod tests {
 
     #[test]
     fn test_named_effect_row_reuses_tail_within_one_function_signature() {
-        let ast = parse(
-            "fn forward(f: (Int) -> Int ! {| row}) -> Int ! {| row} { f(1) }",
-        )
-        .expect("valid named effect-row signature");
+        let ast = parse("fn forward(f: (Int) -> Int ! {| row}) -> Int ! {| row} { f(1) }")
+            .expect("valid named effect-row signature");
         let Decl::Function {
             params,
             effect: Some(outer_row),
@@ -7082,7 +7080,10 @@ mod tests {
         let other = get_callback(&ast.decls[0], 1);
         let second = get_callback(&ast.decls[1], 0);
         assert_ne!(first, other, "different names are independent");
-        assert_ne!(first, second, "same spelling in another function is independent");
+        assert_ne!(
+            first, second,
+            "same spelling in another function is independent"
+        );
     }
 
     #[test]
