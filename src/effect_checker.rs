@@ -597,12 +597,39 @@ impl EffectChecker {
 
             // Let: effects of value + effects of body. The binding shadows a
             // same-named module function inside the body.
-            Expr::Let {
-                name, value, body, ..
-            } => {
-                let val_row = self.infer_effects(ctx, value)?;
-                let body_row = self.infer_with_bound(ctx, std::slice::from_ref(name), body)?;
-                Ok(effect_row_union(&val_row, &body_row))
+            Expr::Let { .. } => {
+                // A sequence of ordinary let-bindings is right-nested in the
+                // AST. Walk that spine iteratively: recursive inference used
+                // one Rust stack frame per binding and overflowed on valid
+                // wide-let conformance programs with an 8 MiB stack.
+                //
+                // Each initializer sees preceding bindings, but not its own
+                // name. Preserve shadowing through the tail expression and
+                // combine effect rows in the original right-associated order.
+                let shadow_base = self.shadowed.len();
+                let mut value_rows = Vec::new();
+                let mut cursor = expr;
+                while let Expr::Let {
+                    name, value, body, ..
+                } = cursor
+                {
+                    match self.infer_effects(ctx, value) {
+                        Ok(row) => value_rows.push(row),
+                        Err(error) => {
+                            self.shadowed.truncate(shadow_base);
+                            return Err(error);
+                        }
+                    }
+                    self.shadowed.push(name.clone());
+                    cursor = body;
+                }
+                let tail = self.infer_effects(ctx, cursor);
+                self.shadowed.truncate(shadow_base);
+                let mut result = tail?;
+                for value_row in value_rows.into_iter().rev() {
+                    result = effect_row_union(&value_row, &result);
+                }
+                Ok(result)
             }
 
             // Let-rec: similar to let, but the binding is recursive (in scope
@@ -1934,59 +1961,69 @@ impl CapabilityAnalyzer {
                 Ok(cap)
             }
 
-            // Let: capability of the body. A `LinearIso`/`Linear` binding
-            // must be consumed exactly once: `consume_linear` (via any Var
-            // reference) already rejects a *second* use; here we reject
-            // *zero* uses once the body's scope closes, completing the
-            // exactly-once discipline (see `spec/formal/capabilities.lean`'s
-            // `linear_at_most_once` theorem and its doc comment).
-            Expr::Let {
-                name,
-                value,
-                body,
-                span,
-                ..
-            } => {
-                let val_cap = self.infer_cap_tracked(ctx, value, consumed)?;
-                let body_ctx = ctx.with_binding(name.clone(), val_cap);
-                // Shadowing: the new binding hides any outer binding of the
-                // same name. Hide the outer consumption state while analyzing
-                // the body, then restore it; the inner binding's own
-                // consumption is scope-local and never leaks out.
-                let outer_consumed = consumed.remove(name);
-                let result = self.infer_cap_tracked(&body_ctx, body, consumed);
-                // A bare rebind (`let a = x` or `let a = consume x`) is
-                // transparent: evaluating `value` already discharged the
-                // source binding's own obligation (via `consume_linear` in
-                // the Var/Consume cases below), so `a` doesn't carry a
-                // *second*, independent must-use obligation for the same
-                // underlying value — only a genuinely fresh linear value
-                // (a literal/call annotated `:cap lineariso`, a function
-                // return, etc.) does.
-                let is_transparent_rebind = match value.as_ref() {
-                    Expr::Var(..) => true,
-                    Expr::Consume { expr: inner, .. } => matches!(inner.as_ref(), Expr::Var(..)),
-                    _ => false,
+            // Right-nested let bindings are common for a sequence of local
+            // declarations. Analyze the spine iteratively so valid wide-let
+            // programs do not exhaust the process stack. Retain a scope frame
+            // for each binding to enforce linear must-use and restore shadowed
+            // consumption in exactly the reverse order of recursive unwinding.
+            Expr::Let { .. } => {
+                let mut scope = ctx.clone();
+                let mut cursor = expr;
+                let mut frames: Vec<(String, Capability, bool, bool, Span)> = Vec::new();
+                let mut result = loop {
+                    let Expr::Let {
+                        name,
+                        value,
+                        body,
+                        span,
+                        ..
+                    } = cursor
+                    else {
+                        break self.infer_cap_tracked(&scope, cursor, consumed);
+                    };
+
+                    let value_cap = match self.infer_cap_tracked(&scope, value, consumed) {
+                        Ok(cap) => cap,
+                        Err(error) => break Err(error),
+                    };
+                    let outer_consumed = consumed.remove(name);
+                    let transparent_rebind = match value.as_ref() {
+                        Expr::Var(..) => true,
+                        Expr::Consume { expr: inner, .. } => {
+                            matches!(inner.as_ref(), Expr::Var(..))
+                        }
+                        _ => false,
+                    };
+                    frames.push((
+                        name.clone(),
+                        value_cap,
+                        outer_consumed,
+                        transparent_rebind,
+                        *span,
+                    ));
+                    scope = scope.with_binding(name.clone(), value_cap);
+                    cursor = body;
                 };
-                if result.is_ok()
-                    && val_cap.is_linear()
-                    && !is_transparent_rebind
-                    && !consumed.contains(name)
+
+                for (name, value_cap, outer_consumed, transparent_rebind, span) in
+                    frames.into_iter().rev()
                 {
-                    let msg = format!(
-                        "linear value `{}` is never used ({} bindings must be consumed exactly once — pass it to a function, `send` it, or `consume {}` it explicitly)",
-                        name, val_cap, name
-                    );
-                    self.diagnostics.push(msg.clone());
-                    consumed.remove(name);
-                    if outer_consumed {
-                        consumed.insert(name.clone());
+                    if result.is_ok()
+                        && value_cap.is_linear()
+                        && !transparent_rebind
+                        && !consumed.contains(&name)
+                    {
+                        let msg = format!(
+                            "linear value `{}` is never used ({} bindings must be consumed exactly once — pass it to a function, `send` it, or `consume {}` it explicitly)",
+                            name, value_cap, name
+                        );
+                        self.diagnostics.push(msg.clone());
+                        result = Err(NuError::cap_error(msg, span));
                     }
-                    return Err(NuError::cap_error(msg, *span));
-                }
-                consumed.remove(name);
-                if outer_consumed {
-                    consumed.insert(name.clone());
+                    consumed.remove(&name);
+                    if outer_consumed {
+                        consumed.insert(name);
+                    }
                 }
                 result
             }

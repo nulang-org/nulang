@@ -1174,15 +1174,23 @@ impl TypeChecker {
         // before ordinary Algorithm-W inference. Dynamic actor references
         // remain permissive for compatibility; explicit ActorRef<P> values
         // are checked structurally below.
-        let annotated = match crate::actor_protocol::annotate_module(module) {
-            Ok(module) => module,
-            Err(err) if self.collect_errors => {
-                self.collected_errors.push(err);
-                module.clone()
+        // Actor protocol annotation clones and recursively visits the AST.
+        // Avoid that work entirely when the module declares no actor
+        // protocols: deep ordinary let chains must not exhaust the compiler
+        // stack before Algorithm-W inference even starts.
+        let annotated = if crate::actor_protocol::has_actor_protocols(module) {
+            match crate::actor_protocol::annotate_module(module) {
+                Ok(annotated) => Some(annotated),
+                Err(err) if self.collect_errors => {
+                    self.collected_errors.push(err);
+                    None
+                }
+                Err(err) => return Err(err),
             }
-            Err(err) => return Err(err),
+        } else {
+            None
         };
-        let module = &annotated;
+        let module = annotated.as_ref().unwrap_or(module);
 
         self.register_class_decls(module);
         let mut ctx = TypeContext::new();
@@ -2463,7 +2471,9 @@ impl TypeChecker {
         Ok((final_subst.clone(), apply_subst(&result_ty, &final_subst)))
     }
 
-    /// Infer the type of a let binding.
+    /// Infer a right-nested sequence of ordinary let bindings without using
+    /// one native stack frame per binding. This retains Algorithm W's ordered
+    /// substitutions and lexical binding contexts.
     fn infer_let(
         &mut self,
         ctx: &TypeContext,
@@ -2474,9 +2484,44 @@ impl TypeChecker {
         mutable: bool,
         _span: Span,
     ) -> NuResult<(Substitution, Type)> {
-        // For let-bound lambdas that reference themselves (e.g.
-        // `let fac = fn(n) ... fac(n-1) ... in ...`), make the binding name
-        // available inside the lambda body with a fresh type variable.
+        let (initial_subst, mut scope) = self.infer_let_binding(ctx, name, ann, value, mutable)?;
+        let mut substitutions = vec![initial_subst];
+        let mut cursor = body;
+
+        while let Expr::Let {
+            name,
+            ty,
+            value,
+            body,
+            mutable,
+            ..
+        } = cursor
+        {
+            let (subst, next_scope) =
+                self.infer_let_binding(&scope, name, ty.as_ref(), value, *mutable)?;
+            substitutions.push(subst);
+            scope = next_scope;
+            cursor = body;
+        }
+
+        let (mut subst, body_ty) = self.infer_expr(&scope, cursor)?;
+        for preceding in substitutions.into_iter().rev() {
+            subst = compose_subst(&subst, &preceding);
+        }
+        Ok((subst.clone(), apply_subst(&body_ty, &subst)))
+    }
+
+    /// Infer one binding's initializer, including recursive lambda bindings
+    /// and explicit annotations. The returned context is visible only to the
+    /// following let-body, never to the initializer being inferred.
+    fn infer_let_binding(
+        &mut self,
+        ctx: &TypeContext,
+        name: &str,
+        ann: Option<&Type>,
+        value: &Expr,
+        mutable: bool,
+    ) -> NuResult<(Substitution, TypeContext)> {
         if matches!(value, Expr::Lambda { .. }) {
             let rec_var = Type::Var(TypeVar::fresh());
             let ctx_with_rec =
@@ -2487,42 +2532,27 @@ impl TypeChecker {
                 &apply_subst(&val_ty, &s1),
                 Span::default(),
             )?;
-            let mut s_combined = compose_subst(&s2, &s1);
-            // An explicit annotation must unify with the inferred value type.
+            let mut combined = compose_subst(&s2, &s1);
             if let Some(ann_ty) = ann {
                 let s_ann =
-                    mgu_assignable(&apply_subst(&val_ty, &s_combined), ann_ty, Span::default())?;
-                s_combined = compose_subst(&s_ann, &s_combined);
+                    mgu_assignable(&apply_subst(&val_ty, &combined), ann_ty, Span::default())?;
+                combined = compose_subst(&s_ann, &combined);
             }
-            let gen_ty = self.do_generalize(ctx, &apply_subst(&val_ty, &s_combined));
+            let gen_ty = self.do_generalize(ctx, &apply_subst(&val_ty, &combined));
             let new_ctx = ctx.extend(name.to_string(), gen_ty, Capability::Ref, mutable);
-            let (s3, body_ty) = self.infer_expr(&new_ctx, body)?;
-            let final_subst = compose_subst(&s3, &s_combined);
-            return Ok((final_subst.clone(), apply_subst(&body_ty, &final_subst)));
+            return Ok((combined, new_ctx));
         }
 
-        // Infer the binding value
         let (s1, val_ty) = self.infer_expr(ctx, value)?;
-
-        // An explicit annotation must unify with the inferred value type.
         let s1 = if let Some(ann_ty) = ann {
             let s_ann = mgu_assignable(&apply_subst(&val_ty, &s1), ann_ty, Span::default())?;
             compose_subst(&s_ann, &s1)
         } else {
             s1
         };
-
-        // Generalize the value type
         let gen_ty = self.do_generalize(ctx, &apply_subst(&val_ty, &s1));
-
-        // Extend context with generalized type
         let new_ctx = ctx.extend(name.to_string(), gen_ty, Capability::Ref, mutable);
-
-        // Infer body with extended context
-        let (s2, body_ty) = self.infer_expr(&new_ctx, body)?;
-
-        let final_subst = compose_subst(&s2, &s1);
-        Ok((final_subst.clone(), apply_subst(&body_ty, &final_subst)))
+        Ok((s1, new_ctx))
     }
 
     /// Infer the type of a recursive let binding.
