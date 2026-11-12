@@ -1,5 +1,11 @@
 # Nulang Changelog
 
+### Experimental Query IR compiler-type bridge and prepared SQL lowering — 2026-11-12
+- **Schema-only SQL sources and typed query results:** query catalog may register column metadata without in-memory rows; query result schemas map into existing closed Nulang record-array compiler types, without changing the parser or type-checker.
+- **Parameterized SQL for SQLite and PostgreSQL:** generated SELECT/WHERE/ORDER BY/LIMIT statements bind all values separately and quote source identifiers. Unsafe phase ordering, unknown fields, incompatible expression types, unsupported text collation, and LIMIT without sorting fail closed.
+- **This is a Rust host-side preparation API, not a database driver, source-level `.nula` query syntax, or proof of production SQL compatibility.** The dedicated integration tests require exact-head Cargo/CI qualification before promotion.
+
+
 ### Experimental host-side relational Query IR — 2026-11-11
 - **Added a pure, typed relational IR and reference interpreter** with Scan, Filter, Project, Sort and Limit operations, strict table schema validation, and deterministic logical-plan explanations. This is an Experimental Rust embedder API, not `.nula` syntax or a SQL engine.
 - **Added a conservative filter-below-sort rewrite** gated by whole-plan typechecking. Optimizations cannot cross Limit or Project; no arbitrary callbacks or effects are permitted in expressions. Black-box tests cover rewrite equivalence, invalid types, missing fields, Limit boundaries, and explain output.

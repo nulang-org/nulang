@@ -110,6 +110,8 @@ fn validate_columns(columns: &[Column]) -> Result<(), QueryError> {
 #[derive(Default, Clone, Debug)]
 pub struct Catalog {
     tables: BTreeMap<String, Table>,
+    /// Metadata-only sources for SQL planning; never executable as local rows.
+    schemas: BTreeMap<String, Vec<Column>>,
 }
 
 impl Catalog {
@@ -119,7 +121,7 @@ impl Catalog {
 
     pub fn insert(&mut self, name: impl Into<String>, table: Table) -> Result<(), QueryError> {
         let name = name.into();
-        if name.is_empty() || self.tables.contains_key(&name) {
+        if name.is_empty() || self.tables.contains_key(&name) || self.schemas.contains_key(&name) {
             return Err(QueryError(format!(
                 "empty or duplicate table name '{name}'"
             )));
@@ -128,10 +130,42 @@ impl Catalog {
         Ok(())
     }
 
-    fn table(&self, name: &str) -> Result<&Table, QueryError> {
-        self.tables
+    /// Register a storage-backed source without materializing any rows.
+    /// Authorization and live catalog verification are the adapter's responsibility.
+    pub fn register_schema(
+        &mut self,
+        name: impl Into<String>,
+        columns: Vec<Column>,
+    ) -> Result<(), QueryError> {
+        let name = name.into();
+        validate_columns(&columns)?;
+        if name.is_empty() || self.tables.contains_key(&name) || self.schemas.contains_key(&name) {
+            return Err(QueryError(format!(
+                "empty or duplicate table name '{name}'"
+            )));
+        }
+        self.schemas.insert(name, columns);
+        Ok(())
+    }
+
+    fn schema(&self, name: &str) -> Result<&[Column], QueryError> {
+        if let Some(table) = self.tables.get(name) {
+            return Ok(&table.columns);
+        }
+        self.schemas
             .get(name)
+            .map(Vec::as_slice)
             .ok_or_else(|| QueryError(format!("unknown table '{name}'")))
+    }
+
+    fn table(&self, name: &str) -> Result<&Table, QueryError> {
+        if let Some(table) = self.tables.get(name) {
+            return Ok(table);
+        }
+        if self.schemas.contains_key(name) {
+            return Err(QueryError(format!("source '{name}' has no in-memory rows")));
+        }
+        Err(QueryError(format!("unknown table '{name}'")))
     }
 }
 
@@ -306,7 +340,7 @@ impl Plan {
 /// Typecheck the entire logical plan before interpreting or optimizing it.
 pub fn infer_schema(plan: &Plan, catalog: &Catalog) -> Result<Vec<Column>, QueryError> {
     match plan {
-        Plan::Scan { table } => Ok(catalog.table(table)?.columns.clone()),
+        Plan::Scan { table } => Ok(catalog.schema(table)?.to_vec()),
         Plan::Filter { input, predicate } => {
             let schema = infer_schema(input, catalog)?;
             if predicate.ty(&schema)? != DataType::Bool {

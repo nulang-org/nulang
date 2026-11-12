@@ -87,6 +87,8 @@ pub mod protocol_wire;
 #[cfg(feature = "python")]
 pub mod python;
 pub mod query;
+pub mod query_sql;
+pub mod query_types;
 pub mod registry;
 pub mod repl;
 pub mod resolver;
