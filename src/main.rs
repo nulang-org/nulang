@@ -1141,6 +1141,7 @@ fn print_help() {
     println!("  -r, --repl       Start interactive REPL");
     println!("  -e, --eval       Evaluate a code string");
     println!("  -c, --check      Type-check a file (don't run)");
+    println!("  prove <file>     Opt-in function postcondition analysis (--json, --strict)");
     println!("  --doc            Generate Markdown API docs (docs/api.md)");
     println!("  --emit-stdlib-docs <dir>  Generate per-effect stdlib Markdown docs into <dir>");
     println!("  --lsp            Start Language Server (stdio)");
@@ -3020,7 +3021,12 @@ fn run_prove_cmd(args: &[String]) -> i32 {
         );
     } else {
         for result in &results {
-            println!("{:?} {}: {}", result.status, result.function, result.detail);
+            let status = match result.status {
+                ProofStatus::Proved => "proved",
+                ProofStatus::Unknown => "unknown",
+                ProofStatus::Counterexample => "counterexample",
+            };
+            println!("{status} {}: {}", result.function, result.detail);
             if let Some(witness) = &result.witness {
                 println!("  witness: {witness:?}");
             }
