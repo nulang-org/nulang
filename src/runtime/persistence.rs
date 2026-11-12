@@ -4442,3 +4442,23 @@ mod libsql_atomic_transition_tests {
         assert_eq!(store.latest_sequence(42), 1);
     }
 }
+
+// The audited local SQLite backend deliberately has no remote client.
+// A future remote adapter must be separately reviewed before enabling it.
+#[cfg(all(test, feature = "sqlite"))]
+#[test]
+fn audited_sqlite_remote_admission_is_fail_closed_without_leaking_credentials() {
+    for endpoint in [
+        "http://127.0.0.1",
+        "https://example.test",
+        "libsql://example.test",
+    ] {
+        let secret = "never-emit-this-token";
+        let error = match LibsqlStore::new_remote(endpoint, secret) {
+            Ok(_) => panic!("audited local SQLite adapter must not open remote connections"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(!error.to_string().contains(secret));
+    }
+}
