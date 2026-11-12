@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Compiler let-chain stack boundedness — 2026-11-11
+- **Type, effect, and capability analyses now walk right-nested ordinary `let` sequences iteratively.** They preserve ordered substitutions, effect shadowing, and linear consumption restoration while avoiding process-stack exhaustion for conformance spill fixtures.
+- **HIR lowering now walks left-associative binary expression spines iteratively** while retaining left-to-right evaluation; actor-protocol annotation skips unnecessary full-module cloning when no actor protocols exist.
+- **Linux regression tests pin valid wide/nested-let fixtures at an 8 MiB stack limit** for both `--check` and execution, with exact output checks (9870 / 7750). Additional validation for deeper AST shapes remains necessary.
+- **Actor-free type checking now avoids redundant actor-protocol AST cloning**, preventing a further frontend stack overflow on the checked-in 600-binding conformance fixture. A third Linux regression verifies both `--check` and the exact executable result (600) under 8 MiB. The historical expected-crash sidecar is updated to assert the corrected behavior; this is not a general guarantee for arbitrarily deep ASTs.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
