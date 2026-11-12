@@ -23,8 +23,10 @@ and `can_write_billboard_face` hooks plus two read-only helpers:
 
 The helpers use the **same validated field declarations** as the model, convert
 primitive values (`String`, `Bool`, `Int`, `Float`) to escaped HTML via
-`stdlib::web::admin`, and evaluate the model's read policy before rendering
-each record. When all policies still deny, the table has no rows and the
+`stdlib::web::admin`, and enforce a nonempty actor tenant ID, exact
+`record.tenant_id == actor_tenant_id`, **and** the model's read policy before
+rendering each record. The mandatory tenant guard still applies if an
+application mistakenly implements `can_read_*` to always return `true`. When all policies still deny, the table has no rows and the
 detail helper renders `Access denied`. Nothing is automatically registered as
 an HTTP route. There are no generated database queries or writes.
 
@@ -34,11 +36,17 @@ overwritten. The generated Nulang source remains application-owned.
 
 **Security:** The `actor_tenant_id` argument must be derived from a verified
 server-side identity and organization membership, never a path, form, or query
-parameter. A custom `can_read_*` implementation must check permissions and
-record-level tenant scope; matching strings are not a sufficient policy.
+parameter. A custom `can_read_*` implementation must check resource permissions and
+membership of the authenticated actor; matching tenant strings are not a
+sufficient policy. The mandatory view-level tenant check is defense-in-depth,
+not proof of identity. A caller supplying an attacker-controlled
+`actor_tenant_id` can still bypass this check, so the ID must originate from
+server-side verified session context.
 Database queries must also be tenant-scoped, and rows must not be fetched or
 sent to untrusted clients before authorization. Rendering is not a substitute
-for a server-side access-control boundary.
+for a server-side access-control boundary. A denied detail is a rendered HTML fragment,
+not automatically an HTTP 401/403 response; applications must reject unauthorized
+HTTP requests at their actual ingress/handler boundary before data is fetched.
 
 ## Reusable HTML helpers
 
@@ -70,8 +78,11 @@ The read-only view helpers have real HTTP tests for escaping and invalid
 shapes, and model-generated helpers have parser, import-resolution, and
 TypeChecker tests. The separate audited security/Hotwire stack remains draft.
 Do not treat this module as production CRUD or proof of end-to-end tenant
-isolation. Additional exact-head CI, negative tenant-integration tests and
-full release security review are mandatory before use with sensitive data.
+isolation. Real-HTTP negative tests now cover cross-tenant records and blank
+identity values even when the app's custom policy is permissive; these are
+not authentication tests, and do not exercise a database's RLS policy.
+Exact-head CI, authenticated-session integration, tenant-RLS negative tests,
+and full release security review are mandatory before sensitive production use.
 
 ### Current integration limitation
 
@@ -80,3 +91,11 @@ nonzero with `RUSTSEC-2026-0459` in the inherited `libsqlite3-sys 0.30.1`
 lockfile dependency. Do not waive the advisory or merge this branch independently
 of the patched SQLite/security integration. The generator and rendering tests
 are local evidence, not production authorization or a release qualification.
+
+### Audited stack integration
+
+When stacked on the patched SQLite/Hotwire runtime in draft #2589, the
+local offline RustSec audit passes with three allowed advisory warnings.
+The original #2538/#2592 generator-only base still has
+`RUSTSEC-2026-0459` in its inherited libsqlite3-sys dependency graph. Do not
+merge that older base without the audited stack or an equivalent fix.
