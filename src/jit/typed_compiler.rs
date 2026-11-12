@@ -1245,6 +1245,8 @@ fn emit_typed_idivmod(
     op2: usize,
     dst: usize,
     op: TypedIntDivOp,
+    overflow_helper: Option<FuncRef>,
+    error_return_block: Block,
 ) {
     let a = cache.load(builder, regs_ptr, op1);
     let b = cache.load(builder, regs_ptr, op2);
@@ -1265,6 +1267,42 @@ fn emit_typed_idivmod(
     let observable = builder.ins().select(is_zero, nil, tagged);
     store_reg(builder, regs_ptr, dst, observable);
     cache.invalidate(dst);
+
+    // Ordinary typed integer divisions remain direct CLIF sdiv operations.
+    // Only the exceptional INT48_MIN / -1 case invokes the existing helper
+    // to register the exact same overflow error as the interpreter/AOT.
+    // INT48_MIN / -1 is safe in i64 (the CLIF unboxed type); the overflow
+    // is specific to Nulang's 48-bit tagged integer representation.
+    if let (TypedIntDivOp::Div, Some(helper)) = (op, overflow_helper) {
+        let min = builder
+            .ins()
+            .iconst(types::I64, crate::value_layout::INT48_MIN);
+        let neg_one = builder.ins().iconst(types::I64, -1);
+        let is_min = builder.ins().icmp(IntCC::Equal, a, min);
+        let is_neg_one = builder.ins().icmp(IntCC::Equal, b, neg_one);
+        let is_overflow = builder.ins().band(is_min, is_neg_one);
+
+        let overflow_block = builder.create_block();
+        let continue_block = builder.create_block();
+        builder
+            .ins()
+            .brif(is_overflow, overflow_block, &[], continue_block, &[]);
+
+        builder.switch_to_block(overflow_block);
+        let boxed_a = emit_tag_int(builder, a);
+        let boxed_b = emit_tag_int(builder, b);
+        let call = builder.ins().call(helper, &[boxed_a, boxed_b]);
+        let error_value = builder.inst_results(call)[0];
+        store_reg(builder, regs_ptr, dst, error_value);
+        // Abort the compiled region immediately on this error. Otherwise
+        // later instructions or effects in the same region could execute
+        // after an interpreter-visible exception.
+        builder.ins().jump(error_return_block, &[]);
+        builder.seal_block(overflow_block);
+
+        builder.switch_to_block(continue_block);
+        builder.seal_block(continue_block);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2025,6 +2063,8 @@ pub fn compile_bytecode_region_typed(
                         instr.op2 as usize,
                         dst,
                         TypedIntDivOp::Div,
+                        Some(helpers["nulang_idiv"]),
+                        return_block,
                     );
                 } else {
                     emit_binop_runtime(
@@ -2055,6 +2095,8 @@ pub fn compile_bytecode_region_typed(
                         instr.op2 as usize,
                         dst,
                         TypedIntDivOp::Mod,
+                        None,
+                        return_block,
                     );
                 } else {
                     emit_binop_runtime(
@@ -3183,6 +3225,64 @@ mod typed_tests {
         func(regs.as_mut_ptr(), consts.as_ptr());
         assert_eq!(unsafe { Value::from_bits(regs[2]) }.as_int(), Some(-3));
         assert_eq!(unsafe { Value::from_bits(regs[3]) }.as_int(), Some(-1));
+    }
+
+    #[test]
+    fn test_idiv_int48_boundary_overflow_typed_cranelift() {
+        use crate::value_layout::{INT48_MAX, INT48_MIN};
+        use crate::vm::Value;
+
+        let mut jit = make_jit();
+        let instructions = vec![
+            Instruction::new3(OpCode::IDiv, 0, 1, 2),
+            Instruction::new1(OpCode::Const1, 9),
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        meta.set_type(0, KnownType::Int);
+        meta.set_type(1, KnownType::Int);
+        let ptr = compile_bytecode_region_typed(
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
+            "test_idiv_int48_boundary_overflow_typed",
+            0,
+            instructions.len(),
+            &instructions,
+            Some(&meta),
+        )
+        .expect("typed int division must compile");
+
+        let func: extern "C" fn(*mut u64, *const u64) = unsafe { std::mem::transmute(ptr) };
+        let consts: [u64; 0] = [];
+        let mut regs = [0u64; 256];
+        let _ = crate::jit::runtime::aot_take_pending_error();
+        regs[0] = Value::int(INT48_MIN).as_raw();
+        regs[1] = Value::int(-1).as_raw();
+        regs[9] = Value::int(77).as_raw();
+        func(regs.as_mut_ptr(), consts.as_ptr());
+        assert_eq!(regs[2], Value::nil().as_raw());
+        assert_eq!(
+            regs[9],
+            Value::int(77).as_raw(),
+            "compiled instructions after an overflow must not run"
+        );
+        let err = crate::jit::runtime::aot_take_pending_error()
+            .expect("compiled division overflow must record runtime error");
+        assert!(
+            err.contains("integer overflow") && err.contains("div"),
+            "{err}"
+        );
+
+        regs[0] = Value::int(INT48_MAX).as_raw();
+        func(regs.as_mut_ptr(), consts.as_ptr());
+        assert_eq!(regs[2], Value::int(-INT48_MAX).as_raw());
+        assert_eq!(
+            regs[9],
+            Value::int(1).as_raw(),
+            "valid division still executes the remainder of the region"
+        );
+        assert!(crate::jit::runtime::aot_take_pending_error().is_none());
     }
 
     #[test]
