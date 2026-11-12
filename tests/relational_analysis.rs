@@ -364,3 +364,102 @@ fn transitive_closure_matches_reference_for_every_three_node_graph() {
         }
     }
 }
+
+#[test]
+fn proof_dag_deduplicates_shared_premises_and_limits_expansion() {
+    use nulang::relational_analysis::{ProofEvidence, ProofLimits};
+
+    let program = LogicProgram::new(
+        vec![
+            relation("leaf", vec![ColumnType::Symbol]),
+            relation("derived", vec![ColumnType::Symbol]),
+            relation("root", vec![ColumnType::Symbol]),
+        ],
+        vec![
+            Rule::new(
+                "derive",
+                atom("derived", vec![var("n")]),
+                vec![atom("leaf", vec![var("n")])],
+            ),
+            Rule::new(
+                "join_twice",
+                atom("root", vec![var("n")]),
+                vec![
+                    atom("derived", vec![var("n")]),
+                    atom("derived", vec![var("n")]),
+                ],
+            ),
+        ],
+    )
+    .unwrap();
+    let target = Fact::new("root", vec![symbol("A")]);
+    let result = program
+        .evaluate([Fact::new("leaf", vec![symbol("A")])], Limits::default())
+        .unwrap();
+    let dag = result
+        .explain_dag(&target, ProofLimits::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(dag.nodes.len(), 3, "shared premises must not be copied");
+    assert_eq!(dag.nodes[dag.root].fact, target);
+    assert!(matches!(
+        &dag.nodes[dag.root].evidence,
+        ProofEvidence::Derived { premises, .. }
+        if premises.len() == 2 && premises[0] == premises[1] && premises[0] < dag.root
+    ));
+    assert_eq!(
+        result.explain_dag(
+            &target,
+            ProofLimits {
+                max_nodes: 2,
+                max_depth: 12
+            },
+        ),
+        Err(LogicError::LimitExceeded("max_proof_nodes"))
+    );
+    assert_eq!(
+        result.explain_dag(
+            &target,
+            ProofLimits {
+                max_nodes: 12,
+                max_depth: 1
+            },
+        ),
+        Err(LogicError::LimitExceeded("max_proof_depth"))
+    );
+    assert_eq!(
+        result.explain_dag(
+            &Fact::new("root", vec![symbol("absent")]),
+            ProofLimits::default()
+        ),
+        Ok(None)
+    );
+}
+
+#[test]
+fn indexed_join_avoids_quadratic_candidate_scanning() {
+    let program = LogicProgram::new(
+        vec![
+            relation("edge", vec![ColumnType::Int, ColumnType::Int]),
+            relation("two_step", vec![ColumnType::Int, ColumnType::Int]),
+        ],
+        vec![Rule::new(
+            "join",
+            atom("two_step", vec![var("a"), var("c")]),
+            vec![
+                atom("edge", vec![var("a"), var("b")]),
+                atom("edge", vec![var("b"), var("c")]),
+            ],
+        )],
+    )
+    .unwrap();
+    let input = (0..400).map(|i| Fact::new("edge", vec![Value::Int(i), Value::Int(i + 1)]));
+    let result = program.evaluate(input, Limits::default()).unwrap();
+    assert_eq!(result.facts_for("two_step").len(), 399);
+    let statistics = result.statistics();
+    assert!(statistics.index_lookups > 0, "{statistics:?}");
+    assert!(
+        statistics.candidate_rows < 4_000,
+        "indexed join should avoid scanning all 400 edges per join: {statistics:?}"
+    );
+}

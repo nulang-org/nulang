@@ -10,7 +10,7 @@
 //! capability analysis. This module is not wired into the language parser,
 //! typechecker, runtime, or authorization decisions.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
 
@@ -21,7 +21,7 @@ pub enum ColumnType {
     Bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Value {
     Symbol(String),
     Int(i64),
@@ -173,14 +173,118 @@ pub enum Evidence {
     },
 }
 
+/// Bound expansion of one explanation, independently of evaluation budgets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProofLimits {
+    pub max_nodes: usize,
+    pub max_depth: usize,
+}
+
+impl Default for ProofLimits {
+    fn default() -> Self {
+        Self {
+            max_nodes: 2_048,
+            max_depth: 256,
+        }
+    }
+}
+
+/// A topologically ordered proof DAG: premise node IDs always precede users.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProofDag {
+    pub nodes: Vec<ProofNode>,
+    pub root: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProofNode {
+    pub fact: Fact,
+    pub evidence: ProofEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProofEvidence {
+    Input,
+    Derived { rule: String, premises: Vec<usize> },
+}
+
+/// Statistics for comparing join strategies without timing noise.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EvaluationStats {
+    pub candidate_rows: usize,
+    pub index_lookups: usize,
+    pub rounds: usize,
+}
+
 /// Completed result: never contains partial output from a budget failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryResult {
     relations: BTreeMap<String, BTreeSet<Vec<Value>>>,
     justifications: BTreeMap<Fact, Justification>,
+    stats: EvaluationStats,
 }
 
 impl QueryResult {
+    pub fn statistics(&self) -> EvaluationStats {
+        self.stats
+    }
+
+    /// Return one deterministic, shared proof graph without recursive tree
+    /// expansion. Limits guard total unique nodes and traversal depth.
+    pub fn explain_dag(
+        &self,
+        fact: &Fact,
+        limits: ProofLimits,
+    ) -> Result<Option<ProofDag>, LogicError> {
+        if !self.justifications.contains_key(fact) {
+            return Ok(None);
+        }
+        let mut nodes = Vec::new();
+        let mut ids: BTreeMap<Fact, usize> = BTreeMap::new();
+        // Explicit postorder DFS: dependencies are always emitted first.
+        let mut stack = vec![(fact.clone(), false, 0usize)];
+        while let Some((current, exiting, depth)) = stack.pop() {
+            if ids.contains_key(&current) {
+                continue;
+            }
+            let justification = self
+                .justifications
+                .get(&current)
+                .expect("derived premises must have a justification");
+            if exiting {
+                if nodes.len() >= limits.max_nodes {
+                    return Err(LogicError::LimitExceeded("max_proof_nodes"));
+                }
+                let evidence = match justification {
+                    Justification::Input => ProofEvidence::Input,
+                    Justification::Derived { rule, premises } => ProofEvidence::Derived {
+                        rule: rule.clone(),
+                        premises: premises.iter().map(|p| ids[p]).collect(),
+                    },
+                };
+                ids.insert(current.clone(), nodes.len());
+                nodes.push(ProofNode {
+                    fact: current,
+                    evidence,
+                });
+            } else {
+                if depth > limits.max_depth {
+                    return Err(LogicError::LimitExceeded("max_proof_depth"));
+                }
+                stack.push((current, true, depth));
+                if let Justification::Derived { premises, .. } = justification {
+                    for premise in premises.iter().rev() {
+                        if !ids.contains_key(premise) {
+                            stack.push((premise.clone(), false, depth + 1));
+                        }
+                    }
+                }
+            }
+        }
+        let root = ids[fact];
+        Ok(Some(ProofDag { nodes, root }))
+    }
+
     pub fn contains(&self, fact: &Fact) -> bool {
         self.relations
             .get(&fact.relation)
@@ -225,6 +329,67 @@ impl QueryResult {
 pub struct LogicProgram {
     schemas: BTreeMap<String, Vec<ColumnType>>,
     rules: Vec<Rule>,
+    index_columns: BTreeMap<String, BTreeSet<usize>>,
+}
+
+/// Only index columns that can be constrained by a constant or by a variable
+/// already bound in an earlier atom. Prevents needless tuple duplication for
+/// unrelated columns of wide compiler relations.
+#[derive(Debug, Clone, Default)]
+struct TupleIndex {
+    columns: BTreeMap<String, BTreeSet<usize>>,
+    entries: HashMap<(String, usize, Value), BTreeSet<Vec<Value>>>,
+}
+
+impl TupleIndex {
+    fn new(columns: &BTreeMap<String, BTreeSet<usize>>) -> Self {
+        Self {
+            columns: columns.clone(),
+            entries: HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, fact: &Fact) {
+        if let Some(columns) = self.columns.get(&fact.relation) {
+            for &column in columns {
+                self.entries
+                    .entry((fact.relation.clone(), column, fact.values[column].clone()))
+                    .or_default()
+                    .insert(fact.values.clone());
+            }
+        }
+    }
+
+    fn matching<'a>(
+        &'a self,
+        atom: &Atom,
+        bindings: &BTreeMap<String, Value>,
+    ) -> Option<Option<&'a BTreeSet<Vec<Value>>>> {
+        let mut best: Option<&BTreeSet<Vec<Value>>> = None;
+        for (column, term) in atom.args.iter().enumerate() {
+            if !self
+                .columns
+                .get(&atom.relation)
+                .is_some_and(|cols| cols.contains(&column))
+            {
+                continue;
+            }
+            let expected = match term {
+                Term::Const(value) => Some(value),
+                Term::Var(name) => bindings.get(name),
+            };
+            let Some(expected) = expected else { continue };
+            let key = (atom.relation.clone(), column, expected.clone());
+            let Some(bucket) = self.entries.get(&key) else {
+                // An indexed equality with no matching values is a proven miss.
+                return Some(None);
+            };
+            if best.is_none_or(|current| bucket.len() < current.len()) {
+                best = Some(bucket);
+            }
+        }
+        best.map(Some)
+    }
 }
 
 impl LogicProgram {
@@ -297,9 +462,33 @@ impl LogicProgram {
             }
         }
 
+        let mut index_columns: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+        for rule in &rules {
+            let mut bound: BTreeSet<&str> = BTreeSet::new();
+            for atom in &rule.body {
+                for (column, term) in atom.args.iter().enumerate() {
+                    let indexed = match term {
+                        Term::Const(_) => true,
+                        Term::Var(name) => bound.contains(name.as_str()),
+                    };
+                    if indexed {
+                        index_columns
+                            .entry(atom.relation.clone())
+                            .or_default()
+                            .insert(column);
+                    }
+                }
+                for term in &atom.args {
+                    if let Term::Var(name) = term {
+                        bound.insert(name);
+                    }
+                }
+            }
+        }
         Ok(Self {
             schemas: by_name,
             rules,
+            index_columns,
         })
     }
 
@@ -349,9 +538,14 @@ impl LogicProgram {
             }
         }
 
+        let mut known_index = TupleIndex::new(&self.index_columns);
+        for fact in proofs.keys() {
+            known_index.insert(fact);
+        }
         let mut delta = known.clone();
+        let mut delta_index = known_index.clone();
         let mut rounds = 0usize;
-        let mut steps = 0usize;
+        let mut stats = EvaluationStats::default();
         while delta.values().any(|tuples| !tuples.is_empty()) {
             if rounds >= limits.max_rounds {
                 return Err(LogicError::LimitExceeded("max_rounds"));
@@ -369,10 +563,12 @@ impl LogicProgram {
                         pivot,
                         &known,
                         &delta,
+                        &known_index,
+                        &delta_index,
                         &mut BTreeMap::new(),
                         &mut Vec::new(),
                         &mut pending,
-                        &mut steps,
+                        &mut stats,
                         limits.max_steps,
                         limits.max_facts.saturating_sub(count),
                     )?;
@@ -399,15 +595,24 @@ impl LogicProgram {
                     .get_mut(&fact.relation)
                     .expect("validated rule head")
                     .insert(fact.values.clone());
+                known_index.insert(&fact);
                 proofs.insert(fact, justification);
             }
             delta = next;
+            delta_index = TupleIndex::new(&self.index_columns);
+            for (relation, tuples) in &delta {
+                for tuple in tuples {
+                    delta_index.insert(&Fact::new(relation, tuple.clone()));
+                }
+            }
             rounds += 1;
         }
+        stats.rounds = rounds;
 
         Ok(QueryResult {
             relations: known,
             justifications: proofs,
+            stats,
         })
     }
 }
@@ -456,10 +661,12 @@ fn join(
     pivot: usize,
     known: &BTreeMap<String, BTreeSet<Vec<Value>>>,
     delta: &BTreeMap<String, BTreeSet<Vec<Value>>>,
+    known_index: &TupleIndex,
+    delta_index: &TupleIndex,
     bindings: &mut BTreeMap<String, Value>,
     premises: &mut Vec<Fact>,
     pending: &mut BTreeMap<Fact, Justification>,
-    steps: &mut usize,
+    stats: &mut EvaluationStats,
     max_steps: usize,
     max_pending: usize,
 ) -> Result<(), LogicError> {
@@ -493,12 +700,27 @@ fn join(
     }
 
     let atom = &rule.body[position];
-    let source = if position == pivot { delta } else { known };
-    for tuple in &source[&atom.relation] {
-        *steps = steps
+    let (source, index) = if position == pivot {
+        (delta, delta_index)
+    } else {
+        (known, known_index)
+    };
+    let indexed = index.matching(atom, bindings);
+    if matches!(indexed, Some(None)) {
+        return Ok(());
+    }
+    let candidates = if let Some(Some(bucket)) = indexed {
+        stats.index_lookups = stats.index_lookups.saturating_add(1);
+        bucket
+    } else {
+        &source[&atom.relation]
+    };
+    for tuple in candidates {
+        stats.candidate_rows = stats
+            .candidate_rows
             .checked_add(1)
             .ok_or(LogicError::LimitExceeded("max_steps"))?;
-        if *steps > max_steps {
+        if stats.candidate_rows > max_steps {
             return Err(LogicError::LimitExceeded("max_steps"));
         }
         let mut inserted = Vec::new();
@@ -531,10 +753,12 @@ fn join(
                 pivot,
                 known,
                 delta,
+                known_index,
+                delta_index,
                 bindings,
                 premises,
                 pending,
-                steps,
+                stats,
                 max_steps,
                 max_pending,
             );
