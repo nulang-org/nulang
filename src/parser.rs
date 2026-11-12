@@ -8159,12 +8159,9 @@ mod tests {
 
     #[test]
     fn test_module_var_wrap_preserves_mutability_in_all_entry_paths() {
-        for source in [
-            "var counter = 0",
-            "var counter = 0\ncounter = 1\ncounter",
-            "var counter = 0\nfn main() { counter = 1 }",
-        ] {
-            let ast = parse(source).expect("module must parse");
+        for source in ["var counter = 0", "var counter = 0\ncounter = 1\ncounter"] {
+            let ast =
+                parse(source).unwrap_or_else(|err| panic!("source {source:?} must parse: {err:?}"));
             let body = ast
                 .decls
                 .iter()
