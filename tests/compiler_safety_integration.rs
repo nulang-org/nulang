@@ -45,5 +45,9 @@ fn incomplete_match_and_discarded_result_report_once_each() {
     let warnings = checker.take_warnings();
     assert_eq!(warnings.iter().filter(|w| w.code == "W0201").count(), 1);
     assert_eq!(warnings.iter().filter(|w| w.code == "W0301").count(), 1);
-    assert_eq!(warnings.len(), 2, "unexpected compiler warnings: {warnings:?}");
+    assert_eq!(
+        warnings.len(),
+        2,
+        "unexpected compiler warnings: {warnings:?}"
+    );
 }
