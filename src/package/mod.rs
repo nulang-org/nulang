@@ -13,6 +13,7 @@
 pub mod commands;
 pub mod identity;
 mod identity_verify;
+pub mod incremental_oracle;
 pub mod lockfile;
 pub mod manifest;
 pub mod module_invalidation;
