@@ -25,9 +25,18 @@ fn add_one(x: Int) -> Int
 The analyzer first runs Nulang's regular frontend and type/effect/capability
 checks. It can establish simple integer postconditions from conjunctions of
 literal bounds, straight-line pure integer expressions, and safe 48-bit signed
-interval arithmetic. It currently handles +, -, unary negation, and immutable
-integer lets. Calls, effects, loops, branches, floats, and non-integer
-parameters are intentionally reported as `unknown`, not certified.
+interval arithmetic. It handles +, -, unary negation, multiplication,
+and immutable integer lets. Multiplication is proved only when the four
+endpoint products fit Nulang's signed 48-bit Int range; otherwise it is
+`unknown` (even if the desired postcondition is mathematically true).
+Calls, effects, loops, branches, floats, and non-integer parameters are
+intentionally reported as `unknown`, not certified.
+
+For example, `requires x >= 0 && x <= 3` allows proving
+`ensures result >= 0 && result <= 9` for `x * x`. This is a
+conservative interval proof, not full algebraic reasoning: the analyzer may
+return `unknown` for valid contracts when it cannot capture relationships
+between variables.
 
 Outcomes:
 
