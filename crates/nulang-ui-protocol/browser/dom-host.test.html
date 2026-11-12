@@ -148,6 +148,74 @@ test("SSR hydrated keyed reorder applies server patches without replacing nodes"
   assert(container.firstElementChild.firstElementChild===oldB,"keyed SSR element replaced");
 });
 
+test("compiled Nulang keyed session snapshot and patch render in Chromium", async () => {
+  const response=await fetch("live-session-fixture.json", {cache:"no-store"});
+  assert(response.ok,"compiler fixture unavailable");
+  const fixture=await response.json();
+  const [initial,update]=fixture.keyed;
+  const container=document.getElementById("mount");
+  container.replaceChildren();
+  const host=window.nulangUiDom.createHost(container,initial.document);
+  const first=host.element("root/k61"), second=host.element("root/k62");
+  assert(first && second && first.textContent==="a" && second.textContent==="b","compiled snapshot did not render");
+  assert(host.applyMessage(update)==="applied","compiled patch failed");
+  assert(host.element("root/k61")===first && host.element("root/k62")===second,"keyed node identity lost");
+  assert([...container.firstElementChild.children].map(node=>node.textContent).join(",")==="b,a,c","compiled keyed order wrong");
+  assert(host.element("root/k63").textContent==="c","compiled inserted node missing");
+  assert(host.document.revision==="2","compiled patch revision not applied");
+});
+
+test("compiled Nulang form acknowledgement clears draft and preserves input sequence", async () => {
+  const response=await fetch("live-session-fixture.json", {cache:"no-store"});
+  assert(response.ok,"compiler fixture unavailable");
+  const fixture=await response.json();
+  const [initial,update]=fixture.form;
+  const container=document.getElementById("mount");
+  container.replaceChildren();
+  const host=window.nulangUiDom.createHost(container,initial.document);
+  const input=host.element("root/p0"), received=[];
+  assert(input && input.tagName==="INPUT","compiled form input missing");
+  host.onInput=detail=>received.push(detail);
+  input.value="approved";
+  input.dispatchEvent(new Event("input",{bubbles:true}));
+  assert(received.length===1 && received[0].sequence==="1","local edit sequence missing");
+  assert(host.applyMessage(update)==="applied","compiled form patch failed");
+  assert(input.value==="approved" && host.document.revision==="2","authoritative input value missing");
+  assert(host.pending.size===0,"compiled acknowledgement failed to release pending edit");
+  input.value="next";
+  input.dispatchEvent(new Event("input",{bubbles:true}));
+  assert(received[1].sequence==="2","client reused acknowledged input sequence");
+});
+
+test("Rust's omitted empty UI fields default to empty, not null or malformed values", () => {
+  const container=document.getElementById("mount");
+  container.replaceChildren();
+  const minimal=snapshot(1,[{id:"root",kind:"div",children:["child"]},{id:"child",kind:"span"}]);
+  const host=window.nulangUiDom.createHost(container,minimal);
+  assert(host.element("child") && host.document.nodes.find(node=>node.id==="child").children.length===0,"omitted children did not default");
+  assert(Object.keys(host.document.nodes.find(node=>node.id==="child").properties).length===0,"omitted properties did not default");
+
+  const original=container.firstChild;
+  const invalidFields=[
+    {id:"child",kind:"span",children:null},
+    {id:"child",kind:"span",children:{}},
+    {id:"child",kind:"span",properties:null},
+    {id:"child",kind:"span",properties:[]}
+  ];
+  for (const bad of invalidFields) {
+    let rejected=false;
+    try {window.nulangUiDom.createHost(container,snapshot(1,[{id:"root",kind:"div",children:["child"]},bad]));}
+    catch (_) {rejected=true;}
+    assert(rejected && container.firstChild===original,"malformed explicit UI fields accepted or mutated DOM");
+  }
+
+  assert(host.applyPatch(patch(1,2,[
+    {op:"upsert_node",node:{id:"fresh",kind:"span"}},
+    {op:"replace_children",node_id:"root",children:["child","fresh"]}
+  ]))==="applied","sparse Rust upsert rejected");
+  assert(host.element("fresh") && host.element("fresh").tagName==="SPAN","sparse upsert not rendered");
+});
+
 (async () => {
  const out=[];
  for(const {name,fn} of tests) {
