@@ -3665,6 +3665,10 @@ impl VM {
             }
         }
 
+        // A prior JIT or AOT invocation must not poison this region. A
+        // compiled arithmetic helper cannot unwind, so retrieve its first
+        // recorded error after native execution and surface it via VM::step.
+        let _ = crate::jit::runtime::aot_take_pending_error();
         let action = if requires_vm_reentry {
             jit.execute_compiled(module_idx, pc, &mut detached_regs, &constants)
         } else {
@@ -3686,6 +3690,7 @@ impl VM {
             jit.execute_compiled(module_idx, pc, regs, &constants)
         };
 
+        let arithmetic_error = crate::jit::runtime::aot_take_pending_error();
         if requires_vm_reentry {
             crate::jit::runtime::clear_jit_vm();
         } else {
@@ -3715,7 +3720,8 @@ impl VM {
 
             // A re-entrant callee raised a runtime error. Surface it before
             // normal branch-exit or safepoint handling.
-            if let Some(msg) = crate::jit::runtime::take_jit_pending_vm_error() {
+            if let Some(msg) = crate::jit::runtime::take_jit_pending_vm_error().or(arithmetic_error)
+            {
                 self.jit_pending_error = Some(msg);
                 return true;
             }
@@ -4906,6 +4912,12 @@ impl VM {
             let ai = a.as_int().unwrap_or(0);
             let bi = b.as_int().unwrap_or(1);
             self.frames[frame_idx].regs[instr.op3 as usize] = if bi != 0 {
+                // Int values are 48-bit signed in the current tagged VM.
+                // The quotient +2^47 cannot be represented and must not
+                // silently wrap back to INT48_MIN.
+                if ai == crate::value_layout::INT48_MIN && bi == -1 {
+                    return Err(int_overflow_error("div", ai, bi));
+                }
                 Value::int(ai / bi)
             } else {
                 Value::nil()
@@ -6429,6 +6441,96 @@ mod vm_tests {
             .to_str()
             .unwrap();
         assert_eq!(s, "hello ffi");
+    }
+
+    #[test]
+    fn test_idiv_int48_boundary_overflow_vm() {
+        let mut module = CodeModule::new("idiv_48bit_overflow_vm");
+        let min = module.add_constant(Constant::Int(crate::value_layout::INT48_MIN));
+        let minus_one = module.add_constant(Constant::Int(-1));
+        for (constant, register) in [(min, 0u8), (minus_one, 1u8)] {
+            module.emit(Instruction::new3(
+                OpCode::ConstU,
+                (constant >> 8) as u8,
+                constant as u8,
+                register,
+            ));
+        }
+        module.emit(Instruction::new3(OpCode::IDiv, 0, 1, 2));
+        module.emit(Instruction::new2(OpCode::Move, 2, 0));
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
+
+        let mut vm = VM::new();
+        vm.load_module(module);
+        let err = vm
+            .run()
+            .expect_err("dividing Int48 min by -1 must not wrap to min");
+        assert!(format!("{err}").contains("integer overflow"), "{err}");
+    }
+
+    /// The optimized JIT must report helper-recorded arithmetic errors
+    /// through VM::step, not silently continue with the nil replacement.
+    #[cfg(feature = "native-codegen")]
+    #[test]
+    fn test_idiv_int48_boundary_overflow_after_jit_tierup() {
+        let mut module = CodeModule::new("idiv_overflow_after_jit_tierup");
+        let eight = module.add_constant(Constant::Int(8));
+        let two = module.add_constant(Constant::Int(2));
+        let limit = module.add_constant(Constant::Int(3000));
+        let min = module.add_constant(Constant::Int(crate::value_layout::INT48_MIN));
+        let neg_one = module.add_constant(Constant::Int(-1));
+        for (constant, reg) in [(eight, 0u8), (two, 1), (limit, 3), (min, 4), (neg_one, 5)] {
+            module.emit(Instruction::new3(
+                OpCode::ConstU,
+                (constant >> 8) as u8,
+                constant as u8,
+                reg,
+            ));
+        }
+        module.emit(Instruction::new1(OpCode::Const0, 2)); // counter
+
+        let loop_start = module.current_offset();
+        module.emit(Instruction::new3(OpCode::IDiv, 0, 1, 7));
+        module.emit(Instruction::new1(OpCode::IInc, 2));
+        module.emit(Instruction::new3(OpCode::ICmpLt, 2, 3, 6));
+
+        let loop_tail = module.current_offset();
+        let back = (loop_start as i16 - loop_tail as i16) as u16;
+        module.emit(Instruction::new3(
+            OpCode::JmpT,
+            6,
+            (back >> 8) as u8,
+            back as u8,
+        ));
+
+        // After the hot loop has tiered up, switch to the boundary operands
+        // and execute the same loop entry once more.
+        module.emit(Instruction::new2(OpCode::Move, 4, 0));
+        module.emit(Instruction::new2(OpCode::Move, 5, 1));
+        let jump_pc = module.current_offset();
+        let back = (loop_start as i16 - jump_pc as i16) as u16;
+        module.emit(Instruction::new3(
+            OpCode::Jmp,
+            (back >> 8) as u8,
+            back as u8,
+            0,
+        ));
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
+
+        let mut vm = VM::new();
+        vm.load_module(module);
+        let err = vm
+            .run()
+            .expect_err("JIT division overflow must surface as VM error");
+        assert!(format!("{err}").contains("integer overflow"), "{err}");
+        let compiled = vm
+            .jit_session
+            .as_ref()
+            .map(|jit| jit.compiled_count())
+            .unwrap_or(0);
+        assert!(compiled > 0, "hot loop must execute a compiled region");
     }
 
     // An ordinary dynamic arithmetic operation must never silently coerce

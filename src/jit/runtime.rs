@@ -121,7 +121,13 @@ pub extern "C" fn nulang_idiv(a: u64, b: u64) -> u64 {
     if bv == 0 {
         return Value::nil().as_raw();
     }
-    tag_int(as_int_or_zero(a) / bv)
+    let av = as_int_or_zero(a);
+    // +2^47 cannot fit the 48-bit signed tagged representation. Match the
+    // interpreter's existing checked-arithmetic error instead of wrapping.
+    if av == INT48_MIN && bv == -1 {
+        return record_arith_error(crate::vm::int_overflow_error("div", av, bv));
+    }
+    tag_int(av / bv)
 }
 
 #[no_mangle]
@@ -2196,6 +2202,30 @@ mod tests {
         );
         assert_eq!(super::nulang_fmul(nil, two_point_five), zero);
         assert_eq!(super::nulang_fmul(two_point_five, nil), zero);
+    }
+
+    #[test]
+    fn test_idiv_int48_boundary_overflow_native_helper() {
+        use crate::value_layout::{INT48_MAX, INT48_MIN};
+        use crate::vm::Value;
+        let _ = super::aot_take_pending_error();
+        let result = super::nulang_idiv(Value::int(INT48_MIN).as_raw(), Value::int(-1).as_raw());
+        assert_eq!(result, Value::nil().as_raw());
+        let error = super::aot_take_pending_error()
+            .expect("native overflow must record a pending runtime error");
+        assert!(
+            error.contains("integer overflow") && error.contains("div"),
+            "{error}"
+        );
+
+        // Neighboring representable values, zero divisor and remainder remain valid.
+        let valid = super::nulang_idiv(Value::int(INT48_MAX).as_raw(), Value::int(-1).as_raw());
+        assert_eq!(valid, Value::int(-INT48_MAX).as_raw());
+        let zero = super::nulang_idiv(Value::int(INT48_MIN).as_raw(), Value::int(0).as_raw());
+        assert_eq!(zero, Value::nil().as_raw());
+        let remainder = super::nulang_imod(Value::int(INT48_MIN).as_raw(), Value::int(-1).as_raw());
+        assert_eq!(remainder, Value::int(0).as_raw());
+        assert!(super::aot_take_pending_error().is_none());
     }
 
     #[test]
