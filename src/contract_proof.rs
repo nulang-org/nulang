@@ -263,6 +263,18 @@ fn eval_int(expr: &Expr, bounds: &Bounds) -> Option<Interval> {
             match op {
                 BinOp::Add => Interval::new(lhs.lo + rhs.lo, lhs.hi + rhs.hi),
                 BinOp::Sub => Interval::new(lhs.lo - rhs.hi, lhs.hi - rhs.lo),
+                BinOp::Mul => {
+                    // Bilinear extrema over two closed intervals occur at
+                    // their endpoints. Reject any intermediate or final
+                    // product that cannot fit the VM's signed Int payload.
+                    let products = [
+                        lhs.lo.checked_mul(rhs.lo)?,
+                        lhs.lo.checked_mul(rhs.hi)?,
+                        lhs.hi.checked_mul(rhs.lo)?,
+                        lhs.hi.checked_mul(rhs.hi)?,
+                    ];
+                    Interval::new(*products.iter().min()?, *products.iter().max()?)
+                }
                 _ => None,
             }
         }
@@ -372,9 +384,42 @@ mod tests {
     }
 
     #[test]
-    fn unknown_on_unsupported_arithmetic() {
+    fn proves_bounded_multiplication_with_negative_operands() {
+        let results = proof(
+            "fn area(x: Int, y: Int) -> Int requires x >= -3 && x <= -1 && y >= -4 && y <= -2 ensures result >= 2 && result <= 12 { x * y }",
+        );
+        assert_eq!(results[0].status, ProofStatus::Proved);
+    }
+
+    #[test]
+    fn proves_mixed_sign_multiplication_with_all_endpoint_products() {
+        let results = proof(
+            "fn area(x: Int, y: Int) -> Int requires x >= -2 && x <= 3 && y >= -4 && y <= 5 ensures result >= -12 && result <= 15 { x * y }",
+        );
+        assert_eq!(results[0].status, ProofStatus::Proved);
+    }
+
+    #[test]
+    fn proves_zero_multiplication_even_for_unbounded_int() {
+        let results = proof("fn zero(x: Int) -> Int ensures result == 0 { x * 0 }");
+        assert_eq!(results[0].status, ProofStatus::Proved);
+    }
+
+    #[test]
+    fn multiplication_beyond_int_payload_range_remains_unknown() {
         let results = proof("fn double(x: Int) -> Int ensures result >= 0 { x * 2 }");
         assert_eq!(results[0].status, ProofStatus::Unknown);
+        let signed_min = proof(
+            "fn negate_min(x: Int) -> Int requires x == -140737488355328 ensures result > 0 { x * -1 }",
+        );
+        assert_eq!(signed_min[0].status, ProofStatus::Unknown);
+    }
+
+    #[test]
+    fn bounded_multiplication_can_report_a_real_counterexample() {
+        let results = proof("fn bad(x: Int) -> Int requires x == 2 ensures result == 5 { x * 2 }");
+        assert_eq!(results[0].status, ProofStatus::Counterexample);
+        assert_eq!(results[0].witness.as_ref().unwrap()["x"], 2);
     }
 
     #[test]
