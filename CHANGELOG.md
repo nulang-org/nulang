@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Mutable binding type safety and module-level preservation — 2026-11-11
+- **Module-level `var` declarations retain mutability** when the parser wraps them into an explicit `main` or synthetic `__main` entry body, including declaration-only modules.
+- **Mutable local bindings remain monomorphic across reassignment**, even when initialized by an inferred lambda. Immutable `let` retains its existing generalization behavior.
+- **Regression tests cover all three parser wrapping paths, valid mutable reassignment, and incompatible typed reuse.** Full executable validation and main-targeted CI remain required before promotion.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
