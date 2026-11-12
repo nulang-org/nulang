@@ -23,6 +23,9 @@
 ### Rustls and Wasmtime security updates — 2026-10-15
 - **Pinned supported TLS and WASM runtime dependencies to patched versions.** Updated rustls 0.23.45 to 0.23.46 and Wasmtime 48.0.5 to 48.0.6 (including compatible Cranelift and runtime lockfile packages) to address October 2026 RustSec advisories.
 - **Documented the remaining legacy rustls 0.22 advisories in the Cargo audit policy.** The affected version is transitive through libsql's hyper-rustls 0.25 path; explicit advisory exceptions are restricted to the documented IDs until the upstream dependency chain is upgraded.
+### Iso-arena may-pointer CFG reachability fix — 2026-10-13
+- **Corrected a conservative pointer-analysis traversal bug affecting opt-in iso-arena allocation.** Successor instructions are visited even when their current may-pointer set is empty; previously scalar/no-op prefixes could prevent analysis of later heap-pointer stores and incorrectly qualify an arena container without child retains.
+- **Added a fail-closed regression test for a nested pointer store behind a zero-pointer prefix.** This change does not alter ORCA ownership semantics or bytecode format; it restricts arena eligibility when a pointer child may be present.
 
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
