@@ -1350,7 +1350,9 @@ fn map_option[A, B](opt: Option[A], f: (A) -> B ! {| row}) -> Option[B] ! {| row
 }
 ```
 
-The function `map_option` preserves the effect row of its callback function `f`. If `f` is pure, `map_option` is pure. If `f` performs `Console` effects, so does `map_option`.
+The `map_option` signature expresses effect-row pass-through: the two occurrences of `row` refer to **the same abstract effect tail within this function signature**. Different names in one signature, or the same name in separate functions, denote independent tails. This binding does not grant effects or permit unrelated tails to satisfy one another.
+
+The checker currently treats unresolved rows conservatively; it does **not** implement full row-variable substitution at arbitrary call sites. As a result, a caller requiring a closed/pure row may still need a statically known concrete effect signature or a handler. The annotation itself is checked without executing the callback.
 
 ### 4.5.3 Effect Row Subtyping
 
