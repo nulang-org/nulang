@@ -4942,6 +4942,34 @@ mod tests {
     }
 
     #[test]
+    fn test_check_module_accepts_same_named_open_callback_row() {
+        // The callback's named tail and the function's declared tail refer
+        // to the same row variable in this signature, not two unknowns.
+        let ast = parse_module(
+            "fn forward(f: (Int) -> Int ! {| row}) -> Int ! {| row} { f(1) }",
+        );
+        let mut checker = EffectChecker::new();
+        let result = checker.check_module(&ast.decls);
+        assert!(
+            result.is_ok(),
+            "matching named row parameter must be accepted: {:?}",
+            result.err(),
+        );
+    }
+
+    #[test]
+    fn test_check_module_rejects_unrelated_open_callback_row() {
+        // Distinct names cannot be equated to bypass a closed or unrelated
+        // effect allowance without explicit row-substitution evidence.
+        let ast = parse_module(
+            "fn forward(f: (Int) -> Int ! {| input}) -> Int ! {| output} { f(1) }",
+        );
+        let mut checker = EffectChecker::new();
+        let result = checker.check_module(&ast.decls);
+        assert!(result.is_err(), "independent effect tails must not unify");
+    }
+
+    #[test]
     fn test_check_module_accepts_matching_declared_effects() {
         // Positive: a function performing exactly its declared effects, plus
         // a caller whose row covers the callee's.
