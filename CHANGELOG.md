@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Diagnostic function interface fingerprints — 2026-11-13
+- **Added conservative Pascal-inspired public-interface impact diagnostics.** A versioned checked-function serializer reads compiler-inferred types and fixed-point effect rows, including reference capabilities, while rejecting unsupported declarations and metadata rather than silently omitting them.
+- **The existing source-based invalidation algorithm remains authoritative.** No cached artifact reuse or production compiler behavior changes; differential tests demonstrate that unchanged function signatures can still produce different bytecode. Full compiler-owned dependency closure, oracle integration, and performance benchmarks are required before enabling incremental reuse.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
