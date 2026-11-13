@@ -390,6 +390,19 @@ fn put_bytes(out: &mut Vec<u8>, value: &[u8]) {
     out.extend_from_slice(value);
 }
 
+/// Canonical compiler-owned representation of one inferred type contract.
+///
+/// Shares the typed semantic identity encoder's alpha-normalization for
+/// fresh inference variables, skolems, and regions. Unlike Type::to_ntir,
+/// this preserves effect rows and reference capabilities. This is diagnostic
+/// data, not proof that the module's import closure was captured.
+pub fn canonical_type_schema_bytes(ty: &Type) -> Vec<u8> {
+    let mut encoder = TypeSchemaEncoder::default();
+    encoder.bytes(b"nulang.type-schema.v1\0");
+    encoder.ty(ty);
+    encoder.out
+}
+
 #[derive(Default)]
 struct TypeSchemaEncoder {
     out: Vec<u8>,
