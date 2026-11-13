@@ -74,6 +74,8 @@ pub mod mir_wasm;
 pub mod mir_wasm_simd;
 #[cfg(feature = "native-codegen")]
 pub mod native_abi;
+#[cfg(feature = "native-executable")]
+pub mod native_executable;
 #[cfg(feature = "otel")]
 pub mod observability;
 pub mod package;
