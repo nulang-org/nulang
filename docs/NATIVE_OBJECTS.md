@@ -38,7 +38,22 @@ ABI.
 ```rust
 let artifact = nulang::aot::object::NativeObjectArtifact::compile(&mir, "native")?;
 artifact.write_to("module.o")?;
+
+// Explicit size-oriented machine-code optimization (optional).
+// The default compile() API continues to optimize for speed.
+let small = nulang::aot::object::NativeObjectArtifact::compile_with_optimization(
+    &mir,
+    "native",
+    nulang::aot::AotOptimization::Small,
+)?;
+small.write_to("module-small.o")?;
 ```
+
+The optional Small policy maps to Cranelift's speed-and-size mode.
+It does not remove unreferenced runtime imports or perform final linker
+garbage collection, so output-size savings are not guaranteed. Measure
+the final linked executable and runtime dependencies, not just object bytes.
+This API is not yet a user-facing standalone build command.
 
 Build or test the feature directly:
 

@@ -29,6 +29,16 @@ impl NativeObjectArtifact {
     /// exports are intentionally not part of this first artifact slice; actor
     /// modules fail closed until the stable actor-entry ABI is exported too.
     pub fn compile(mir_module: &mir::Module, target: &str) -> NuResult<Self> {
+        Self::compile_with_optimization(mir_module, target, super::AotOptimization::Speed)
+    }
+
+    /// Emit an object with explicit native code-size or speed optimization.
+    /// The default compile method continues to use speed for compatibility.
+    pub fn compile_with_optimization(
+        mir_module: &mir::Module,
+        target: &str,
+        optimization: super::AotOptimization,
+    ) -> NuResult<Self> {
         if !mir_module.behaviors.is_empty() {
             return Err(crate::types::NuError::VMError {
                 msg: "native object emission does not yet export actor behavior entries".into(),
@@ -38,7 +48,12 @@ impl NativeObjectArtifact {
 
         let mut flag_builder = settings::builder();
         let _ = flag_builder.set("enable_simd", "true");
-        let _ = flag_builder.set("opt_level", "speed");
+        flag_builder
+            .set("opt_level", optimization.cranelift_level())
+            .map_err(|e| crate::types::NuError::VMError {
+                msg: format!("invalid native object optimization policy: {e}"),
+                span: Span::default(),
+            })?;
         let isa_builder = super::create_isa_builder(target)?;
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
