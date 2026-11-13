@@ -15,7 +15,26 @@
 //! true AOT object-file emission. This gives us native code without needing
 //! a linker — the trampoline calls into the JIT module at startup.
 
+/// Cranelift optimization policy for native machine code.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AotOptimization {
+    #[default]
+    Speed,
+    Small,
+}
+
+impl AotOptimization {
+    fn cranelift_level(self) -> &'static str {
+        match self {
+            Self::Speed => "speed",
+            Self::Small => "speed_and_size",
+        }
+    }
+}
+
 pub mod codegen;
+#[cfg(feature = "native-object")]
+pub mod object;
 
 use cranelift::prelude::*;
 use cranelift_frontend::FunctionBuilderContext;
@@ -65,10 +84,24 @@ impl AotModule {
 
     /// Compile a MIR module to native code for a specific target ISA.
     pub fn compile_for_target(mir_module: &mir::Module, target: &str) -> NuResult<Self> {
+        Self::compile_for_target_with_optimization(mir_module, target, AotOptimization::Speed)
+    }
+
+    /// Compile with an explicit machine-code optimization policy.
+    pub fn compile_for_target_with_optimization(
+        mir_module: &mir::Module,
+        target: &str,
+        optimization: AotOptimization,
+    ) -> NuResult<Self> {
         // Set up Cranelift with the target ISA.
         let mut flag_builder = settings::builder();
         let _ = flag_builder.set("enable_simd", "true");
-        let _ = flag_builder.set("opt_level", "speed");
+        flag_builder
+            .set("opt_level", optimization.cranelift_level())
+            .map_err(|e| crate::types::NuError::VMError {
+                msg: format!("invalid native optimization policy: {e}"),
+                span: Span::default(),
+            })?;
         let isa_builder = create_isa_builder(target)?;
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
@@ -2004,6 +2037,105 @@ fn collect_rvalue_field_and_consts(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "native-object")]
+    fn native_object_test_mir(source: &str) -> crate::mir::Module {
+        let tokens = crate::lexer::Lexer::new(source).lex().unwrap();
+        let ast = crate::parser::Parser::new(tokens).parse_module().unwrap();
+        let mut tc = crate::typechecker::TypeChecker::new();
+        tc.check_module(&ast).unwrap();
+        let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
+        crate::mir_lower::lower_module(&hir).unwrap()
+    }
+
+    #[cfg(feature = "native-object")]
+    #[test]
+    fn test_native_object_emits_relocatable_entry_symbol() {
+        let mir = native_object_test_mir("fn main() -> Int { 40 + 2 }");
+        let artifact = super::object::NativeObjectArtifact::compile(&mir, "native")
+            .expect("native object compilation");
+        assert!(!artifact.bytes().is_empty());
+        assert_eq!(artifact.entry_symbol(), Some("nulang_entry"));
+        assert!(
+            artifact
+                .bytes()
+                .windows(b"nulang_entry".len())
+                .any(|window| window == b"nulang_entry"),
+            "object symbol table should contain the stable nulang_entry symbol"
+        );
+    }
+
+    #[cfg(feature = "native-object")]
+    #[test]
+    fn test_native_object_small_optimization_keeps_entry_symbol() {
+        let mir = native_object_test_mir("fn main() -> Int { 40 + 2 }");
+        let artifact = super::object::NativeObjectArtifact::compile_with_optimization(
+            &mir,
+            "native",
+            super::AotOptimization::Small,
+        )
+        .expect("size-optimized object compilation");
+        assert!(!artifact.bytes().is_empty());
+        assert_eq!(artifact.entry_symbol(), Some("nulang_entry"));
+    }
+
+    #[cfg(feature = "native-object")]
+    #[test]
+    fn test_aot_small_optimization_preserves_integer_semantics() {
+        let mir = native_object_test_mir("fn main() -> Int { 40 + 2 }");
+        let speed = super::AotModule::compile(&mir)
+            .expect("default native compile")
+            .run()
+            .expect("default native run");
+        let small = super::AotModule::compile_for_target_with_optimization(
+            &mir,
+            "native",
+            super::AotOptimization::Small,
+        )
+        .expect("size native compile")
+        .run()
+        .expect("size native run");
+        assert_eq!(small, speed);
+        assert_eq!(crate::value_layout::as_int_raw(small), 42);
+    }
+
+    #[cfg(feature = "native-object")]
+    #[test]
+    fn test_native_object_library_has_no_entry_symbol() {
+        let mir = native_object_test_mir("fn add(a: Int, b: Int) -> Int { a + b }");
+        let artifact = super::object::NativeObjectArtifact::compile(&mir, "native")
+            .expect("native object library compilation");
+        assert!(!artifact.bytes().is_empty());
+        assert_eq!(artifact.entry_symbol(), None);
+    }
+
+    #[cfg(feature = "native-object")]
+    #[test]
+    fn test_native_object_preserves_runtime_constant_metadata() {
+        let mir = native_object_test_mir(r#"fn main() -> String { "artifact" }"#);
+        let artifact = super::object::NativeObjectArtifact::compile(&mir, "native")
+            .expect("native object string compilation");
+        assert!(
+            artifact.constants().iter().any(|constant| matches!(
+                constant,
+                crate::bytecode::Constant::String(value) if value == "artifact"
+            )),
+            "link/runtime packaging needs the exact constant pool used by native code"
+        );
+    }
+
+    #[cfg(feature = "native-object")]
+    #[test]
+    fn test_native_object_actor_module_fails_closed_until_actor_exports_exist() {
+        let mir = native_object_test_mir("actor Counter { behavior get() { 1 } }");
+        let err = super::object::NativeObjectArtifact::compile(&mir, "native")
+            .err()
+            .expect("actor object emission should fail closed in the first slice");
+        assert!(
+            err.to_string().contains("actor behavior entries"),
+            "unexpected actor object error: {err}"
+        );
+    }
+
     /// End-to-end: `"hello" + 2 + 3` must concatenate with coercion ("hello23"),
     /// not fall through to integer arithmetic on the string's tag bits. Replicates
     /// `AotModule::run`'s heap + constants setup but keeps the heap alive so the
