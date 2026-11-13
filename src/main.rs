@@ -114,6 +114,7 @@ fn main() {
                 None,
                 opts.verbose,
                 &opts.backend,
+                opts.native_opt.as_deref(),
                 opts.out_file.as_deref(),
                 opts.metrics_port,
                 &opts.target,
@@ -324,6 +325,20 @@ fn main() {
                     );
                     std::process::exit(1);
                 }
+            }
+            "--native-opt" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Error: --native-opt requires an argument (speed | small)");
+                    std::process::exit(1);
+                }
+                match args[i + 1].as_str() {
+                    "speed" | "small" => opts.native_opt = Some(args[i + 1].clone()),
+                    _ => {
+                        eprintln!("Error: --native-opt must be speed | small");
+                        std::process::exit(1);
+                    }
+                }
+                i += 1;
             }
             "--target" => {
                 if i + 1 < args.len() {
@@ -536,6 +551,7 @@ fn main() {
                     "--dap",
                     "--doc",
                     "--backend",
+                    "--native-opt",
                     "--out",
                     "--emit-nbc",
                     "--emit-behavior-manifest",
@@ -574,6 +590,11 @@ fn main() {
             arg => positional.push(arg.to_string()),
         }
         i += 1;
+    }
+
+    if opts.native_opt.is_some() && opts.backend != "native" {
+        eprintln!("Error: --native-opt requires --backend native");
+        std::process::exit(1);
     }
 
     if opts.emit_behavior_manifest.is_some() && !opts.emit_nbc {
@@ -715,6 +736,7 @@ fn main() {
                         Some(&p),
                         v,
                         &b,
+                        opts.native_opt.as_deref(),
                         None,
                         None,
                         &opts.target,
@@ -762,6 +784,7 @@ fn main() {
                         None,
                         opts.verbose,
                         &opts.backend,
+                        opts.native_opt.as_deref(),
                         opts.out_file.as_deref(),
                         opts.metrics_port,
                         &opts.target,
@@ -781,6 +804,7 @@ fn main() {
                 None,
                 opts.verbose,
                 &opts.backend,
+                opts.native_opt.as_deref(),
                 opts.out_file.as_deref(),
                 opts.metrics_port,
                 &opts.target,
@@ -949,6 +973,7 @@ fn main() {
                         Some(path),
                         verbose,
                         backend,
+                        opts.native_opt.as_deref(),
                         out_file,
                         opts.metrics_port,
                         &opts.target,
@@ -968,6 +993,7 @@ fn main() {
                 Some(path),
                 opts.verbose,
                 &opts.backend,
+                opts.native_opt.as_deref(),
                 opts.out_file.as_deref(),
                 opts.metrics_port,
                 &opts.target,
@@ -1003,6 +1029,7 @@ fn main() {
             None,
             opts.verbose,
             &opts.backend,
+            opts.native_opt.as_deref(),
             opts.out_file.as_deref(),
             opts.metrics_port,
             &opts.target,
@@ -1029,6 +1056,8 @@ struct Options {
     verbose: bool,
     backend: String,
     out_file: Option<String>,
+    /// Explicit Cranelift optimization policy, native backend only.
+    native_opt: Option<String>,
     /// Compile the input to a `.nbc` artifact and write it, don't run.
     emit_nbc: bool,
     /// Optional RFC 0020 behavior sidecar output path. Currently emitted for
@@ -1092,6 +1121,7 @@ impl Default for Options {
             verbose: false,
             backend: "bytecode".to_string(),
             out_file: None,
+            native_opt: None,
             emit_nbc: false,
             emit_behavior_manifest: None,
             behavior_package_name: None,
@@ -1163,6 +1193,8 @@ fn print_help() {
         println!(
             "  --target <t>     Target ISA for native backend: native (default) | ptx | riscv64"
         );
+        println!("  --native-opt <p>  Native Cranelift codegen: speed (default) | small");
+        println!("                   small optimizes JIT machine code, not standalone binary size");
     }
     if cfg!(feature = "wasm-backend") {
         println!("  --out <file>     Output file for WASM backends (default: out.wasm)");
@@ -1788,11 +1820,13 @@ fn run_frontend(
 }
 
 #[cfg_attr(not(feature = "wasm-backend"), allow(unused_variables))]
+#[cfg_attr(not(feature = "native-codegen"), allow(unused_variables))]
 fn run_source(
     source: &str,
     file_path: Option<&str>,
     verbose: bool,
     backend: &str,
+    native_opt: Option<&str>,
     out_file: Option<&str>,
     metrics_port: Option<u16>,
     target: &str,
@@ -1953,7 +1987,15 @@ fn run_source(
                     );
                 }
             }
-            let aot_module = nulang::aot::AotModule::compile_for_target(&mir, target)?;
+            let optimization = match native_opt {
+                Some("small") => nulang::aot::AotOptimization::Small,
+                _ => nulang::aot::AotOptimization::Speed,
+            };
+            let aot_module = nulang::aot::AotModule::compile_for_target_with_optimization(
+                &mir,
+                target,
+                optimization,
+            )?;
 
             // If --out is specified, write assembly to file
             if let Some(out_file) = out_file {
