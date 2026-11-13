@@ -1199,7 +1199,7 @@ html[data-theme="light"] starlight-theme-select label::before {
    documentation index. Keep documentation pages conservative; scope the
    stronger editorial rhythm to the splash page. */
 html[data-has-hero] .hero {
-  padding-block: clamp(4.5rem, 8vw, 7rem) 2.25rem;
+  padding-block: clamp(2.75rem, 5vw, 4.5rem) 2.25rem;
   background:
     linear-gradient(90deg, color-mix(in srgb, var(--nu-blue) 5%, transparent) 1px, transparent 1px),
     linear-gradient(color-mix(in srgb, var(--nu-blue) 5%, transparent) 1px, transparent 1px),
@@ -1213,7 +1213,27 @@ html[data-has-hero] .hero::before {
 }
 
 html[data-has-hero] .hero-cloud {
-  gap: clamp(2.5rem, 5vw, 5rem);
+  gap: clamp(1.5rem, 3vw, 3rem);
+}
+
+html[data-has-hero] .hero h1 {
+  max-width: 13ch;
+  font-size: clamp(2.9rem, 5.25vw, 4.35rem);
+  line-height: 1.02;
+}
+
+html[data-has-hero] .hero .tagline {
+  margin: 1.1rem 0 0;
+  max-width: 35rem;
+  line-height: 1.55;
+}
+
+html[data-has-hero] .hero .actions {
+  margin-top: 1.4rem;
+}
+
+html[data-has-hero] .hero .hero-proof-grid {
+  margin-top: 1.4rem;
 }
 
 @media (min-width: 64rem) {

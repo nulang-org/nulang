@@ -783,7 +783,9 @@ fn data_attr(name: &str, value: &str, span: Span) -> Expr {
 /// `data-signal` and `data-action` attributes emitted by the compiler.
 pub fn generate_client_runtime() -> String {
     r#"(function () {
-  const signals = {};
+  // Signal names come from compiled bindings; they must never resolve through
+  // Object.prototype (e.g. constructor, toString, __proto__).
+  const signals = Object.create(null);
   const signalBindings = Object.create(null);
 
   function refreshSignal(name) {
@@ -885,10 +887,9 @@ pub fn generate_client_runtime() -> String {
           runClientAction(handler);
         }
       };
-      el.addEventListener('click', listener);
-      if (el.tagName === 'FORM') {
-        el.addEventListener('submit', listener);
-      }
+      // Clicks bubble from every control in a form. Only an actual submit
+      // should invoke its action; non-form actions remain click-driven.
+      el.addEventListener(el.tagName === 'FORM' ? 'submit' : 'click', listener);
     });
   }
 

@@ -12,7 +12,7 @@ Nulang actors are isolated, concurrent units of computation that communicate exc
 
 - **Private state** — mutable fields only accessible from within the actor
 - **Behaviors** — message handlers that transform state and send responses
-- **A mailbox** — FIFO-ordered message queue
+- **A mailbox** — priority-separated message queues (system ahead of normal/bulk messages), not a single global FIFO
 - **An identity** — a unique `Actor` reference (64-bit id)
 
 ## Defining Actors
@@ -73,7 +73,7 @@ These are parser desugars — `spawn link Actor {..} in {..}` is equivalent to `
 
 ## Sending Messages
 
-`send` delivers a message to an actor's mailbox asynchronously:
+`send` attempts asynchronous delivery to an actor's mailbox:
 
 ```nulang
 actor Counter {
@@ -92,11 +92,13 @@ let counter = spawn Counter {}
 send counter tick()
 ```
 
-Messages are always delivered and never dropped. The sender does not block.
+**A successful `send` expression is not a delivery acknowledgment.** New actors use unbounded mailboxes by default, but the runtime supports bounded mailboxes: normal/bulk messages can be rejected when capacity is exhausted, while system/supervision messages bypass that limit. Sends to missing actors or unknown behaviors can also be rejected, as can unsupported cross-shard payloads. The local runtime records a dead-letter **notification** for some failed deliveries, not a durable copy of the original message.
+
+The language-level fire-and-forget `send` does not establish exactly-once delivery, durable retries, or remote-delivery guarantees. For critical messages, design an explicit acknowledgment/idempotency protocol and plan for backpressure. See [Implementation Status](https://github.com/nulang-org/nulang/blob/main/docs/IMPLEMENTATION_STATUS.md) for the runtime boundary.
 
 ## Receiving Messages
 
-Inside a behavior, `receive` scans the mailbox for a matching message. It does not block: non-matching messages are skipped (requeued in FIFO order), and if no message matches, `receive` returns `nil` immediately:
+Inside a behavior, `receive` looks for a matching message without blocking. Non-matching messages remain available for later receives; priority bands mean the mailbox is not one globally ordered FIFO. Without a timeout, `receive` returns `nil` immediately when there is no match:
 
 ```nulang
 actor Worker {
@@ -166,9 +168,11 @@ perform Actor.exit(2)   // Kill (cannot be trapped)
 
 ## Scheduling
 
-Actors are scheduled cooperatively with reduction-bounded fairness. Each actor gets a budget of 1000 message reductions per turn. When exhausted, it yields and requeues at the back of its priority queue.
+Actors are scheduled cooperatively. A newly created actor has a **1,000-message-reduction ceiling per turn**, but the live scheduler also limits mailbox batches: currently **up to 16 messages** when peers are ready and **up to 256 messages** when the actor is running alone (subject to mailbox depth and the reduction ceiling).
 
-Priorities: High → Normal (default) → Low. All High-priority actors run before any Normal; Normal before Low.
+These are **message-level** scheduling limits, not a promise that every CPU-intensive behavior can be interrupted mid-handler. JIT safepoints and instruction-budget work have separate semantics and validation requirements; do not assume universal preemption for blocking native calls or all execution backends.
+
+Priorities are strict: High → Normal (default) → Low. Sustained High-priority traffic can starve lower-priority work.
 
 ## Next
 

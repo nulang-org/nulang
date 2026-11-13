@@ -26,7 +26,7 @@ Nulang's bytecode VM uses hot-counter tiering to compile frequently-executed cod
 - **Typed compilation**: When register types are statically provable (via `TypeMetadata`), the typed compiler strips NaN-tag guards, emitting unboxed integer and float operations directly.
 - **SIMD auto-vectorization**: Element-wise loops on arrays are detected by the SIMD analyzer and compiled to `I64x2`, `F64x2`, `I32x4`, or `F32x4` vector instructions with scalar prefix/epilogue.
 
-Warm-up behavior: the first 1,000 iterations of a hot loop run in the interpreter. Once the threshold is crossed, the compiled region replaces interpretation for subsequent iterations.
+Warm-up behavior: a region becomes **eligible** for compilation after its hot counter reaches 1,000 interpreted visits. Compilation and subsequent JIT execution depend on the visited program counters and whether the region is supported; 1,000 source-level loop iterations are not a universal compilation guarantee.
 
 ## Secondary native AOT
 
@@ -59,12 +59,12 @@ The bytecode VM is designed for compact code and fast dispatch:
 
 - **32-bit instructions**: `{opcode: u8, op1: u8, op2: u8, op3: u8}` — fixed-width, cache-friendly.
 - **256 registers per frame**: Flat `Vec<u64>` with 48-bit payload + 16-bit type tag.
-- **135 opcodes**: spanning the ranges above (arithmetic, control flow, closures, actors, effects, FFI, etc.).
+- **Opcode inventory**: see the authoritative `OpCode` enum in [`src/bytecode.rs`](https://github.com/nulang-org/nulang/blob/main/src/bytecode.rs). Counts evolve as instructions are added; avoid treating a snapshot count as a format contract.
 - **i64-tagged values**: integers, floats, booleans, nil, and unit are all represented inline — no boxing, no heap allocation for primitives.
 
 ## Memory Model
 
-- **Per-actor heaps**: Each actor owns a 64 KB bump-allocated heap, chained on demand. Objects never move.
+- **Per-actor heaps**: A new actor configures a **16 KiB initial bump block**, allocated **lazily on first small-object allocation** rather than on spawn. Additional blocks are chained as needed; live objects do not move.
 - **ORCA GC**: Reference counting with cycle detection, per-actor — one actor's GC never pauses another.
 - **Size-class free lists**: Small allocations reuse exact-size slots; allocations over 256 bytes use a large-object space.
 - **Global allocator**: `mimalloc` for all non-actor allocations (compiler, runtime, JIT buffers).
