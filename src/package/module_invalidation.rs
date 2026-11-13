@@ -68,6 +68,139 @@ pub enum Invalidation {
     FullRebuild { reason: String },
 }
 
+/// Compiler-emitted, canonical public-interface observations for a module graph.
+///
+/// A fingerprint must cover every publicly observable contract, including
+/// exported types, inferred effects, reference capabilities, actor protocols,
+/// and any schema/ABI identity exposed by the module. The planner cannot
+/// authenticate the supplied bytes or prove that this closure is complete.
+/// Do not construct fingerprints from source-text heuristics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleInterfaces {
+    context_digest: [u8; 32],
+    fingerprints: BTreeMap<String, [u8; 32]>,
+}
+
+impl ModuleInterfaces {
+    pub fn new(snapshot: &ModuleSnapshot) -> Self {
+        Self {
+            context_digest: snapshot.context_digest,
+            fingerprints: BTreeMap::new(),
+        }
+    }
+
+    /// Hash the complete deterministic interface serialization emitted by the
+    /// compiler. This API does not assert the bytes are canonical or complete.
+    pub fn insert(&mut self, name: impl Into<String>, interface_bytes: &[u8]) {
+        self.fingerprints
+            .insert(name.into(), *blake3::hash(interface_bytes).as_bytes());
+    }
+}
+
+/// A diagnostic-only estimate of which compilation stages a change may affect.
+/// This is NOT permission to skip downstream type checking or reuse artifacts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterfaceInvalidation {
+    Unchanged,
+    Dirty {
+        /// Source, import, or interface observations changed for these modules.
+        changed_modules: Vec<String>,
+        /// Other modules transitively importing a changed public interface.
+        affected_dependents: Vec<String>,
+    },
+    FullRebuild {
+        reason: String,
+    },
+}
+
+/// Compare compiler-produced public interfaces while retaining all existing
+/// fail-closed checks of the conservative module invalidation planner.
+///
+/// Private implementation edits can be distinguished from interface changes
+/// for diagnostics only. Real incremental reuse still requires compiler-owned
+/// complete input closure, deterministic interface serialization, and clean
+/// versus incremental semantic/output parity across every supported backend.
+pub fn analyze_interface_invalidation(
+    before: &ModuleSnapshot,
+    after: &ModuleSnapshot,
+    before_interfaces: &ModuleInterfaces,
+    after_interfaces: &ModuleInterfaces,
+) -> InterfaceInvalidation {
+    if let Invalidation::FullRebuild { reason } = invalidated_modules(before, after) {
+        return InterfaceInvalidation::FullRebuild { reason };
+    }
+    for (label, snapshot, observed) in [
+        ("before", before, before_interfaces),
+        ("after", after, after_interfaces),
+    ] {
+        if observed.context_digest != snapshot.context_digest {
+            return InterfaceInvalidation::FullRebuild {
+                reason: format!(
+                    "{label} interface observations use a different compilation context"
+                ),
+            };
+        }
+        if !observed.fingerprints.keys().eq(snapshot.modules.keys()) {
+            return InterfaceInvalidation::FullRebuild {
+                reason: format!(
+                    "{label} interface observations do not cover exactly the module graph"
+                ),
+            };
+        }
+    }
+
+    let mut changed = BTreeSet::new();
+    let mut changed_interfaces = BTreeSet::new();
+    for (name, input) in &after.modules {
+        let previous = before.modules.get(name);
+        let interface_changed =
+            before_interfaces.fingerprints.get(name) != after_interfaces.fingerprints.get(name);
+        let imports_changed = previous.map(|old| &old.imports) != Some(&input.imports);
+        if previous != Some(input) || interface_changed {
+            changed.insert(name.clone());
+        }
+        // Changed imports can change public behavior even if a caller supplied
+        // identical interface bytes, so be conservative until closure is proven.
+        if imports_changed || interface_changed {
+            changed_interfaces.insert(name.clone());
+        }
+    }
+
+    if changed.is_empty() {
+        return InterfaceInvalidation::Unchanged;
+    }
+
+    let mut reverse: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for snapshot in [before, after] {
+        for (name, input) in &snapshot.modules {
+            for dependency in &input.imports {
+                reverse
+                    .entry(dependency.clone())
+                    .or_default()
+                    .insert(name.clone());
+            }
+        }
+    }
+
+    let mut affected = BTreeSet::new();
+    let mut queue: VecDeque<String> = changed_interfaces.into_iter().collect();
+    while let Some(module) = queue.pop_front() {
+        if let Some(dependents) = reverse.get(&module) {
+            for dependent in dependents {
+                if affected.insert(dependent.clone()) {
+                    queue.push_back(dependent.clone());
+                }
+            }
+        }
+    }
+    // Modules already listed as locally changed must not be reported twice.
+    affected.retain(|name| !changed.contains(name));
+    InterfaceInvalidation::Dirty {
+        changed_modules: changed.into_iter().collect(),
+        affected_dependents: affected.into_iter().collect(),
+    }
+}
+
 /// Compute a conservative invalidation frontier using source changes and both
 /// historical and current dependency edges. The caller must still execute
 /// normal type/effect/capability checking and compare fresh compiler outputs.
@@ -199,6 +332,185 @@ mod tests {
         snapshot.insert("app", b"fn app() { api() }", ["api"]);
         snapshot.insert("unrelated", b"fn unrelated() { 3 }", [] as [&str; 0]);
         snapshot
+    }
+
+    fn interfaces(snapshot: &ModuleSnapshot) -> ModuleInterfaces {
+        let mut result = ModuleInterfaces::new(snapshot);
+        for name in snapshot.modules.keys() {
+            result.insert(name.clone(), name.as_bytes());
+        }
+        result
+    }
+
+    #[test]
+    fn private_body_edit_does_not_invalidate_importers_interfaces() {
+        let before = fixture(b"compiler=1");
+        let mut after = before.clone();
+        after.insert("core", b"fn core() { 42 }", [] as [&str; 0]);
+        assert_eq!(
+            analyze_interface_invalidation(
+                &before,
+                &after,
+                &interfaces(&before),
+                &interfaces(&after),
+            ),
+            InterfaceInvalidation::Dirty {
+                changed_modules: vec!["core".into()],
+                affected_dependents: vec![],
+            }
+        );
+        assert_eq!(
+            invalidated_modules(&before, &after),
+            Invalidation::Dirty {
+                modules: vec!["api".into(), "app".into(), "core".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn public_interface_change_invalidates_transitive_importers() {
+        let before = fixture(b"compiler=1");
+        let mut after = before.clone();
+        after.insert("core", b"fn core(x) { x }", [] as [&str; 0]);
+        let mut changed = interfaces(&after);
+        changed.insert("core", b"core: Int -> Int");
+        assert_eq!(
+            analyze_interface_invalidation(&before, &after, &interfaces(&before), &changed),
+            InterfaceInvalidation::Dirty {
+                changed_modules: vec!["core".into()],
+                affected_dependents: vec!["api".into(), "app".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn missing_interface_observation_is_full_rebuild() {
+        let before = fixture(b"compiler=1");
+        let mut incomplete = interfaces(&before);
+        incomplete.fingerprints.remove("api");
+        assert!(matches!(
+            analyze_interface_invalidation(&before, &before, &interfaces(&before), &incomplete),
+            InterfaceInvalidation::FullRebuild { .. }
+        ));
+    }
+
+    #[test]
+    fn changing_import_edges_invalidates_downstream_even_with_stable_api() {
+        let before = fixture(b"compiler=1");
+        let mut after = before.clone();
+        after.insert("api", b"fn api() { core() }", ["core", "unrelated"]);
+        assert_eq!(
+            analyze_interface_invalidation(
+                &before,
+                &after,
+                &interfaces(&before),
+                &interfaces(&after),
+            ),
+            InterfaceInvalidation::Dirty {
+                changed_modules: vec!["api".into()],
+                affected_dependents: vec!["app".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn interface_change_without_source_change_is_reported() {
+        let snapshot = fixture(b"compiler=1");
+        let mut updated = interfaces(&snapshot);
+        updated.insert("core", b"changed exported effect row");
+        assert_eq!(
+            analyze_interface_invalidation(&snapshot, &snapshot, &interfaces(&snapshot), &updated,),
+            InterfaceInvalidation::Dirty {
+                changed_modules: vec!["core".into()],
+                affected_dependents: vec!["api".into(), "app".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn added_unimported_module_only_changes_itself() {
+        let before = fixture(b"compiler=1");
+        let mut after = before.clone();
+        after.insert("new", b"fn new() { 1 }", [] as [&str; 0]);
+        assert_eq!(
+            analyze_interface_invalidation(
+                &before,
+                &after,
+                &interfaces(&before),
+                &interfaces(&after),
+            ),
+            InterfaceInvalidation::Dirty {
+                changed_modules: vec!["new".into()],
+                affected_dependents: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn complete_equal_interface_observations_are_unchanged() {
+        let before = fixture(b"compiler=1");
+        assert_eq!(
+            analyze_interface_invalidation(
+                &before,
+                &before,
+                &interfaces(&before),
+                &interfaces(&before),
+            ),
+            InterfaceInvalidation::Unchanged
+        );
+    }
+
+    #[test]
+    fn mismatched_interface_compilation_context_requires_full_rebuild() {
+        let before = fixture(b"compiler=1");
+        let mut observed = interfaces(&before);
+        observed.context_digest = [0; 32];
+        assert!(matches!(
+            analyze_interface_invalidation(&before, &before, &interfaces(&before), &observed,),
+            InterfaceInvalidation::FullRebuild { .. }
+        ));
+    }
+
+    #[test]
+    fn extra_interface_observation_requires_full_rebuild() {
+        let before = fixture(b"compiler=1");
+        let mut observed = interfaces(&before);
+        observed.insert("unknown", b"untracked public interface");
+        assert!(matches!(
+            analyze_interface_invalidation(&before, &before, &interfaces(&before), &observed,),
+            InterfaceInvalidation::FullRebuild { .. }
+        ));
+    }
+
+    #[test]
+    fn invalid_module_graph_remains_fail_closed() {
+        let before = fixture(b"compiler=1");
+        let mut after = before.clone();
+        after.modules.remove("core");
+        assert!(matches!(
+            analyze_interface_invalidation(
+                &before,
+                &after,
+                &interfaces(&before),
+                &interfaces(&after),
+            ),
+            InterfaceInvalidation::FullRebuild { .. }
+        ));
+    }
+
+    #[test]
+    fn changed_compiler_context_remains_fail_closed() {
+        let before = fixture(b"compiler=1");
+        let after = fixture(b"compiler=2");
+        assert!(matches!(
+            analyze_interface_invalidation(
+                &before,
+                &after,
+                &interfaces(&before),
+                &interfaces(&after),
+            ),
+            InterfaceInvalidation::FullRebuild { .. }
+        ));
     }
 
     #[test]

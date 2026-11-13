@@ -52,3 +52,35 @@ cargo fmt --all --check
 
 Nulang Cloud remains unchanged; this module cannot authorize shared cache
 entries, admission, placement, or metering.
+
+## Pascal-inspired public interface impact diagnostics
+
+`ModuleInterfaces` records a BLAKE3 digest of canonical, compiler-emitted
+public interface bytes for **every** resolved module in a snapshot. These
+bytes must cover exported types, effect rows, reference capabilities,
+actor behavior/protocol identity, and schema/ABI contracts. There is no
+compiler-owned interface emitter wired into this diagnostic path yet, so
+callers cannot treat supplied bytes as verified semantic fingerprints.
+
+`analyze_interface_invalidation(before, after, before_interfaces,
+after_interfaces)` separates locally changed modules from their potentially
+affected reverse dependents:
+
+- A private source-body edit with unchanged imports and public interface
+  remains a local change in the **diagnostic report only**.
+- A changed exported interface propagates through reverse dependencies.
+- A changed module import set propagates conservatively, even when the
+  supplied interface bytes match.
+- Missing/extra observations, compiler-context changes, invalid graphs,
+  and module removal require a full rebuild.
+
+The preexisting `invalidated_modules` function is unchanged and still
+conservatively invalidates all importers of a changed source module.
+Neither interface impact diagnostics nor the incremental correctness
+oracle authorize skipping semantic checks, reusing cached objects,
+or changing CI, cloud placement, or deployment behavior.
+
+To make separate compilation production-safe, implement compiler-owned
+canonical interface serialization, account for implicit dependencies,
+compare clean/incremental diagnostics, HIR/MIR and emitted artifacts,
+and benchmark repeated edits before enabling reuse.
