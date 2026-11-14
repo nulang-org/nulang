@@ -156,7 +156,7 @@ let pairs = flat_map(fn(x) { [x, x * 10] }, [1, 2])
 let groups = partition(fn(x) { x % 2 == 0 }, xs)  // ([2, 4], [1, 3, 5])
 let joined = fold(fn(acc, s) { acc + s }, "", ["Nu", "lang"])
 let matches = count_if(fn(x) { x > 3 }, xs)
-let pairs = zip(["a", "b"], [1, 2])
+let heterogeneous = zip(["a", "b"], [1, 2])
 let unique = uniq(["red", "blue", "red"])
 ```
 

@@ -247,6 +247,9 @@ jobs:
       - name: Verify stdlib sort comparator budget
         run: python3 -m unittest scripts/tests/test_stdlib_sort_complexity.py
 
+      - name: Verify combined stdlib list semantics
+        run: python3 -m unittest scripts/tests/test_stdlib_list_integration.py
+
       - name: Check zero warnings
         run: cargo check --locked --tests --no-default-features
 

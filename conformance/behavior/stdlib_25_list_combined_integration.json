@@ -1,0 +1,1 @@
+{"exit_code":0,"stdout":"unique=3\nlong=2\ngroups=2:1\nflat=4\nzip=40\nenumerate=2:gamma\nfold=:alpha:beta:gamma\nextrema=beta:alpha\nsorted=beta:alpha:gamma\nsource=5","stderr":""}
