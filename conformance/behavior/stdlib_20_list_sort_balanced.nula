@@ -1,0 +1,23 @@
+// Balanced sorting regression: ordered, reversed, and repeated values.
+import stdlib::list
+
+fn main() {
+    let ascending_input = range(64);
+    let sorted = sort_by(fn(a, b) { a < b }, ascending_input);
+    perform IO.print("ascending_ok=" + (if sorted[0] == 0 && sorted[63] == 63 then "true" else "false"));
+
+    let back = sort(reverse(ascending_input));
+    perform IO.print("descending_input_ok=" + (if back[0] == 0 && back[63] == 63 then "true" else "false"));
+
+    let same = sort([7, 7, 7, 7, 7, 7, 7, 7]);
+    perform IO.print("duplicates_ok=" + (if length(same) == 8 && same[0] == 7 && same[7] == 7 then "true" else "false"));
+
+    let items = [
+        { priority: 1, sequence: 0 },
+        { priority: 0, sequence: 1 },
+        { priority: 1, sequence: 2 },
+        { priority: 0, sequence: 3 }
+    ];
+    let stable = sort_by(fn(a, b) { a.priority < b.priority }, items);
+    perform IO.print("stable_ties=" + (if stable[0].sequence == 1 && stable[1].sequence == 3 && stable[2].sequence == 0 && stable[3].sequence == 2 then "true" else "false"));
+}
