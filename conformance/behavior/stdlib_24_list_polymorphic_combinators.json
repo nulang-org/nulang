@@ -1,0 +1,1 @@
+{"exit_code":0,"stdout":"append=red,blue\nzip=alice:10,bob:20\nenumerate=1:south\nfold_string=start-a-b\nfold_cross=3\nfold_empty=seed\nfold_order=15","stderr":""}

@@ -1,0 +1,29 @@
+// Cross-PR integration regression: composable transforms, heterogeneous
+// collection operations, Ruby-inspired helpers, and stable sorting.
+import stdlib::list
+
+fn main() {
+    let original = ["alpha", "", "beta", "alpha", "gamma"]
+    let cleaned = filter_map(fn(s) { if s == "" then None else Some(s) }, original)
+    let unique = uniq(cleaned)
+    let count_long = count_if(fn(s) { perform String.length(s) == 5 }, unique)
+    let grouped = partition(fn(s) { perform String.length(s) == 5 }, unique)
+    let copied = flat_map(fn(s) { [s, s] }, take(2, unique))
+    let pairings = zip(append(unique, ["delta"]), [10, 20, 30, 40])
+    let indexed = enumerate(unique)
+    let joined = fold(fn(acc, s) { acc + ":" + s }, "", unique)
+    let shorter = fn(a, b) { perform String.length(a) < perform String.length(b) }
+    let shortest = match min_by(shorter, unique) { Some(s) => s, None => "missing" }
+    let longest = match max_by(shorter, unique) { Some(s) => s, None => "missing" }
+    let ordered = sort_by(shorter, unique)
+    perform IO.print("unique=" + perform Int.to_string(length(unique)))
+    perform IO.print("long=" + perform Int.to_string(count_long))
+    perform IO.print("groups=" + perform Int.to_string(length(grouped.0)) + ":" + perform Int.to_string(length(grouped.1)))
+    perform IO.print("flat=" + perform Int.to_string(length(copied)))
+    perform IO.print("zip=" + perform Int.to_string(pairings[3].1))
+    perform IO.print("enumerate=" + perform Int.to_string(indexed[2].0) + ":" + indexed[2].1)
+    perform IO.print("fold=" + joined)
+    perform IO.print("extrema=" + shortest + ":" + longest)
+    perform IO.print("sorted=" + ordered[0] + ":" + ordered[1] + ":" + ordered[2])
+    perform IO.print("source=" + perform Int.to_string(length(original)))
+}

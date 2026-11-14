@@ -16,6 +16,21 @@ fn option_int_is_none(opt: Option[Int]) -> Bool {
   }
 }
 
+// Compare optional string results without relying on integer-only Test.assert_eq.
+fn option_string_eq(opt: Option[String], expected: String) -> Bool {
+  match opt {
+    Some(x) => x == expected,
+    None => false,
+  }
+}
+
+fn option_string_is_none(opt: Option[String]) -> Bool {
+  match opt {
+    Some(_) => false,
+    None => true,
+  }
+}
+
 // ── length ───────────────────────────────────────────────────────────────────
 fn test_length() {
   perform Test.assert_eq(length([]), 0, "length empty")
@@ -241,6 +256,43 @@ fn test_uniq() {
   perform Test.assert_eq(sum(same), 5, "uniq all same sum")
 }
 
+// ── Ruby-style Enumerable extensions ─────────────────────────────────────────
+fn test_count_if() {
+  let is_even = fn(x) { x - (x / 2) * 2 == 0 }
+  perform Test.assert_eq(count_if(is_even, [1, 2, 3, 4, 5, 6]), 3, "count_if matches")
+  perform Test.assert_eq(count_if(is_even, [1, 3, 5]), 0, "count_if no matches")
+  perform Test.assert_eq(count_if(is_even, []), 0, "count_if empty")
+  let nonempty = fn(s) { perform String.length(s) > 0 }
+  perform Test.assert_eq(count_if(nonempty, ["", "a", "bb", ""]), 2, "count_if string elements")
+}
+
+fn test_generic_extrema() {
+  let shorter = fn(a, b) {
+    let alen = perform String.length(a)
+    let blen = perform String.length(b)
+    alen < blen
+  }
+  perform Test.assert(option_string_eq(min_by(shorter, ["peach", "a", "pear"]), "a"), "min_by strings")
+  perform Test.assert(option_string_eq(max_by(shorter, ["a", "peach", "pear"]), "peach"), "max_by strings")
+  perform Test.assert(option_string_eq(min_by(shorter, ["aa", "bb"]), "aa"), "min_by preserves first tie")
+  perform Test.assert(option_string_eq(max_by(shorter, ["aa", "bb"]), "aa"), "max_by preserves first tie")
+  perform Test.assert(option_string_is_none(min_by(shorter, [])), "min_by empty strings")
+  perform Test.assert(option_string_is_none(max_by(shorter, [])), "max_by empty strings")
+}
+
+fn test_generic_uniq() {
+  let source = ["red", "blue", "red", "green", "blue"]
+  let result = uniq(source)
+  perform Test.assert_eq(length(result), 3, "uniq string length")
+  perform Test.assert(result[0] == "red", "uniq preserves first string")
+  perform Test.assert(result[1] == "blue", "uniq preserves second string")
+  perform Test.assert(result[2] == "green", "uniq preserves third string")
+  perform Test.assert_eq(length(source), 5, "uniq does not mutate input")
+  let flags = uniq([true, false, true])
+  perform Test.assert_eq(length(flags), 2, "uniq bool length")
+  perform Test.assert(flags[0] && !flags[1], "uniq bool ordering")
+}
+
 fn main() {
   test_length()
   test_sum()
@@ -266,4 +318,7 @@ fn main() {
   test_zip()
   test_enumerate()
   test_uniq()
+  test_count_if()
+  test_generic_extrema()
+  test_generic_uniq()
 }

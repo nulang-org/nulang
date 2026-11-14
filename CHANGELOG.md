@@ -1,4 +1,9 @@
 # Nulang Changelog
+
+### Ruby Enumerable and polymorphic stdlib integration — 2026-11-14
+- **The Experimental list helpers `fold`, `append`, `zip`, and `enumerate` accept compatible non-integer types.** `fold` supports heterogeneous accumulators and `zip` accepts mixed-type inputs. The source-level behavioral fixture checks noncommutative folds, empty folds, and mixed tuples.
+- **Integration preserves previous `filter_map`, `flat_map`, and `partition` support** and adds `count_if`, generic `min_by`/`max_by` and generic `uniq`. No parser, VM, bytecode, or backend changes.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
