@@ -342,12 +342,13 @@ Stdlib `list` functions fall into two categories:
 - **Polymorphic**: `length`, `contains`, `index_of`, `find`,
   `any`, `all`, `map`, `filter`, `filter_map`, `flat_map`,
   `partition`, `fold`, `append`, `zip`, `enumerate`, `reverse`,
-  `take`, `drop`, and `range` accept compatible element types.
+  `take`, `drop`, `range`, `count_if`, `min_by`, `max_by`, and
+  `uniq` accept compatible element types.
   `fold` accepts an accumulator independent of the element type, while
   `zip` supports different left/right element types.
 
 - **Int-only** (annotated `[Int]`): `sum`, `max_of`, `min_of`,
-  `sort`, and `uniq` require integer arrays.
+  and `sort` require integer arrays.
 
 ```nula
 import stdlib::list
@@ -358,6 +359,9 @@ let joined = fold(fn(acc, s) { acc + s }, "hello", ["world"])
 let words = append(["hello"], ["world"])
 let pairs = zip(["alice"], [42])
 let indexed = enumerate(["north", "south"])
+let red_count = count_if(fn(s) { s == "red" }, ["red", "blue", "red"])
+let unique = uniq(["red", "blue", "red"])
+let short = min_by(fn(a, b) { perform String.length(a) < perform String.length(b) }, ["aaa", "b"])
 let excited = map(fn(s) { s + "!" }, ["a", "b", "c"])
 let pos = filter(fn(r) { r.x > 0 }, [{x: 1}, {x: -1}, {x: 2}])
 

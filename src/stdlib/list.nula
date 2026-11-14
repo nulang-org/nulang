@@ -5,7 +5,8 @@
 // partition, fold, append, zip, enumerate, reverse, take, drop, range,
 // length, contains, index_of, find, any and all. A fold accumulator
 // may differ from its element type; zip accepts distinct element types.
-// Integer-only helpers: sum, max_of, min_of, sort, uniq.
+// Integer-only helpers: sum, max_of, min_of, sort.
+// Comparator extrema and uniq work with compatible element types.
 //
 // Built on `perform Array.push` / `perform Array.new` / `perform Array.length`
 // primitives (added 2026-07-30).
@@ -67,6 +68,16 @@ pub fn find(pred, xs) {
         if pred(x) then { return Some(x) } else {}
     };
     None
+}
+
+/// Count matching elements in one traversal, without allocating a filtered array.
+/// The predicate runs exactly once per input element, left to right.
+pub fn count_if(pred, xs) -> Int {
+    var count = 0;
+    for x in xs {
+        if pred(x) then { count = count + 1 } else {}
+    };
+    count
 }
 
 /// Left fold: fold(f, init, [a, b, c]) = f(f(f(init, a), b), c).
@@ -251,27 +262,35 @@ pub fn sort_by(cmp, xs) {
 }
 
 /// Minimum element according to comparator cmp(a, b), or None for an empty array.
+/// Polymorphic: comparator must be a strict ordering; equal keys keep first.
 pub fn min_by(cmp, xs) {
-    var first = true;
-    var best = 0;
-    for x in xs {
-        if first then { best = x; first = false } else {
-            if cmp(x, best) then { best = x } else {}
-        }
-    };
-    if first then None else Some(best)
+    let len = perform Array.length(xs);
+    if len == 0 then { None } else {
+        var best = xs[0];
+        var i = 1;
+        while i < len {
+            let x = xs[i];
+            if cmp(x, best) then { best = x } else {};
+            i = i + 1
+        };
+        Some(best)
+    }
 }
 
 /// Maximum element according to comparator cmp(a, b), or None for an empty array.
+/// Polymorphic: comparator must be a strict ordering; equal keys keep first.
 pub fn max_by(cmp, xs) {
-    var first = true;
-    var best = 0;
-    for x in xs {
-        if first then { best = x; first = false } else {
-            if cmp(best, x) then { best = x } else {}
-        }
-    };
-    if first then None else Some(best)
+    let len = perform Array.length(xs);
+    if len == 0 then { None } else {
+        var best = xs[0];
+        var i = 1;
+        while i < len {
+            let x = xs[i];
+            if cmp(best, x) then { best = x } else {};
+            i = i + 1
+        };
+        Some(best)
+    }
 }
 
 /// Concatenate two arrays into a new array.  Original arrays unchanged.
@@ -309,7 +328,8 @@ pub fn enumerate(xs) {
 }
 
 /// Remove duplicates, preserving first-occurrence order.
-pub fn uniq(xs: [Int]) -> [Int] {
+/// Accepts any equality-comparable type; uses linear scans (quadratic worst case).
+pub fn uniq(xs) {
     var result = [];
     for x in xs {
         if !contains(x, result) then { result = perform Array.push(result, x) } else {}
