@@ -1,11 +1,11 @@
 // Nulang standard library — list/array operations over native arrays.
 // Language version: 2.0.0-alpha
 //
-// Polymorphic functions (map, filter, filter_map, flat_map, partition,
-// fold, reverse, take, drop, range, length, contains, index_of, find,
-// any, all) work with compatible element types. Functions with explicit
-// [Int] annotations (sum, max_of, min_of, sort, append, zip, enumerate,
-// uniq) are Int-only for now.
+// Polymorphic functions include map, filter, filter_map, flat_map,
+// partition, fold, append, zip, enumerate, reverse, take, drop, range,
+// length, contains, index_of, find, any and all. A fold accumulator
+// may differ from its element type; zip accepts distinct element types.
+// Integer-only helpers: sum, max_of, min_of, sort, uniq.
 //
 // Built on `perform Array.push` / `perform Array.new` / `perform Array.length`
 // primitives (added 2026-07-30).
@@ -275,7 +275,7 @@ pub fn max_by(cmp, xs) {
 }
 
 /// Concatenate two arrays into a new array.  Original arrays unchanged.
-pub fn append(xs: [Int], ys: [Int]) -> [Int] {
+pub fn append(xs, ys) {
     var result = xs;
     for x in ys {
         result = perform Array.push(result, x)
@@ -284,7 +284,7 @@ pub fn append(xs: [Int], ys: [Int]) -> [Int] {
 }
 
 /// Zip two arrays into an array of tuples. Result length = min(len(xs), len(ys)).
-pub fn zip(xs: [Int], ys: [Int]) {
+pub fn zip(xs, ys) {
     var result = [];
     var i = 0;
     var len_x = perform Array.length(xs);
@@ -297,7 +297,7 @@ pub fn zip(xs: [Int], ys: [Int]) {
 }
 
 /// Enumerate: returns [(0, xs[0]), (1, xs[1]), ...].
-pub fn enumerate(xs: [Int]) {
+pub fn enumerate(xs) {
     var result = [];
     var i = 0;
     var len = perform Array.length(xs);

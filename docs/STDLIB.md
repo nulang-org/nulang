@@ -83,12 +83,13 @@ let r = sqrt(25.0)       // ~5.0
 List/array operations over native arrays. Functions fall into two categories:
 
 - **Int-only** (annotated `[Int]`): `sum`, `max_of`, `min_of`,
-  `sort`, `append`, `zip`, `enumerate`, and `uniq`.
+  `sort`, and `uniq`.
 
 - **Polymorphic** (no element-type annotation): `length`, `contains`, `index_of`,
-  `find`, `any`, `all`, `map`, `filter`, `filter_map`, `flat_map`, `partition`,
-  `fold`, `reverse`, `take`, `drop`, and `range`. These accept compatible
-  accumulator and element types.
+  `find`, `any`, `all`, `map`, `filter`, `filter_map`, `flat_map`,
+  `partition`, `fold`, `append`, `zip`, `enumerate`, `reverse`, `take`,
+  `drop`, and `range`. Fold accumulator types may differ from input element
+  types; zip accepts heterogeneous array element types.
 
 ### Traversal functions
 
