@@ -1,4 +1,8 @@
 # Nulang Changelog
+
+### Optional Syntyr styling preset for Web scaffolds — 2026-11-15
+- **The existing `nula new --template web` now supports opt-in `--style syntyr`.** Generated apps include pinned, self-hosted Syntyr 0.3.0-alpha.4 core and semantic styles, MIT attribution, scoped Studio styling, a responsive Todo UI, and no mandatory npm/CDN/JavaScript dependency. The default web template remains unstyled.
+- **Generated Todo forms support standard no-JavaScript POST submissions.** Hidden action fields distinguish add, toggle and delete operations; web starter type annotations incompatible with route-contract parsing have been removed. Both styled and unstyled web scaffold builds were verified locally.
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
