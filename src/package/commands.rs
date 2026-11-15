@@ -2799,6 +2799,10 @@ mod tests {
         let core = std::fs::read_to_string(dir.join("public/syntyr.core.css")).unwrap();
         let semantic = std::fs::read_to_string(dir.join("public/syntyr.semantic.css")).unwrap();
         let css = std::fs::read_to_string(dir.join("public/style.css")).unwrap();
+        assert!(
+            source.contains("el(\"html\", [(\"lang\", text(\"en\"))], ["),
+            "Syntyr starter needs an explicit document language for assistive technology"
+        );
         assert!(source.contains("syn-root syn-semantic"));
         assert!(source.contains("data-syn-theme"));
         assert!(source.contains("syntyr.core.css"));

@@ -118,7 +118,8 @@ fn home() {
             delete_todo(form_value("id"))
         } else {}
     } else {}
-    document(
+    // Explicit document language is necessary for accessible screen-reader output.
+    el("html", [("lang", text("en"))], [
         head([
             title("Nulang Todo — Syntyr"),
             el("meta", [("name", text("viewport")), ("content", text("width=device-width, initial-scale=1"))], []),
@@ -146,7 +147,7 @@ fn home() {
                 ])
             ])
         ])
-    )
+    ])
 }
 
 app "todos" {
