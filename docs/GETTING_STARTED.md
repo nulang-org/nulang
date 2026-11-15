@@ -416,6 +416,31 @@ my-project/
   src/main.nula        # entry point
 ```
 
+
+### Optional Syntyr styling for web projects
+
+Nulang's web framework remains styling-agnostic. To generate a server-rendered
+Todo starter with self-hosted, MIT-licensed Syntyr CSS:
+
+```sh
+nulang nula new tasks --template web --style syntyr
+cd tasks
+nulang nula dev
+# http://127.0.0.1:8787/
+```
+
+The preset includes pinned Syntyr 0.3.0-alpha.4 core and semantic styles,
+an app-owned `public/style.css`, an attribution license, and a local README.
+No npm, CDN, Syntyr runtime, or mandatory client JavaScript is needed.
+The normal `--template web` (without `--style`) remains unchanged.
+`--style syntyr` is restricted to `--template web`; other templates
+do not acquire a CSS dependency.
+
+The Syntyr template uses the neutral `studio` theme and scoped
+`.syn-root.syn-semantic` styling. You can edit the markup/classes,
+replace the stylesheets, or remove Syntyr without touching the HTTP routes.
+See [the Syntyr integration guide](web/SYNTYR.md).
+
 Dependencies are stored in `Nulang.toml` under `[dependencies]` and resolved to
 `Nulang.lock`.
 

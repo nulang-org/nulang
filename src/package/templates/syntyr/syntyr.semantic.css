@@ -1,0 +1,34 @@
+/* Optional semantic mode. Requires core.css and .syn-root ancestor. */
+@layer syn.semantic {
+  .syn-semantic :where(button:not([class]), input[type="submit"]:not([class]), input[type="button"]:not([class]), input[type="reset"]:not([class])) {
+    display: inline-flex; justify-content: center; align-items: center; gap: .5rem;
+    min-height: var(--syn-control-height); padding: .65rem 1rem;
+    border: 1px solid var(--syn-frame); border-radius: var(--syn-radius);
+    background: var(--syn-surface-hi); color: var(--syn-text);
+    cursor: pointer; font: 650 .81rem/1.2 var(--syn-mono);
+  }
+  .syn-semantic :where(button:not([class]), input[type="submit"]:not([class])):hover { border-color: var(--syn-accent); background: var(--syn-accent-soft); }
+  .syn-semantic :where(input:not([class]):is(:not([type]), [type="text"], [type="email"], [type="search"], [type="password"], [type="url"], [type="tel"], [type="number"], [type="date"], [type="time"], [type="datetime-local"], [type="month"], [type="week"]), select:not([class]), textarea:not([class])) {
+    width: 100%; min-height: var(--syn-control-height); padding: .7rem .8rem;
+    border: 1px solid var(--syn-frame); background: var(--syn-bg); border-radius: var(--syn-radius); color: var(--syn-text);
+  }
+  .syn-semantic :where(input:not([class]), select:not([class]), textarea:not([class])):where(:user-invalid, [aria-invalid="true"]) { border-color: var(--syn-danger); }
+  .syn-semantic :where(input[type="range"]:not([class])) { width: 100%; }
+  .syn-semantic :where(input:not([class]), textarea:not([class]))::placeholder { color: var(--syn-muted); opacity: 1; }
+  .syn-semantic :where(input[type="checkbox"]:not([class]), input[type="radio"]:not([class]), input[type="range"]:not([class])) { accent-color: var(--syn-accent); }
+  .syn-semantic :where(label:not([class])) { display: grid; gap: .35rem; font-weight: 600; font-size: .9rem; }
+  .syn-semantic :where(fieldset:not([class])) { border: 1px solid var(--syn-frame); min-width: 0; padding: 1rem; }
+  .syn-semantic :where(legend:not([class])) { padding-inline: .4rem; }
+  .syn-semantic :where(article:not([class])) { padding: clamp(1rem, 3vw, 1.75rem); border: 1px solid var(--syn-frame); background: var(--syn-surface); min-width: 0; }
+  .syn-semantic :where(table:not([class])) { width: 100%; border-collapse: collapse; text-align: left; }
+  .syn-semantic :where(th:not([class]), td:not([class])) { padding: .65rem; border-bottom: 1px solid var(--syn-frame); }
+  .syn-semantic :where(th:not([class])) { color: var(--syn-muted); }
+  .syn-semantic :where(details:not([class])) { padding-block: .75rem; border-block-start: 1px solid var(--syn-frame); }
+  .syn-semantic :where(summary:not([class])) { cursor: pointer; font-weight: 600; }
+  .syn-semantic :where(blockquote:not([class])) { margin-inline: 0; padding: .5rem 1rem; border-inline-start: 2px solid var(--syn-accent); color: var(--syn-muted); }
+  .syn-semantic :where(hr:not([class])) { border: 0; border-top: 1px solid var(--syn-frame); }
+  .syn-semantic :where(code:not([class])) { font-family: var(--syn-mono); color: var(--syn-accent); }
+  @media (forced-colors: active) {
+    .syn-semantic :where(button:not([class]), input:not([class]), select:not([class]), textarea:not([class]), article:not([class]), fieldset:not([class])) { border-color: CanvasText; }
+  }
+}
