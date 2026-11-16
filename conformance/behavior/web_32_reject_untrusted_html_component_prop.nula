@@ -1,0 +1,12 @@
+import stdlib::web::html
+import stdlib::web::types
+
+component Card(children: Html) {
+    <article>{html: children}</article>
+}
+
+fn main() {
+    let payload = "<img src=x onerror=alert(1)>"
+    let page = <Card children={payload} />
+    perform IO.print(page)
+}
