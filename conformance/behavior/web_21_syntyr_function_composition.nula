@@ -1,0 +1,11 @@
+import stdlib::web::html
+import stdlib::web::types
+
+fn panel(label: String) -> Html {
+    <article class="syn-panel"><h2 class="syn-heading">{label}</h2></article>
+}
+
+fn main() {
+    let h = <section class="syn-root">{panel("Operations")}</section>
+    perform IO.print(h)
+}

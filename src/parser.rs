@@ -4415,6 +4415,23 @@ impl Parser {
         }
     }
 
+    // HTML attributes allow hyphenated and colon-separated names (e.g. data-on:click).
+    // Keep this local to the HTML parser: '-' is subtraction in Nulang code.
+    fn expect_html_attr_name(&mut self) -> NuResult<String> {
+        let mut name = self.expect_html_ident("HTML attribute name")?;
+        loop {
+            let separator = match self.peek_kind() {
+                TokenKind::Minus => '-',
+                TokenKind::Colon => ':',
+                _ => break,
+            };
+            self.advance();
+            name.push(separator);
+            name.push_str(&self.expect_html_ident("HTML attribute name segment")?);
+        }
+        Ok(name)
+    }
+
     /// Parse a JSX/HTML element: `<tag attrs>children</tag>` or `<tag attrs />`.
     /// Desugars to `el("tag", attrs, children)` where `attrs` and `children`
     /// are arrays. Text children are wrapped in `text("...")` calls.
@@ -4436,7 +4453,7 @@ impl Parser {
             }
 
             // Attribute: name="value" or name={expr} or boolean name
-            let attr_name = self.expect_html_ident("HTML attribute name")?;
+            let attr_name = self.expect_html_attr_name()?;
             let attr_val = if self.consume_if(&TokenKind::Assign) {
                 if self.consume_if(&TokenKind::LBrace) {
                     let expr = self.parse_expr()?;
@@ -6201,35 +6218,7 @@ impl Parser {
     /// Resolve an import path to a file path. Handles stdlib:: prefix.
     fn resolve_import_path(&self, import_path: &str) -> Option<std::path::PathBuf> {
         if let Some(module) = import_path.strip_prefix("stdlib::") {
-            let module_path = module.replace("::", std::path::MAIN_SEPARATOR_STR);
-            // Try NULANG_STDLIB env var first.
-            if let Ok(dir) = std::env::var("NULANG_STDLIB") {
-                return Some(std::path::PathBuf::from(dir).join(format!("{}.nula", module_path)));
-            }
-            // Try relative to executable.
-            if let Ok(exe) = std::env::current_exe() {
-                if let Some(exe_dir) = exe.parent() {
-                    let candidate = exe_dir.join("stdlib").join(format!("{}.nula", module_path));
-                    if candidate.exists() {
-                        return Some(candidate);
-                    }
-                }
-            }
-            // Development fallback: src/stdlib/ relative to CWD.
-            if let Ok(cwd) = std::env::current_dir() {
-                let dev_path = cwd
-                    .join("src")
-                    .join("stdlib")
-                    .join(format!("{}.nula", module_path));
-                if dev_path.exists() {
-                    return Some(dev_path);
-                }
-            }
-            // Last resort.
-            return Some(std::path::PathBuf::from(format!(
-                "src/stdlib/{}.nula",
-                module_path
-            )));
+            return Some(crate::resolver::resolve_stdlib_module(module));
         }
 
         // @nulang/auth or @nulang/auth/session -> resolved via NULANG_MODULE_PATH.

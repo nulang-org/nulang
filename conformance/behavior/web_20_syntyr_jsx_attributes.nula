@@ -1,0 +1,10 @@
+import stdlib::web::html
+import stdlib::web::types
+
+fn main() {
+    let label = "Sync"
+    let h = <section class="syn-root" data-syn-theme="studio" aria-label="Dashboard">
+        <button class="syn-button" type="button" aria-pressed="true" data-syn-state="active">{label}</button>
+    </section>
+    perform IO.print(h)
+}
