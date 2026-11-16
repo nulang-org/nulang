@@ -1,0 +1,11 @@
+import stdlib::web::html
+import stdlib::web::types
+
+fn main() {
+    let h = <main class="syn-root">
+        <p class="syn-lede">Hello,
+            Nulang Web.</p>
+        <p>Second paragraph!</p>
+    </main>
+    perform IO.print(h)
+}

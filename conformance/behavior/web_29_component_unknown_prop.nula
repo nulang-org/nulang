@@ -1,0 +1,11 @@
+import stdlib::web::html
+import stdlib::web::types
+
+component Card(title: String) {
+    <article>{title}</article>
+}
+
+fn main() {
+    let view = <Card title="Operations" unknown="x" />
+    perform IO.print(view)
+}

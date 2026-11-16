@@ -6,6 +6,6 @@ fn panel(label: String) -> Html {
 }
 
 fn main() {
-    let h = <section class="syn-root">{panel("Operations")}</section>
+    let h = <section class="syn-root">{html: panel("Operations")}</section>
     perform IO.print(h)
 }

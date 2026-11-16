@@ -1,0 +1,12 @@
+import stdlib::web::html
+import stdlib::web::types
+
+component Card(title: String) {
+    <article class="syn-panel"><h2>{title}</h2></article>
+}
+
+fn main() {
+    let attack = "<img src=x onerror=alert(1)>"
+    let view = <Card title={attack} />
+    perform IO.print(view)
+}
