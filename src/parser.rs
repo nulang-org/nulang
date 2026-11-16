@@ -4719,12 +4719,11 @@ impl Parser {
                     self.pos = saved;
                     children.push(self.parse_html_expr()?);
                 } else {
+                    let interpolation_span = self.current_span();
                     self.advance(); // '{'
-                                    // JSX escapes arbitrary expressions by default. Embedding
-                                    // an already constructed Html value requires the explicit
-                                    // {html: expression} form (the same trust boundary as raw).
-                                    // This prevents ordinary route/query strings from becoming
-                                    // executable markup when interpolated in JSX.
+                                    // Expressions are escaped by default. Explicit {html: expr}
+                                    // may insert a prebuilt Html fragment, but must not accept
+                                    // an untrusted String even if el()'s array inference is loose.
                     let trusted_html = matches!(
                         self.peek_kind(),
                         TokenKind::Ident(name) if name == "html"
@@ -4739,12 +4738,25 @@ impl Parser {
                     let expr = self.parse_expr()?;
                     self.expect(TokenKind::RBrace)?;
                     children.push(if trusted_html {
-                        expr
+                        // A typed let checks opaque nominal identity through
+                        // the existing typechecker; no new runtime operation.
+                        let binding_name = format!("__nulang_html_{}", interpolation_span.start);
+                        let html_type =
+                            self.resolve_named_type("Html", Vec::new(), interpolation_span)?;
+                        Expr::Let {
+                            name: binding_name.clone(),
+                            ty: Some(html_type),
+                            value: Box::new(expr),
+                            body: Box::new(Expr::Var(binding_name, interpolation_span)),
+                            mutable: false,
+                            let_in: true,
+                            span: interpolation_span,
+                        }
                     } else {
                         Expr::App {
-                            func: Box::new(Expr::Var("text".to_string(), span)),
+                            func: Box::new(Expr::Var("text".to_string(), interpolation_span)),
                             args: vec![expr],
-                            span,
+                            span: interpolation_span,
                         }
                     });
                 }
@@ -5904,7 +5916,9 @@ impl Parser {
             self.pos += 1; // also skip 'type' after 'opaque'
         }
         self.skip_newlines();
-        let decl_result = if self.peek_kind() == &TokenKind::Alias {
+        // Opaque declarations use alias syntax but have no `alias` token.
+        // Re-parsing them as regular types silently strips Nominal opacity.
+        let decl_result = if is_opaque || self.peek_kind() == &TokenKind::Alias {
             self.parse_type_alias(false, is_opaque)
         } else {
             self.parse_type_decl_variant_or_record(false, vec![])
@@ -7238,6 +7252,33 @@ mod tests {
                 );
             }
             other => panic!("expected unknown type name error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_imported_opaque_html_remains_nominal_in_annotations() {
+        let ast = parse("import stdlib::web::types\nfn unsafe_html(value: Html) -> Html { value }")
+            .expect("imported web types parse");
+        let declared = ast
+            .decls
+            .iter()
+            .find_map(|decl| match decl {
+                Decl::Function {
+                    name,
+                    params,
+                    ret_type,
+                    ..
+                } if name == "unsafe_html" => {
+                    Some((params[0].ty.as_ref().unwrap(), ret_type.as_ref().unwrap()))
+                }
+                _ => None,
+            })
+            .expect("function declaration present");
+        for ty in [declared.0, declared.1] {
+            assert!(
+                matches!(ty, Type::Nominal { name, .. } if name == "Html"),
+                "Imported opaque Html must not silently become String: {ty:?}"
+            );
         }
     }
 

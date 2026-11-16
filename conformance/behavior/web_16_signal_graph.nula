@@ -4,7 +4,7 @@ import stdlib::web::types
 signal count: Html = text("7")
 
 fn home() -> Html {
-    <div class="card"><span>{count}</span></div>
+    <div class="card"><span>{html: count}</span></div>
 }
 
 fn main() {

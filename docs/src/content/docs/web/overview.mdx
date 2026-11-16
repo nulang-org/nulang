@@ -124,9 +124,18 @@ punctuation and inline spaces; indentation-only gaps are removed from multiline
 markup. All ordinary `{expression}` interpolations are **escaped** using `Web.text`,
 including string props and values derived from requests.
 
-Use `{html: expression}` only when `expression` is already a trusted/escaped
-`Html` fragment. This is an explicit trust boundary: applying it to an
-untrusted `String` can create an HTML-injection vulnerability.
+Use `{html: expression}` only when `expression` is already an
+`Html` fragment. The compiler requires the opaque `Html` type and rejects
+plain `String` values at this boundary, including values passed to
+`Html`-typed component props. **This is not an HTML sanitizer**: calling
+`raw(untrusted_input)` explicitly constructs dangerous `Html` and remains
+the application's responsibility. Prefer `text` for all untrusted data.
+
+**Migration:** previously implicit interpolation of an `Html`-typed
+fragment or signal, such as `{count}` for `signal count: Html`, now
+requires `{html: count}`. Plain string signals keep the safe `{count}`
+form. This behavior change is intentional and should be reviewed at
+existing JSX call sites.
 
 ```nulang
 import stdlib::web::html

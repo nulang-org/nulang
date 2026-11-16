@@ -1,0 +1,8 @@
+import stdlib::web::html
+import stdlib::web::types
+
+fn main() {
+    let payload = "<script>alert(1)</script>"
+    let page = <main>{html: payload}</main>
+    perform IO.print(page)
+}
