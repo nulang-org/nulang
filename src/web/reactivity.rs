@@ -586,15 +586,29 @@ fn rewrite_expr(
                 }
             }
 
-            // Wrap direct signal reads in children with <span data-signal="...">.
+            // Wrap signal reads with <span data-signal="...">. Ordinary JSX
+            // interpolations lower to text(signal) so untrusted values are
+            // escaped; preserve that text() call inside the signal wrapper.
+            // Explicit {html: signal} still produces a direct Html value.
             if let Expr::Array(children, _) = &mut args[2] {
                 for child in children.iter_mut() {
-                    if let Expr::Var(name, child_span) = child {
-                        if signals.contains(name) {
-                            let name = name.clone();
-                            let child_span = *child_span;
-                            *child = wrap_signal_read(&name, child_span);
+                    let binding = match child {
+                        Expr::Var(name, child_span) if signals.contains(name) => {
+                            Some((name.clone(), *child_span))
                         }
+                        Expr::App { func, args, .. } if is_var(func, "text") && args.len() == 1 => {
+                            match &args[0] {
+                                Expr::Var(name, child_span) if signals.contains(name) => {
+                                    Some((name.clone(), *child_span))
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some((name, child_span)) = binding {
+                        let value = child.clone();
+                        *child = wrap_signal_read(&name, child_span, value);
                     }
                 }
             }
@@ -914,13 +928,13 @@ pub fn generate_client_runtime() -> String {
         .to_string()
 }
 
-fn wrap_signal_read(name: &str, span: Span) -> Expr {
+fn wrap_signal_read(name: &str, span: Span, value: Expr) -> Expr {
     Expr::App {
         func: Box::new(Expr::Var("el".to_string(), span)),
         args: vec![
             Expr::Literal(Literal::String("span".to_string()), span),
             Expr::Array(vec![data_attr("data-signal", name, span)], span),
-            Expr::Array(vec![Expr::Var(name.to_string(), span)], span),
+            Expr::Array(vec![value], span),
         ],
         span,
     }

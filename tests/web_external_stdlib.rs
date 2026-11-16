@@ -25,12 +25,24 @@ fn web_build_resolves_imported_html_type_from_an_external_project() {
         r#"import stdlib::web::html
 import stdlib::web::types
 
+signal status: String = "<img src=x onerror=alert(1)>"
+
+component StatusPanel(label: String) {
+    <article class="syn-panel">
+        <h2>{label}</h2>
+        <slot />
+    </article>
+}
+
 @placement(static)
 fn home() -> Html {
     document(
         head([title("External")]),
         el("body", [("class", text("syn-root")), ("data-syn-theme", text("studio"))], [
-            el("h1", [], [text("Works")])
+            <StatusPanel label="Works">
+                <p class="syn-muted">HTML-first app.</p>
+                <p>{status}</p>
+            </StatusPanel>
         ])
     )
 }
@@ -63,6 +75,11 @@ app "external" {
         assert!(contents.contains("class=\"syn-root\""));
         assert!(contents.contains("data-syn-theme=\"studio\""));
         assert!(contents.contains("Works"));
+        assert!(contents.contains("class=\"syn-panel\""));
+        assert!(contents.contains("<p class=\"syn-muted\">HTML-first app.</p>"));
+        assert!(contents.contains("data-signal=\"status\""));
+        assert!(contents.contains("&lt;img src=x onerror=alert(1)&gt;"));
+        assert!(!contents.contains("<img src=x onerror=alert(1)>"));
         assert_eq!(
             std::fs::read_to_string(&stylesheet).expect("copied static CSS"),
             "body { color: black; }"
