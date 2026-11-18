@@ -98,10 +98,39 @@ independent adoption. Obtain consent before recording or publishing anything
 and remove identifiers, credentials, and private data. If consent is
 withdrawn, exclude that participant's per-person report from publication.
 
-For aggregate findings, preserve the entire funnel: invited, consented,
-attempted, completed independently, completed with help, blocked, declined,
-and withdrawn. Avoid reporting a median from an unspecified or selectively
-sampled denominator. `Issue #809` is the public tracker; do not post raw
+### Consent-safe recruitment disposition counts
+
+Keep a **cohort-level, counts-only invitation ledger**, separate from the
+per-participant worksheets. Increment `invited` once per distinct person
+approached *when that can be known without retaining identities*; if only
+invitation events can be counted, label them `invitations sent` and do not
+pretend they are unique people. Record `participation declined`, `recording
+declined`, and `withdrawn` as **separate** aggregate dispositions where
+disclosed collection terms and applicable rules permit. Declining a recording
+does **not** mean declining the pilot: the person may still participate
+without audio/video recording, with only the session notes they explicitly
+allow. Declining participation does not authorize an individual
+worksheet or contact record. Do not retain names, contact details, participant IDs, unique
+timestamps, reasons, quotes, session notes, or a linkable record for people
+who decline participation.
+
+When someone withdraws, remove their worksheet and individual-level
+session/recording evidence as required by their withdrawal request. Retain a
+withdrawal count **only if** it is irreversibly non-identifying and permitted
+by the disclosed retention terms; otherwise disclose the affected
+denominator as `not measurable`, rather than silently treating the person
+as an independent completion. Never reconstruct an individual's status from
+the aggregate counters. Do not publish granular cohort slices from which a
+single person's participation or withdrawal could be inferred.
+
+For aggregate findings, preserve the full funnel: invited, participation
+declined, recording declined, consented, attempted, completed independently,
+completed with help, blocked, and withdrawn. These are **stage counts, not mutually exclusive categories**:
+someone may consent, attempt, and later withdraw. State the denominator for
+every reported rate (for example `independent completions / distinct invitees` when
+measurable and `independent completions / attempted`) and separately report missing
+dispositions. Never use a survivor-only denominator or invent zero values
+for unmeasured stages. `Issue #809` is the public tracker; do not post raw
 interviews or private transcripts there.
 
 ## Decision rules

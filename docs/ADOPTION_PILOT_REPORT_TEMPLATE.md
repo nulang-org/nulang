@@ -15,6 +15,8 @@ tokens, private source code, or unredacted logs.
 | --- | --- |
 | Anonymous ID | `P-___` |
 | Consent for participation | yes / no / withdrawn |
+| Consent for session notes | yes / no / withdrawn |
+| Optional audio/video recording consent | yes / no / withdrawn |
 | Consent to publish anonymous findings | yes / no / withdrawn |
 | Previous language / actor-system experience | |
 | Operating system and architecture | |
@@ -120,10 +122,37 @@ reliability guarantee.
 - **Suggested narrowly scoped follow-up issue:**
 - **Publication permission confirmed?** yes / no
 
-When reporting across participants, include the complete denominator (invited,
-consented, attempted, completed independently, assisted, blocked, declined,
-withdrawn) rather than only successes. Report median onboarding times **only
-for actually measured samples**, alongside sample count and missing values.
+For the **cohort-level report**, use a separate counts-only ledger, not a
+compilation of withdrawn worksheets or identifiers for declined invitees.
+See the [aggregate disposition rules](ADOPTION_PILOT.md#consent-safe-recruitment-disposition-counts).
+Do not create an individual worksheet for someone who declines participation;
+declining optional recording alone does **not** exclude them from the pilot.
+Destroy withdrawn participant records as required by the withdrawal request;
+retain aggregate withdrawal counts only when irreversibly non-identifying
+and permitted.
+
+| Aggregate stage | Count or `not measurable` |
+| --- | --- |
+| Distinct invitees, when verifiable without identifiers | |
+| Invitations sent, if distinct invitees are not measurable | |
+| Participation declined | |
+| Recording declined (may still participate) | |
+| Consented to session | |
+| Attempted | |
+| Completed independently | |
+| Completed with assistance | |
+| Blocked / abandoned | |
+| Follow-up completed ≥24 hours later | |
+| Withdrawn | |
+| Unknown invitation disposition | |
+
+These counts overlap across stages: **do not sum them to invent a cohort
+size**. For each success percentage, specify its denominator (distinct
+invitees where measurable, or attempted). **Never** divide people who
+completed by invitation events and call it a participant conversion rate.
+Disclose exclusions and unknown dispositions. Report median
+onboarding times **only for actually measured, consented samples**,
+alongside sample count and missing values.
 Use the [pilot gate](ADOPTION_PILOT.md) and [semantic stabilization
 contract](SEMANTIC_STABILIZATION_CONTRACT.md) to distinguish an early adoption
 milestone from a later language-stability decision.

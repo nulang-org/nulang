@@ -70,8 +70,17 @@ reviewed and merged.
    recorded. Assisted completions are useful findings, not unassisted success.
 4. **Record one worksheet per participant** and schedule the return attempt
    for at least 24 hours later. Keep raw evidence private where necessary.
-5. **Report the denominator and outcomes** in #809 only with participant
-   permission. Separate invited, declined, consented, attempted, assisted,
+5. **Track the invitation funnel without a participant roster.** Count each
+   person once when this can be established without retaining identifiers;
+   otherwise count invitation events explicitly. Tally participation and
+   recording refusals separately using only the
+   [consent-safe aggregate ledger](ADOPTION_PILOT.md#consent-safe-recruitment-disposition-counts).
+   Do not create participant worksheets for invitees who decline participation.
+   A participant may refuse recording and still complete the pilot. Follow
+   the withdrawal and publication rules before retaining or sharing counts.
+   Report denominators and outcomes in #809 only when publication is
+   permitted; distinguish invited, participation declined, recording declined,
+   consented, attempted, assisted,
    blocked, independently completed, follow-up completed, and withdrawn.
 6. **Prioritize reproducible blockers** and defer broad performance or new
    core features unless the participant evidence justifies them.
