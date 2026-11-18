@@ -11,6 +11,8 @@
 //!   sim.run_until_quiescence();
 //!   assert!(!sim.has_deadlock());
 
+pub mod shrink;
+
 use std::collections::{HashMap, VecDeque};
 
 /// Seed count for DST seed-sweep tests. Defaults to `default`; the

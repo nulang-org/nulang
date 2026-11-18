@@ -86,7 +86,7 @@ Comparisons: `==`, `!=`, `<`, `>`. Booleans: `true`, `false`, `and`, `or`, `not`
 
 ### Strings
 
-Single-quoted strings and string concatenation:
+Double-quoted strings and string concatenation:
 
 ```nula
 let greeting = "Hello"

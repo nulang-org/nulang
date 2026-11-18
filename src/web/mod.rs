@@ -5,6 +5,7 @@ pub mod budget;
 pub mod contracts;
 pub mod dispatch;
 pub mod handler_call;
+pub mod html_safety;
 pub mod http_problem;
 pub mod http_request;
 pub mod ir;

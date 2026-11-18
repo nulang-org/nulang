@@ -160,6 +160,12 @@ Examples:
 - `actor/message_enqueue/*` measures local mailbox admission/enqueue only.
 - `actor/message_drain/*` measures scheduler + registered native-handler
   execution for messages already queued in setup.
+- `actor/fabric_publish_unmatched/{0,1000,10000}` measures a Fabric publish
+  with no matching subscription while unrelated idle actors are resident. Actor
+  construction, scheduler settling, and teardown are excluded. This isolates
+  the formerly eager all-actor mailbox-pressure scan; it is *not* subscriber
+  dispatch or delivered-message throughput. Compare the three actor-count
+  points on the same host to detect inappropriate dependence on actor density.
 - `actor/lifecycle_spawn_send_receive_gc` is an end-to-end lifecycle cost and
   is intentionally not a message-throughput benchmark.
 - `gc/orca_throughput` exercises admitted primitive actor traffic plus the

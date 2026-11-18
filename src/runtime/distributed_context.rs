@@ -821,11 +821,10 @@ impl Runtime {
 
         let shard_idx = self.shard_idx;
         let shard_count = self.shard_count.max(1);
-        let local_mailboxes: HashMap<u64, (usize, usize)> = self
-            .actors
-            .iter()
-            .map(|(&actor_id, actor)| (actor_id, (actor.mailbox.len(), actor.mailbox.capacity())))
-            .collect();
+        // Only matching local targets need their mailbox scored. Reading the
+        // actor table on demand avoids cloning every actor's pressure metrics
+        // into a temporary hash map for each publication.
+        let actors = &self.actors;
         let cluster_known = self.distributed.cluster.is_some();
         let healthy_remote: HashSet<NodeId> = self
             .distributed
@@ -847,7 +846,9 @@ impl Runtime {
                 FabricTarget::Local { actor_id, .. } => {
                     let owner_shard = (*actor_id % shard_count as u64) as u16;
                     if owner_shard == shard_idx {
-                        let (depth, capacity) = *local_mailboxes.get(actor_id)?;
+                        let actor = actors.get(actor_id)?;
+                        let depth = actor.mailbox.len();
+                        let capacity = actor.mailbox.capacity();
                         if capacity > 0 && depth >= capacity {
                             return None;
                         }
@@ -1139,6 +1140,45 @@ mod tests {
 
         shards[1].drain_cross_shard_messages();
         assert_eq!(shards[1].actors.get(&3).unwrap().mailbox.len(), 1);
+    }
+
+    #[test]
+    fn fabric_group_placement_uses_live_mailbox_depth_across_publishes() {
+        let mut rt = Runtime::new();
+        // Unsubscribed actors must not affect which worker gets a job.
+        for id in 200..300 {
+            let actor = Actor::new(id, "unsubscribed", 1);
+            rt.actors.insert(id, actor);
+        }
+
+        for id in [120, 122] {
+            let mut worker = Actor::new(id, "worker", 1);
+            worker.state = ActorState::Running;
+            worker.register_behavior("work", noop);
+            rt.actors.insert(id, worker);
+            rt.fabric_subscribe_group("jobs.*", "workers", id, "work")
+                .unwrap();
+        }
+
+        let first = rt
+            .fabric_publish_report("jobs.run", &[Value::int(1)])
+            .unwrap();
+        assert_eq!(first.admitted, 1);
+        assert_eq!(rt.actors.get(&120).unwrap().mailbox.len(), 1);
+        assert_eq!(rt.actors.get(&122).unwrap().mailbox.len(), 0);
+
+        let second = rt
+            .fabric_publish_report("jobs.run", &[Value::int(2)])
+            .unwrap();
+        assert_eq!(second.admitted, 1);
+        assert_eq!(rt.actors.get(&122).unwrap().mailbox.len(), 1);
+
+        // Once both bounded mailboxes are full, no worker is eligible.
+        let saturated = rt
+            .fabric_publish_report("jobs.run", &[Value::int(3)])
+            .unwrap();
+        assert_eq!(saturated.selected, 0);
+        assert_eq!(saturated.admitted, 0);
     }
 
     #[test]

@@ -21,6 +21,7 @@
 //! the contract and prevent future implementations from quietly upgrading an
 //! at-least-once external call into an unsound "exactly once" promise.
 
+use crate::bytecode::{CodeModule, Constant, OpCode};
 use crate::primitives::{DeliverySemantics, EffectBoundary};
 use crate::semantic_identity::EffectSiteId;
 use blake3::Hasher;
@@ -71,11 +72,27 @@ impl DurableEffectId {
         site_id: EffectSiteId,
         occurrence_index: u32,
     ) -> Self {
+        Self::derive_from_site_bytes(
+            actor_id,
+            execution_key,
+            site_id.as_bytes(),
+            occurrence_index,
+        )
+    }
+
+    /// Reuse the canonical site-ID encoding directly from checked bytecode
+    /// metadata, rather than duplicating the identity hash in host adapters.
+    fn derive_from_site_bytes(
+        actor_id: u64,
+        execution_key: &str,
+        site_id: &[u8; 32],
+        occurrence_index: u32,
+    ) -> Self {
         let mut hasher = Hasher::new();
         hasher.update(EFFECT_ID_SITE_DOMAIN);
         hasher.update(&actor_id.to_le_bytes());
         hash_len_prefixed(&mut hasher, execution_key.as_bytes());
-        hasher.update(site_id.as_bytes());
+        hasher.update(site_id);
         hasher.update(&occurrence_index.to_le_bytes());
         Self(*hasher.finalize().as_bytes())
     }
@@ -194,7 +211,104 @@ pub struct DurableEffectSpec {
     pub delivery: DeliverySemantics,
 }
 
+/// Why an artifact cannot be used as the source of a durable external effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompiledEffectSpecError {
+    /// The caller did not supply an identity that survives crash/replay.
+    MissingExecutionKey,
+    /// The compiler did not produce semantic identity for this bytecode PC.
+    MissingSite { pc: usize },
+    /// The PC is not a valid asynchronous effect instruction.
+    InvalidOpcode { pc: usize },
+    /// The effect metadata and opcode constant disagree.
+    OperationMismatch { pc: usize },
+}
+
+impl fmt::Display for CompiledEffectSpecError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingExecutionKey => {
+                write!(
+                    f,
+                    "durable compiled effect requires a replay-stable execution key"
+                )
+            }
+            Self::MissingSite { pc } => {
+                write!(f, "missing compiler-owned effect-site metadata at pc {pc}")
+            }
+            Self::InvalidOpcode { pc } => {
+                write!(
+                    f,
+                    "effect-site metadata at pc {pc} does not point to PerformAsync"
+                )
+            }
+            Self::OperationMismatch { pc } => {
+                write!(
+                    f,
+                    "effect-site operation does not match opcode constant at pc {pc}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for CompiledEffectSpecError {}
+
 impl DurableEffectSpec {
+    /// Construct an effect spec using compiler-owned identity from a checked
+    /// asynchronous `perform` site in a bytecode artifact.
+    ///
+    /// Validates that the metadata's PC targets `PerformAsync` and that its
+    /// declared operation matches the opcode constant. The static site ID and
+    /// caller's replay-stable turn key/occurrence identify the logical call.
+    ///
+    /// This **does not dispatch or journal the effect**, or authenticate its
+    /// semantic-site hash. Use only an artifact admitted through the verified
+    /// compilation/artifact-pin path; opcode/constant agreement alone cannot
+    /// prove provenance. Callers must pass the spec to the coordinator before
+    /// provider dispatch and supply truthful boundary/delivery semantics.
+    /// Effectively-once still requires real provider-side deduplication.
+    pub fn from_compiled_async_site(
+        module: &CodeModule,
+        pc: usize,
+        actor_id: u64,
+        execution_key: &str,
+        occurrence_index: u32,
+        boundary: EffectBoundary,
+        delivery: DeliverySemantics,
+    ) -> Result<Self, CompiledEffectSpecError> {
+        if execution_key.trim().is_empty() {
+            return Err(CompiledEffectSpecError::MissingExecutionKey);
+        }
+
+        let site = module
+            .effect_site_at(pc)
+            .ok_or(CompiledEffectSpecError::MissingSite { pc })?;
+        let instruction = module
+            .instructions
+            .get(pc)
+            .ok_or(CompiledEffectSpecError::InvalidOpcode { pc })?;
+        if instruction.opcode != OpCode::PerformAsync {
+            return Err(CompiledEffectSpecError::InvalidOpcode { pc });
+        }
+        match module.constants.get(instruction.imm16() as usize) {
+            Some(Constant::String(operation)) if operation == &site.effect_operation => {}
+            _ => return Err(CompiledEffectSpecError::OperationMismatch { pc }),
+        }
+
+        Ok(Self::new(
+            DurableEffectId::derive_from_site_bytes(
+                actor_id,
+                execution_key,
+                &site.id,
+                occurrence_index,
+            ),
+            site.effect_operation.clone(),
+            boundary,
+            delivery,
+        ))
+    }
+
     pub fn new(
         id: DurableEffectId,
         effect_operation: impl Into<String>,

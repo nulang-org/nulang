@@ -65,6 +65,90 @@ blanket exactly-once guarantee for an uncooperative provider.
 The configured backend owns retry, deduplication, and commit semantics. Nulang
 delegates rather than inferring a stronger guarantee.
 
+## Compiled async-effect identity bridge (experimental)
+
+`DurableEffectSpec::from_compiled_async_site` accepts a `CodeModule`, exact
+`PerformAsync` program counter, stable actor/turn identity, and dynamic site
+occurrence. It rejects missing site metadata, a non-`PerformAsync` opcode, a
+constant-pool operation mismatch, and a missing execution key. It derives the
+same logical `DurableEffectId` as compiler-owned semantic-site identity rather
+than inventing another effect identifier in every provider integration. Callers
+must first admit a verified/pinned compiled artifact: checking an opcode and
+constant does not establish semantic-ID provenance from untrusted metadata.
+
+`tests/effect_site_artifact_metadata.rs` now checks this bridge against a
+compiled `.nula` actor behavior, an NBC encode/decode round trip, formatting
+changes, a simulated provider commit before local receipt, repeat dispatch with
+the same idempotency key, and replay/mismatch behavior in `MemoryStore`.
+
+**This is not a .nula end-to-end durability guarantee.** The test invokes the
+coordinator directly from Rust; the production bytecode effect callback is
+not yet forced through this coordinator. `from_compiled_async_site` only
+constructs a validated specification: it does not persist a `Prepared` intent,
+dispatch the provider, or enforce provider cooperation. Full acceptance still
+requires a VM/host dispatch adapter that journals *before* the external call,
+tracks replay-stable turn keys and invocation occurrence across process restarts,
+integrates terminal receipts atomically with the owning turn, and injects real
+restart/failover faults. This work must preserve source-level effect authority
+checks and never reinterpret `DeliverySemantics` as a stronger guarantee than
+the external provider supplies.
+
+## Compiled external-effect dispatch helper (experimental)
+
+`DurableEffectCoordinator::execute_compiled_async_with_deduplication`
+takes the live owning `Actor`, an exact typed `AuthorityGrant`, a verified
+compiled module, exact effect-site PC, replay-stable execution key and occurrence,
+request bytes, and a provider callback. It rejects a mismatched actor ID, terminated actor, or
+activation epoch, requires the complete current actor grant manifest to parse,
+and verifies that an unparameterized `Other(Namespace::Operation)` grant
+matches the compiler's `Namespace.operation` effect site. All of these checks
+happen before journal reads, `Prepared` writes, or provider dispatch.
+
+**Fail-closed restriction:** This generic bridge does not authorize
+resource-parameterized or built-in grants (`Net::TcpOut`, `Fs::Read`,
+`Secret::Read`, etc.). Those require specialized host adapters that bind the
+exact evaluated destination/resource to authority. The host must supply a
+trusted live actor and correctly matched provider; caller-controlled actor
+objects, forged artifacts, or a provider closure that invokes a different
+operation are outside this proof.
+
+Once authorized, the coordinator obtains one canonical effect ID and commits
+`Prepared` **before** calling the provider,
+supplies the stable idempotency key, persists a terminal receipt, and replays
+a completed result without redispatch. Provider errors leave `Prepared`
+intact because the external operation may already have committed.
+
+When a prior effect is still `Prepared`, the coordinator reads its committed
+activation tail and refuses redispatch unless the caller's epoch matches the
+durably claimed epoch. A new owner must claim its epoch before retrying.
+A completed receipt remains available read-only across epoch changes.
+This is a **read fence**, not a lease or a proof that an owner cannot change
+between the epoch check and external dispatch. The external provider must
+actually deduplicate the idempotency key.
+
+`tests/authorized_compiled_durable_dispatch.rs` also covers missing
+or malformed grants, wrong or terminated actor, wrong activation epoch, unrelated/parameterized
+authority, revocation before retry or read-only receipt replay, and valid
+grant/receipt reuse. These cases assert no journal mutation on denial.
+
+`tests/compiled_durable_dispatch.rs` exercises source-compiled effect
+metadata through the coordinator, timeout recovery, stable provider
+deduplication and replay, drift rejection, and stale-epoch rejection using
+`MemoryStore`. This is a Rust integration path; it is **not** proof that
+the VM's ordinary `.nula` `PerformAsync` host callback uses the helper
+or that process restarts, multi-owner race conditions, all resource-scoped
+external authority, and transactional actor-turn completion have been validated.
+
+`tests/durable_compiled_store_restart.rs` extends the trusted Rust adapter
+checks to file-backed SQLite: it compiles and round-trips an NBC artifact,
+commits and reopens a terminal receipt, checks request drift and revoked
+authority after reopen, and verifies that a `Prepared` timeout preserves a
+stable provider idempotency key across a fresh store instance. The gate
+explicitly runs this regression with the `sqlite` feature. It does **not**
+execute the VM's live `PerformAsync` callback, kill a process, verify provider
+side-effect deduplication, or prove atomic actor-turn completion. Those require
+separate integration and crash tests.
+
 ## What is not yet a production-wide guarantee
 
 Passing this gate does **not** prove that every `perform`, workflow activity,

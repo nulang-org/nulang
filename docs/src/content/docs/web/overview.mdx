@@ -20,6 +20,12 @@ Nulang ships three built-in effects for the web, all resolved by the runtime hos
 The web stack is **experimental**. The pieces below are real and verified, but the surface is small — expect it to grow. The framework-style `app` blocks, placement inference, and static-site builds described below are compiler-first conveniences layered over the `Web` effect registry.
 :::
 
+:::caution[Production exposure]
+`nula dev` is a development host, **not an audited production security boundary**. The Web HTTP server, client action dispatch, and in-process SSE features are experimental. Before exposing a deployment to untrusted traffic, verify the exact revision for request framing, Host/origin checks, response header and cookie handling, static-root containment, SSE resource bounds, and form-action dispatch. Open hardening PRs do not change the guarantees of released or current-`main` code until merged and validated.
+
+For the shipped-versus-proposed distinction, see the [implementation status](https://github.com/nulang-org/nulang/blob/main/docs/IMPLEMENTATION_STATUS.md).
+:::
+
 ## Making HTTP Requests
 
 `Http.get` and `Http.post` perform a request and return the response **body as a string**, or `nil` on any error (DNS failure, non-2xx, timeout):

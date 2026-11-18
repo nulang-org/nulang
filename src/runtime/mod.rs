@@ -87,6 +87,9 @@ pub use trace::TraceContext;
 mod cluster_dst;
 
 #[cfg(test)]
+mod cluster_dst_trace_tests;
+
+#[cfg(test)]
 mod cluster_sim;
 
 #[cfg(test)]
