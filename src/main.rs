@@ -597,6 +597,17 @@ fn main() {
             || opts.emit_nbc
             || opts.emit_signals.is_some()
             || opts.emit_stdlib_docs.is_some()
+            || opts.emit_behavior_manifest.is_some()
+            || opts.behavior_package_name.is_some()
+            || opts.behavior_package_version.is_some()
+            || opts.rewrite_signals.is_some()
+            || opts.verify_source.is_some()
+            || opts.init.is_some()
+            || opts.watch.is_some()
+            || opts.explain.is_some()
+            || opts.bench_count.is_some()
+            || opts.metrics_port.is_some()
+            || opts.store_path.is_some()
             || opts.out_file.is_some()
             || opts.json
             || opts.doc

@@ -108,3 +108,32 @@ fn inspection_rejects_json_diagnostics_mode() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("without other execution modes"));
 }
+
+#[test]
+fn inspection_rejects_init_without_creating_a_directory() {
+    let dir = std::env::temp_dir().join(format!(
+        "nulang_dump_ir_init_must_not_run_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let out = Command::new(env!("CARGO_BIN_EXE_nulang"))
+        .args(["--dump-ir", "ast", "init"])
+        .arg(&dir)
+        .arg(fixture())
+        .output()
+        .expect("run nulang with incompatible init mode");
+    // Clean up even if the current implementation wrongly creates the dir.
+    let created = dir.exists();
+    if created {
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    assert!(!out.status.success(), "init must be rejected");
+    assert!(!created, "--dump-ir must never create project directories");
+}
+
+#[test]
+fn inspection_rejects_watch_mode_before_running() {
+    let out = run(&["--dump-ir", "mir", "--watch", fixture(), fixture()]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("without other execution modes"));
+}
