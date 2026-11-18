@@ -75,7 +75,9 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: nulang-linux-x86_64
-          - os: ubuntu-latest
+          # Pin the cross-build host: ubuntu-latest apt architectures can
+          # resolve incompatible package revisions and downgrade host libs.
+          - os: ubuntu-24.04
             target: aarch64-unknown-linux-gnu
             artifact: nulang-linux-aarch64
           - os: macos-latest

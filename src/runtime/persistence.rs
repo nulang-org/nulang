@@ -1364,16 +1364,48 @@ impl LibsqlStore {
         Self::new(":memory:")
     }
 
+    /// Build the HTTPS-only transport for remote libSQL, using the platform
+    /// trust store and normal certificate and hostname verification.
+    ///
+    /// Use a custom connector rather than libSQL's vulnerable older Rustls
+    /// dependency chain. Native TLS initialization failures return io::Error,
+    /// not a panic. Plaintext HTTP is rejected by the connector.
+    fn https_connector() -> io::Result<hyper_tls::HttpsConnector<hyper::client::HttpConnector>> {
+        let tls = native_tls::TlsConnector::new().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("remote libSQL TLS initialization failed: {error}"),
+            )
+        })?;
+        let mut http = hyper::client::HttpConnector::new();
+        http.enforce_http(false);
+        let mut connector =
+            hyper_tls::HttpsConnector::from((http, tokio_native_tls::TlsConnector::from(tls)));
+        connector.https_only(true);
+        Ok(connector)
+    }
+
     /// Connect to a remote Turso database.
     ///
     /// Journal pragmas (`journal_mode`, `synchronous`) are deliberately
     /// skipped: a Turso server manages its own journal and durability
     /// policy.
     pub fn new_remote(url: &str, auth_token: &str) -> io::Result<Self> {
+        // Reject insecure or unsupported schemes before allocating the Tokio
+        // runtime or constructing the transport. The libsql scheme is an
+        // HTTPS alias normalized by the upstream Hrana client.
+        if !url.starts_with("https://") && !url.starts_with("libsql://") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "remote libSQL requires an HTTPS or libsql:// endpoint",
+            ));
+        }
         let rt =
             tokio::runtime::Runtime::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let connector = Self::https_connector()?;
         let db = rt.block_on(async {
             libsql::Builder::new_remote(url.to_string(), auth_token.to_string())
+                .connector(connector)
                 .build()
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
@@ -4405,4 +4437,138 @@ mod libsql_atomic_transition_tests {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(store.latest_sequence(42), 1);
     }
+}
+
+// A remote libSQL database must never silently downgrade to a plaintext
+// transport. This connector contract is compiled only when sqlite is enabled.
+#[cfg(all(test, feature = "sqlite"))]
+#[test]
+fn libsql_remote_connector_rejects_plain_http_before_connecting() {
+    use hyper::service::Service;
+
+    let mut connector = LibsqlStore::https_connector().expect("native TLS context");
+    let url: hyper::Uri = "http://127.0.0.1:7777".parse().unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(connector.call(url));
+    assert!(result.is_err(), "remote libSQL must refuse plaintext HTTP");
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+#[test]
+fn libsql_remote_refuses_insecure_scheme_without_exposing_auth_token() {
+    let error = match LibsqlStore::new_remote("http://127.0.0.1:7777", "secret-should-stay-private")
+    {
+        Ok(_) => panic!("plaintext remote connection was admitted"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("HTTPS") || message.contains("https"),
+        "expected HTTPS-only rejection, got {message}"
+    );
+    assert!(!message.contains("secret-should-stay-private"));
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+#[test]
+fn libsql_remote_https_starts_tls_before_any_application_data() {
+    use hyper::service::Service;
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test listener");
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let peer = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut record_header = [0u8; 5];
+                    stream
+                        .read_exact(&mut record_header)
+                        .expect("TLS record header");
+                    return Some(record_header);
+                }
+                Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("unexpected localhost accept error: {error}"),
+            }
+        }
+    });
+
+    let mut connector = LibsqlStore::https_connector().unwrap();
+    let url: hyper::Uri = format!("https://127.0.0.1:{port}/").parse().unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(3), connector.call(url)).await
+    });
+    assert!(
+        result.is_err() || result.unwrap().is_err(),
+        "no TLS server responds"
+    );
+    let record = peer
+        .join()
+        .expect("test peer thread completed")
+        .expect("HTTPS connector should attempt TLS before timing out");
+    assert_eq!(
+        record[0], 0x16,
+        "TLS handshake record, not a plaintext request"
+    );
+    assert_eq!(record[1], 0x03, "TLS protocol version header");
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+#[test]
+fn libsql_remote_libsql_scheme_uses_https_custom_transport() {
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let peer = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut header = [0u8; 5];
+                    stream.read_exact(&mut header).expect("TLS client hello");
+                    return Some(header);
+                }
+                Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("unexpected localhost accept error: {error}"),
+            }
+        }
+    });
+
+    let error =
+        match LibsqlStore::new_remote(&format!("libsql://127.0.0.1:{port}"), "test-auth-token") {
+            Ok(_) => panic!("a mock TLS peer should not be accepted as a libSQL database"),
+            Err(error) => error,
+        };
+    let header = peer
+        .join()
+        .unwrap()
+        .expect("remote libsql scheme should reach TLS peer");
+    assert_eq!(header[0], 0x16, "no plaintext to libsql:// endpoint");
+    assert_eq!(header[1], 0x03, "TLS client handshake");
+    assert!(!error.to_string().contains("test-auth-token"));
 }

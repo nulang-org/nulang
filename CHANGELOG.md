@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Patched WASM/TLS dependencies and HTTPS-only remote libSQL — 2026-11-12
+- **Patched the Wasmtime 48.x/Cranelift toolchain and affected cryptography, certificate-root, and compression dependencies**, removing the November RustSec advisories without disabling the audit gate.
+- **Remote libSQL uses a platform-native HTTPS connector rather than the affected legacy Rustls dependency chain.** HTTPS and libsql:// endpoints are supported; plaintext HTTP endpoints now fail closed. Native CA trust stores must be maintained by deployments.
+- **The security branch passed cargo audit, focused SQLite/transport regressions, full-feature checks, and four-platform release builds.** Live authenticated Turso connectivity remains an operational smoke-test requirement before promoting remote-libSQL workloads.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
