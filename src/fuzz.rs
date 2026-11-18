@@ -1070,6 +1070,24 @@ mod tests {
         );
     }
 
+    /// Remaining exact shard-3 mutants from nightly 44289859849.
+    /// A representative fix is not enough: preserve each observed mutant
+    /// because a compiler change could make only one syntax variant diverge.
+    #[test]
+    fn differential_nov18_shard3_remaining_mutants_agree() {
+        for source in [
+            "var i = 0.0; var s = 0.0; while i < 100.0 { s = s + i * 2.5 - i /i 3.0; i = i + 1.0; }; s",
+            "fn choose(c) { if- c then 1 else 0 }; choose(true) + choose(false)",
+            "fn cond(c, a, b) { if -c then a else b }; cond(true, 1, 2) + cond(false, 10, 20)",
+        ] {
+            let outcome = differential_fuzz_one(source);
+            assert!(
+                matches!(outcome, Ok(DiffOutcome::Agreed { .. })),
+                "Nov 18 shard-3 mutant {source:?}: {outcome:?}"
+            );
+        }
+    }
+
     /// Differential regression cases: known kernels that must agree across
     /// all backends. Added from nightly fuzz captures (2026-10-10).
     #[test]
