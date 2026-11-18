@@ -110,8 +110,9 @@ disclosed collection terms and applicable rules permit. Declining a recording
 does **not** mean declining the pilot: the person may still participate
 without audio/video recording, with only the session notes they explicitly
 allow. Declining participation does not authorize an individual
-worksheet or contact record. Do not retain names, contact details, participant IDs, unique
-timestamps, reasons, quotes, session notes, or a linkable record for people
+worksheet or contact record. Do not retain names, contact details,
+participant IDs, unique timestamps, reasons, quotes, session notes, or a
+linkable record for people
 who decline participation.
 
 When someone withdraws, remove their worksheet and individual-level
@@ -125,10 +126,11 @@ single person's participation or withdrawal could be inferred.
 
 For aggregate findings, preserve the full funnel: invited, participation
 declined, recording declined, consented, attempted, completed independently,
-completed with help, blocked, and withdrawn. These are **stage counts, not mutually exclusive categories**:
-someone may consent, attempt, and later withdraw. State the denominator for
-every reported rate (for example `independent completions / distinct invitees` when
-measurable and `independent completions / attempted`) and separately report missing
+completed with help, blocked, and withdrawn. These are **stage counts, not
+mutually exclusive categories**: someone may consent, attempt, and later
+withdraw. State the denominator for every reported rate (for example
+`independent completions / distinct invitees` when measurable and
+`independent completions / attempted`) and separately report missing
 dispositions. Never use a survivor-only denominator or invent zero values
 for unmeasured stages. `Issue #809` is the public tracker; do not post raw
 interviews or private transcripts there.
