@@ -165,3 +165,59 @@ fn legacy_route_still_falls_back_over_real_http() {
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
     assert!(response_body(&response).starts_with("legacy"), "{response}");
 }
+
+#[test]
+fn form_redirect_returns_http_303_with_location_instead_of_meta_refresh() {
+    let (module, function_index) =
+        compile_handler(r#"fn submit() { perform Web.redirect("/done") }"#, "submit");
+    let route = WebRoute {
+        method: HttpMethod::Post,
+        path: "/submit".to_string(),
+        handler_module: module,
+        handler_func_idx: function_index,
+    };
+    let server = WebDevServer::bind(0, None, None, vec![route]).expect("bind redirect route");
+
+    let response = send_raw_request(
+        server.port,
+        "POST /submit HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 303 See Other\r\n"),
+        "{response}"
+    );
+    assert!(response.contains("\r\nLocation: /done\r\n"), "{response}");
+    assert_eq!(
+        response_body(&response),
+        "",
+        "no script or meta refresh in the redirect body"
+    );
+}
+
+#[test]
+fn redirect_location_rejects_crlf_header_injection() {
+    let (module, function_index) = compile_handler(
+        r#"fn submit() { perform Web.redirect("/done\r\nX-Injected: true") }"#,
+        "submit",
+    );
+    let route = WebRoute {
+        method: HttpMethod::Post,
+        path: "/submit".to_string(),
+        handler_module: module,
+        handler_func_idx: function_index,
+    };
+    let server = WebDevServer::bind(0, None, None, vec![route]).expect("bind redirect route");
+
+    let response = send_raw_request(
+        server.port,
+        "POST /submit HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+        "{response}"
+    );
+    assert!(!response.contains("\r\nX-Injected: true\r\n"), "{response}");
+    assert!(!response.contains("\r\nLocation: "), "{response}");
+}
