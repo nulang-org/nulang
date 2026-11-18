@@ -1565,6 +1565,25 @@ impl TypeChecker {
                     let upcap = up.cap.unwrap_or(Capability::Ref);
                     new_ctx.bind(up.name.clone(), uty, upcap, false);
                 }
+                // Constraints must refer to declared interfaces. Otherwise
+                // generic functions can type-check but fail later when HIR
+                // manufactures a non-existent _impl_* dictionary symbol.
+                // Class declarations are registered for the whole module
+                // before inference, so forward declarations remain valid.
+                for (_, _, class_names) in type_param_constraints {
+                    for class_name in class_names {
+                        if !self.class_table.contains_key(class_name) {
+                            return Err(NuError::type_error(
+                                format!(
+                                    "unknown typeclass '{}' in constraint on function '{}'",
+                                    class_name, name
+                                ),
+                                *span,
+                            ));
+                        }
+                    }
+                }
+
                 // Inject typeclass constraints from type parameter annotations
                 // so method calls on constrained type vars resolve (B.3).
                 for (_, tv, class_names) in type_param_constraints {

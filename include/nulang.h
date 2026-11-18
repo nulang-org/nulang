@@ -1,5 +1,7 @@
 /**
  * Nulang stable C embedding API.
+ * AUTO-GENERATED from src/ffi/c_api.rs and src/ffi/marshal.rs,
+ * using include/nulang.h.in. Run scripts/generate_c_header.py --write.
  *
  * This header exposes the same ABI as `src/ffi/c_api.rs`. Include it and link
  * against `libnulang.so` (or the static `nulang` rlib) to compile and run
@@ -41,10 +43,10 @@ typedef enum {
 /* -------------------------------------------------------------------------- */
 
 /** Create a new Nulang runtime. */
-NulangRuntime *nulang_runtime_new(void);
+NulangRuntime * nulang_runtime_new(void);
 
 /** Free a runtime created by `nulang_runtime_new`. */
-void nulang_runtime_free(NulangRuntime *runtime);
+void nulang_runtime_free(NulangRuntime * runtime);
 
 /* -------------------------------------------------------------------------- */
 /* Compilation and execution                                                   */
@@ -56,14 +58,14 @@ void nulang_runtime_free(NulangRuntime *runtime);
  * Returns a non-negative module handle on success, or -1 on error. On error,
  * the message is available through `nulang_last_error`.
  */
-int64_t nulang_compile(NulangRuntime *runtime, const char *source);
+int64_t nulang_compile(NulangRuntime * runtime, const char * source);
 
 /**
  * Run the top-level expression of a compiled module.
  *
  * On error the result is nil and `nulang_last_error` contains the message.
  */
-NulangValue nulang_run(NulangRuntime *runtime, int64_t module_handle);
+NulangValue nulang_run(NulangRuntime * runtime, int64_t module_handle);
 
 /**
  * Call an exported Nulang function by name.
@@ -72,21 +74,17 @@ NulangValue nulang_run(NulangRuntime *runtime, int64_t module_handle);
  * passed in r0, r1, etc. The function's return value (register 0) is
  * returned. On error the result is nil.
  */
-NulangValue nulang_call_function(NulangRuntime *runtime,
-                                 int64_t module_handle,
-                                 const char *name,
-                                 const NulangValue *args,
-                                 size_t arg_count);
+NulangValue nulang_call_function(NulangRuntime * runtime, int64_t module_handle, const char * name, const NulangValue * args, size_t arg_count);
 
 /* -------------------------------------------------------------------------- */
 /* Error handling                                                              */
 /* -------------------------------------------------------------------------- */
 
 /** Return the last error message, or NULL if there is none. */
-const char *nulang_last_error(NulangRuntime *runtime);
+const char * nulang_last_error(NulangRuntime * runtime);
 
 /** Clear the runtime's last error state. */
-void nulang_clear_error(NulangRuntime *runtime);
+void nulang_clear_error(NulangRuntime * runtime);
 
 /* -------------------------------------------------------------------------- */
 /* Value constructors                                                          */
@@ -102,9 +100,7 @@ NulangValue nulang_value_unit(void);
  * Create a Nulang string value by interning `s` into `module_handle`'s
  * constant pool. Returns nil on error.
  */
-NulangValue nulang_module_string(NulangRuntime *runtime,
-                                 int64_t module_handle,
-                                 const char *s);
+NulangValue nulang_module_string(NulangRuntime * runtime, int64_t module_handle, const char * s);
 
 /* -------------------------------------------------------------------------- */
 /* Value extractors                                                            */
@@ -122,14 +118,14 @@ bool nulang_value_is_unit(NulangValue value);
  * The returned pointer is owned by the runtime and normally valid until the
  * runtime is freed. Call `nulang_free_string` to release it earlier.
  */
-const char *nulang_value_to_string(NulangRuntime *runtime, NulangValue value);
+const char * nulang_value_to_string(NulangRuntime * runtime, NulangValue value);
 
 /**
  * Free a C string previously returned by `nulang_value_to_string`.
  *
  * Returns true if the pointer was recognized and freed.
  */
-bool nulang_free_string(NulangRuntime *runtime, const char *ptr);
+bool nulang_free_string(NulangRuntime * runtime, const char * ptr);
 
 /* -------------------------------------------------------------------------- */
 /* Native function registration                                                */
@@ -142,11 +138,7 @@ bool nulang_free_string(NulangRuntime *runtime, const char *ptr);
  * block when the function was registered this way. Returns 0 on success,
  * -1 on error.
  */
-int nulang_register_native_function(const char *name,
-                                    const void *ptr,
-                                    const NulangCType *params,
-                                    size_t param_count,
-                                    NulangCType ret);
+int nulang_register_native_function(const char * name, const void * ptr, const NulangCType * params, size_t param_count, NulangCType ret);
 
 #ifdef __cplusplus
 }

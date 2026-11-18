@@ -1,0 +1,14 @@
+// Constraints can refer to classes declared later in the same source module.
+// Rejection of unknown classes must not impose source-order restrictions.
+fn eq_check[T: Eq](a: T, b: T) -> Bool { a.eq(b) }
+
+class Eq[T] {
+    fn eq(self: T, other: T) -> Bool
+}
+
+impl Eq Int {
+    fn eq(self: Int, other: Int) = self == other
+}
+
+perform IO.print(eq_check(3, 3))
+perform IO.print(eq_check(3, 4))
