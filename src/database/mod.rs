@@ -9,6 +9,7 @@ pub mod checkpoint;
 #[cfg(feature = "postgres")]
 pub mod consumer_postgres;
 pub mod consumer_sink;
+pub mod optimistic;
 pub mod owner;
 pub mod retention;
 pub(crate) mod retention_admission;

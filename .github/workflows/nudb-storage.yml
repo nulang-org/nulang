@@ -84,7 +84,9 @@ jobs:
           NUDB_POSTGRES_TEST_URL: "host=127.0.0.1 port=5432 user=nudb password=nudbtest dbname=nudb"
         run: cargo test --locked --no-default-features --features postgres --test nudb_postgres_sink
       - name: Group commit contract
-        run: cargo test --locked --no-default-features --test nudb_group_commit
+        run: |
+          cargo test --locked --no-default-features --test nudb_group_commit
+          cargo test --locked --no-default-features --test nudb_optimistic_point_writes
       - name: Durable transaction receipts, retries and recovery
         run: |
           cargo test --locked --no-default-features --lib database::receipt_tests
