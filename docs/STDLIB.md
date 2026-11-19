@@ -87,7 +87,8 @@ List/array operations over native arrays. Functions fall into two categories:
 
 - **Polymorphic** (no element-type annotation): `length`, `contains`, `index_of`,
   `find`, `any`, `all`, `map`, `filter`, `reverse`, `take`, `drop`,
-  and `range`. These accept arrays of any compatible element type.
+  `range`, `take_while`, `drop_while`, `scan`, and `chunk_every`.
+  These accept arrays of any compatible element type.
 
 ### Traversal functions
 
@@ -114,6 +115,10 @@ List/array operations over native arrays. Functions fall into two categories:
 | `take` | `fn take(n, xs)` | Take first `n` elements. |
 | `drop` | `fn drop(n, xs)` | Drop first `n` elements. |
 | `range` | `fn range(n)` | Array of `[0, 1, ..., n-1]`. |
+| `take_while` | `fn take_while(pred, xs)` | Longest initial prefix satisfying `pred`; stops evaluating it on first failure. |
+| `drop_while` | `fn drop_while(pred, xs)` | Suffix after first predicate failure. |
+| `scan` | `fn scan(f, init, xs)` | Successive accumulators, excluding `init` itself. |
+| `chunk_every` | `fn chunk_every(size: Int, xs) -> Result[[[T]], ChunkError]` | Consecutive non-overlapping chunks, including a partial tail; rejects non-positive sizes. |
 
 ### Usage
 
@@ -136,7 +141,18 @@ let rev     = reverse(xs)        // [5, 4, 3, 2, 1]
 let first3  = take(3, xs)        // [1, 2, 3]
 let rest    = drop(2, xs)        // [3, 4, 5]
 let r       = range(4)           // [0, 1, 2, 3]
+let prefix  = take_while(fn(x) { x < 3 }, xs) // [1, 2]
+let suffix  = drop_while(fn(x) { x < 3 }, xs) // [3, 4, 5]
+let totals  = scan(fn(acc, x) { acc + x }, 0, [1, 2, 3]) // [1, 3, 6]
+let groups  = chunk_every(2, xs) // Ok([[1, 2], [3, 4], [5]])
+let invalid = chunk_every(0, xs) // Error(InvalidChunkSize)
 ```
+
+`chunk_every` is eager and allocates nested arrays. `size` must be positive,
+including for an empty input. For large or unbounded inputs, prefer a bounded
+pull-stream interface once its language and runtime contracts are qualified.
+These functions currently use `Array.push` and do not guarantee zero-copy or
+linear total allocation cost.
 
 Polymorphic functions work with strings, records, and any element type:
 

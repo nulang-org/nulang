@@ -1,0 +1,1 @@
+{"exit_code": 0, "stdout": "strings_chunks=2\nstrings_first=a\nstrings_last=ddd\noriginal_len=4\noriginal_first=a\nstrings_taken=2\nstrings_dropped_first=long\nstrings_dropped_second=c\nstrings_scan0=start-\nstrings_scan1=start-end\nmixed_scan=6", "stderr": ""}

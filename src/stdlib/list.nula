@@ -277,3 +277,74 @@ pub fn uniq(xs: [Int]) -> [Int] {
     };
     result
 }
+
+// ---------------------------------------------------------------------------
+// Enum-inspired eager operations
+// ---------------------------------------------------------------------------
+
+/// Error from chunk_every when size is zero or negative.
+pub type ChunkError = InvalidChunkSize
+
+/// Split xs into consecutive, non-overlapping chunks of at most size items.
+///
+/// The final chunk is shorter when there are too few remaining items.
+/// Returns Error(InvalidChunkSize) for non-positive sizes, including on [].
+/// This is eager; use a bounded stream when the input cannot fit in memory.
+pub fn chunk_every(size: Int, xs) {
+    if size <= 0 then { return Error(InvalidChunkSize) } else {};
+    var chunks = [];
+    var chunk = [];
+    var n = 0;
+    for x in xs {
+        chunk = perform Array.push(chunk, x);
+        n = n + 1;
+        if n == size then {
+            chunks = perform Array.push(chunks, chunk);
+            chunk = [];
+            n = 0
+        } else {}
+    };
+    if n > 0 then { chunks = perform Array.push(chunks, chunk) } else {};
+    Ok(chunks)
+}
+
+/// Return the longest initial prefix for which pred is true.
+/// Does not evaluate pred on elements following the first failed predicate.
+pub fn take_while(pred, xs) {
+    var result = [];
+    for x in xs {
+        if !pred(x) then { return result } else {};
+        result = perform Array.push(result, x)
+    };
+    result
+}
+
+/// Remove the longest initial prefix for which pred is true.
+/// Once pred fails, append the remaining values without calling pred again.
+pub fn drop_while(pred, xs) {
+    var dropping = true;
+    var result = [];
+    for x in xs {
+        if dropping then {
+            if pred(x) then {} else {
+                dropping = false;
+                result = perform Array.push(result, x)
+            }
+        } else {
+            result = perform Array.push(result, x)
+        }
+    };
+    result
+}
+
+/// Return each successive accumulator after applying f(acc, value).
+/// Unlike fold, scan returns a collection and does not include init itself.
+pub fn scan(f, init, xs) {
+    var acc = init;
+    var result = [];
+    for x in xs {
+        acc = f(acc, x);
+        result = perform Array.push(result, acc)
+    };
+    result
+}
