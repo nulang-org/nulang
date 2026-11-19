@@ -476,6 +476,15 @@ fn main() {
                 }
             }
             "--emit-nbc" => opts.emit_nbc = true,
+            "--dump-ir" => {
+                if i + 1 < args.len() {
+                    opts.dump_ir = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    eprintln!("Error: --dump-ir requires a stage (ast|hir|mir)");
+                    std::process::exit(1);
+                }
+            }
             "--emit-behavior-manifest" => {
                 if i + 1 < args.len() {
                     opts.emit_behavior_manifest = Some(args[i + 1].clone());
@@ -538,6 +547,7 @@ fn main() {
                     "--backend",
                     "--out",
                     "--emit-nbc",
+                    "--dump-ir",
                     "--emit-behavior-manifest",
                     "--behavior-package-name",
                     "--behavior-package-version",
@@ -574,6 +584,42 @@ fn main() {
             arg => positional.push(arg.to_string()),
         }
         i += 1;
+    }
+
+    if let Some(stage) = opts.dump_ir.as_deref() {
+        if !matches!(stage, "ast" | "hir" | "mir") {
+            eprintln!("Error: invalid IR stage '{stage}' (expected ast|hir|mir)");
+            std::process::exit(1);
+        }
+        if positional.len() != 1
+            || opts.eval_code.is_some()
+            || opts.check_file.is_some()
+            || opts.emit_nbc
+            || opts.emit_signals.is_some()
+            || opts.emit_stdlib_docs.is_some()
+            || opts.emit_behavior_manifest.is_some()
+            || opts.behavior_package_name.is_some()
+            || opts.behavior_package_version.is_some()
+            || opts.rewrite_signals.is_some()
+            || opts.verify_source.is_some()
+            || opts.init.is_some()
+            || opts.watch.is_some()
+            || opts.explain.is_some()
+            || opts.bench_count.is_some()
+            || opts.metrics_port.is_some()
+            || opts.store_path.is_some()
+            || opts.out_file.is_some()
+            || opts.json
+            || opts.doc
+            || opts.lsp
+            || opts.dap
+            || opts.repl
+        {
+            eprintln!(
+                "Error: --dump-ir requires exactly one source file, without other execution modes"
+            );
+            std::process::exit(1);
+        }
     }
 
     if opts.emit_behavior_manifest.is_some() && !opts.emit_nbc {
@@ -886,6 +932,43 @@ fn main() {
             }
         };
 
+        // Diagnostic-only compiler inspection: use the same checked frontend as
+        // execution, then stop before code generation or VM side effects.
+        if let Some(stage) = opts.dump_ir.as_deref() {
+            let (ast, types) = match run_frontend(
+                &source,
+                Some(path),
+                false,
+                &opts.with_capabilities,
+                opts.deny_warnings,
+            ) {
+                Ok(result) => result,
+                Err(err) => {
+                    print_error(&err, use_color);
+                    std::process::exit(exit_code(&err));
+                }
+            };
+            match stage {
+                "ast" => println!("=== AST ===\n{ast:#?}"),
+                "hir" => {
+                    let hir = nulang::hir_lower::lower_module(&ast, &types.inferred_decl_types);
+                    println!("=== HIR ===\n{hir:#?}");
+                }
+                "mir" => {
+                    let hir = nulang::hir_lower::lower_module(&ast, &types.inferred_decl_types);
+                    match nulang::mir_lower::lower_module(&hir) {
+                        Ok(mir) => println!("=== MIR ===\n{mir:#?}"),
+                        Err(err) => {
+                            print_error(&err, use_color);
+                            std::process::exit(exit_code(&err));
+                        }
+                    }
+                }
+                _ => unreachable!("validated during argument parsing"),
+            }
+            return;
+        }
+
         // `--emit-signals`: analyze the module and write the signal graph JSON.
         if let Some(out) = opts.emit_signals.as_ref() {
             match run_frontend(
@@ -1031,6 +1114,8 @@ struct Options {
     out_file: Option<String>,
     /// Compile the input to a `.nbc` artifact and write it, don't run.
     emit_nbc: bool,
+    /// Diagnostic-only AST/HIR/MIR rendering; never execute.
+    dump_ir: Option<String>,
     /// Optional RFC 0020 behavior sidecar output path. Currently emitted for
     /// the bytecode artifact path so package builds can bind durable schema
     /// metadata to the same typed program and artifact identity.
@@ -1093,6 +1178,7 @@ impl Default for Options {
             backend: "bytecode".to_string(),
             out_file: None,
             emit_nbc: false,
+            dump_ir: None,
             emit_behavior_manifest: None,
             behavior_package_name: None,
             behavior_package_version: None,
@@ -1188,6 +1274,7 @@ fn print_help() {
     println!("  -v, --verbose    Show bytecode and AST");
     println!("  --metrics-port <N>  Start Prometheus metrics server on port N");
     println!("  --emit-signals <file> Emit signal graph JSON for the web framework");
+    println!("  --dump-ir <stage> <file>  Inspect checked AST, HIR, or MIR without executing");
     println!("  --rewrite-signals <file> Rewrite HTML for signals and emit client JS");
     println!("  --store <uri>    Durable store URI for programs declaring durable");
     println!("                   entities (default: $NULANG_STORE_PATH or .nulang/store/).");

@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Checked compiler inspection, C ABI sync, and generic constraints — 2026-11-18
+- **Diagnostic-only `--dump-ir ast|hir|mir <file>`** prints checked compiler representations without running code; unsupported IR stages fail before loading the program.
+- **Reproducible public C header** derives 21 export signatures and the C type enum from the Rust FFI, retaining the documented header template. C11/C++11 compile probes and a checked-in-header parity test catch ABI drift.
+- **Undeclared generic typeclass constraints now fail at the function definition** instead of compiling to an unresolved `_impl_*` call. Forward-declared valid classes remain accepted; generic/typeclass conformance cases pin both behaviors.
+- These are pre-production compiler/tooling improvements, not a claim of native/WASM/backend semantic parity or a change to frozen bytecode/transport formats.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.

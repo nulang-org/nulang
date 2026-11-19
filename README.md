@@ -181,6 +181,34 @@ PAT/App token removes that approval step.
 
 ---
 
+### Compiler inspection and native embedding
+
+Diagnostic-only IR inspection uses the ordinary checked compiler frontend
+without executing source code or writing an executable artifact:
+
+```bash
+nulang --dump-ir ast examples/01_hello.nula
+nulang --dump-ir hir examples/01_hello.nula
+nulang --dump-ir mir examples/01_hello.nula
+```
+
+The output is **internal debug data**, not a stable interchange format. The
+supported stages are `ast`, `hir`, and `mir`; unsupported values fail closed.
+
+For C/C++ embedders, `include/nulang.h` is generated from the exported Rust
+C ABI signatures while `include/nulang.h.in` preserves documentation and
+ordering. Validate or update the checked-in header with:
+
+```bash
+python3 scripts/generate_c_header.py --check
+python3 scripts/generate_c_header.py --write
+```
+
+The generator handles the currently audited C ABI types only. New FFI types
+require an explicit mapping and ABI review.
+
+---
+
 ## Package Manager
 
 Nulang ships with `nula`, a package manager invoked as `nulang nula <subcommand>`:

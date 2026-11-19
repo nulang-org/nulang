@@ -1,0 +1,11 @@
+// An undeclared generic constraint must fail at definition time.
+// It must not make it to unresolved _impl_* lookup at runtime.
+fn cmp[T: Ord](x: T, y: T) -> Bool {
+    x == y
+}
+
+fn main() {
+    perform IO.print(cmp(1, 2))
+    perform IO.print(cmp("a", "b"))
+    perform IO.print(cmp(5, 5))
+}
