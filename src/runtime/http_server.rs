@@ -362,6 +362,7 @@ impl HttpServerState {
             204 => "No Content",
             301 => "Moved Permanently",
             302 => "Found",
+            303 => "See Other",
             304 => "Not Modified",
             400 => "Bad Request",
             401 => "Unauthorized",
@@ -520,6 +521,7 @@ pub struct RequestContext {
 thread_local! {
     static CURRENT_REQUEST: RefCell<Option<RequestContext>> = const { RefCell::new(None) };
     static RESPONSE_COOKIES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static RESPONSE_REDIRECT: RefCell<Option<Result<String, ()>>> = const { RefCell::new(None) };
 }
 
 /// Set the request context for the current thread, run `f`, then clear it.
@@ -529,9 +531,46 @@ where
 {
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = Some(ctx));
     RESPONSE_COOKIES.with(|c| c.borrow_mut().clear());
+    RESPONSE_REDIRECT.with(|c| *c.borrow_mut() = None);
     let result = f();
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = None);
     result
+}
+
+/// Record an HTTP redirect only when executing an actual web request.
+/// Standalone/static rendering keeps the legacy HTML fallback unchanged.
+/// Invalid destinations fail closed when the HTTP adapter constructs a response.
+pub(crate) fn record_response_redirect(location: &str) {
+    let has_request = CURRENT_REQUEST.with(|ctx| ctx.borrow().is_some());
+    if !has_request {
+        return;
+    }
+    let safe = !location.is_empty()
+        && !location
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace())
+        && !location
+            .chars()
+            .any(|c| matches!(c, '\\' | '"' | '\'' | '<' | '>'))
+        && if location.starts_with('/') {
+            !location.starts_with("//")
+        } else {
+            location
+                .strip_prefix("https://")
+                .or_else(|| location.strip_prefix("http://"))
+                .and_then(|rest| rest.split(['/', '?', '#']).next())
+                .is_some_and(|authority| !authority.is_empty() && !authority.contains('@'))
+        };
+    let redirect = if safe {
+        Ok(location.to_string())
+    } else {
+        Err(())
+    };
+    RESPONSE_REDIRECT.with(|state| *state.borrow_mut() = Some(redirect));
+}
+
+fn take_response_redirect() -> Option<Result<String, ()>> {
+    RESPONSE_REDIRECT.with(|state| state.borrow_mut().take())
 }
 
 /// Add a `Set-Cookie` header for the current response.
@@ -1055,11 +1094,30 @@ impl WebDevServer {
                         )),
                         Err(error) => Err(error),
                     });
+                // The Respond effect is request-scoped, not encoded into HTML.
+                // Read it even if rendering failed, so it cannot affect a
+                // subsequent response handled on the same thread.
+                let redirect = take_response_redirect();
                 match rendered {
-                    Ok(Some(html)) => HttpResponse {
-                        status: 200,
-                        headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())],
-                        body: inject_client_runtime_script(&html).into_bytes(),
+                    Ok(Some(html)) => match redirect {
+                        Some(Ok(location)) => HttpResponse {
+                            status: 303,
+                            headers: vec![("Location".into(), location)],
+                            body: Vec::new(),
+                        },
+                        Some(Err(())) => HttpResponse {
+                            status: 500,
+                            headers: vec![("Content-Type".into(), "text/plain".into())],
+                            body: b"Invalid redirect location".to_vec(),
+                        },
+                        None => HttpResponse {
+                            status: 200,
+                            headers: vec![(
+                                "Content-Type".into(),
+                                "text/html; charset=utf-8".into(),
+                            )],
+                            body: inject_client_runtime_script(&html).into_bytes(),
+                        },
                     },
                     Ok(None) => HttpResponse {
                         status: 500,
