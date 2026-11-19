@@ -22,7 +22,7 @@ Nulang's capability system (inspired by Pony) prevents data races and use-after-
 
 **Key guarantees**:
 
-- **No data races**: only `iso` and `val` are sendable between actors. Mutable `ref` and `trn` cannot cross actor boundaries.
+- **Actor message sendability**: `iso`, `lineariso`, `val`, and `tag` are sendable reference capabilities. `ref`, `trn`, and `box` are not. Source-level reference capability checks are separate from runtime authority enforcement.
 - **Compile-time only**: capabilities are erased at runtime. There is zero overhead for capability checks — they are proved by the type checker and then discarded.
 - **LinearIso enforcement**: `lineariso` is tracked per binding along every control-flow path. Sending or capturing a `lineariso` value consumes it; branch-merge analysis ensures at-most-once use conservatively.
 
@@ -49,7 +49,8 @@ fn greet() -> Unit ! {IO} {
 ```
 
 - **Row polymorphism**: `!{IO | e}` means "IO plus whatever other effects the caller has." Effects compose without monad transformers.
-- **Handler exhaustiveness**: unhandled effects are compile-time errors. If a function performs `State.get`, the caller must either handle `State` or propagate it in its own effect row.
+- **Effect-row checking**: an explicit function effect row that omits an inferred effect is a compile-time error. Inferred effect rows do not prove an installed handler exists.
+- **Runtime handler resolution**: an unhandled effect is a runtime error unless a matching handler or runtime-backed operation services it. Static handler exhaustiveness checking is not yet implemented.
 - **Side-effect documentation**: the effect row IS the documentation. You can see every side effect a function may have by reading its type signature.
 
 ## Actor Isolation
