@@ -403,7 +403,10 @@ fn deleted_actor_tail_does_not_allow_resetting_existing_history() {
         std::io::ErrorKind::InvalidData
     );
     assert_eq!(
-        journal.commit_transition(transition(77, 1, 1)).unwrap_err().kind(),
+        journal
+            .commit_transition(transition(77, 1, 1))
+            .unwrap_err()
+            .kind(),
         std::io::ErrorKind::InvalidData
     );
     assert_eq!(journal.tablet_sequence(), 2);
@@ -431,7 +434,11 @@ fn actor_history_audit_accepts_contiguous_interleaved_history_after_checkpoint()
         3
     );
     assert_eq!(
-        journal.verify_actor_history(100).unwrap().unwrap().activation_epoch,
+        journal
+            .verify_actor_history(100)
+            .unwrap()
+            .unwrap()
+            .activation_epoch,
         2
     );
     assert_eq!(
@@ -469,7 +476,10 @@ fn actor_history_audit_rejects_missing_middle_transition_after_checkpoint() {
 
     let journal = NuDbTransitionJournal::open(&path).unwrap();
     // Tail-only checks still see an intact final transition.
-    assert_eq!(journal.load_tail_position(900).unwrap().unwrap().sequence, 3);
+    assert_eq!(
+        journal.load_tail_position(900).unwrap().unwrap().sequence,
+        3
+    );
     let sequence_before = journal.tablet_sequence();
     assert_eq!(
         journal.verify_actor_history(900).unwrap_err().kind(),
@@ -501,7 +511,10 @@ fn actor_history_audit_rejects_corrupt_intermediate_payload() {
     );
 
     let journal = NuDbTransitionJournal::open(&path).unwrap();
-    assert_eq!(journal.load_tail_position(901).unwrap().unwrap().sequence, 3);
+    assert_eq!(
+        journal.load_tail_position(901).unwrap().unwrap().sequence,
+        3
+    );
     assert_eq!(
         journal.verify_actor_history(901).unwrap_err().kind(),
         std::io::ErrorKind::InvalidData
@@ -535,7 +548,10 @@ fn actor_history_audit_rejects_orphan_transition_beyond_rewritten_tail() {
     );
 
     let journal = NuDbTransitionJournal::open(&path).unwrap();
-    assert_eq!(journal.load_tail_position(902).unwrap().unwrap().sequence, 1);
+    assert_eq!(
+        journal.load_tail_position(902).unwrap().unwrap().sequence,
+        1
+    );
     assert_eq!(
         journal.verify_actor_history(902).unwrap_err().kind(),
         std::io::ErrorKind::InvalidData
