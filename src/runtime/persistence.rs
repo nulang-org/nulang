@@ -1096,6 +1096,45 @@ impl JsonFileStore {
     pub fn new<P: AsRef<Path>>(base_dir: P) -> io::Result<Self> {
         let base_dir = base_dir.as_ref().to_path_buf();
         fs::create_dir_all(&base_dir)?;
+
+        // A present-but-corrupt snapshot must not be treated as a fresh actor
+        // on a new CLI process. Refuse to open a store whose durable evidence
+        // cannot be decoded, before any actor code or external effect runs.
+        for entry in fs::read_dir(&base_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(actor_id) = name
+                .to_str()
+                .and_then(|name| name.strip_prefix("actor_"))
+                .and_then(|id| id.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let snapshot_path = entry.path().join("snapshot.json");
+            let bytes = match fs::read(&snapshot_path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let snapshot: ActorSnapshot = serde_json::from_slice(&bytes).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "corrupt durable snapshot at {}: {error}",
+                        snapshot_path.display()
+                    ),
+                )
+            })?;
+            if snapshot.actor_id != actor_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "durable snapshot identity mismatch at {}: directory actor {} vs snapshot actor {}",
+                        snapshot_path.display(), actor_id, snapshot.actor_id
+                    ),
+                ));
+            }
+        }
         Ok(JsonFileStore { base_dir })
     }
 
