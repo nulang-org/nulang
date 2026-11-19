@@ -60,3 +60,10 @@ upgrades or whose vulnerable APIs are not used by the current implementation.
 Those suppressions are accepted risks, not a claim that the dependency graph is
 advisory-free. Release decisions should review that file and the relevant
 reachable feature paths.
+
+Remote Turso/libSQL connections opened through `LibsqlStore::new_remote`
+require a well-formed `https://` or `libsql://` endpoint; plaintext HTTP,
+embedded URL credentials, and fragments are rejected before passing the
+bearer token to libsql. This transport guard does **not** fix the still-vulnerable
+legacy `rustls-webpki 0.102.8` dependency (RUSTSEC-2026-0382). Remote use
+remains a security-review item until the TLS dependency migration is complete.

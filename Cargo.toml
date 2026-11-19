@@ -61,7 +61,7 @@ mobile-runtime = []
 # Enables the standalone Savina-style actor benchmark runner without pulling optional subsystems.
 savina-bench = []
 python = ["dep:pyo3"]
-sqlite = ["dep:libsql", "dep:tokio"]
+sqlite = ["dep:libsql", "dep:tokio", "dep:url"]
 lsp = ["dep:tower-lsp", "dep:tokio", "dep:futures", "dep:tower-service"]
 ai-runtime = ["dep:nulang-ai", "dep:nulang-ai-local", "dep:uuid", "dep:reqwest", "dep:tokio"]
 wasm-backend = ["native-codegen", "dep:wasm-encoder", "dep:wasmtime", "dep:wat", "dep:borsh"]
@@ -150,6 +150,8 @@ opentelemetry_sdk = { version = "0.24", optional = true, features = ["rt-tokio",
 
 # Python interop (optional, see [features])
 pyo3 = { version = "0.29", features = ["auto-initialize", "py-clone"], optional = true }
+# Reuse the existing URL parser only for the optional libSQL remote TLS guard.
+url = { version = "2.5", optional = true }
 # libSQL persistence backend (LibsqlStore + remote Turso support). Only
 # `core` (local SQLite) + `remote` (hrana/HTTP Turso access, what
 # `Builder::new_remote` uses) + `tls` are needed -- default-features also

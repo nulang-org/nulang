@@ -2350,6 +2350,34 @@ fn test_memory_store_latest_sequence() {
 
 #[cfg(feature = "sqlite")]
 #[test]
+fn test_libsql_remote_rejects_cleartext_and_malformed_endpoints() {
+    for endpoint in [
+        "http://127.0.0.1:9",
+        "http://example.org",
+        "ws://example.org",
+        "https://",
+        "libsql://",
+        "https://user:pass@example.org",
+        " libsql://example.org",
+    ] {
+        let error = match LibsqlStore::new_remote(endpoint, "confidential-token") {
+            Err(error) => error,
+            Ok(_) => panic!("endpoint should have been rejected: {endpoint}"),
+        };
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "{endpoint}: cleartext or malformed endpoints must fail before any connection"
+        );
+        assert!(
+            !error.to_string().contains("confidential-token"),
+            "endpoint validation must not disclose authentication tokens"
+        );
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
 fn test_libsql_store_save_load_snapshot() {
     let mut store = LibsqlStore::in_memory().unwrap();
     let mut state = HashMap::new();
