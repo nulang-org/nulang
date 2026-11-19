@@ -4264,6 +4264,33 @@ mod libsql_atomic_transition_tests {
     }
 
     #[test]
+    fn local_actor_store_uses_patched_sqlite_engine() {
+        let store = LibsqlStore::in_memory().expect("local actor database opens");
+        let rows = store.query("SELECT sqlite_version()", &[]).expect("read SQLite version");
+        let versions: Vec<String> = serde_json::from_str(&rows[0]).unwrap();
+        let version = &versions[0];
+        let parts: Vec<u32> = version.split('.').map(|item| item.parse().unwrap()).collect();
+        assert!(parts.as_slice() >= &[3, 54, 0], "outdated SQLite engine: {version}");
+    }
+
+    #[cfg(feature = "ai-runtime")]
+    #[test]
+    fn actor_and_agent_stores_share_sqlite_engine() {
+        let actor = LibsqlStore::in_memory().unwrap();
+        let actor_versions: Vec<String> = serde_json::from_str(
+            &actor.query("SELECT sqlite_version()", &[]).unwrap()[0]
+        ).unwrap();
+        let path = std::env::temp_dir().join(format!("nulang_dual_sqlite_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let agent = nulang_ai_local::SqliteStore::open(&path).unwrap();
+        let conn = rusqlite::Connection::open(agent.db_path()).unwrap();
+        let agent_version: String = conn.query_row("SELECT sqlite_version()", [], |r| r.get(0)).unwrap();
+        assert_eq!(actor_versions, vec![agent_version], "two native SQLite engines are forbidden");
+        drop(conn); drop(agent);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn libsql_atomic_transition_commits_all_components() {
         let mut store = LibsqlStore::in_memory().unwrap();
         let committed = store.commit_transition(transition(42, 1, 1)).unwrap();
