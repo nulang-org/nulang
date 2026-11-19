@@ -326,16 +326,35 @@ impl TabletOwner {
     }
 }
 
+/// Conservative owner-admission estimate for the current NUDBWAL3 JSON codec.
+///
+/// `Vec<u8>` is serialized as decimal JSON numbers (up to three digits and
+/// a separator per byte), so raw key/value lengths severely underestimate the
+/// WAL footprint of a batch. Include bounded framing, record fields and per-
+/// mutation JSON overhead without allocating/serializing on the admission path.
+/// A single oversized queue head still makes progress; an enforced on-disk byte
+/// ceiling must use the separate WAL budget/quota APIs.
 fn estimated_write_bytes(write: &TabletWrite) -> usize {
-    write.mutations().iter().fold(32usize, |total, mutation| {
-        let bytes = match mutation {
-            TabletMutation::Put { key, value } => {
-                9usize.saturating_add(key.len()).saturating_add(value.len())
-            }
-            TabletMutation::Delete { key } => 5usize.saturating_add(key.len()),
-        };
-        total.saturating_add(bytes)
-    })
+    const RECORD_AND_FRAME_OVERHEAD: usize = 320;
+    const MUTATION_JSON_OVERHEAD: usize = 64;
+
+    fn json_byte_array_upper_bound(len: usize) -> usize {
+        len.saturating_mul(4).saturating_add(2)
+    }
+
+    write
+        .mutations()
+        .iter()
+        .fold(RECORD_AND_FRAME_OVERHEAD, |total, mutation| {
+            let arrays = match mutation {
+                TabletMutation::Put { key, value } => json_byte_array_upper_bound(key.len())
+                    .saturating_add(json_byte_array_upper_bound(value.len())),
+                TabletMutation::Delete { key } => json_byte_array_upper_bound(key.len()),
+            };
+            total
+                .saturating_add(MUTATION_JSON_OVERHEAD)
+                .saturating_add(arrays)
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -587,6 +606,41 @@ mod tests {
         assert_eq!(owner.current_sequence().unwrap(), 2);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("checkpoint"));
+    }
+
+    #[test]
+    fn serialized_wal_bytes_bound_coalescing_before_the_delay_expires() {
+        let path = temp_wal();
+        let config = TabletOwnerConfig {
+            queue_capacity: 4,
+            max_batch_writes: 4,
+            max_batch_bytes: 1400,
+            max_batch_delay: Duration::from_secs(60),
+        };
+        let mut owner = TabletOwner::open(descriptor(), &path, config).unwrap();
+        let value = vec![255_u8; 180];
+        let mutations = mutation(&value);
+        // JSON represents each byte as a decimal number, not one raw byte.
+        let encoded_mutations = serde_json::to_vec(&mutations).unwrap().len();
+        assert!(encoded_mutations * 2 > config.max_batch_bytes);
+
+        let t0 = Instant::now();
+        owner.admit_write_at(t0, 9, 0, mutations.clone()).unwrap();
+        owner.admit_write_at(t0, 9, 1, mutations).unwrap();
+
+        let committed = owner
+            .process_batch_if_due(t0)
+            .unwrap()
+            .expect("serialized WAL payload must force an early batch flush");
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].sequence, 1);
+        assert_eq!(owner.queued_writes(), 1);
+        assert_eq!(owner.process_batch().unwrap().len(), 1);
+        drop(owner);
+
+        let reopened = TabletOwner::open(descriptor(), &path, config).unwrap();
+        assert_eq!(reopened.current_sequence().unwrap(), 2);
+        assert_eq!(reopened.read_latest(b"k").unwrap(), Some(value.as_slice()));
     }
 
     #[test]
