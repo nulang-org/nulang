@@ -43,3 +43,33 @@ fn goal_graph_tasks_restore_in_stable_created_at_then_id_order() {
     drop(store);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn bundled_sqlite_security_baseline_and_existing_goal_reopen() {
+    // libsqlite3-sys 0.39.1 bundles SQLite 3.54.1. A real runtime assertion
+    // protects against an older native sqlite library being linked instead.
+    assert!(
+        rusqlite::version_number() >= 3_054_001,
+        "expected patched bundled SQLite >= 3.54.1, linked version is {}",
+        rusqlite::version()
+    );
+
+    let dir = std::env::temp_dir().join(format!("nulang-ai-sqlite-upgrade-{}", Uuid::new_v4()));
+    let mut goal = Goal::new("sqlite", "reopen persisted data", 10.0);
+    goal.id = Uuid::new_v4();
+    let mut task = Task::new(goal.id, "persisted task", ManagerKind::Engineering);
+    task.id = Uuid::new_v4();
+    {
+        let store = SqliteStore::open(&dir).expect("create database");
+        store.upsert_goal(&goal).expect("write goal");
+        store.upsert_task(&task).expect("write task");
+    }
+    let store = SqliteStore::open(&dir).expect("reopen existing SQLite database");
+    let graph = store.get_goal_graph(goal.id).expect("read persisted goal");
+    assert_eq!(graph.goal.id, goal.id);
+    assert_eq!(graph.goal.intent, goal.intent);
+    assert_eq!(graph.tasks.len(), 1);
+    assert_eq!(graph.tasks[0].id, task.id);
+    drop(store);
+    std::fs::remove_dir_all(dir).expect("remove test database");
+}

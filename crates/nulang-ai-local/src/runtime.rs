@@ -195,6 +195,17 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn agent_configuration_defaults_remain_unchanged() {
+        let config = AgentConfigFile::default();
+        assert_eq!(config.inference.mode, "direct");
+        assert_eq!(config.inference.provider, "openai");
+        assert_eq!(config.inference.model, "gpt-4o");
+        assert_eq!(config.director.default_budget_usd, 25.0);
+        assert_eq!(config.director.managers, vec!["engineering"]);
+        assert_eq!(config.storage.data_dir, "~/.nulang/agents");
+    }
+
+    #[test]
     fn runtime_emits_nlap_events() {
         let tmp = std::env::temp_dir().join(format!("nulang-agent-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();

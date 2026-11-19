@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentConfigFile {
     #[serde(default)]
     pub inference: InferenceSection,
@@ -36,16 +36,6 @@ pub struct DirectorSection {
 pub struct StorageSection {
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
-}
-
-impl Default for AgentConfigFile {
-    fn default() -> Self {
-        Self {
-            inference: InferenceSection::default(),
-            director: DirectorSection::default(),
-            storage: StorageSection::default(),
-        }
-    }
 }
 
 impl Default for InferenceSection {
