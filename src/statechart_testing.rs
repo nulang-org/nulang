@@ -45,6 +45,8 @@ pub struct MachineTestPlan {
 pub struct FailedTransitionTest {
     pub source: String,
     pub event: String,
+    /// Exact ordered event sequence and fixture literals to replay the failure.
+    pub sequence: Vec<TestEvent>,
     pub reason: String,
 }
 
@@ -227,11 +229,195 @@ pub fn run_transition_tests(decl: &Decl, plan: &MachineTestPlan) -> MachineTestR
             Err(reason) => report.failed.push(FailedTransitionTest {
                 source: case.source.clone(),
                 event: case.event.clone(),
+                sequence: case.sequence.clone(),
                 reason,
             }),
         }
     }
     report
+}
+
+/// Deterministic *suggestions*, not proof of guard satisfiability.
+/// Simple primitive comparisons are supported; complex or untyped guards
+/// require explicit user fixtures. The actual runner still executes guards.
+pub fn suggest_fixtures(decl: &Decl) -> Result<TestFixtures, String> {
+    use crate::types::{PrimitiveType, Type};
+    let Decl::StateMachine { events, .. } = decl else {
+        return Err("expected state_machine declaration".into());
+    };
+    let mut result = TestFixtures::new();
+    for event in events {
+        let mut values = Vec::new();
+        for param in &event.params {
+            let value = match param.ty.as_ref() {
+                Some(Type::Primitive(PrimitiveType::Int)) => serde_json::json!(0),
+                Some(Type::Primitive(PrimitiveType::Float)) => serde_json::json!(0.0),
+                Some(Type::Primitive(PrimitiveType::Bool)) => serde_json::json!(false),
+                Some(Type::Primitive(PrimitiveType::String)) => serde_json::json!(""),
+                _ => {
+                    return Err(format!(
+                        "event '{}' requires manual fixture for untyped or complex parameter '{}'",
+                        event.name, param.name
+                    ))
+                }
+            };
+            values.push(value);
+        }
+        if let Some(guard) = &event.guard {
+            let manual = || {
+                format!(
+                "event '{}' requires manual fixture: guard is not a supported simple comparison",
+                event.name
+            )
+            };
+            match guard {
+                crate::ast::Expr::Var(name, _) => {
+                    let idx = event
+                        .params
+                        .iter()
+                        .position(|p| &p.name == name)
+                        .ok_or_else(manual)?;
+                    if !matches!(
+                        event.params[idx].ty,
+                        Some(Type::Primitive(PrimitiveType::Bool))
+                    ) {
+                        return Err(manual());
+                    }
+                    values[idx] = serde_json::json!(true);
+                }
+                crate::ast::Expr::Unary {
+                    op: crate::ast::UnOp::Not,
+                    expr,
+                    ..
+                } => {
+                    let crate::ast::Expr::Var(name, _) = expr.as_ref() else {
+                        return Err(manual());
+                    };
+                    let idx = event
+                        .params
+                        .iter()
+                        .position(|p| &p.name == name)
+                        .ok_or_else(manual)?;
+                    if !matches!(
+                        event.params[idx].ty,
+                        Some(Type::Primitive(PrimitiveType::Bool))
+                    ) {
+                        return Err(manual());
+                    }
+                    values[idx] = serde_json::json!(false);
+                }
+                crate::ast::Expr::Binary {
+                    op, left, right, ..
+                } => {
+                    use crate::ast::{BinOp, Expr, Literal};
+                    let (name, literal, operator) = match (left.as_ref(), right.as_ref()) {
+                        (Expr::Var(name, _), Expr::Literal(lit, _)) => (name, lit, *op),
+                        (Expr::Literal(lit, _), Expr::Var(name, _)) => {
+                            let flipped = match op {
+                                BinOp::Lt => BinOp::Gt,
+                                BinOp::Le => BinOp::Ge,
+                                BinOp::Gt => BinOp::Lt,
+                                BinOp::Ge => BinOp::Le,
+                                BinOp::Eq => BinOp::Eq,
+                                BinOp::Ne => BinOp::Ne,
+                                _ => return Err(manual()),
+                            };
+                            (name, lit, flipped)
+                        }
+                        _ => return Err(manual()),
+                    };
+                    let idx = event
+                        .params
+                        .iter()
+                        .position(|p| &p.name == name)
+                        .ok_or_else(manual)?;
+                    let suggested = match (event.params[idx].ty.as_ref(), literal, operator) {
+                        (Some(Type::Primitive(PrimitiveType::Int)), Literal::Int(n), op) => {
+                            let n = match op {
+                                BinOp::Eq | BinOp::Le | BinOp::Ge => Some(*n),
+                                BinOp::Gt => n.checked_add(1),
+                                BinOp::Lt => n.checked_sub(1),
+                                BinOp::Ne => Some(if *n == 0 { 1 } else { 0 }),
+                                _ => None,
+                            }
+                            .ok_or_else(manual)?;
+                            serde_json::json!(n)
+                        }
+                        (
+                            Some(Type::Primitive(PrimitiveType::Bool)),
+                            Literal::Bool(b),
+                            BinOp::Eq,
+                        ) => serde_json::json!(b),
+                        (
+                            Some(Type::Primitive(PrimitiveType::Bool)),
+                            Literal::Bool(b),
+                            BinOp::Ne,
+                        ) => serde_json::json!(!b),
+                        (
+                            Some(Type::Primitive(PrimitiveType::String)),
+                            Literal::String(s),
+                            BinOp::Eq,
+                        ) => serde_json::json!(s),
+                        (
+                            Some(Type::Primitive(PrimitiveType::String)),
+                            Literal::String(s),
+                            BinOp::Ne,
+                        ) => serde_json::json!(if s.is_empty() { "x" } else { "" }),
+                        _ => return Err(manual()),
+                    };
+                    values[idx] = suggested;
+                }
+                _ => return Err(manual()),
+            }
+        }
+        result.insert(event.name.clone(), values);
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod fixture_tests {
+    use super::*;
+    use crate::{lexer::Lexer, parser::Parser};
+
+    fn machine(source: &str) -> Decl {
+        let mut lexer = Lexer::new(source);
+        Parser::new(lexer.lex().unwrap())
+            .parse_module()
+            .unwrap()
+            .decls
+            .remove(0)
+    }
+
+    #[test]
+    fn suggests_deterministic_guard_satisfying_integer_fixture() {
+        let decl = machine("state_machine M { state Pending\n state Paid\n event pay(amount: Int) from Pending: Paid if amount > 0 }");
+        let fixtures = suggest_fixtures(&decl).unwrap();
+        assert_eq!(fixtures["pay"], vec![serde_json::json!(1)]);
+        let plan = generate_transition_tests(&decl, &fixtures).unwrap();
+        let report = run_transition_tests(&decl, &plan);
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert!(report.passed > 0);
+    }
+
+    #[test]
+    fn refuses_guards_that_cannot_be_proven_satisfiable() {
+        let decl = machine(
+            "state_machine M { state A\n state B\n event go(x: Int) from A: B if x > 0 && x < 0 }",
+        );
+        assert!(suggest_fixtures(&decl)
+            .unwrap_err()
+            .contains("manual fixture"));
+    }
+
+    #[test]
+    fn fixtures_reproducible_and_keep_declared_event_names() {
+        let decl = machine("state_machine M { state A\n state B\n event reset: A\n event toggle(ok: Bool) from A: B if ok }");
+        let first = suggest_fixtures(&decl).unwrap();
+        assert_eq!(first["reset"], Vec::<serde_json::Value>::new());
+        assert_eq!(first["toggle"], vec![serde_json::json!(true)]);
+        assert_eq!(first, suggest_fixtures(&decl).unwrap());
+    }
 }
 
 fn execute_case(decl: &Decl, case: &TransitionTestCase) -> Result<(), String> {
