@@ -518,6 +518,10 @@ impl Default for StateModel {
 pub struct StateMachineEvent {
     pub name: String,
     pub params: Vec<Param>,
+    /// Optional source state; absent preserves legacy any-state behavior.
+    pub source: Option<String>,
+    /// Pure event predicate over event parameters.
+    pub guard: Option<Expr>,
     /// Target state name. Must be one of the states declared via `state`
     /// lines (enforced by the parser); handler-function targets like
     /// gen_statem's are not supported.
@@ -991,13 +995,11 @@ pub struct ExternFunc {
 ///      target is statically known, so no dispatch is needed);
 ///   4. evaluates to `nil`.
 ///
-/// Hooks run on every matching transition, including self-transitions
-/// (e.g. `disconnect: Closed` taken while already `Closed` runs both the
-/// `Closed` exit and entry hooks). Because events do not name source states,
-/// every event is allowed in every state — gen_statem's "event ignored in a
-/// state where it is not allowed" case cannot arise, so no message is ever
-/// dropped for state reasons. `send`/`ask` against the machine behave
-/// exactly as against any actor.
+/// Hooks run on every accepted transition, including self-transitions.
+/// Legacy events without a source remain legal in any state. An event with
+/// a source state or guard is a no-op when its conditions do not match; it
+/// does not run hooks or mutate the state. `send`/`ask` against the machine
+/// behave exactly as against any actor.
 pub fn desugar_state_machine(
     name: &str,
     states: &[String],
@@ -1054,6 +1056,36 @@ pub fn desugar_state_machine(
             // on_entry of the (statically known) target state, if declared.
             if let Some((_, hook)) = entry_hooks.iter().find(|(s, _)| s == &event.target) {
                 body_exprs.push(hook.clone());
+            }
+            // Rejected transitions do not mutate state or run lifecycle hooks.
+            if event.source.is_some() || event.guard.is_some() {
+                let source_cond = event.source.as_ref().map(|source| Expr::Binary {
+                    op: BinOp::Eq,
+                    left: Box::new(sm_state()),
+                    right: Box::new(Expr::Literal(Literal::String(source.clone()), span)),
+                    span,
+                });
+                let cond = match (source_cond, event.guard.as_ref()) {
+                    (Some(state), Some(guard)) => Expr::Binary {
+                        op: BinOp::And,
+                        left: Box::new(state),
+                        right: Box::new(guard.clone()),
+                        span,
+                    },
+                    (Some(state), None) => state,
+                    (None, Some(guard)) => guard.clone(),
+                    (None, None) => unreachable!(),
+                };
+                body_exprs.push(Expr::Literal(Literal::Unit, span));
+                body_exprs = vec![Expr::If {
+                    cond: Box::new(cond),
+                    then_branch: Box::new(Expr::Block {
+                        exprs: body_exprs,
+                        span,
+                    }),
+                    else_branch: None,
+                    span,
+                }];
             }
             body_exprs.push(Expr::Literal(Literal::Nil, span));
             Behavior {
@@ -1322,12 +1354,16 @@ mod tests {
             StateMachineEvent {
                 name: "connect".to_string(),
                 params: vec![Param::new("address", None)],
+                source: None,
+                guard: None,
                 target: "Connecting".to_string(),
                 span: sp,
             },
             StateMachineEvent {
                 name: "disconnect".to_string(),
                 params: vec![],
+                source: None,
+                guard: None,
                 target: "Closed".to_string(),
                 span: sp,
             },
@@ -1389,6 +1425,63 @@ mod tests {
             panic!("event behavior body should be a block");
         };
         assert_eq!(exprs.len(), 3);
+    }
+
+    #[test]
+    fn test_scoped_state_machine_wraps_hooks_and_assignment_in_guard() {
+        let sp = Span::default();
+        let event = StateMachineEvent {
+            name: "pay".to_string(),
+            params: vec![Param::new("amount", Some(Type::int()))],
+            source: Some("Pending".to_string()),
+            guard: Some(Expr::Binary {
+                op: BinOp::Gt,
+                left: Box::new(Expr::Var("amount".into(), sp)),
+                right: Box::new(Expr::Literal(Literal::Int(0), sp)),
+                span: sp,
+            }),
+            target: "Paid".to_string(),
+            span: sp,
+        };
+        let decl = desugar_state_machine(
+            "Order",
+            &["Pending".into(), "Paid".into()],
+            &[event],
+            &[("Paid".into(), Expr::Literal(Literal::Unit, sp))],
+            &[("Pending".into(), Expr::Literal(Literal::Unit, sp))],
+            sp,
+        );
+        let Decl::Actor { behaviors, .. } = decl else {
+            panic!("expected actor");
+        };
+        let Expr::Block { exprs, .. } = &behaviors[0].body else {
+            panic!("expected block");
+        };
+        assert_eq!(exprs.len(), 2);
+        let Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } = &exprs[0]
+        else {
+            panic!("expected guard");
+        };
+        assert!(else_branch.is_none());
+        assert!(matches!(cond.as_ref(), Expr::Binary { op: BinOp::And, .. }));
+        let Expr::Block {
+            exprs: accepted, ..
+        } = then_branch.as_ref()
+        else {
+            panic!("expected body");
+        };
+        assert!(accepted
+            .iter()
+            .any(|expr| matches!(expr, Expr::Assign { .. })));
+        assert!(matches!(
+            accepted.last(),
+            Some(Expr::Literal(Literal::Unit, _))
+        ));
     }
 
     #[test]
