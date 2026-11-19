@@ -574,6 +574,14 @@ impl StdLib {
                     description: "Wrap a raw string as an Html value without escaping.",
                 },
                 BuiltinOp {
+                    name: "Web.turbo_stream",
+                    effect: "Web",
+                    op: "turbo_stream",
+                    signature: "turbo_stream(action: String, target: String, content: Html) -> Html",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Render a safe Turbo Stream HTML action and select the Turbo Stream response MIME type for the current Web request.",
+                },
+                BuiltinOp {
                     name: "Web.redirect",
                     effect: "Web",
                     op: "redirect",
