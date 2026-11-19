@@ -31,6 +31,7 @@ pub mod cir_lower;
 pub mod compat;
 pub mod compiler_identity;
 pub mod content_identity;
+pub mod contract_proof;
 pub mod core_vm;
 #[cfg(feature = "native-codegen")]
 pub mod cranelift_utils;
