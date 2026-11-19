@@ -1000,6 +1000,31 @@ mod tests {
         }
     }
 
+    /// Exact first diverging mutant from nightly run 44289859849 (shard 3).
+    /// Regression must compile and preserve observable cold/warm agreement.
+    #[test]
+    fn differential_nov18_shard3_first_float_loop_agrees() {
+        let source =
+            "var i = 0.0; var s = 01.0 / 0.0 100.0 { s = s + i * 2.5 - i / 3.0; i = i + 1.0; }; s";
+        let outcome = differential_fuzz_one(source);
+        assert!(
+            matches!(outcome, Ok(DiffOutcome::Agreed { .. })),
+            "Nov 18 shard 3 first mutant: {outcome:?}"
+        );
+    }
+
+    /// Shard 6 repro: float div-by-zero yields nil, but interpreter FAdd
+    /// coerces its nil operand to 0.0 before adding the array element.
+    #[test]
+    fn differential_nov18_shard6_float_nil_array_agrees() {
+        let source = "let a = [1.5, 2.5]; 1.0 / 0.0 + a[1]";
+        let outcome = differential_fuzz_one(source);
+        assert!(
+            matches!(outcome, Ok(DiffOutcome::Agreed { .. })),
+            "Nov 18 shard 6 float/array mutant: {outcome:?}"
+        );
+    }
+
     /// Differential regression cases: known kernels that must agree across
     /// all backends. Added from nightly fuzz captures (2026-10-10).
     #[test]
