@@ -182,6 +182,26 @@ fn my_tests() {
 
 ---
 
+## Module: http
+
+The original `get(url)` and `post(url, body)` wrappers preserve their
+legacy string-or-`nil` behavior. For new callers, use the additive
+`try_get` and `try_post` functions, which report failures as
+`Result[String, HttpRequestError]` without inventing transport error kinds.
+
+| Function | Contract |
+|---|---|
+| `get(url)` / `post(url, body)` | Legacy body or `nil` on error |
+| `try_get(url)` | `Result[String, HttpRequestError] ! {Http}` |
+| `try_post(url, body)` | `Result[String, HttpRequestError] ! {Http}` |
+
+`HttpRequestError = GetFailed(url) | PostFailed(url)`. The raw effects
+currently erase details such as timeouts, status codes, and DNS failures;
+the new errors therefore intentionally identify only the operation and URL.
+The preexisting `HttpError` declaration is unchanged for compatibility.
+
+---
+
 ## Module: fs
 
 Filesystem I/O via the built-in `FS` effect. Operations are `perform FS.read`,
@@ -196,6 +216,14 @@ effect.
 | `write` | `fn write(path: String, content: String) -> Unit ! {FS}` | Write a string to a file, overwriting existing content. Creates the file if needed. Returns nil on failure. |
 | `append` | `fn append(path: String, content: String) -> Unit ! {FS}` | Append a string to the end of a file. Creates the file if needed. Returns nil on failure. |
 | `exists` | `fn exists(path: String) -> Bool ! {FS}` | Check whether a file or directory exists at the given path. |
+| `try_read` | `Result[String, FsError] ! {FS}` | Returns `Error(ReadFailed(path))` instead of `nil`. |
+| `try_write` | `Result[Unit, FsError] ! {FS}` | Returns `Error(WriteFailed(path))` instead of `nil`. |
+| `try_append` | `Result[Unit, FsError] ! {FS}` | Returns `Error(AppendFailed(path))` instead of `nil`. |
+
+`FsError` contains the failed operation and path only. The FS host effect
+does not currently expose specific underlying OS errors. The original
+`read`, `write`, `append`, and `exists` functions remain unchanged.
+
 
 ### Usage
 
