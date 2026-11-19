@@ -134,6 +134,41 @@ struct ParsedApp {
     span: Span,
 }
 
+/// Conservative, side-effect-free subset of state-machine guard expressions.
+/// Arbitrary function calls require sound interprocedural effect analysis.
+fn pure_machine_guard(expr: &Expr, params: &[crate::ast::Param]) -> bool {
+    match expr {
+        Expr::Literal(..) => true,
+        Expr::Var(name, ..) => params.iter().any(|p| p.name == *name),
+        Expr::FieldAccess { expr, .. } => pure_machine_guard(expr, params),
+        Expr::Binary {
+            op, left, right, ..
+        } => {
+            matches!(
+                op,
+                BinOp::Eq
+                    | BinOp::Ne
+                    | BinOp::Lt
+                    | BinOp::Le
+                    | BinOp::Gt
+                    | BinOp::Ge
+                    | BinOp::And
+                    | BinOp::Or
+                    | BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Mod
+            ) && pure_machine_guard(left, params)
+                && pure_machine_guard(right, params)
+        }
+        Expr::Unary { op, expr, .. } => {
+            matches!(op, UnOp::Not | UnOp::Neg) && pure_machine_guard(expr, params)
+        }
+        _ => false,
+    }
+}
+
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
         let mut parser = Self::new_raw(tokens);
@@ -1430,7 +1465,8 @@ impl Parser {
     /// ```text
     /// state_machine Name {
     ///   state StateName                       // one or more; first = initial
-    ///   event event_name(params): StateName   // target must be a declared state
+    ///   event event_name(params): StateName   // legacy, accepted from any state
+    ///   event event_name(params) from Source: Target if predicate
     ///   on_entry StateName { body }           // hooks; state must be declared
     ///   on_exit StateName { body }
     /// }
@@ -1478,11 +1514,32 @@ impl Parser {
                             } else {
                                 Vec::new()
                             };
+                            let source = if self.peek_kind() == &TokenKind::Ident("from".into()) {
+                                self.advance();
+                                Some(self.expect_ident("event source state")?)
+                            } else {
+                                None
+                            };
                             self.expect(TokenKind::Colon)?;
                             let target = self.expect_ident("event target state")?;
+                            // Guards must be pure and limited to event parameters.
+                            let guard = if self.consume_if(&TokenKind::If) {
+                                let expr = self.parse_expr()?;
+                                if !pure_machine_guard(&expr, &params) {
+                                    return Err(NuError::parse_error(
+                                        format!("event '{}' guard must be pure and reference only event parameters", event_name),
+                                        tok.span,
+                                    ));
+                                }
+                                Some(expr)
+                            } else {
+                                None
+                            };
                             events.push(StateMachineEvent {
                                 name: event_name,
                                 params,
+                                source,
+                                guard,
                                 target,
                                 span: tok.span,
                             });
@@ -1535,6 +1592,17 @@ impl Parser {
         let state_list = states.join(", ");
         let declared = |state: &str| states.iter().any(|s| s == state);
         for (i, event) in events.iter().enumerate() {
+            if let Some(source) = &event.source {
+                if !declared(source) {
+                    return Err(NuError::parse_error(
+                        format!(
+                            "event '{}' has unknown source state '{}' in state_machine '{}'",
+                            event.name, source, name,
+                        ),
+                        event.span,
+                    ));
+                }
+            }
             if events[..i].iter().any(|e| e.name == event.name) {
                 return Err(NuError::parse_error(
                     format!(
@@ -8640,6 +8708,52 @@ mod tests {
             }
             _ => panic!("Expected ParseError"),
         }
+    }
+
+    #[test]
+    fn test_parse_state_machine_scoped_guarded_transition() {
+        let source = r#"
+            state_machine Order {
+                state Pending
+                state Paid
+                event pay(amount: Int) from Pending: Paid if amount > 0
+            }
+        "#;
+        let module = parse(source).unwrap();
+        let Decl::StateMachine { events, .. } = &module.decls[0] else {
+            panic!("expected machine");
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source.as_deref(), Some("Pending"));
+        assert_eq!(events[0].target, "Paid");
+        assert!(matches!(events[0].guard, Some(Expr::Binary { .. })));
+    }
+
+    #[test]
+    fn test_parse_state_machine_rejects_unknown_source_state() {
+        let source = "state_machine M { state A\n state B\n event go from Missing: B }";
+        let err = parse(source).unwrap_err();
+        assert!(err.to_string().contains("unknown source state"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_state_machine_rejects_effectful_guard() {
+        let source = r#"
+            state_machine M {
+                state A
+                state B
+                event go from A: B if perform IO.print("bad")
+            }
+        "#;
+        let err = parse(source).unwrap_err();
+        assert!(err.to_string().contains("guard"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_state_machine_rejects_unbound_guard_variable() {
+        let source = "state_machine M { state A\n state B\n event go from A: B if unknown > 0 }";
+        let err = parse(source).unwrap_err();
+        assert!(err.to_string().contains("guard"), "{err}");
     }
 
     #[test]

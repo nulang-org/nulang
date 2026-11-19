@@ -2970,12 +2970,16 @@ mod tests {
                     ast::StateMachineEvent {
                         name: "connect".to_string(),
                         params: vec![Param::new("address", None)],
+                        source: None,
+                        guard: None,
                         target: "Connected".to_string(),
                         span: sp,
                     },
                     ast::StateMachineEvent {
                         name: "disconnect".to_string(),
                         params: vec![],
+                        source: None,
+                        guard: None,
                         target: "Closed".to_string(),
                         span: sp,
                     },
