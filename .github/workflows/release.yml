@@ -75,7 +75,10 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: nulang-linux-x86_64
-          - os: ubuntu-latest
+          # Keep cross-architecture APT packages on a single stable Ubuntu
+          # release. ubuntu-latest can roll ahead of ports.ubuntu.com and
+          # propose downgrades of already-installed host packages.
+          - os: ubuntu-24.04
             target: aarch64-unknown-linux-gnu
             artifact: nulang-linux-aarch64
           - os: macos-latest

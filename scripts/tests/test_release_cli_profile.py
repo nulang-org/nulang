@@ -49,6 +49,19 @@ class ReleaseCliProfileTests(unittest.TestCase):
         )
 
 
+    def test_arm64_cross_release_pins_compatible_ubuntu_runner_without_downgrades(self):
+        """Multiarch APT must not cross Ubuntu releases or downgrade host packages."""
+        workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        matrix = workflow.split("      matrix:\n", 1)[1].split("    permissions:\n", 1)[0]
+        self.assertIn(
+            "          - os: ubuntu-24.04\n"
+            "            target: aarch64-unknown-linux-gnu\n",
+            matrix,
+            "arm64 cross-releases require a stable distro package baseline",
+        )
+        self.assertNotIn("--allow-downgrades", workflow)
+        self.assertIn("libc6-dev-arm64-cross", workflow)
+
     def test_linux_arm64_release_installs_libc_headers_and_probes_cross_compiler(self):
         """Cross GCC must find target stdint.h before the costly Rust build."""
         workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
