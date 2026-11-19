@@ -1,10 +1,12 @@
 // Nulang standard library — list/array operations over native arrays.
 // Language version: 2.0.0-alpha
 //
-// Polymorphic functions (map, filter, reverse, take, drop, range, length,
-// contains, index_of, find, any, all) work with any element type. Functions with explicit
-// [Int] annotations (sum, fold, max_of, min_of, sort, append, zip, enumerate,
-// uniq) are Int-only for now.
+// Polymorphic functions include map, filter, filter_map, flat_map,
+// partition, fold, append, zip, enumerate, reverse, take, drop, range,
+// length, contains, index_of, find, any and all. A fold accumulator
+// may differ from its element type; zip accepts distinct element types.
+// Integer-only helpers: sum, max_of, min_of, sort.
+// Comparator extrema and uniq work with compatible element types.
 //
 // Built on `perform Array.push` / `perform Array.new` / `perform Array.length`
 // primitives (added 2026-07-30).
@@ -68,8 +70,18 @@ pub fn find(pred, xs) {
     None
 }
 
+/// Count matching elements in one traversal, without allocating a filtered array.
+/// The predicate runs exactly once per input element, left to right.
+pub fn count_if(pred, xs) -> Int {
+    var count = 0;
+    for x in xs {
+        if pred(x) then { count = count + 1 } else {}
+    };
+    count
+}
+
 /// Left fold: fold(f, init, [a, b, c]) = f(f(f(init, a), b), c).
-pub fn fold(f, init: Int, xs: [Int]) -> Int {
+pub fn fold(f, init, xs) {
     var acc = init;
     for x in xs {
         acc = f(acc, x)
@@ -123,7 +135,45 @@ pub fn filter(pred, xs) {
     result
 }
 
-/// Reverse: return new array with elements in reverse order.
+/// Filter and transform in one traversal.
+/// The callback returns Some(value) to include it or None to skip.
+pub fn filter_map(f, xs) {
+    var result = [];
+    for x in xs {
+        match f(x) {
+            | Some(value) => { result = perform Array.push(result, value) }
+            | None => {}
+        }
+    };
+    result
+}
+
+/// Map each element to an array and concatenate the arrays in input order.
+pub fn flat_map(f, xs) {
+    var result = [];
+    for x in xs {
+        for value in f(x) {
+            result = perform Array.push(result, value)
+        }
+    };
+    result
+}
+
+/// Split elements into matching and non-matching arrays, retaining order.
+pub fn partition(pred, xs) {
+    var matched = [];
+    var unmatched = [];
+    for x in xs {
+        if pred(x) then {
+            matched = perform Array.push(matched, x)
+        } else {
+            unmatched = perform Array.push(unmatched, x)
+        }
+    };
+    (matched, unmatched)
+}
+
+/// Reverse: return a new array with elements in reverse order.
 pub fn reverse(xs) {
     var result = [];
     var i = perform Array.length(xs) - 1;
@@ -169,17 +219,28 @@ pub fn range(n) {
     result
 }
 
-/// Quicksort: returns a new sorted array (ascending).  Original unchanged.
-/// Picks the first element as pivot; partitions via `filter` into less,
-/// equal, and greater slices, then recurses.  Handles empty, single-element,
-/// duplicates, and negative numbers correctly.
+/// Quicksort: returns a new sorted array (ascending). Original unchanged.
+/// Middle-element pivot avoids the quadratic recursion of a first-element
+/// pivot on already-ordered inputs. Adversarial inputs can still be quadratic.
+/// Partition each element once to avoid three intermediate filtered traversals.
 pub fn sort(xs: [Int]) -> [Int] {
-    var len = perform Array.length(xs);
+    let len = perform Array.length(xs);
     if len <= 1 then { xs } else {
-        var pivot = xs[0];
-        var less = filter(fn(x) { x < pivot }, xs);
-        var eq = filter(fn(x) { x == pivot }, xs);
-        var greater = filter(fn(x) { x > pivot }, xs);
+        let pivot = xs[len / 2];
+        var less = [];
+        var eq = [];
+        var greater = [];
+        for x in xs {
+            if x < pivot then {
+                less = perform Array.push(less, x)
+            } else {
+                if x > pivot then {
+                    greater = perform Array.push(greater, x)
+                } else {
+                    eq = perform Array.push(eq, x)
+                }
+            }
+        };
         var result = sort(less);
         for x in eq {
             result = perform Array.push(result, x)
@@ -191,15 +252,28 @@ pub fn sort(xs: [Int]) -> [Int] {
     }
 }
 
-/// Sort using comparator cmp(a, b) that returns true if a should come before b.
-/// Same quicksort as `sort`, but uses cmp for the partition instead of < and >.
+/// Sort using a strict-order comparator cmp(a, b): true if a precedes b.
+/// Use a middle pivot and a single partition pass, with at most two comparator
+/// calls per element per level. Equal items retain their original order.
+/// This remains quicksort: adversarial inputs can still take quadratic time.
 pub fn sort_by(cmp, xs) {
-    var len = perform Array.length(xs);
+    let len = perform Array.length(xs);
     if len <= 1 then { xs } else {
-        var pivot = xs[0];
-        var less = filter(fn(x) { cmp(x, pivot) }, xs);
-        var eq = filter(fn(x) { !cmp(x, pivot) && !cmp(pivot, x) }, xs);
-        var greater = filter(fn(x) { cmp(pivot, x) }, xs);
+        let pivot = xs[len / 2];
+        var less = [];
+        var eq = [];
+        var greater = [];
+        for x in xs {
+            if cmp(x, pivot) then {
+                less = perform Array.push(less, x)
+            } else {
+                if cmp(pivot, x) then {
+                    greater = perform Array.push(greater, x)
+                } else {
+                    eq = perform Array.push(eq, x)
+                }
+            }
+        };
         var result = sort_by(cmp, less);
         for x in eq {
             result = perform Array.push(result, x)
@@ -212,31 +286,39 @@ pub fn sort_by(cmp, xs) {
 }
 
 /// Minimum element according to comparator cmp(a, b), or None for an empty array.
+/// Polymorphic: comparator must be a strict ordering; equal keys keep first.
 pub fn min_by(cmp, xs) {
-    var first = true;
-    var best = 0;
-    for x in xs {
-        if first then { best = x; first = false } else {
-            if cmp(x, best) then { best = x } else {}
-        }
-    };
-    if first then None else Some(best)
+    let len = perform Array.length(xs);
+    if len == 0 then { None } else {
+        var best = xs[0];
+        var i = 1;
+        while i < len {
+            let x = xs[i];
+            if cmp(x, best) then { best = x } else {};
+            i = i + 1
+        };
+        Some(best)
+    }
 }
 
 /// Maximum element according to comparator cmp(a, b), or None for an empty array.
+/// Polymorphic: comparator must be a strict ordering; equal keys keep first.
 pub fn max_by(cmp, xs) {
-    var first = true;
-    var best = 0;
-    for x in xs {
-        if first then { best = x; first = false } else {
-            if cmp(best, x) then { best = x } else {}
-        }
-    };
-    if first then None else Some(best)
+    let len = perform Array.length(xs);
+    if len == 0 then { None } else {
+        var best = xs[0];
+        var i = 1;
+        while i < len {
+            let x = xs[i];
+            if cmp(best, x) then { best = x } else {};
+            i = i + 1
+        };
+        Some(best)
+    }
 }
 
 /// Concatenate two arrays into a new array.  Original arrays unchanged.
-pub fn append(xs: [Int], ys: [Int]) -> [Int] {
+pub fn append(xs, ys) {
     var result = xs;
     for x in ys {
         result = perform Array.push(result, x)
@@ -245,7 +327,7 @@ pub fn append(xs: [Int], ys: [Int]) -> [Int] {
 }
 
 /// Zip two arrays into an array of tuples. Result length = min(len(xs), len(ys)).
-pub fn zip(xs: [Int], ys: [Int]) {
+pub fn zip(xs, ys) {
     var result = [];
     var i = 0;
     var len_x = perform Array.length(xs);
@@ -258,7 +340,7 @@ pub fn zip(xs: [Int], ys: [Int]) {
 }
 
 /// Enumerate: returns [(0, xs[0]), (1, xs[1]), ...].
-pub fn enumerate(xs: [Int]) {
+pub fn enumerate(xs) {
     var result = [];
     var i = 0;
     var len = perform Array.length(xs);
@@ -270,7 +352,8 @@ pub fn enumerate(xs: [Int]) {
 }
 
 /// Remove duplicates, preserving first-occurrence order.
-pub fn uniq(xs: [Int]) -> [Int] {
+/// Accepts any equality-comparable type; uses linear scans (quadratic worst case).
+pub fn uniq(xs) {
     var result = [];
     for x in xs {
         if !contains(x, result) then { result = perform Array.push(result, x) } else {}

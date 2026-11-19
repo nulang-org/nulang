@@ -1,0 +1,43 @@
+// Standard library — composable, polymorphic collection helpers.
+// Required: filter_map, flat_map, partition, and generic fold.
+import stdlib::list
+
+fn main() {
+    let evens = filter_map(
+        fn(n) { if n % 2 == 0 then Some("even") else None },
+        [1, 2, 3, 4]
+    )
+    perform IO.print("filter_map_len=" + perform Int.to_string(length(evens)))
+    perform IO.print("filter_map_first=" + evens[0])
+    perform IO.print("filter_map_last=" + evens[1])
+
+    let none = filter_map(fn(_n) { None }, [1, 2])
+    perform IO.print("filter_map_none=" + perform Int.to_string(length(none)))
+    let empty = filter_map(fn(n) { Some(n) }, [])
+    perform IO.print("filter_map_empty=" + perform Int.to_string(length(empty)))
+
+    let expanded = flat_map(fn(n) { [n, n * 10] }, [1, 2, 3])
+    perform IO.print("flat_map_len=" + perform Int.to_string(length(expanded)))
+    perform IO.print("flat_map_first=" + perform Int.to_string(expanded[0]))
+    perform IO.print("flat_map_middle=" + perform Int.to_string(expanded[3]))
+    perform IO.print("flat_map_last=" + perform Int.to_string(expanded[5]))
+    let flat_empty = flat_map(fn(n) { [n] }, [])
+    perform IO.print("flat_map_empty=" + perform Int.to_string(length(flat_empty)))
+
+    let groups = partition(fn(n) { n % 2 == 0 }, [1, 2, 3, 4, 5])
+    let yes = groups.0
+    let no = groups.1
+    perform IO.print("partition_yes=" + perform Int.to_string(length(yes)))
+    perform IO.print("partition_no=" + perform Int.to_string(length(no)))
+    perform IO.print("partition_yes_first=" + perform Int.to_string(yes[0]))
+    perform IO.print("partition_no_last=" + perform Int.to_string(no[2]))
+    let no_groups = partition(fn(n) { n > 0 }, [])
+    perform IO.print("partition_empty=" + perform Int.to_string(length(no_groups.0) + length(no_groups.1)))
+
+    let concatenated = fold(fn(acc, s) { acc + s }, "", ["Nu", "lang"])
+    perform IO.print("fold_string=" + concatenated)
+    let mixed = fold(fn(acc, n) { acc + perform Int.to_string(n) }, "", [1, 2])
+    perform IO.print("fold_mixed=" + mixed)
+    let folded_empty = fold(fn(acc, s) { acc + s }, "seed", [])
+    perform IO.print("fold_empty=" + folded_empty)
+}

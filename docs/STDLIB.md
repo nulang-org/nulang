@@ -82,12 +82,15 @@ let r = sqrt(25.0)       // ~5.0
 
 List/array operations over native arrays. Functions fall into two categories:
 
-- **Int-only** (annotated `[Int]`): `sum`, `fold`, `max_of`, `min_of`,
-  `sort`, `append`, `zip`, `enumerate`, and `uniq`.
+- **Int-only** (annotated `[Int]`): `sum`, `max_of`, `min_of`,
+  and `sort`.
 
 - **Polymorphic** (no element-type annotation): `length`, `contains`, `index_of`,
-  `find`, `any`, `all`, `map`, `filter`, `reverse`, `take`, `drop`,
-  and `range`. These accept arrays of any compatible element type.
+  `find`, `any`, `all`, `map`, `filter`, `filter_map`, `flat_map`,
+  `partition`, `fold`, `append`, `zip`, `enumerate`, `count_if`,
+  `min_by`, `max_by`, `uniq`, `reverse`, `take`,
+  `drop`, and `range`. Fold accumulator types may differ from input element
+  types; zip accepts heterogeneous array element types.
 
 ### Traversal functions
 
@@ -100,9 +103,12 @@ List/array operations over native arrays. Functions fall into two categories:
 | `find` | `fn find(pred, xs) -> Option[T]` | First matching element, or `None`. |
 | `any` | `fn any(pred, xs) -> Bool` | True if any element satisfies the predicate. |
 | `all` | `fn all(pred, xs) -> Bool` | True if all elements satisfy the predicate. |
-| `fold` | `fn fold(f, init: Int, xs: [Int]) -> Int` | Left fold: `fold(f, init, [a,b,c])` = `f(f(f(init, a), b), c)`. |
+| `count_if` | `fn count_if(pred, xs) -> Int` | Count matching elements in one traversal without an intermediate array. |
+| `fold` | `fn fold(f, init, xs)` | Polymorphic left fold: accumulator and element types may differ. |
 | `max_of` | `fn max_of(xs: [Int]) -> Option[Int]` | Maximum element, or `None` for an empty array. |
 | `min_of` | `fn min_of(xs: [Int]) -> Option[Int]` | Minimum element, or `None` for an empty array. |
+| `min_by` | `fn min_by(cmp, xs)` | First minimal element for a strict comparator, or `None` if empty. |
+| `max_by` | `fn max_by(cmp, xs)` | First maximal element for a strict comparator, or `None` if empty. |
 
 ### Array-producing functions
 
@@ -110,6 +116,13 @@ List/array operations over native arrays. Functions fall into two categories:
 |---|---|---|
 | `map` | `fn map(f, xs)` | Apply `f` to each element, return new array. |
 | `filter` | `fn filter(pred, xs)` | Keep elements where `pred` returns true. |
+| `filter_map` | `fn filter_map(f, xs)` | Apply `f` once per element; collect values from `Some(value)`, skipping `None`. |
+| `flat_map` | `fn flat_map(f, xs)` | Concatenate arrays returned by `f` in input order. |
+| `partition` | `fn partition(pred, xs)` | Return `(matching, non_matching)` arrays in stable order. |
+| `append` | `fn append(xs, ys)` | New concatenated array; both inputs must have compatible element types. |
+| `zip` | `fn zip(xs, ys)` | Pairs elements from two arrays, allowing different element types; shortest length wins. |
+| `enumerate` | `fn enumerate(xs)` | Index-element pairs, preserving input order. |
+| `uniq` | `fn uniq(xs)` | First-occurrence deduplication; quadratic worst-case due to linear membership checks. |
 | `reverse` | `fn reverse(xs)` | Return new array with elements in reverse order. |
 | `take` | `fn take(n, xs)` | Take first `n` elements. |
 | `drop` | `fn drop(n, xs)` | Drop first `n` elements. |
@@ -136,6 +149,15 @@ let rev     = reverse(xs)        // [5, 4, 3, 2, 1]
 let first3  = take(3, xs)        // [1, 2, 3]
 let rest    = drop(2, xs)        // [3, 4, 5]
 let r       = range(4)           // [0, 1, 2, 3]
+
+// Compose filtering, flattening, and grouping without manual loops
+let tens = filter_map(fn(x) { if x > 2 then Some(x * 10) else None }, xs)
+let pairs = flat_map(fn(x) { [x, x * 10] }, [1, 2])
+let groups = partition(fn(x) { x % 2 == 0 }, xs)  // ([2, 4], [1, 3, 5])
+let joined = fold(fn(acc, s) { acc + s }, "", ["Nu", "lang"])
+let matches = count_if(fn(x) { x > 3 }, xs)
+let heterogeneous = zip(["a", "b"], [1, 2])
+let unique = uniq(["red", "blue", "red"])
 ```
 
 Polymorphic functions work with strings, records, and any element type:
@@ -147,7 +169,7 @@ import stdlib::list
 let excited = map(fn(s) { s + "!" }, ["a", "b", "c"])  // ["a!", "b!", "c!"]
 let short   = filter(fn(s) { perform String.length(s) <= 4 }, ["hi", "hello", "hey"])  // ["hi", "hey"]
 
-// Int-only numerical/ordering operations still reject incompatible element types.
+// Integer-only numerical/ordering operations still reject incompatible element types.
 ```
 
 ---
