@@ -561,12 +561,17 @@ impl Parser {
     }
 
     /// Synthesize `fn {record_name}_eq(a, b) -> Bool` comparing every field with
-    /// `==`, `&&`-chained. The zero-field case is trivially `true`.
+    /// Pairwise comparisons are joined with a balanced boolean tree.
     fn derive_eq_function(record_name: &str, fields: &[(String, Type)], span: Span) -> Decl {
         let rec_ty = Type::Record(fields.to_vec());
-        let mut body: Option<Expr> = None;
-        for (field, _) in fields {
-            let cmp = Expr::Binary {
+        // Build comparisons left-to-right, but combine them pairwise. A
+        // left-associated tree has O(field_count) depth and can overflow
+        // compiler passes on wide generated record equality functions.
+        // Pairing adjacent terms retains the original short-circuit order
+        // while reducing the maximum generated depth to O(log field_count).
+        let mut comparisons: Vec<Expr> = fields
+            .iter()
+            .map(|(field, _)| Expr::Binary {
                 op: BinOp::Eq,
                 left: Box::new(Expr::FieldAccess {
                     expr: Box::new(Expr::Var("a".to_string(), span)),
@@ -579,18 +584,29 @@ impl Parser {
                     span,
                 }),
                 span,
-            };
-            body = Some(match body {
-                None => cmp,
-                Some(acc) => Expr::Binary {
-                    op: BinOp::And,
-                    left: Box::new(acc),
-                    right: Box::new(cmp),
-                    span,
-                },
-            });
+            })
+            .collect();
+
+        while comparisons.len() > 1 {
+            let mut next = Vec::with_capacity(comparisons.len().div_ceil(2));
+            let mut iter = comparisons.into_iter();
+            while let Some(left) = iter.next() {
+                next.push(match iter.next() {
+                    Some(right) => Expr::Binary {
+                        op: BinOp::And,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                        span,
+                    },
+                    None => left,
+                });
+            }
+            comparisons = next;
         }
-        let body = body.unwrap_or_else(|| Expr::Literal(Literal::Bool(true), span));
+
+        let body = comparisons
+            .pop()
+            .unwrap_or_else(|| Expr::Literal(Literal::Bool(true), span));
         Decl::Function {
             name: format!("{}_eq", record_name.to_lowercase()),
             type_params: vec![],
@@ -6930,6 +6946,111 @@ mod tests {
         let tokens = lexer.lex()?;
         let mut parser = Parser::new(tokens);
         parser.parse_expr()
+    }
+
+    #[test]
+    fn test_derive_eq_large_record_tree_is_balanced_and_ordered() {
+        // A generated expression must not grow linearly deep with record width.
+        // Preserve field order so short-circuit evaluation remains observable as
+        // the same left-to-right comparisons for every generated function.
+        let fields: Vec<(String, Type)> = (0..1024)
+            .map(|i| (format!("field_{i}"), Type::Primitive(PrimitiveType::Int)))
+            .collect();
+        let Decl::Function { body, .. } =
+            Parser::derive_eq_function("Large", &fields, Span::default())
+        else {
+            panic!("derive_eq_function must produce a function");
+        };
+
+        let mut stack = vec![(&body, 0usize)];
+        let mut max_depth = 0usize;
+        let mut observed_order = Vec::new();
+        while let Some((expr, depth)) = stack.pop() {
+            match expr {
+                Expr::Binary {
+                    op: BinOp::And,
+                    left,
+                    right,
+                    ..
+                } => {
+                    stack.push((right.as_ref(), depth + 1));
+                    stack.push((left.as_ref(), depth + 1));
+                }
+                Expr::Binary {
+                    op: BinOp::Eq,
+                    left,
+                    ..
+                } => {
+                    let Expr::FieldAccess { field, .. } = left.as_ref() else {
+                        panic!("each equality must compare a record field");
+                    };
+                    observed_order.push(field.clone());
+                    max_depth = max_depth.max(depth);
+                }
+                _ => panic!("unexpected expression in generated equality"),
+            }
+        }
+
+        let expected_order: Vec<_> = fields.iter().map(|(name, _)| name.clone()).collect();
+        assert_eq!(observed_order, expected_order);
+        assert!(
+            max_depth <= 20,
+            "derived equality has depth {max_depth}; expected logarithmic depth"
+        );
+    }
+
+    #[test]
+    fn test_derive_eq_handles_empty_and_odd_record_widths() {
+        let Decl::Function { body, .. } = Parser::derive_eq_function("Empty", &[], Span::default())
+        else {
+            panic!("derived equality must be a function");
+        };
+        assert!(matches!(body, Expr::Literal(Literal::Bool(true), _)));
+
+        for width in [1, 3, 5] {
+            let fields: Vec<_> = (0..width)
+                .map(|i| (format!("field_{i}"), Type::Primitive(PrimitiveType::Int)))
+                .collect();
+            let Decl::Function { body, .. } =
+                Parser::derive_eq_function("Odd", &fields, Span::default())
+            else {
+                panic!("derived equality must be a function");
+            };
+            let mut stack = vec![&body];
+            let mut observed_order = Vec::new();
+            while let Some(expr) = stack.pop() {
+                match expr {
+                    Expr::Binary {
+                        op: BinOp::And,
+                        left,
+                        right,
+                        ..
+                    } => {
+                        stack.push(right);
+                        stack.push(left);
+                    }
+                    Expr::Binary {
+                        op: BinOp::Eq,
+                        left,
+                        ..
+                    } => {
+                        let Expr::FieldAccess { field, .. } = left.as_ref() else {
+                            panic!("expected a field comparison");
+                        };
+                        observed_order.push(field.clone());
+                    }
+                    _ => panic!("unexpected equality expression"),
+                }
+            }
+            assert_eq!(
+                observed_order,
+                fields
+                    .iter()
+                    .map(|(field, _)| field.clone())
+                    .collect::<Vec<_>>(),
+                "comparison order changed for width {width}"
+            );
+        }
     }
 
     #[test]
