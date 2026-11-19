@@ -1000,6 +1000,49 @@ mod tests {
         }
     }
 
+    /// Regression from nightly fuzz shard 6 at 448cfa8 (2026-10-27/28):
+    /// float division by zero feeding an array-indexed addition must yield
+    /// the same observable value after JIT tier-up as in the cold VM.
+    #[test]
+    fn differential_nil_float_add_array_regression() {
+        let source = "let a = [1.5, 2.5]; 1.0 / 0.0 + a[1]";
+        match differential_fuzz_one(source) {
+            Ok(DiffOutcome::Agreed { .. }) => {}
+            other => panic!("interpreter/JIT parity regression: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn differential_fuzz_direct_call_runtime_error_has_one_prefix() {
+        // October 15 nightly repro: warmed JIT must not wrap a callee's
+        // formatted RuntimeError in another RuntimeError prefix.
+        let source =
+            "fn cond(c, a, b) { if- c then a else b }; cond(true, 1, 2) + cond(false, 10, 20)";
+        let outcome = differential_fuzz_one(source)
+            .expect("JIT direct-call runtime error must match interpreter formatting");
+        assert!(
+            matches!(outcome, DiffOutcome::Agreed { .. }),
+            "must compare the actual compiler backends: {:?}",
+            outcome
+        );
+    }
+
+    /// October 16 nightly differential fuzz, shard 3: native AOT must keep
+    /// the same error category as the reference interpreter for an unhandled
+    /// effect produced by a non-exhaustive match. Comparing the formatted
+    /// error strings as-is is intentional: this must not silently pass when
+    /// the AOT backend was not exercised.
+    #[test]
+    fn differential_fuzz_oct16_aot_unhandled_effect_category_agrees() {
+        let source = "let x = 42; match x { 0 => (fn(x) { x + 1 })(41)}";
+        let outcome = differential_fuzz_one(source)
+            .expect("unhandled effect kind must match across interpreter and AOT");
+        assert!(
+            matches!(outcome, DiffOutcome::Agreed { aot: true, .. }),
+            "AOT must execute and preserve the effect error category: {outcome:?}"
+        );
+    }
+
     /// Differential regression cases: known kernels that must agree across
     /// all backends. Added from nightly fuzz captures (2026-10-10).
     #[test]

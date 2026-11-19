@@ -35,6 +35,15 @@ struct Env {
 
 /// Clone a parsed module and enrich statically resolvable actor calls with type
 /// annotations. Unknown actor identities are left untouched for compatibility.
+/// Whether this module defines actor protocols requiring call annotations.
+/// Pure/function-only modules can skip cloning and recursively walking their
+/// entire AST during HIR lowering.
+pub fn has_actor_protocols(module: &AstModule) -> bool {
+    let mut protocols = FxHashMap::default();
+    collect_protocols(&module.decls, &mut protocols);
+    !protocols.is_empty()
+}
+
 pub fn annotate_module(module: &AstModule) -> NuResult<AstModule> {
     let mut protocols = FxHashMap::default();
     collect_protocols(&module.decls, &mut protocols);

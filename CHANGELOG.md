@@ -1,4 +1,32 @@
 # Nulang Changelog
+### Native AOT unhandled-effect error-category parity — 2026-10-16
+- **Native AOT preserves the interpreter's `EffectError` category for unhandled effects.** Its pending native-error slot carries a typed runtime/effect distinction while retaining first-error-wins semantics for operations that continue after a compiled helper reports failure.
+- **Deterministic differential and helper-level regressions cover the observed October 16 mismatch and preserve both error categories.** Standalone and runtime-backed AOT entry points consume the same typed channel; the JIT message-only adapter remains compatible.
+
+### Canonicalize managed floating-point NaNs — 2026-10-30
+- Canonicalize all NaNs at `Value::float` construction, including ordinary native FFI F64 returns, so adversarial NaN payload bits cannot impersonate Nulang pointer, integer, or other value tags.
+- Add regression coverage for raw FFI conversion and a native C-ABI float return. Existing finite floats preserve their original bit patterns. The JIT/AOT/WASM differential matrix still requires hosted exact-head verification.
+
+### NUL0 TCP partial-frame recovery across read timeouts — 2026-11-10
+- **Preserve bytes already consumed from NUL0 frame prefixes and payloads when socket reads return `WouldBlock`, `TimedOut`, or `Interrupted`.** Retry from the unconsumed offset rather than restarting `read_exact` with a fresh buffer, preventing frame misalignment and lost actor packets.
+- **Cover fragmented reads, shutdown and premature EOF with deterministic regressions.** Existing maximum-frame-size limits and transport failure semantics are retained. The intermittent five-node post-heal delivery problem still requires separate qualification; this change does not establish that it is fully resolved.
+
+### SQLite local database pathname integrity — 2026-11-11
+- **Preserve native filesystem path bytes when opening local actor SQLite stores.** The security-migration adapter previously converted paths through lossy UTF-8, potentially opening a different file for a non-UTF-8 Unix pathname. The constructor now forwards Path directly, preserving database-file identity; the in-memory special name remains supported.
+- **Added a Unix filesystem regression checking exact filename bytes and no accidental replacement-name database.** Keep the patched SQLite/security integration and remote Turso fail-closed behavior separate; there are no new audit exclusions.
+
+### Callback effect soundness on stack-safe compiler — 2026-11-11
+- **Closed effect budgets now reject unresolved callable tails**, including untyped parameters and computed callbacks through match branches, annotations, blocks, record fields, and indices. Pure callbacks with statically known rows remain admissible.
+- **Right-nested let-effect inference remains iterative and now preserves scoped callback provenance** through long binding chains, including same-name shadowing. Effect-row combinations deduplicate repeated effects and preserve distinct unknown tail identities.
+- **Conformance additions cover eleven positive/negative callback cases**, alongside direct Rust tests and a 600-binding regression. This is conservative checking, not full row-variable constraint solving, and host/backend parity remains subject to exact-head CI.
+- **This integration inherits the audited single-SQLite security branch** which deliberately rejects legacy remote libSQL/Turso; it requires explicit compatibility review before any production promotion.
+
+### Compiler let-chain stack boundedness — 2026-11-11
+- **Type, effect, and capability analyses now walk right-nested ordinary `let` sequences iteratively.** They preserve ordered substitutions, effect shadowing, and linear consumption restoration while avoiding process-stack exhaustion for conformance spill fixtures.
+- **HIR lowering now walks left-associative binary expression spines iteratively** while retaining left-to-right evaluation; actor-protocol annotation skips unnecessary full-module cloning when no actor protocols exist.
+- **Linux regression tests pin valid wide/nested-let fixtures at an 8 MiB stack limit** for both `--check` and execution, with exact output checks (9870 / 7750). Additional validation for deeper AST shapes remains necessary.
+- **Actor-free type checking now avoids redundant actor-protocol AST cloning**, preventing a further frontend stack overflow on the checked-in 600-binding conformance fixture. A third Linux regression verifies both `--check` and the exact executable result (600) under 8 MiB. The historical expected-crash sidecar is updated to assert the corrected behavior; this is not a general guarantee for arbitrarily deep ASTs.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.

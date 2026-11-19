@@ -1,0 +1,8 @@
+fn pure() -> Unit ! {} {}
+fn invoke(cb: () -> Unit ! {}) -> Unit ! {} {
+    (match true with {
+        | true => cb
+        | _ => cb
+    })()
+}
+invoke(pure)

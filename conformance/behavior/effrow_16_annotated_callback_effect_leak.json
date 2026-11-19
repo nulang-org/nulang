@@ -1,0 +1,1 @@
+{"exit_code":5,"stdout":"","stderr":"disallowed effect(s): IO","proves":"A type annotation around an IO-typed callback cannot erase its invocation effects or allow a pure function to perform IO."}

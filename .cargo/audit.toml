@@ -1,37 +1,7 @@
 [advisories]
-# RUSTSEC-2026-0186 is an "unsound" warning for memmap2 < 0.9.11.
-# The vulnerable APIs (Mmap::advise_range, MmapMut::flush[_async]_range)
-# are not called by nulang or by its transitive dependency cranelift-jit,
-# which only uses MmapMut::map_anon. Upgrading memmap2 is blocked on
-# cranelift-jit updating its own memmap2 requirement.
-ignore = [
-    "RUSTSEC-2026-0186",
-    # RUSTSEC-2026-0346 / RUSTSEC-2026-0349 hit only rustls 0.22.4, pulled
-    # exclusively through libsql 0.10.0-pre.4 -> hyper-rustls 0.25. rustls
-    # 0.22 is end-of-life (no patched 0.22 release), and every published libsql
-    # release -- including current git main -- still pins hyper-rustls 0.25
-    # (hyper 0.14). These paths only execute when connecting to a remote Turso
-    # database; Nulang's local SQLite file/in-memory stores never reach them.
-    # Tracked until libsql migrates to hyper 1.0 / rustls 0.23.
-    "RUSTSEC-2026-0346",
-    "RUSTSEC-2026-0349",
-    # The rustls-webpki advisories below are transitive through libsql
-    # 0.10.0-pre.4 -> hyper-rustls 0.25 -> rustls 0.22.4 -> rustls-webpki 0.102.8.
-    # No patched libsql release is available, and the vulnerable code path
-    # (TLS certificate validation with CRLs / name constraints) is only reachable
-    # when connecting to a remote Turso database. Nulang's LibsqlStore also
-    # supports local SQLite (file and in-memory) which do not exercise this
-    # code path. These are documented known risks until libsql updates its
-    # rustls dependency.
-    "RUSTSEC-2026-0049",
-    "RUSTSEC-2026-0098",
-    "RUSTSEC-2026-0099",
-    "RUSTSEC-2026-0104",
-    # h2 "unbounded empty DATA frames" DoS (RUSTSEC-2026-0258). Nulang does not
-    # expose an HTTP/2 server; h2 is a transitive dependency of HTTP clients.
-    # Upgrading requires hyper/reqwest ecosystem updates.
-    "RUSTSEC-2026-0258",
-    # rustls-pemfile is unmaintained (RUSTSEC-2025-0134). Transitive through
-    # libsql/hyper-rustls; no actionable upgrade path until upstream moves.
-    "RUSTSEC-2025-0134",
-]
+# Do not suppress RustSec advisories. After the 2026-11 remediation,
+# cargo audit reports any new vulnerabilities directly in CI.
+#
+# Unmaintained/unsound warnings remain visible instead of being hidden;
+# the CI gate uses cargo audit without --deny warnings.
+ignore = []

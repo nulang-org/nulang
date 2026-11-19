@@ -108,7 +108,7 @@ cargo build --release --all-features
 |---------|---------|-------------|
 | `native-codegen` | On | Cranelift-backed tiered JIT and the native/AOT backend |
 | `python` | On | PyO3 Python interop |
-| `sqlite` | On | libsql/Turso persistence |
+| `sqlite` | On | Local libSQL/SQLite persistence; remote Turso connections are currently disabled pending a TLS security update |
 | `lsp` | On | tower-lsp language server |
 | `ai-runtime` | On | AI runtime — LLM providers, pipelines, debates, supervisor teams |
 | `tls` | On | TLS support for the TCP transport |

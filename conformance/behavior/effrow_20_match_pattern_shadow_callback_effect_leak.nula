@@ -1,0 +1,8 @@
+fn good() -> Unit ! {} {}
+fn danger() -> Unit ! {IO} { perform IO.print("unsafe") }
+fn invoke(cb: () -> Unit ! {}, unsafe_cb: () -> Unit ! {IO}) -> Unit ! {} {
+    (match unsafe_cb with {
+        | cb => cb
+    })()
+}
+invoke(good, danger)

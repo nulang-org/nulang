@@ -1,0 +1,8 @@
+fn io() -> Unit ! {IO} { perform IO.print("unsafe") }
+fn invoke(cb: () -> Unit ! {IO}) -> Unit ! {} {
+    (match true with {
+        | true => cb
+        | _ => cb
+    })()
+}
+invoke(io)
