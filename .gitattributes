@@ -1,0 +1,2 @@
+# Preserve upstream source faithfully; whitespace-only issues are pre-existing in published libSQL.
+vendor/libsql/** linguist-vendored whitespace=-blank-at-eol,-blank-at-eof
