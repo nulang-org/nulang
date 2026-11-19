@@ -1,0 +1,123 @@
+name: README Roadmap Sync
+
+# Roadmap issue #331 is the editorial source of truth. Changes to linked
+# issues/PRs are proposed through a reviewable PR, never pushed to main.
+on:
+  schedule:
+    - cron: '17 08 * * 1'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'README.md'
+      - 'scripts/sync_readme_roadmap.py'
+      - 'scripts/tests/test_sync_readme_roadmap.py'
+      - '.github/workflows/readme-roadmap-sync.yml'
+
+concurrency:
+  group: readme-roadmap-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test-roadmap:
+    name: Validate README roadmap generator
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python3 -m unittest discover -s scripts/tests -p 'test_sync_readme_roadmap.py' -v
+
+  roadmap:
+    name: Propose current README roadmap
+    # An on-demand run must use the protected main workflow, not arbitrary code
+    # on a user-selected feature branch.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: read
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.DOCS_SYNC_TOKEN || github.token }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Test roadmap renderer
+        run: python3 -m unittest discover -s scripts/tests -p 'test_sync_readme_roadmap.py' -v
+
+      - name: Refresh and propose README roadmap
+        env:
+          # GITHUB_TOKEN-created PR checks require maintainer approval; a PAT/App token
+          # avoids that gate, matching the existing docs-sync workflow.
+          GH_TOKEN: ${{ secrets.DOCS_SYNC_TOKEN || github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Execute the updater from the reviewed main branch, even when an
+          # existing automation PR branch has been edited by a contributor.
+          cp scripts/sync_readme_roadmap.py "$RUNNER_TEMP/sync_readme_roadmap.py"
+
+          sync_branch="automation/readme-roadmap"
+          git fetch origin main
+          if git ls-remote --exit-code --heads origin "$sync_branch" >/dev/null 2>&1; then
+            git fetch origin "$sync_branch:refs/remotes/origin/$sync_branch"
+            git switch -c "$sync_branch" --track "origin/$sync_branch"
+            # Merge main into the existing branch, preserving reviewed edits.
+            # Conflicts fail closed instead of overwriting maintainer changes.
+            git merge --no-edit origin/main
+          else
+            git switch -c "$sync_branch" origin/main
+          fi
+
+          python3 "$RUNNER_TEMP/sync_readme_roadmap.py"
+          git add README.md
+          if ! git diff --cached --quiet; then
+            git commit -m "docs: refresh issue-backed README roadmap"
+          fi
+
+          # Never silently carry unrelated changes through an automation PR.
+          unexpected="$(git diff --name-only origin/main HEAD -- . ':!README.md')"
+          if [ -n "$unexpected" ]; then
+            echo "::error::Automation branch contains non-README changes; review manually."
+            printf '%s\n' "$unexpected"
+            exit 1
+          fi
+
+          if git diff --quiet origin/main HEAD -- README.md; then
+            echo "README roadmap is already current relative to main."
+            exit 0
+          fi
+
+          # Ordinary fast-forward push: concurrent or manual changes on the
+          # review branch cannot be overwritten by the scheduler.
+          git push origin "HEAD:refs/heads/$sync_branch"
+
+          pr_number="$(gh pr list --head "$sync_branch" --base main --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$pr_number" ]; then
+            echo "Updated existing roadmap PR #$pr_number without replacing its history or description."
+          else
+            gh pr create \
+              --base main \
+              --head "$sync_branch" \
+              --title "docs: refresh issue-backed README roadmap" \
+              --body "Automated README-only roadmap refresh from issue #331 and the current open/closed state of its linked issues/PRs. Closed does not imply shipped. Review and merge through normal branch protection."
+          fi
