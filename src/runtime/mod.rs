@@ -72,6 +72,7 @@ mod libsql_tls;
 #[cfg(feature = "ai-runtime")]
 mod llm;
 mod metrics;
+mod nudb_transition;
 mod persistence;
 mod process_groups;
 mod registry;
@@ -122,6 +123,7 @@ pub use http_server::{render_route_handler, HttpMethod, HttpServerState, WebDevS
 pub use mailbox::*;
 pub use network::NetworkTransport;
 pub use network::*;
+pub use nudb_transition::NuDbTransitionJournal;
 pub use object_store::*;
 pub use orca_cycle::*;
 pub use persistence::*;
