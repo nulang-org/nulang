@@ -1679,6 +1679,28 @@ fn run_frontend(
     // 3. Type check
     let mut type_checker = TypeChecker::new();
     let module_type = type_checker.check_module(&ast)?;
+    // Compiler-side lint warnings are emitted after successful inference,
+    // so no warning is derived from an incomplete or erroneous type.
+    if !type_checker.warnings.is_empty() {
+        let use_color = std::io::stderr().is_terminal();
+        for warning in &type_checker.warnings {
+            eprintln!("{}", nulang::diagnostic::format_warning(warning, use_color));
+        }
+        if deny_warnings {
+            return Err(nulang::types::NuError::parse_error(
+                format!(
+                    "aborting due to {} warning{} (--deny-warnings)",
+                    type_checker.warnings.len(),
+                    if type_checker.warnings.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ),
+                type_checker.warnings[0].span,
+            ));
+        }
+    }
 
     if verbose {
         println!("=== Inferred Type ===");
