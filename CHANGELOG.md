@@ -1,4 +1,14 @@
 # Nulang Changelog
+### Mutable binding type safety and module-level preservation — 2026-11-11
+- **Module-level `var` declarations retain mutability** in explicit or synthetic entry functions, and explicit `main` retains declared `requires`/`ensures` metadata.
+- **Mutable local bindings remain monomorphic across reassignment**, while immutable `let` preserves generalization.
+- **Regressions cover parser wrappers, valid mutable assignments, and rejected incompatible type reuse.**
+
+### Conservative ML-style match diagnostics and constructor validation — 2026-11-11
+- **Finite-domain pattern coverage is diagnosed, not blindly rejected.** `W0201` reports provably missing cases for declared variants and `Bool`; `W0202` reports redundant arms, with `--deny-warnings` for strict enforcement.
+- **Known closed-variant constructor names and payload shapes are type-checked.** Invalid constructor names or shapes are errors.
+- **CLI, LSP, and browser playground share the same coverage analyzer.** Exact-head conformance and backend parity remain required before promotion.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.

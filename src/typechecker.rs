@@ -1076,6 +1076,9 @@ pub struct TypeChecker {
     pub collect_errors: bool,
     /// Errors collected when `collect_errors` is set (empty otherwise).
     pub collected_errors: Vec<crate::types::NuError>,
+    /// Non-fatal semantic diagnostics collected during type inference.
+    /// Includes finite-domain pattern coverage and discarded Result values.
+    pub warnings: Vec<NuWarning>,
 }
 
 /// Pre-computed class and instance tables extracted from an AST module.
@@ -1157,7 +1160,13 @@ impl TypeChecker {
             rigid_vars: FxHashSet::default(),
             collect_errors: false,
             collected_errors: Vec::new(),
+            warnings: Vec::new(),
         }
+    }
+
+    /// Consume and return non-fatal semantic warnings collected by type checking.
+    pub fn take_warnings(&mut self) -> Vec<NuWarning> {
+        std::mem::take(&mut self.warnings)
     }
 
     /// Type-check an entire module, returning the type of the last declaration.
@@ -1170,6 +1179,7 @@ impl TypeChecker {
 
     /// Type-check an entire module, returning the type of the last declaration.
     pub fn check_module(&mut self, module: &AstModule) -> NuResult<Type> {
+        self.warnings.clear();
         // Enrich statically known actor sends/asks with protocol constraints
         // before ordinary Algorithm-W inference. Dynamic actor references
         // remain permissive for compatibility; explicit ActorRef<P> values
@@ -1918,13 +1928,13 @@ impl TypeChecker {
             } => self.infer_match(ctx, scrutinee, arms, *span),
 
             // Block: sequence of expressions
-            Expr::Block { exprs, span } => self.infer_block(ctx, exprs, *span),
+            Expr::Block { exprs, span } => self.infer_block(ctx, exprs, *span, true),
 
             // Par: validate independence now, even though execution remains
             // sequential until RFC 0024's scoped-concurrency backend lands.
             Expr::Par { exprs, span } => {
                 crate::parallel_analysis::validate_parallel_branches(exprs, *span)?;
-                self.infer_block(ctx, exprs, *span)
+                self.infer_block(ctx, exprs, *span, false)
             }
 
             // Spawn actor
@@ -2494,8 +2504,15 @@ impl TypeChecker {
                     mgu_assignable(&apply_subst(&val_ty, &s_combined), ann_ty, Span::default())?;
                 s_combined = compose_subst(&s_ann, &s_combined);
             }
-            let gen_ty = self.do_generalize(ctx, &apply_subst(&val_ty, &s_combined));
-            let new_ctx = ctx.extend(name.to_string(), gen_ty, Capability::Ref, mutable);
+            let binding_ty = apply_subst(&val_ty, &s_combined);
+            // A mutable location cannot be used at independently instantiated
+            // types after reassignment, even when its initial value is a lambda.
+            let binding_ty = if mutable {
+                binding_ty
+            } else {
+                self.do_generalize(ctx, &binding_ty)
+            };
+            let new_ctx = ctx.extend(name.to_string(), binding_ty, Capability::Ref, mutable);
             let (s3, body_ty) = self.infer_expr(&new_ctx, body)?;
             let final_subst = compose_subst(&s3, &s_combined);
             return Ok((final_subst.clone(), apply_subst(&body_ty, &final_subst)));
@@ -2512,11 +2529,17 @@ impl TypeChecker {
             s1
         };
 
-        // Generalize the value type
-        let gen_ty = self.do_generalize(ctx, &apply_subst(&val_ty, &s1));
+        // Only immutable let bindings are generalized. Mutable bindings
+        // denote one storage location and must remain monomorphic across
+        // reads and assignments (OCaml's value-restriction principle).
+        let binding_ty = apply_subst(&val_ty, &s1);
+        let binding_ty = if mutable {
+            binding_ty
+        } else {
+            self.do_generalize(ctx, &binding_ty)
+        };
 
-        // Extend context with generalized type
-        let new_ctx = ctx.extend(name.to_string(), gen_ty, Capability::Ref, mutable);
+        let new_ctx = ctx.extend(name.to_string(), binding_ty, Capability::Ref, mutable);
 
         // Infer body with extended context
         let (s2, body_ty) = self.infer_expr(&new_ctx, body)?;
@@ -3161,57 +3184,100 @@ impl TypeChecker {
                 let concrete = !matches!(&current_ty, Type::Var(_) | Type::Skolem(_));
                 if concrete {
                     let type_key = format!("{}", current_ty);
-                    let class_table = self.class_table.clone();
-                    let instance_table = self.instance_table.clone();
-                    for (class_name, class_info) in &class_table {
-                        if class_info.methods.iter().any(|m| m.name == field) {
-                            let key = (class_name.clone(), type_key.clone());
-                            if instance_table.contains_key(&key) {
-                                let dict_name = format!("_impl_{}_{}", class_name, type_key);
-                                if let Some((dict_ty, _, _)) = ctx.lookup(&dict_name) {
-                                    if let Type::Record(fields) = dict_ty {
-                                        if let Some((_, field_ty)) =
-                                            fields.iter().find(|(n, _)| n == field)
+                    // Resolve a registered implementation before reporting a
+                    // missing one. A different class may define the same
+                    // method without implementing it for this receiver type.
+                    // Sort to avoid hash-table-order-dependent resolution.
+                    let mut method_classes: Vec<&String> = self
+                        .class_table
+                        .iter()
+                        .filter_map(|(name, info)| {
+                            info.methods
+                                .iter()
+                                .any(|method| method.name == field)
+                                .then_some(name)
+                        })
+                        .collect();
+                    method_classes.sort_unstable();
+                    let selected_class = method_classes
+                        .iter()
+                        .copied()
+                        .find(|name| {
+                            self.instance_table
+                                .contains_key(&((*name).clone(), type_key.clone()))
+                        })
+                        .or_else(|| method_classes.first().copied());
+                    if let Some(class_name) = selected_class {
+                        let key = (class_name.clone(), type_key.clone());
+                        if self.instance_table.contains_key(&key) {
+                            let dict_name = format!("_impl_{}_{}", class_name, type_key);
+                            if let Some((dict_ty, _, _)) = ctx.lookup(&dict_name) {
+                                if let Type::Record(fields) = dict_ty {
+                                    if let Some((_, field_ty)) =
+                                        fields.iter().find(|(n, _)| n == field)
+                                    {
+                                        if let Type::Function {
+                                            param,
+                                            ret,
+                                            effect,
+                                            cap,
+                                        } = field_ty
                                         {
-                                            if let Type::Function {
-                                                param,
-                                                ret,
-                                                effect,
-                                                cap,
-                                            } = field_ty
-                                            {
-                                                let remaining = strip_first_param(param);
-                                                return Ok((
-                                                    s1.clone(),
-                                                    Type::Function {
-                                                        param: Box::new(remaining),
-                                                        ret: ret.clone(),
-                                                        effect: effect.clone(),
-                                                        cap: *cap,
-                                                    },
-                                                ));
-                                            }
+                                            let remaining = strip_first_param(param);
+                                            return Ok((
+                                                s1.clone(),
+                                                Type::Function {
+                                                    param: Box::new(remaining),
+                                                    ret: ret.clone(),
+                                                    effect: effect.clone(),
+                                                    cap: *cap,
+                                                },
+                                            ));
                                         }
                                     }
                                 }
-                                // Instance registered but dict not in
-                                // context (should not happen).
-                                return Err(NuError::TypeError {
-                                    msg: format!("internal: dict '{}' not in scope", dict_name),
-                                    span,
-                                    expected_type: None,
-                                    found_type: None,
-                                    similar_names: None,
-                                });
                             }
+                            // Instance registered but dict not in
+                            // context (should not happen).
                             return Err(NuError::TypeError {
-                                msg: format!("no impl {}[{}]", class_name, current_ty),
+                                msg: format!("internal: dict '{}' not in scope", dict_name),
                                 span,
                                 expected_type: None,
                                 found_type: None,
                                 similar_names: None,
                             });
                         }
+                        // Report concrete alternatives for the same class, not
+                        // unrelated implementations. Sorting makes diagnostics
+                        // deterministic despite FxHashMap iteration order.
+                        let mut available_types: Vec<&str> = self
+                            .instance_table
+                            .keys()
+                            .filter_map(|(registered_class, registered_type)| {
+                                (registered_class == class_name).then_some(registered_type.as_str())
+                            })
+                            .collect();
+                        available_types.sort_unstable();
+                        available_types.dedup();
+                        let available = if available_types.is_empty() {
+                            format!("no {} implementations registered", class_name)
+                        } else {
+                            format!(
+                                "available {} implementations: {}",
+                                class_name,
+                                available_types.join(", ")
+                            )
+                        };
+                        return Err(NuError::TypeError {
+                                msg: format!(
+                                    "no impl {}[{}] for method .{}; {}; hint: add `impl {} {} {{ ... }}`",
+                                    class_name, current_ty, field, available, class_name, current_ty
+                                ),
+                                span,
+                                expected_type: None,
+                                found_type: None,
+                                similar_names: None,
+                            });
                     }
                 }
 
@@ -3400,6 +3466,21 @@ impl TypeChecker {
             final_subst = compose_subst(&s, &final_subst);
         }
 
+        // Coverage analysis runs only after ordinary pattern/guard/body typing
+        // succeeds and uses the fully substituted scrutinee type. Guarded arms
+        // cannot close a coverage hole because their predicate may be false.
+        let coverage_ty = apply_subst(&scrut_ty, &final_subst);
+        let coverage_arms: Vec<(Pattern, bool)> = arms
+            .iter()
+            .map(|(pattern, guard, _)| (pattern.clone(), guard.is_some()))
+            .collect();
+        self.warnings
+            .extend(crate::pattern_coverage::warnings_for_match(
+                &coverage_ty,
+                &coverage_arms,
+                span,
+            ));
+
         Ok((final_subst.clone(), apply_subst(&first_arm, &final_subst)))
     }
 
@@ -3473,13 +3554,29 @@ impl TypeChecker {
             },
             Pattern::Variant(name, pat) => match scrut_ty {
                 Type::Variant(variants) => {
-                    let mut new_ctx = ctx.clone();
-                    if let Some((_, Some(ty))) = variants.iter().find(|(n, _)| n == name) {
-                        if let Some(p) = pat {
-                            new_ctx = self.bind_pattern(&new_ctx, p, ty)?;
-                        }
+                    // A statically closed variant gives enough information to
+                    // reject impossible constructors and payload-shape errors.
+                    // Unknown/abstract scrutinee types retain their existing
+                    // inference fallback below.
+                    let (_, payload) =
+                        variants.iter().find(|(n, _)| n == name).ok_or_else(|| {
+                            NuError::type_error(
+                                format!("unknown variant constructor '{name}' in match"),
+                                Span::default(),
+                            )
+                        })?;
+                    match (payload.as_ref(), pat.as_deref()) {
+                        (Some(ty), Some(inner)) => self.bind_pattern(ctx, inner, ty),
+                        (None, None) => Ok(ctx.clone()),
+                        (Some(_), None) => Err(NuError::type_error(
+                            format!("variant constructor '{name}' requires a payload pattern"),
+                            Span::default(),
+                        )),
+                        (None, Some(_)) => Err(NuError::type_error(
+                            format!("variant constructor '{name}' has no payload"),
+                            Span::default(),
+                        )),
                     }
-                    Ok(new_ctx)
                 }
                 _ => {
                     if let Some(p) = pat {
@@ -3499,11 +3596,15 @@ impl TypeChecker {
         }
     }
 
+    /// Detect Result values that are discarded as ordinary block statements.
+    /// A `par` region is excluded: its branches may become independently
+    /// observable child results under RFC 0024's structured task semantics.
     fn infer_block(
         &mut self,
         ctx: &TypeContext,
         exprs: &[Expr],
         _span: Span,
+        warn_discarded: bool,
     ) -> NuResult<(Substitution, Type)> {
         if exprs.is_empty() {
             return Ok((vec![], Type::unit()));
@@ -3511,13 +3612,44 @@ impl TypeChecker {
 
         let mut subst = vec![];
         let mut last_ty = Type::unit();
-        for expr in exprs {
+        let mut discarded = Vec::new();
+        for (index, expr) in exprs.iter().enumerate() {
             let ctx_sub = apply_subst_to_ctx(ctx, &subst);
             let (s, ty) = self.infer_expr(&ctx_sub, expr)?;
             subst = compose_subst(&s, &subst);
+            if warn_discarded && index + 1 != exprs.len() {
+                discarded.push((expr.span(), ty.clone()));
+            }
             last_ty = ty;
         }
+        // Infer *all* expressions first: a later unification may specialize
+        // the type of an earlier expression. Never diagnose an unresolved
+        // type variable as a Result merely because it might become one.
+        for (span, ty) in discarded {
+            if Self::is_result_variant(&apply_subst(&ty, &subst))
+                && !self
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "W0301" && w.span == span)
+            {
+                self.warnings.push(NuWarning::discarded_result(span));
+            }
+        }
         Ok((subst.clone(), apply_subst(&last_ty, &subst)))
+    }
+
+    fn is_result_variant(ty: &Type) -> bool {
+        match ty {
+            Type::Variant(variants) if variants.len() == 2 => {
+                variants
+                    .iter()
+                    .any(|(name, payload)| name == "Ok" && payload.is_some())
+                    && variants
+                        .iter()
+                        .any(|(name, payload)| name == "Error" && payload.is_some())
+            }
+            _ => false,
+        }
     }
 
     fn declared_actor_protocol(behaviors: &[Behavior]) -> Type {
@@ -4830,6 +4962,93 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Regression: discarded Result values must be diagnosed after inference.
+    // -----------------------------------------------------------------------
+
+    fn result_returning_context() -> TypeContext {
+        let result = Type::Variant(vec![
+            ("Ok".to_string(), Some(Type::int())),
+            ("Error".to_string(), Some(Type::string())),
+        ]);
+        ctx_with(
+            "try_op",
+            Type::Function {
+                param: Box::new(Type::int()),
+                ret: Box::new(result),
+                effect: EffectRow::empty(),
+                cap: Capability::Ref,
+            },
+        )
+    }
+
+    #[test]
+    fn test_discarded_result_statement_emits_warning() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Block {
+            exprs: vec![app(var("try_op"), int_lit(1)), int_lit(2)],
+            span: sp(),
+        };
+        tc.infer_expr(&result_returning_context(), &expr).unwrap();
+        assert_eq!(tc.warnings.len(), 1);
+        assert_eq!(tc.warnings[0].code, "W0301");
+    }
+
+    #[test]
+    fn test_returned_result_is_not_discarded() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Block {
+            exprs: vec![int_lit(1), app(var("try_op"), int_lit(2))],
+            span: sp(),
+        };
+        tc.infer_expr(&result_returning_context(), &expr).unwrap();
+        assert!(tc.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_discarded_non_result_variant_is_not_warned() {
+        let mut tc = TypeChecker::new();
+        let ctx = ctx_with(
+            "maybe",
+            Type::Variant(vec![
+                ("Some".to_string(), Some(Type::int())),
+                ("None".to_string(), None),
+            ]),
+        );
+        let expr = Expr::Block {
+            exprs: vec![var("maybe"), int_lit(1)],
+            span: sp(),
+        };
+        tc.infer_expr(&ctx, &expr).unwrap();
+        assert!(tc.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_par_branches_do_not_trigger_discard_warning() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Par {
+            exprs: vec![app(var("try_op"), int_lit(1)), int_lit(2)],
+            span: sp(),
+        };
+        tc.infer_expr(&result_returning_context(), &expr).unwrap();
+        assert!(tc.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_discarded_result_in_parsed_module_emits_warning() {
+        let source = "type Result[Ok, Err] = Ok(Ok) | Error(Err)\nfn f() -> Int { Ok(1); 42 }";
+        let tokens = crate::lexer::Lexer::new(source).lex().unwrap();
+        let mut parser = crate::parser::Parser::new(tokens);
+        let module = parser.parse_module().unwrap();
+        let mut tc = TypeChecker::new();
+        tc.check_module(&module).unwrap();
+        assert_eq!(
+            tc.warnings.iter().filter(|w| w.code == "W0301").count(),
+            1,
+            "actual Result constructor should be recognized after inference"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Test: Array
     // -----------------------------------------------------------------------
 
@@ -5584,6 +5803,46 @@ mod tests {
             "expected a type error, got {:?}",
             result.ok()
         );
+    }
+
+    #[test]
+    fn test_module_var_can_be_reassigned_with_same_type() {
+        let result = check_src("var counter = 0\ncounter = 1\ncounter");
+        assert!(
+            result.is_ok(),
+            "expected mutable top-level binding: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_module_var_reassignment_must_keep_original_type() {
+        let result = check_src("var id = fn(x) x\nid = fn(x: Int) x + 1\nid(true)");
+        match result {
+            Err(NuError::TypeError { msg, .. }) => assert!(
+                !msg.contains("immutable binding"),
+                "must reject inconsistent types, not erase mutability: {msg}"
+            ),
+            other => panic!("expected a type error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_mutable_let_reassignment_cannot_change_instantiation() {
+        // OCaml-style value restriction: an assignable binding is a single
+        // storage location. It must not be instantiated afresh per use.
+        let result = check_src("var id = fn(x) x in { id = fn(x: Int) x + 1; id(true) }");
+        assert!(
+            matches!(result, Err(NuError::TypeError { .. })),
+            "expected a type error, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_mutable_let_accepts_same_type_reassignment() {
+        let result = check_src("var id = fn(x) x in { id = fn(x: Int) x + 1; id(5) }");
+        assert!(result.is_ok(), "expected success, got {:?}", result);
     }
 
     #[test]

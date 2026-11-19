@@ -1655,6 +1655,22 @@ impl NuWarning {
         }
     }
 
+    /// `W0301` — a Result was silently discarded in a block.
+    pub fn discarded_result(span: Span) -> Self {
+        NuWarning {
+            code: "W0301",
+            msg: "unused Result value; an error may be silently ignored".to_string(),
+            span,
+            help: Some(
+                concat!(
+                    "handle the Result with `match`, return it, or bind it explicitly ",
+                    "(e.g. `let _ignored = ...`) to document the intentional discard"
+                )
+                .to_string(),
+            ),
+        }
+    }
+
     /// Plain-text one-line rendering, used when no SourceMap is installed.
     pub fn format_plain(&self) -> String {
         let mut out = format!("warning[{}]: {}", self.code, self.msg);
