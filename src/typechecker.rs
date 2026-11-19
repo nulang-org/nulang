@@ -1076,6 +1076,9 @@ pub struct TypeChecker {
     pub collect_errors: bool,
     /// Errors collected when `collect_errors` is set (empty otherwise).
     pub collected_errors: Vec<crate::types::NuError>,
+    /// Non-fatal semantic diagnostics collected during type inference.
+    /// Pattern coverage belongs here because it depends on the inferred scrutinee type.
+    pub warnings: Vec<NuWarning>,
 }
 
 /// Pre-computed class and instance tables extracted from an AST module.
@@ -1157,7 +1160,13 @@ impl TypeChecker {
             rigid_vars: FxHashSet::default(),
             collect_errors: false,
             collected_errors: Vec::new(),
+            warnings: Vec::new(),
         }
+    }
+
+    /// Consume and return non-fatal semantic warnings collected by type checking.
+    pub fn take_warnings(&mut self) -> Vec<NuWarning> {
+        std::mem::take(&mut self.warnings)
     }
 
     /// Type-check an entire module, returning the type of the last declaration.
@@ -3400,6 +3409,21 @@ impl TypeChecker {
             final_subst = compose_subst(&s, &final_subst);
         }
 
+        // Coverage analysis runs only after ordinary pattern/guard/body typing
+        // succeeds and uses the fully substituted scrutinee type. Guarded arms
+        // cannot close a coverage hole because their predicate may be false.
+        let coverage_ty = apply_subst(&scrut_ty, &final_subst);
+        let coverage_arms: Vec<(Pattern, bool)> = arms
+            .iter()
+            .map(|(pattern, guard, _)| (pattern.clone(), guard.is_some()))
+            .collect();
+        self.warnings
+            .extend(crate::pattern_coverage::warnings_for_match(
+                &coverage_ty,
+                &coverage_arms,
+                span,
+            ));
+
         Ok((final_subst.clone(), apply_subst(&first_arm, &final_subst)))
     }
 
@@ -3473,13 +3497,29 @@ impl TypeChecker {
             },
             Pattern::Variant(name, pat) => match scrut_ty {
                 Type::Variant(variants) => {
-                    let mut new_ctx = ctx.clone();
-                    if let Some((_, Some(ty))) = variants.iter().find(|(n, _)| n == name) {
-                        if let Some(p) = pat {
-                            new_ctx = self.bind_pattern(&new_ctx, p, ty)?;
-                        }
+                    // A statically closed variant gives enough information to
+                    // reject impossible constructors and payload-shape errors.
+                    // Unknown/abstract scrutinee types retain their existing
+                    // inference fallback below.
+                    let (_, payload) =
+                        variants.iter().find(|(n, _)| n == name).ok_or_else(|| {
+                            NuError::type_error(
+                                format!("unknown variant constructor '{name}' in match"),
+                                Span::default(),
+                            )
+                        })?;
+                    match (payload.as_ref(), pat.as_deref()) {
+                        (Some(ty), Some(inner)) => self.bind_pattern(ctx, inner, ty),
+                        (None, None) => Ok(ctx.clone()),
+                        (Some(_), None) => Err(NuError::type_error(
+                            format!("variant constructor '{name}' requires a payload pattern"),
+                            Span::default(),
+                        )),
+                        (None, Some(_)) => Err(NuError::type_error(
+                            format!("variant constructor '{name}' has no payload"),
+                            Span::default(),
+                        )),
                     }
-                    Ok(new_ctx)
                 }
                 _ => {
                     if let Some(p) = pat {
