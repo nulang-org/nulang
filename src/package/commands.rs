@@ -1467,6 +1467,25 @@ fn cmd_build_web() -> NuResult<()> {
     })?;
     eprintln!("  Wrote {}", ir_path.display());
 
+    // Emit API documentation from the exact validated contract compilation
+    // used for dispatch and deployment IR. Never reparse route definitions.
+    let openapi = crate::web::openapi::generate_openapi(
+        &validated_contracts,
+        &manifest.package.name,
+        &manifest.package.version,
+    );
+    let openapi_json =
+        serde_json::to_vec_pretty(&openapi).map_err(|error| NuError::PackageError {
+            msg: format!("cannot serialize OpenAPI document: {error}"),
+            span: Span::default(),
+        })?;
+    let openapi_file = output_dir.join("openapi.json");
+    std::fs::write(&openapi_file, openapi_json).map_err(|error| NuError::PackageError {
+        msg: format!("cannot write {}: {error}", openapi_file.display()),
+        span: Span::default(),
+    })?;
+    eprintln!("  Wrote {}", openapi_file.display());
+
     // Enforce performance budgets declared in Nulang.toml.
     if let Err(violations) = crate::web::budget::check_initial_js_budget(
         &output_dir,
@@ -3095,6 +3114,17 @@ app "counter" {
 
         let _guard = ChangeDir::new(&dir);
         cmd_build_web().expect("web build should succeed");
+
+        // The generated API contract and deployment IR must describe the same
+        // validated routes; OpenAPI is a build artifact, not a separate parser.
+        let openapi: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join("dist/openapi.json"))
+                .expect("OpenAPI document should be emitted with the web build"),
+        )
+        .expect("OpenAPI document must be valid JSON");
+        assert_eq!(openapi["openapi"], "3.1.0");
+        assert_eq!(openapi["info"]["title"], "signal-app");
+        assert!(openapi["paths"]["/"]["get"].is_object());
 
         let html =
             std::fs::read_to_string(dir.join("dist/index.html")).expect("index.html should exist");
