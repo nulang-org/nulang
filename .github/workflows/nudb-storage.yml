@@ -9,6 +9,7 @@ on:
   pull_request:
     paths:
       - "src/database/**"
+      - "src/runtime/nudb_transition.rs"
       - "tests/nudb_*.rs"
       - "tests/tablet_owner_admission.rs"
       - "benches/database_bench.rs"
@@ -18,6 +19,7 @@ on:
     branches: [main]
     paths:
       - "src/database/**"
+      - "src/runtime/nudb_transition.rs"
       - "tests/nudb_*.rs"
       - "tests/tablet_owner_admission.rs"
       - "benches/database_bench.rs"
@@ -93,6 +95,8 @@ jobs:
           cargo test --locked --no-default-features --test nudb_idempotent_group_receipts
           cargo test --locked --no-default-features --test nudb_idempotent_group_limits
           cargo test --locked --no-default-features --test nudb_receipt_digest_integrity
+      - name: Atomic durable actor transitions and crash recovery
+        run: cargo test --locked --no-default-features --test nudb_atomic_transition_journal
       - name: Tablet owner admission and coalescing
         run: |
           cargo test --locked --no-default-features --lib database::owner::tests
