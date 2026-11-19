@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use super::backup::{self, BackupError, BackupReceipt};
 use super::checkpoint::{self, CheckpointError};
+use super::optimistic::{OptimisticTabletWrite, PointTransaction};
 use super::retention_store::{DurableRetentionRegistry, RegistryError};
 use super::tablet::{
     transaction_digest, MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite,
@@ -215,6 +216,88 @@ impl WalBackedTablet {
     ) -> Result<TabletWrite, TabletError> {
         self.tablet
             .prepare_write(presented_epoch, expected_previous_sequence, mutations)
+    }
+
+    /// Prepare snapshot-scoped point-key writes without reserving the next
+    /// WAL sequence. A second independent writer can prepare at the same
+    /// snapshot and commit afterwards if the read/write sets do not conflict.
+    ///
+    /// This API does not validate predicate/range reads or multi-tablet state.
+    pub fn prepare_optimistic_write(
+        &self,
+        ownership_epoch: u64,
+        snapshot_sequence: u64,
+        read_keys: Vec<Vec<u8>>,
+        mutations: Vec<TabletMutation>,
+    ) -> Result<OptimisticTabletWrite, TabletError> {
+        self.tablet.prepare_optimistic_write(
+            ownership_epoch,
+            snapshot_sequence,
+            read_keys,
+            mutations,
+        )
+    }
+
+    /// Start an automatically tracked point-key transaction at the current
+    /// snapshot. Point reads through `read_point` cannot be omitted from the
+    /// transaction's read set by accident.
+    pub fn begin_point_transaction(&self) -> PointTransaction {
+        self.tablet.begin_point_transaction()
+    }
+
+    /// Read one key through a tracked transaction at its original snapshot.
+    pub fn read_point(
+        &self,
+        tx: &mut PointTransaction,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, TabletError> {
+        tx.read(&self.tablet, key)
+    }
+
+    /// Commit a tracked point transaction with the same WAL receipts and
+    /// point-key conflict checks as the low-level optimistic API.
+    pub fn commit_point_transaction_idempotent(
+        &mut self,
+        id: TransactionId,
+        tx: PointTransaction,
+    ) -> Result<TransactionReceipt, WalBackedError> {
+        let prepared = tx.into_prepared(&self.tablet)?;
+        self.commit_optimistic_idempotent(id, prepared)
+    }
+
+    /// Durably commit an identified point-key optimistic transaction.
+    ///
+    /// Existing matching receipts win over stale snapshot conflicts, enabling
+    /// an ambiguous WAL retry after restart using the original ID and writes.
+    /// Receipts identify the ordered mutation payload (as in commit_idempotent).
+    /// This is a single-tablet, single-owner API, not a multi-node transaction.
+    pub fn commit_optimistic_idempotent(
+        &mut self,
+        id: TransactionId,
+        proposed: OptimisticTabletWrite,
+    ) -> Result<TransactionReceipt, WalBackedError> {
+        // Even a replay-only receipt lookup must reject wrong tablet, stale
+        // ownership and future snapshots. Only *data conflicts* are bypassed
+        // when an identical durable transaction is retried after newer writes.
+        self.tablet.validate_optimistic_identity(&proposed)?;
+        let digest = transaction_digest(proposed.mutations());
+        if let Some(receipt) = self.tablet.transaction_receipt(id) {
+            if receipt.digest() != digest {
+                return Err(WalBackedError::IdempotencyConflict(id));
+            }
+            return Ok(receipt);
+        }
+        let write = self
+            .tablet
+            .rebase_optimistic_write(proposed)?
+            .with_identity(TransactionIdentity { id, digest });
+        let sequence = self.commit(write)?;
+        let receipt = self
+            .tablet
+            .transaction_receipt(id)
+            .expect("durable optimistic commit must publish its receipt");
+        debug_assert_eq!(receipt.sequence(), sequence);
+        Ok(receipt)
     }
 
     /// Commit an identified transaction, or return its original receipt if

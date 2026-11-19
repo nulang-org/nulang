@@ -666,6 +666,16 @@ impl MemoryTablet {
         self.current_sequence = sequence;
     }
 
+    /// Most recent committed change to a key, including tombstones.
+    /// Conflict checks must use sequence numbers, not value comparison:
+    /// even deleting or re-writing an equal value is a conflicting change.
+    pub(crate) fn latest_key_write_sequence(&self, key: &[u8]) -> Option<u64> {
+        self.rows
+            .get(key)
+            .and_then(|versions| versions.last())
+            .map(|version| version.sequence)
+    }
+
     /// Read one key at an already committed snapshot sequence.
     pub fn read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, TabletError> {
         if snapshot > self.current_sequence {
@@ -728,6 +738,15 @@ pub enum TabletError {
         requested: u64,
     },
     InvalidSnapshotHistory,
+    OptimisticConflict {
+        key: Vec<u8>,
+        snapshot: u64,
+        committed: u64,
+    },
+    TooManyOptimisticReadKeys {
+        requested: usize,
+        limit: usize,
+    },
     DuplicateTransactionId(TransactionId),
     KeyOutsideTabletRange,
 }
@@ -784,6 +803,18 @@ impl fmt::Display for TabletError {
             } => write!(
                 f,
                 "snapshot {requested} is ahead of committed tablet sequence {committed}"
+            ),
+            Self::OptimisticConflict {
+                key,
+                snapshot,
+                committed,
+            } => write!(
+                f,
+                "point key {key:?} changed at sequence {committed} after transaction snapshot {snapshot}"
+            ),
+            Self::TooManyOptimisticReadKeys { requested, limit } => write!(
+                f,
+                "optimistic point read set contains {requested} keys; limit is {limit}"
             ),
             Self::InvalidSnapshotHistory => {
                 f.write_str("tablet snapshot contains invalid MVCC version history or receipt history")
