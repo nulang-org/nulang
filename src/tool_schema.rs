@@ -31,136 +31,177 @@ pub struct ToolSchema {
 
 /// Convert a Nulang type into a JSON Schema value.
 ///
-/// Supported shapes:
-/// - Primitives: Int, Float, Bool, String, Unit
-/// - Records: `{ type: "object", properties: {...} }`
-/// - Arrays / Lists: `{ type: "array", items: ... }`
-/// - Tuples: `{ type: "array", prefixItems: [...] }`
-/// - Variants: `{ oneOf: [...] }`
-/// - References: unwrap to the inner type
+/// Unknown or unresolved types map to the unsatisfiable JSON Schema `false`
+/// rather than the unconstrained schema `{}`. This is particularly important
+/// for tool schemas exposed to external LLM providers.
 pub fn type_to_json_schema(ty: &Type) -> serde_json::Value {
+    checked_type_to_json_schema(ty).unwrap_or_else(|_| serde_json::json!(false))
+}
+
+/// Checked JSON Schema conversion for compiler diagnostics and public APIs.
+///
+/// Every nested member must be representable. A partial schema is unsafe:
+/// replacing an unknown field type with `{}` would accept arbitrary input.
+pub fn checked_type_to_json_schema(ty: &Type) -> Result<serde_json::Value, String> {
     match ty {
-        Type::Var(_) => serde_json::json!({}),
-        Type::Primitive(PrimitiveType::Int) => serde_json::json!({"type": "integer"}),
-        Type::Primitive(PrimitiveType::Float) => serde_json::json!({"type": "number"}),
-        Type::Primitive(PrimitiveType::Bool) => serde_json::json!({"type": "boolean"}),
-        Type::Primitive(PrimitiveType::String) => serde_json::json!({"type": "string"}),
-        Type::Primitive(PrimitiveType::Unit) => serde_json::json!({"type": "null"}),
-        Type::Primitive(PrimitiveType::Nil) => serde_json::json!({"type": "null"}),
-        Type::Primitive(PrimitiveType::Never) | Type::Primitive(PrimitiveType::Address) => {
-            serde_json::json!({})
+        Type::Var(_) => Err("unresolved type variable".to_string()),
+        Type::Primitive(PrimitiveType::Int) => Ok(serde_json::json!({"type": "integer"})),
+        Type::Primitive(PrimitiveType::Float) => Ok(serde_json::json!({"type": "number"})),
+        Type::Primitive(PrimitiveType::Bool) => Ok(serde_json::json!({"type": "boolean"})),
+        Type::Primitive(PrimitiveType::String) => Ok(serde_json::json!({"type": "string"})),
+        Type::Primitive(PrimitiveType::Unit | PrimitiveType::Nil) => {
+            Ok(serde_json::json!({"type": "null"}))
+        }
+        Type::Primitive(PrimitiveType::Never | PrimitiveType::Address) => {
+            Err("type is not a JSON value".to_string())
         }
         Type::Record(fields) => {
             let mut properties = Map::new();
-            let mut required = Vec::new();
+            let mut required = Vec::with_capacity(fields.len());
             for (name, field_ty) in fields {
-                properties.insert(name.clone(), type_to_json_schema(field_ty));
+                if name == ".." {
+                    return Err("open record rows cannot be represented as a closed schema".into());
+                }
+                if properties.contains_key(name) {
+                    return Err(format!("duplicate record field: {name}"));
+                }
+                let schema = checked_type_to_json_schema(field_ty)
+                    .map_err(|err| format!("record field {name}: {err}"))?;
+                properties.insert(name.clone(), schema);
                 required.push(name.clone());
             }
-            serde_json::json!({
+            Ok(serde_json::json!({
                 "type": "object",
                 "properties": properties,
                 "required": required,
-            })
+                "additionalProperties": false,
+            }))
         }
-        Type::Array(inner) => serde_json::json!({
+        Type::Array(inner) => Ok(serde_json::json!({
             "type": "array",
-            "items": type_to_json_schema(inner),
-        }),
-        Type::Tuple(elems) => serde_json::json!({
-            "type": "array",
-            "prefixItems": elems.iter().map(type_to_json_schema).collect::<Vec<_>>(),
-        }),
-        Type::Variant(variants) => {
-            let one_of: Vec<serde_json::Value> = variants
+            "items": checked_type_to_json_schema(inner)?,
+        })),
+        Type::Tuple(elems) => {
+            let schemas: Result<Vec<_>, _> = elems
                 .iter()
-                .map(|(name, inner)| {
-                    if let Some(inner_ty) = inner {
-                        serde_json::json!({
-                            "type": "object",
-                            "properties": {
-                                name: type_to_json_schema(inner_ty),
-                            },
-                            "required": [name],
-                        })
-                    } else {
-                        serde_json::json!({
-                            "type": "string",
-                            "enum": [name],
-                        })
-                    }
+                .enumerate()
+                .map(|(i, ty)| {
+                    checked_type_to_json_schema(ty)
+                        .map_err(|err| format!("tuple element {i}: {err}"))
                 })
                 .collect();
-            serde_json::json!({ "oneOf": one_of })
+            Ok(serde_json::json!({
+                "type": "array",
+                "prefixItems": schemas?,
+                "items": false,
+                "minItems": elems.len(),
+            }))
         }
-        Type::Reference { inner, .. } => type_to_json_schema(inner),
-        Type::App { constructor, args } => {
-            // Common constructors: List[T], Array[T], Option[T]
-            if let Type::Var(_) | Type::Primitive(_) | Type::App { .. } = constructor.as_ref() {
-                // Cannot determine a concrete schema; fall through to unknown.
-                return serde_json::json!({});
+        Type::Variant(variants) => {
+            if variants.is_empty() {
+                return Err("empty variant has no JSON representation".into());
             }
-            let constructor_name = type_name(constructor);
-            match constructor_name.as_deref() {
-                Some("List") | Some("Array") if !args.is_empty() => serde_json::json!({
+            let mut names = std::collections::HashSet::new();
+            let mut schemas = Vec::with_capacity(variants.len());
+            for (name, inner) in variants {
+                if !names.insert(name) {
+                    return Err(format!("duplicate variant case: {name}"));
+                }
+                let schema = if let Some(inner_ty) = inner {
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            name: checked_type_to_json_schema(inner_ty)
+                                .map_err(|err| format!("variant {name}: {err}"))?,
+                        },
+                        "required": [name],
+                        "additionalProperties": false,
+                    })
+                } else {
+                    serde_json::json!({"type": "string", "enum": [name]})
+                };
+                schemas.push(schema);
+            }
+            Ok(serde_json::json!({"oneOf": schemas}))
+        }
+        Type::Reference { inner, .. } | Type::Scheme { body: inner, .. } => {
+            checked_type_to_json_schema(inner)
+        }
+        Type::Nominal { underlying, .. } => checked_type_to_json_schema(underlying),
+        Type::App { constructor, args } => {
+            let name = match constructor.as_ref() {
+                Type::Nominal { name, .. } => name.as_str(),
+                _ => return Err("unrecognized generic type constructor".into()),
+            };
+            if args.len() != 1 {
+                return Err(format!("{name} expects one type parameter"));
+            }
+            match name {
+                "List" | "Array" => Ok(serde_json::json!({
                     "type": "array",
-                    "items": type_to_json_schema(&args[0]),
-                }),
-                Some("Option") if !args.is_empty() => serde_json::json!({
+                    "items": checked_type_to_json_schema(&args[0])?,
+                })),
+                "Option" => Ok(serde_json::json!({
                     "anyOf": [
                         {"type": "null"},
-                        type_to_json_schema(&args[0]),
+                        checked_type_to_json_schema(&args[0])?,
                     ],
-                }),
-                _ => serde_json::json!({}),
+                })),
+                _ => Err(format!("unsupported generic type constructor: {name}")),
             }
         }
-        Type::Function { .. } => serde_json::json!({}),
-        Type::Actor { .. } => serde_json::json!({}),
-        Type::Scheme { body, .. } => type_to_json_schema(body),
-        Type::Nominal { underlying, .. } => type_to_json_schema(underlying),
-        Type::Skolem(_) => serde_json::json!({}),
+        Type::Function { .. } | Type::Actor { .. } | Type::Skolem(_) => {
+            Err("non-serializable or unresolved type".into())
+        }
     }
 }
 
-/// Best-effort name extraction for type-application constructors.
-fn type_name(ty: &Type) -> Option<String> {
-    match ty {
-        Type::Primitive(p) => Some(format!("{:?}", p)),
-        Type::Var(_) => None,
-        Type::App { constructor, .. } => type_name(constructor),
-        Type::Reference { inner, .. } => type_name(inner),
-        _ => None,
-    }
-}
-
-/// Build a `ToolSchema` from a Nulang function signature.
-///
-/// `params` must contain the explicit parameter types; `ret` is validated to be
-/// present but is not included in the tool schema (providers only need argument
-/// schemas).
+/// Build a tool schema. Unsupported parameters produce an unsatisfiable
+/// schema instead of exposing unconstrained input to a provider. Use the
+/// checked variant below when the caller can surface a compiler diagnostic.
 pub fn function_to_tool_schema(
     name: &str,
     description: &str,
     params: &[(String, Type)],
-    _ret: &Type,
+    ret: &Type,
 ) -> ToolSchema {
+    try_function_to_tool_schema(name, description, params, ret).unwrap_or_else(|_| ToolSchema {
+        name: name.to_string(),
+        description: description.to_string(),
+        parameters: serde_json::json!(false),
+    })
+}
+
+/// Build a schema with explicit diagnostics on invalid tool parameter types.
+/// Return types are not represented in the provider's argument schema.
+pub fn try_function_to_tool_schema(
+    name: &str,
+    description: &str,
+    params: &[(String, Type)],
+    _ret: &Type,
+) -> Result<ToolSchema, String> {
     let mut properties = Map::new();
-    let mut required = Vec::new();
+    let mut required = Vec::with_capacity(params.len());
     for (param_name, param_ty) in params {
-        properties.insert(param_name.clone(), type_to_json_schema(param_ty));
+        if properties.contains_key(param_name) {
+            return Err(format!("duplicate tool parameter: {param_name}"));
+        }
+        let schema = checked_type_to_json_schema(param_ty)
+            .map_err(|err| format!("parameter {param_name}: {err}"))?;
+        properties.insert(param_name.clone(), schema);
         required.push(param_name.clone());
     }
 
-    ToolSchema {
+    Ok(ToolSchema {
         name: name.to_string(),
         description: description.to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": properties,
             "required": required,
+            "additionalProperties": false,
         }),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -207,5 +248,101 @@ mod tests {
             type_to_json_schema(&arr),
             serde_json::json!({"type": "array", "items": {"type": "integer"}})
         );
+    }
+
+    #[test]
+    fn unknown_types_are_never_unconstrained_schemas() {
+        let unresolved = Type::Var(crate::types::TypeVar(999));
+        assert_eq!(type_to_json_schema(&unresolved), serde_json::json!(false));
+        assert_eq!(
+            type_to_json_schema(&Type::Primitive(PrimitiveType::Address)),
+            serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn unknown_nested_type_rejects_entire_schema() {
+        let payload = Type::Record(vec![(
+            "items".to_string(),
+            Type::Array(Box::new(Type::Var(crate::types::TypeVar(999)))),
+        )]);
+        assert_eq!(type_to_json_schema(&payload), serde_json::json!(false));
+    }
+
+    #[test]
+    fn tool_with_unsupported_parameter_is_not_advertised_as_unconstrained() {
+        let schema = function_to_tool_schema(
+            "unsafe_tool",
+            "Not safely serializable",
+            &[("payload".to_string(), Type::Var(crate::types::TypeVar(999)))],
+            &Type::unit(),
+        );
+        assert_eq!(schema.parameters, serde_json::json!(false));
+    }
+
+    #[test]
+    fn supported_records_are_closed_at_schema_boundary() {
+        let record = Type::Record(vec![("count".to_string(), Type::int())]);
+        assert_eq!(
+            type_to_json_schema(&record),
+            serde_json::json!({
+                "type": "object",
+                "properties": {"count": {"type": "integer"}},
+                "required": ["count"],
+                "additionalProperties": false,
+            })
+        );
+    }
+
+    #[test]
+    fn checked_conversion_reports_nested_type_diagnostic() {
+        let ty = Type::Record(vec![(
+            "payload".to_string(),
+            Type::Var(crate::types::TypeVar(999)),
+        )]);
+        let err = checked_type_to_json_schema(&ty).unwrap_err();
+        assert!(err.contains("record field payload"), "{err}");
+        assert!(err.contains("unresolved type variable"), "{err}");
+    }
+
+    #[test]
+    fn generic_option_and_named_variant_fields_have_precise_schemas() {
+        let option = Type::App {
+            constructor: Box::new(Type::Nominal {
+                name: "Option".to_string(),
+                underlying: Box::new(Type::unit()),
+            }),
+            args: vec![Type::int()],
+        };
+        assert_eq!(
+            type_to_json_schema(&option),
+            serde_json::json!({
+                "anyOf": [{"type": "null"}, {"type": "integer"}]
+            })
+        );
+        let variant = Type::Variant(vec![("Accepted".to_string(), Some(Type::int()))]);
+        assert_eq!(
+            type_to_json_schema(&variant),
+            serde_json::json!({
+                "oneOf": [{
+                    "type": "object",
+                    "properties": {"Accepted": {"type": "integer"}},
+                    "required": ["Accepted"],
+                    "additionalProperties": false
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn duplicate_tool_parameters_fail_closed_with_context() {
+        let params = vec![
+            ("x".to_string(), Type::int()),
+            ("x".to_string(), Type::string()),
+        ];
+        let err = try_function_to_tool_schema("duplicate", "", &params, &Type::unit()).unwrap_err();
+        assert!(err.contains("duplicate tool parameter: x"), "{err}");
+        let safe = function_to_tool_schema("duplicate", "", &params, &Type::unit());
+        assert_eq!(safe.parameters, serde_json::json!(false));
     }
 }
