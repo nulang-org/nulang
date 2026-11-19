@@ -2566,7 +2566,7 @@ fn test_libsql_store_migrates_old_schema_crdt_column() {
         // Create a database with the pre-crdt_snapshot four-column schema.
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let db = libsql::Builder::new_local(&path).build().await.unwrap();
+            let db = super::sqlite_compat::Builder::new_local(&path).build().await.unwrap();
             let conn = db.connect().unwrap();
             conn.execute(
                 "CREATE TABLE snapshots (
