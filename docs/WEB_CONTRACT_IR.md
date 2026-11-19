@@ -168,6 +168,33 @@ The transport-neutral `RequestDecodeError` exposes stable machine-readable codes
 
 Compiler/runtime binding defects deliberately remain server errors. They must not be presented as mistakes made by the caller.
 
+## Browser route URL generation (opt-in)
+
+`nula build --web` additionally emits `dist/app.routes.mjs` and
+`dist/app.routes.d.mts` from the same **validated** `ContractCompilation` used
+by dispatch, deployment IR, and OpenAPI. Import the module only when needed;
+it is never automatically injected into the initial page JavaScript.
+
+```ts
+import { urlFor } from "./dist/app.routes.mjs";
+const href = urlFor("GET /users/{id: Int}", { path: { id: 42 } });
+```
+
+TypeScript declarations provide an overload for every statically extracted
+method/path route. Browser runtime validation fails on unknown route names,
+missing or extra path/query inputs, wrong primitive types, unsafe path
+segments, and non-finite numerics; UTF-8 and reserved characters are encoded
+as URL segments. A `from query` binding is **required** unless Nulang's request
+decoder gains an optional binding contract; this matches the current server's
+400-on-missing-input behavior. Unknown opaque source types are string-backed.
+
+This is browser-client interop, not a Nulang-language `Web.url` intrinsic,
+not an authorization policy, and not a substitute for server-side route input
+validation. It does not change the existing router, the HTTP dispatch ABI, or
+the behavior of other client runtimes. It intentionally does not expose a
+client-side cache or a separate navigation state manager. See
+`src/web/route_links.rs` and `src/web/route_links_runtime.mjs`.
+
 ## OpenAPI
 
 OpenAPI 3.1 generation consumes the same `ContractCompilation` and binding IR; it does not reparse Nulang source.
