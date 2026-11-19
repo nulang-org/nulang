@@ -6,13 +6,16 @@ use crate::ast::Decl;
 use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::statechart::analyze_machine;
-use crate::statechart_testing::{generate_transition_tests, run_transition_tests, TestFixtures};
+use crate::statechart_testing::{
+    generate_transition_tests, run_transition_tests, suggest_fixtures, TestFixtures,
+};
 
 pub const MACHINE_USAGE: &str = "\
 Usage:
   nulang machine graph <file.nula> [--machine NAME] [--format mermaid|json] [--out FILE]
   nulang machine paths <file.nula> [--machine NAME] [--fixtures FILE.json] [--out FILE]
   nulang machine test  <file.nula> [--machine NAME] [--fixtures FILE.json]
+  nulang machine fixtures <file.nula> [--machine NAME] [--out FILE.json]
 
 Fixtures JSON: { \"pay\": [42], \"cancel\": [] }
 'paths' generates runnable test cases. 'test' executes them using real
@@ -25,6 +28,7 @@ enum Action {
     Graph,
     Paths,
     Test,
+    Fixtures,
 }
 
 #[derive(Debug)]
@@ -45,6 +49,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         "graph" => Action::Graph,
         "paths" => Action::Paths,
         "test" => Action::Test,
+        "fixtures" => Action::Fixtures,
         other => return Err(format!("unknown machine action '{other}'\n{MACHINE_USAGE}")),
     };
     if args[1].starts_with('-') {
@@ -81,8 +86,8 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     if action != Action::Graph && opts.format.is_some() {
         return Err("--format is only supported for 'machine graph'".into());
     }
-    if action == Action::Graph && opts.fixtures_path.is_some() {
-        return Err("fixtures apply only to 'machine paths' or 'machine test'".into());
+    if matches!(action, Action::Graph | Action::Fixtures) && opts.fixtures_path.is_some() {
+        return Err("--fixtures applies only to 'machine paths' or 'machine test'".into());
     }
     if action == Action::Test && opts.output.is_some() {
         return Err("'machine test' prints results; --out is not supported".into());
@@ -198,6 +203,10 @@ fn render_from_source(
             }))
             .map_err(|e| e.to_string())
         }
+        Action::Fixtures => {
+            let suggestions = suggest_fixtures(machine)?;
+            serde_json::to_string_pretty(&suggestions).map_err(|e| e.to_string())
+        }
         Action::Paths => {
             let plan = generate_transition_tests(machine, fixtures)?;
             let cases: Vec<_> = plan
@@ -247,6 +256,13 @@ fn render_from_source(
                     "FAIL {} --{}--> ?: {}\n",
                     failed.source, failed.event, failed.reason
                 ));
+                let replay = failed
+                    .sequence
+                    .iter()
+                    .map(|step| format!("{}({})", step.event, step.args.join(", ")))
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
+                output.push_str(&format!("  replay: {}\n", replay));
             }
             for skipped in &plan.skipped {
                 output.push_str(&format!(
@@ -316,11 +332,31 @@ mod tests {
     }
 
     #[test]
+    fn failing_machine_test_reports_replayable_event_trace() {
+        let fixtures = TestFixtures::from([("pay".into(), vec![serde_json::json!(0)])]);
+        let err = render_from_source(MACHINE, Action::Test, None, None, &fixtures).unwrap_err();
+        assert!(err.contains("replay: pay(0)"), "{err}");
+        assert!(err.contains("expected Paid"), "{err}");
+    }
+
+    #[test]
     fn machine_test_executes_guarded_case_with_fixture() {
         let fixtures = TestFixtures::from([("pay".into(), vec![serde_json::json!(1)])]);
         let result = render_from_source(MACHINE, Action::Test, None, None, &fixtures).unwrap();
         assert!(result.contains("0 failed"), "{result}");
         assert!(result.contains("0 skipped"), "{result}");
+    }
+
+    #[test]
+    fn fixtures_cli_suggests_reproducible_simple_guard_inputs() {
+        let fixtures =
+            render_from_source(MACHINE, Action::Fixtures, None, None, &TestFixtures::new())
+                .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&fixtures).unwrap();
+        assert_eq!(parsed["pay"], serde_json::json!([1]));
+        assert_eq!(parsed["reset"], serde_json::json!([]));
+        let args = ["fixtures", "order.nula", "--out", "order.fixtures.json"].map(str::to_owned);
+        assert!(parse_args(&args).is_ok());
     }
 
     #[test]

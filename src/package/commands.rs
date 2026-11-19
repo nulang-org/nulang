@@ -290,7 +290,8 @@ fn print_usage() {
     println!("  init          Scaffold a new package in the current directory");
     println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
     println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
-    println!("  test [--filter <substr>] [--verbose|-v] [--watch|-w]  Run .nula test files");
+    println!("  test [--filter <substr>] [--verbose|-v] [--watch|-w] [--json]");
+    println!("                Run tests/*.nula and tests/statecharts/*.nula");
     println!("  run           Build and run the package entry point");
     println!("  run --watch   Build and re-run on source changes");
     println!("  watch         Alias for 'run --watch'");
@@ -1330,7 +1331,12 @@ fn collect_mtimes_recursive(dir: &Path, out: &mut Vec<(PathBuf, std::time::Syste
         let path = entry.path();
         if path.is_dir() {
             collect_mtimes_recursive(&path, out);
-        } else if path.extension().is_some_and(|ext| ext == "nula") {
+        } else if path.extension().is_some_and(|ext| ext == "nula")
+            || path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".fixtures.json"))
+        {
             if let Ok(meta) = std::fs::metadata(&path) {
                 if let Ok(mtime) = meta.modified() {
                     out.push((path, mtime));
@@ -1712,10 +1718,79 @@ fn guess_content_type(path: &Path) -> &'static str {
 /// With `--verbose` (or `-v`): prints each test file name before execution,
 /// shows ✓ PASS / ✗ FAIL per file, and displays error messages for failures.
 /// Default (non-verbose) output is clean and greppable.
+/// Machine tests are opt-in by placement under tests/statecharts/. The
+/// sibling `<stem>.fixtures.json` is optional; missing guard inputs fail
+/// coverage rather than silently counting as passing cases.
+#[derive(Debug)]
+struct StatechartTestFile {
+    display: String,
+    source: PathBuf,
+    fixtures: Option<PathBuf>,
+}
+
+fn discover_statechart_test_files(
+    tests_dir: &Path,
+    filter: Option<&str>,
+) -> NuResult<Vec<StatechartTestFile>> {
+    let dir = tests_dir.join("statecharts");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(NuError::PackageError {
+                msg: format!(
+                    "cannot inspect statechart tests in {}: {}",
+                    dir.display(),
+                    e
+                ),
+                span: Span::default(),
+            })
+        }
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| NuError::PackageError {
+            msg: format!("cannot read statechart test entry: {e}"),
+            span: Span::default(),
+        })?;
+        let source = entry.path();
+        if !source.is_file() || source.extension().is_none_or(|e| e != "nula") {
+            continue;
+        }
+        let Some(stem) = source.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if filter.is_some_and(|filter| !stem.contains(filter)) {
+            continue;
+        }
+        let fixture_path = source.with_file_name(format!("{stem}.fixtures.json"));
+        files.push(StatechartTestFile {
+            display: format!("tests/statecharts/{}.nula", stem),
+            source,
+            fixtures: fixture_path.is_file().then_some(fixture_path),
+        });
+    }
+    files.sort_by(|a, b| a.display.cmp(&b.display));
+    Ok(files)
+}
+
+fn run_statechart_test_file(case: &StatechartTestFile) -> Result<(), String> {
+    let mut args = vec![
+        "test".to_string(),
+        case.source.to_string_lossy().into_owned(),
+    ];
+    if let Some(fixtures) = &case.fixtures {
+        args.push("--fixtures".into());
+        args.push(fixtures.to_string_lossy().into_owned());
+    }
+    crate::statechart_cli::run(&args).map(|_| ())
+}
+
 fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
     eprintln!("Preparing package...");
     let _entry = prepare_package()?;
     let tests_dir = package_root()?.join("tests");
+    let statechart_files = discover_statechart_test_files(&tests_dir, filter)?;
     let mut test_files: Vec<PathBuf> = match std::fs::read_dir(&tests_dir) {
         Ok(entries) => entries
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -1731,7 +1806,7 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
         Err(_) => Vec::new(),
     };
     test_files.sort();
-    if test_files.is_empty() {
+    if test_files.is_empty() && statechart_files.is_empty() {
         if json {
             let mut report = crate::json_diagnostics::JsonReport::new("test", None, Vec::new());
             report.tests = Some(Vec::new());
@@ -1747,6 +1822,8 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
         display: String,
         file_to_run: PathBuf,
         is_temp: bool,
+        is_statechart: bool,
+        fixtures: Option<PathBuf>,
     }
 
     let mut tests: Vec<TestCase> = Vec::new();
@@ -1769,6 +1846,8 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
                 display: relative.display().to_string(),
                 file_to_run: file.clone(),
                 is_temp: false,
+                is_statechart: false,
+                fixtures: None,
             });
         } else {
             if verbose {
@@ -1792,9 +1871,23 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
                     display: fn_name.clone(),
                     file_to_run: temp_path,
                     is_temp: true,
+                    is_statechart: false,
+                    fixtures: None,
                 });
             }
         }
+    }
+
+    // Dedicated test files opt in by residing under tests/statecharts/.
+    // They join the normal report and --filter / --json result stream.
+    for machine in statechart_files {
+        tests.push(TestCase {
+            display: machine.display,
+            file_to_run: machine.source,
+            is_temp: false,
+            is_statechart: true,
+            fixtures: machine.fixtures,
+        });
     }
 
     eprintln!("running {} tests", tests.len());
@@ -1807,7 +1900,13 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
         let started = std::time::Instant::now();
         // In --json mode the child's stdout is captured (discarded) so the
         // JSON report is the only thing on our stdout.
-        let outcome = if json {
+        let outcome = if test.is_statechart {
+            run_statechart_test_file(&StatechartTestFile {
+                display: test.display.clone(),
+                source: test.file_to_run.clone(),
+                fixtures: test.fixtures.clone(),
+            })
+        } else if json {
             run_test_file_captured(&file_str)
         } else {
             run_test_file(&file_str)
@@ -2763,6 +2862,85 @@ mod tests {
     fn test_nulang_exe_rejects_invalid_args() {
         let result = nulang_exe(&["--nonexistent-flag"]);
         assert!(result.is_err(), "unknown flags should fail");
+    }
+
+    #[test]
+    fn test_statechart_discovery_is_opt_in_deterministic_and_fixture_aware() {
+        let root = std::env::temp_dir().join(format!(
+            "nulang_statechart_discovery_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("tests/statecharts")).unwrap();
+        std::fs::write(root.join("tests/ordinary.nula"), "fn main() {}").unwrap();
+        std::fs::write(
+            root.join("tests/statecharts/zeta.nula"),
+            "state_machine Z { state A }",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("tests/statecharts/alpha.nula"),
+            "state_machine A { state A }",
+        )
+        .unwrap();
+        std::fs::write(root.join("tests/statecharts/zeta.fixtures.json"), "{}").unwrap();
+
+        let cases = discover_statechart_test_files(&root.join("tests"), None).unwrap();
+        assert_eq!(cases.len(), 2);
+        assert_eq!(cases[0].display, "tests/statecharts/alpha.nula");
+        assert_eq!(cases[1].display, "tests/statecharts/zeta.nula");
+        assert!(cases[0].fixtures.is_none());
+        assert!(cases[1]
+            .fixtures
+            .as_ref()
+            .unwrap()
+            .ends_with("zeta.fixtures.json"));
+        assert_eq!(
+            discover_statechart_test_files(&root.join("tests"), Some("zeta"))
+                .unwrap()
+                .len(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_watch_collects_machine_fixtures_but_not_unrelated_json() {
+        let root =
+            std::env::temp_dir().join(format!("nulang_watch_statecharts_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("statecharts")).unwrap();
+        std::fs::write(
+            root.join("statecharts/order.nula"),
+            "state_machine M { state A }",
+        )
+        .unwrap();
+        std::fs::write(root.join("statecharts/order.fixtures.json"), "{}").unwrap();
+        std::fs::write(root.join("statecharts/other.json"), "{}").unwrap();
+        let watched = collect_mtimes(&root);
+        assert_eq!(watched.len(), 2);
+        assert!(watched
+            .iter()
+            .any(|(p, _)| p.ends_with("order.fixtures.json")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_statechart_runner_handles_guarded_fixture_and_failed_guard() {
+        let root =
+            std::env::temp_dir().join(format!("nulang_statechart_runner_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("tests/statecharts")).unwrap();
+        let machine = root.join("tests/statecharts/order.nula");
+        let fixture = root.join("tests/statecharts/order.fixtures.json");
+        std::fs::write(&machine, "state_machine Order { state Pending\n state Paid\n event pay(amount: Int) from Pending: Paid if amount > 0 }").unwrap();
+        std::fs::write(&fixture, r#"{"pay":[42]}"#).unwrap();
+        let cases = discover_statechart_test_files(&root.join("tests"), None).unwrap();
+        assert!(run_statechart_test_file(&cases[0]).is_ok());
+        std::fs::write(&fixture, r#"{"pay":[0]}"#).unwrap();
+        let err = run_statechart_test_file(&cases[0]).unwrap_err();
+        assert!(err.contains("expected Paid"), "{err}");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

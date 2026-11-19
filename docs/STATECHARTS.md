@@ -59,6 +59,7 @@ nulang machine graph order.nula --format mermaid --out order.mmd
 nulang machine graph order.nula --format json --out order-graph.json
 nulang machine paths order.nula --fixtures fixtures.json --out order-paths.json
 nulang machine test order.nula --fixtures fixtures.json
+nulang machine fixtures order.nula --out fixtures.json
 ```
 
 For multiple machines in one file, specify `--machine NAME`. Fixtures map
@@ -70,6 +71,28 @@ each event name to a JSON array of primitive argument values:
   "reset": []
 }
 ```
+
+`machine fixtures` suggests deterministic primitive fixture values. It
+supports simple integer comparisons (e.g. `amount > 0` produces `1`),
+direct boolean predicates, and primitive equality/inequality. Complex or
+contradictory guards, unsupported types, and untyped arguments fail closed
+and require manual fixtures. **Suggestions are not proofs:** verify them with
+`machine test`, and review them before using in a trusted test environment.
+
+## Integration with `nula test`
+
+Place a machine in `tests/statecharts/order.nula` with its optional fixture file
+`tests/statecharts/order.fixtures.json`. Running `nulang nula test` now
+includes those machine tests alongside ordinary `tests/*.nula` tests in
+the regular pass/fail summary and `--json` results. `--filter` selects
+machine files by filename stem, and `--watch` detects changes to both
+`.nula` files and `.fixtures.json` files.
+
+This is **opt-in by file placement**: source files outside
+`tests/statecharts/` are not automatically executed by the package
+test runner. Machine hooks are still executed during these tests; only place
+trusted, safe-to-run test machines in that directory. Missing fixtures
+fail coverage rather than disappearing from the test summary.
 
 The `paths` output lists executable cases, explicit skips, and structurally
 unreachable states. Its shortest paths cover **transition edges** (including
