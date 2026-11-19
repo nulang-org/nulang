@@ -4198,6 +4198,7 @@ mod durable_transition_tests {
 
 #[cfg(all(test, feature = "sqlite"))]
 mod libsql_atomic_transition_tests {
+    use super::libsql;
     use super::*;
 
     fn snapshot(actor_id: u64, sequence: u64, count: i64) -> ActorSnapshot {
