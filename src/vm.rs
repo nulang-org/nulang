@@ -3187,17 +3187,9 @@ impl VM {
         })
     }
 
-    /// Get a constant string from a module's constant pool.
+    /// Get an owned constant string for call sites that need one.
     fn module_const_string(&self, module_idx: usize, const_idx: usize) -> String {
-        self.modules
-            .get(module_idx)
-            .and_then(|m| m.constants.get(const_idx))
-            .map(|c| match c {
-                Constant::String(s) => s.clone(),
-                Constant::Int(n) => n.to_string(),
-                _ => format!("{:?}", c),
-            })
-            .unwrap_or_else(|| format!("#const{}", const_idx))
+        module_constant_name(&self.modules, module_idx, const_idx).into_owned()
     }
 
     /// Convert a runtime value into a plain Rust string.
@@ -3976,18 +3968,18 @@ impl VM {
     ) -> NuResult<()> {
         let eff_name_idx = instr.imm16();
         let dst_reg = instr.op3;
-        let qualified_name = self.module_const_string(module_idx, eff_name_idx as usize);
+        // Keep the common Constant::String case borrowed through dispatch.
+        // Borrow only self.modules, leaving handler_stack and actor_callbacks
+        // free to mutate without copying the qualified name.
+        let qualified_name = module_constant_name(&self.modules, module_idx, eff_name_idx as usize);
         // The MIR pipeline encodes the performed operation as
         // "Effect.op" (e.g. "IO.print"); hand-built modules may
         // carry a bare name with no operation.
-        let (effect_name, op_name) = match qualified_name.split_once('.') {
-            Some((effect, op)) => (effect.to_string(), Some(op.to_string())),
-            None => (qualified_name.clone(), None),
-        };
+        let (effect_name, op_name) = split_effect_key(&qualified_name);
         // ---- Test effect: assertion primitives ----
         // Handled inline so assertion failures produce RuntimeError.
         if effect_name == "Test" {
-            match op_name.as_deref() {
+            match op_name {
                 Some("assert") => {
                     let cond = self.frames[frame_idx]
                         .regs
@@ -4063,14 +4055,14 @@ impl VM {
         if self.handler_stack.is_empty() {
             let result = match self.modules.get(module_idx) {
                 Some(module) => self.actor_callbacks.perform_builtin_effect_in_module(
-                    &effect_name,
-                    op_name.as_deref(),
+                    effect_name,
+                    op_name,
                     module,
                     &self.frames[frame_idx].regs,
                 ),
                 None => self.actor_callbacks.perform_builtin_effect(
-                    &effect_name,
-                    op_name.as_deref(),
+                    effect_name,
+                    op_name,
                     &[],
                     &self.frames[frame_idx].regs,
                 ),
@@ -4144,14 +4136,14 @@ impl VM {
             // performing module's constant pool.
             let result = match self.modules.get(module_idx) {
                 Some(module) => self.actor_callbacks.perform_builtin_effect_in_module(
-                    &effect_name,
-                    op_name.as_deref(),
+                    effect_name,
+                    op_name,
                     module,
                     &self.frames[frame_idx].regs,
                 ),
                 None => self.actor_callbacks.perform_builtin_effect(
-                    &effect_name,
-                    op_name.as_deref(),
+                    effect_name,
+                    op_name,
                     &[],
                     &self.frames[frame_idx].regs,
                 ),
@@ -6279,6 +6271,42 @@ fn module_with_handler_table(bindings: Vec<crate::bytecode::HandlerBinding>) -> 
 // VM Tests
 // ---------------------------------------------------------------------------
 
+/// Resolve a module constant to its display name without cloning strings.
+///
+/// The common String constant stays borrowed for effect dispatch. Non-string
+/// and invalid constants preserve the legacy diagnostic text by allocating
+/// only in those exceptional cases.
+#[inline]
+fn module_constant_name(
+    modules: &[CodeModule],
+    module_idx: usize,
+    const_idx: usize,
+) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    modules
+        .get(module_idx)
+        .and_then(|m| m.constants.get(const_idx))
+        .map(|c| match c {
+            Constant::String(s) => Cow::Borrowed(s.as_str()),
+            Constant::Int(n) => Cow::Owned(n.to_string()),
+            _ => Cow::Owned(format!("{:?}", c)),
+        })
+        .unwrap_or_else(|| Cow::Owned(format!("#const{}", const_idx)))
+}
+
+/// Borrows both sides of an effect key from its resolved constant.
+///
+/// Perform is a VM hot path: allocating the effect and operation substrings
+/// separately would add up to two avoidable heap allocations per dispatch.
+/// Only the first dot separates the effect from its (possibly dotted) operation.
+#[inline]
+fn split_effect_key(qualified_name: &str) -> (&str, Option<&str>) {
+    match qualified_name.split_once('.') {
+        Some((effect, operation)) => (effect, Some(operation)),
+        None => (qualified_name, None),
+    }
+}
+
 #[cfg(test)]
 mod vm_tests {
     use super::*;
@@ -6407,6 +6435,72 @@ mod vm_tests {
             .to_str()
             .unwrap();
         assert_eq!(s, "hello ffi");
+    }
+
+    // Splitting an effect key must borrow both parts from the one
+    // already-resolved constant rather than allocating on every Perform.
+    #[test]
+    fn module_effect_key_borrows_string_constant_without_allocating() {
+        use std::borrow::Cow;
+
+        let mut module = CodeModule::new("effect-key-borrow");
+        let idx = module.add_string_constant("Actor.send");
+        let mut vm = VM::new_without_jit();
+        vm.load_module(module);
+
+        let key = module_constant_name(&vm.modules, 0, idx as usize);
+        assert!(matches!(key, Cow::Borrowed("Actor.send")));
+        let original = match &vm.modules[0].constants[idx as usize] {
+            Constant::String(s) => s,
+            _ => unreachable!(),
+        };
+        assert_eq!(key.as_ptr(), original.as_ptr());
+        assert_eq!(split_effect_key(key.as_ref()), ("Actor", Some("send")));
+    }
+
+    #[test]
+    fn module_effect_key_preserves_invalid_or_missing_constant_fallback() {
+        use std::borrow::Cow;
+
+        let mut module = CodeModule::new("effect-key-fallback");
+        let int_idx = module.add_constant(Constant::Int(42));
+        let bool_idx = module.add_constant(Constant::Bool(true));
+        let mut vm = VM::new_without_jit();
+        vm.load_module(module);
+
+        assert!(matches!(
+            module_constant_name(&vm.modules, 0, int_idx as usize),
+            Cow::Owned(_)
+        ));
+        assert_eq!(module_constant_name(&vm.modules, 0, int_idx as usize), "42");
+        assert_eq!(
+            module_constant_name(&vm.modules, 0, bool_idx as usize),
+            "Bool(true)"
+        );
+        assert_eq!(module_constant_name(&vm.modules, 0, 0xffff), "#const65535");
+    }
+
+    #[test]
+    fn effect_key_split_borrows_qualified_parts() {
+        let qualified = String::from("Actor.send");
+        let (effect, operation) = split_effect_key(&qualified);
+        assert_eq!(effect, "Actor");
+        assert_eq!(operation, Some("send"));
+        assert_eq!(effect.as_ptr(), qualified.as_ptr());
+        assert_eq!(
+            operation.unwrap().as_ptr(),
+            qualified[("Actor.".len())..].as_ptr()
+        );
+    }
+
+    #[test]
+    fn effect_key_split_preserves_bare_and_multi_dot_names() {
+        let (effect, operation) = split_effect_key("Timer");
+        assert_eq!((effect, operation), ("Timer", None));
+        let (effect, operation) = split_effect_key("Web.render.partial");
+        assert_eq!((effect, operation), ("Web", Some("render.partial")));
+        let (effect, operation) = split_effect_key(".empty");
+        assert_eq!((effect, operation), ("", Some("empty")));
     }
 
     /// Test 1: Basic integer arithmetic.
