@@ -2494,8 +2494,15 @@ impl TypeChecker {
                     mgu_assignable(&apply_subst(&val_ty, &s_combined), ann_ty, Span::default())?;
                 s_combined = compose_subst(&s_ann, &s_combined);
             }
-            let gen_ty = self.do_generalize(ctx, &apply_subst(&val_ty, &s_combined));
-            let new_ctx = ctx.extend(name.to_string(), gen_ty, Capability::Ref, mutable);
+            let binding_ty = apply_subst(&val_ty, &s_combined);
+            // A mutable location cannot be used at independently instantiated
+            // types after reassignment, even when its initial value is a lambda.
+            let binding_ty = if mutable {
+                binding_ty
+            } else {
+                self.do_generalize(ctx, &binding_ty)
+            };
+            let new_ctx = ctx.extend(name.to_string(), binding_ty, Capability::Ref, mutable);
             let (s3, body_ty) = self.infer_expr(&new_ctx, body)?;
             let final_subst = compose_subst(&s3, &s_combined);
             return Ok((final_subst.clone(), apply_subst(&body_ty, &final_subst)));
@@ -2512,11 +2519,17 @@ impl TypeChecker {
             s1
         };
 
-        // Generalize the value type
-        let gen_ty = self.do_generalize(ctx, &apply_subst(&val_ty, &s1));
+        // Only immutable let bindings are generalized. Mutable bindings
+        // denote one storage location and must remain monomorphic across
+        // reads and assignments (OCaml's value-restriction principle).
+        let binding_ty = apply_subst(&val_ty, &s1);
+        let binding_ty = if mutable {
+            binding_ty
+        } else {
+            self.do_generalize(ctx, &binding_ty)
+        };
 
-        // Extend context with generalized type
-        let new_ctx = ctx.extend(name.to_string(), gen_ty, Capability::Ref, mutable);
+        let new_ctx = ctx.extend(name.to_string(), binding_ty, Capability::Ref, mutable);
 
         // Infer body with extended context
         let (s2, body_ty) = self.infer_expr(&new_ctx, body)?;
@@ -5584,6 +5597,46 @@ mod tests {
             "expected a type error, got {:?}",
             result.ok()
         );
+    }
+
+    #[test]
+    fn test_module_var_can_be_reassigned_with_same_type() {
+        let result = check_src("var counter = 0\ncounter = 1\ncounter");
+        assert!(
+            result.is_ok(),
+            "expected mutable top-level binding: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_module_var_reassignment_must_keep_original_type() {
+        let result = check_src("var id = fn(x) x\nid = fn(x: Int) x + 1\nid(true)");
+        match result {
+            Err(NuError::TypeError { msg, .. }) => assert!(
+                !msg.contains("immutable binding"),
+                "must reject inconsistent types, not erase mutability: {msg}"
+            ),
+            other => panic!("expected a type error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_mutable_let_reassignment_cannot_change_instantiation() {
+        // OCaml-style value restriction: an assignable binding is a single
+        // storage location. It must not be instantiated afresh per use.
+        let result = check_src("var id = fn(x) x in { id = fn(x: Int) x + 1; id(true) }");
+        assert!(
+            matches!(result, Err(NuError::TypeError { .. })),
+            "expected a type error, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_mutable_let_accepts_same_type_reassignment() {
+        let result = check_src("var id = fn(x) x in { id = fn(x: Int) x + 1; id(5) }");
+        assert!(result.is_ok(), "expected success, got {:?}", result);
     }
 
     #[test]
