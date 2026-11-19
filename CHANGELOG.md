@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Follow-up Wasmtime security maintenance (draft) — 2026-11-19
+- **Raise the Wasmtime 48.x minimum to 48.0.9, resolving to 48.0.10**, with matching internal Wasmtime/Cranelift/Pulley crates. This addresses RUSTSEC-2026-0566 through RUSTSEC-2026-0573 without changing SQLite providers or remote libSQL transport.
+- **Current RustSec audit remains red:** the updated exact-head lockfile has one finding, RUSTSEC-2026-0459 (`libsqlite3-sys 0.30.1`). The previous November 12 zero-vulnerability audit result below is historical and is not the current release status. Never bypass or ignore the remaining advisory.
+- **SQLite remediation is a separate stop-ship:** an isolated bundled-`rusqlite` upgrade introduces duplicate native `sqlite3_*` symbols with `libsql-ffi`. Retain both authenticated HTTPS remote-libSQL functionality and local persistence while designing an independently tested single patched SQLite provider. This update alone is not merge clearance.
 ### Patched WASM/TLS dependencies and HTTPS-only remote libSQL — 2026-11-12
 - **Patched the Wasmtime 48.x/Cranelift toolchain and affected cryptography, certificate-root, and compression dependencies**, removing the November RustSec advisories without disabling the audit gate.
 - **Remote libSQL uses a platform-native HTTPS connector rather than the affected legacy Rustls dependency chain.** HTTPS and libsql:// endpoints are supported; plaintext HTTP endpoints now fail closed. Native CA trust stores must be maintained by deployments.
