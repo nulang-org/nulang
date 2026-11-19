@@ -51,18 +51,28 @@ pub fn run(args: &[String]) -> NuResult<()> {
     match args.first().map(String::as_str) {
         Some("new") => {
             let mut template: Option<&str> = None;
+            let mut style: Option<&str> = None;
             let mut path_arg: Option<&str> = None;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
-                    "--template" => {
+                    "--template" | "--style" => {
+                        let flag = args[i].as_str();
                         i += 1;
-                        if i < args.len() {
+                        if i >= args.len() || args[i].starts_with("--") {
+                            return Err(NuError::PackageError {
+                                msg: format!("{} requires a value", flag),
+                                span: Span::default(),
+                            });
+                        }
+                        if flag == "--template" {
                             template = Some(args[i].as_str());
+                        } else {
+                            style = Some(args[i].as_str());
                         }
                     }
                     other => {
-                        if path_arg.is_some() {
+                        if path_arg.is_some() || other.starts_with("--") {
                             return Err(NuError::PackageError {
                                 msg: format!("unexpected argument '{}' for nula new", other),
                                 span: Span::default(),
@@ -73,7 +83,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
                 }
                 i += 1;
             }
-            cmd_new(path_arg, template)
+            cmd_new_styled(path_arg, template, style)
         }
         Some("init") => cmd_init(),
         Some("build") => {
@@ -284,7 +294,7 @@ fn print_usage() {
     println!("Usage: nulang nula <COMMAND>");
     println!();
     println!("Commands:");
-    println!("  new   <path> [--template <name>]");
+    println!("  new   <path> [--template <name>] [--style syntyr]");
     println!("                Scaffold a new package directory");
     println!("                Templates: default, cli, lib, full");
     println!("  init          Scaffold a new package in the current directory");
@@ -361,8 +371,17 @@ fn run_auth_enable(_args: &[String]) -> NuResult<()> {
     Ok(())
 }
 
-/// `nula new <name> [--template <name>]`: scaffold a package directory.
+/// `nula new <name> [--template <name>] [--style syntyr]`: scaffold a package.
+#[cfg(test)]
 fn cmd_new(path_arg: Option<&str>, template: Option<&str>) -> NuResult<()> {
+    cmd_new_styled(path_arg, template, None)
+}
+
+fn cmd_new_styled(
+    path_arg: Option<&str>,
+    template: Option<&str>,
+    style: Option<&str>,
+) -> NuResult<()> {
     let path_str = path_arg.ok_or_else(|| NuError::PackageError {
         msg: "nula new requires a package name or path".to_string(),
         span: Span::default(),
@@ -402,7 +421,20 @@ fn cmd_new(path_arg: Option<&str>, template: Option<&str>) -> NuResult<()> {
             span: Span::default(),
         });
     }
-    scaffold_package(&dir, name, tmpl)?;
+    let style = style.unwrap_or("none");
+    if !["none", "syntyr"].contains(&style) {
+        return Err(NuError::PackageError {
+            msg: format!("unknown style '{}' (available: none, syntyr)", style),
+            span: Span::default(),
+        });
+    }
+    if style == "syntyr" && tmpl != "web" {
+        return Err(NuError::PackageError {
+            msg: "--style syntyr requires --template web".to_string(),
+            span: Span::default(),
+        });
+    }
+    scaffold_package_styled(&dir, name, tmpl, style)?;
     println!("Created package '{}' at '{}'", name, dir.display());
     Ok(())
 }
@@ -455,6 +487,11 @@ fn validate_package_name(name: &str) -> NuResult<()> {
 
 /// Write the `Nulang.toml` + template source files for a new package.
 fn scaffold_package(dir: &Path, name: &str, template: &str) -> NuResult<()> {
+    scaffold_package_styled(dir, name, template, "none")
+}
+
+/// Syntyr is an opt-in, vendored CSS preset; no network access or npm needed.
+fn scaffold_package_styled(dir: &Path, name: &str, template: &str, style: &str) -> NuResult<()> {
     std::fs::create_dir_all(dir).map_err(|e| NuError::PackageError {
         msg: format!("cannot create {}: {}", dir.display(), e),
         span: Span::default(),
@@ -489,7 +526,31 @@ fn scaffold_package(dir: &Path, name: &str, template: &str) -> NuResult<()> {
         })?;
     }
 
-    for (rel_path, content) in template_files(template) {
+    let files = if template == "web" && style == "syntyr" {
+        vec![
+            ("src/main.nula", include_str!("templates/syntyr/main.nula")),
+            (
+                "public/style.css",
+                include_str!("templates/syntyr/style.css"),
+            ),
+            (
+                "public/syntyr.core.css",
+                include_str!("templates/syntyr/syntyr.core.css"),
+            ),
+            (
+                "public/syntyr.semantic.css",
+                include_str!("templates/syntyr/syntyr.semantic.css"),
+            ),
+            (
+                "SYNTYR-LICENSE",
+                include_str!("templates/syntyr/SYNTYR-LICENSE"),
+            ),
+            ("README.md", include_str!("templates/syntyr/README.md")),
+        ]
+    } else {
+        template_files(template)
+    };
+    for (rel_path, content) in files {
         let dest = dir.join(rel_path);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| NuError::PackageError {
@@ -581,7 +642,7 @@ import stdlib::web::types
 import stdlib::web::host
 import stdlib::json
 
-fn get_todos() -> [JsonValue] {
+fn get_todos() {
     let raw = kv_get("todos")
     if raw == "" then { [] }
     else {
@@ -648,7 +709,7 @@ fn delete_todo(id_str) {
     set_todos(updated)
 }
 
-fn render_todos() -> Html {
+fn render_todos() {
     let todos = get_todos()
     var rows = []
     for todo in todos {
@@ -673,7 +734,7 @@ fn render_todos() -> Html {
     el("ul", [("class", text("todos"))], rows)
 }
 
-fn home() -> Html {
+fn home() {
     if request_method() == "POST" then {
         let action = form_value("__nulang_action")
         if action == "add_todo" then {
@@ -2718,6 +2779,104 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn test_web_syntyr_style_scaffolds_self_hosted_assets() {
+        let dir =
+            std::env::temp_dir().join(format!("nulang_syntyr_web_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let args = vec![
+            "new".to_string(),
+            dir.to_str().unwrap().to_string(),
+            "--template".to_string(),
+            "web".to_string(),
+            "--style".to_string(),
+            "syntyr".to_string(),
+        ];
+        run(&args).expect("Syntyr must be a supported opt-in web style");
+        let source = std::fs::read_to_string(dir.join("src/main.nula")).unwrap();
+        let core = std::fs::read_to_string(dir.join("public/syntyr.core.css")).unwrap();
+        let semantic = std::fs::read_to_string(dir.join("public/syntyr.semantic.css")).unwrap();
+        let css = std::fs::read_to_string(dir.join("public/style.css")).unwrap();
+        assert!(
+            source.contains("el(\"html\", [(\"lang\", text(\"en\"))], ["),
+            "Syntyr starter needs an explicit document language for assistive technology"
+        );
+        assert!(source.contains("syn-root syn-semantic"));
+        assert!(source.contains("data-syn-theme"));
+        assert!(source.contains("syntyr.core.css"));
+        assert!(source.contains("syntyr.semantic.css"));
+        assert!(source.contains("route \"POST\" \"/\" -> home"));
+        assert_eq!(
+            source
+                .matches("(\"name\", text(\"__nulang_action\"))")
+                .count(),
+            3,
+            "native forms need action fields even when client JavaScript is disabled"
+        );
+        assert!(core.contains(".syn-root"));
+        assert!(semantic.contains(".syn-semantic"));
+        assert!(css.contains(".todos"));
+        assert!(dir.join("SYNTYR-LICENSE").is_file());
+        assert!(dir.join("README.md").is_file());
+        assert!(dir.join("Nulang.toml").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_new_syntyr_style_rejects_non_web_template_and_unknown_style() {
+        for (template, style) in [("cli", "syntyr"), ("web", "unknown")] {
+            let dir = std::env::temp_dir().join(format!(
+                "nulang_syntyr_invalid_{}_{}_{}",
+                template,
+                style,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let args = vec![
+                "new".to_string(),
+                dir.to_str().unwrap().to_string(),
+                "--template".to_string(),
+                template.to_string(),
+                "--style".to_string(),
+                style.to_string(),
+            ];
+            assert!(run(&args).is_err());
+            assert!(!dir.exists(), "invalid styling must not create a package");
+        }
+    }
+
+    #[test]
+    fn test_new_style_flag_requires_a_value() {
+        let args = vec![
+            "new".to_string(),
+            "example".to_string(),
+            "--template".to_string(),
+            "web".to_string(),
+            "--style".to_string(),
+        ];
+        let err = run(&args).expect_err("missing --style value must be rejected");
+        assert!(err.to_string().contains("--style requires a value"));
+    }
+
+    #[test]
+    fn test_new_web_without_style_remains_unstyled() {
+        let dir =
+            std::env::temp_dir().join(format!("nulang_web_default_style_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let args = vec![
+            "new".to_string(),
+            dir.to_str().unwrap().to_string(),
+            "--template".to_string(),
+            "web".to_string(),
+        ];
+        run(&args).expect("unstyled web scaffold remains supported");
+        assert!(!dir.join("public/syntyr.core.css").exists());
+        assert!(!std::fs::read_to_string(dir.join("src/main.nula"))
+            .unwrap()
+            .contains("syn-root"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

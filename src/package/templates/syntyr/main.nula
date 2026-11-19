@@ -1,0 +1,156 @@
+// Nulang Web app — a compiler-first full-stack Todo list.
+//
+// Run with: `nula dev` (development server) or `nula build --web` (SSG).
+//
+// The server renders the initial HTML and handles form POSTs with an
+// ephemeral in-memory store. The generated `app.client.js` intercepts
+// form submissions so the page updates without a full reload when JS is
+// enabled.
+
+import stdlib::web::html
+import stdlib::web::types
+import stdlib::web::host
+import stdlib::json
+
+fn get_todos() {
+    let raw = kv_get("todos")
+    if raw == "" then { [] }
+    else {
+        match parse(raw) {
+            JsonArray(items) => items
+            _ => []
+        }
+    }
+}
+
+fn set_todos(todos) {
+    kv_set("todos", stringify(JsonArray(todos)))
+}
+
+fn next_id() -> Int {
+    let raw = kv_get("todo_counter")
+    let n = if raw == "" then { 0 } else { perform String.to_int(raw) }
+    kv_set("todo_counter", perform Int.to_string(n + 1))
+    n + 1
+}
+
+fn add_todo(title) {
+    let id = next_id()
+    let todos = get_todos()
+    let todo = JsonObject([
+        ("id", JsonNumber(perform Int.to_float(id))),
+        ("title", JsonString(title)),
+        ("done", JsonBool(false))
+    ])
+    set_todos(perform Array.push(todos, todo))
+}
+
+fn toggle_todo(id_str) {
+    let id = perform String.to_int(id_str)
+    let todos = get_todos()
+    var updated = []
+    for todo in todos {
+        let tid = perform Float.to_int(get_number(todo, "id", 0.0))
+        if tid == id then {
+            let title = get_string(todo, "title", "")
+            let done = get_bool(todo, "done", false)
+            updated = perform Array.push(updated, JsonObject([
+                ("id", JsonNumber(perform Int.to_float(tid))),
+                ("title", JsonString(title)),
+                ("done", JsonBool(!done))
+            ]))
+        } else {
+            updated = perform Array.push(updated, todo)
+        }
+    }
+    set_todos(updated)
+}
+
+fn delete_todo(id_str) {
+    let id = perform String.to_int(id_str)
+    let todos = get_todos()
+    var updated = []
+    for todo in todos {
+        let tid = perform Float.to_int(get_number(todo, "id", 0.0))
+        if tid != id then {
+            updated = perform Array.push(updated, todo)
+        } else {}
+    }
+    set_todos(updated)
+}
+
+fn render_todos() {
+    let todos = get_todos()
+    var rows = []
+    for todo in todos {
+        let id = perform Float.to_int(get_number(todo, "id", 0.0))
+        let id_str = perform Int.to_string(id)
+        let title = get_string(todo, "title", "")
+        let done = get_bool(todo, "done", false)
+        let label = if done then perform String.concat(title, " (done)") else title
+        let row = el("li", [("class", if done then text("done") else text(""))], [
+            el("span", [], [text(label)]),
+            el("form", [("action", text("/")), ("data-action", text("toggle_todo")), ("data-action-placement", text("server")), ("method", text("POST"))], [
+                el("input", [("type", text("hidden")), ("name", text("__nulang_action")), ("value", text("toggle_todo"))], []),
+                el("input", [("type", text("hidden")), ("name", text("id")), ("value", text(id_str))], []),
+                el("button", [("class", text("syn-button")), ("type", text("submit"))], [text(if done then "Undo" else "Done")])
+            ]),
+            el("form", [("action", text("/")), ("data-action", text("delete_todo")), ("data-action-placement", text("server")), ("method", text("POST"))], [
+                el("input", [("type", text("hidden")), ("name", text("__nulang_action")), ("value", text("delete_todo"))], []),
+                el("input", [("type", text("hidden")), ("name", text("id")), ("value", text(id_str))], []),
+                el("button", [("class", text("syn-button")), ("type", text("submit"))], [text("Delete")])
+            ])
+        ])
+        rows = perform Array.push(rows, row)
+    }
+    el("ul", [("class", text("todos"))], rows)
+}
+
+fn home() {
+    if request_method() == "POST" then {
+        let action = form_value("__nulang_action")
+        if action == "add_todo" then {
+            let title = form_value("title")
+            if title != "" then { add_todo(title) } else {}
+        } else if action == "toggle_todo" then {
+            toggle_todo(form_value("id"))
+        } else if action == "delete_todo" then {
+            delete_todo(form_value("id"))
+        } else {}
+    } else {}
+    // Explicit document language is necessary for accessible screen-reader output.
+    el("html", [("lang", text("en"))], [
+        head([
+            title("Nulang Todo — Syntyr"),
+            el("meta", [("name", text("viewport")), ("content", text("width=device-width, initial-scale=1"))], []),
+            el("link", [("rel", text("stylesheet")), ("href", text("/syntyr.core.css"))], []),
+            el("link", [("rel", text("stylesheet")), ("href", text("/syntyr.semantic.css"))], []),
+            el("link", [("rel", text("stylesheet")), ("href", text("/style.css"))], [])
+        ]),
+        body([
+            el("main", [("class", text("syn-root syn-semantic app-shell")), ("data-syn-theme", text("studio"))], [
+                el("header", [("class", text("app-header"))], [
+                    el("p", [("class", text("app-eyebrow"))], [text("NULANG / SYNTYR")]),
+                    el("h1", [("class", text("syn-heading"))], [text("Tasks")]),
+                    el("p", [], [text("A server-rendered Nulang app with optional, zero-JavaScript Syntyr styling.")])
+                ]),
+                el("section", [("class", text("syn-panel"))], [
+                    el("form", [("action", text("/")), ("class", text("new-todo")), ("data-action", text("add_todo")), ("data-action-placement", text("server")), ("method", text("POST"))], [
+                        el("input", [("type", text("hidden")), ("name", text("__nulang_action")), ("value", text("add_todo"))], []),
+                        el("label", [("for", text("todo-title"))], [text("New task")]),
+                        el("div", [("class", text("new-todo-controls"))], [
+                            el("input", [("class", text("syn-input")), ("id", text("todo-title")), ("type", text("text")), ("name", text("title")), ("placeholder", text("What needs doing?")), ("required", text("required"))], []),
+                            el("button", [("class", text("syn-button syn-button--primary")), ("type", text("submit"))], [text("Add task")])
+                        ])
+                    ]),
+                    render_todos()
+                ])
+            ])
+        ])
+    ])
+}
+
+app "todos" {
+    route "GET" "/" -> home
+    route "POST" "/" -> home
+}
