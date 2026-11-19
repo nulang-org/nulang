@@ -1,0 +1,48 @@
+name: Documentation Improvement
+description: Report unclear docs, a broken example, or a missing explanation (no compiler setup required)
+title: "[Docs]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for improving the docs! Search existing issues first.
+        Security issue? Follow SECURITY.md and do not publish details here.
+  - type: input
+    id: page
+    attributes:
+      label: Page or file link
+      description: Link the Nulang page or repository file, ideally with a section heading.
+      placeholder: https://nulang.org/getting-started/quick-start/
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What needs improvement?
+      options:
+        - Incorrect or outdated information
+        - Confusing explanation
+        - Broken link or navigation
+        - Example that does not work
+        - Missing documentation
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Current wording or behavior
+      description: Quote a short excerpt, describe the problem, and include a minimal command if an example fails.
+    validations:
+      required: true
+  - type: textarea
+    id: improvement
+    attributes:
+      label: Suggested correction and acceptance criteria
+      description: What would make the page correct or easier to use? A short proposed sentence or runnable example helps.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Environment or reference (optional)
+      description: For runnable examples, include OS, Nulang version/commit, and redacted error output. Not required for typos.

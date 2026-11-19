@@ -1,45 +1,57 @@
 name: Bug Report
-description: Report a bug in the Nulang compiler, runtime, or tooling
+description: Report a reproducible compiler, runtime, tooling, or docs bug
 title: "[Bug]: "
 labels: [bug]
 body:
   - type: markdown
     attributes:
-      value: Thanks for taking the time to report a bug!
+      value: |
+        Please search existing issues first and reduce the failure to the smallest example.
+        **Security issue?** Do not post details here; use SECURITY.md and private reporting.
   - type: input
     id: version
     attributes:
-      label: Nulang version
-      description: Output of `nulang --version`, or the commit you built from.
-      placeholder: e.g. 1.0.0-frozen (built from source @ abc1234)
+      label: Nulang version or exact commit
+      description: Output of `nulang --version` and/or the built source commit SHA.
+      placeholder: e.g. release version or git SHA
     validations:
       required: true
   - type: input
-    id: os
+    id: environment
     attributes:
-      label: Operating system
-      description: Windows is currently unsupported — please reproduce under WSL.
-      placeholder: e.g. Ubuntu 24.04, macOS 15
+      label: OS, toolchain and feature flags
+      description: Include OS/architecture, Rust version (if source-built), and relevant `--features` or CLI flags.
+      placeholder: e.g. Ubuntu 24.04 x86_64, Rust 1.95.0, default features
     validations:
       required: true
   - type: textarea
-    id: what-happened
+    id: observed
     attributes:
-      label: What happened?
-      description: Describe the bug and what you expected instead.
+      label: Actual behavior
+      description: What happened? Include the exact diagnostic or failure mode.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should happen instead? Reference a documented contract if applicable.
     validations:
       required: true
   - type: textarea
     id: repro
     attributes:
-      label: Minimal reproduction
-      description: The smallest `.nula` program or command that triggers the bug.
-      render: nulang
+      label: Minimal reproduction and steps
+      description: A minimal .nula file or commands, with steps to reproduce. Remove secrets.
+      placeholder: |
+        1. Build with ...
+        2. Run ...
+        3. Observe ...
     validations:
       required: true
   - type: textarea
     id: logs
     attributes:
-      label: Relevant output / logs
-      description: Compiler errors, stack traces, or runtime output.
+      label: Relevant output or logs (redacted)
+      description: Paste compiler errors or logs without credentials or personal data.
       render: text

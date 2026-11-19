@@ -160,6 +160,16 @@ export default defineConfig({
           ],
         },
         {
+          label: 'Community',
+          collapsed: false,
+          items: [
+            { label: 'Contribute', link: 'contributing/' },
+            { label: 'Roadmap', link: 'https://github.com/nulang-org/nulang/blob/main/ROADMAP.md' },
+            { label: 'Issues', link: 'https://github.com/nulang-org/nulang/issues' },
+            { label: 'Discussions', link: 'https://github.com/nulang-org/nulang/discussions' },
+          ],
+        },
+        {
           label: 'Reference',
           collapsed: true,
           items: [
