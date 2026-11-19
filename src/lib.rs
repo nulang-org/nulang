@@ -87,6 +87,7 @@ pub mod protocol_wire;
 #[cfg(feature = "python")]
 pub mod python;
 pub mod registry;
+pub mod relational_analysis;
 pub mod repl;
 pub mod resolver;
 pub mod runtime;
