@@ -52,7 +52,8 @@ mod tests {
     #[test]
     fn malformed_query_becomes_client_problem_response() {
         let empty = HashMap::new();
-        let query = HashMap::from([("limit".to_string(), "many".to_string())]);
+        let empty_multi = HashMap::<String, Vec<String>>::new();
+        let query = HashMap::from([("limit".to_string(), vec!["many".to_string()])]);
         let headers = Vec::new();
         let values = RequestBindingValues {
             path: &empty,
@@ -60,7 +61,7 @@ mod tests {
             headers: &headers,
             cookies: &empty,
             body: None,
-            form: &empty,
+            form: &empty_multi,
         };
         let binding = RouteBindingContract {
             source: RouteBindingSource::Query,

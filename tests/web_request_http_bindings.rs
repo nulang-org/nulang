@@ -114,3 +114,57 @@ fn web_main() {
     assert_eq!(error.http_status(), 400);
     assert_eq!(error.code(), "missing_request_input");
 }
+
+#[test]
+fn duplicate_form_fields_are_rejected_instead_of_silently_overwriting() {
+    let module = parse(
+        r#"
+fn endpoint(title: String from form("title")) -> String { title }
+fn web_main() {
+    perform Web.route("POST", "/leads", endpoint)
+}
+"#,
+    );
+    let contracts = compile_module_contracts(&module);
+    let bindings = compile_route_bindings(&contracts.routes[0]);
+    assert!(bindings.diagnostics.is_empty());
+
+    let path = HashMap::new();
+    let headers = vec![(
+        "Content-Type".to_string(),
+        "application/x-www-form-urlencoded".to_string(),
+    )];
+    // Encoded aliases must also count as duplicate field names.
+    let captured =
+        HttpRequestBindingInputs::capture("/leads", &headers, b"title=first&%74itle=second");
+    let error = bind_request_arguments(&bindings.bindings, 1, &captured.values(&path, &headers))
+        .expect_err("a scalar form binding must not silently select either value");
+    assert_eq!(error.http_status(), 400);
+    assert_eq!(error.code(), "ambiguous_request_input");
+    assert_eq!(error.problem_details()["source"], "form");
+    assert_eq!(error.problem_details()["source_name"], "title");
+}
+
+#[test]
+fn duplicate_query_fields_are_rejected_instead_of_silently_overwriting() {
+    let module = parse(
+        r#"
+fn endpoint(limit: Int from query) -> String { "ok" }
+fn web_main() {
+    perform Web.route("GET", "/leads", endpoint)
+}
+"#,
+    );
+    let contracts = compile_module_contracts(&module);
+    let bindings = compile_route_bindings(&contracts.routes[0]);
+    assert!(bindings.diagnostics.is_empty());
+
+    let path = HashMap::new();
+    let headers = vec![];
+    let captured = HttpRequestBindingInputs::capture("/leads?limit=1&limit=9000", &headers, b"");
+    let error = bind_request_arguments(&bindings.bindings, 1, &captured.values(&path, &headers))
+        .expect_err("a scalar query binding must not silently select either value");
+    assert_eq!(error.http_status(), 400);
+    assert_eq!(error.code(), "ambiguous_request_input");
+    assert_eq!(error.problem_details()["source"], "query");
+}
