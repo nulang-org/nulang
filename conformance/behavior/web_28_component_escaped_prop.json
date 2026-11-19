@@ -1,0 +1,5 @@
+{
+  "exit_code": 0,
+  "stdout": "<article class=\"syn-panel\"><h2>&lt;img src=x onerror=alert(1)&gt;</h2></article>",
+  "stderr": ""
+}

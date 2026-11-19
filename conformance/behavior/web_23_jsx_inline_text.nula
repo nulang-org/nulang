@@ -1,0 +1,8 @@
+import stdlib::web::html
+import stdlib::web::types
+
+fn main() {
+    let subject = "Nulang"
+    let h = <p class="syn-muted">Hello, {subject}! Test: 1 + 2 = 3.</p>
+    perform IO.print(h)
+}

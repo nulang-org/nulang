@@ -1,0 +1,8 @@
+import stdlib::web::html
+import stdlib::web::types
+
+fn main() {
+    let attack = "<img src=x onerror=alert(1)> &"
+    let h = <p class="syn-muted">Untrusted: {attack}</p>
+    perform IO.print(h)
+}

@@ -106,6 +106,10 @@ fn infix_precedence(op: &TokenKind) -> Option<(u8, bool)> {
 
 pub struct Parser {
     tokens: Vec<Token>,
+    // JSX text requires the exact source slice (including punctuation and spaces),
+    // not the token spellings. Keep it parser-owned so nested imports cannot
+    // replace its source via the thread-local diagnostics SourceMap.
+    source_text: Option<String>,
     pos: usize,
     local_type_params: FxHashMap<String, TypeVar>,
     global_type_constructors: FxHashMap<String, TypeVar>,
@@ -124,6 +128,9 @@ pub struct Parser {
     imported_type_cache: FxHashMap<String, (Vec<TypeVar>, Type)>,
     /// Module-level named handler registry.
     handler_registry: FxHashMap<String, Vec<EffectHandler>>,
+    // Compile-time HTML component templates. They expand to ordinary Html
+    // expressions; no browser runtime or new AST backend is introduced.
+    html_components: FxHashMap<String, HtmlComponent>,
 }
 
 /// Parsed app block; kept private to the parser and desugared into
@@ -132,6 +139,12 @@ struct ParsedApp {
     _name: String,
     routes: Vec<(String, String, String)>,
     span: Span,
+}
+
+#[derive(Clone)]
+struct HtmlComponent {
+    params: Vec<Param>,
+    body: Expr,
 }
 
 impl Parser {
@@ -146,11 +159,13 @@ impl Parser {
     fn new_raw(tokens: Vec<Token>) -> Self {
         Parser {
             tokens,
+            source_text: crate::types::current_source_text(),
             pos: 0,
             global_type_constructors: FxHashMap::default(),
             local_type_params: FxHashMap::default(),
             imported_type_cache: FxHashMap::default(),
             handler_registry: FxHashMap::default(),
+            html_components: FxHashMap::default(),
             diagnostics: Vec::new(),
             warnings: Vec::new(),
         }
@@ -231,6 +246,13 @@ impl Parser {
             // App blocks are handled before other declarations.
             if self.match_token(&TokenKind::App) {
                 app_decls.push(self.parse_app_decl()?);
+                continue;
+            }
+
+            // HTML components are compile-time templates over normal Html
+            // expressions, intentionally separate from ordinary declarations.
+            if matches!(self.peek_kind(), TokenKind::Ident(name) if name == "component") {
+                self.parse_html_component_decl()?;
                 continue;
             }
 
@@ -4415,6 +4437,98 @@ impl Parser {
         }
     }
 
+    // HTML attributes allow hyphenated and colon-separated names (e.g. data-on:click).
+    // Keep this local to the HTML parser: '-' is subtraction in Nulang code.
+    fn expect_html_attr_name(&mut self) -> NuResult<String> {
+        let mut name = self.expect_html_ident("HTML attribute name")?;
+        loop {
+            let separator = match self.peek_kind() {
+                TokenKind::Minus => '-',
+                TokenKind::Colon => ':',
+                _ => break,
+            };
+            self.advance();
+            name.push(separator);
+            name.push_str(&self.expect_html_ident("HTML attribute name segment")?);
+        }
+        Ok(name)
+    }
+
+    /// Register a compile-time HTML component with named string/expression
+    /// props and a single Html expression body. A `<slot />` expands to
+    /// zero or more child nodes, without wrapping them in extra elements.
+    fn parse_html_component_decl(&mut self) -> NuResult<()> {
+        let span = self.current_span();
+        self.advance(); // contextual `component`
+        let name = self.expect_ident("component name")?;
+        if !name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            return Err(NuError::parse_error(
+                "Component names must begin with an uppercase letter".to_string(),
+                span,
+            ));
+        }
+        if self.html_components.contains_key(&name) {
+            return Err(NuError::parse_error(
+                format!("Duplicate HTML component '{}'", name),
+                span,
+            ));
+        }
+        self.expect(TokenKind::LParen)?;
+        let (params, defaults, request_bindings) = self.parse_params_with_defaults()?;
+        self.expect(TokenKind::RParen)?;
+        if defaults.iter().any(Option::is_some) || !request_bindings.is_empty() {
+            return Err(NuError::parse_error(
+                "HTML components do not support default or request-bound props".to_string(),
+                span,
+            ));
+        }
+        self.expect(TokenKind::LBrace)?;
+        self.skip_newlines();
+        let body = self.parse_expr()?;
+        self.skip_newlines();
+        self.expect(TokenKind::RBrace)?;
+        self.html_components
+            .insert(name, HtmlComponent { params, body });
+        Ok(())
+    }
+
+    fn is_empty_slot(expr: &Expr) -> bool {
+        matches!(
+            expr,
+            Expr::App { func, args, .. }
+                if matches!(func.as_ref(), Expr::Var(name, _) if name == "el")
+                && args.len() == 3
+                && matches!(&args[0], Expr::Literal(Literal::String(name), _) if name == "slot")
+                && matches!(&args[1], Expr::Array(items, _) if items.is_empty())
+                && matches!(&args[2], Expr::Array(items, _) if items.is_empty())
+        )
+    }
+
+    // Expand slot nodes only in HTML child arrays, never in attribute values.
+    fn fill_html_slots(expr: Expr, slot: &[Expr]) -> Expr {
+        match expr {
+            Expr::App { func, args, span } => {
+                let args = args
+                    .into_iter()
+                    .map(|arg| Self::fill_html_slots(arg, slot))
+                    .collect();
+                Expr::App { func, args, span }
+            }
+            Expr::Array(items, span) => {
+                let mut filled = Vec::new();
+                for item in items {
+                    if Self::is_empty_slot(&item) {
+                        filled.extend(slot.iter().cloned());
+                    } else {
+                        filled.push(Self::fill_html_slots(item, slot));
+                    }
+                }
+                Expr::Array(filled, span)
+            }
+            other => other,
+        }
+    }
+
     /// Parse a JSX/HTML element: `<tag attrs>children</tag>` or `<tag attrs />`.
     /// Desugars to `el("tag", attrs, children)` where `attrs` and `children`
     /// are arrays. Text children are wrapped in `text("...")` calls.
@@ -4422,21 +4536,22 @@ impl Parser {
         let span = self.current_span();
         self.expect(TokenKind::Lt)?; // consume '<'
         let tag = self.expect_html_ident("HTML tag name")?;
+        let component = self.html_components.contains_key(&tag);
 
         let mut attrs: Vec<Expr> = Vec::new();
         loop {
             self.skip_newlines();
             if self.consume_if(&TokenKind::Slash) {
                 self.expect(TokenKind::Gt)?;
-                return Ok(self.html_el(&tag, attrs, Vec::new(), span));
+                return self.html_el(&tag, attrs, Vec::new(), span);
             }
             if self.consume_if(&TokenKind::Gt) {
                 let children = self.parse_html_children(&tag, span)?;
-                return Ok(self.html_el(&tag, attrs, children, span));
+                return self.html_el(&tag, attrs, children, span);
             }
 
             // Attribute: name="value" or name={expr} or boolean name
-            let attr_name = self.expect_html_ident("HTML attribute name")?;
+            let attr_name = self.expect_html_attr_name()?;
             let attr_val = if self.consume_if(&TokenKind::Assign) {
                 if self.consume_if(&TokenKind::LBrace) {
                     let expr = self.parse_expr()?;
@@ -4444,7 +4559,11 @@ impl Parser {
                     expr
                 } else {
                     let s = self.expect_string("HTML attribute value")?;
-                    self.html_text(&s, span)
+                    if component {
+                        Expr::Literal(Literal::String(s), span)
+                    } else {
+                        self.html_text(&s, span)
+                    }
                 }
             } else {
                 self.html_text(&attr_name, span)
@@ -4456,8 +4575,66 @@ impl Parser {
         }
     }
 
-    fn html_el(&self, tag: &str, attrs: Vec<Expr>, children: Vec<Expr>, span: Span) -> Expr {
-        Expr::App {
+    fn html_el(
+        &self,
+        tag: &str,
+        attrs: Vec<Expr>,
+        children: Vec<Expr>,
+        span: Span,
+    ) -> NuResult<Expr> {
+        if let Some(template) = self.html_components.get(tag) {
+            let mut provided = FxHashMap::default();
+            for attr in attrs {
+                if let Expr::Tuple(parts, _) = attr {
+                    if let [Expr::Literal(Literal::String(name), _), value] = parts.as_slice() {
+                        if provided.insert(name.clone(), value.clone()).is_some() {
+                            return Err(NuError::parse_error(
+                                format!("Duplicate prop '{}' on component '{}'", name, tag),
+                                span,
+                            ));
+                        }
+                    }
+                }
+            }
+            let mut arguments = Vec::new();
+            for param in &template.params {
+                let Some(value) = provided.remove(&param.name) else {
+                    return Err(NuError::parse_error(
+                        format!("Missing prop '{}' on component '{}'", param.name, tag),
+                        span,
+                    ));
+                };
+                arguments.push((param.clone(), value));
+            }
+            if let Some(unknown) = provided.keys().next() {
+                return Err(NuError::parse_error(
+                    format!("Unknown prop '{}' on component '{}'", unknown, tag),
+                    span,
+                ));
+            }
+            let mut rendered = Self::fill_html_slots(template.body.clone(), &children);
+            for (param, value) in arguments.into_iter().rev() {
+                rendered = Expr::Let {
+                    name: param.name,
+                    ty: param.ty,
+                    value: Box::new(value),
+                    body: Box::new(rendered),
+                    mutable: false,
+                    let_in: true,
+                    span,
+                };
+            }
+            return Ok(rendered);
+        }
+        // Components use capitalized names; emit a clear error rather than
+        // silently serializing <Card> as a malformed custom HTML element.
+        if tag.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            return Err(NuError::parse_error(
+                format!("Unknown HTML component '{}'", tag),
+                span,
+            ));
+        }
+        Ok(Expr::App {
             func: Box::new(Expr::Var("el".to_string(), span)),
             args: vec![
                 Expr::Literal(Literal::String(tag.to_string()), span),
@@ -4465,7 +4642,7 @@ impl Parser {
                 Expr::Array(children, span),
             ],
             span,
-        }
+        })
     }
 
     fn html_text(&self, s: &str, span: Span) -> Expr {
@@ -4476,98 +4653,113 @@ impl Parser {
         }
     }
 
+    fn append_html_text(
+        &self,
+        children: &mut Vec<Expr>,
+        start: u32,
+        end: u32,
+        span: Span,
+    ) -> NuResult<()> {
+        let source = self.source_text.as_deref().ok_or_else(|| {
+            NuError::parse_error(
+                "HTML text requires the original source text".to_string(),
+                span,
+            )
+        })?;
+        let raw = source
+            .get(start as usize..end as usize)
+            .ok_or_else(|| NuError::parse_error("Invalid HTML text span".to_string(), span))?;
+
+        // Preserve exact inline spaces and punctuation. For multiline JSX,
+        // discard indentation-only gaps and fold text-bearing lines with a
+        // single space (the conventional JSX whitespace behavior).
+        let content = if raw.contains('\n') || raw.contains('\r') {
+            raw.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        } else {
+            raw.to_string()
+        };
+        if !content.is_empty() {
+            children.push(self.html_text(&content, span));
+        }
+        Ok(())
+    }
+
     fn parse_html_children(&mut self, close_tag: &str, span: Span) -> NuResult<Vec<Expr>> {
         let mut children: Vec<Expr> = Vec::new();
-        while !self.is_at_end() {
-            self.skip_newlines();
+        // Called directly after the opening '>'; its end marks the first
+        // possible literal text byte. Token spans exclude skipped whitespace.
+        let mut text_start = self.tokens[self.pos - 1].span.end;
 
-            // Closing tag: </close_tag>
-            if self.peek_kind() == &TokenKind::Lt {
-                let saved = self.pos;
-                self.advance(); // '<'
-                if self.consume_if(&TokenKind::Slash) {
-                    let closing = self.expect_html_ident("closing tag name")?;
-                    if closing == close_tag {
+        while !self.is_at_end() {
+            let next = self.peek_kind().clone();
+            if next == TokenKind::Lt || next == TokenKind::LBrace {
+                self.append_html_text(&mut children, text_start, self.current_span().start, span)?;
+
+                if next == TokenKind::Lt {
+                    let saved = self.pos;
+                    self.advance(); // '<'
+                    if self.consume_if(&TokenKind::Slash) {
+                        let closing = self.expect_html_ident("closing tag name")?;
+                        if closing != close_tag {
+                            return Err(NuError::parse_error(
+                                format!(
+                                    "Expected closing tag </{}>, found </{}>",
+                                    close_tag, closing
+                                ),
+                                self.current_span(),
+                            ));
+                        }
                         self.expect(TokenKind::Gt)?;
                         return Ok(children);
-                    } else {
-                        return Err(NuError::parse_error(
-                            format!(
-                                "Expected closing tag </{}>, found </{}>",
-                                close_tag, closing
-                            ),
-                            self.current_span(),
-                        ));
                     }
+                    self.pos = saved;
+                    children.push(self.parse_html_expr()?);
+                } else {
+                    self.advance(); // '{'
+                                    // JSX escapes arbitrary expressions by default. Embedding
+                                    // an already constructed Html value requires the explicit
+                                    // {html: expression} form (the same trust boundary as raw).
+                                    // This prevents ordinary route/query strings from becoming
+                                    // executable markup when interpolated in JSX.
+                    let trusted_html = matches!(
+                        self.peek_kind(),
+                        TokenKind::Ident(name) if name == "html"
+                    ) && self
+                        .tokens
+                        .get(self.pos + 1)
+                        .is_some_and(|token| token.kind == TokenKind::Colon);
+                    if trusted_html {
+                        self.advance(); // 'html'
+                        self.advance(); // ':'
+                    }
+                    let expr = self.parse_expr()?;
+                    self.expect(TokenKind::RBrace)?;
+                    children.push(if trusted_html {
+                        expr
+                    } else {
+                        Expr::App {
+                            func: Box::new(Expr::Var("text".to_string(), span)),
+                            args: vec![expr],
+                            span,
+                        }
+                    });
                 }
-                // Not a closing tag: restore and parse nested element
-                self.pos = saved;
-                children.push(self.parse_html_expr()?);
-                continue;
+                text_start = self.tokens[self.pos - 1].span.end;
+            } else {
+                // Inside HTML text, punctuation and keywords are literal.
+                // Their original spelling and intervening whitespace come
+                // from the source slice, not their Nulang token kinds.
+                self.advance();
             }
-
-            // Interpolated expression: {expr}
-            if self.consume_if(&TokenKind::LBrace) {
-                let expr = self.parse_expr()?;
-                self.expect(TokenKind::RBrace)?;
-                children.push(expr);
-                continue;
-            }
-
-            if self.peek_kind() == &TokenKind::Eof {
-                break;
-            }
-
-            // Text node: consume the next token as literal text
-            let text = self.html_token_text()?;
-            children.push(self.html_text(&text, span));
         }
         Err(NuError::parse_error(
             format!("Unclosed HTML tag <{}>", close_tag),
             span,
         ))
-    }
-
-    fn html_token_text(&mut self) -> NuResult<String> {
-        let span = self.current_span();
-        match self.peek_kind().clone() {
-            TokenKind::Ident(s) | TokenKind::UpperIdent(s) => {
-                self.advance();
-                Ok(s)
-            }
-            other if Self::is_keyword_token(&other) => {
-                self.advance();
-                Ok(other.to_string())
-            }
-            TokenKind::IntLit(n) => {
-                self.advance();
-                Ok(n.to_string())
-            }
-            TokenKind::FloatLit(n) => {
-                self.advance();
-                Ok(n.to_string())
-            }
-            TokenKind::StringLit(s) => {
-                self.advance();
-                Ok(s)
-            }
-            TokenKind::BoolLit(b) => {
-                self.advance();
-                Ok(b.to_string())
-            }
-            TokenKind::NilLit => {
-                self.advance();
-                Ok("nil".to_string())
-            }
-            TokenKind::UnitLit => {
-                self.advance();
-                Ok("unit".to_string())
-            }
-            other => Err(NuError::parse_error(
-                format!("Unexpected token in HTML text: {}", other),
-                span,
-            )),
-        }
     }
 
     // === Helper Methods ===
@@ -6056,7 +6248,7 @@ impl Parser {
     }
 
     /// Check that every route parameter declared in an app route pattern is
-    /// read by the handler via `perform Web.param("name")`. This is a basic
+    /// read by the handler via `perform Web.param("name")` or `param("name")`. This is a basic
     /// static check; it does not follow calls into helper functions or imported
     /// handlers.
     fn check_route_params(&self, apps: &[ParsedApp], decls: &[Decl]) -> NuResult<()> {
@@ -6104,6 +6296,17 @@ impl Parser {
                     if name == param {
                         return true;
                     }
+                }
+            }
+            // Also recognize the stdlib wrapper `param("name")`. The Web
+            // route checker already accepts this spelling; the parser-level
+            // app check must not reject valid handlers before it runs.
+            Expr::App { func, args, .. }
+                if matches!(func.as_ref(), Expr::Var(name, _) if name == "param")
+                    && args.len() == 1 =>
+            {
+                if matches!(&args[0], Expr::Literal(Literal::String(name), _) if name == param) {
+                    return true;
                 }
             }
             _ => {}
@@ -6201,35 +6404,7 @@ impl Parser {
     /// Resolve an import path to a file path. Handles stdlib:: prefix.
     fn resolve_import_path(&self, import_path: &str) -> Option<std::path::PathBuf> {
         if let Some(module) = import_path.strip_prefix("stdlib::") {
-            let module_path = module.replace("::", std::path::MAIN_SEPARATOR_STR);
-            // Try NULANG_STDLIB env var first.
-            if let Ok(dir) = std::env::var("NULANG_STDLIB") {
-                return Some(std::path::PathBuf::from(dir).join(format!("{}.nula", module_path)));
-            }
-            // Try relative to executable.
-            if let Ok(exe) = std::env::current_exe() {
-                if let Some(exe_dir) = exe.parent() {
-                    let candidate = exe_dir.join("stdlib").join(format!("{}.nula", module_path));
-                    if candidate.exists() {
-                        return Some(candidate);
-                    }
-                }
-            }
-            // Development fallback: src/stdlib/ relative to CWD.
-            if let Ok(cwd) = std::env::current_dir() {
-                let dev_path = cwd
-                    .join("src")
-                    .join("stdlib")
-                    .join(format!("{}.nula", module_path));
-                if dev_path.exists() {
-                    return Some(dev_path);
-                }
-            }
-            // Last resort.
-            return Some(std::path::PathBuf::from(format!(
-                "src/stdlib/{}.nula",
-                module_path
-            )));
+            return Some(crate::resolver::resolve_stdlib_module(module));
         }
 
         // @nulang/auth or @nulang/auth/session -> resolved via NULANG_MODULE_PATH.
