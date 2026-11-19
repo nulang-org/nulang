@@ -154,7 +154,9 @@ impl NuDbTransitionJournal {
         match tail.as_ref() {
             Some(tail) => {
                 if tail.activation_epoch == 0 || tail.sequence == 0 {
-                    return Err(invalid_data("NuDB actor tail has invalid epoch or sequence"));
+                    return Err(invalid_data(
+                        "NuDB actor tail has invalid epoch or sequence",
+                    ));
                 }
                 let stored = self
                     .load_transition(actor_id, tail.sequence)?
@@ -191,10 +193,7 @@ impl NuDbTransitionJournal {
     /// per-commit hot-path check. It retains only one decoded record at a time,
     /// performs no writes, and never repairs or silently skips missing data.
     /// Callers must complete this audit before applying any recovered effects.
-    pub fn verify_actor_history(
-        &self,
-        actor_id: u64,
-    ) -> io::Result<Option<DurableTailPosition>> {
+    pub fn verify_actor_history(&self, actor_id: u64) -> io::Result<Option<DurableTailPosition>> {
         let Some(tail) = self.load_tail(actor_id)? else {
             return Ok(None);
         };
@@ -213,7 +212,9 @@ impl NuDbTransitionJournal {
                 return Err(invalid_data("NuDB actor history predecessor mismatch"));
             }
             if record.activation_epoch < previous_epoch {
-                return Err(invalid_data("NuDB actor history activation epoch regressed"));
+                return Err(invalid_data(
+                    "NuDB actor history activation epoch regressed",
+                ));
             }
             previous_epoch = record.activation_epoch;
         }
