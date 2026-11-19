@@ -2149,15 +2149,19 @@ impl Value {
         Value { raw }
     }
 
-    /// Decode externally controlled raw bits without allowing them to mint a
-    /// process-local host heap pointer. Immediate tags and floats are safe to
-    /// transport as opaque values; `TAG_PTR` requires host provenance and is
-    /// therefore rejected at untrusted boundaries.
+    /// Decode externally controlled raw bits without allowing them to mint
+    /// process-local pointers, actor identities, executable closure handles,
+    /// or shared-object references. Such handles must be constructed by
+    /// trusted runtime APIs that can establish their provenance and authority.
+    /// Plain immediates, floating-point values, and guest-relative interned
+    /// string IDs retain their existing wire representation.
     pub fn try_from_untrusted_bits(raw: u64) -> Result<Self, &'static str> {
-        if (raw & TAG_MASK) == TAG_PTR {
-            Err("pointer-tagged raw value has no Nulang host-heap provenance")
-        } else {
-            Ok(Value { raw })
+        match raw & TAG_MASK {
+            TAG_PTR => Err("pointer-tagged raw value has no Nulang host-heap provenance"),
+            TAG_ACTOR => Err("actor-tagged raw value has no Nulang actor authority"),
+            TAG_CLOSURE => Err("closure-tagged raw value has no Nulang function provenance"),
+            TAG_OBJECT => Err("object-tagged raw value has no Nulang object-store provenance"),
+            _ => Ok(Value { raw }),
         }
     }
 

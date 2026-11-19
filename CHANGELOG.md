@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Untrusted tagged-value handle provenance — 2026-11-09
+- **Fail closed when untrusted raw bits claim to be actor, executable closure, or shared-object references.** The central `Value::try_from_untrusted_bits` decoder now rejects those host-owned handles in addition to heap pointers. Plain scalar and interned-string tags remain accepted.
+- **Regression tests cover forged raw handles and trusted actor construction.** This intentionally tightens the C ABI and raw-value FFI/WASM boundaries; callers that previously round-tripped opaque host handles through arbitrary raw bits need a trusted, validated handle API instead of a forged numeric tag.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
