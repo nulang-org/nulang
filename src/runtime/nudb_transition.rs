@@ -154,7 +154,9 @@ impl NuDbTransitionJournal {
         match tail.as_ref() {
             Some(tail) => {
                 if tail.activation_epoch == 0 || tail.sequence == 0 {
-                    return Err(invalid_data("NuDB actor tail has invalid epoch or sequence"));
+                    return Err(invalid_data(
+                        "NuDB actor tail has invalid epoch or sequence",
+                    ));
                 }
                 let stored = self
                     .load_transition(actor_id, tail.sequence)?
@@ -191,10 +193,7 @@ impl NuDbTransitionJournal {
     /// per-commit hot-path check. It retains only one decoded record at a time,
     /// performs no writes, and never repairs or silently skips missing data.
     /// Callers must complete this audit before applying any recovered effects.
-    pub fn verify_actor_history(
-        &self,
-        actor_id: u64,
-    ) -> io::Result<Option<DurableTailPosition>> {
+    pub fn verify_actor_history(&self, actor_id: u64) -> io::Result<Option<DurableTailPosition>> {
         let Some(tail) = self.load_tail(actor_id)? else {
             return Ok(None);
         };
@@ -213,7 +212,9 @@ impl NuDbTransitionJournal {
                 return Err(invalid_data("NuDB actor history predecessor mismatch"));
             }
             if record.activation_epoch < previous_epoch {
-                return Err(invalid_data("NuDB actor history activation epoch regressed"));
+                return Err(invalid_data(
+                    "NuDB actor history activation epoch regressed",
+                ));
             }
             previous_epoch = record.activation_epoch;
         }
@@ -264,10 +265,17 @@ impl NuDbTransitionJournal {
         let envelope = TransitionEnvelope::encode(&transition, digest)?;
         let tail = self.load_tail(transition.actor_id)?;
         if let Some(tail) = &tail {
-            if transition.activation_epoch == tail.activation_epoch
-                && transition.sequence == tail.sequence
-            {
-                if digest == tail.digest {
+            // A client may retry any previously acknowledged sequence, not only
+            // the current tail. Consult its immutable committed envelope before
+            // rejecting an old epoch. Identical retries are read-only; conflicts
+            // and missing historical records fail closed without WAL mutation.
+            if transition.sequence <= tail.sequence {
+                let committed = self
+                    .load_transition(transition.actor_id, transition.sequence)?
+                    .ok_or_else(|| {
+                        invalid_data("NuDB actor history is missing an acknowledged transition")
+                    })?;
+                if committed.digest().map_err(invalid_data)? == digest {
                     return Ok(DurableCommit {
                         actor_id: transition.actor_id,
                         activation_epoch: transition.activation_epoch,
@@ -277,7 +285,7 @@ impl NuDbTransitionJournal {
                 }
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
-                    "conflicting NuDB transition already committed at epoch/sequence",
+                    "conflicting NuDB transition already committed at actor sequence",
                 ));
             }
             if transition.activation_epoch < tail.activation_epoch {

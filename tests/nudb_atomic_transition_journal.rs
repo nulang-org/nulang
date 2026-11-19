@@ -183,6 +183,81 @@ fn retries_are_idempotent_and_conflicts_or_stale_epochs_do_not_advance_wal() {
 }
 
 #[test]
+fn historical_retry_after_checkpoint_returns_original_receipt_without_new_commit() {
+    let path = temp_wal("historical_retry");
+    cleanup(&path);
+    let first = transition(42, 1, 2);
+    let second = transition(42, 2, 3);
+    let original_digest = first.digest().unwrap();
+
+    {
+        let mut journal = NuDbTransitionJournal::open(&path).unwrap();
+        journal.commit_transition(first.clone()).unwrap();
+        journal.commit_transition(second).unwrap();
+        journal.checkpoint().unwrap();
+    }
+
+    let mut journal = NuDbTransitionJournal::open(&path).unwrap();
+    let sequence_before = journal.tablet_sequence();
+    let receipt = journal
+        .commit_transition(first.clone())
+        .expect("an exact historical retry must return its original receipt");
+
+    assert_eq!(receipt.actor_id, 42);
+    assert_eq!(receipt.sequence, 1);
+    assert_eq!(receipt.activation_epoch, 2);
+    assert_eq!(receipt.digest, original_digest);
+    assert_eq!(journal.tablet_sequence(), sequence_before);
+    assert_eq!(journal.load_tail_position(42).unwrap().unwrap().sequence, 2);
+
+    let mut conflicting = first;
+    conflicting.outbox[0].payload.push(PersistedValue::Int(99));
+    assert_eq!(
+        journal.commit_transition(conflicting).unwrap_err().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(
+        journal
+            .commit_transition(transition(42, 3, 2))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(journal.tablet_sequence(), sequence_before);
+    drop(journal);
+    cleanup(&path);
+}
+
+#[test]
+fn missing_historical_transition_fails_closed_on_retry() {
+    let path = temp_wal("historical_missing");
+    cleanup(&path);
+    let first = transition(77, 1, 1);
+    {
+        let mut journal = NuDbTransitionJournal::open(&path).unwrap();
+        journal.commit_transition(first.clone()).unwrap();
+        journal.commit_transition(transition(77, 2, 1)).unwrap();
+    }
+    mutate_raw_tablet(
+        &path,
+        TabletMutation::Delete {
+            key: raw_transition_key(77, 1),
+        },
+    );
+
+    let mut journal = NuDbTransitionJournal::open(&path).unwrap();
+    let sequence_before = journal.tablet_sequence();
+    assert_eq!(
+        journal.commit_transition(first).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert_eq!(journal.tablet_sequence(), sequence_before);
+    assert_eq!(journal.load_tail_position(77).unwrap().unwrap().sequence, 2);
+    drop(journal);
+    cleanup(&path);
+}
+
+#[test]
 fn actor_sequences_are_independent_within_one_tablet() {
     let path = temp_wal("multi_actor");
     cleanup(&path);
@@ -328,7 +403,10 @@ fn deleted_actor_tail_does_not_allow_resetting_existing_history() {
         std::io::ErrorKind::InvalidData
     );
     assert_eq!(
-        journal.commit_transition(transition(77, 1, 1)).unwrap_err().kind(),
+        journal
+            .commit_transition(transition(77, 1, 1))
+            .unwrap_err()
+            .kind(),
         std::io::ErrorKind::InvalidData
     );
     assert_eq!(journal.tablet_sequence(), 2);
@@ -356,7 +434,11 @@ fn actor_history_audit_accepts_contiguous_interleaved_history_after_checkpoint()
         3
     );
     assert_eq!(
-        journal.verify_actor_history(100).unwrap().unwrap().activation_epoch,
+        journal
+            .verify_actor_history(100)
+            .unwrap()
+            .unwrap()
+            .activation_epoch,
         2
     );
     assert_eq!(
@@ -394,7 +476,10 @@ fn actor_history_audit_rejects_missing_middle_transition_after_checkpoint() {
 
     let journal = NuDbTransitionJournal::open(&path).unwrap();
     // Tail-only checks still see an intact final transition.
-    assert_eq!(journal.load_tail_position(900).unwrap().unwrap().sequence, 3);
+    assert_eq!(
+        journal.load_tail_position(900).unwrap().unwrap().sequence,
+        3
+    );
     let sequence_before = journal.tablet_sequence();
     assert_eq!(
         journal.verify_actor_history(900).unwrap_err().kind(),
@@ -426,7 +511,10 @@ fn actor_history_audit_rejects_corrupt_intermediate_payload() {
     );
 
     let journal = NuDbTransitionJournal::open(&path).unwrap();
-    assert_eq!(journal.load_tail_position(901).unwrap().unwrap().sequence, 3);
+    assert_eq!(
+        journal.load_tail_position(901).unwrap().unwrap().sequence,
+        3
+    );
     assert_eq!(
         journal.verify_actor_history(901).unwrap_err().kind(),
         std::io::ErrorKind::InvalidData
@@ -460,7 +548,10 @@ fn actor_history_audit_rejects_orphan_transition_beyond_rewritten_tail() {
     );
 
     let journal = NuDbTransitionJournal::open(&path).unwrap();
-    assert_eq!(journal.load_tail_position(902).unwrap().unwrap().sequence, 1);
+    assert_eq!(
+        journal.load_tail_position(902).unwrap().unwrap().sequence,
+        1
+    );
     assert_eq!(
         journal.verify_actor_history(902).unwrap_err().kind(),
         std::io::ErrorKind::InvalidData
