@@ -95,6 +95,60 @@ def criterion_filter(benchmarks: list[str]) -> str:
     return rf"^(?:{escaped})$"
 
 
+def criterion_directory(root: Path) -> Path:
+    try:
+        metadata = json.loads(
+            command_output(
+                ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+                cwd=root,
+            )
+        )
+        target_directory = metadata["target_directory"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RuntimeError("could not determine Criterion report directory") from exc
+    if not isinstance(target_directory, str) or not target_directory:
+        raise RuntimeError("cargo metadata returned an invalid target directory")
+    return Path(target_directory) / "criterion"
+
+
+def benchmark_ids_for_reports(
+    criterion_dir: Path, report_names: list[str]
+) -> dict[str, str]:
+    report_ids: dict[str, str] = {}
+    for metadata_path in sorted(criterion_dir.glob("**/new/benchmark.json")):
+        try:
+            metadata = json.loads(metadata_path.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            raise RuntimeError(
+                f"unable to read Criterion benchmark metadata: {metadata_path}"
+            ) from exc
+        directory_name = metadata.get("directory_name")
+        full_id = metadata.get("full_id")
+        if not isinstance(directory_name, str) or not directory_name:
+            raise RuntimeError(
+                f"Criterion benchmark metadata has no directory_name: {metadata_path}"
+            )
+        if not isinstance(full_id, str) or not full_id:
+            raise RuntimeError(
+                f"Criterion benchmark metadata has no full_id: {metadata_path}"
+            )
+        previous = report_ids.get(directory_name)
+        if previous is not None and previous != full_id:
+            raise RuntimeError(
+                "Criterion report-directory collision for "
+                f"{directory_name}: {previous} vs {full_id}"
+            )
+        report_ids[directory_name] = full_id
+
+    missing = [name for name in report_names if name not in report_ids]
+    if missing:
+        raise RuntimeError(
+            "Criterion metadata did not map historical report paths: "
+            + ", ".join(missing)
+        )
+    return {name: report_ids[name] for name in report_names}
+
+
 def validate_run_count(runs: int) -> None:
     if runs < 2 or runs % 2 != 0:
         raise ValueError("paired confirmation requires an even --runs value >= 2")
@@ -205,24 +259,24 @@ def run_filtered_benchmarks(
     root: Path,
     env: dict[str, str],
     target_dir: Path,
-    benchmarks: list[str],
+    report_benchmark_ids: dict[str, str],
     affinity: set[int] | None,
 ) -> dict[str, float]:
     criterion_dir = target_dir / "criterion"
     shutil.rmtree(criterion_dir, ignore_errors=True)
     command_output(
-        bench_command(criterion_filter(benchmarks)),
+        bench_command(criterion_filter(list(report_benchmark_ids.values()))),
         cwd=root,
         env=env,
         cpu_affinity=affinity,
     )
     rows = collect_means(criterion_dir)
-    missing = [name for name in benchmarks if name not in rows]
+    missing = [name for name in report_benchmark_ids if name not in rows]
     if missing:
         raise RuntimeError(
             "Criterion confirmation did not emit estimates for: " + ", ".join(missing)
         )
-    return {name: rows[name] for name in benchmarks}
+    return {name: rows[name] for name in report_benchmark_ids}
 
 
 def _bootstrap_median_ci(
@@ -339,6 +393,9 @@ def main() -> int:
 
     benchmarks = [row["benchmark"] for row in regressions]
     thresholds = {row["benchmark"]: float(row["threshold"]) for row in regressions}
+    report_benchmark_ids = benchmark_ids_for_reports(
+        criterion_directory(ROOT), benchmarks
+    )
     affinity = measurement_affinity(args.cpu_mode)
     base = add_worktree(args.base_ref)
     target_root = Path(tempfile.mkdtemp(prefix="nulang-criterion-target-"))
@@ -374,7 +431,7 @@ def main() -> int:
                     root=roots[variant],
                     env=envs[variant],
                     target_dir=targets[variant],
-                    benchmarks=benchmarks,
+                    report_benchmark_ids=report_benchmark_ids,
                     affinity=affinity,
                 )
                 for name, mean_ns in measured.items():
