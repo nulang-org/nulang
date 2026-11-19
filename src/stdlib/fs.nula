@@ -1,31 +1,42 @@
 // Nulang standard library — filesystem I/O via built-in FS effect.
-// Import: `import std.fs`
+// Import: `import stdlib::fs`
 //
-// The `FS` effect is wired into the standalone VM.
-// Operations: `perform FS.read(path)`, `perform FS.write(path, content)`,
-// `perform FS.append(path, content)`, `perform FS.exists(path)`.
+// The raw `FS` effect remains backwards-compatible and may return `nil` on
+// host I/O failure. These wrappers convert that ambient failure convention into
+// typed `Result` values for ordinary application code.
+
+/// Filesystem error surfaced by the stdlib wrappers.
+///
+/// The raw FS effect currently erases the host error detail, so the wrapper
+/// records the operation and path rather than pretending to distinguish OS
+/// error kinds it cannot observe.
+pub type FsError = ReadFailed(String) | WriteFailed(String) | AppendFailed(String)
 
 /// Read the entire contents of a file into a string.
-/// Returns nil if the file cannot be read (missing, permission denied, etc.).
-pub fn read(path: String) -> String ! {FS} {
-    perform FS.read(path)
+pub fn read(path: String) -> Result[String, FsError] ! {FS} {
+    let value = perform FS.read(path);
+    if value == nil then Error(ReadFailed(path)) else Ok(value)
 }
 
 /// Write a string to a file, overwriting any existing content.
 /// Creates the file if it does not exist.
-/// Returns nil if the file cannot be written.
-pub fn write(path: String, content: String) -> Unit ! {FS} {
-    perform FS.write(path, content)
+pub fn write(path: String, content: String) -> Result[Unit, FsError] ! {FS} {
+    let value = perform FS.write(path, content);
+    if value == nil then Error(WriteFailed(path)) else Ok(unit)
 }
 
 /// Append a string to the end of a file.
 /// Creates the file if it does not exist.
-/// Returns nil if the file cannot be written.
-pub fn append(path: String, content: String) -> Unit ! {FS} {
-    perform FS.append(path, content)
+pub fn append(path: String, content: String) -> Result[Unit, FsError] ! {FS} {
+    let value = perform FS.append(path, content);
+    if value == nil then Error(AppendFailed(path)) else Ok(unit)
 }
 
 /// Check whether a file or directory exists at the given path.
+///
+/// The raw FS.exists operation cannot currently distinguish "not found" from
+/// other host-level metadata failures, so this remains Bool until the host ABI
+/// exposes that distinction.
 pub fn exists(path: String) -> Bool ! {FS} {
     perform FS.exists(path)
 }

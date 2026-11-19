@@ -1,0 +1,31 @@
+// stdlib::fs — wrappers convert raw nil-on-error effects into Result.
+import stdlib::fs
+
+fn main() {
+    let p = "/tmp/nulang_stdlib_fs_result_contract.txt"
+
+    match write(p, "hello") {
+        Ok(_) => perform IO.print("write=ok"),
+        Error(_) => perform IO.print("write=error"),
+    }
+
+    match read(p) {
+        Ok(value) => perform IO.print("read=" + value),
+        Error(_) => perform IO.print("read=error"),
+    }
+
+    match append(p, "!") {
+        Ok(_) => perform IO.print("append=ok"),
+        Error(_) => perform IO.print("append=error"),
+    }
+
+    match read(p) {
+        Ok(value) => perform IO.print("read2=" + value),
+        Error(_) => perform IO.print("read2=error"),
+    }
+
+    match read("/tmp/nulang_stdlib_fs_result_missing_xyz.txt") {
+        Ok(_) => perform IO.print("missing=ok"),
+        Error(_) => perform IO.print("missing=error"),
+    }
+}
