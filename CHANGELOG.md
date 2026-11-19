@@ -1,4 +1,8 @@
 # Nulang Changelog
+
+### Experimental Web signal subscriptions and computed values — 2026-11-11
+- **The compiler-emitted browser micro-runtime gains `signal(name).subscribe(listener)` and `computed(dependencies, calculate)`.** Computations use explicit named dependencies, suppress unchanged values, and release source listeners through `dispose()`; no new compiler syntax, scheduler, DOM renderer, or server state is introduced.
+- **Dependency lists are snapshotted and signal maps remain prototype-safe.** Dependency-free Node regression tests exercise hydration, subscription lifetimes, read-only derived values, disposal, and prototype-named signals. Production HTTP security and full Rust/CI validation remain separate gates.
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.

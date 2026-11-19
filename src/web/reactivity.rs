@@ -787,6 +787,7 @@ pub fn generate_client_runtime() -> String {
   // Object.prototype (e.g. constructor, toString, __proto__).
   const signals = Object.create(null);
   const signalBindings = Object.create(null);
+  const subscriptions = Object.create(null);
 
   function refreshSignal(name) {
     const bindings = signalBindings[name];
@@ -794,6 +795,95 @@ pub fn generate_client_runtime() -> String {
     bindings.forEach(function (el) {
       el.textContent = signals[name];
     });
+  }
+
+  function subscribeSignal(name, listener) {
+    if (typeof listener !== 'function') {
+      throw new TypeError('nulang: signal subscriber must be a function');
+    }
+    if (!subscriptions[name]) subscriptions[name] = new Set();
+    subscriptions[name].add(listener);
+    let active = true;
+    return function () {
+      if (!active) return;
+      active = false;
+      const listeners = subscriptions[name];
+      if (listeners) {
+        listeners.delete(listener);
+        if (listeners.size === 0) delete subscriptions[name];
+      }
+    };
+  }
+
+  function updateSignal(name, value) {
+    if (Object.is(signals[name], value)) return;
+    signals[name] = value;
+    refreshSignal(name);
+    const listeners = subscriptions[name];
+    if (listeners) {
+      Array.from(listeners).forEach(function (listener) {
+        if (listeners.has(listener)) listener(value);
+      });
+    }
+  }
+
+  function createComputed(dependencies, calculate) {
+    if (!Array.isArray(dependencies) || dependencies.length === 0 ||
+        !dependencies.every(function (name) {
+          return typeof name === 'string' && name.length > 0;
+        })) {
+      throw new TypeError('nulang: computed requires nonempty string dependencies');
+    }
+    if (new Set(dependencies).size !== dependencies.length) {
+      throw new TypeError('nulang: computed has duplicate dependencies');
+    }
+    if (typeof calculate !== 'function') {
+      throw new TypeError('nulang: computed calculator must be a function');
+    }
+
+    const sources = dependencies.slice();
+    let current = calculate.apply(null, sources.map(function (name) {
+      return signals[name];
+    }));
+    let disposed = false;
+    const listeners = new Set();
+    function recompute() {
+      if (disposed) return;
+      const next = calculate.apply(null, sources.map(function (name) {
+        return signals[name];
+      }));
+      if (Object.is(current, next)) return;
+      current = next;
+      Array.from(listeners).forEach(function (listener) {
+        if (listeners.has(listener)) listener(current);
+      });
+    }
+    const unsubscribeDependencies = sources.map(function (name) {
+      return subscribeSignal(name, recompute);
+    });
+
+    return {
+      get: function () { return current; },
+      subscribe: function (listener) {
+        if (disposed) throw new Error('nulang: computed is disposed');
+        if (typeof listener !== 'function') {
+          throw new TypeError('nulang: computed subscriber must be a function');
+        }
+        listeners.add(listener);
+        let active = true;
+        return function () {
+          if (!active) return;
+          active = false;
+          listeners.delete(listener);
+        };
+      },
+      dispose: function () {
+        if (disposed) return;
+        disposed = true;
+        unsubscribeDependencies.forEach(function (stop) { stop(); });
+        listeners.clear();
+      }
+    };
   }
 
   function runClientAction(handler) {
@@ -897,12 +987,13 @@ pub fn generate_client_runtime() -> String {
     signal: function (name) {
       return {
         get: function () { return signals[name]; },
-        set: function (value) {
-          signals[name] = value;
-          refreshSignal(name);
-        }
+        set: function (value) { updateSignal(name, value); },
+        subscribe: function (listener) { return subscribeSignal(name, listener); }
       };
-    }
+    },
+    // Explicit source names keep this small runtime deterministic; the Nulang
+    // compiler remains responsible for discovering dependencies in templates.
+    computed: createComputed
   };
 
   if (document.readyState === 'loading') {
