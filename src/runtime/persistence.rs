@@ -13,6 +13,9 @@ use crate::durable_effect::DurableEffectId;
 use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
 use crate::vm::Value;
 
+#[cfg(feature = "sqlite")]
+use super::sqlite_compat as libsql;
+
 use tracing::warn;
 
 /// How a state field is persisted / replicated.
@@ -1404,7 +1407,7 @@ impl LibsqlStore {
             tokio::runtime::Runtime::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let connector = Self::https_connector()?;
         let db = rt.block_on(async {
-            libsql::Builder::new_remote(url.to_string(), auth_token.to_string())
+            ::libsql::Builder::new_remote(url.to_string(), auth_token.to_string())
                 .connector(connector)
                 .build()
                 .await
@@ -1414,7 +1417,7 @@ impl LibsqlStore {
             .connect()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         let store = LibsqlStore {
-            conn: std::sync::Mutex::new(conn),
+            conn: std::sync::Mutex::new(libsql::Connection::remote(conn)),
             rt,
             path: PathBuf::from(url),
         };
@@ -4266,27 +4269,47 @@ mod libsql_atomic_transition_tests {
     #[test]
     fn local_actor_store_uses_patched_sqlite_engine() {
         let store = LibsqlStore::in_memory().expect("local actor database opens");
-        let rows = store.query("SELECT sqlite_version()", &[]).expect("read SQLite version");
+        let rows = store
+            .query("SELECT sqlite_version()", &[])
+            .expect("read SQLite version");
         let versions: Vec<String> = serde_json::from_str(&rows[0]).unwrap();
         let version = &versions[0];
-        let parts: Vec<u32> = version.split('.').map(|item| item.parse().unwrap()).collect();
-        assert!(parts.as_slice() >= &[3, 54, 0], "outdated SQLite engine: {version}");
+        let parts: Vec<u32> = version
+            .split('.')
+            .map(|item| item.parse().unwrap())
+            .collect();
+        assert!(
+            parts.as_slice() >= &[3, 54, 0],
+            "outdated SQLite engine: {version}"
+        );
     }
 
     #[cfg(feature = "ai-runtime")]
     #[test]
     fn actor_and_agent_stores_share_sqlite_engine() {
         let actor = LibsqlStore::in_memory().unwrap();
-        let actor_versions: Vec<String> = serde_json::from_str(
-            &actor.query("SELECT sqlite_version()", &[]).unwrap()[0]
-        ).unwrap();
-        let path = std::env::temp_dir().join(format!("nulang_dual_sqlite_{}_{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let actor_versions: Vec<String> =
+            serde_json::from_str(&actor.query("SELECT sqlite_version()", &[]).unwrap()[0]).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "nulang_dual_sqlite_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let agent = nulang_ai_local::SqliteStore::open(&path).unwrap();
         let conn = rusqlite::Connection::open(agent.db_path()).unwrap();
-        let agent_version: String = conn.query_row("SELECT sqlite_version()", [], |r| r.get(0)).unwrap();
-        assert_eq!(actor_versions, vec![agent_version], "two native SQLite engines are forbidden");
-        drop(conn); drop(agent);
+        let agent_version: String = conn
+            .query_row("SELECT sqlite_version()", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            actor_versions,
+            vec![agent_version],
+            "two native SQLite engines are forbidden"
+        );
+        drop(conn);
+        drop(agent);
         std::fs::remove_dir_all(path).unwrap();
     }
 
