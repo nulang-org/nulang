@@ -93,6 +93,8 @@ pub mod runtime;
 pub mod semantic_identity;
 pub mod semantic_schema;
 pub mod statechart;
+pub mod statechart_cli;
+pub mod statechart_testing;
 pub mod stdlib;
 #[cfg(test)]
 pub mod stress_tests;

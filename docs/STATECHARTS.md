@@ -49,9 +49,54 @@ Conformance tests exercise parser validation, effect-free guards, type
 checking, formatting, AST lowering, graph traversal, and actual actor
 execution.
 
+## Machine CLI (experimental)
+
+The CLI builds on the static analysis and generates **transition-edge coverage**
+using shortest executable prefixes. It does not generate a new runtime.
+
+```bash
+nulang machine graph order.nula --format mermaid --out order.mmd
+nulang machine graph order.nula --format json --out order-graph.json
+nulang machine paths order.nula --fixtures fixtures.json --out order-paths.json
+nulang machine test order.nula --fixtures fixtures.json
+```
+
+For multiple machines in one file, specify `--machine NAME`. Fixtures map
+each event name to a JSON array of primitive argument values:
+
+```json
+{
+  "pay": [42],
+  "reset": []
+}
+```
+
+The `paths` output lists executable cases, explicit skips, and structurally
+unreachable states. Its shortest paths cover **transition edges** (including
+a global event from each structurally reachable state) and negative cases
+that verify source-scoped events are rejected from other reachable states. These are generated
+test scenarios, not a proof that guards are satisfiable. Event arguments
+come from supplied fixtures; missing, malformed, or unsupported fixtures
+are skipped explicitly.
+
+The `test` command recompiles the selected machine plus a generated
+in-memory entry point for each case. A fresh bytecode actor and runtime
+execute the sequence, and the resulting `_sm_state` is compared against
+the expected target. It returns nonzero if any generated case fails, if
+an edge is skipped, or if no executable cases exist. Guards that reject
+their supplied fixture yield a failing case, not a passing test.
+
+The current runner tests a selected machine independently, including its
+entry/exit hooks. It **executes those hooks**, so run it only against trusted
+source or mocked external effects. It does not compile arbitrary surrounding
+application declarations or assert intermediate checkpoints. Fixture
+arguments are limited to numbers, booleans, and strings. Large graphs are
+bounded; no process-wide deployment/persistence guarantees are implied.
+
 ## Deferred work
 
-Future versions may add event-family dispatch, hierarchical states, model-based
-test generation with guard fixtures, typed invalid-event results, machine
-manifest metadata, timer-triggered transitions, and inspector integration.
-These require separate semantic and compatibility review.
+Future versions may add event-family dispatch, hierarchical and parallel
+states, typed invalid-event results, machine manifest metadata,
+timer-triggered transitions, an inspection UI, richer guard fixture
+synthesis, and persistent generated test artifacts. These require separate
+semantic and compatibility review.
