@@ -1055,11 +1055,12 @@ runtime withstands adversarial operational review. Both hold up as
    candidates — `httparse` + `ureq` (unify), `rustyline`'s feature surface,
    `tracing-subscriber` heavy features — remain untrimmed, rationale
    unchanged) → target ≤300.
-   `libsql` itself is now feature-trimmed to `core`+`remote`+`tls`
-   (dropped `replication`/`sync`, -36 crates including all of tonic/
-   axum) but its `core`/FFI/bindgen layer remains — full replacement
-   with a bytecode-only journal format is still a candidate if further
-   reduction is needed. Every dep gets a "why we depend on this" line
+   `libsql` is temporarily restricted to `core` (local SQLite). The
+   `remote`/`tls` features were disabled while its dependency chain continues
+   to pin vulnerable rustls-webpki 0.102.x (RUSTSEC-2026-0382). Remote
+   `LibsqlStore::new_remote` fails explicitly until a patched client path is
+   implemented. The `core`/FFI/bindgen layer remains — full replacement
+   with a bytecode-only journal format is still a candidate if needed. Every dep gets a "why we depend on this" line
    in `SPEC2.md` §Implementation Status.
 
 **Acceptance.**

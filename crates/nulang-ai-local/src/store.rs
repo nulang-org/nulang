@@ -391,3 +391,26 @@ fn parse_manager_kind(raw: String) -> ManagerKind {
         _ => ManagerKind::Engineering,
     }
 }
+
+#[cfg(test)]
+mod sqlite_security_tests {
+    use rusqlite::Connection;
+
+    #[test]
+    fn bundled_sqlite_release_has_wal_memory_disclosure_fix() {
+        // RUSTSEC-2026-0459 / CVE-2026-119375: the vulnerable WAL
+        // page-size case is fixed in bundled SQLite 3.54.0.
+        let conn = Connection::open_in_memory().unwrap();
+        let version: String = conn
+            .query_row("SELECT sqlite_version()", [], |row| row.get(0))
+            .unwrap();
+        let parts: Vec<u32> = version
+            .split('.')
+            .map(|component| component.parse::<u32>().unwrap())
+            .collect();
+        assert!(
+            parts.as_slice() >= &[3, 54, 0],
+            "vulnerable bundled SQLite: {version}"
+        );
+    }
+}
