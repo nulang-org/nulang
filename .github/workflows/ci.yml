@@ -239,6 +239,9 @@ jobs:
       - name: Test
         run: cargo test --locked --no-default-features
 
+      - name: Verify stdlib sort comparator budget
+        run: python3 -m unittest scripts/tests/test_stdlib_sort_complexity.py
+
       - name: Check zero warnings
         run: cargo check --locked --tests --no-default-features
 

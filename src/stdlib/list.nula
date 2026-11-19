@@ -169,17 +169,28 @@ pub fn range(n) {
     result
 }
 
-/// Quicksort: returns a new sorted array (ascending).  Original unchanged.
-/// Picks the first element as pivot; partitions via `filter` into less,
-/// equal, and greater slices, then recurses.  Handles empty, single-element,
-/// duplicates, and negative numbers correctly.
+/// Quicksort: returns a new sorted array (ascending). Original unchanged.
+/// Middle-element pivot avoids the quadratic recursion of a first-element
+/// pivot on already-ordered inputs. Adversarial inputs can still be quadratic.
+/// Partition each element once to avoid three intermediate filtered traversals.
 pub fn sort(xs: [Int]) -> [Int] {
-    var len = perform Array.length(xs);
+    let len = perform Array.length(xs);
     if len <= 1 then { xs } else {
-        var pivot = xs[0];
-        var less = filter(fn(x) { x < pivot }, xs);
-        var eq = filter(fn(x) { x == pivot }, xs);
-        var greater = filter(fn(x) { x > pivot }, xs);
+        let pivot = xs[len / 2];
+        var less = [];
+        var eq = [];
+        var greater = [];
+        for x in xs {
+            if x < pivot then {
+                less = perform Array.push(less, x)
+            } else {
+                if x > pivot then {
+                    greater = perform Array.push(greater, x)
+                } else {
+                    eq = perform Array.push(eq, x)
+                }
+            }
+        };
         var result = sort(less);
         for x in eq {
             result = perform Array.push(result, x)
@@ -191,15 +202,28 @@ pub fn sort(xs: [Int]) -> [Int] {
     }
 }
 
-/// Sort using comparator cmp(a, b) that returns true if a should come before b.
-/// Same quicksort as `sort`, but uses cmp for the partition instead of < and >.
+/// Sort using a strict-order comparator cmp(a, b): true if a precedes b.
+/// Use a middle pivot and a single partition pass, with at most two comparator
+/// calls per element per level. Equal items retain their original order.
+/// This remains quicksort: adversarial inputs can still take quadratic time.
 pub fn sort_by(cmp, xs) {
-    var len = perform Array.length(xs);
+    let len = perform Array.length(xs);
     if len <= 1 then { xs } else {
-        var pivot = xs[0];
-        var less = filter(fn(x) { cmp(x, pivot) }, xs);
-        var eq = filter(fn(x) { !cmp(x, pivot) && !cmp(pivot, x) }, xs);
-        var greater = filter(fn(x) { cmp(pivot, x) }, xs);
+        let pivot = xs[len / 2];
+        var less = [];
+        var eq = [];
+        var greater = [];
+        for x in xs {
+            if cmp(x, pivot) then {
+                less = perform Array.push(less, x)
+            } else {
+                if cmp(pivot, x) then {
+                    greater = perform Array.push(greater, x)
+                } else {
+                    eq = perform Array.push(eq, x)
+                }
+            }
+        };
         var result = sort_by(cmp, less);
         for x in eq {
             result = perform Array.push(result, x)
