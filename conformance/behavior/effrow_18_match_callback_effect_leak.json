@@ -1,0 +1,1 @@
+{"exit_code":5,"stdout":"","stderr":"disallowed effect(s): IO","proves":"Direct invocation of a callback selected by match cannot evade an explicitly pure effect contract."}

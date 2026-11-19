@@ -1,0 +1,9 @@
+// Guard invocation of a statically pure match-bound callback remains pure.
+fn yes() -> Bool ! {} { true }
+fn invoke(cb: () -> Bool ! {}) -> Unit ! {} {
+    match cb with {
+        | f if f() => {}
+        | _ => {}
+    }
+}
+invoke(yes)

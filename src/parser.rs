@@ -108,6 +108,8 @@ pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     local_type_params: FxHashMap<String, TypeVar>,
+    /// Written row variables share identity within a callable scope only.
+    effect_row_names: FxHashMap<String, Region>,
     global_type_constructors: FxHashMap<String, TypeVar>,
     /// Accumulated parse errors from error-recovery. Callers that want
     /// all errors (not just the first) call `consumed_diagnostics()`.
@@ -149,6 +151,7 @@ impl Parser {
             pos: 0,
             global_type_constructors: FxHashMap::default(),
             local_type_params: FxHashMap::default(),
+            effect_row_names: FxHashMap::default(),
             imported_type_cache: FxHashMap::default(),
             handler_registry: FxHashMap::default(),
             diagnostics: Vec::new(),
@@ -742,6 +745,7 @@ impl Parser {
 
     fn parse_decl(&mut self) -> NuResult<Decl> {
         self.local_type_params.clear();
+        self.effect_row_names.clear();
         let _span = self.current_span();
         let annotations = self.parse_function_annotations()?;
         self.skip_newlines();
@@ -930,7 +934,25 @@ impl Parser {
         Ok(annotations)
     }
 
+    fn with_fresh_effect_row_scope<T>(
+        &mut self,
+        parse: impl FnOnce(&mut Self) -> NuResult<T>,
+    ) -> NuResult<T> {
+        let outer = std::mem::take(&mut self.effect_row_names);
+        let result = parse(self);
+        self.effect_row_names = outer;
+        result
+    }
+
     fn parse_function(
+        &mut self,
+        public: bool,
+        annotations: Vec<FunctionAnnotation>,
+    ) -> NuResult<Decl> {
+        self.with_fresh_effect_row_scope(|parser| parser.parse_function_scoped(public, annotations))
+    }
+
+    fn parse_function_scoped(
         &mut self,
         public: bool,
         mut annotations: Vec<FunctionAnnotation>,
@@ -2791,6 +2813,10 @@ impl Parser {
     // === Behaviors ===
 
     fn parse_behavior(&mut self) -> NuResult<Behavior> {
+        self.with_fresh_effect_row_scope(Self::parse_behavior_scoped)
+    }
+
+    fn parse_behavior_scoped(&mut self) -> NuResult<Behavior> {
         let span = self.current_span();
         self.advance(); // consume 'behavior'
         let name = self.expect_ident("behavior name")?;
@@ -3561,6 +3587,10 @@ impl Parser {
     }
 
     fn parse_lambda(&mut self) -> NuResult<Expr> {
+        self.with_fresh_effect_row_scope(Self::parse_lambda_scoped)
+    }
+
+    fn parse_lambda_scoped(&mut self) -> NuResult<Expr> {
         let span = self.current_span();
         self.advance(); // consume 'fn'
         self.expect(TokenKind::LParen)?;
@@ -5712,11 +5742,15 @@ impl Parser {
             self.pos += 1; // also skip 'type' after 'opaque'
         }
         self.skip_newlines();
-        let decl_result = if self.peek_kind() == &TokenKind::Alias {
-            self.parse_type_alias(false, is_opaque)
-        } else {
-            self.parse_type_decl_variant_or_record(false, vec![])
-        };
+        // Re-parsing a type declaration must not capture the row variables of
+        // the function currently using that type, or introduce names into it.
+        let decl_result = self.with_fresh_effect_row_scope(|parser| {
+            if parser.peek_kind() == &TokenKind::Alias {
+                parser.parse_type_alias(false, is_opaque)
+            } else {
+                parser.parse_type_decl_variant_or_record(false, vec![])
+            }
+        });
         let result = decl_result.and_then(|decl| {
             let (type_params, body) = match decl {
                 Decl::TypeAlias {
@@ -6443,8 +6477,11 @@ impl Parser {
             let mut region = Region(0);
             while self.peek_kind() != &TokenKind::RBrace && !self.is_at_end() {
                 if self.consume_if(&TokenKind::Pipe) {
-                    let _rname = self.expect_ident("row variable")?;
-                    region = Region::fresh();
+                    let name = self.expect_ident("row variable")?;
+                    region = *self
+                        .effect_row_names
+                        .entry(name)
+                        .or_insert_with(Region::fresh);
                     is_open = true;
                     break;
                 }
@@ -7004,6 +7041,137 @@ mod tests {
             }
             _ => panic!("Expected effect declaration"),
         }
+    }
+
+    #[test]
+    fn test_effect_row_name_shares_identity_in_function_signature() {
+        let ast = parse("fn apply(f: (Int) -> Int ! {| row}) -> Int ! {| row} { f(1) }").unwrap();
+        match &ast.decls[0] {
+            Decl::Function {
+                params,
+                effect: Some(EffectRow::Open(_, outer)),
+                ..
+            } => match params[0].ty.as_ref() {
+                Some(Type::Function {
+                    effect: EffectRow::Open(_, inner),
+                    ..
+                }) => {
+                    assert_eq!(
+                        inner, outer,
+                        "same row variable must have the same identity within one signature"
+                    );
+                }
+                other => panic!("expected open callback row, got {other:?}"),
+            },
+            other => panic!("expected open function row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_effect_row_names_are_distinct_and_scoped_to_each_function() {
+        let ast = parse(
+            "fn first(f: (Int) -> Int ! {| a}) -> Int ! {| b} { f(1) } \
+             fn second(f: (Int) -> Int ! {| a}) -> Int ! {| a} { f(1) }",
+        )
+        .unwrap();
+        let rows = |decl: &Decl| match decl {
+            Decl::Function {
+                params,
+                effect: Some(EffectRow::Open(_, outer)),
+                ..
+            } => match params[0].ty.as_ref() {
+                Some(Type::Function {
+                    effect: EffectRow::Open(_, inner),
+                    ..
+                }) => (*inner, *outer),
+                other => panic!("expected callback row, got {other:?}"),
+            },
+            other => panic!("expected function row, got {other:?}"),
+        };
+        let (first_a, first_b) = rows(&ast.decls[0]);
+        let (second_a, second_outer) = rows(&ast.decls[1]);
+        assert_ne!(
+            first_a, first_b,
+            "different row names must not share identity"
+        );
+        assert_eq!(second_a, second_outer);
+        assert_ne!(
+            first_a, second_a,
+            "separate declarations must not share row identities"
+        );
+    }
+
+    #[test]
+    fn test_effect_row_names_are_scoped_to_each_behavior() {
+        let ast = parse(
+            "actor A { behavior one(f: (Int) -> Int ! {| r}) -> Int ! {| r} { f(1) } \
+             behavior two(f: (Int) -> Int ! {| r}) -> Int ! {| r} { f(1) } }",
+        )
+        .unwrap();
+        let Decl::Actor { behaviors, .. } = &ast.decls[0] else {
+            panic!("expected actor")
+        };
+        let rows = |behavior: &Behavior| {
+            let Some(EffectRow::Open(_, outer)) = &behavior.effect else {
+                panic!("expected row")
+            };
+            let Some(Type::Function {
+                effect: EffectRow::Open(_, inner),
+                ..
+            }) = behavior.params[0].ty.as_ref()
+            else {
+                panic!("expected callback row")
+            };
+            (*inner, *outer)
+        };
+        let (inner_a, outer_a) = rows(&behaviors[0]);
+        let (inner_b, outer_b) = rows(&behaviors[1]);
+        assert_eq!(inner_a, outer_a);
+        assert_eq!(inner_b, outer_b);
+        assert_ne!(inner_a, inner_b);
+    }
+
+    #[test]
+    fn test_resolved_type_row_does_not_capture_function_row_name() {
+        let ast = parse(
+            "type alias Callback = (Int) -> Int ! {| row} \
+             fn apply(f: Callback) -> Int ! {| row} { f(1) }",
+        )
+        .unwrap();
+        let Decl::Function {
+            params,
+            effect: Some(EffectRow::Open(_, outer)),
+            ..
+        } = &ast.decls[1]
+        else {
+            panic!("expected function row")
+        };
+        let Some(Type::Function {
+            effect: EffectRow::Open(_, inner),
+            ..
+        }) = params[0].ty.as_ref()
+        else {
+            panic!("expected callback row")
+        };
+        assert_ne!(
+            inner, outer,
+            "a type declaration must not capture a use-site row name"
+        );
+    }
+
+    #[test]
+    fn test_effect_row_scope_is_restored_after_parse_error() {
+        let mut parser = Parser::new(vec![]);
+        let outer = Region::fresh();
+        parser.effect_row_names.insert("row".into(), outer);
+        let result: NuResult<()> = parser.with_fresh_effect_row_scope(|parser| {
+            parser
+                .effect_row_names
+                .insert("row".into(), Region::fresh());
+            Err(NuError::parse_error("test error".into(), Span::default()))
+        });
+        assert!(result.is_err());
+        assert_eq!(parser.effect_row_names.get("row"), Some(&outer));
     }
 
     #[test]

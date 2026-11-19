@@ -1000,6 +1000,74 @@ mod tests {
         }
     }
 
+    /// October 27/28 shard 3: AOT must preserve the interpreter's unhandled
+    /// effect category; merely returning a generic runtime error is divergent.
+    #[test]
+    fn differential_fuzz_oct28_aot_unhandled_effect_category_agrees() {
+        let source = "let x = 42; match x { 0 => (fn(x) { x + 1 })(41)}";
+        let outcome = differential_fuzz_one(source)
+            .expect("unhandled effect kind must match across interpreter and AOT");
+        assert!(
+            matches!(outcome, DiffOutcome::Agreed { aot: true, .. }),
+            "AOT must execute and preserve the effect error category: {outcome:?}"
+        );
+    }
+
+    /// Until WASM has typed unhandled-effect propagation, compilation must
+    /// reject the compiler-generated match fallback rather than return nil.
+    #[cfg(feature = "wasm-backend")]
+    #[test]
+    fn wasm_rejects_non_exhaustive_match_effect_without_error_support() {
+        use crate::backends::WasmBackend;
+        let mutant = compile_for_diff_verbose("let x = 42; match x { 0 => (fn(x) { x + 1 })(41)}")
+            .expect("regression must compile to MIR");
+        let mut wasm = crate::backends::DefaultWasmBackend;
+        let error = wasm
+            .compile(&mutant.mir_module, "main")
+            .expect_err("unhandled match effect must fail closed in WASM");
+        assert!(
+            error
+                .to_string()
+                .contains("WASM backend restricted profile"),
+            "unexpected WASM rejection: {error}"
+        );
+    }
+
+    /// Regression from nightly fuzz shard 6 at 448cfa8 (2026-10-27/28):
+    /// float division by zero feeding an array-indexed addition must yield
+    /// the same observable value after JIT tier-up as in the cold VM.
+    #[test]
+    fn differential_nil_float_add_array_regression() {
+        let source = "let a = [1.5, 2.5]; 1.0 / 0.0 + a[1]";
+        match differential_fuzz_one(source) {
+            Ok(DiffOutcome::Agreed { .. }) => {}
+            other => panic!("interpreter/JIT parity regression: {other:?}"),
+        }
+    }
+
+    /// Exact October 28 shard 3 input (token adjacency is intentional).
+    #[test]
+    fn nightly_shard3_loop_parity_regression() {
+        for source in [
+            "var i = 0.0; var s = 01.0 / 0.0 100.0 { s = s + i * 2.5 - i / 3.0; i = i + 1.0; }; s",
+            "var i = 0.0; var s = 0.0; while i < 100.0 { s = s + i * 2.5 - i /i 3.0; i = i + 1.0; }; s",
+        ] {
+            let result = differential_fuzz_one(source)
+                .unwrap_or_else(|e| panic!("shard 3 loop divergence for {source:?}: {e}"));
+            assert!(matches!(result, DiffOutcome::Agreed { .. }), "{result:?}");
+        }
+    }
+
+    #[test]
+    fn nightly_shard3_direct_call_error_parity_regression() {
+        let source =
+            "fn cond(c, a, b) { if -c then a else b }; cond(true, 1, 2) + cond(false, 10, 20)";
+        assert!(matches!(
+            differential_fuzz_one(source),
+            Ok(DiffOutcome::Agreed { .. })
+        ));
+    }
+
     /// Differential regression cases: known kernels that must agree across
     /// all backends. Added from nightly fuzz captures (2026-10-10).
     #[test]

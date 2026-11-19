@@ -1,1 +1,1 @@
-{"exit_code": 0, "stdout": "subset"}
+{"exit_code":0,"stdout":"nil","proves":"The IO-only body is valid within a wider open effect declaration; the declaration is not invoked."}

@@ -1,0 +1,4 @@
+// Unknown callback effects may not be discharged by match-variable rebinding.
+fn invoke(cb) -> Unit ! {} {
+    match cb with { | f => f() }
+}

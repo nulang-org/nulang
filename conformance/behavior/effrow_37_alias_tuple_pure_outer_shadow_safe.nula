@@ -1,0 +1,8 @@
+// A non-function nested variable cannot accidentally borrow a pure outer callback.
+fn good() -> Unit ! {} {}
+fn invoke(cb: () -> Unit ! {}) -> Unit ! {} {
+    match (cb, 1) with {
+        | pair @ (callback, _) => callback()
+    }
+}
+invoke(good)

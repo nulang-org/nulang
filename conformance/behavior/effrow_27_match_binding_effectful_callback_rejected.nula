@@ -1,0 +1,9 @@
+// Pattern-bound callback shadows outer pure cb; the matched IO effect must not be erased.
+fn good() -> Unit ! {} {}
+fn danger() -> Unit ! {IO} { perform IO.print("must not run") }
+fn invoke(cb: () -> Unit ! {}, unsafe_cb: () -> Unit ! {IO}) -> Unit ! {} {
+    match unsafe_cb with {
+        | cb => cb()
+    }
+}
+invoke(good, danger)

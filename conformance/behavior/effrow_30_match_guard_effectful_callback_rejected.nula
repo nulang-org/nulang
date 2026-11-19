@@ -1,0 +1,12 @@
+// An effectful callback called in a match guard must violate a pure contract.
+fn danger() -> Bool ! {IO} {
+    perform IO.print("must not run")
+    true
+}
+fn invoke(cb: () -> Bool ! {IO}) -> Unit ! {} {
+    match cb with {
+        | f if f() => {}
+        | _ => {}
+    }
+}
+invoke(danger)

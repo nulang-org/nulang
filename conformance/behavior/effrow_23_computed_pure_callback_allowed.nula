@@ -1,0 +1,5 @@
+fn pure() -> Unit ! {} {}
+fn by_block(cb: () -> Unit ! {}) -> Unit ! {} { ({ cb })() }
+fn by_let(cb: () -> Unit ! {}) -> Unit ! {} { (let wrapped = cb in wrapped)() }
+by_block(pure)
+by_let(pure)

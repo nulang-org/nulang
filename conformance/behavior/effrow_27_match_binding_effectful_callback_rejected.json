@@ -1,0 +1,1 @@
+{"exit_code":5,"stdout":"","stderr":"disallowed effect(s): IO","proves":"A direct match binding retains the matched effectful callback's IO effects even if it shadows an outer pure callback."}

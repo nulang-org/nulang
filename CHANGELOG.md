@@ -1,4 +1,36 @@
 # Nulang Changelog
+
+### FFI foreign-pointer provenance isolation — 2026-10-31
+- Bound WASM FFI guest-controlled strings before copying to native memory (symbols 256 bytes, CStr arguments 1 MiB), reject malformed/out-of-range/unterminated strings, and read only the bounded linear-memory slice rather than cloning the entire guest memory for each denied or permitted FFI call. End-to-end WASM regression verified oversized symbols previously reached callback lookup.
+- WASM FFI capabilities are now scoped to each `WasmRuntime`: default-deny, explicit trusted-host `grant_registered_ffi_callback` and `revoke_ffi_callback`, and a snapshot of the exact native callback/signature in that runtime. A real two-runtime regression demonstrated that a process-global registration was previously callable by another WASM runtime without any grant. Library-scoped/dynamic native symbols remain forbidden for WASM.
+- Make WASM FFI registration-only: guests can invoke explicitly registered, library-agnostic host callbacks with matching ABI, but can no longer use guest-controlled library/symbol strings to dynamically load arbitrary host libraries or reuse native-VM library-scoped cache entries. A real Wasmtime guest previously reached an unregistered `libc.so.6` function; regression now rejects this at resolution. Native interpreter FFI remains unchanged.
+- Check the *resolved native function* signature against the guest-declared WASM FFI signature before invocation. Pre-registered native callbacks previously accepted contradictory declarations, allowing a guest to claim an integer return and receive an actual native `VoidPtr` tagged host address; end-to-end WASM test reproduced the bypass.
+- WASM native FFI imports now fail closed before symbol resolution when the declared return type is a host-pointer-bearing `VoidPtr` or `CStr`. The previous WASM host FFI adapter returned raw tagged host addresses directly to guest code; a minimal real Wasmtime import regression reproduced the address disclosure, and scalar FFI return values remain supported.
+- Prevent opaque foreign-pointer handles from crossing node boundaries or persisting into durable continuation snapshots: network classification rejects them, direct wire encoding does not disclose native address bits, and save/restore maps them to nil while rejecting forged legacy raw pointer tags.
+- Encode returned native `VoidPtr` and copied `CStr` allocations with a distinct opaque foreign-pointer value tag. These addresses no longer impersonate `ActorHeap` objects and may only be dereferenced by explicitly unsafe FFI adapters with valid lifetime guarantees.
+- Preserve native pointer round-trips and the VM's C-string copy-and-free contract. Reject both heap and foreign pointer tags when decoding externally supplied raw `Value` bits.
+- A native regression reproduced a `SIGABRT` from a valid foreign pointer being read as a heap header; the same regression passes after the correction. This adds a tagged-value ABI variant; backend/FFI interoperability and security review remain required before release.
+
+### Canonicalize managed floating-point NaNs — 2026-10-30
+- Canonicalize all NaNs at `Value::float` construction, including ordinary native FFI F64 returns, so adversarial NaN payload bits cannot impersonate Nulang pointer, integer, or other value tags.
+- Add regression coverage for raw FFI conversion and a native C-ABI float return. Existing finite floats preserve their original bit patterns. The JIT/AOT/WASM differential matrix still requires hosted exact-head verification.
+
+### Ureq 3 Rustls and HTTP client compatibility — 2026-10-29
+- **Upgrade the opt-in synchronous HTTP client from ureq 2.12.1 to ureq 3.5.0**, using its maintained Rustls 0.23 backend and patched WebPKI 1.0.x trust roots. Cargo's dependency resolver removes the obsolete `webpki-roots 0.26.11` tree; no direct checksum edits or audit exclusions.
+- **Preserve registry publish/fetch/list, VM Http.get/Http.post and cloud deploy behavior** across the ureq 3 request and response API changes. Deploy explicitly returns the 401 authentication hint and readable error bodies for non-2xx HTTP responses, while transport failures remain errors. Rustls still authenticates server certificates and hostnames.
+- **Security acceptance remains exact-head dependent:** local HTTP/HTTPS regressions, full-feature tests, and a complete non-bypassed cargo-audit must all pass before this stacked PR or upstream security changes are merge-ready.
+
+
+### Remote libsql connector migration off obsolete Rustls 0.22 — 2026-10-29
+- **Removed libsql's built-in `tls` feature** (which locked `hyper-rustls 0.25`, `rustls 0.22`, and vulnerable `rustls-webpki 0.102.8`). The remote Turso/HTTP protocol and local SQLite backend remain enabled; the host now supplies libsql's supported Hyper 0.14 `connector` extension point with modern `tokio-rustls 0.26` / Rustls 0.23.
+- **Preserved certificate and hostname verification**, loading native OS trust anchors and negotiating HTTP/1.1 without a plaintext fallback. Invalid remote URL schemes and userinfo fail closed; missing CA roots abort remote connection setup. Local loopback tests exercise rejection of HTTP and an untrusted self-signed TLS server.
+- **Not yet an audit release gate:** legacy `webpki-roots 0.26.11` is independently locked by `ureq 2`. A separate checked TLS-client migration must remove that last advisory source before calling `cargo-audit` green; no RustSec ignore rules were added.
+
+
+### Partial October RustSec dependency remediation — 2026-10-29
+- **Cargo-resolved pinned security upgrades:** Wasmtime / Cranelift / Pulley 48.0.6 → 48.0.7, `ctutils` 0.4.2 → 0.4.4, `rustls-webpki` 0.103.14 → 0.103.16 and `webpki-roots` 1.0.9 → 1.0.10. All lockfile checksums and transitive dependency changes were generated by Cargo's offline resolver, not edited manually.
+- **Not a completed audit fix:** `rustls-webpki` 0.102.8 remains through `libsql 0.10.0-pre.4 → hyper-rustls 0.25 → rustls 0.22`. This legacy TLS branch has no published compatible patched webpki 0.102 release; replacing its dependency owner and verifying remote TLS behavior is separate mandatory work (issue #2093). Do not silence RUSTSEC-2026-0382 or treat the security gate as green.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.

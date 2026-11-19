@@ -1,0 +1,1 @@
+{"exit_code":0,"stdout":"","proves":"Known-pure callbacks returned from single-expression blocks and let aliases remain admissible in explicitly pure functions."}

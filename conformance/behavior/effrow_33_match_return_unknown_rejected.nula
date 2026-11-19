@@ -1,0 +1,4 @@
+// Unknown callback provenance must remain unresolved through a match.
+fn invoke(cb) -> Unit ! {} {
+    (match cb with { | f => f })()
+}

@@ -75,7 +75,8 @@ pub fn value_to_bool(v: &Value) -> Result<bool, String> {
 /// The returned pointer is borrowed from the value and must remain valid for
 /// the duration of the native call.
 pub unsafe fn value_to_cstr(v: &Value) -> Result<*const c_char, String> {
-    v.as_ptr()
+    v.as_foreign_ptr()
+        .or_else(|| v.as_ptr())
         .ok_or_else(|| "expected pointer string".to_string())
         .map(|p| p as *const c_char)
 }
@@ -86,7 +87,8 @@ pub unsafe fn value_to_cstr(v: &Value) -> Result<*const c_char, String> {
 /// The returned pointer is borrowed from the value and must remain valid for
 /// the duration of the native call.
 pub unsafe fn value_to_voidptr(v: &Value) -> Result<*mut c_void, String> {
-    v.as_ptr()
+    v.as_foreign_ptr()
+        .or_else(|| v.as_ptr())
         .ok_or_else(|| "expected pointer".to_string())
         .map(|p| p as *mut c_void)
 }
@@ -124,17 +126,14 @@ pub fn bool_to_value(b: bool) -> Value {
     Value::bool(b)
 }
 
-/// Pack a raw pointer into a Nulang pointer value, returning `Value::nil()`
+/// Pack an opaque native address into a *foreign* pointer value, returning `Value::nil()`
 /// when the address does not fit in the 48-bit payload (e.g. LA57 or
 /// AArch64-52 virtual addresses). Packing a truncated address would produce
 /// a dangling pointer that is later dereferenced as if valid, so failing
 /// closed here is strictly safer than the legacy masking behavior.
 fn ptr_to_value_checked(p: *mut u8) -> Value {
     if crate::value_layout::ptr_fits_payload(p as u64) {
-        unsafe {
-            /* SAFETY: FFI/native boundary contract establishes the pointer lifetime and validity for this conversion. */
-            Value::ptr(p)
-        }
+        Value::foreign_ptr(p)
     } else {
         Value::nil()
     }
@@ -163,7 +162,7 @@ pub unsafe fn cstr_to_value(s: *const c_char) -> Value {
 /// # Safety
 /// `v` must be a pointer value whose payload was returned by `CString::into_raw`.
 pub unsafe fn free_cstr_value(v: Value) {
-    if let Some(ptr) = v.as_ptr() {
+    if let Some(ptr) = v.as_foreign_ptr() {
         // SAFETY: ptr came from CString::into_raw in cstr_to_value.
         let _ = CString::from_raw(ptr as *mut c_char);
     }
@@ -630,6 +629,44 @@ mod tests {
     }
 
     #[test]
+    fn test_foreign_nan_cannot_mint_pointer_or_other_value_tags() {
+        for tag in [
+            crate::value_layout::TAG_PTR,
+            crate::value_layout::TAG_INT,
+            crate::value_layout::TAG_BOOL,
+            crate::value_layout::TAG_NIL,
+            crate::value_layout::TAG_STRING,
+        ] {
+            let returned = f64::from_bits(tag | 0x1234);
+            let result = f64_to_value(returned);
+            assert!(
+                result.as_float().is_some_and(f64::is_nan),
+                "foreign floating-point NaN {tag:#018x} must remain a float"
+            );
+            assert!(
+                !result.is_ptr(),
+                "NaN payload cannot grant pointer provenance"
+            );
+        }
+    }
+
+    #[cfg(feature = "ffi")]
+    #[test]
+    fn test_native_f64_tagged_nan_result_is_canonicalized() {
+        extern "C" fn native_colliding_nan() -> f64 {
+            f64::from_bits(crate::value_layout::TAG_PTR | 0x1234)
+        }
+        let func = make_func(
+            native_colliding_nan as *const c_void,
+            Signature::new(vec![], CType::F64),
+        );
+        // SAFETY: native_colliding_nan has the exact declared signature.
+        let result = unsafe { call_native(&func, &[]) }.expect("valid native return");
+        assert!(result.as_float().is_some_and(f64::is_nan));
+        assert!(!result.is_ptr());
+    }
+
+    #[test]
     fn test_marshal_f64_roundtrip() {
         let v = Value::float(2.5);
         assert_eq!(value_to_f64(&v), Ok(2.5));
@@ -655,7 +692,7 @@ mod tests {
         let borrowed = unsafe { value_to_cstr(&v).unwrap() };
         // SAFETY: borrowed pointer is valid.
         let round = unsafe { cstr_to_value(borrowed) };
-        let round_ptr = round.as_ptr().unwrap() as *const c_char;
+        let round_ptr = round.as_foreign_ptr().unwrap() as *const c_char;
         // SAFETY: round pointer is a valid C string.
         assert_eq!(
             unsafe { CStr::from_ptr(round_ptr).to_str().unwrap() },
@@ -669,6 +706,15 @@ mod tests {
         let p = &mut n as *mut i64 as *mut c_void;
         let v = voidptr_to_value(p);
         // SAFETY: pointer is valid.
+        assert!(
+            v.is_foreign_ptr(),
+            "native pointers must not forge VM heap objects"
+        );
+        assert!(!v.is_ptr());
+        assert!(
+            Value::try_from_untrusted_bits(v.as_raw()).is_err(),
+            "untrusted raw C cannot mint native pointer handles"
+        );
         let p2 = unsafe { value_to_voidptr(&v).unwrap() } as *mut i64;
         // SAFETY: p2 points to valid i64.
         assert_eq!(unsafe { *p2 }, 123);
@@ -766,7 +812,7 @@ mod tests {
             Signature::new(vec![], CType::CStr),
         );
         let result = unsafe { call_native(&func, &[]).unwrap() };
-        let ptr = result.as_ptr().unwrap() as *const c_char;
+        let ptr = result.as_foreign_ptr().unwrap() as *const c_char;
         // SAFETY: pointer came from make_greeting's CString::into_raw.
         let s = unsafe { std::ffi::CStr::from_ptr(ptr).to_str().unwrap() };
         assert_eq!(s, "hello ffi");

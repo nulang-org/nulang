@@ -1,0 +1,1 @@
+{"exit_code":5,"stdout":"","stderr":"disallowed effect(s): IO","proves":"Calling a callback returned through an expression-level let alias cannot erase IO effects."}
