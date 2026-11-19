@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Single patched SQLite engine with preserved remote HTTPS (draft) — 2026-11-19
+- **The local actor store and AI-local runtime now use the same bundled rusqlite 0.41.1 / libsqlite3-sys 0.39.1 SQLite provider**, while the existing libSQL Hrana client runs remote-only without linking libsql-ffi's separate SQLite 3.47 engine.
+- **A compatibility adapter preserves the existing LibsqlStore persistence API, including immediate transactions and remote HTTPS/Turso operations.** Cross-provider durability, full linked feature matrix, and authenticated disposable remote smoke tests are required before release.
+- **Removed historical RustSec audit ignore entries**, exposing the previously suppressed RUSTSEC-2026-0258 on the legacy Hyper 0.14/h2 0.3 remote-libSQL path; patched the independent h2 0.4 chain to 0.4.16. The legacy h2 dependency still needs secure remediation without disabling remote HTTPS. This draft is not approved for merge until the audit is clean, exact-head validation and independent security review are complete.
+
 ### Follow-up Wasmtime security maintenance (draft) — 2026-11-19
 - **Raise the Wasmtime 48.x minimum to 48.0.9, resolving to 48.0.10**, with matching internal Wasmtime/Cranelift/Pulley crates. This addresses RUSTSEC-2026-0566 through RUSTSEC-2026-0573 without changing SQLite providers or remote libSQL transport.
 - **Current RustSec audit remains red:** the updated exact-head lockfile has one finding, RUSTSEC-2026-0459 (`libsqlite3-sys 0.30.1`). The previous November 12 zero-vulnerability audit result below is historical and is not the current release status. Never bypass or ignore the remaining advisory.
