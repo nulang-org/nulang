@@ -10,6 +10,7 @@
 //!   nulang agent <init|run|chat|goals|graph>
 //!   nulang nula <new|build|build-wasm|test|run|add|remove|publish|deploy|watch|doc>
 //!   nulang fmt [--check] [<file>]
+//!   nulang machine <graph|paths|test> <file.nula> [options]
 //!
 //! Options:
 //!   -r, --repl               Start interactive REPL
@@ -175,6 +176,18 @@ fn main() {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
+    }
+
+    // Model-based state-machine inspection and executable tests.
+    if args[1] == "machine" {
+        match nulang::statechart_cli::run(&args[2..]) {
+            Ok(result) => print!("{}", result),
+            Err(message) => {
+                eprintln!("{}", message);
+                std::process::exit(1);
+            }
+        }
+        return;
     }
 
     // `nulang nula <cmd>` dispatches to the package manager.
@@ -1126,6 +1139,7 @@ fn print_help() {
     println!("       nulang --lsp");
     println!("       nulang --dap");
     println!("       nulang fmt [--check] [<file>]");
+    println!("       nulang machine <graph|paths|test> <file.nula> [options]");
     println!("       nulang node --listen <ADDR> [--seed <ADDR>] [--expected-nodes <N>]");
     println!("       nulang --doc");
     println!();
