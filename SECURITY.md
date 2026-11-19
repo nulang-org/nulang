@@ -39,6 +39,7 @@ Reports are particularly useful for:
 - VM/JIT/AOT memory-safety or type-confusion defects;
 - bytecode / `.nbc` validation bypasses;
 - actor isolation, authority/capability, or cross-node authentication bypasses;
+- cached remote-actor routes bypassing cluster membership/health checks;
 - package integrity, registry authentication, or source-hash verification bugs;
 - TLS/certificate-validation failures;
 - FFI sandbox/allowlist escapes;

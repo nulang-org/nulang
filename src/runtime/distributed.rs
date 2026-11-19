@@ -426,12 +426,35 @@ impl AddressResolver {
             return ResolveResult::Local { actor_id };
         }
 
-        // Periodic eviction sweep — every 100th remote resolve, clean stale entries.
+        // A cached actor address is only a lookup hint, not authority to
+        // contact a peer whose cluster membership was revoked. Validate
+        // liveness before the fast path and evict stale entries on failure.
+        match cluster.get_node(node_id) {
+            Some(info) if info.status == NodeStatus::Healthy => {}
+            Some(info) => {
+                self.remote_cache.remove_node(node_id);
+                self.stats.failed_resolves += 1;
+                return ResolveResult::Unresolvable {
+                    reason: format!(
+                        "node {:?} is not healthy (status: {:?})",
+                        node_id, info.status
+                    ),
+                };
+            }
+            None => {
+                self.remote_cache.remove_node(node_id);
+                self.stats.failed_resolves += 1;
+                return ResolveResult::Unresolvable {
+                    reason: format!("node {:?} is not known in the cluster", node_id),
+                };
+            }
+        }
+
+        // Periodic eviction sweep — every 100th successful remote resolve.
         if self.stats.remote_resolves % 100 == 0 {
             self.remote_cache.evict_stale();
         }
 
-        // Check the cache first.
         if self.remote_cache.get(node_id, actor_id).is_some() {
             self.stats.cache_hits += 1;
             self.stats.remote_resolves += 1;
@@ -439,32 +462,9 @@ impl AddressResolver {
         }
 
         self.stats.cache_misses += 1;
-
-        // Verify the node is in the cluster and healthy.
-        match cluster.get_node(node_id) {
-            Some(info) => {
-                if info.status != NodeStatus::Healthy {
-                    self.stats.failed_resolves += 1;
-                    return ResolveResult::Unresolvable {
-                        reason: format!(
-                            "node {:?} is not healthy (status: {:?})",
-                            node_id, info.status
-                        ),
-                    };
-                }
-
-                // Healthy node — cache the actor and return remote result.
-                self.remote_cache.put(node_id, actor_id);
-                self.stats.remote_resolves += 1;
-                ResolveResult::Remote { node_id, actor_id }
-            }
-            None => {
-                self.stats.failed_resolves += 1;
-                ResolveResult::Unresolvable {
-                    reason: format!("node {:?} is not known in the cluster", node_id),
-                }
-            }
-        }
+        self.remote_cache.put(node_id, actor_id);
+        self.stats.remote_resolves += 1;
+        ResolveResult::Remote { node_id, actor_id }
     }
 
     /// Record that we successfully sent to a remote actor.
@@ -3005,6 +3005,79 @@ mod tests {
         assert_eq!(resolver.stats().remote_resolves, 1);
         // Should be cached after resolution.
         assert!(resolver.cache_mut().get(peer_id, 55).is_some());
+    }
+
+    #[test]
+    fn test_resolver_cached_actor_never_bypasses_failed_peer_status() {
+        let mut cluster = make_cluster(9000);
+        let peer_id = add_peer(&mut cluster, 9001);
+        let local_id = NodeId::new(&addr(9000));
+        let mut resolver = AddressResolver::new(local_id);
+        let address = ActorAddress::remote(peer_id, 55);
+
+        // Cache a successful resolution while the peer is alive.
+        assert!(matches!(
+            resolver.resolve(&cluster, address),
+            ResolveResult::Remote { .. }
+        ));
+        assert!(resolver.cache_mut().get(peer_id, 55).is_some());
+
+        // A higher-incarnation failure announcement must revoke routing
+        // authority even when a hot cache entry survives.
+        cluster.merge_membership(vec![crate::runtime::cluster::NodeGossip {
+            node_id: peer_id,
+            address: addr(9001),
+            status: NodeStatus::Failed,
+            incarnation: 100,
+        }]);
+        assert_eq!(
+            cluster.get_node(peer_id).unwrap().status,
+            NodeStatus::Failed
+        );
+        assert!(
+            matches!(
+                resolver.resolve(&cluster, address),
+                ResolveResult::Unresolvable { .. }
+            ),
+            "a cached actor must not bypass failed peer status"
+        );
+        assert!(
+            resolver.cache_mut().get(peer_id, 55).is_none(),
+            "failed peer entries must be invalidated"
+        );
+
+        // A genuinely recovered member can be resolved and cached again.
+        cluster.merge_membership(vec![crate::runtime::cluster::NodeGossip {
+            node_id: peer_id,
+            address: addr(9001),
+            status: NodeStatus::Healthy,
+            incarnation: 101,
+        }]);
+        assert!(matches!(
+            resolver.resolve(&cluster, address),
+            ResolveResult::Remote { .. }
+        ));
+    }
+
+    #[test]
+    fn test_resolver_cached_actor_does_not_bypass_unknown_peer() {
+        let cluster = make_cluster(9000);
+        let local_id = NodeId::new(&addr(9000));
+        let mut resolver = AddressResolver::new(local_id);
+        let missing = NodeId(9999);
+        resolver.record_remote_send(missing, 55);
+        assert!(resolver.cache_mut().get(missing, 55).is_some());
+        assert!(
+            matches!(
+                resolver.resolve(&cluster, ActorAddress::remote(missing, 55)),
+                ResolveResult::Unresolvable { .. }
+            ),
+            "cached unknown peers must not be routable"
+        );
+        assert!(
+            resolver.cache_mut().get(missing, 55).is_none(),
+            "unknown peer cache entries must be invalidated"
+        );
     }
 
     // -- 8. Resolver: unresolvable (unknown node) --------------------------
