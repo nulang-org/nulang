@@ -4,7 +4,7 @@ members = ["crates/nulang-ai", "crates/nulang-ai-core", "crates/nulang-ai-protoc
 # and builds only for wasm32-unknown-unknown; it is intentionally standalone
 # (its own lockfile, minimal pure-Rust dep set) and excluded from workspace
 # builds/tests so `cargo test --workspace` is unaffected.
-exclude = ["crates/nulang-playground"]
+exclude = ["crates/nulang-playground", "vendor/libsql"]
 
 [package]
 name = "nulang"
@@ -254,3 +254,8 @@ rcgen = "0.14"
 [[bench]]
 name = "bench_main"
 harness = false
+
+# Security-only local patch of the published 0.10.0-pre.4 libSQL crate.
+# Its Hyper 0.14 http2 feature pulls vulnerable h2 0.3.x; keep HTTP/1.1 Hrana.
+[patch.crates-io]
+libsql = { path = "vendor/libsql" }
