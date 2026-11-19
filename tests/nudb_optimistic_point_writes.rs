@@ -335,3 +335,190 @@ fn independent_writes_from_many_threads_preserve_every_durable_result() {
         );
     }
 }
+
+#[test]
+fn retry_receipts_must_not_bypass_tablet_epoch_or_snapshot_fences() {
+    use nulang::database::tablet::MemoryTablet;
+
+    let fixture = TestWal::new();
+    let mut db = fixture.open();
+    let mutations = vec![put(b"k", b"original")];
+    let original = db
+        .prepare_optimistic_write(EPOCH, 0, vec![], mutations.clone())
+        .unwrap();
+    assert_eq!(
+        db.commit_optimistic_idempotent(id(100), original)
+            .unwrap()
+            .sequence(),
+        1
+    );
+
+    let wrong_descriptor = TabletDescriptor::new(
+        TabletId::new(708).unwrap(),
+        KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+        EPOCH,
+    )
+    .unwrap();
+    let wrong = MemoryTablet::new(wrong_descriptor)
+        .prepare_optimistic_write(EPOCH, 0, vec![], mutations.clone())
+        .unwrap();
+    assert_eq!(
+        db.commit_optimistic_idempotent(id(100), wrong).unwrap_err(),
+        WalBackedError::Tablet(TabletError::WrongTablet {
+            expected: TabletId::new(707).unwrap(),
+            presented: TabletId::new(708).unwrap(),
+        }),
+        "same ID and mutations cannot skip tablet routing validation"
+    );
+
+    let stale_descriptor = TabletDescriptor::new(
+        TabletId::new(707).unwrap(),
+        KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+        EPOCH - 1,
+    )
+    .unwrap();
+    let stale = MemoryTablet::new(stale_descriptor)
+        .prepare_optimistic_write(EPOCH - 1, 0, vec![], mutations.clone())
+        .unwrap();
+    assert_eq!(
+        db.commit_optimistic_idempotent(id(100), stale).unwrap_err(),
+        WalBackedError::Tablet(TabletError::StaleEpoch {
+            current: EPOCH,
+            presented: EPOCH - 1,
+        }),
+        "receipt reuse must not bypass the current owner epoch"
+    );
+
+    let mut ahead_tablet = MemoryTablet::new(descriptor());
+    for seq in 0..2 {
+        let write = ahead_tablet
+            .prepare_write(EPOCH, seq, vec![put(b"x", b"unrelated")])
+            .unwrap();
+        ahead_tablet.commit(write).unwrap();
+    }
+    let future = ahead_tablet
+        .prepare_optimistic_write(EPOCH, 2, vec![], mutations)
+        .unwrap();
+    assert_eq!(
+        db.commit_optimistic_idempotent(id(100), future)
+            .unwrap_err(),
+        WalBackedError::Tablet(TabletError::SnapshotAhead {
+            committed: 1,
+            requested: 2,
+        })
+    );
+    assert_eq!(db.current_sequence(), 1);
+    assert_eq!(db.read_latest(b"k"), Some(&b"original"[..]));
+}
+
+#[test]
+fn tracked_point_reads_prevent_write_skew_without_manual_read_keys() {
+    let fixture = TestWal::new();
+    let mut db = fixture.open();
+    db.commit_idempotent(id(101), vec![put(b"x", b"on"), put(b"y", b"on")])
+        .unwrap();
+
+    let mut first = db.begin_point_transaction();
+    let mut second = db.begin_point_transaction();
+    assert_eq!(
+        db.read_point(&mut first, b"x").unwrap(),
+        Some(b"on".to_vec())
+    );
+    assert_eq!(
+        db.read_point(&mut second, b"y").unwrap(),
+        Some(b"on".to_vec())
+    );
+    first.put(b"y".to_vec(), b"off".to_vec()).unwrap();
+    second.put(b"x".to_vec(), b"off".to_vec()).unwrap();
+
+    assert_eq!(
+        db.commit_point_transaction_idempotent(id(102), first)
+            .unwrap()
+            .sequence(),
+        2
+    );
+    assert!(matches!(
+        db.commit_point_transaction_idempotent(id(103), second),
+        Err(WalBackedError::Tablet(TabletError::OptimisticConflict {
+            key,
+            snapshot: 1,
+            committed: 2
+        })) if key == b"y"
+    ));
+    assert_eq!(db.read_latest(b"x"), Some(&b"on"[..]));
+    assert_eq!(db.read_latest(b"y"), Some(&b"off"[..]));
+}
+
+#[test]
+fn tracked_absent_reads_detect_creation_and_own_writes_are_visible() {
+    let fixture = TestWal::new();
+    let mut db = fixture.open();
+    let mut tx = db.begin_point_transaction();
+    assert_eq!(db.read_point(&mut tx, b"missing").unwrap(), None);
+    tx.put(b"x".to_vec(), b"one".to_vec()).unwrap();
+    assert_eq!(db.read_point(&mut tx, b"x").unwrap(), Some(b"one".to_vec()));
+    tx.delete(b"x".to_vec()).unwrap();
+    assert_eq!(db.read_point(&mut tx, b"x").unwrap(), None);
+    db.commit_idempotent(id(104), vec![put(b"missing", b"appeared")])
+        .unwrap();
+    assert!(matches!(
+        db.commit_point_transaction_idempotent(id(105), tx),
+        Err(WalBackedError::Tablet(TabletError::OptimisticConflict {
+            key, committed: 1, ..
+        })) if key == b"missing"
+    ));
+    assert_eq!(db.read_latest(b"x"), None);
+}
+
+#[test]
+fn tracked_point_txn_rejects_foreign_tablets_and_stale_writes() {
+    let fixture = TestWal::new();
+    let db = fixture.open();
+    let mut tx = db.begin_point_transaction();
+    assert_eq!(
+        db.read_point(&mut tx, b"z").unwrap_err(),
+        TabletError::KeyOutsideTabletRange
+    );
+    assert_eq!(db.current_sequence(), 0);
+
+    let foreign_descriptor = TabletDescriptor::new(
+        TabletId::new(708).unwrap(),
+        KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+        EPOCH,
+    )
+    .unwrap();
+    let foreign = nulang::database::tablet::MemoryTablet::new(foreign_descriptor);
+    assert_eq!(
+        tx.read(&foreign, b"k").unwrap_err(),
+        TabletError::WrongTablet {
+            expected: TabletId::new(708).unwrap(),
+            presented: TabletId::new(707).unwrap(),
+        }
+    );
+    assert_eq!(
+        tx.put(b"z".to_vec(), b"out-of-range".to_vec()).unwrap_err(),
+        TabletError::KeyOutsideTabletRange
+    );
+}
+
+#[test]
+fn tracked_read_set_deduplicates_keys_and_bounds_distinct_reads() {
+    use nulang::database::optimistic::MAX_POINT_READ_KEYS;
+
+    let fixture = TestWal::new();
+    let db = fixture.open();
+    let mut tx = db.begin_point_transaction();
+    for i in 0..MAX_POINT_READ_KEYS {
+        let key = format!("key_{i:04}");
+        assert_eq!(db.read_point(&mut tx, key.as_bytes()).unwrap(), None);
+    }
+    // A duplicate read does not exhaust a slot.
+    assert_eq!(db.read_point(&mut tx, b"key_0000").unwrap(), None);
+    assert_eq!(
+        db.read_point(&mut tx, b"key_extra").unwrap_err(),
+        TabletError::TooManyOptimisticReadKeys {
+            requested: MAX_POINT_READ_KEYS + 1,
+            limit: MAX_POINT_READ_KEYS,
+        }
+    );
+}

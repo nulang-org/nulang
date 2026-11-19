@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use super::backup::{self, BackupError, BackupReceipt};
 use super::checkpoint::{self, CheckpointError};
-use super::optimistic::OptimisticTabletWrite;
+use super::optimistic::{OptimisticTabletWrite, PointTransaction};
 use super::retention_store::{DurableRetentionRegistry, RegistryError};
 use super::tablet::{
     transaction_digest, MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite,
@@ -238,6 +238,33 @@ impl WalBackedTablet {
         )
     }
 
+    /// Start an automatically tracked point-key transaction at the current
+    /// snapshot. Point reads through `read_point` cannot be omitted from the
+    /// transaction's read set by accident.
+    pub fn begin_point_transaction(&self) -> PointTransaction {
+        self.tablet.begin_point_transaction()
+    }
+
+    /// Read one key through a tracked transaction at its original snapshot.
+    pub fn read_point(
+        &self,
+        tx: &mut PointTransaction,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, TabletError> {
+        tx.read(&self.tablet, key)
+    }
+
+    /// Commit a tracked point transaction with the same WAL receipts and
+    /// point-key conflict checks as the low-level optimistic API.
+    pub fn commit_point_transaction_idempotent(
+        &mut self,
+        id: TransactionId,
+        tx: PointTransaction,
+    ) -> Result<TransactionReceipt, WalBackedError> {
+        let prepared = tx.into_prepared(&self.tablet)?;
+        self.commit_optimistic_idempotent(id, prepared)
+    }
+
     /// Durably commit an identified point-key optimistic transaction.
     ///
     /// Existing matching receipts win over stale snapshot conflicts, enabling
@@ -249,6 +276,10 @@ impl WalBackedTablet {
         id: TransactionId,
         proposed: OptimisticTabletWrite,
     ) -> Result<TransactionReceipt, WalBackedError> {
+        // Even a replay-only receipt lookup must reject wrong tablet, stale
+        // ownership and future snapshots. Only *data conflicts* are bypassed
+        // when an identical durable transaction is retried after newer writes.
+        self.tablet.validate_optimistic_identity(&proposed)?;
         let digest = transaction_digest(proposed.mutations());
         if let Some(receipt) = self.tablet.transaction_receipt(id) {
             if receipt.digest() != digest {

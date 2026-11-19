@@ -5,6 +5,8 @@
 //! has changed since that snapshot. No predicate/range validation is provided.
 //! WAL ordering and durability remain the responsibility of WalBackedTablet.
 
+use std::collections::BTreeSet;
+
 use super::tablet::{
     MemoryTablet, TabletDescriptor, TabletError, TabletId, TabletMutation, TabletWrite,
 };
@@ -32,6 +34,107 @@ impl OptimisticTabletWrite {
     }
 }
 
+/// Snapshot-scoped point transaction that automatically records every
+/// database key read by `read`, including reads returning no value.
+///
+/// Mutable writes are staged locally and are visible to later reads in the
+/// same transaction; the writes are also conflict-checked at commit. Reads
+/// return owned bytes so callers cannot keep a mutable tablet borrow alive.
+/// This is not a range-query or phantom-safe transaction, and it does not
+/// currently acquire a MVCC GC snapshot pin.
+#[derive(Debug)]
+pub struct PointTransaction {
+    descriptor: TabletDescriptor,
+    snapshot_sequence: u64,
+    read_keys: BTreeSet<Vec<u8>>,
+    mutations: Vec<TabletMutation>,
+}
+
+impl PointTransaction {
+    pub fn snapshot_sequence(&self) -> u64 {
+        self.snapshot_sequence
+    }
+
+    fn validate_source(&self, tablet: &MemoryTablet) -> Result<(), TabletError> {
+        if self.descriptor.id() != tablet.descriptor().id() {
+            return Err(TabletError::WrongTablet {
+                expected: tablet.descriptor().id(),
+                presented: self.descriptor.id(),
+            });
+        }
+        validate_epoch(tablet.descriptor(), self.descriptor.ownership_epoch())?;
+        if self.snapshot_sequence > tablet.current_sequence() {
+            return Err(TabletError::SnapshotAhead {
+                committed: tablet.current_sequence(),
+                requested: self.snapshot_sequence,
+            });
+        }
+        Ok(())
+    }
+
+    /// Read at the transaction's original committed snapshot, recording the
+    /// key so later writes by another transaction cause commit rejection.
+    /// Staged writes take precedence and already belong to the write set.
+    pub fn read(
+        &mut self,
+        tablet: &MemoryTablet,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, TabletError> {
+        self.validate_source(tablet)?;
+        if !self.descriptor.range().contains(key) {
+            return Err(TabletError::KeyOutsideTabletRange);
+        }
+        if let Some(mutation) = self.mutations.iter().rev().find(|m| m.key() == key) {
+            return Ok(match mutation {
+                TabletMutation::Put { value, .. } => Some(value.clone()),
+                TabletMutation::Delete { .. } => None,
+            });
+        }
+        if !self.read_keys.contains(key) && self.read_keys.len() >= MAX_POINT_READ_KEYS {
+            return Err(TabletError::TooManyOptimisticReadKeys {
+                requested: self.read_keys.len() + 1,
+                limit: MAX_POINT_READ_KEYS,
+            });
+        }
+        let result = tablet.read_at(key, self.snapshot_sequence)?.map(Vec::from);
+        self.read_keys.insert(key.to_vec());
+        Ok(result)
+    }
+
+    /// Stage one write. The final mutation to a key wins within this
+    /// transaction; writes remain uncommitted until durable WAL admission.
+    pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), TabletError> {
+        if !self.descriptor.range().contains(&key) {
+            return Err(TabletError::KeyOutsideTabletRange);
+        }
+        self.mutations.push(TabletMutation::Put { key, value });
+        Ok(())
+    }
+
+    pub fn delete(&mut self, key: Vec<u8>) -> Result<(), TabletError> {
+        if !self.descriptor.range().contains(&key) {
+            return Err(TabletError::KeyOutsideTabletRange);
+        }
+        self.mutations.push(TabletMutation::Delete { key });
+        Ok(())
+    }
+
+    /// Admission does not reserve a tablet sequence; callers can prepare
+    /// independently and let the ordered WAL commit path detect conflicts.
+    pub(crate) fn into_prepared(
+        self,
+        tablet: &MemoryTablet,
+    ) -> Result<OptimisticTabletWrite, TabletError> {
+        self.validate_source(tablet)?;
+        tablet.prepare_optimistic_write(
+            self.descriptor.ownership_epoch(),
+            self.snapshot_sequence,
+            self.read_keys.into_iter().collect(),
+            self.mutations,
+        )
+    }
+}
+
 fn validate_epoch(descriptor: &TabletDescriptor, presented: u64) -> Result<(), TabletError> {
     let current = descriptor.ownership_epoch();
     if presented < current {
@@ -44,6 +147,16 @@ fn validate_epoch(descriptor: &TabletDescriptor, presented: u64) -> Result<(), T
 }
 
 impl MemoryTablet {
+    /// Begin a point-key transaction at the latest committed snapshot.
+    pub fn begin_point_transaction(&self) -> PointTransaction {
+        PointTransaction {
+            descriptor: self.descriptor().clone(),
+            snapshot_sequence: self.current_sequence(),
+            read_keys: BTreeSet::new(),
+            mutations: Vec::new(),
+        }
+    }
+
     /// Prepare against a committed snapshot without reserving a global tablet
     /// sequence. A later writer may commit before this transaction does.
     pub fn prepare_optimistic_write(
@@ -85,32 +198,52 @@ impl MemoryTablet {
         })
     }
 
+    /// Check routing/ownership/snapshot admission independently of read/write
+    /// conflict validation. A durable idempotent retry must recheck these
+    /// invariants even if its transaction ID already has a matching receipt.
+    pub(crate) fn validate_optimistic_identity(
+        &self,
+        proposed: &OptimisticTabletWrite,
+    ) -> Result<(), TabletError> {
+        if proposed.tablet_id != self.descriptor().id() {
+            return Err(TabletError::WrongTablet {
+                expected: self.descriptor().id(),
+                presented: proposed.tablet_id,
+            });
+        }
+        validate_epoch(self.descriptor(), proposed.ownership_epoch)?;
+        if proposed.snapshot_sequence > self.current_sequence() {
+            return Err(TabletError::SnapshotAhead {
+                committed: self.current_sequence(),
+                requested: proposed.snapshot_sequence,
+            });
+        }
+        let range = self.descriptor().range();
+        if proposed.read_keys.iter().any(|key| !range.contains(key))
+            || proposed
+                .mutations
+                .iter()
+                .any(|mutation| !range.contains(mutation.key()))
+        {
+            return Err(TabletError::KeyOutsideTabletRange);
+        }
+        Ok(())
+    }
+
     /// Revalidate a prepared point transaction and assign the next sequence.
     /// No state changes are made before a WAL writer durably accepts the result.
     pub(crate) fn rebase_optimistic_write(
         &self,
         proposed: OptimisticTabletWrite,
     ) -> Result<TabletWrite, TabletError> {
+        self.validate_optimistic_identity(&proposed)?;
         let OptimisticTabletWrite {
-            tablet_id,
+            tablet_id: _,
             ownership_epoch,
             snapshot_sequence,
             read_keys,
             mutations,
         } = proposed;
-        if tablet_id != self.descriptor().id() {
-            return Err(TabletError::WrongTablet {
-                expected: self.descriptor().id(),
-                presented: tablet_id,
-            });
-        }
-        validate_epoch(self.descriptor(), ownership_epoch)?;
-        if snapshot_sequence > self.current_sequence() {
-            return Err(TabletError::SnapshotAhead {
-                committed: self.current_sequence(),
-                requested: snapshot_sequence,
-            });
-        }
         let range = self.descriptor().range();
         for key in read_keys
             .iter()
