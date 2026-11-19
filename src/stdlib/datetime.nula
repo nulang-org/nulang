@@ -102,12 +102,13 @@ pub fn new(year: Int, month: Int, day: Int, hour: Int, minute: Int, second: Int)
     { year: year, month: month, day: day, hour: hour, minute: minute, second: second }
 }
 
-/// Check if a DateTime represents a valid calendar date.
-/// Does basic range validation on each field.
+/// Check Gregorian calendar validity, including leap-year month lengths.
+/// A DateTime record can still be constructed with invalid fields; use this
+/// predicate when accepting external input or validating an existing value.
 pub fn is_valid(dt: DateTime) -> Bool {
     dt.year >= 0 &&
     dt.month >= 1 && dt.month <= 12 &&
-    dt.day >= 1 && dt.day <= 31 &&
+    dt.day >= 1 && dt.day <= month_days(dt.month, is_leap(dt.year)) &&
     dt.hour >= 0 && dt.hour <= 23 &&
     dt.minute >= 0 && dt.minute <= 59 &&
     dt.second >= 0 && dt.second <= 59

@@ -71,4 +71,9 @@ fn main() {
 
   // ── stdlib re-exports ────────────────────────────────────────────────
   assert(is_valid(new(2024, 2, 29, 23, 59, 59)), "stdlib is_valid available")
+  assert(!is_valid(new(2023, 2, 29, 0, 0, 0)), "non-leap February 29 rejected")
+  assert(!is_valid(new(1900, 2, 29, 0, 0, 0)), "century without 400 divisor is not leap")
+  assert(is_valid(new(2000, 2, 29, 0, 0, 0)), "century with 400 divisor is leap")
+  assert(!is_valid(new(2024, 4, 31, 0, 0, 0)), "April 31 rejected")
+  assert(!is_valid(new(2024, 2, 30, 0, 0, 0)), "February 30 rejected")
 }
