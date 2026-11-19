@@ -22,6 +22,15 @@ pub enum CType {
     /// Raw host-pointer tags returned by C are rejected because the ABI cannot
     /// establish that they point into a live Nulang heap.
     Value,
+    // Native host-only exact-width ABI types; not yet language-level FfiType.
+    I8,
+    U8,
+    I16,
+    U16,
+    I32,
+    U32,
+    U64,
+    F32,
 }
 
 /// A C function signature for marshalling.
@@ -187,6 +196,39 @@ pub fn unit_to_value() -> Value {
 // libffi-based dynamic invocation (used when the `ffi` feature is enabled)
 // ---------------------------------------------------------------------------
 
+// Checked FFI scalar conversions: avoid silent C narrowing or truncating
+// Nulang's signed 48-bit integer payload on native returns.
+#[cfg(feature = "ffi")]
+fn checked_integer_argument<T: TryFrom<i64>>(v: &Value, ty: &str) -> Result<T, String> {
+    let n = value_to_i64(v)?;
+    T::try_from(n).map_err(|_| format!("integer {n} out of range for {ty}"))
+}
+
+#[cfg(feature = "ffi")]
+fn checked_f32_argument(v: &Value) -> Result<f32, String> {
+    let n = value_to_f64(v)?;
+    if n.is_finite() && n.abs() > f32::MAX as f64 {
+        return Err(format!("float {n} out of range for f32"));
+    }
+    Ok(n as f32)
+}
+
+fn checked_signed_return(n: i64) -> Result<Value, String> {
+    if !crate::value_layout::int48_in_range(n) {
+        return Err(format!(
+            "native integer {n} exceeds Nulang signed 48-bit range"
+        ));
+    }
+    Ok(Value::int(n))
+}
+
+#[cfg(feature = "ffi")]
+fn checked_unsigned_return(n: u64) -> Result<Value, String> {
+    let signed = i64::try_from(n)
+        .map_err(|_| format!("native integer {n} exceeds Nulang signed 48-bit range"))?;
+    checked_signed_return(signed)
+}
+
 #[cfg(feature = "ffi")]
 fn ctype_to_libffi(ty: &CType) -> libffi::middle::Type {
     use libffi::middle::Type;
@@ -198,6 +240,14 @@ fn ctype_to_libffi(ty: &CType) -> libffi::middle::Type {
         CType::VoidPtr => Type::pointer(),
         CType::Unit => Type::void(),
         CType::Value => Type::u64(),
+        CType::I8 => Type::i8(),
+        CType::U8 => Type::u8(),
+        CType::I16 => Type::i16(),
+        CType::U16 => Type::u16(),
+        CType::I32 => Type::i32(),
+        CType::U32 => Type::u32(),
+        CType::U64 => Type::u64(),
+        CType::F32 => Type::f32(),
     }
 }
 
@@ -227,6 +277,12 @@ pub unsafe fn call_native(func: &NativeFunction, args: &[Value]) -> Result<Value
     let mut u8_storage: Vec<u8> = Vec::new();
     let mut ptr_storage: Vec<*const c_void> = Vec::new();
     let mut u64_storage: Vec<u64> = Vec::new();
+    let mut i8_storage: Vec<i8> = Vec::new();
+    let mut i16_storage: Vec<i16> = Vec::new();
+    let mut u16_storage: Vec<u16> = Vec::new();
+    let mut i32_storage: Vec<i32> = Vec::new();
+    let mut u32_storage: Vec<u32> = Vec::new();
+    let mut f32_storage: Vec<f32> = Vec::new();
 
     let mut ffi_types: Vec<Type> = Vec::with_capacity(args.len());
     /// Tracks which storage vector holds each argument, so `ffi_args` can be
@@ -238,6 +294,12 @@ pub unsafe fn call_native(func: &NativeFunction, args: &[Value]) -> Result<Value
         U8(usize),
         Ptr(usize),
         U64(usize),
+        I8(usize),
+        I16(usize),
+        U16(usize),
+        I32(usize),
+        U32(usize),
+        F32(usize),
     }
     let mut arg_slots: Vec<ArgSlot> = Vec::with_capacity(args.len());
 
@@ -296,6 +358,70 @@ pub unsafe fn call_native(func: &NativeFunction, args: &[Value]) -> Result<Value
                 ffi_types.push(Type::u64());
                 arg_slots.push(ArgSlot::U64(u64_storage.len() - 1));
             }
+            CType::I8 => {
+                i8_storage.push(
+                    checked_integer_argument(val, "i8")
+                        .map_err(|e| format!("FFI argument {i} for {}: {e}", func.symbol))?,
+                );
+                ffi_types.push(Type::i8());
+                arg_slots.push(ArgSlot::I8(i8_storage.len() - 1));
+            }
+            CType::U8 => {
+                u8_storage.push(
+                    checked_integer_argument(val, "u8")
+                        .map_err(|e| format!("FFI argument {i} for {}: {e}", func.symbol))?,
+                );
+                ffi_types.push(Type::u8());
+                arg_slots.push(ArgSlot::U8(u8_storage.len() - 1));
+            }
+            CType::I16 => {
+                i16_storage.push(
+                    checked_integer_argument(val, "i16")
+                        .map_err(|e| format!("FFI argument {i} for {}: {e}", func.symbol))?,
+                );
+                ffi_types.push(Type::i16());
+                arg_slots.push(ArgSlot::I16(i16_storage.len() - 1));
+            }
+            CType::U16 => {
+                u16_storage.push(
+                    checked_integer_argument(val, "u16")
+                        .map_err(|e| format!("FFI argument {i} for {}: {e}", func.symbol))?,
+                );
+                ffi_types.push(Type::u16());
+                arg_slots.push(ArgSlot::U16(u16_storage.len() - 1));
+            }
+            CType::I32 => {
+                i32_storage.push(
+                    checked_integer_argument(val, "i32")
+                        .map_err(|e| format!("FFI argument {i} for {}: {e}", func.symbol))?,
+                );
+                ffi_types.push(Type::i32());
+                arg_slots.push(ArgSlot::I32(i32_storage.len() - 1));
+            }
+            CType::U32 => {
+                u32_storage.push(
+                    checked_integer_argument(val, "u32")
+                        .map_err(|e| format!("FFI argument {i} for {}: {e}", func.symbol))?,
+                );
+                ffi_types.push(Type::u32());
+                arg_slots.push(ArgSlot::U32(u32_storage.len() - 1));
+            }
+            CType::U64 => {
+                u64_storage.push(
+                    checked_integer_argument(val, "u64")
+                        .map_err(|e| format!("FFI argument {i} for {}: {e}", func.symbol))?,
+                );
+                ffi_types.push(Type::u64());
+                arg_slots.push(ArgSlot::U64(u64_storage.len() - 1));
+            }
+            CType::F32 => {
+                f32_storage.push(
+                    checked_f32_argument(val)
+                        .map_err(|e| format!("FFI argument {i} for {}: {e}", func.symbol))?,
+                );
+                ffi_types.push(Type::f32());
+                arg_slots.push(ArgSlot::F32(f32_storage.len() - 1));
+            }
         }
     }
 
@@ -307,6 +433,12 @@ pub unsafe fn call_native(func: &NativeFunction, args: &[Value]) -> Result<Value
             ArgSlot::U8(i) => ffi_args.push(arg(&u8_storage[i])),
             ArgSlot::Ptr(i) => ffi_args.push(arg(&ptr_storage[i])),
             ArgSlot::U64(i) => ffi_args.push(arg(&u64_storage[i])),
+            ArgSlot::I8(i) => ffi_args.push(arg(&i8_storage[i])),
+            ArgSlot::I16(i) => ffi_args.push(arg(&i16_storage[i])),
+            ArgSlot::U16(i) => ffi_args.push(arg(&u16_storage[i])),
+            ArgSlot::I32(i) => ffi_args.push(arg(&i32_storage[i])),
+            ArgSlot::U32(i) => ffi_args.push(arg(&u32_storage[i])),
+            ArgSlot::F32(i) => ffi_args.push(arg(&f32_storage[i])),
         }
     }
 
@@ -317,7 +449,7 @@ pub unsafe fn call_native(func: &NativeFunction, args: &[Value]) -> Result<Value
     match func.signature.ret {
         CType::I64 => {
             let r: i64 = unsafe { cif.call(code, &ffi_args) };
-            Ok(i64_to_value(r))
+            checked_signed_return(r)
         }
         CType::F64 => {
             let r: f64 = unsafe { cif.call(code, &ffi_args) };
@@ -345,6 +477,38 @@ pub unsafe fn call_native(func: &NativeFunction, args: &[Value]) -> Result<Value
             let r: u64 = unsafe { cif.call(code, &ffi_args) };
             opaque_c_value_to_value(r)
         }
+        CType::I8 => {
+            let r: i8 = unsafe { cif.call(code, &ffi_args) };
+            checked_signed_return(i64::from(r))
+        }
+        CType::U8 => {
+            let r: u8 = unsafe { cif.call(code, &ffi_args) };
+            checked_unsigned_return(u64::from(r))
+        }
+        CType::I16 => {
+            let r: i16 = unsafe { cif.call(code, &ffi_args) };
+            checked_signed_return(i64::from(r))
+        }
+        CType::U16 => {
+            let r: u16 = unsafe { cif.call(code, &ffi_args) };
+            checked_unsigned_return(u64::from(r))
+        }
+        CType::I32 => {
+            let r: i32 = unsafe { cif.call(code, &ffi_args) };
+            checked_signed_return(i64::from(r))
+        }
+        CType::U32 => {
+            let r: u32 = unsafe { cif.call(code, &ffi_args) };
+            checked_unsigned_return(u64::from(r))
+        }
+        CType::U64 => {
+            let r: u64 = unsafe { cif.call(code, &ffi_args) };
+            checked_unsigned_return(r)
+        }
+        CType::F32 => {
+            let r: f32 = unsafe { cif.call(code, &ffi_args) };
+            Ok(f64_to_value(f64::from(r)))
+        }
     }
 }
 
@@ -364,7 +528,7 @@ mod fixed_arity {
         /// Convert from a Nulang `Value` to this argument type.
         fn from_value(v: Value) -> Result<Self, String>;
         /// Convert this argument type to a Nulang `Value`.
-        fn to_value(self) -> Value;
+        fn to_value(self) -> Result<Value, String>;
     }
 
     impl CTypeArg for i64 {
@@ -372,8 +536,8 @@ mod fixed_arity {
         fn from_value(v: Value) -> Result<Self, String> {
             value_to_i64(&v)
         }
-        fn to_value(self) -> Value {
-            i64_to_value(self)
+        fn to_value(self) -> Result<Value, String> {
+            checked_signed_return(self)
         }
     }
     impl CTypeArg for f64 {
@@ -381,8 +545,8 @@ mod fixed_arity {
         fn from_value(v: Value) -> Result<Self, String> {
             value_to_f64(&v)
         }
-        fn to_value(self) -> Value {
-            f64_to_value(self)
+        fn to_value(self) -> Result<Value, String> {
+            Ok(f64_to_value(self))
         }
     }
     impl CTypeArg for bool {
@@ -390,8 +554,8 @@ mod fixed_arity {
         fn from_value(v: Value) -> Result<Self, String> {
             value_to_bool(&v)
         }
-        fn to_value(self) -> Value {
-            bool_to_value(self)
+        fn to_value(self) -> Result<Value, String> {
+            Ok(bool_to_value(self))
         }
     }
     impl CTypeArg for *const c_char {
@@ -400,8 +564,8 @@ mod fixed_arity {
             unsafe { value_to_cstr(&v) }
         }
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
-        fn to_value(self) -> Value {
-            unsafe { cstr_to_value(self) }
+        fn to_value(self) -> Result<Value, String> {
+            Ok(unsafe { cstr_to_value(self) })
         }
     }
     impl CTypeArg for *mut c_void {
@@ -409,8 +573,8 @@ mod fixed_arity {
         fn from_value(v: Value) -> Result<Self, String> {
             unsafe { value_to_voidptr(&v) }
         }
-        fn to_value(self) -> Value {
-            voidptr_to_value(self)
+        fn to_value(self) -> Result<Value, String> {
+            Ok(voidptr_to_value(self))
         }
     }
     impl CTypeArg for () {
@@ -418,8 +582,8 @@ mod fixed_arity {
         fn from_value(_v: Value) -> Result<Self, String> {
             Ok(())
         }
-        fn to_value(self) -> Value {
-            unit_to_value()
+        fn to_value(self) -> Result<Value, String> {
+            Ok(unit_to_value())
         }
     }
 
@@ -434,7 +598,7 @@ mod fixed_arity {
             match $ret {
                 $(CType::$r => {
                     let f: extern "C" fn() -> $rty = unsafe { std::mem::transmute($ptr) };
-                    Ok(<$rty as CTypeArg>::to_value(f()))
+                    <$rty as CTypeArg>::to_value(f())
                 },)*
                 _ => Err("unsupported native return type (Value requires the ffi feature)".to_string()),
             }
@@ -447,7 +611,7 @@ mod fixed_arity {
                     let f: extern "C" fn($pty) -> $rty = unsafe { std::mem::transmute($ptr) };
                     let mut __iter = $args.iter();
                     let __a0 = <$pty as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
-                    Ok(<$rty as CTypeArg>::to_value(f(__a0)))
+                    <$rty as CTypeArg>::to_value(f(__a0))
                 }},)*
                 _ => Err("unsupported native return type (Value requires the ffi feature)".to_string()),
             }
@@ -461,7 +625,7 @@ mod fixed_arity {
                     let mut __iter = $args.iter();
                     let __a0 = <$pty0 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
                     let __a1 = <$pty1 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
-                    Ok(<$rty as CTypeArg>::to_value(f(__a0, __a1)))
+                    <$rty as CTypeArg>::to_value(f(__a0, __a1))
                 }},)*
                 _ => Err("unsupported native return type (Value requires the ffi feature)".to_string()),
             }
@@ -476,7 +640,7 @@ mod fixed_arity {
                     let __a0 = <$pty0 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
                     let __a1 = <$pty1 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
                     let __a2 = <$pty2 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
-                    Ok(<$rty as CTypeArg>::to_value(f(__a0, __a1, __a2)))
+                    <$rty as CTypeArg>::to_value(f(__a0, __a1, __a2))
                 }},)*
                 _ => Err("unsupported native return type (Value requires the ffi feature)".to_string()),
             }
@@ -492,7 +656,7 @@ mod fixed_arity {
                     let __a1 = <$pty1 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
                     let __a2 = <$pty2 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
                     let __a3 = <$pty3 as CTypeArg>::from_value(__iter.next().copied().unwrap_or(Value::nil()))?;
-                    Ok(<$rty as CTypeArg>::to_value(f(__a0, __a1, __a2, __a3)))
+                    <$rty as CTypeArg>::to_value(f(__a0, __a1, __a2, __a3))
                 }},)*
                 _ => Err("unsupported native return type (Value requires the ffi feature)".to_string()),
             }
@@ -608,6 +772,143 @@ mod tests {
             library: None,
             symbol: "test".to_string(),
         }
+    }
+
+    // Regression contracts for exact C scalar widths. These tests must execute
+    // through libffi, not only exercise an argument-conversion helper.
+    #[cfg(feature = "ffi")]
+    extern "C" fn mirror_i8(x: i8) -> i8 {
+        x
+    }
+    #[cfg(feature = "ffi")]
+    extern "C" fn mirror_u8(x: u8) -> u8 {
+        x
+    }
+    #[cfg(feature = "ffi")]
+    extern "C" fn mirror_i16(x: i16) -> i16 {
+        x
+    }
+    #[cfg(feature = "ffi")]
+    extern "C" fn mirror_u16(x: u16) -> u16 {
+        x
+    }
+    #[cfg(feature = "ffi")]
+    extern "C" fn mirror_i32(x: i32) -> i32 {
+        x
+    }
+    #[cfg(feature = "ffi")]
+    extern "C" fn mirror_u32(x: u32) -> u32 {
+        x
+    }
+    #[cfg(feature = "ffi")]
+    extern "C" fn mirror_u64(x: u64) -> u64 {
+        x
+    }
+    #[cfg(feature = "ffi")]
+    extern "C" fn mirror_f32(x: f32) -> f32 {
+        x
+    }
+    #[cfg(feature = "ffi")]
+    extern "C" fn large_u64() -> u64 {
+        (1_u64 << 47) + 1
+    }
+    extern "C" fn large_i64() -> i64 {
+        1_i64 << 47
+    }
+
+    #[cfg(feature = "ffi")]
+    #[test]
+    fn graphics_ffi_fixed_width_scalars_roundtrip() {
+        let signed = [
+            (CType::I8, mirror_i8 as *const c_void, -128),
+            (CType::I16, mirror_i16 as *const c_void, -32_768),
+            (CType::I32, mirror_i32 as *const c_void, i32::MIN as i64),
+        ];
+        for (abi, ptr, value) in signed {
+            let f = make_func(ptr, Signature::new(vec![abi], abi));
+            let result = unsafe { call_native(&f, &[Value::int(value)]).unwrap() };
+            assert_eq!(result.as_int(), Some(value), "mismatched {abi:?}");
+        }
+        let unsigned = [
+            (CType::U8, mirror_u8 as *const c_void, u8::MAX as i64),
+            (CType::U16, mirror_u16 as *const c_void, u16::MAX as i64),
+            (CType::U32, mirror_u32 as *const c_void, u32::MAX as i64),
+            (CType::U64, mirror_u64 as *const c_void, 1_i64 << 40),
+        ];
+        for (abi, ptr, value) in unsigned {
+            let f = make_func(ptr, Signature::new(vec![abi], abi));
+            let result = unsafe { call_native(&f, &[Value::int(value)]).unwrap() };
+            assert_eq!(result.as_int(), Some(value), "mismatched {abi:?}");
+        }
+        let f = make_func(
+            mirror_f32 as *const c_void,
+            Signature::new(vec![CType::F32], CType::F32),
+        );
+        let result = unsafe { call_native(&f, &[Value::float(3.25)]).unwrap() };
+        assert_eq!(result.as_float(), Some(3.25));
+    }
+
+    #[cfg(feature = "ffi")]
+    #[test]
+    fn graphics_ffi_rejects_out_of_range_scalar_arguments() {
+        for (abi, ptr, value) in [
+            (CType::I8, mirror_i8 as *const c_void, -129),
+            (CType::I8, mirror_i8 as *const c_void, 128),
+            (CType::U8, mirror_u8 as *const c_void, -1),
+            (CType::U8, mirror_u8 as *const c_void, 256),
+            (CType::I16, mirror_i16 as *const c_void, 32_768),
+            (CType::U16, mirror_u16 as *const c_void, 65_536),
+            (CType::I32, mirror_i32 as *const c_void, 2_147_483_648),
+            (CType::U32, mirror_u32 as *const c_void, -1),
+            (CType::U64, mirror_u64 as *const c_void, -1),
+        ] {
+            let f = make_func(ptr, Signature::new(vec![abi], abi));
+            assert!(
+                unsafe { call_native(&f, &[Value::int(value)]) }.is_err(),
+                "{abi:?} must reject out-of-range input {value}"
+            );
+        }
+        let f = make_func(
+            mirror_f32 as *const c_void,
+            Signature::new(vec![CType::F32], CType::F32),
+        );
+        assert!(unsafe { call_native(&f, &[Value::float(1e100)]) }.is_err());
+    }
+
+    #[cfg(feature = "ffi")]
+    #[test]
+    fn graphics_ffi_rejects_integer_return_overflow_instead_of_truncating() {
+        let f = make_func(
+            large_u64 as *const c_void,
+            Signature::new(vec![], CType::U64),
+        );
+        assert!(unsafe { call_native(&f, &[]) }.is_err());
+        let f = make_func(
+            large_i64 as *const c_void,
+            Signature::new(vec![], CType::I64),
+        );
+        assert!(unsafe { call_native(&f, &[]) }.is_err());
+    }
+
+    #[cfg(not(feature = "ffi"))]
+    #[test]
+    fn graphics_ffi_fallback_rejects_unrepresentable_i64_return() {
+        let f = make_func(
+            large_i64 as *const c_void,
+            Signature::new(vec![], CType::I64),
+        );
+        assert!(unsafe { call_native(&f, &[]) }.is_err());
+    }
+
+    #[cfg(not(feature = "ffi"))]
+    #[test]
+    fn graphics_ffi_fixed_width_requires_libffi_feature() {
+        let f = make_func(
+            large_i64 as *const c_void,
+            Signature::new(vec![], CType::U32),
+        );
+        let error = unsafe { call_native(&f, &[]) }.unwrap_err();
+        assert!(error.contains("unsupported native return type"));
     }
 
     #[test]

@@ -1,4 +1,9 @@
 # Nulang Changelog
+
+### Experimental host FFI fixed-width C scalars — 2026-11-12
+- **Host-registered libffi signatures now support exact-width i8/u8/i16/u16/i32/u32/u64 and f32 scalars**, with checked conversions from Nulang values and no changes to source-language extern types, bytecode formats, or default dependencies.
+- **Reject silent integer narrowing**, including C integer returns beyond Nulang's signed 48-bit integer payload on libffi and the minimal no-libffi fallback. Numeric out-of-range tests exercise actual C function calls.
+- This is preparation for official optional graphics packages (issue #2642), not a complete graphics FFI or a verified GPU backend. See docs/FFI_GRAPHICS_ABI.md.
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
