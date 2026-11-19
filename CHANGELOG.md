@@ -1,4 +1,7 @@
 # Nulang Changelog
+
+### Canonical Option/Result combinators — 2026-11-10
+- **`stdlib::option` and `stdlib::result` use prelude-owned algebraic types.** Add `and_then`, `or_else`, `unwrap_or`, `unwrap_or_else`, Option `filter` and `ok_or`, and Result `map_err` and `to_option`. End-to-end conformance tests cover success, error, and fallback paths. Existing aborting `unwrap` is unchanged pending cross-backend panic parity.
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
