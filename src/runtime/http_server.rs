@@ -7,11 +7,11 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::bytecode::CodeModule;
@@ -829,9 +829,13 @@ fn invalid_ui_action_response(captured: &HttpRequestBindingInputs) -> Option<Htt
 /// Limits concurrently active development-server connections, including
 /// long-lived SSE streams. Lease release is automatic on worker exit or panic.
 /// This is capacity control, not an isolation boundary for untrusted code.
+#[derive(Debug)]
 struct ConnectionSlots {
     active: AtomicUsize,
     limit: usize,
+    next_socket_id: AtomicUsize,
+    active_sockets: Mutex<HashMap<usize, TcpStream>>,
+    drained: Condvar,
 }
 
 impl ConnectionSlots {
@@ -839,6 +843,9 @@ impl ConnectionSlots {
         Self {
             active: AtomicUsize::new(0),
             limit,
+            next_socket_id: AtomicUsize::new(0),
+            active_sockets: Mutex::new(HashMap::new()),
+            drained: Condvar::new(),
         }
     }
 
@@ -857,21 +864,69 @@ impl ConnectionSlots {
                 Ok(_) => {
                     return Some(ConnectionLease {
                         slots: Arc::clone(self),
+                        socket_id: None,
                     });
                 }
                 Err(observed) => current = observed,
             }
         }
     }
+
+    /// Retain a shutdown handle for each admitted connection. A cloned socket
+    /// can interrupt a worker blocked on an incomplete request or SSE write.
+    fn try_acquire_socket(
+        self: &Arc<Self>,
+        stream: &TcpStream,
+    ) -> std::io::Result<Option<ConnectionLease>> {
+        let Some(mut lease) = self.try_acquire() else {
+            return Ok(None);
+        };
+        let shutdown_handle = stream.try_clone()?;
+        let id = self.next_socket_id.fetch_add(1, Ordering::Relaxed);
+        self.active_sockets
+            .lock()
+            .unwrap()
+            .insert(id, shutdown_handle);
+        lease.socket_id = Some(id);
+        Ok(Some(lease))
+    }
+
+    fn interrupt_active(&self) {
+        let sockets = self.active_sockets.lock().unwrap();
+        for stream in sockets.values() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+
+    /// Once the accept loop has stopped, no new leases can be created. Wait
+    /// only for a bounded interval: non-cooperative user code may still run.
+    fn wait_for_drain(&self, timeout: Duration) -> bool {
+        let sockets = self.active_sockets.lock().unwrap();
+        let (_sockets, _) = self
+            .drained
+            .wait_timeout_while(sockets, timeout, |_| {
+                self.active.load(Ordering::Acquire) != 0
+            })
+            .unwrap();
+        self.active.load(Ordering::Acquire) == 0
+    }
 }
 
 struct ConnectionLease {
     slots: Arc<ConnectionSlots>,
+    socket_id: Option<usize>,
 }
 
 impl Drop for ConnectionLease {
     fn drop(&mut self) {
+        // Coordinate the transition to zero with the same mutex used by the
+        // drain waiter so it cannot miss a worker-exit notification.
+        let mut sockets = self.slots.active_sockets.lock().unwrap();
+        if let Some(id) = self.socket_id.take() {
+            sockets.remove(&id);
+        }
         self.slots.active.fetch_sub(1, Ordering::AcqRel);
+        self.slots.drained.notify_all();
     }
 }
 
@@ -881,14 +936,30 @@ impl Drop for ConnectionLease {
 pub struct WebDevServer {
     pub port: u16,
     shutdown_flag: Arc<AtomicBool>,
+    connection_slots: Arc<ConnectionSlots>,
     listener_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for WebDevServer {
     fn drop(&mut self) {
-        self.shutdown_flag.store(true, Ordering::Relaxed);
+        self.shutdown_flag.store(true, Ordering::Release);
         if let Some(handle) = self.listener_thread.take() {
             let _ = handle.join();
+        }
+        // Give in-flight requests a short opportunity to complete before
+        // interrupting idle reads and long-lived streams. The overall drain
+        // deadline remains bounded if user code does not cooperate.
+        if !self
+            .connection_slots
+            .wait_for_drain(Duration::from_millis(500))
+        {
+            self.connection_slots.interrupt_active();
+            if !self
+                .connection_slots
+                .wait_for_drain(Duration::from_millis(1500))
+            {
+                eprintln!("web dev server shutdown: connection workers exceeded drain deadline");
+            }
         }
     }
 }
@@ -925,6 +996,8 @@ impl WebDevServer {
         let actual_port = listener.local_addr()?.port();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
+        let connection_slots = Arc::new(ConnectionSlots::new(Self::MAX_CONCURRENT_CONNECTIONS));
+        let slots_for_listener = Arc::clone(&connection_slots);
         let routes_clone = routes;
         let static_dir_clone = static_dir.clone();
         let output_dir_clone = output_dir.clone();
@@ -938,12 +1011,14 @@ impl WebDevServer {
                     output_dir_clone,
                     routes_clone,
                     shutdown_clone,
+                    slots_for_listener,
                 );
             })?;
 
         Ok(WebDevServer {
             port: actual_port,
             shutdown_flag: shutdown,
+            connection_slots,
             listener_thread: Some(handle),
         })
     }
@@ -954,9 +1029,9 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
         shutdown: Arc<AtomicBool>,
+        slots: Arc<ConnectionSlots>,
     ) {
         listener.set_nonblocking(true).ok();
-        let slots = Arc::new(ConnectionSlots::new(Self::MAX_CONCURRENT_CONNECTIONS));
         // Route tables contain compiled modules; share them rather than
         // cloning the full vector for every incoming connection.
         let routes = Arc::new(routes);
@@ -966,20 +1041,27 @@ impl WebDevServer {
             }
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let Some(lease) = slots.try_acquire() else {
-                        let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
-                        HttpServerState::write_response(
-                            &mut stream,
-                            &HttpResponse {
-                                status: 503,
-                                headers: vec![
-                                    ("Content-Type".into(), "text/plain".into()),
-                                    ("Retry-After".into(), "1".into()),
-                                ],
-                                body: b"Server at connection capacity".to_vec(),
-                            },
-                        );
-                        continue;
+                    let lease = match slots.try_acquire_socket(&stream) {
+                        Ok(Some(lease)) => lease,
+                        Ok(None) => {
+                            let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+                            HttpServerState::write_response(
+                                &mut stream,
+                                &HttpResponse {
+                                    status: 503,
+                                    headers: vec![
+                                        ("Content-Type".into(), "text/plain".into()),
+                                        ("Retry-After".into(), "1".into()),
+                                    ],
+                                    body: b"Server at connection capacity".to_vec(),
+                                },
+                            );
+                            continue;
+                        }
+                        Err(error) => {
+                            eprintln!("failed to track web connection for shutdown: {error}");
+                            continue;
+                        }
                     };
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
                     let static_dir = static_dir.clone();
@@ -1359,6 +1441,32 @@ mod tests {
         let raw = b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nokGET / HTTP/1.1\r\n\r\n";
         let request = read_http_request(&mut chunks(raw, 128)).unwrap().unwrap();
         assert_eq!(request.body, b"ok");
+    }
+
+    #[test]
+    fn test_web_connection_slots_interrupt_sockets_and_wait_for_drain() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        let slots = Arc::new(ConnectionSlots::new(1));
+        let lease = slots
+            .try_acquire_socket(&accepted)
+            .unwrap()
+            .expect("one active socket");
+        assert!(slots.try_acquire_socket(&accepted).unwrap().is_none());
+
+        slots.interrupt_active();
+        let mut data = [0_u8; 1];
+        let read = peer.read(&mut data);
+        assert!(
+            matches!(read, Ok(0))
+                || matches!(read, Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset),
+            "registered sockets must be interrupted, got {read:?}"
+        );
+        assert!(!slots.wait_for_drain(Duration::from_millis(1)));
+        drop(lease);
+        assert!(slots.wait_for_drain(Duration::from_millis(1)));
     }
 
     #[test]
