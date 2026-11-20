@@ -51,6 +51,19 @@ Each JSONL row (schema 2) contains:
   run.
 - `warm_compile_delta.*`: additional compiler work performed during the warm
   run.
+- `modeled_break_even_total_runs`: diagnostic integer (or `null`) for the
+  first *total* invocation count where `first_run + (N - 1) * warm_run <= N *
+  interpreter_run`. The model is emitted only when the first run compiled
+  native code, the second run performed no further native compilation, and
+  warm JIT execution is faster than interpretation. A `null` value means
+  the model is unsupported or shows no sustained payoff; it does not mean
+  the real workload can never benefit from tiering.
+
+The break-even number extrapolates one warmed execution sample. It does **not**
+measure a scheduler policy, account for later promotions, memory/code-cache
+costs, or replace multi-run same-host A/B benchmarks. Do not change
+`HOT_THRESHOLD` or `TIER2_THRESHOLD` based on a single estimate.
+
 
 Compiler time measures only the interval around the native backend compile
 request. Region planning, interpreter warm-up, and generated-code execution

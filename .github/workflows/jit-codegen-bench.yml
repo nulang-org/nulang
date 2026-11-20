@@ -42,6 +42,13 @@ jobs:
             --features native-codegen \
             test_tier2_replaces_baseline_with_typed_code
 
+      - name: Test modeled JIT break-even regression
+        run: |
+          cargo test --locked --release \
+            --no-default-features \
+            --features native-codegen \
+            --bin nulang-jit-bench
+
       - name: Run JIT telemetry workloads
         env:
           REPEAT: "${{ github.event_name == 'pull_request' && '1' || inputs.repeat || '5' }}"
