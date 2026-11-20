@@ -315,6 +315,56 @@ impl BehaviorManifest {
         Ok(())
     }
 
+    /// Admit an executable replacement for a durable deployment.
+    ///
+    /// This is the deployment-facing counterpart to [`Self::validate_upgrade_from`].
+    /// It binds the incoming manifest to the exact artifact that will run before
+    /// checking durable-state compatibility, so a valid sidecar cannot be
+    /// reused to admit different executable bytes. Callers should persist the
+    /// returned record with their deployment decision.
+    ///
+    /// The current manifest schema identifies migration *topology*, rather than
+    /// migration-body semantics. A successful result therefore proves a
+    /// structurally compatible, artifact-bound upgrade; it does not replace
+    /// runtime migration execution and validation.
+    pub fn admit_upgrade_artifact_from(
+        &self,
+        previous: &BehaviorManifest,
+        incoming_artifact_bytes: &[u8],
+    ) -> Result<BehaviorUpgradeAdmission, BehaviorAdmissionError> {
+        self.verify_artifact_bytes(incoming_artifact_bytes)
+            .map_err(BehaviorAdmissionError::IncomingArtifactMismatch)?;
+        self.validate_upgrade_from(previous)?;
+
+        let previous_by_name: BTreeMap<_, _> = previous
+            .actors
+            .iter()
+            .map(|actor| (&actor.name, actor))
+            .collect();
+        let mut migrated_actors: Vec<_> = self
+            .actors
+            .iter()
+            .filter(|incoming| incoming.persistence.is_durable())
+            .filter_map(|incoming| {
+                let previous = previous_by_name.get(&incoming.name)?;
+                (previous.schema_version != incoming.schema_version).then(|| {
+                    BehaviorActorUpgrade {
+                        actor: incoming.name.clone(),
+                        from_schema_version: previous.schema_version,
+                        to_schema_version: incoming.schema_version,
+                    }
+                })
+            })
+            .collect();
+        migrated_actors.sort_by(|left, right| left.actor.cmp(&right.actor));
+
+        Ok(BehaviorUpgradeAdmission {
+            previous_artifact_digest: previous.artifact.digest.clone(),
+            incoming_artifact_digest: self.artifact.digest.clone(),
+            migrated_actors,
+        })
+    }
+
     fn normalize(&mut self) {
         self.artifact.flags.sort();
         self.artifact.flags.dedup();
@@ -433,6 +483,24 @@ impl BehaviorManifest {
         }
         Ok(())
     }
+}
+
+/// Stable evidence a control plane can record after admitting an upgrade.
+///
+/// Artifact digests name the previous deployment and the exact verified bytes
+/// of the incoming deployment. `migrated_actors` is sorted by actor name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BehaviorUpgradeAdmission {
+    pub previous_artifact_digest: String,
+    pub incoming_artifact_digest: String,
+    pub migrated_actors: Vec<BehaviorActorUpgrade>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BehaviorActorUpgrade {
+    pub actor: String,
+    pub from_schema_version: u32,
+    pub to_schema_version: u32,
 }
 
 fn parse_identity<T>(field: &'static str, value: &str) -> Result<T, BehaviorManifestError>
@@ -651,6 +719,7 @@ impl From<serde_json::Error> for BehaviorManifestError {
 pub enum BehaviorAdmissionError {
     InvalidPreviousManifest(BehaviorManifestError),
     InvalidIncomingManifest(BehaviorManifestError),
+    IncomingArtifactMismatch(BehaviorManifestError),
     PackageMismatch {
         previous: String,
         incoming: String,
@@ -695,6 +764,9 @@ impl fmt::Display for BehaviorAdmissionError {
             }
             Self::InvalidIncomingManifest(error) => {
                 write!(f, "incoming behavior manifest is invalid: {error}")
+            }
+            Self::IncomingArtifactMismatch(error) => {
+                write!(f, "incoming executable does not match its behavior manifest: {error}")
             }
             Self::PackageMismatch { previous, incoming } => write!(
                 f,
@@ -948,6 +1020,46 @@ mod tests {
         let previous = base_manifest(actor(1, b"schema-v1"));
         let incoming = base_manifest(actor(3, b"schema-v3"));
         incoming.validate_upgrade_from(&previous).unwrap();
+    }
+
+    #[test]
+    fn artifact_bound_upgrade_returns_a_deterministic_migration_record() {
+        let previous = base_manifest(actor(1, b"schema-v1"));
+        let incoming = base_manifest(actor(3, b"schema-v3"));
+
+        let admission = incoming
+            .admit_upgrade_artifact_from(&previous, b"artifact-bytes")
+            .unwrap();
+
+        assert_eq!(
+            admission.previous_artifact_digest,
+            previous.artifact.digest
+        );
+        assert_eq!(
+            admission.incoming_artifact_digest,
+            incoming.artifact.digest
+        );
+        assert_eq!(
+            admission.migrated_actors,
+            vec![BehaviorActorUpgrade {
+                actor: "payments::Account".to_string(),
+                from_schema_version: 1,
+                to_schema_version: 3,
+            }]
+        );
+    }
+
+    #[test]
+    fn artifact_bound_upgrade_rejects_bytes_not_described_by_the_sidecar() {
+        let previous = base_manifest(actor(1, b"schema-v1"));
+        let incoming = base_manifest(actor(2, b"schema-v2"));
+
+        assert!(matches!(
+            incoming.admit_upgrade_artifact_from(&previous, b"tampered-artifact"),
+            Err(BehaviorAdmissionError::IncomingArtifactMismatch(
+                BehaviorManifestError::ArtifactDigestMismatch { .. }
+            ))
+        ));
     }
 
     #[test]
