@@ -53,6 +53,16 @@ impl ModuleRegistry {
                 desugar_pass: None,
             },
         );
+        // Pure policy evaluation: import does not grant runtime authority or secrets.
+        modules.insert(
+            "@nulang/permissions".to_string(),
+            ModuleSpec {
+                capabilities: vec![],
+                cli_subcommands: vec![],
+                cloud_config_keys: vec![],
+                desugar_pass: None,
+            },
+        );
         modules.insert(
             "@nulang/postgres".to_string(),
             ModuleSpec {
@@ -149,6 +159,26 @@ mod tests {
         assert!(reg.get("@nulang/web").is_some());
         assert!(reg.get("@nulang/auth").is_some());
         assert!(reg.get("@nulang/postgres").is_some());
+    }
+
+    #[test]
+    fn test_permissions_module_registers_without_unverified_runtime_effects() {
+        let reg = ModuleRegistry::builtin();
+        let module = reg
+            .get("@nulang/permissions")
+            .expect("permissions module registered");
+        assert!(
+            module.capabilities.is_empty(),
+            "pure policies do not grant host authority"
+        );
+        assert!(
+            module.cloud_config_keys.is_empty(),
+            "policy evaluation needs no secrets"
+        );
+        assert_eq!(
+            ModuleRegistry::module_name_for_dep("nulang-permissions"),
+            Some("@nulang/permissions".to_string())
+        );
     }
 
     #[test]
