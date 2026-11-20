@@ -76,6 +76,8 @@ mod registry;
 pub mod resp;
 pub mod resp_cache;
 mod spawn;
+#[cfg(feature = "sqlite")]
+mod sqlite_compat;
 #[cfg(feature = "native-codegen")]
 pub(crate) use spawn::spawn_from_module_with_authority;
 mod timer;
