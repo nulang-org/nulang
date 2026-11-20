@@ -15,7 +15,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::bytecode::CodeModule;
 use crate::value_layout::PAYLOAD_MASK;
@@ -205,6 +205,52 @@ fn valid_http_authority(value: &str) -> bool {
                         | b';'
                 )
         })
+}
+
+/// Enforces a single elapsed-time budget across *all* socket reads needed to
+/// parse one HTTP request (headers and body). A per-read SO_RCVTIMEO alone is
+/// insufficient: a client sending one byte before each timeout can hold a
+/// worker indefinitely. The deadline covers reading, not handler execution.
+struct RequestDeadlineReader<'a> {
+    stream: &'a mut TcpStream,
+    deadline: Instant,
+}
+
+impl Read for RequestDeadlineReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "HTTP request read deadline exceeded",
+            ));
+        }
+
+        // Decrease the socket timeout before *every* read. Otherwise a read
+        // initiated just before the deadline could block for a full timeout.
+        self.stream.set_read_timeout(Some(remaining))?;
+        let n = self.stream.read(buf)?;
+        if Instant::now() >= self.deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "HTTP request read deadline exceeded",
+            ));
+        }
+        Ok(n)
+    }
+}
+
+fn read_tcp_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, HttpReadError> {
+    // Both listeners configure a nonzero read timeout before dispatch.
+    // Missing or unreadable configuration is an error, not an infinite budget.
+    let budget = stream
+        .read_timeout()
+        .map_err(|_| HttpReadError::BadRequest)?
+        .ok_or(HttpReadError::BadRequest)?;
+    read_http_request(&mut RequestDeadlineReader {
+        stream,
+        deadline: Instant::now() + budget,
+    })
 }
 
 /// Reads exactly one HTTP/1.x request. Both HTTP listeners use this same
@@ -534,7 +580,7 @@ impl HttpServerState {
         handler_module: &CodeModule,
         handler_func_idx: usize,
     ) {
-        let request = match read_http_request(&mut stream) {
+        let request = match read_tcp_http_request(&mut stream) {
             Ok(Some(request)) => request,
             Ok(None) => return,
             Err(error) => {
@@ -1237,7 +1283,8 @@ impl Drop for ConnectionLease {
 pub struct WebServerOptions {
     /// Maximum simultaneous connections, including long-lived SSE streams.
     pub max_concurrent_connections: usize,
-    /// Maximum time to wait for data on an individual connection.
+    /// Total time allowed to receive one HTTP request's headers and body.
+    /// The budget does not reset when more bytes arrive.
     pub read_timeout: Duration,
     /// Maximum time to block writing a response to a slow client.
     pub write_timeout: Duration,
@@ -1561,7 +1608,7 @@ impl WebDevServer {
         routes: Arc<Vec<RuntimeWebRoute>>,
         shutdown: Arc<AtomicBool>,
     ) {
-        let request = match read_http_request(&mut stream) {
+        let request = match read_tcp_http_request(&mut stream) {
             Ok(Some(request)) => request,
             Ok(None) => return,
             Err(error) => {
