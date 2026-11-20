@@ -17,3 +17,4 @@ pub mod lockfile;
 pub mod manifest;
 pub mod module_invalidation;
 pub mod resolver;
+pub mod resource;
