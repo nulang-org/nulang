@@ -470,4 +470,80 @@ fn utility() { route("/not-a-web-route", local_handler) }
         assert_eq!(compiled.routes[0].path, "/");
         assert_eq!(compiled.routes[0].handler.as_deref(), Some("home"));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_nulang_source_files() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "nulang-contract-symlink-file-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("outside")).unwrap();
+        let outside = root.join("outside/page.nula");
+        fs::write(
+            &outside,
+            r#"fn home() -> String { "ok" }
+               fn web_main() { perform Web.route("GET", "/", home) }"#,
+        )
+        .unwrap();
+        symlink(&outside, root.join("src/page.nula")).unwrap();
+
+        let report = compile_contracts_from_tree(&root.join("src"));
+        assert!(report.routes.is_empty(), "followed source file symlink");
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("symbolic link")),
+            "expected symlink diagnostic: {:?}",
+            report.diagnostics
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_source_directories() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "nulang-contract-symlink-dir-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("outside")).unwrap();
+        fs::write(
+            root.join("outside/page.nula"),
+            r#"fn home() -> String { "ok" }
+               fn web_main() { perform Web.route("GET", "/", home) }"#,
+        )
+        .unwrap();
+        symlink(root.join("outside"), root.join("src/linked")).unwrap();
+
+        let report = compile_contracts_from_tree(&root.join("src"));
+        assert!(
+            report.routes.is_empty(),
+            "followed source directory symlink"
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("symbolic link")),
+            "expected symlink diagnostic: {:?}",
+            report.diagnostics
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 }
