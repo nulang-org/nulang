@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Read-only Web Contract preflight and source traversal hardening — 2026-11-20
+- **Added `nulang web check [--json] [PACKAGE_DIR]`** to validate the compiler-owned Web Contract IR without executing handlers or starting a listener. Structured diagnostics and stable success/validation/usage exit statuses support CI and generator preflight checks.
+- **Web source discovery now rejects symbolic links** (including a linked `src` root) and surfaces directory-entry inspection failures rather than following or silently ignoring them. New regression cases pin this behavior. It does not protect against a concurrent filesystem swap and does not certify production HTTP security.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.

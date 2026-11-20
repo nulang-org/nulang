@@ -10,6 +10,7 @@
 //!   nulang agent <init|run|chat|goals|graph>
 //!   nulang nula <new|build|build-wasm|test|run|add|remove|publish|deploy|watch|doc>
 //!   nulang fmt [--check] [<file>]
+//!   nulang web check [--json] [PACKAGE_DIR]
 //!
 //! Options:
 //!   -r, --repl               Start interactive REPL
@@ -175,6 +176,38 @@ fn main() {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
+    }
+
+    // Read-only, compiler-owned Web Contract IR preflight. It must not
+    // start the experimental HTTP development host or execute user code.
+    if args[1] == "web" {
+        if args.get(2).map(String::as_str) != Some("check") {
+            eprintln!("Usage: nulang web check [--json] [PACKAGE_DIR]");
+            std::process::exit(2);
+        }
+        let options =
+            nulang::web::preflight::parse_check_args(&args[3..]).unwrap_or_else(|error| {
+                eprintln!("{error}\nUsage: nulang web check [--json] [PACKAGE_DIR]");
+                std::process::exit(2);
+            });
+        let report = nulang::web::preflight::check_web_package(&options.root);
+        if options.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report)
+                    .expect("WebCheckReport serialization is infallible")
+            );
+        } else if report.ok {
+            println!("Web contract check passed ({} routes)", report.route_count);
+        } else {
+            for diagnostic in &report.diagnostics {
+                eprintln!("web contract: {diagnostic}");
+            }
+        }
+        if !report.ok {
+            std::process::exit(1);
+        }
+        return;
     }
 
     // `nulang nula <cmd>` dispatches to the package manager.

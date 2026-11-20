@@ -76,23 +76,62 @@ fn collect_modules_recursive(
     modules: &mut Vec<AstModule>,
     diagnostics: &mut Vec<String>,
 ) {
-    if path.is_dir() {
-        let Ok(entries) = std::fs::read_dir(path) else {
+    // Never traverse symbolic links while deriving authoritative route metadata.
+    // In particular, a linked directory could recurse back into its ancestors.
+    // This is an admission check, not an atomic filesystem sandbox against a
+    // concurrent actor replacing source entries after inspection.
+    let file_type = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata.file_type(),
+        Err(error) => {
             diagnostics.push(format!(
-                "{}: failed to read source directory",
+                "{}: failed to inspect source entry: {error}",
                 path.display()
             ));
             return;
+        }
+    };
+    if file_type.is_symlink() {
+        diagnostics.push(format!(
+            "{}: symbolic link is not allowed in web source tree",
+            path.display()
+        ));
+        return;
+    }
+
+    if file_type.is_dir() {
+        let entries = match std::fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                diagnostics.push(format!(
+                    "{}: failed to read source directory: {error}",
+                    path.display()
+                ));
+                return;
+            }
         };
-        let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
-        entries.sort_by_key(|entry| entry.path());
+        // A failed directory entry must not disappear from validation.
+        let mut sorted_entries = Vec::new();
         for entry in entries {
+            match entry {
+                Ok(entry) => sorted_entries.push(entry),
+                Err(error) => diagnostics.push(format!(
+                    "{}: failed to list source directory entry: {error}",
+                    path.display()
+                )),
+            }
+        }
+        sorted_entries.sort_by_key(|entry| entry.path());
+        for entry in sorted_entries {
             collect_modules_recursive(&entry.path(), modules, diagnostics);
         }
         return;
     }
 
     if path.extension().and_then(|ext| ext.to_str()) != Some("nula") {
+        return;
+    }
+    if !file_type.is_file() {
+        diagnostics.push(format!("{}: unsupported source file type", path.display()));
         return;
     }
 
@@ -469,5 +508,81 @@ fn utility() { route("/not-a-web-route", local_handler) }
         assert_eq!(compiled.routes.len(), 1);
         assert_eq!(compiled.routes[0].path, "/");
         assert_eq!(compiled.routes[0].handler.as_deref(), Some("home"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_nulang_source_files() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "nulang-contract-symlink-file-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("outside")).unwrap();
+        let outside = root.join("outside/page.nula");
+        fs::write(
+            &outside,
+            r#"fn home() -> String { "ok" }
+               fn web_main() { perform Web.route("GET", "/", home) }"#,
+        )
+        .unwrap();
+        symlink(&outside, root.join("src/page.nula")).unwrap();
+
+        let report = compile_contracts_from_tree(&root.join("src"));
+        assert!(report.routes.is_empty(), "followed source file symlink");
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("symbolic link")),
+            "expected symlink diagnostic: {:?}",
+            report.diagnostics
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_source_directories() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "nulang-contract-symlink-dir-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("outside")).unwrap();
+        fs::write(
+            root.join("outside/page.nula"),
+            r#"fn home() -> String { "ok" }
+               fn web_main() { perform Web.route("GET", "/", home) }"#,
+        )
+        .unwrap();
+        symlink(root.join("outside"), root.join("src/linked")).unwrap();
+
+        let report = compile_contracts_from_tree(&root.join("src"));
+        assert!(
+            report.routes.is_empty(),
+            "followed source directory symlink"
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("symbolic link")),
+            "expected symlink diagnostic: {:?}",
+            report.diagnostics
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }
