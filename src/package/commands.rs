@@ -2190,6 +2190,24 @@ struct DeployResponse {
     status: String,
 }
 
+/// Reject the development-only KV session example during a production deploy,
+/// including a dry run. Local compilation remains available for experimentation.
+fn validate_deploy_security(root: &Path, manifest: &Manifest) -> NuResult<()> {
+    let demo_dependency = manifest
+        .dependencies
+        .keys()
+        .any(|name| name == "nulang-auth" || name == "@nulang/auth");
+    let demo_import = crate::web::ir::source_tree_uses_development_auth(&root.join("src"));
+
+    if demo_dependency || demo_import {
+        return Err(NuError::PackageError {
+            msg: "@nulang/auth is development-only: sequential session tokens and unverified login(user) cannot be deployed. Replace it with verified authentication and server-side authorization before deploying.".to_string(),
+            span: Span::default(),
+        });
+    }
+    Ok(())
+}
+
 /// `nula deploy [--wasm] [--url <url>] [--token <token>] [--adapter <kind>] [--dry-run]`
 /// — build and deploy the current package to Nulang Cloud or another adapter.
 #[cfg(feature = "ureq")]
@@ -2214,6 +2232,9 @@ fn cmd_deploy(
     })?;
     let name = manifest.package.name.clone();
     let version = manifest.package.version.clone();
+
+    // Bundled auth uses sequential KV session tokens and unverified login(user).
+    validate_deploy_security(&root, &manifest)?;
 
     // Build the web output so dist/ contains the IR and static assets.
     cmd_build_web()?;
@@ -2606,6 +2627,53 @@ fn cmd_remove(name: Option<&str>) -> NuResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_deploy_rejects_development_auth_import_and_dependency() {
+        let dir =
+            std::env::temp_dir().join(format!("nulang_dev_auth_deploy_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        scaffold_package(&dir, "demo-auth", "web").expect("web scaffold");
+        let manifest = Manifest::load(&dir).unwrap();
+        assert!(validate_deploy_security(&dir, &manifest).is_ok());
+
+        let main = dir.join("src/main.nula");
+        let original = std::fs::read_to_string(&main).unwrap();
+        std::fs::write(&main, format!("import @nulang/auth\n{original}")).unwrap();
+        let err = validate_deploy_security(&dir, &manifest)
+            .expect_err("deploy must reject demo auth regardless of configured cloud secrets");
+        assert!(err.to_string().contains("development-only"));
+        // The actual deploy command must refuse before compiling or sending
+        // artifacts, including dry-run previews.
+        #[cfg(feature = "ureq")]
+        {
+            let _guard = ChangeDir::new(&dir);
+            let result = cmd_deploy(
+                false,
+                None,
+                None,
+                crate::web::adapters::AdapterKind::NulangCloud,
+                true,
+            );
+            assert!(result.unwrap_err().to_string().contains("development-only"));
+        }
+        std::fs::write(&main, original).unwrap();
+
+        let path = dir.join("Nulang.toml");
+        let source = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            source.replacen(
+                "[dependencies]\n",
+                "[dependencies]\nnulang-auth = \"0.1.0\"\n",
+                1,
+            ),
+        )
+        .unwrap();
+        let manifest = Manifest::load(&dir).unwrap();
+        assert!(validate_deploy_security(&dir, &manifest).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_manifest_language_pin() {
