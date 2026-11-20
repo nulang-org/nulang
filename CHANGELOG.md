@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Bounded local SQLite result materialization (draft) — 2026-11-20
+- **Fail closed when an eager local SQLite query would buffer more than 100,000 rows or an estimated 64 MiB of row/value storage.** Reject the query with a pagination hint rather than returning a truncated result or retaining an unbounded in-memory buffer. Text/blob byte lengths are checked before cloning each cell.
+- The limit affects only local SQLite in the security integration adapter; remote Turso/Hrana and downstream JSON serialization have separate memory behavior. Existing large-result callers must paginate. Exact-head testing and review are required before release.
+
 ### Single patched SQLite engine with preserved remote HTTPS (draft) — 2026-11-19
 - **The local actor store and AI-local runtime now use the same bundled rusqlite 0.41.1 / libsqlite3-sys 0.39.1 SQLite provider**, while the existing libSQL Hrana client runs remote-only without linking libsql-ffi's separate SQLite 3.47 engine.
 - **A compatibility adapter preserves the existing LibsqlStore persistence API, including immediate transactions and remote HTTPS/Turso operations.** Cross-provider durability, full linked feature matrix, and authenticated disposable remote smoke tests are required before release.

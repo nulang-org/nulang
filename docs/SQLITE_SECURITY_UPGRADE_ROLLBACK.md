@@ -99,3 +99,15 @@ candidate unless independently proven otherwise.
 **Stop-ship:** Until old-store upgrade/reopen/rollback evidence and the
 authenticated disposable remote suite are recorded, this document is a
 runbook proposal—not a statement that production database migration is safe.
+
+## Local query result memory budget (candidate)
+
+The compatibility adapter buffers local SQLite query rows before exposing them
+as a `Rows` iterator. To prevent an unbounded buffer, the candidate rejects
+queries that would exceed **100,000 buffered rows** or approximately **64 MiB
+of estimated in-memory row/value storage**, returning an error with a pagination
+hint instead of silently truncating results. Text/blob bytes are measured before
+copying a cell into the buffer. This is not a strict process RSS limit: SQLite
+internal allocations and downstream JSON output may use additional memory.
+Callers that legitimately need large result sets must use keyset pagination or
+bounded `LIMIT` queries. This budget does not yet cover remote Turso queries.

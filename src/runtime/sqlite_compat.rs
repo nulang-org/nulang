@@ -209,18 +209,75 @@ fn local_query(conn: &rusqlite::Connection, sql: &str, params: Params) -> Result
     Ok(collected)
 }
 
+// The compatibility adapter buffers local rows before returning them.
+// Bound that buffer so a query cannot silently consume unbounded memory.
+// These are safety budgets, not a claim of a strict process RSS ceiling:
+// SQLite itself and downstream JSON serialization allocate separately.
+const MAX_LOCAL_QUERY_ROWS: usize = 100_000;
+const MAX_LOCAL_QUERY_BUFFERED_BYTES: usize = 64 * 1024 * 1024;
+
 fn collect_rows<P: rusqlite::Params>(
     stmt: &mut rusqlite::Statement<'_>,
     params: P,
     width: usize,
     dest: &mut VecDeque<Row>,
 ) -> Result<()> {
+    collect_rows_with_limits(
+        stmt,
+        params,
+        width,
+        dest,
+        MAX_LOCAL_QUERY_ROWS,
+        MAX_LOCAL_QUERY_BUFFERED_BYTES,
+    )
+}
+
+fn collect_rows_with_limits<P: rusqlite::Params>(
+    stmt: &mut rusqlite::Statement<'_>,
+    params: P,
+    width: usize,
+    dest: &mut VecDeque<Row>,
+    max_rows: usize,
+    max_buffered_bytes: usize,
+) -> Result<()> {
+    let mut buffered_bytes = 0usize;
+    let per_row_metadata = std::mem::size_of::<Row>()
+        .saturating_add(width.saturating_mul(std::mem::size_of::<Value>()));
     let mut rows = stmt.query(params).map_err(|e| e.to_string())?;
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        let cells = (0..width)
-            .map(|index| row.get::<_, rusqlite::types::Value>(index).map(from_local))
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|e| e.to_string())?;
+        if dest.len() >= max_rows {
+            return Err(format!(
+                "local SQLite query exceeds {max_rows}-row budget; paginate the result"
+            ));
+        }
+        buffered_bytes = buffered_bytes.saturating_add(per_row_metadata);
+        if buffered_bytes > max_buffered_bytes {
+            return Err(format!(
+                "local SQLite query exceeds {max_buffered_bytes}-byte buffer budget; paginate the result"
+            ));
+        }
+        let mut cells = Vec::with_capacity(width);
+        for index in 0..width {
+            // Inspect SQLite's borrowed cell before cloning text/blob bytes.
+            let value = row.get_ref(index).map_err(|e| e.to_string())?;
+            let payload_bytes = match value {
+                rusqlite::types::ValueRef::Text(bytes) | rusqlite::types::ValueRef::Blob(bytes) => {
+                    bytes.len()
+                }
+                _ => 0,
+            };
+            buffered_bytes = buffered_bytes.saturating_add(payload_bytes);
+            if buffered_bytes > max_buffered_bytes {
+                return Err(format!(
+                    "local SQLite query exceeds {max_buffered_bytes}-byte buffer budget; paginate the result"
+                ));
+            }
+            cells.push(
+                row.get::<_, rusqlite::types::Value>(index)
+                    .map(from_local)
+                    .map_err(|e| e.to_string())?,
+            );
+        }
         dest.push_back(Row { cells });
     }
     Ok(())
@@ -297,5 +354,65 @@ impl Row {
 
     pub fn get<T: FromCell>(&self, index: usize) -> Result<T> {
         T::from_cell(self.get_value(index)?)
+    }
+}
+
+#[cfg(test)]
+mod local_query_budget_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unbounded_local_result_before_materializing_every_row() {
+        let conn = rusqlite::Connection::open_in_memory().expect("fixture connection");
+        let sql = "WITH RECURSIVE counter(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM counter WHERE n < 100001) SELECT n FROM counter";
+        let result = local_query(&conn, sql, Params::None);
+        assert!(
+            result.is_err(),
+            "local queries must fail closed once buffered results exceed the documented 100000-row budget"
+        );
+    }
+
+    #[test]
+    fn rejects_excess_text_bytes_before_cloning_into_buffer() {
+        let conn = rusqlite::Connection::open_in_memory().expect("fixture connection");
+        let mut stmt = conn.prepare("SELECT '0123456789'").expect("query");
+        let width = stmt.column_count();
+        let overhead = std::mem::size_of::<Row>() + std::mem::size_of::<Value>();
+        let mut dest = VecDeque::new();
+        let error = collect_rows_with_limits(&mut stmt, (), width, &mut dest, 10, overhead + 9)
+            .expect_err("10 bytes of text must exceed a 9-byte payload allowance");
+        assert!(error.contains("byte buffer budget"), "{error}");
+        assert!(dest.is_empty(), "no oversized row may enter the buffer");
+    }
+
+    #[test]
+    fn accepts_exact_byte_budget_without_truncating_text() {
+        let conn = rusqlite::Connection::open_in_memory().expect("fixture connection");
+        let mut stmt = conn.prepare("SELECT '0123456789'").expect("query");
+        let width = stmt.column_count();
+        let overhead = std::mem::size_of::<Row>() + std::mem::size_of::<Value>();
+        let mut dest = VecDeque::new();
+        collect_rows_with_limits(&mut stmt, (), width, &mut dest, 10, overhead + 10)
+            .expect("exact budget is allowed");
+        assert_eq!(dest.len(), 1);
+        assert_eq!(
+            dest.pop_front().unwrap().get::<String>(0).unwrap(),
+            "0123456789"
+        );
+    }
+
+    #[test]
+    fn small_local_result_keeps_complete_ordered_rows() {
+        let conn = rusqlite::Connection::open_in_memory().expect("fixture connection");
+        let mut rows = local_query(
+            &conn,
+            "SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3",
+            Params::None,
+        )
+        .expect("small results must succeed");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.pop_front().unwrap().get::<i64>(0).unwrap(), 1);
+        assert_eq!(rows.pop_front().unwrap().get::<i64>(0).unwrap(), 2);
+        assert_eq!(rows.pop_front().unwrap().get::<i64>(0).unwrap(), 3);
     }
 }
