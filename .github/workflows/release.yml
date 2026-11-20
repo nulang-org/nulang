@@ -75,7 +75,11 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: nulang-linux-x86_64
-          - os: ubuntu-latest
+          # ubuntu-latest is migrating to 26.04; its cross-architecture
+          # dependency resolver currently attempts prohibited package
+          # downgrades when installing libssl-dev:arm64. Keep the Linux
+          # cross build on the previous supported LTS until validated.
+          - os: ubuntu-24.04
             target: aarch64-unknown-linux-gnu
             artifact: nulang-linux-aarch64
           - os: macos-latest
