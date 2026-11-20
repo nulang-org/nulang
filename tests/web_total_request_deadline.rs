@@ -53,3 +53,26 @@ fn incomplete_body_trickle_is_rejected_with_total_request_deadline() {
         "{response}"
     );
 }
+
+#[test]
+fn complete_request_within_budget_still_dispatches_normally() {
+    let options = WebServerOptions {
+        read_timeout: Duration::from_secs(1),
+        write_timeout: Duration::from_secs(1),
+        ..WebServerOptions::default()
+    };
+    let server = WebDevServer::bind_runtime_with_options(0, None, None, vec![], options)
+        .expect("bind development HTTP listener");
+    let mut socket = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    socket
+        .write_all(b"GET /missing HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    socket.shutdown(Shutdown::Write).unwrap();
+    let mut response = Vec::new();
+    socket.read_to_end(&mut response).unwrap();
+    let response = String::from_utf8(response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 404 Not Found"), "{response}");
+}
