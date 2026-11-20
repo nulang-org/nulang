@@ -137,6 +137,35 @@ mod tests {
         assert!(report.diagnostics[0].contains("source directory"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn preflight_rejects_symlinked_source_roots() {
+        use std::os::unix::fs::symlink;
+
+        let (root, _cleanup) = fixture(
+            r#"
+            fn home() -> String { "hello" }
+            fn web_main() { perform Web.route("GET", "/", home) }
+        "#,
+        );
+        let aliased = root.with_extension("aliased");
+        fs::create_dir(&aliased).unwrap();
+        symlink(root.join("src"), aliased.join("src")).unwrap();
+
+        let report = check_web_package(&aliased);
+        assert!(!report.ok);
+        assert_eq!(report.route_count, 0);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("symbolic link")),
+            "expected symlink diagnostic: {:?}",
+            report.diagnostics
+        );
+        fs::remove_dir_all(aliased).unwrap();
+    }
+
     #[test]
     fn cli_rejects_ambiguous_arguments() {
         assert!(parse_check_args(&["--json".into(), "project".into()]).is_ok());

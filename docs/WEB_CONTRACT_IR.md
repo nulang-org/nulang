@@ -270,6 +270,10 @@ Human-readable output reports the validated route count or diagnostics.
 and a deterministically sorted, deduplicated `diagnostics` array.
 Exit statuses are `0` for valid contracts, `1` for validation failures
 (including a missing source directory), and `2` for invalid CLI arguments.
+Source discovery rejects symbolic links in the `src/` tree (including its
+root), unreadable entries, and unsupported source file types rather than
+following paths outside the package or silently omitting them. This inspection
+does not provide atomic protection against concurrent filesystem mutation.
 The JSON is intended for CI and coding agents; consumers should inspect the
 exit code and `ok` field rather than requiring particular diagnostic prose.
 
