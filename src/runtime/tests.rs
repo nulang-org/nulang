@@ -2559,6 +2559,37 @@ fn test_libsql_store_crdt_snapshot_roundtrip() {
 
 #[cfg(feature = "sqlite")]
 #[test]
+fn test_libsql_store_rejects_incompatible_snapshot_view_before_accepting_writes() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "nulang-snapshot-schema-fail-closed-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create disposable directory");
+    let path = dir.join("legacy.db");
+    {
+        let db = rusqlite::Connection::open(&path).expect("create fixture");
+        db.execute("CREATE VIEW snapshots AS SELECT 1 AS actor_id", [])
+            .expect("create incompatible legacy object");
+    }
+    // The former migration swallowed every failed ALTER TABLE statement,
+    // returning a live actor store whose snapshots table was actually a view.
+    let error = LibsqlStore::new(&path)
+        .err()
+        .expect("startup must fail when a required snapshot column cannot be added");
+    assert!(
+        error.to_string().contains("snapshots"),
+        "identify the failing table without accepting a broken store: {error}"
+    );
+    std::fs::remove_dir_all(&dir).expect("clean up disposable fixture");
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
 fn test_libsql_store_migrates_old_schema_crdt_column() {
     let path =
         std::env::temp_dir().join(format!("nulang_libsql_migrate_{}.db", std::process::id()));
