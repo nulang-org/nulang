@@ -1,0 +1,66 @@
+// @nulang/permissions — pure, deny-by-default tenant-scoped RBAC evaluator.
+//
+// This module does NOT authenticate users or establish tenant membership.
+// Only pass trusted, request-scoped role assignments obtained from a verified
+// identity/session resolver; never accept grants or resource tenant IDs from
+// untrusted clients. Enforce the decision before any protected side effect.
+//
+// Rules match exactly. No implicit "*" wildcard or role inheritance.
+// An explicit deny takes precedence over every allow, including across roles.
+
+/// Construct a role assignment sourced from an authoritative membership store.
+pub fn role_assignment(tenant_id: String, subject_id: String, role: String) {
+    { tenant_id: tenant_id, subject_id: subject_id, role: role }
+}
+
+/// Construct one tenant-scoped authorization rule.
+/// Effect must be "allow" or "deny"; anything else is treated as a deny.
+pub fn permission_rule(
+    tenant_id: String,
+    role: String,
+    resource: String,
+    action: String,
+    outcome: String
+) {
+    { tenant_id: tenant_id, role: role, resource: resource, action: action, outcome: outcome }
+}
+
+/// Pure policy decision. No role, missing policy, or missing identity => deny.
+/// resource_tenant_id must come from the loaded object, not a request parameter.
+pub fn is_allowed(
+    tenant_id: String,
+    subject_id: String,
+    resource_tenant_id: String,
+    resource: String,
+    action: String,
+    assignments,
+    rules
+) -> Bool {
+    if tenant_id == "" || subject_id == "" || resource_tenant_id == ""
+        || resource == "" || action == "" || tenant_id != resource_tenant_id then {
+        false
+    } else {
+        var allowed = false;
+        var denied = false;
+        for membership in assignments {
+            if membership.tenant_id == tenant_id
+                && membership.subject_id == subject_id
+                && membership.role != "" then {
+                for rule in rules {
+                    if rule.tenant_id == tenant_id
+                        && rule.role == membership.role
+                        && rule.resource == resource
+                        && rule.action == action then {
+                        if rule.outcome == "allow" then {
+                            allowed = true
+                        } else {
+                            // "deny" and malformed/unknown effects both deny.
+                            denied = true
+                        }
+                    } else {}
+                }
+            } else {}
+        };
+        allowed && !denied
+    }
+}

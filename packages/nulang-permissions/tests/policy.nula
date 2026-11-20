@@ -1,0 +1,52 @@
+// Security contract: exact-match, tenant-isolated, deny-by-default RBAC.
+import lib
+import stdlib::test
+
+fn main() {
+  let alice = [
+    role_assignment("tenant-a", "alice", "reader"),
+    role_assignment("tenant-a", "alice", "editor")
+  ];
+  let rules = [
+    permission_rule("tenant-a", "reader", "document", "read", "allow"),
+    permission_rule("tenant-a", "editor", "document", "write", "allow")
+  ];
+  assert(is_allowed("tenant-a", "alice", "tenant-a", "document", "read", alice, rules), "reader may read own tenant document");
+  assert(is_allowed("tenant-a", "alice", "tenant-a", "document", "write", alice, rules), "editor may write own tenant document");
+  assert(!is_allowed("tenant-a", "alice", "tenant-b", "document", "read", alice, rules), "no cross-tenant object access");
+  assert(!is_allowed("tenant-b", "alice", "tenant-b", "document", "read", alice, rules), "no cross-tenant grant reuse");
+  assert(!is_allowed("tenant-a", "bob", "tenant-a", "document", "read", alice, rules), "no subject impersonation");
+  assert(!is_allowed("tenant-a", "alice", "tenant-a", "secret", "read", alice, rules), "no unrelated resource");
+  assert(!is_allowed("tenant-a", "alice", "tenant-a", "document", "delete", alice, rules), "no unrelated action");
+  assert(!is_allowed("tenant-a", "alice", "tenant-a", "document", "read", [], rules), "no roles means deny");
+  assert(!is_allowed("tenant-a", "alice", "tenant-a", "document", "read", alice, []), "no policy means deny");
+  assert(!is_allowed("", "alice", "", "document", "read", alice, rules), "empty tenant denied");
+  assert(!is_allowed("tenant-a", "", "tenant-a", "document", "read", alice, rules), "empty subject denied");
+  assert(!is_allowed("tenant-a", "alice", "tenant-a", "", "read", alice, rules), "empty resource denied");
+  assert(!is_allowed("tenant-a", "alice", "tenant-a", "document", "", alice, rules), "empty action denied");
+  let denied = [
+    permission_rule("tenant-a", "reader", "document", "read", "allow"),
+    permission_rule("tenant-a", "editor", "document", "read", "deny")
+  ];
+  assert(!is_allowed("tenant-a", "alice", "tenant-a", "document", "read", alice, denied), "explicit deny overrides allow across roles");
+  let invalid_effect = [permission_rule("tenant-a", "reader", "document", "read", "unknown")];
+  assert(!is_allowed("tenant-a", "alice", "tenant-a", "document", "read", alice, invalid_effect), "unknown effect fails closed");
+  let foreign_rules = [permission_rule("tenant-b", "reader", "document", "read", "allow")];
+  assert(!is_allowed("tenant-a", "alice", "tenant-a", "document", "read", alice, foreign_rules), "no cross-tenant rule reuse");
+  let wildcards = [permission_rule("tenant-a", "reader", "*", "read", "allow")];
+  assert(!is_allowed("tenant-a", "alice", "tenant-a", "document", "read", alice, wildcards), "no implicit wildcard escalation");
+  let revoked_roles = [role_assignment("tenant-a", "bob", "reader")];
+  assert(!is_allowed("tenant-a", "alice", "tenant-a", "document", "read", revoked_roles, rules), "revoked membership immediately denied");
+  let malformed_with_allow = [
+    permission_rule("tenant-a", "reader", "document", "read", "allow"),
+    permission_rule("tenant-a", "editor", "document", "read", "alow")
+  ];
+  assert(!is_allowed("tenant-a", "alice", "tenant-a", "document", "read", alice, malformed_with_allow), "malformed effect denies even if another role allows");
+  let foreign_deny = [
+    permission_rule("tenant-a", "reader", "document", "read", "allow"),
+    permission_rule("tenant-b", "editor", "document", "read", "deny")
+  ];
+  assert(is_allowed("tenant-a", "alice", "tenant-a", "document", "read", alice, foreign_deny), "foreign tenant deny does not affect this tenant");
+  let blank_role = [role_assignment("tenant-a", "alice", "")];
+  assert(!is_allowed("tenant-a", "alice", "tenant-a", "document", "read", blank_role, rules), "blank roles never grant permission");
+}
