@@ -1492,6 +1492,47 @@ impl LibsqlStore {
             )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            // `CREATE TABLE IF NOT EXISTS` accepts an existing SQLite view,
+            // and PRAGMA table_info reports that view's columns. Do not treat
+            // a read-only view with all expected names as a durable table.
+            let mut objects = conn
+                .query(
+                    "SELECT type FROM sqlite_master WHERE name = 'snapshots' COLLATE NOCASE LIMIT 1",
+                    (),
+                )
+                .await
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("unable to inspect snapshots object type: {e}"),
+                    )
+                })?;
+            let object_type: String = objects
+                .next()
+                .await
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("unable to read snapshots object type: {e}"),
+                    )
+                })?
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "snapshots table is missing")
+                })?
+                .get(0)
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid snapshots object type: {e}"),
+                    )
+                })?;
+            drop(objects);
+            if object_type != "table" {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("snapshots must be a writable table, found {object_type}"),
+                ));
+            }
             // Inspect the existing schema once. A failed migration must never be
             // silently treated as a usable durable store. In particular,
             // duplicate-column errors are expected for upgraded databases,
