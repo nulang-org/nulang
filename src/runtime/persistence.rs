@@ -1492,36 +1492,58 @@ impl LibsqlStore {
             )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-            // Durable activation fencing was added after the original snapshot schema.
-            // Legacy rows represent the initial activation and therefore default to 1.
-            let _ = conn
-                .execute(
-                    "ALTER TABLE snapshots ADD COLUMN activation_epoch INTEGER NOT NULL DEFAULT 1",
-                    (),
+            // Inspect the existing schema once. A failed migration must never be
+            // silently treated as a usable durable store. In particular,
+            // duplicate-column errors are expected for upgraded databases,
+            // but read-only, incompatible or corrupt schemas are not.
+            let mut columns = std::collections::HashSet::new();
+            let mut rows = conn
+                .query("PRAGMA table_info(snapshots)", ())
+                .await
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("unable to inspect snapshots schema: {e}"),
+                    )
+                })?;
+            while let Some(row) = rows.next().await.map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("unable to read snapshots schema: {e}"),
                 )
-                .await;
-            // Migrate databases created before the waiting_signal column existed.
-            let _ = conn
-                .execute("ALTER TABLE snapshots ADD COLUMN waiting_signal TEXT", ())
-                .await;
-            // Migrate databases created before the crdt_snapshot column existed.
-            let _ = conn
-                .execute("ALTER TABLE snapshots ADD COLUMN crdt_snapshot TEXT", ())
-                .await;
-            // Migrate databases created before the crdt_field_map column existed.
-            let _ = conn
-                .execute("ALTER TABLE snapshots ADD COLUMN crdt_field_map TEXT", ())
-                .await;
-            // Durable schema identity was added after the original persistence
-            // schema. Legacy rows remain NULL and follow the explicit legacy policy.
-            let _ = conn
-                .execute("ALTER TABLE snapshots ADD COLUMN schema_name TEXT", ())
-                .await;
-            // Authority was added after the original persistence schema. Old rows
-            // remain NULL and therefore restore with empty (deny-by-default) authority.
-            let _ = conn
-                .execute("ALTER TABLE snapshots ADD COLUMN authority_tokens TEXT", ())
-                .await;
+            })? {
+                let column: String = row.get(1).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("invalid snapshots schema column: {e}"),
+                    )
+                })?;
+                columns.insert(column);
+            }
+            drop(rows);
+            // Legacy snapshots omit some optional columns. Only add genuinely
+            // missing columns and propagate every real migration failure.
+            for (name, definition) in [
+                (
+                    "activation_epoch",
+                    "activation_epoch INTEGER NOT NULL DEFAULT 1",
+                ),
+                ("waiting_signal", "waiting_signal TEXT"),
+                ("crdt_snapshot", "crdt_snapshot TEXT"),
+                ("crdt_field_map", "crdt_field_map TEXT"),
+                ("schema_name", "schema_name TEXT"),
+                ("authority_tokens", "authority_tokens TEXT"),
+            ] {
+                if !columns.contains(name) {
+                    let sql = format!("ALTER TABLE snapshots ADD COLUMN {definition}");
+                    conn.execute(&sql, ()).await.map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("failed to migrate snapshots.{name}: {e}"),
+                        )
+                    })?;
+                }
+            }
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS journal (
                     actor_id INTEGER NOT NULL,
