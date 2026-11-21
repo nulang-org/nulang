@@ -1,4 +1,9 @@
 # Nulang Changelog
+
+### Local actor-delivery trace allocation reduction — 2026-10-22
+- **Accepted local actor messages now take ownership of their W3C traceparent rather than cloning its heap allocation.** Rejected mailbox messages also reuse the original envelope when routed to the dead-letter queue, avoiding redundant payload construction.
+- **Regressions verify ownership transfer and unchanged admission/DLQ accounting.** This is an allocation-level optimization; throughput impact remains unquantified until exact-base, same-host A/B benchmarks complete.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.

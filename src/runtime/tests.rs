@@ -272,6 +272,70 @@ fn test_mailbox_push_pop() {
 }
 
 #[test]
+fn test_local_delivery_moves_traceparent_into_mailbox_without_reallocation() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![]));
+    let traceparent = TraceContext::root().to_traceparent();
+    let allocation = traceparent.as_ptr();
+
+    assert!(matches!(
+        rt.deliver_local_message(actor_id, 0, &[], Some(traceparent)),
+        MessageAdmission::Accepted
+    ));
+
+    let msg = rt.actors.get_mut(&actor_id).unwrap().receive().unwrap();
+    let delivered = msg.trace_id.expect("accepted message retains traceparent");
+    assert_eq!(
+        delivered.as_ptr(),
+        allocation,
+        "local delivery must transfer the traceparent allocation, not clone it"
+    );
+}
+
+#[test]
+fn test_local_delivery_backpressure_and_missing_target_keep_dlq_accounting() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![]));
+    rt.actors.get_mut(&actor_id).unwrap().mailbox = Mailbox::new(1);
+
+    assert!(matches!(
+        rt.deliver_local_message(actor_id, 0, &[Value::int(7)], None),
+        MessageAdmission::Accepted
+    ));
+    assert!(matches!(
+        rt.deliver_local_message(
+            actor_id,
+            0,
+            &[Value::int(8)],
+            Some(TraceContext::root().to_traceparent())
+        ),
+        MessageAdmission::Backpressured
+    ));
+    assert_eq!(
+        rt.dlq_depth(),
+        1,
+        "full mailboxes send one DLQ notification"
+    );
+
+    let delivered = rt.actors.get_mut(&actor_id).unwrap().receive().unwrap();
+    assert_eq!(delivered.payload.as_slice(), &[Value::int(7)]);
+    assert!(matches!(
+        rt.deliver_local_message(
+            u64::MAX,
+            0,
+            &[Value::int(9)],
+            Some(TraceContext::root().to_traceparent())
+        ),
+        MessageAdmission::Rejected
+    ));
+    assert_eq!(
+        rt.dlq_depth(),
+        2,
+        "missing targets send one DLQ notification"
+    );
+}
+
+#[test]
 fn test_send_carries_current_trace_span() {
     let mut rt = Runtime::new();
     let b = rt.spawn_actor(Box::new(|| vec![]));
