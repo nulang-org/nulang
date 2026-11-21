@@ -8074,12 +8074,12 @@ fn test_hibernated_grain_with_object_holds_is_not_evicted() {
 
     {
         let actor = rt.actors.get_mut(&actor_id).unwrap();
-        actor.hibernation_state = Some(HibernationState {
+        actor.hibernation_state = Some(Box::new(HibernationState {
             continuation_bytes: Vec::new(),
             module_hash: [0; 32],
             hibernated_at_ms: 0,
             state_fields: HashMap::new(),
-        });
+        }));
     }
 
     assert_eq!(

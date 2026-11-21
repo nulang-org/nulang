@@ -368,7 +368,7 @@ pub struct Actor {
     /// Records the N most recent messages delivered to this actor.
     pub flight_recorder: FlightRecorder,
     /// Hibernation state: None = active, Some = hibernated with serialized bytes.
-    pub hibernation_state: Option<HibernationState>,
+    pub hibernation_state: Option<Box<HibernationState>>,
     /// Time (in milliseconds) since last activity. Used for hibernation timeout.
     pub idle_ms: u64,
     /// If true, the scheduler-driven dehydration scanner never hibernates this
@@ -579,7 +579,7 @@ impl Actor {
             vm,
             module_hash,
         )?;
-        self.hibernation_state = Some(HibernationState {
+        self.hibernation_state = Some(Box::new(HibernationState {
             continuation_bytes: bytes.clone(),
             module_hash: *module_hash,
             hibernated_at_ms: std::time::SystemTime::now()
@@ -587,7 +587,7 @@ impl Actor {
                 .unwrap()
                 .as_millis() as u64,
             state_fields: self.state_data.clone(),
-        });
+        }));
         Ok(bytes)
     }
 
@@ -837,6 +837,52 @@ impl Actor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_only_hibernation_marker_wakes_without_continuation() {
+        let mut actor = Actor::new(71, "idle_grain", 0);
+        actor.hibernation_state = Some(Box::new(HibernationState {
+            continuation_bytes: Vec::new(),
+            module_hash: [4; 32],
+            hibernated_at_ms: 7,
+            state_fields: HashMap::new(),
+        }));
+        assert!(actor.is_hibernated());
+
+        let mut vm = crate::vm::VM::new();
+        actor
+            .wake_from_hibernation(&mut vm)
+            .expect("empty-continuation marker must wake");
+        assert!(!actor.is_hibernated());
+        assert!(actor.hibernation_state.is_none());
+        assert_eq!(actor.id, 71);
+        assert!(actor.wake_from_hibernation(&mut vm).is_err());
+    }
+
+    #[test]
+    fn idle_actor_does_not_reserve_inline_hibernation_snapshot() {
+        let mut actor = Actor::new(123, "sleepy", 0);
+        assert!(std::mem::size_of_val(&actor.hibernation_state) <= std::mem::size_of::<usize>());
+        assert!(actor.hibernation_state.is_none());
+        assert!(!actor.is_hibernated());
+
+        actor.hibernation_state = Some(Box::new(HibernationState {
+            continuation_bytes: Vec::new(),
+            module_hash: [9; 32],
+            hibernated_at_ms: 42,
+            state_fields: HashMap::new(),
+        }));
+        assert!(actor.is_hibernated());
+        assert_eq!(
+            actor.hibernation_state.as_ref().unwrap().module_hash,
+            [9; 32]
+        );
+
+        actor.reset(124, "awake", 0);
+        assert!(!actor.is_hibernated());
+        assert!(actor.hibernation_state.is_none());
+        assert_eq!(actor.id, 124);
+    }
 
     #[test]
     fn test_actor_new() {
