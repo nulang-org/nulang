@@ -61,6 +61,13 @@ Download the latest archive and its matching `.sha256` file from
 [GitHub Releases](https://github.com/nulang-org/nulang/releases), verify the
 checksum, then put the extracted executable on your PATH.
 
+**Python interoperability is excluded from Python-free public release binaries.**
+The `release-cli` profile avoids linking a version-specific system `libpython`;
+a downloaded executable may recognize `Python.*` effects but cannot execute
+them. To use Python interop, build from source with
+`cargo build --locked --release --no-default-features --features full`
+and install compatible Python development/runtime libraries.
+
 Linux x86_64 example:
 
 ```bash
