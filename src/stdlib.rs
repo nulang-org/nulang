@@ -518,6 +518,14 @@ impl StdLib {
                     description: "Send the prompt to the configured inference provider and return the reply; suspends non-blockingly when the runtime supports it.",
                 },
                 BuiltinOp {
+                    name: "Http.request",
+                    effect: "Http",
+                    op: "request",
+                    signature: "request(method: String, url: String, headers_json: String, body: String) -> String",
+                    implemented_in: ImplSite::StandaloneVm,
+                    description: "Experimental bounded text HTTP request. headers_json is an array of string pairs; returns JSON with status, ok, headers, body on any HTTP status, or nil on validation/transport failure. Never redirects or retries; requires the ureq feature.",
+                },
+                BuiltinOp {
                     name: "Http.get",
                     effect: "Http",
                     op: "get",

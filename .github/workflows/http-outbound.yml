@@ -1,0 +1,48 @@
+name: Outbound HTTP Conformance
+
+on:
+  pull_request:
+    paths:
+      - 'src/http_outbound.rs'
+      - 'src/lib.rs'
+      - 'src/vm.rs'
+      - 'src/stdlib.rs'
+      - 'src/runtime/callbacks.rs'
+      - 'packages/http-client/**'
+      - 'tests/http_outbound_request.rs'
+      - '.github/workflows/http-outbound.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'src/http_outbound.rs'
+      - 'src/lib.rs'
+      - 'src/vm.rs'
+      - 'src/stdlib.rs'
+      - 'src/runtime/callbacks.rs'
+      - 'packages/http-client/**'
+      - 'tests/http_outbound_request.rs'
+      - '.github/workflows/http-outbound.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: outbound-http-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  http:
+    runs-on: ubuntu-latest
+    name: Outbound HTTP security and wire tests
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.95.0'
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and run loopback HTTP tests in minimal feature profile
+        run: cargo test --locked --no-default-features --features ureq --test http_outbound_request
+      - name: Verify exact actor authority grant
+        run: cargo test --locked --no-default-features --features ureq actor_http_request_authorizes_url_not_method_and_rejects_other_ports
+      - name: Check package compiles under Nulang VM
+        run: cargo run --locked --no-default-features --features ureq --bin nulang -- --check packages/http-client/src/lib.nula
