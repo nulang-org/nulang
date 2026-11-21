@@ -190,6 +190,50 @@ fn bench_orca_local_alloc_drop(c: &mut Criterion) {
     group.finish();
 }
 
+/// End-to-end cost of delivering heap pointers to a long-lived receiving
+/// actor, including message admission, ORCA in-flight credit draining, and
+/// receiver-side lifetime holds. Both cases deliver 256 messages; only the
+/// number of *distinct objects* differs. This is not an isolated HashSet
+/// microbenchmark.
+fn bench_orca_receiver_hold(c: &mut Criterion) {
+    const MESSAGES: usize = 256;
+    let mut group = c.benchmark_group("gc/orca_receiver_hold");
+    group.throughput(Throughput::Elements(MESSAGES as u64));
+
+    for (label, unique_objects) in [("repeated/256", 1), ("distinct/256", MESSAGES)] {
+        group.bench_function(label, |b| {
+            b.iter_batched(
+                || foreign_ref_fixture(unique_objects),
+                |(mut rt, owner, target, ptrs)| {
+                    rt.current_actor = Some(owner);
+                    for index in 0..MESSAGES {
+                        // SAFETY: fixture allocations remain live on the owner
+                        // heap until the receiver completes all deliveries.
+                        let value = unsafe { Value::ptr(ptrs[index % ptrs.len()]) };
+                        rt.send_message_by_id(target, 0, &[value]);
+                    }
+                    rt.current_actor = None;
+                    rt.run_scheduler();
+
+                    assert_eq!(
+                        rt.actors
+                            .get(&owner)
+                            .expect("owner actor")
+                            .orca_gc
+                            .stats()
+                            .foreign_refs_received,
+                        unique_objects as u64,
+                        "each distinct object must acquire exactly one receiver hold"
+                    );
+                    black_box(rt);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 fn bench_cycle_detection(c: &mut Criterion) {
     c.bench_function("gc/cycle_detection", |b| {
         b.iter(|| {
@@ -216,5 +260,6 @@ criterion_group!(
     benches,
     bench_orca_throughput,
     bench_orca_foreign_ref_send,
+    bench_orca_receiver_hold,
     bench_cycle_detection
 );
