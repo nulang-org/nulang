@@ -401,6 +401,7 @@ fn rvalue_uses_local(rv: &RValue, local: LocalId) -> bool {
             *arr == local || *idx == local
         }
         RValue::ArrayLen(id) | RValue::Unary(_, id) => *id == local,
+        RValue::Intrinsic(intrinsic) => intrinsic.args.iter().any(|a| *a == local),
         RValue::StringEq(a, b) => *a == local || *b == local,
         RValue::StrConcat(a, b) => *a == local || *b == local,
         RValue::Perform { args, .. } | RValue::PerformAsync { args, .. } => {
@@ -665,6 +666,12 @@ fn remap_rvalue(rv: &RValue, remap: &FxHashMap<LocalId, LocalId>) -> RValue {
         RValue::Unary(op, id) => RValue::Unary(*op, remap_local(*id, remap)),
         RValue::Binary(op, a, b) => {
             RValue::Binary(*op, remap_local(*a, remap), remap_local(*b, remap))
+        }
+        RValue::Intrinsic(intrinsic) => {
+            RValue::Intrinsic(crate::compiler_intrinsics::MirIntrinsic {
+                op: intrinsic.op,
+                args: remap_locals(&intrinsic.args, remap),
+            })
         }
         RValue::StringEq(a, b) => RValue::StringEq(remap_local(*a, remap), remap_local(*b, remap)),
         RValue::StrConcat(a, b) => {
