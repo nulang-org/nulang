@@ -91,7 +91,12 @@ def measurement_affinity(cpu_mode: str) -> set[int] | None:
 def criterion_filter(benchmarks: list[str]) -> str:
     if not benchmarks:
         raise ValueError("at least one benchmark is required")
-    escaped = "|".join(re.escape(name) for name in benchmarks)
+    # Regression manifests contain Criterion's filesystem-safe directory names.
+    # Criterion itself filters against full IDs: e.g. the directory
+    # scheduler_global_owner_dispatch/1000 corresponds to the full ID
+    # scheduler/global_owner_dispatch/1000. Either slash or underscore may
+    # appear at a sanitized boundary; keep the entire expression anchored.
+    escaped = "|".join(re.escape(name).replace("_", "[/_]") for name in benchmarks)
     return rf"^(?:{escaped})$"
 
 

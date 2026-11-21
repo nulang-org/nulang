@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import re
 import sys
 import tempfile
 import unittest
@@ -20,6 +21,26 @@ class CriterionFilterTests(unittest.TestCase):
     def test_filter_is_anchored_and_regex_escaped(self):
         value = confirm.criterion_filter(["group/a+b", "scheduler/foo/1000"])
         self.assertEqual(r"^(?:group/a\+b|scheduler/foo/1000)$", value)
+
+    def test_filter_matches_criterion_ids_when_directory_names_are_sanitized(self):
+        # Criterion filters on the full ID (with a slash in the group ID), while
+        # collect_bench_results.py historically records safe directory names.
+        recorded = [
+            "scheduler_global_owner_dispatch/1000",
+            "persist_memory_journal_read/1000",
+            "actor_selective_receive_guard_retry/32_rejections",
+        ]
+        expression = confirm.criterion_filter(recorded)
+        for full_id in (
+            "scheduler/global_owner_dispatch/1000",
+            "persist/memory_journal_read/1000",
+            "actor/selective_receive_guard_retry/32_rejections",
+        ):
+            with self.subTest(full_id=full_id):
+                self.assertIsNotNone(re.fullmatch(expression, full_id))
+
+        self.assertIsNone(re.fullmatch(expression, "scheduler/global_owner_dispatch/10000"))
+        self.assertIsNone(re.fullmatch(expression, "persist/memory_journal_read/1000_extra"))
 
 
 class ManifestValidationTests(unittest.TestCase):
