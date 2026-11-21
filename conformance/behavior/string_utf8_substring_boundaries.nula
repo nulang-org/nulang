@@ -1,0 +1,17 @@
+// String.substring has a byte-offset interface but must not panic when a
+// requested span cuts through UTF-8 code point bytes.
+fn show(s) {
+    if s == nil then "<nil>" else s
+}
+
+fn main() {
+    perform IO.print("ascii=" + show(perform String.substring("abcdef", 1, 3)))
+    perform IO.print("unicode=" + show(perform String.substring("hé💡", 1, 2)))
+    perform IO.print("lead_cut=" + show(perform String.substring("é", 0, 1)))
+    perform IO.print("trail_cut=" + show(perform String.substring("é", 1, 1)))
+    perform IO.print("emoji_cut=" + show(perform String.substring("💡", 0, 2)))
+    perform IO.print("clamped=" + show(perform String.substring("hé", 1, 100)))
+    perform IO.print("overflow_clamped=" + show(perform String.substring("abc", 1, 9223372036854775807)))
+    perform IO.print("empty=" + show(perform String.substring("hé", 3, 0)))
+    perform IO.print("negative=" + show(perform String.substring("hi", -1, 1)))
+}

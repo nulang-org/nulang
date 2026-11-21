@@ -1237,11 +1237,9 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
             let s = resolve_value_string(constants, *regs.first().unwrap_or(&Value::nil()));
             let start = regs.get(1).and_then(|v| v.as_int()).unwrap_or(0);
             let len = regs.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-            if start < 0 || len < 0 || start as usize > s.len() {
+            let Some(sub) = utf8_substring_by_bytes(&s, start, len) else {
                 return Some(Value::nil());
-            }
-            let end = ((start + len) as usize).min(s.len());
-            let sub = &s[start as usize..end];
+            };
             let bytes = sub.as_bytes().to_vec();
             match self.heap.alloc(bytes.len() + 1, HeapTypeTag::String) {
                 Some(ptr) => {
@@ -2717,6 +2715,25 @@ pub const CLOSURE_ENV_IDX_MASK: u64 = CLOSURE_ENV_FLAG - 1;
 /// fixed, predictable amount of memory instead of running unboundedly
 /// toward an uncontrolled OOM.
 const MAX_CLOSURE_ENVS: usize = 10_000_000;
+
+/// Return a UTF-8-safe substring using the existing byte-offset API.
+///
+/// This does not reinterpret offsets as character indices: a span that cuts
+/// through a UTF-8 code point is invalid, even when its length would be
+/// otherwise in bounds. Bounds from a Nulang Int may not fit `usize` on
+/// 32-bit hosts, so conversion and addition are guarded.
+fn utf8_substring_by_bytes(s: &str, start: i64, len: i64) -> Option<&str> {
+    let start = usize::try_from(start).ok()?;
+    let len = usize::try_from(len).unwrap_or(usize::MAX);
+    if start > s.len() {
+        return None;
+    }
+    let end = start.saturating_add(len).min(s.len());
+    if !s.is_char_boundary(start) || !s.is_char_boundary(end) {
+        return None;
+    }
+    Some(&s[start..end])
+}
 
 impl VM {
     /// Create a new VM with the JIT tiering enabled (the default).
@@ -8979,5 +8996,37 @@ mod vm_tests {
             // slots[1] is a TAG_STRING — verify it's a valid string value
             assert!(slots[1].is_string(), "array[1] should be a string");
         }
+    }
+}
+
+#[cfg(test)]
+mod utf8_substring_boundary_tests {
+    use super::utf8_substring_by_bytes;
+
+    #[test]
+    fn preserves_existing_byte_offset_semantics() {
+        assert_eq!(utf8_substring_by_bytes("abcdef", 1, 3), Some("bcd"));
+        assert_eq!(utf8_substring_by_bytes("hé💡", 1, 2), Some("é"));
+        assert_eq!(utf8_substring_by_bytes("hé", 1, 100), Some("é"));
+        assert_eq!(utf8_substring_by_bytes("hé", 3, 0), Some(""));
+    }
+
+    #[test]
+    fn rejects_split_codepoints_instead_of_panicking() {
+        assert_eq!(utf8_substring_by_bytes("é", 0, 1), None);
+        assert_eq!(utf8_substring_by_bytes("é", 1, 1), None);
+        assert_eq!(utf8_substring_by_bytes("💡", 0, 2), None);
+        assert_eq!(utf8_substring_by_bytes("a💡b", 2, 1), None);
+    }
+
+    #[test]
+    fn handles_negative_and_oversized_offsets_without_overflow() {
+        assert_eq!(utf8_substring_by_bytes("abc", -1, 1), None);
+        assert_eq!(utf8_substring_by_bytes("abc", 0, -1), None);
+        assert_eq!(utf8_substring_by_bytes("abc", i64::MAX, 1), None);
+        assert_eq!(
+            utf8_substring_by_bytes("abc", 1, i64::MAX),
+            Some("bc")
+        );
     }
 }
