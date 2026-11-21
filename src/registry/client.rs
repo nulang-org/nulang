@@ -11,6 +11,32 @@
 #[cfg(feature = "ureq")]
 use std::io::Read;
 
+/// Construct a shared, explicitly verified HTTP transport for registry/deploy.
+/// ureq 2 native TLS uses OS trust, not obsolete bundled root certificates.
+#[cfg(feature = "ureq")]
+pub(crate) fn verified_https_agent(target_url: &str) -> Result<ureq::Agent, String> {
+    let (scheme, authority) = target_url
+        .split_once("://")
+        .ok_or_else(|| "registry/deploy URL must specify http:// or https://".to_string())?;
+    if authority.is_empty() {
+        return Err("registry/deploy URL must include a host".to_string());
+    }
+    let https_only = if scheme.eq_ignore_ascii_case("https") {
+        true
+    } else if scheme.eq_ignore_ascii_case("http") {
+        false // Preserve explicitly configured local/development HTTP endpoints.
+    } else {
+        return Err("registry/deploy URL must specify http:// or https://".to_string());
+    };
+
+    let connector = native_tls::TlsConnector::new()
+        .map_err(|e| format!("system TLS initialization failed: {}", e))?;
+    Ok(ureq::AgentBuilder::new()
+        .https_only(https_only)
+        .tls_connector(std::sync::Arc::new(connector))
+        .build())
+}
+
 /// Client for a package registry server.
 pub struct RegistryClient {
     registry_url: String,
@@ -36,9 +62,12 @@ impl RegistryClient {
         #[cfg(feature = "ureq")]
         {
             let url = format!("{}/api/v1/packages/{}/{}", self.base_url(), name, version);
+            let agent = verified_https_agent(&url)?;
             let request = match &self.token {
-                Some(token) => ureq::put(&url).set("Authorization", &format!("Bearer {}", token)),
-                None => ureq::put(&url),
+                Some(token) => agent
+                    .put(&url)
+                    .set("Authorization", &format!("Bearer {}", token)),
+                None => agent.put(&url),
             };
             match request.send_bytes(tarball) {
                 Ok(_) => Ok(()),
@@ -57,7 +86,7 @@ impl RegistryClient {
         #[cfg(feature = "ureq")]
         {
             let url = format!("{}/api/v1/packages/{}/{}", self.base_url(), name, version);
-            match ureq::get(&url).call() {
+            match verified_https_agent(&url)?.get(&url).call() {
                 Ok(response) => {
                     let mut bytes = Vec::new();
                     response
@@ -81,7 +110,7 @@ impl RegistryClient {
         #[cfg(feature = "ureq")]
         {
             let url = format!("{}/api/v1/packages/{}", self.base_url(), name);
-            match ureq::get(&url).call() {
+            match verified_https_agent(&url)?.get(&url).call() {
                 Ok(response) => {
                     let text = response.into_string().map_err(|e| e.to_string())?;
                     Self::parse_versions(&text)
@@ -130,5 +159,89 @@ impl RegistryClient {
             }
             other => other.to_string(),
         }
+    }
+}
+
+#[cfg(all(test, feature = "ureq"))]
+mod tls_transport_tests {
+    use super::{verified_https_agent, RegistryClient};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    #[test]
+    fn https_configured_agent_rejects_all_plaintext_requests() {
+        // For HTTPS registries/deploys, following a Location: http://...
+        // must be forbidden by the same HTTPS-only transport policy.
+        let agent = verified_https_agent("https://registry.example.test").unwrap();
+        let failure = agent
+            .get("http://127.0.0.1:9/not-a-registry")
+            .call()
+            .expect_err("HTTPS-configured agent must reject plaintext URLs");
+        assert!(
+            failure.to_string().to_ascii_lowercase().contains("https"),
+            "expected explicit HTTPS-only rejection, got: {failure}"
+        );
+    }
+
+    #[test]
+    fn explicitly_configured_local_http_remains_supported() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut buf = [0u8; 1024];
+            let count = stream.read(&mut buf).unwrap();
+            assert!(count > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                .unwrap();
+        });
+        let result = verified_https_agent(&url)
+            .unwrap()
+            .get(&url)
+            .call()
+            .expect("explicit local HTTP should work");
+        assert_eq!(result.status(), 200);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn transport_rejects_unsupported_or_missing_url_schemes() {
+        for target in ["registry.example.test", "ftp://registry.example.test"] {
+            assert!(
+                verified_https_agent(target).is_err(),
+                "unsupported scheme should not select an insecure transport: {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_https_never_downgrades_to_plain_http() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback TLS sentinel");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept HTTPS connection");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut first = [0u8; 5];
+            let count = stream.read(&mut first).unwrap_or(0);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            assert!(count > 0, "client did not initiate TLS handshake");
+            first[0]
+        });
+        let client = RegistryClient::new(format!("https://127.0.0.1:{}", port), None);
+        assert!(
+            client.fetch("test", "1.0.0").is_err(),
+            "plain server must not be trusted as HTTPS"
+        );
+        assert_eq!(
+            server.join().unwrap(),
+            0x16,
+            "expected a TLS ClientHello record"
+        );
     }
 }
