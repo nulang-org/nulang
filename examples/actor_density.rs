@@ -48,6 +48,114 @@ fn print_layout() {
     println!("trace_entry_struct_bytes={}", size_of::<TraceEntry>());
 }
 
+/// An explicit accounting of the public Actor fields as laid out by rustc.
+/// Note that this is not a sum of heap allocations or a complete ABI contract:
+/// private fields and padding are reported together as unattributed bytes.
+struct ActorLayoutField {
+    name: &'static str,
+    offset: usize,
+    bytes: usize,
+}
+
+fn actor_field_layout(actor: &Actor) -> Vec<ActorLayoutField> {
+    let mut fields = Vec::new();
+    macro_rules! field {
+        ($name:ident) => {
+            fields.push(ActorLayoutField {
+                name: stringify!($name),
+                offset: std::mem::offset_of!(Actor, $name),
+                bytes: std::mem::size_of_val(&actor.$name),
+            });
+        };
+    }
+
+    field!(id);
+    field!(name);
+    field!(state);
+    field!(mailbox);
+    field!(heap);
+    field!(orca_gc);
+    field!(iso_arena);
+    field!(state_data);
+    field!(state_models);
+    field!(event_log);
+    field!(event_sourced_sequences);
+    field!(event_sourced_compaction_interval);
+    field!(persistent);
+    field!(is_workflow);
+    field!(behavior_table);
+    #[cfg(feature = "native-codegen")]
+    field!(aot_targets);
+    field!(bytecode_offsets);
+    field!(compensation_offsets);
+    field!(compensated_steps);
+    field!(bytecode_module);
+    field!(bytecode_module_idx);
+    field!(parent);
+    field!(children);
+    field!(monitors);
+    field!(links);
+    field!(trap_exits);
+    field!(priority);
+    field!(run_state);
+    field!(reduction_count);
+    field!(max_reductions);
+    field!(sequence);
+    field!(activation_epoch);
+    field!(current_workflow_activation);
+    field!(workflow_replay_activation);
+    field!(workflow_replay_event_ordinal);
+    field!(suspended_execution);
+    field!(jit_safepoint_counter);
+    field!(jit_yield_pending);
+    field!(waiting_signal);
+    field!(received_signals);
+    field!(query_handlers);
+    field!(is_agent);
+    field!(capabilities);
+    field!(backend);
+    #[cfg(feature = "ai-runtime")]
+    field!(llm_inflight);
+    #[cfg(feature = "ai-runtime")]
+    field!(llm_pending_prompt);
+    #[cfg(feature = "ai-runtime")]
+    field!(llm_completed);
+    field!(receive_wait);
+    field!(timer_sleep_fired);
+    field!(retry_config);
+    field!(fallback_config);
+    field!(flight_recorder);
+    field!(hibernation_state);
+    field!(idle_ms);
+    field!(pinned);
+    field!(dirty_fields);
+    field!(held_objects);
+
+    fields.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(b.name)));
+    fields
+}
+
+fn run_layout() {
+    let actor = Actor::new(1, "actor_1", 0);
+    let fields = actor_field_layout(&actor);
+    let accounted: usize = fields.iter().map(|field| field.bytes).sum();
+
+    println!("mode=layout");
+    println!("actor_layout_public_field_count={}", fields.len());
+    println!("actor_layout_public_field_bytes={accounted}");
+    println!(
+        "actor_layout_private_and_padding_bytes={}",
+        size_of::<Actor>().saturating_sub(accounted)
+    );
+    println!("actor_layout_field_format=name,offset,bytes");
+    for field in fields {
+        println!(
+            "actor_layout_field={},{},{}",
+            field.name, field.offset, field.bytes
+        );
+    }
+}
+
 fn print_rss(name: &str, value: Option<u64>) {
     match value {
         Some(bytes) => println!("{name}={bytes}"),
@@ -193,7 +301,7 @@ fn run_fanout(actor_count: usize) {
 
 fn usage(program: &str) -> ! {
     eprintln!(
-        "usage: {program} <idle|construct|fanout> [actor_count]\n\n\
+        "usage: {program} <layout|idle|construct|fanout> [actor_count]\n\n\
          examples:\n  {program} idle 100000\n  {program} construct 100000\n  {program} fanout 100000"
     );
     std::process::exit(2);
@@ -217,9 +325,34 @@ fn main() {
     }
 
     match mode.as_str() {
+        "layout" => run_layout(),
         "idle" => run_idle(actor_count),
         "construct" => run_construct_only(actor_count),
         "fanout" => run_fanout(actor_count),
         _ => usage(&program),
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn layout_reports_public_fields_inside_actual_actor_bounds() {
+        let actor = Actor::new(1, "actor_1", 0);
+        let fields = actor_field_layout(&actor);
+        let names: Vec<_> = fields.iter().map(|field| field.name).collect();
+
+        assert!(names.contains(&"mailbox"));
+        assert!(names.contains(&"iso_arena"));
+        assert!(names.contains(&"flight_recorder"));
+        assert!(names.contains(&"state_data"));
+        assert!(names.contains(&"held_objects"));
+        assert!(fields
+            .iter()
+            .all(|field| field.offset + field.bytes <= size_of::<Actor>()));
+        assert!(fields
+            .windows(2)
+            .all(|window| window[0].bytes >= window[1].bytes));
     }
 }
