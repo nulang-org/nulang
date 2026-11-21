@@ -2,17 +2,24 @@ name: Remote RTT stage profile
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
     paths:
       - 'tests/remote_rtt_stage_profile.rs'
       - 'tests/remote_rtt_stage_profile_contract.rs'
       - '.github/workflows/remote-rtt-stage-profile-pr.yml'
       - 'src/runtime/**'
 
+# A newer push to the same PR supersedes the previous run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   profile:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:

@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
 
 # A newer push to the same PR/branch supersedes the previous run. Without
 # this, every push queues a full ~6h run set (including Release Build) and
@@ -20,6 +21,7 @@ jobs:
   # Documentation site + zero-install browser playground
   # -----------------------------------------------------------------------
   docs-site:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Docs site & browser playground
     runs-on: ubuntu-latest
     steps:
@@ -77,6 +79,7 @@ jobs:
   # Primary build & test (default features)
   # -----------------------------------------------------------------------
   test:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Build & Test
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -139,6 +142,7 @@ jobs:
   # Release build — catches optimization-only errors
   # -----------------------------------------------------------------------
   release:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Release Build
     runs-on: ubuntu-latest
     timeout-minutes: 75
@@ -156,11 +160,18 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Build (public CLI release profile)
         run: cargo build --locked --release --no-default-features --features release-cli --bin nulang
 
       - name: Test (same profile as public release artifacts)
-        run: cargo test --locked --release --no-default-features --features release-cli
+        run: cargo nextest run --locked --release --no-default-features --features release-cli
+
+      # nextest intentionally does not execute rustdoc tests.
+      - name: Test doctests (same profile as public release artifacts)
+        run: cargo test --locked --release --no-default-features --features release-cli --doc
 
       - name: Verify Linux CLI has no Python ABI linkage
         run: bash scripts/check_release_linux.sh /tmp/cargo-target/release/nulang
@@ -183,6 +194,7 @@ jobs:
   # Nula package-manager smoke test — scaffold a package and run `nula test`
   # -----------------------------------------------------------------------
   nula-test:
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.release.result == 'success'
     name: Nula Package Test
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -217,6 +229,7 @@ jobs:
   # No-default-features build — proves zero PyO3/SQLite/LSP dependencies
   # -----------------------------------------------------------------------
   minimal-build:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Build without optional features
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -231,13 +244,20 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       # No python3-dev installed here on purpose: this job proves the
       # no-default-features build has zero PyO3/SQLite/LSP dependencies.
       - name: Build
         run: cargo build --locked --all-targets --no-default-features
 
       - name: Test
-        run: cargo test --locked --no-default-features
+        run: cargo nextest run --locked --no-default-features
+
+      # nextest intentionally does not execute rustdoc tests.
+      - name: Test doctests (no default features)
+        run: cargo test --locked --no-default-features --doc
 
       - name: Check zero warnings
         run: cargo check --locked --tests --no-default-features
@@ -252,6 +272,7 @@ jobs:
   # WASM backend
   # -----------------------------------------------------------------------
   wasm-backend:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Build & Test (wasm-backend feature)
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -269,21 +290,31 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Build
         run: cargo build --locked --all-targets --features wasm-backend
 
       - name: Test
-        run: cargo test --locked --features wasm-backend
+        run: cargo nextest run --locked --features wasm-backend
+
+      # nextest intentionally does not execute rustdoc tests.
+      - name: Test doctests
+        run: cargo test --locked --features wasm-backend --doc
 
   # -----------------------------------------------------------------------
   # Lint — format, clippy, audit, docs, all-features check
   # -----------------------------------------------------------------------
   lint:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Format, Clippy & Audit
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y python3-dev
@@ -300,6 +331,21 @@ jobs:
       # Format check is blocking — the codebase has been rustfmt'd.
       - name: Format check
         run: cargo fmt --check
+
+      # Keep whitespace hygiene blocking alongside formatting.
+      - name: Whitespace check
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BASE_SHA: ${{ github.event.before }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            git diff --check "$PR_BASE_SHA...$PR_HEAD_SHA"
+          elif [ "$PUSH_BASE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            git diff --check "$PUSH_BASE_SHA...$GITHUB_SHA"
+          else
+            git diff --check HEAD^...$GITHUB_SHA
+          fi
 
       # Clippy with default features — correctness lints are blocking.
       - name: Clippy (default features)
@@ -344,6 +390,7 @@ jobs:
   # Lean formalization — verifies the formal specs compile
   # -----------------------------------------------------------------------
   lean:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Lean Formalization
     runs-on: ubuntu-latest
     timeout-minutes: 20

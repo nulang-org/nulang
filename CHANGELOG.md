@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Draft-aware CI and preserved test matrix — 2026-10-28
+- **Draft pull requests do not consume expensive validation jobs, including the Fabric publish A/B benchmark.** PR workflows resume on `ready_for_review`; the admission contract test discovers newly added workflows rather than using a hard-coded list, so future lanes cannot silently bypass draft gating.
+- **All required Rust test jobs use nextest plus explicit doctest runs.** Release, no-default-features, and WASM jobs retain their previous build, test, smoke, audit, documentation, package, and Lean validation; only test-process scheduling changes.
+- **The workflow contract test protects required contexts, draft reactivation, cancellation scope, and the nextest/doctest split.** External Woodpecker and Buildkite configuration is unchanged.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.

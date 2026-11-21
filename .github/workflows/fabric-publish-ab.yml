@@ -2,6 +2,7 @@ name: Fabric publication exact-base A/B
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
     paths:
       - '.github/workflows/fabric-publish-ab.yml'
       - 'scripts/fabric_publish_ab_bench.py'
@@ -15,6 +16,7 @@ concurrency:
 
 jobs:
   paired:
+    if: github.event.pull_request.draft == false
     name: Matched-fixture Fabric A/B
     runs-on: ubuntu-latest
     timeout-minutes: 90
