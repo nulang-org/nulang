@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "name": "nulang",
+  "commands": {
+    "test": {
+      "run": "just test",
+      "timeout_seconds": 3600
+    },
+    "lint": {
+      "run": "just lint",
+      "timeout_seconds": 1800
+    },
+    "typecheck": {
+      "run": "cargo check --locked --tests",
+      "timeout_seconds": 1800
+    },
+    "build": {
+      "run": "cargo build --locked",
+      "timeout_seconds": 3600
+    },
+    "dev": {
+      "run": "cargo run --bin nula -- repl"
+    }
+  },
+  "validation": {
+    "fallback_checks": [
+      "lint",
+      "typecheck",
+      "test"
+    ]
+  }
+}
