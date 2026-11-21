@@ -404,8 +404,11 @@ impl ActorHeap {
     /// Returns `None` only if the global allocator fails (OS OOM); an
     /// exhausted bump block triggers growth instead of failure.
     pub fn alloc(&mut self, payload_size: usize, type_tag: TypeTag) -> Option<*mut u8> {
-        let aligned_payload = align_up(payload_size);
-        let total_size = Self::HEADER_SIZE + aligned_payload;
+        // Reject sizes that cannot be represented after alignment and
+        // prepending the header. Wrapping here would let a huge logical
+        // payload alias a tiny physical allocation.
+        let aligned_payload = payload_size.checked_add(ALIGN - 1)? & !(ALIGN - 1);
+        let total_size = Self::HEADER_SIZE.checked_add(aligned_payload)?;
         // `block_size` is the uniform physical size reserved for the class
         // (the exact total for Huge/LOS blocks).  The header still records
         // the exact `total_size`, because the VM derives array / record /
@@ -1533,6 +1536,27 @@ fn test_header_size_is_56() {
     // The whole design assumes HEADER_SIZE == 56. If this ever changes,
     // classify_total_size and the memory layout comments must be updated.
     assert_eq!(ActorHeap::HEADER_SIZE, 56);
+}
+
+/// Invalid allocator requests must not wrap the padded payload or total
+/// allocation size. Such requests must not reserve heap storage.
+#[test]
+fn test_allocation_size_overflow_fails_without_modifying_heap() {
+    let mut heap = ActorHeap::new(4096);
+    let huge_sizes = [
+        usize::MAX,
+        usize::MAX - (ALIGN - 1),
+        usize::MAX - ActorHeap::HEADER_SIZE + 1,
+    ];
+    for payload_size in huge_sizes {
+        assert!(
+            heap.alloc(payload_size, TypeTag::Raw).is_none(),
+            "overflow-sized allocation must be rejected"
+        );
+        assert_eq!(heap.live_count(), 0);
+        assert_eq!(heap.used(), 0);
+        assert_eq!(heap.free_list_count(), 0);
+    }
 }
 
 #[test]
