@@ -936,6 +936,44 @@ mod transactional_receive_tests {
     }
 
     #[test]
+    fn bounded_mailbox_retains_capacity_through_selective_receive_and_system_bypass() {
+        let mut mb = Mailbox::new(1);
+        mb.push(msg(7, 1, MessagePriority::Normal))
+            .expect("first normal message admitted");
+
+        // Pattern discovery and guard rejection cannot release a slot.
+        assert!(mb.receive_match(&[7]).is_some());
+        assert_eq!(mb.len(), 1);
+        assert!(mb.push(msg(8, 2, MessagePriority::Bulk)).is_err());
+        mb.reset_receive_match();
+        assert!(mb.push_local(msg(9, 3, MessagePriority::Normal)).is_err());
+
+        // Supervisor signals must get through even if regular traffic is
+        // backpressured; they remain capacity-accounted until consumed.
+        mb.push(msg(99, 4, MessagePriority::System))
+            .expect("system signal bypasses bounded capacity");
+        assert_eq!(mb.len(), 2);
+
+        let (arm, payload) = mb.receive_match(&[99, 7]).expect("system first");
+        assert_eq!(arm, 0);
+        assert_eq!(payload[0].as_int(), Some(4));
+        mb.commit_receive_match().expect("commit system signal");
+        assert_eq!(mb.len(), 1);
+        assert!(mb.push(msg(10, 5, MessagePriority::Normal)).is_err());
+
+        let (_, normal) = mb.receive_match(&[7]).expect("staged normal");
+        assert_eq!(normal[0].as_int(), Some(1));
+        mb.commit_receive_match().expect("commit remaining normal");
+        assert!(mb.is_empty());
+
+        // One bounded slot is available again only after consumption.
+        mb.push(msg(10, 5, MessagePriority::Normal))
+            .expect("capacity restored after commit");
+        assert_eq!(mb.pop().expect("last message").sender, 5);
+        assert!(mb.is_empty());
+    }
+
+    #[test]
     fn indexed_receive_reset_rewinds_behavior_cursor() {
         let mut mb = Mailbox::new(8);
         mb.push_local(msg(7, 11, MessagePriority::Normal)).unwrap();
