@@ -510,12 +510,14 @@ mod tests {
     }
 
     #[test]
-    fn test_example_counter_actor_runs() {
+    fn test_example_counter_actor_standalone_vm_does_not_fabricate_actor() {
+        // run_source uses a bare VM, not the actor-capable RuntimeVmCallbacks.
+        // CLI execution has separate real-runtime spawn and delivery tests.
         let source = include_str!("../../examples/counter_actor.nula");
         let (value, _ty) = run_source(source).unwrap();
         assert!(
-            value.as_actor_id().is_some(),
-            "spawn should return an actor reference"
+            value.is_nil(),
+            "standalone VM must not fabricate actor references without a runtime"
         );
     }
 

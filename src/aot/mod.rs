@@ -1254,6 +1254,8 @@ impl crate::vm::ActorVmCallbacks for AotActorCallbacks {
         unsafe { (*self.actor).set_state_field(field, value) };
     }
 
+    // Standalone native driver has no actor-spawn support; returning an ActorRef
+    // with id zero would incorrectly advertise a spawned actor.
     fn spawn_actor(
         &mut self,
         _module: &crate::bytecode::CodeModule,
@@ -1261,7 +1263,7 @@ impl crate::vm::ActorVmCallbacks for AotActorCallbacks {
         _behavior_idx: usize,
         _init: Vec<(String, crate::vm::Value)>,
     ) -> crate::vm::Value {
-        crate::vm::Value::actor_ref(0)
+        crate::vm::Value::nil()
     }
 
     fn try_receive(&mut self) -> Option<(u16, crate::vm::Value)> {
