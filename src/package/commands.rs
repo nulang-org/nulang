@@ -876,6 +876,15 @@ fn capability_args() -> Vec<String> {
     }
 }
 
+/// Build compiler arguments with the capabilities declared in Nulang.toml.
+/// Keep WASM, JSON and deployment compiler invocations consistent with
+/// ordinary package builds instead of silently reverting to default-deny.
+fn compiler_args_with_manifest_capabilities(base: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = base.iter().map(|arg| (*arg).to_string()).collect();
+    args.extend(capability_args());
+    args
+}
+
 /// Try to find an already-built `nulang` CLI executable. Returns `None` if no
 /// standalone binary is available (e.g. during `cargo test --lib` where only
 /// the test harness exists).
@@ -1131,7 +1140,9 @@ fn cmd_build_json(root: &Path, name: &str, version: &str, entry_str: &str) -> Nu
     // Step 1: type-check with JSON diagnostics, capturing the child's stdout.
     eprintln!("Building {}...", name);
     eprintln!("  Type-checking {}...", entry_str);
-    let check = nulang_exe_output(&["--json", "--check", entry_str])?;
+    let check_args = compiler_args_with_manifest_capabilities(&["--json", "--check", entry_str]);
+    let check_refs: Vec<&str> = check_args.iter().map(String::as_str).collect();
+    let check = nulang_exe_output(&check_refs)?;
     if !check.status.success() {
         let stdout = String::from_utf8_lossy(&check.stdout);
         // Forward the child's structured diagnostics when parseable; fall
@@ -1173,7 +1184,7 @@ fn cmd_build_json(root: &Path, name: &str, version: &str, entry_str: &str) -> Nu
     let behavior_path = dist_dir.join(format!("{}.behavior.json", name));
     let behavior_path_str = behavior_path.to_string_lossy().into_owned();
     eprintln!("  Compiling {} to .nbc...", name);
-    let compile = nulang_exe_output(&[
+    let compile_args = compiler_args_with_manifest_capabilities(&[
         "--emit-nbc",
         "--out",
         &nbc_path_str,
@@ -1184,7 +1195,9 @@ fn cmd_build_json(root: &Path, name: &str, version: &str, entry_str: &str) -> Nu
         "--behavior-package-version",
         version,
         entry_str,
-    ])?;
+    ]);
+    let compile_refs: Vec<&str> = compile_args.iter().map(String::as_str).collect();
+    let compile = nulang_exe_output(&compile_refs)?;
     if !compile.status.success() {
         let stderr = String::from_utf8_lossy(&compile.stderr).trim().to_string();
         let report = JsonReport::new(
@@ -1261,7 +1274,15 @@ fn cmd_build_wasm() -> NuResult<()> {
 
     eprintln!("Building {} (WASM AOT)...", name);
     eprintln!("  Compiling {} to WASM...", entry.display());
-    nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
+    let wasm_args = compiler_args_with_manifest_capabilities(&[
+        --backend,
+        wasm-aot,
+        --out,
+        &wasm_path_str,
+        &entry_str,
+    ]);
+    let wasm_refs: Vec<&str> = wasm_args.iter().map(String::as_str).collect();
+    nulang_exe(&wasm_refs)?;
     println!("WASM AOT build succeeded.");
     Ok(())
 }
@@ -2274,7 +2295,7 @@ fn cmd_deploy(
     let behavior_path = nula_dist.join(format!("{}.behavior.json", name));
     let behavior_path_str = behavior_path.to_string_lossy().into_owned();
     eprintln!("Compiling {} to .nbc + behavior manifest...", name);
-    nulang_exe(&[
+    let bytecode_args = compiler_args_with_manifest_capabilities(&[
         "--emit-nbc",
         "--out",
         &nbc_path_str,
@@ -2285,14 +2306,24 @@ fn cmd_deploy(
         "--behavior-package-version",
         &version,
         &entry_str,
-    ])?;
+    ]);
+    let bytecode_refs: Vec<&str> = bytecode_args.iter().map(String::as_str).collect();
+    nulang_exe(&bytecode_refs)?;
 
     // Optionally build .wasm + .cwasm (WASM tier).
     if wasm {
         let wasm_path = nula_dist.join(format!("{}.wasm", name));
         let wasm_path_str = wasm_path.to_string_lossy().into_owned();
         eprintln!("Compiling {} to .wasm + .cwasm...", name);
-        nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
+        let wasm_args = compiler_args_with_manifest_capabilities(&[
+            --backend,
+            wasm-aot,
+            --out,
+            &wasm_path_str,
+            &entry_str,
+        ]);
+        let wasm_refs: Vec<&str> = wasm_args.iter().map(String::as_str).collect();
+        nulang_exe(&wasm_refs)?;
     }
 
     // Bundle into .tar.gz: .nula/dist/ contents + dist/** + Nulang.toml + Nulang.lock.
@@ -2606,6 +2637,64 @@ fn cmd_remove(name: Option<&str>) -> NuResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_compiler_args_forward_manifest_capabilities_to_wasm_and_json() {
+        let dir =
+            std::env::temp_dir().join(format!("nulang_compiler_cap_args_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_package(&dir, "cap-args", "default").expect("scaffold should succeed");
+        let mut manifest = Manifest::load(&dir).expect("manifest should load");
+        manifest.package.capabilities = vec!["net".to_string(), "fs".to_string()];
+        manifest.save(&dir).expect("save manifest");
+
+        let _guard = ChangeDir::new(&dir);
+        let wasm = compiler_args_with_manifest_capabilities(&[
+            "--backend",
+            "wasm-aot",
+            "--out",
+            "dist/cap-args.wasm",
+            "src/main.nula",
+        ]);
+        assert_eq!(
+            wasm.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "--backend",
+                "wasm-aot",
+                "--out",
+                "dist/cap-args.wasm",
+                "src/main.nula",
+                "--with",
+                "net",
+                "--with",
+                "fs",
+            ]
+        );
+
+        let check =
+            compiler_args_with_manifest_capabilities(&["--json", "--check", "src/main.nula"]);
+        assert_eq!(
+            check.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "--json",
+                "--check",
+                "src/main.nula",
+                "--with",
+                "net",
+                "--with",
+                "fs"
+            ]
+        );
+
+        manifest.package.capabilities.clear();
+        manifest.save(&dir).expect("save empty capabilities");
+        assert_eq!(
+            compiler_args_with_manifest_capabilities(&["--json", "--check", "src/main.nula"]),
+            vec!["--json", "--check", "src/main.nula"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_manifest_language_pin() {

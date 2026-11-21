@@ -222,6 +222,36 @@ fn nula_build_json_success() {
 }
 
 #[test]
+fn nula_build_json_forwards_manifest_net_capability() {
+    let dir = temp_dir("buildcaps");
+    scaffold_package(
+        &dir,
+        "fn main() = perform Http.get(\"https://example.com\")\n",
+        &[],
+    );
+    std::fs::write(
+        dir.join("Nulang.toml"),
+        "[package]\nname = \"jsonprobe\"\nversion = \"0.1.0\"\ncapabilities = [\"net\"]\n",
+    )
+    .expect("write manifest with net capability");
+
+    let out = run_nula(&dir, &["build", "--json"]);
+    assert!(
+        out.status.success(),
+        "declared net capability should allow JSON check and bytecode compilation: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("build stdout must be JSON");
+    assert_eq!(report["ok"], true);
+    assert!(dir.join(".nula/dist/jsonprobe.nbc").exists());
+    assert!(dir.join(".nula/dist/jsonprobe.behavior.json").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn nula_build_json_type_error_forwards_diagnostics() {
     let dir = temp_dir("buildbad");
     scaffold_package(&dir, "fn main() = countr + 1\n", &[]);
