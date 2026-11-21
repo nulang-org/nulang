@@ -1,0 +1,58 @@
+name: Trace dispatch three-arm diagnostic
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/trace-dispatch-abc.yml'
+      - 'scripts/trace_dispatch_abc_bench.py'
+      - 'scripts/tests/test_trace_dispatch_abc_bench.py'
+
+concurrency:
+  group: trace-dispatch-abc-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    name: Exact SHA baseline vs optimized vs eager-root
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Fetch exact diagnostic heads
+        run: |
+          git fetch origin refs/pull/1359/head refs/pull/1499/head
+          git cat-file -e 37b483b392865e6a30982318f61a2df13483017e^{commit}
+          git cat-file -e e6daa5f12a49af96945518f99747ef4ca9e9daae^{commit}
+          git cat-file -e ba4a5374810491f02023fd9806a9d3eac317e6a6^{commit}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify three-arm benchmark contracts
+        run: python3 -m unittest scripts/tests/test_trace_dispatch_abc_bench.py
+
+      - name: Run balanced same-host three-arm experiment
+        run: |
+          python3 scripts/trace_dispatch_abc_bench.py \
+            --base-sha 37b483b392865e6a30982318f61a2df13483017e \
+            --optimized-sha e6daa5f12a49af96945518f99747ef4ca9e9daae \
+            --eager-root-sha ba4a5374810491f02023fd9806a9d3eac317e6a6 \
+            --runs 6 --warmup 1 --cpu-mode single \
+            --output trace-dispatch-abc.json
+
+      - name: Preserve paired measurements
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: trace-dispatch-abc-${{ github.sha }}
+          path: trace-dispatch-abc.json
+          if-no-files-found: error
