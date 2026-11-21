@@ -213,6 +213,9 @@ jobs:
 
       - name: Verify documentation examples
         run: NULANG_BIN=./target/release/nulang bash scripts/verify_doc_examples.sh
+
+      - name: Verify inventory actor example
+        run: NULANG_BIN=./target/release/nulang bash scripts/verify_inventory_example.sh
   # -----------------------------------------------------------------------
   # No-default-features build — proves zero PyO3/SQLite/LSP dependencies
   # -----------------------------------------------------------------------

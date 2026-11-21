@@ -1,0 +1,62 @@
+// 18_inventory_reservations.nula - isolated state and business invariants
+//
+// One actor owns stock and reservations. Requests that would over-reserve
+// inventory are rejected instead of updating shared mutable state.
+//
+// Run:
+//   cargo run --locked -- examples/18_inventory_reservations.nula
+//
+// This is an in-memory actor example: it does not demonstrate persistence,
+// cross-node delivery, authorization, or exactly-once external effects.
+
+actor Inventory {
+    state available: Int = 5
+    state reserved: Int = 0
+
+    behavior reserve(quantity: Int) {
+        if quantity > 0 then {
+            if quantity <= self.available then {
+                self.available = self.available - quantity
+                self.reserved = self.reserved + quantity
+                perform IO.print("reservation accepted: " + perform Int.to_string(quantity))
+            } else {
+                perform IO.print("reservation rejected: " + perform Int.to_string(quantity) + " (insufficient stock)")
+            }
+        } else {
+            perform IO.print("reservation rejected: quantity must be positive")
+        }
+    }
+
+    behavior release(quantity: Int) {
+        if quantity > 0 then {
+            if quantity <= self.reserved then {
+                self.reserved = self.reserved - quantity
+                self.available = self.available + quantity
+                perform IO.print("release accepted: " + perform Int.to_string(quantity))
+            } else {
+                perform IO.print("release rejected: exceeds reserved inventory")
+            }
+        } else {
+            perform IO.print("release rejected: quantity must be positive")
+        }
+    }
+
+    behavior status() {
+        perform IO.print(
+            "available=" + perform Int.to_string(self.available) +
+            " reserved=" + perform Int.to_string(self.reserved)
+        )
+    }
+}
+
+fn main() {
+    let inventory = spawn Inventory {}
+
+    inventory ! reserve(3)
+    inventory ! reserve(4) // Rejected: only 2 units remain available
+    inventory ! status()
+    inventory ! release(1)
+    inventory ! status()
+
+    0
+}
