@@ -84,7 +84,7 @@ let person = { first: "Alice", last: "Smith", age: 30 }
 perform IO.print(full_name(person))  // "Alice Smith" — extra fields are fine
 ```
 
-An explicit annotation like `fn f(r: { first: String, last: String })` creates a **closed** record that rejects extra fields. Use inferred parameters for row-polymorphic functions.
+An explicit annotation like `fn f(r: { first: String, last: String })` creates a **closed** record that rejects extra fields. An experimental open annotation, `fn f(r: { first: String, last: String, .. })`, retains the declared field requirements but accepts additional fields.
 
 Records are structurally typed and created with `{ field: value, ... }` syntax.
 

@@ -1,0 +1,2 @@
+// Rejected: only one inferred row tail may appear.
+fn broken(p: { x: Int, .., .. }) -> Int { p.x }

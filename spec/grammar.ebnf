@@ -166,6 +166,9 @@ The following surface is Experimental and deliberately **not** specified here.
 It may change without RFC and is not part of the frozen or stable language:
 
 - `workflow` and `agent` declarations (AI orchestration).
+- Inline open-record **type annotations** such as `{ x: Int, .. }` (the
+  trailing `..` denotes a fresh inferred row variable). This experimental
+  additive extension must be stabilized by RFC before inclusion in §3.
 - `@backend(native|wasm)` actor annotation.
 - `@tool(description: "...")` function annotation (LLM tool exposure).
 - `extern "lib" { ... }` FFI blocks.

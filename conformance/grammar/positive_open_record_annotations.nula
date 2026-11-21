@@ -1,0 +1,11 @@
+// Experimental explicit open record annotations (RFC 0026).
+// case 01: a required field plus an inferred open row
+fn open_x(point: { x: Int, .. }) -> Int { point.x }
+// case 02: multiple required fields and a row tail
+fn open_name(person: { first: String, last: String, .. }) -> String {
+    person.first + person.last
+}
+// case 03: closed annotations remain legal
+fn closed_x(point: { x: Int }) -> Int { point.x }
+// case 04: empty inferred row tail
+fn any_record(value: { .. }) -> { .. } { value }

@@ -432,7 +432,7 @@ pub enum Type {
     /// A record whose field list ends with the reserved pseudo-field
     /// [`RECORD_ROW_TAIL_FIELD`] is an *open* record: the pseudo-field's type
     /// is a row variable standing for "possibly more fields". Records from
-    /// literals and annotations are always closed (no tail).
+    /// literal types are closed; explicit `..` annotations are open.
     Record(Vec<(String, Type)>),
     /// Variant Type1 | Type2 | ...
     Variant(Vec<(String, Option<Type>)>),
@@ -499,7 +499,11 @@ impl std::fmt::Display for Type {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}: {}", n, t)?;
+                    if n == RECORD_ROW_TAIL_FIELD {
+                        write!(f, "..")?;
+                    } else {
+                        write!(f, "{}: {}", n, t)?;
+                    }
                 }
                 write!(f, " }}")
             }
@@ -1008,7 +1012,8 @@ impl Type {
 
     /// An open record type: the given fields plus a fresh row variable
     /// standing for "possibly more fields". Produced by field access on a
-    /// record of not-yet-known shape; see [`RECORD_ROW_TAIL_FIELD`].
+    /// record of not-yet-known shape or by `{ x: Int, .. }` annotations;
+    /// see [`RECORD_ROW_TAIL_FIELD`].
     pub fn record_open(fields: Vec<(String, Type)>, row: TypeVar) -> Type {
         let mut fields = fields;
         fields.push((RECORD_ROW_TAIL_FIELD.to_string(), Type::Var(row)));

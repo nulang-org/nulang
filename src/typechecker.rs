@@ -5752,6 +5752,49 @@ mod tests {
     }
 
     #[test]
+    fn test_explicit_open_record_accepts_additional_fields() {
+        let src = "fn get_x(p: { x: Int, .. }) -> Int { p.x }\nget_x({ x: 7, y: 42 })";
+        let result = check_src(src);
+        assert!(
+            result.is_ok(),
+            "open record should accept extra fields: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_open_record_annotation_does_not_fix_unrelated_extra_fields() {
+        let src = "fn get_x(p: { x: Int, .. }) -> Int { p.x }\nget_x({ x: 7, y: 42 }) + get_x({ x: 3, label: \"second\" })";
+        let result = check_src(src);
+        assert!(
+            result.is_ok(),
+            "each call should infer its own row tail: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_explicit_open_record_requires_declared_field() {
+        let src = "fn get_x(p: { x: Int, .. }) -> Int { p.x }\nget_x({ y: 42 })";
+        assert!(check_src(src).is_err(), "open record should require x");
+    }
+
+    #[test]
+    fn test_explicit_open_record_rejects_wrong_field_type() {
+        let src = "fn get_x(p: { x: Int, .. }) -> Int { p.x }\nget_x({ x: true, y: 42 })";
+        assert!(check_src(src).is_err(), "required field x must be Int");
+    }
+
+    #[test]
+    fn test_closed_record_still_rejects_additional_fields() {
+        let src = "fn get_x(p: { x: Int }) -> Int { p.x }\nget_x({ x: 7, y: 42 })";
+        assert!(
+            check_src(src).is_err(),
+            "closed records must remain exact"
+        );
+    }
+
+    #[test]
     fn test_same_row_var_record_unify_populates_structured_fields() {
         // Two open records sharing the SAME row variable but demanding
         // disjoint extra fields cannot be reconciled. This branch
