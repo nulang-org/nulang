@@ -58,6 +58,33 @@ need an RFC; changes to Frozen or Stable surfaces do — see
 `RFC/0000-template.md`. Record every user-visible change in `CHANGELOG.md`
 under the correct tier.
 
+## Review and security admission
+
+Every contributor, including maintainers and dependency bots, follows the
+[maintainer review and merge policy](docs/MAINTAINER_REVIEW.md):
+
+- Use a pull request, the PR evidence template, and the governance stability
+  tiers. Describe the actual tests executed at the current head; do not
+  report queued, blocked, or unrun tests as passing.
+- Changes to untrusted bytecode, actors, durability, FFI, registry provenance,
+  networking, sandboxing, or CI/release permissions need adversarial test
+  cases and explicit threat-boundary review.
+- A passing formatting/build pipeline is necessary but not sufficient. A
+  separate maintainer should review the security and semantic diff before
+  promotion; unresolved review findings block merges.
+- Never interpolate PR titles, bodies, branch names, or other untrusted event
+  fields directly into a GitHub Actions `run:` script. Pass them through
+  `env:` or action inputs instead.
+- Do not bypass check failures by weakening tests, disabling audits, or
+  silently changing policy. Disclose and justify any requested exception.
+
+Independent review is required for critical code, but do **not** add a sole
+maintainer to `.github/CODEOWNERS` while GitHub's active ruleset requires
+code-owner review. That would block the maintainer's own PRs, or encourage
+bypass. Add CODEOWNERS only after onboarding a second trusted reviewer.
+Enforce up-to-date CI and reviewed merges in the GitHub ruleset; repository
+files alone cannot enforce server-side branch protection.
+
 ## Questions?
 
 - **Ask / discuss:** [GitHub Discussions](https://github.com/nulang-org/nulang/discussions)
