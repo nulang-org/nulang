@@ -2,6 +2,7 @@
 
 > Practical orientation for AI assistants working in the Nulang codebase.
 > All paths are relative to the repo root (`~/nulang`).
+> For implementation tasks, also follow [agent work orders and exact-head evidence](docs/AGENT_WORK_ORDERS.md); these supplement rather than weaken Nulang's semantic, security, and CI rules.
 
 ## Project Overview
 
