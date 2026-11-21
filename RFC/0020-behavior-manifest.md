@@ -10,10 +10,11 @@
 ## Implementation status
 
 An experimental v0alpha1 durability/admission subset is implemented in
-`src/behavior_manifest.rs`. Package bytecode builds emit
+`src/behavior_manifest.rs`. Package bytecode and WASM builds emit
 `<package>.behavior.json` and deployment bundles include it. The current
 implementation covers compiler artifact identity, an exact BLAKE3 digest binding
-to the emitted bytecode bytes, durable actor persistence classification,
+to the emitted executable bytes (including canonical `.wasm` bytes for
+`nula build-wasm`), durable actor persistence classification,
 state-schema semantic identity, schema versions, migration topology,
 deterministic manifest hashing, and structural upgrade preflight.
 

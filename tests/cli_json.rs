@@ -221,6 +221,56 @@ fn nula_build_json_success() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(feature = "wasm-backend")]
+#[test]
+fn nula_build_wasm_emits_behavior_manifest_bound_to_wasm() {
+    let dir = temp_dir("buildwasm");
+    scaffold_package(&dir, "fn main() = 1\n", &[]);
+
+    let out = run_nula(&dir, &["build-wasm"]);
+    assert!(
+        out.status.success(),
+        "build-wasm should succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let wasm_path = dir.join(".nula/dist/jsonprobe.wasm");
+    let cwasm_path = dir.join(".nula/dist/jsonprobe.cwasm");
+    let behavior_path = dir.join(".nula/dist/jsonprobe.behavior.json");
+    assert!(wasm_path.exists(), "build-wasm must emit canonical wasm");
+    assert!(
+        cwasm_path.exists(),
+        "build-wasm must emit precompiled cwasm"
+    );
+    assert!(
+        behavior_path.exists(),
+        "build-wasm must emit RFC 0020 behavior sidecar"
+    );
+
+    let wasm_bytes = std::fs::read(&wasm_path).expect("read emitted wasm");
+    let cwasm_bytes = std::fs::read(&cwasm_path).expect("read emitted cwasm");
+    let behavior_bytes = std::fs::read(&behavior_path).expect("read behavior sidecar");
+    let behavior = nulang::behavior_manifest::BehaviorManifest::from_json(&behavior_bytes)
+        .expect("parse emitted behavior sidecar");
+
+    assert_eq!(behavior.package.name, "jsonprobe");
+    assert_eq!(behavior.package.version, "0.1.0");
+    assert_eq!(
+        behavior.artifact.kind,
+        nulang::behavior_manifest::BEHAVIOR_ARTIFACT_KIND_WASM_MODULE
+    );
+    assert_eq!(behavior.artifact.backend, "wasm");
+    behavior
+        .verify_artifact_bytes(&wasm_bytes)
+        .expect("behavior sidecar must bind to exact emitted wasm bytes");
+    assert!(
+        behavior.verify_artifact_bytes(&cwasm_bytes).is_err(),
+        "sidecar must bind canonical wasm, not host-specific cwasm"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn nula_build_json_type_error_forwards_diagnostics() {
     let dir = temp_dir("buildbad");

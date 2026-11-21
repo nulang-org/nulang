@@ -21,6 +21,7 @@ use std::str::FromStr;
 
 pub const BEHAVIOR_MANIFEST_SCHEMA: &str = "nulang.behavior/v0alpha1";
 pub const BEHAVIOR_ARTIFACT_KIND_NBC_V1: &str = "nulang-bytecode-v1";
+pub const BEHAVIOR_ARTIFACT_KIND_WASM_MODULE: &str = "wasm-module";
 const BEHAVIOR_MANIFEST_DIGEST_DOMAIN: &[u8] = b"nulang.behavior-manifest.v0alpha1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,8 +117,30 @@ impl BehaviorManifest {
         artifact_bytes: &[u8],
         hir: &hir::Module,
     ) -> Result<Self, BehaviorManifestError> {
+        Self::from_typed_hir_with_artifact_kind(
+            package_name,
+            package_version,
+            BEHAVIOR_ARTIFACT_KIND_NBC_V1,
+            artifact,
+            artifact_bytes,
+            hir,
+        )
+    }
+
+    /// Build the same semantic manifest for a specific executable artifact
+    /// kind. This keeps backend-invariant behavior metadata identical while
+    /// binding the sidecar to the exact bytes emitted by that backend.
+    pub fn from_typed_hir_with_artifact_kind(
+        package_name: impl Into<String>,
+        package_version: impl Into<String>,
+        artifact_kind: impl Into<String>,
+        artifact: &ArtifactIdentityManifest,
+        artifact_bytes: &[u8],
+        hir: &hir::Module,
+    ) -> Result<Self, BehaviorManifestError> {
         let package_name = package_name.into();
         let package_version = package_version.into();
+        let artifact_kind = artifact_kind.into();
         let actor_defs = actor_defs_by_name(hir);
         let schemas = actor_state_schemas_from_hir(hir);
 
@@ -147,7 +170,7 @@ impl BehaviorManifest {
                 language_version: LANGUAGE_VERSION_STR.to_string(),
             },
             artifact: BehaviorArtifact {
-                kind: BEHAVIOR_ARTIFACT_KIND_NBC_V1.to_string(),
+                kind: artifact_kind,
                 digest: artifact_digest(artifact_bytes),
                 source_id: artifact.source_id().map(|id| id.to_string()),
                 semantic_id: artifact.semantic_id().to_string(),
@@ -345,7 +368,9 @@ impl BehaviorManifest {
                 "package version must not be empty".to_string(),
             ));
         }
-        if self.artifact.kind != BEHAVIOR_ARTIFACT_KIND_NBC_V1 {
+        if self.artifact.kind != BEHAVIOR_ARTIFACT_KIND_NBC_V1
+            && self.artifact.kind != BEHAVIOR_ARTIFACT_KIND_WASM_MODULE
+        {
             return Err(BehaviorManifestError::UnsupportedArtifactKind(
                 self.artifact.kind.clone(),
             ));
