@@ -239,6 +239,73 @@ pub struct HibernationState {
     pub state_fields: HashMap<String, Value>,
 }
 
+/// Cold, workflow-only query handlers. Idle actors store only a nullable
+/// pointer; the HashMap is allocated on the first registration rather than
+/// embedding its three-word hashbrown bookkeeping in every Actor.
+///
+/// The storage is intentionally discarded on pooled-actor reset so an actor
+/// cannot accidentally inherit another actor's ephemeral query handlers.
+#[derive(Debug, Default)]
+pub struct LazyQueryHandlers {
+    inner: Option<Box<HashMap<String, Value>>>,
+}
+
+impl LazyQueryHandlers {
+    /// Lookups never allocate or change the idle actor footprint.
+    pub fn get(&self, name: &str) -> Option<&Value> {
+        self.inner.as_ref().and_then(|handlers| handlers.get(name))
+    }
+
+    /// Allocates the map only when the first query handler is registered.
+    pub fn insert(&mut self, name: String, handler: Value) -> Option<Value> {
+        self.inner
+            .get_or_insert_with(|| Box::new(HashMap::new()))
+            .insert(name, handler)
+    }
+
+    /// Empty the map and release its backing allocation on actor reuse.
+    pub fn clear(&mut self) {
+        self.inner = None;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_none_or(|handlers| handlers.is_empty())
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.as_ref().map_or(0, |handlers| handlers.len())
+    }
+
+    /// Reports whether the optional backing HashMap has been allocated.
+    pub fn is_allocated(&self) -> bool {
+        self.inner.is_some()
+    }
+}
+
+// Preserve the ordinary HashMap read and mutation surface for embedders.
+// Unregistered actors dereference to a shared immutable empty map; mutations
+// instantiate private storage before returning a mutable reference.
+impl std::ops::Deref for LazyQueryHandlers {
+    type Target = HashMap<String, Value>;
+
+    fn deref(&self) -> &Self::Target {
+        static EMPTY: std::sync::OnceLock<HashMap<String, Value>> = std::sync::OnceLock::new();
+        self.inner
+            .as_deref()
+            .unwrap_or_else(|| EMPTY.get_or_init(HashMap::new))
+    }
+}
+
+impl std::ops::DerefMut for LazyQueryHandlers {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner
+            .get_or_insert_with(|| Box::new(HashMap::new()))
+            .as_mut()
+    }
+}
+
 /// An actor: independent unit of computation with isolated state and mailbox.
 pub struct Actor {
     pub id: u64,
@@ -331,7 +398,7 @@ pub struct Actor {
     /// with the actor bound as `self`, or a plain value returned as-is.
     /// Handlers are ephemeral: they are not journaled and must be
     /// re-registered after a node restart.
-    pub query_handlers: HashMap<String, Value>,
+    pub query_handlers: LazyQueryHandlers,
     /// True if this actor was generated from an `agent` declaration.
     pub is_agent: bool,
     /// Spawn-time capability manifest (canonical tokens such as
@@ -467,7 +534,7 @@ impl Actor {
             suspended_execution: None,
             waiting_signal: None,
             received_signals: Vec::new(),
-            query_handlers: HashMap::new(),
+            query_handlers: LazyQueryHandlers::default(),
             is_agent: false,
             capabilities: std::collections::BTreeSet::new(),
             backend: ActorBackend::default(),
@@ -849,6 +916,54 @@ mod tests {
         assert!(!actor.is_agent);
         assert_eq!(actor.max_reductions, 1000);
         assert_eq!(actor.reduction_count, 0);
+    }
+
+    #[test]
+    fn test_actor_query_handlers_allocate_only_for_workflows_and_reset_on_reuse() {
+        let mut actor = Actor::new(1, "idle", 0);
+        assert_eq!(
+            std::mem::size_of_val(&actor.query_handlers),
+            std::mem::size_of::<usize>(),
+            "cold query-handler metadata should occupy a single pointer"
+        );
+        assert!(!actor.query_handlers.is_allocated());
+        assert!(actor.query_handlers.is_empty());
+        assert_eq!(actor.query_handlers.get("health"), None);
+        assert!(!actor.query_handlers.contains_key("health"));
+        assert_eq!(actor.query_handlers.keys().count(), 0);
+        assert!(
+            !actor.query_handlers.is_allocated(),
+            "reads must not allocate"
+        );
+
+        assert_eq!(
+            actor
+                .query_handlers
+                .insert("health".to_string(), Value::int(7)),
+            None
+        );
+        assert!(actor.query_handlers.is_allocated());
+        assert_eq!(actor.query_handlers.get("health"), Some(&Value::int(7)));
+        assert_eq!(
+            actor
+                .query_handlers
+                .insert("health".to_string(), Value::int(8)),
+            Some(Value::int(7)),
+            "overwriting should retain HashMap insertion semantics"
+        );
+        assert_eq!(actor.query_handlers.get("health"), Some(&Value::int(8)));
+        *actor
+            .query_handlers
+            .entry("extra".to_string())
+            .or_insert(Value::int(0)) = Value::int(11);
+        assert_eq!(actor.query_handlers.get("extra"), Some(&Value::int(11)));
+
+        // Pooling must not leak query handlers across actor identities, nor
+        // retain their backing allocation after it is no longer needed.
+        actor.reset(2, "reused", 0);
+        assert!(!actor.query_handlers.is_allocated());
+        assert!(actor.query_handlers.is_empty());
+        assert_eq!(actor.query_handlers.get("health"), None);
     }
 
     #[test]
