@@ -58,6 +58,100 @@ fn utf16_col_to_byte(line: &str, col: usize) -> usize {
     line.len()
 }
 
+/// Conservative indentation formatter. Count syntax delimiters from lexer
+/// tokens, never from raw text (which may contain braces in strings/comments).
+/// Leave unsupported multiline lexical constructs untouched rather than risk
+/// changing their contents or turning invalid code into different code.
+fn format_nulang_source(source: &str) -> String {
+    if source.is_empty() || source.contains("/*") || source.contains('\r') {
+        return source.to_string();
+    }
+
+    let tokens = match Lexer::new(source).lex() {
+        Ok(tokens) => tokens,
+        Err(_) => return source.to_string(),
+    };
+
+    for token in &tokens {
+        let start = token.span.start as usize;
+        let end = token.span.end as usize;
+        let Some(text) = source.get(start..end) else {
+            return source.to_string();
+        };
+        if !matches!(&token.kind, crate::lexer::TokenKind::Newline)
+            && (text.contains('\n') || text.contains('\r'))
+        {
+            return source.to_string();
+        }
+    }
+
+    use crate::lexer::TokenKind;
+    let mut out = String::with_capacity(source.len());
+    let mut indent = 0usize;
+    let mut offset = 0usize;
+    let mut token_index = 0usize;
+    let width = 4usize;
+
+    for (line_index, line) in source.lines().enumerate() {
+        if line_index > 0 {
+            out.push('\n');
+        }
+        let end = offset + line.len();
+        let trimmed = line.trim();
+
+        let mut opens = 0usize;
+        let mut closes = 0usize;
+        let mut leading_closes = 0usize;
+        let mut seen_nonclose = false;
+        let mut ends_in_clause = false;
+
+        while token_index < tokens.len() {
+            let token = &tokens[token_index];
+            let start = token.span.start as usize;
+            if start >= end {
+                break;
+            }
+            token_index += 1;
+            if start < offset {
+                continue;
+            }
+            match &token.kind {
+                TokenKind::LBrace | TokenKind::LBracket | TokenKind::LParen => {
+                    opens += 1;
+                    seen_nonclose = true;
+                }
+                TokenKind::RBrace | TokenKind::RBracket | TokenKind::RParen => {
+                    closes += 1;
+                    if !seen_nonclose {
+                        leading_closes += 1;
+                    }
+                }
+                TokenKind::Newline | TokenKind::Eof => continue,
+                _ => seen_nonclose = true,
+            }
+            ends_in_clause = matches!(&token.kind, TokenKind::In | TokenKind::Then);
+        }
+
+        if !trimmed.is_empty() {
+            indent = indent.saturating_sub(leading_closes * width);
+            out.push_str(&" ".repeat(indent));
+            out.push_str(trimmed);
+            indent = indent
+                .saturating_add(opens * width)
+                .saturating_sub((closes - leading_closes) * width);
+            if ends_in_clause && opens == 0 {
+                indent = indent.saturating_add(width);
+            }
+        }
+        offset = end + 1; // Move past the source newline.
+    }
+
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // LSP Server
 // ---------------------------------------------------------------------------
@@ -1297,53 +1391,7 @@ impl NulangLanguageServer {
     }
 
     fn fmt_source(&self, source: &str) -> String {
-        let mut out = String::with_capacity(source.len());
-        let mut indent: usize = 0;
-        let w: usize = 4;
-        let mut prev = false;
-        for line in source.lines() {
-            let t = line.trim();
-            if t.is_empty() {
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                prev = true;
-                continue;
-            }
-            let close = t
-                .chars()
-                .filter(|&c| c == '}' || c == ']' || c == ')')
-                .count();
-            let open = t
-                .chars()
-                .filter(|&c| c == '{' || c == '[' || c == '(')
-                .count();
-            let net = open as isize - close as isize;
-            if close > 0 && close >= open {
-                indent = indent.saturating_sub((close - open) * w);
-            }
-            if t.starts_with("in ") || t == "in" {
-                indent = indent.saturating_sub(w);
-            }
-            if !prev && !out.is_empty() {
-                out.push('\n');
-            }
-            for _ in 0..indent / w {
-                out.push_str("    ");
-            }
-            out.push_str(t);
-            if net > 0 {
-                indent += net as usize * w;
-            }
-            if (t.ends_with("in") || t.ends_with("then")) && !t.contains('{') {
-                indent += w;
-            }
-            prev = false;
-        }
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out
+        format_nulang_source(source)
     }
 
     fn sem_tokens(&self, source: &str) -> Vec<SemanticToken> {
@@ -4708,4 +4756,27 @@ mod lsp_tests {
             "expected cached inlay hint with Int type"
         );
     }
+
+    #[test]
+    fn test_format_ignores_braces_in_strings_and_comments() {
+        let source = "fn main() {\n    perform IO.print(\"{\")\n    // } should not close a block\n    perform IO.print(\"ok\")\n}\n";
+        assert_eq!(format_nulang_source(source), source);
+    }
+
+    #[test]
+    fn test_format_nested_blocks_and_is_idempotent() {
+        let source = "fn main() {\nif true {\nperform IO.print(\"ok\")\n}\n}\n";
+        let expected = "fn main() {\n    if true {\n        perform IO.print(\"ok\")\n    }\n}\n";
+        assert_eq!(format_nulang_source(source), expected);
+        assert_eq!(format_nulang_source(expected), expected);
+    }
+
+    #[test]
+    fn test_format_preserves_multiline_literals_and_invalid_input() {
+        let multiline = "fn main() {\n    let text = \"\"\"{\nraw\n}\"\"\"\n}\n";
+        assert_eq!(format_nulang_source(multiline), multiline);
+        let invalid = "fn main() {\n    let text = \"unterminated\n";
+        assert_eq!(format_nulang_source(invalid), invalid);
+    }
+
 }

@@ -93,7 +93,7 @@ Records are structurally typed and created with `{ field: value, ... }` syntax.
 Algebraic data types defined with `type ... = ... | ...`:
 
 ```nulang
-type Result[T, E] = Ok(T) | Err(E)
+type Result[T, E] = Ok(T) | Error(E)
 
 type Tree[T] = Leaf | Node((Tree[T], T, Tree[T]))
 ```
@@ -181,8 +181,10 @@ actor Assistant {
 }
 
 let a = spawn Assistant {} in
-ask a ask("What is an actor model?")
+ask a ask("What is an actor model?") timeout 1000
 ```
+
+`ask ... timeout` currently accepts a non-negative **integer literal in milliseconds**. Dynamic expressions are not yet supported and produce a parse error rather than silently disabling the timeout.
 
 See [AI Agents](/ai/overview/) for agent declarations and tool binding.
 
@@ -211,7 +213,7 @@ fn greet() -> Unit ! {IO} {
     perform IO.print("Hello")
 }
 
-// throws is an alias for !
+// `throws` is also accepted, but `!` is the canonical effect-row spelling
 fn log(msg: String) -> Unit throws {IO} {
     perform IO.print(msg)
 }

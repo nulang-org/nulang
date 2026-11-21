@@ -4237,16 +4237,21 @@ impl Parser {
         };
         self.expect(TokenKind::LParen)?;
         let args = self.parse_arg_list()?;
-        // Optional transport modifiers: `timeout <int>`
+        // Only literal, non-negative millisecond timeouts are implemented.
+        // Reject unsupported expressions instead of silently dropping the timeout.
         let timeout_ms = if let TokenKind::Ident(ref s) = self.peek_kind() {
             if s == "timeout" {
-                self.advance(); // consume 'timeout'
+                let timeout_span = self.current_span();
+                self.advance();
                 let ms = self.parse_expr()?;
-                // Evaluate timeout at compile time if it's a literal int
-                if let Expr::Literal(Literal::Int(n), _) = &ms {
-                    Some(*n as u64)
-                } else {
-                    None // dynamic timeout not yet supported
+                match ms {
+                    Expr::Literal(Literal::Int(n), _) if n >= 0 => Some(n as u64),
+                    _ => {
+                        return Err(NuError::parse_error(
+                            "ask timeout requires a non-negative integer literal (dynamic timeouts are not supported)".to_string(),
+                            timeout_span,
+                        ));
+                    }
                 }
             } else {
                 None
@@ -4281,7 +4286,7 @@ impl Parser {
         self.advance(); // consume 'perform'
         let effect = self.expect_ident("effect name")?;
         self.expect(TokenKind::Dot)?;
-        // `ask`, `link`, `monitor`, `exit` and `ref` are reserved keywords,
+        // `ask`, `link`, `monitor`, `exit`, `ref`, and `import` are reserved keywords,
         // so they lex as keyword tokens rather than identifiers; accept them
         // as operation names (`perform Actor.link(t)`, `perform Grain.ref(...)`).
         let op = match self.peek_kind() {
@@ -4304,6 +4309,10 @@ impl Parser {
             TokenKind::Ref => {
                 self.advance();
                 "ref".to_string()
+            }
+            TokenKind::Import => {
+                self.advance();
+                "import".to_string()
             }
             _ => self.expect_ident("operation name")?,
         };
@@ -7936,6 +7945,49 @@ mod tests {
                     assert_eq!(op, expected_op, "{}", source);
                 }
                 other => panic!("Expected perform for {}, got {:?}", source, other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_ask_timeout_literal_is_retained() {
+        let expr = parse_expr("ask worker get() timeout 500").unwrap();
+        match expr {
+            Expr::Ask { timeout_ms, .. } => assert_eq!(timeout_ms, Some(500)),
+            other => panic!("Expected Ask expression, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_ask_timeout_rejects_unsupported_values() {
+        for source in [
+            "ask worker get() timeout delay",
+            "ask worker get() timeout 100 + 50",
+            "ask worker get() timeout -1",
+        ] {
+            let err = parse_expr(source).expect_err("nonliteral or negative timeout must fail");
+            assert!(
+                format!("{:?}", err).contains("non-negative integer literal"),
+                "{} should explain the supported timeout syntax: {:?}",
+                source,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_perform_reserved_keyword_operation_names() {
+        for (source, effect, op) in [
+            ("perform Python.import(\"math\")", "Python", "import"),
+            ("perform Actor.link(worker)", "Actor", "link"),
+        ] {
+            let expr = parse_expr(source).unwrap();
+            match expr {
+                Expr::Perform { effect: got_effect, op: got_op, .. } => {
+                    assert_eq!(got_effect, effect);
+                    assert_eq!(got_op, op);
+                }
+                other => panic!("Expected Perform expression, got {:?}", other),
             }
         }
     }
