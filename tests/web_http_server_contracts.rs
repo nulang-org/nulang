@@ -125,6 +125,22 @@ fn compiler_bound_query_executes_over_real_http() {
 }
 
 #[test]
+fn absolute_form_routes_a_typed_query_over_real_http() {
+    let server = WebDevServer::bind_runtime(0, None, None, vec![typed_query_route()])
+        .expect("bind typed WebDevServer");
+
+    // The absolute request-target's authority overrides the mismatched Host,
+    // and the normalized path/query must reach compiler-backed dispatch.
+    let response = send_raw_request(
+        server.port,
+        "GET http://example.test/users?limit=31 HTTP/1.1\r\nHost: misleading.test\r\nConnection: close\r\n\r\n",
+    );
+
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(response_body(&response).starts_with("31"), "{response}");
+}
+
+#[test]
 fn invalid_typed_query_is_problem_json_over_real_http() {
     let server = WebDevServer::bind_runtime(0, None, None, vec![typed_query_route()])
         .expect("bind typed WebDevServer");
