@@ -133,8 +133,9 @@ is needed.
 Nulang-only A/B probes include a mailbox-only one-value admission lower bound,
 a 0/1/4/5/16-value runtime enqueue sweep around the small-message inline
 boundary, a matched warmed-bytecode/JIT vs AOT actor-drain comparison over the
-same actor source, first-run JIT-vs-interpreter crossover probes at 3k, 4k,
-5k, and 7.5k loop trips, and two warmed 100k-iteration JIT execution controls:
+same actor source, a native-handler drain control over 50k increment messages
+with and without an incoming W3C traceparent, first-run JIT-vs-interpreter
+crossover probes at 3k, 4k, 5k, and 7.5k loop trips, and two warmed 100k-iteration JIT execution controls:
 a non-reentrant arithmetic loop plus a call-heavy loop that re-enters the VM. The actor comparison warms bytecode past the tier-up
 threshold before timing and excludes enqueue time for both backends; it also
 emits a `[backend-bench]` AOT speedup line. The tiering probes preconstruct
