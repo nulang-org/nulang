@@ -291,6 +291,36 @@ fn test_send_carries_current_trace_span() {
 }
 
 #[test]
+fn traced_local_delivery_preserves_admission_and_dead_letter_accounting() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(Vec::new));
+    rt.actors.get_mut(&actor_id).unwrap().mailbox.reset(1);
+
+    let parent = TraceContext::root();
+    rt.current_trace = Some(parent);
+    rt.send_message_by_id(actor_id, 0, &[Value::int(7)]);
+    rt.send_message_by_id(actor_id, 0, &[Value::int(8)]);
+
+    // Only the first normal message is admitted. The second follows the
+    // bounded-mailbox backpressure path, without replacing the first payload.
+    assert_eq!(rt.actors[&actor_id].mailbox.len(), 1);
+    assert_eq!(rt.dlq_depth(), 1);
+    let delivered = rt.actors.get_mut(&actor_id).unwrap().receive().unwrap();
+    assert_eq!(delivered.payload[0].as_int(), Some(7));
+    let context = TraceContext::from_traceparent(
+        delivered.trace_id.as_deref().expect("accepted traceparent"),
+    )
+    .expect("valid accepted traceparent");
+    assert_eq!(context.trace_id(), parent.trace_id());
+    assert_eq!(context.span_id(), parent.span_id());
+
+    // Missing actors still enter the DLQ rather than creating a mailbox.
+    rt.send_message_by_id(u64::MAX, 0, &[Value::int(9)]);
+    assert_eq!(rt.dlq_depth(), 2);
+    assert!(!rt.actors.contains_key(&u64::MAX));
+}
+
+#[test]
 fn test_delivery_establishes_child_context_and_inherits() {
     let mut rt = Runtime::new();
     let a = rt.spawn_actor(Box::new(|| vec![]));
