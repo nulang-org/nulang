@@ -30,6 +30,13 @@
       "description": "String helpers including trim, split, join, replace, case conversion, and search."
     },
     {
+      "name": "bytes",
+      "import": "stdlib::bytes",
+      "source": "src/stdlib/bytes.nula",
+      "stability": "experimental",
+      "description": "UTF-8 octet extraction and strict hexadecimal encoding/decoding over [Int]; in-memory only."
+    },
+    {
       "name": "map",
       "import": "stdlib::map",
       "source": "src/stdlib/map.nula",

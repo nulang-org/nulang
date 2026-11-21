@@ -15,6 +15,7 @@ registry cannot silently drift from the in-tree standard library.
 | `math` | `stdlib::math` | experimental | `src/stdlib/math.nula` | — | Numeric helpers including abs, min, max, clamp, pow, factorial, gcd, and sqrt. |
 | `list` | `stdlib::list` | experimental | `src/stdlib/list.nula` | — | Functional array/list combinators including map, filter, fold, append, reverse, and sort. |
 | `string` | `stdlib::string` | experimental | `src/stdlib/string.nula` | — | String helpers including trim, split, join, replace, case conversion, and search. |
+| `bytes` | `stdlib::bytes` | experimental | `src/stdlib/bytes.nula` | — | UTF-8 octet extraction and strict hexadecimal encoding/decoding over [Int]; in-memory only. |
 | `map` | `stdlib::map` | experimental | `src/stdlib/map.nula` | — | Persistent map helpers implemented in Nulang over array-backed key/value records. |
 | `set` | `stdlib::set` | experimental | `src/stdlib/set.nula` | — | Persistent set helpers implemented in Nulang over arrays. |
 | `result` | `stdlib::result` | experimental | `src/stdlib/result.nula` | — | Operations on the prelude-owned Result type. |

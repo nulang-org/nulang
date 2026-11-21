@@ -1,0 +1,72 @@
+// Nulang standard library — strict octet conversion and hexadecimal encoding.
+// Import: `import stdlib::bytes`
+//
+// Experimental representation: [Int], with each element restricted to 0..255.
+// This is an in-memory codec, NOT a streaming Reader/Writer or a native ByteBuffer.
+// Do not use these helpers as a way to decode arbitrary bytes into a String.
+//
+// This module uses byte-indexed String.charAt and is thus safe for UTF-8 input:
+// a non-ASCII character produces all of its UTF-8 bytes, not its code point.
+
+/// Errors from strict octet and hexadecimal operations.
+pub type ByteError = OddHexLength | InvalidHexDigit(Int) | InvalidByte(Int)
+
+/// Copy the UTF-8 bytes of a string into an octet array.
+/// Strings are valid UTF-8. This does not perform any character conversion.
+pub fn from_utf8(text: String) -> [Int] {
+    let n = perform String.length(text);
+    // All elements are Int, so zero-initialized preallocation is ownership-safe.
+    var out = perform Array.new(n, 0);
+    var i = 0;
+    while i < n {
+        out[i] = perform String.charAt(text, i);
+        i = i + 1
+    };
+    out
+}
+
+/// Lowercase hexadecimal representation of an octet array.
+///
+/// Rejects numbers outside [0,255] rather than truncating or wrapping them.
+pub fn encode_hex(bytes: [Int]) -> Result[String, ByteError] {
+    var out = perform StrBuilder.new();
+    for b in bytes {
+        if b < 0 || b > 255 then { return Error(InvalidByte(b)) } else {};
+        let upper = b / 16;
+        let lower = b % 16;
+        let upper_ascii = if upper < 10 then upper + 48 else upper + 87;
+        let lower_ascii = if lower < 10 then lower + 48 else lower + 87;
+        out = perform StrBuilder.push(out, perform String.from_char(upper_ascii));
+        out = perform StrBuilder.push(out, perform String.from_char(lower_ascii))
+    };
+    Ok(perform StrBuilder.to_string(out))
+}
+
+// Return -1 for a non-hexadecimal ASCII input byte.
+fn hex_digit(b: Int) -> Int {
+    if b >= 48 && b <= 57 then b - 48
+    else if b >= 65 && b <= 70 then b - 55
+    else if b >= 97 && b <= 102 then b - 87
+    else -1
+}
+
+/// Decode ASCII hexadecimal digits into octets.
+///
+/// Accepts both letter cases; rejects odd lengths and invalid characters
+/// (including non-ASCII input). No partial output is returned on failure.
+pub fn decode_hex(text: String) -> Result[[Int], ByteError] {
+    let n = perform String.length(text);
+    if n % 2 != 0 then { return Error(OddHexLength) } else {};
+    // Known output length; avoid quadratic Array.push copying.
+    var out = perform Array.new(n / 2, 0);
+    var i = 0;
+    while i < n {
+        let hi = hex_digit(perform String.charAt(text, i));
+        if hi < 0 then { return Error(InvalidHexDigit(i)) } else {};
+        let lo = hex_digit(perform String.charAt(text, i + 1));
+        if lo < 0 then { return Error(InvalidHexDigit(i + 1)) } else {};
+        out[i / 2] = hi * 16 + lo;
+        i = i + 2
+    };
+    Ok(out)
+}
