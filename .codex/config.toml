@@ -1,0 +1,9 @@
+# Nulang code-intelligence policy:
+# - codebase-memory-mcp provides architecture, call-path, and impact analysis.
+# - Prefer rust-analyzer for semantic definition/reference/type truth.
+# - Prefer rg for exact text and ast-grep for structural rewrites.
+
+[mcp_servers.codebase-memory-mcp]
+command = "codebase-memory-mcp"
+args = []
+enabled = true
