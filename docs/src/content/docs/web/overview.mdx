@@ -208,9 +208,11 @@ nulang nula dev            # serves on the [web] port (or: nula dev --port 8080)
 
 `nula dev` compiles the package, starts the web server, serves each registered route dynamically, falls back to `static_dir` for unclaimed paths (e.g. `/style.css`), and injects the client runtime script into pages. Try it:
 
+For this experimental routed Web host, mutations (POST/PUT/PATCH/DELETE) require a trusted `Host` and matching `Origin` (or unambiguous `Referer`) with compatible `Sec-Fetch-Site`. Absent, duplicate, or cross-site provenance is rejected with HTTP `403` before handler execution. This intentionally also applies to manual API clients: include `Origin` in `curl` requests. Behind a trusted HTTPS reverse proxy, set `NULANG_WEB_PUBLIC_ORIGIN=https://your-domain.example` and preserve the public `Host`; client-supplied `X-Forwarded-*` headers must not establish trust. This protects request provenance, **not** authentication or per-resource authorization; standalone `Http.serve` does not use this guard.
+
 ```bash
 curl http://127.0.0.1:8080/hello/david      # <h1>Hello, david!</h1>
-curl -X POST -d 'msg=hi' http://127.0.0.1:8080/sign
+curl -X POST -H 'Origin: http://127.0.0.1:8080' -d 'msg=hi' http://127.0.0.1:8080/sign
 curl http://127.0.0.1:8080/last             # "Last message: hi"
 ```
 
@@ -240,7 +242,7 @@ Subscribers connect to the built-in Server-Sent Events endpoint `/<room-prefix>/
 
 ```bash
 curl -N http://127.0.0.1:8080/__nulang/sse/signs   # in one terminal
-curl -X POST -d 'msg=live' http://127.0.0.1:8080/sign   # in another → SSE client receives it
+curl -X POST -H 'Origin: http://127.0.0.1:8080' -d 'msg=live' http://127.0.0.1:8080/sign   # in another → SSE client receives it
 ```
 
 The `examples/chat-web` package shows the full pattern: an SSE `<script>` in the page, a POST handler that stores and broadcasts, and a `redirect` back. Treat this layer as minimal — one broadcast op, one SSE transport, in-process delivery.
