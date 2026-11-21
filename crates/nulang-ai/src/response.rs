@@ -34,7 +34,7 @@ impl TokenUsage {
         Self {
             prompt,
             completion,
-            total: prompt + completion,
+            total: prompt.saturating_add(completion),
         }
     }
 }
@@ -166,6 +166,17 @@ mod tests {
         assert_eq!(usage.prompt, 0);
         assert_eq!(usage.completion, 0);
         assert_eq!(usage.total, 0);
+    }
+
+    #[test]
+    fn test_token_usage_total_saturates_instead_of_overflowing() {
+        let overflow = TokenUsage::new(u32::MAX, 1);
+        assert_eq!(overflow.prompt, u32::MAX);
+        assert_eq!(overflow.completion, 1);
+        assert_eq!(overflow.total, u32::MAX);
+
+        let both_max = TokenUsage::new(u32::MAX, u32::MAX);
+        assert_eq!(both_max.total, u32::MAX);
     }
 
     #[test]
