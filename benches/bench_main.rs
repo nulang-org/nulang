@@ -14,6 +14,7 @@ mod interp_bench;
 mod jit_bench;
 mod persist_bench;
 mod scheduler_bench;
+mod trace_bench;
 mod vm_bench;
 
 use criterion::criterion_main;
@@ -30,6 +31,7 @@ criterion_main!(
     dist_bench::benches,
     persist_bench::benches,
     scheduler_bench::benches,
+    trace_bench::benches,
 );
 
 #[cfg(not(feature = "native-codegen"))]
@@ -42,4 +44,5 @@ criterion_main!(
     dist_bench::benches,
     persist_bench::benches,
     scheduler_bench::benches,
+    trace_bench::benches,
 );

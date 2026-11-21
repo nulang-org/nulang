@@ -21,6 +21,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+const TRACEPARENT_LEN: usize = 55;
+const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+
 /// Thread-safe stateless PRNG for trace / span id generation.
 ///
 /// A monotonically incremented counter fed through splitmix64. Deterministic
@@ -65,6 +68,52 @@ fn nonzero_u128() -> u128 {
     }
 }
 
+#[inline]
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[inline]
+fn parse_hex(bytes: &[u8]) -> Option<u128> {
+    let mut value = 0u128;
+    for &byte in bytes {
+        value = (value << 4) | u128::from(hex_nibble(byte)?);
+    }
+    Some(value)
+}
+
+#[inline]
+fn write_hex(out: &mut [u8], value: u128) {
+    let len = out.len();
+    for (index, slot) in out.iter_mut().enumerate() {
+        let shift = (len - index - 1) * 4;
+        *slot = HEX_LOWER[((value >> shift) & 0x0f) as usize];
+    }
+}
+
+/// Encode the version-00 W3C traceparent layout directly into its final
+/// 55-byte backing buffer. This avoids the generic formatting machinery on
+/// every actor send while still returning an owned String at the API boundary.
+#[inline]
+fn encode_traceparent_bytes(trace_id: u128, span_id: u64, sampled: bool) -> Vec<u8> {
+    let mut out = vec![0u8; TRACEPARENT_LEN];
+    out[0] = b'0';
+    out[1] = b'0';
+    out[2] = b'-';
+    write_hex(&mut out[3..35], trace_id);
+    out[35] = b'-';
+    write_hex(&mut out[36..52], u128::from(span_id));
+    out[52] = b'-';
+    out[53] = b'0';
+    out[54] = if sampled { b'1' } else { b'0' };
+    out
+}
+
 /// A W3C trace context: a 128-bit trace id plus the current span id, its
 /// parent span id, and the sampled flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,45 +151,37 @@ impl TraceContext {
     /// obtain this side's own span under it. Returns `None` on malformed
     /// input, non-zero-length version, or a zero trace/span id.
     pub fn from_traceparent(s: &str) -> Option<Self> {
-        let mut parts = s.split('-');
-        let version = parts.next()?;
-        let trace = parts.next()?;
-        let span = parts.next()?;
-        let flags = parts.next()?;
-        if parts.next().is_some() {
-            return None; // too many fields
-        }
-        if version.len() != 2 || trace.len() != 32 || span.len() != 16 || flags.len() != 2 {
+        let bytes = s.as_bytes();
+        if bytes.len() != TRACEPARENT_LEN
+            || &bytes[0..2] != b"00"
+            || bytes[2] != b'-'
+            || bytes[35] != b'-'
+            || bytes[52] != b'-'
+        {
             return None;
         }
-        let mut version_buf = [0u8; 1];
-        hex::decode_to_slice(version, &mut version_buf).ok()?;
-        if version_buf[0] != 0 {
-            return None; // only version 00 is understood
-        }
-        let mut trace_buf = [0u8; 16];
-        hex::decode_to_slice(trace, &mut trace_buf).ok()?;
-        let mut span_buf = [0u8; 8];
-        hex::decode_to_slice(span, &mut span_buf).ok()?;
-        let mut flags_buf = [0u8; 1];
-        hex::decode_to_slice(flags, &mut flags_buf).ok()?;
-        let trace_id = u128::from_be_bytes(trace_buf);
-        let span_id = u64::from_be_bytes(span_buf);
+
+        let trace_id = parse_hex(&bytes[3..35])?;
+        let span_id = u64::try_from(parse_hex(&bytes[36..52])?).ok()?;
+        let flags = u8::try_from(parse_hex(&bytes[53..55])?).ok()?;
         if trace_id == 0 || span_id == 0 {
             return None;
         }
+
         Some(TraceContext {
             trace_id,
             span_id,
             parent_span_id: 0,
-            sampled: flags_buf[0] & 0x01 != 0,
+            sampled: flags & 0x01 != 0,
         })
     }
 
     /// Encode as a W3C `traceparent` string.
     pub fn to_traceparent(&self) -> String {
-        let flags = if self.sampled { "01" } else { "00" };
-        format!("00-{:032x}-{:016x}-{flags}", self.trace_id, self.span_id)
+        let bytes = encode_traceparent_bytes(self.trace_id, self.span_id, self.sampled);
+        // SAFETY: encode_traceparent_bytes writes only ASCII literals and
+        // lowercase hexadecimal digits into every byte of the output buffer.
+        unsafe { String::from_utf8_unchecked(bytes) }
     }
 
     pub fn trace_id(&self) -> u128 {
@@ -223,6 +264,30 @@ mod tests {
         assert_eq!(ctx.trace_id(), 0x4bf9_2f35_77b3_4da6_a3ce_929d_0e0e_4736);
         assert_eq!(ctx.span_id(), 0x00f0_67aa_0ba9_02b7);
         assert!(ctx.sampled());
+    }
+
+    #[test]
+    fn test_fixed_width_traceparent_codec() {
+        let bytes = encode_traceparent_bytes(
+            0x4bf9_2f35_77b3_4da6_a3ce_929d_0e0e_4736,
+            0x00f0_67aa_0ba9_02b7,
+            true,
+        );
+        assert_eq!(bytes.len(), TRACEPARENT_LEN);
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        );
+    }
+
+    #[test]
+    fn test_uppercase_traceparent_remains_accepted() {
+        let ctx = TraceContext::from_traceparent(
+            "00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-01",
+        )
+        .expect("hex decoder historically accepts uppercase input");
+        assert_eq!(ctx.trace_id(), 0x4bf9_2f35_77b3_4da6_a3ce_929d_0e0e_4736);
+        assert_eq!(ctx.span_id(), 0x00f0_67aa_0ba9_02b7);
     }
 
     #[test]
