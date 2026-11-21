@@ -10,6 +10,7 @@ on:
       - ".github/workflows/codeql.yml"
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled]
     paths:
       - "**.rs"
       - "**/Cargo.toml"
@@ -31,6 +32,10 @@ permissions:
 
 jobs:
   analyze:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.draft == false ||
+      contains(github.event.pull_request.labels.*.name, 'P0')
     name: Analyze (Rust)
     runs-on: ubuntu-latest
     timeout-minutes: 45
