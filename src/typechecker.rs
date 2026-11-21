@@ -2226,9 +2226,21 @@ impl TypeChecker {
                 let final_subst = compose_subst(&s3, &compose_subst(&s2, &s1));
                 Ok((final_subst, Type::unit()))
             }
-            // Defer — just typecheck the deferred expression; the defer
-            // itself has unit type.
-            Expr::Defer { expr, .. } => {
+            // Ordinary defer is lowered for deterministic local exits.
+            // Error-only cleanup currently has no reliable error-unwind
+            // mechanism in the VM/actor runtime: accepting it would silently
+            // skip cleanup on precisely the path where it is required.
+            Expr::Defer {
+                expr,
+                error_only,
+                span,
+            } => {
+                if *error_only {
+                    return Err(NuError::NotYetImplemented {
+                        feature: "errdefer requires error-unwind cleanup semantics".to_string(),
+                        span: *span,
+                    });
+                }
                 let _ = self.infer_expr(ctx, expr)?;
                 Ok((vec![], Type::unit()))
             }
@@ -4395,6 +4407,37 @@ mod tests {
     // -----------------------------------------------------------------------
     // Test: Literals
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_errdefer_is_rejected_until_error_unwind_is_implemented() {
+        let span = sp();
+        let expr = Expr::Defer {
+            expr: Box::new(Expr::Literal(Literal::Int(42), span)),
+            error_only: true,
+            span,
+        };
+        let mut checker = TypeChecker::new();
+        let err = checker
+            .infer_expr(&TypeContext::new(), &expr)
+            .expect_err("errdefer must not silently skip crash/error cleanup");
+        assert!(matches!(
+            err,
+            NuError::NotYetImplemented { feature, .. } if feature.contains("errdefer")
+        ));
+    }
+
+    #[test]
+    fn test_ordinary_defer_remains_well_typed() {
+        let span = sp();
+        let expr = Expr::Defer {
+            expr: Box::new(Expr::Literal(Literal::Int(42), span)),
+            error_only: false,
+            span,
+        };
+        let mut checker = TypeChecker::new();
+        let (_, ty) = checker.infer_expr(&TypeContext::new(), &expr).unwrap();
+        assert_eq!(ty, Type::unit());
+    }
 
     #[test]
     fn test_infer_int_literal() {

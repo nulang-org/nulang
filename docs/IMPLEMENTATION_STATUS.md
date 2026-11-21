@@ -60,6 +60,14 @@ source
 Do not claim backend parity unless the relevant conformance and differential
 tests establish it. Bytecode remains the semantic reference.
 
+## Deterministic scope cleanup (stabilization boundary)
+
+- On successful lexical block exit, `defer` expressions are lowered in last-in-first-out order.
+- On explicit `return` and `break`, the exit value is evaluated and captured before ordinary deferred expressions run.
+- `errdefer` currently fails at type checking with `NotYetImplemented` because the runtime does not yet guarantee cleanup during error unwinding.
+- Scope-lowered cleanup is **not** a guarantee of cleanup on panic, abrupt actor cancellation, process termination, durable recovery, or a failed external effect. Those require separate runtime-level and durability contracts.
+- Parallel branches remain conservative about deferred cleanup until concurrent ordering and cancellation are specified.
+
 ## Actor runtime
 
 The live runtime is sharded and cooperatively scheduled.

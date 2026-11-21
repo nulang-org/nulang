@@ -12126,11 +12126,86 @@ match { a: 2, b: 9 } with {
         assert_int(source, 42);
     }
 
-    /// errdefer: same as defer (error-only distinction not yet tracked in HIR).
+    /// Nested lexical scopes must execute cleanup in inner-first LIFO
+    /// order, with effects observable by code outside the cleaned scopes.
+    #[test]
+    fn test_defer_nested_lifo_order_reaches_vm() {
+        let source = r#"
+            var trace = 0 in {
+                {
+                    defer trace = trace * 10 + 1
+                    {
+                        defer trace = trace * 10 + 2
+                        defer trace = trace * 10 + 3
+                        0
+                    }
+                    0
+                }
+                trace
+            }
+        "#;
+        assert_int(source, 321);
+    }
+
+    /// The value of a lexical block must be captured before its defer
+    /// mutates the variable it returned, while cleanup stays observable.
+    #[test]
+    fn test_defer_block_result_is_captured_before_cleanup_in_vm() {
+        let source = r#"
+            var value = 7 in {
+                let before = {
+                    defer value = 99
+                    value
+                } in before * 100 + value
+            }
+        "#;
+        assert_int(source, 799);
+    }
+
+    /// Returning a variable from a scope captures the pre-cleanup value.
+    #[test]
+    fn test_defer_return_captures_value_before_cleanup_in_vm() {
+        let source = r#"
+            fn read_before_cleanup() -> Int {
+                var value = 7 in {
+                    defer value = 99
+                    return value
+                }
+            }
+            read_before_cleanup()
+        "#;
+        assert_int(source, 7);
+    }
+
+    /// Breaking out of nested scopes executes only exited scopes'
+    /// deferred mutations, from inner to outer, before loop continuation.
+    #[test]
+    fn test_defer_nested_break_cleanup_reaches_vm() {
+        let source = r#"
+            var trace = 0 in {
+                while true {
+                    defer trace = trace * 10 + 1
+                    {
+                        defer trace = trace * 10 + 2
+                        break
+                    }
+                }
+                trace
+            }
+        "#;
+        assert_int(source, 21);
+    }
+
+    /// An error-only defer must not silently execute on a successful exit.
+    /// It remains unavailable until VM error unwinding can guarantee cleanup.
     #[test]
     fn test_errdefer_basic() {
         let source = "{ errdefer 1; 42 }";
-        assert_int(source, 42);
+        let error = run_source(source).expect_err("errdefer must fail closed");
+        assert!(
+            matches!(error, NuError::NotYetImplemented { .. }),
+            "expected an unsupported error-only cleanup diagnostic, got {error:?}"
+        );
     }
 
     /// Defer with break: defers run on break path.
