@@ -1,6 +1,9 @@
 [target.x86_64-unknown-linux-gnu]
+# Keep the portable system linker as the repository default. Do not force GNU
+# bfd: developers can opt into mold/LLD through scripts/cargo-fast.sh without
+# making those linkers hard requirements for contributors or CI.
 linker = "gcc"
-rustflags = ["-C", "link-arg=-fuse-ld=bfd", "-C", "link-arg=-Wl,--export-dynamic"]
+rustflags = ["-C", "link-arg=-Wl,--export-dynamic"]
 
 [env]
 PYO3_USE_ABI3_FORWARD_COMPATIBILITY = "1"
@@ -11,6 +14,45 @@ CXXFLAGS = "-include cstdint"
 
 [build]
 target-dir = "/tmp/cargo-target"
+
+# Fast inner-loop commands. These deliberately avoid the heavyweight default
+# feature graph (Cranelift, PyO3, libSQL, LSP, AI runtime, etc.) unless the
+# developer is working on one of those subsystems.
+[alias]
+fast-check = "check --lib --no-default-features"
+fast-test = "test --lib --no-default-features"
+fast-build = "build --no-default-features"
+check-jit = "check --lib --no-default-features --features native-codegen"
+check-full = "check --workspace --all-targets --all-features"
+build-timings = "build --timings"
+debug-build = "build --profile debugging"
+dev-runtime-build = "build --profile dev-runtime"
+
+# Optimize the normal edit/check/build loop for compiler throughput. Full debug
+# information remains available through `cargo debug-build`.
+[profile.dev]
+opt-level = 0
+debug = "line-tables-only"
+incremental = true
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+opt-level = 0
+debug = false
+
+# Opt-in debugger profile with full symbols for workspace code.
+[profile.debugging]
+inherits = "dev"
+debug = true
+
+# Opt-in profile that restores the previous dependency optimization when the
+# speed of the generated debug binary matters more than compilation latency.
+[profile.dev-runtime]
+inherits = "dev"
+
+[profile.dev-runtime.package."*"]
+opt-level = 1
+debug = false
 
 # quick-xml 0.14 (pulled in transitively by `inferno` for flamegraph support)
 # carries a future-incompat lint for code that a future Rust release will
