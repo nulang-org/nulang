@@ -814,7 +814,7 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
             let mut rt = self.runtime.borrow_mut();
             return rt.query_workflow(workflow_id, &query_name);
         }
-        #[cfg(feature = "sqlite")]
+        #[cfg(any(feature = "sqlite", feature = "postgres"))]
         if effect_name == "DB" && op_name == Some("query") {
             let sql = match regs.first().and_then(|v| v.as_string_id()) {
                 Some(id) => match constants.get(id as usize) {
@@ -832,7 +832,10 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
                     let json = serde_json::to_string(&rows).unwrap_or_default();
                     self.alloc_string(&json)
                 }
-                Err(_) => crate::vm::Value::nil(),
+                Err(error) => {
+                    tracing::warn!(%error, "DB.query failed; legacy API returns Nil");
+                    crate::vm::Value::nil()
+                },
             };
             return Some(result);
         }
@@ -1639,7 +1642,7 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                 };
                 return (*self.runtime).query_workflow(workflow_id, &query_name);
             }
-            #[cfg(feature = "sqlite")]
+            #[cfg(any(feature = "sqlite", feature = "postgres"))]
             if effect_name == "DB" && op_name == Some("query") {
                 let sql = match regs.first().and_then(|v| v.as_string_id()) {
                     Some(id) => match constants.get(id as usize) {
@@ -1658,7 +1661,10 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                             Some(crate::vm::Value::nil())
                         }
                     }
-                    Err(_) => Some(crate::vm::Value::nil()),
+                    Err(error) => {
+                        tracing::warn!(%error, "DB.query failed; legacy API returns Nil");
+                        Some(crate::vm::Value::nil())
+                    },
                 };
             }
             if effect_name == "Actor" {
@@ -3047,4 +3053,25 @@ mod host_authority_tests {
             authorize_actor_host_effect(&rt, None, "FS", Some("read"), &constants, &regs,).is_ok()
         );
     }
+}
+
+
+// PostgreSQL builds without SQLite must still dispatch the public DB effect.
+#[cfg(all(test, feature = "postgres", not(feature = "sqlite")))]
+#[test]
+fn postgres_only_build_dispatches_db_query() {
+    use crate::vm::ActorVmCallbacks;
+
+    let runtime = Rc::new(RefCell::new(Runtime::new()));
+    let mut callbacks = RuntimeVmCallbacks::new(runtime);
+    let result = callbacks.perform_builtin_effect(
+        "DB",
+        Some("query"),
+        &[crate::bytecode::Constant::String("SELECT 1".to_owned())],
+        &[crate::vm::Value::string(0)],
+    );
+    assert!(
+        result.is_some(),
+        "DB.query must be handled even when SQLite is disabled"
+    );
 }
