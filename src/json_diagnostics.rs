@@ -104,7 +104,25 @@ pub struct JsonSpan {
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonSuggestion {
     pub message: String,
+    /// A replacement for a verified source slice; null for advisory help.
     pub replacement: Option<String>,
+    /// Source-anchored text edit. Additive optional field in JSON schema v1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edit: Option<JsonTextEdit>,
+    /// Suggestions require semantic review and rechecking after application.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applicability: Option<String>,
+}
+
+/// Byte offsets (UTF-8), not character counts or LSP UTF-16 columns.
+/// Consumers must verify `expected_text` before applying the replacement.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonTextEdit {
+    pub file: String,
+    pub start_byte: u32,
+    pub end_byte: u32,
+    pub expected_text: String,
+    pub new_text: String,
 }
 
 /// Per-test result for `nula test --json`.
@@ -139,11 +157,68 @@ fn diagnostic_from_single(err: &NuError) -> JsonDiagnostic {
         message: json_message(err),
         span: err.primary_span().and_then(json_span),
         notes: crate::diagnostic::diagnostic_notes(err),
-        suggestion: err.suggestion().map(|msg| JsonSuggestion {
-            message: msg.to_string(),
-            replacement: None,
+        suggestion: unbound_variable_text_edit(err).or_else(|| {
+            err.suggestion().map(|msg| JsonSuggestion {
+                message: msg.to_string(),
+                replacement: None,
+                edit: None,
+                applicability: None,
+            })
         }),
     }
+}
+
+/// Only propose a concrete edit for a uniquely suggested in-scope name whose
+/// source span exactly matches the unknown identifier. A close name is not
+/// proof of programmer intent, so these edits always require review and a
+/// subsequent compiler check. Never infer an edit from free-form help text.
+fn unbound_variable_text_edit(err: &NuError) -> Option<JsonSuggestion> {
+    let NuError::TypeError {
+        msg,
+        span,
+        similar_names: Some(names),
+        ..
+    } = err
+    else {
+        return None;
+    };
+    if err.stable_code() != Some("E0202") {
+        return None;
+    }
+    let [candidate] = names.as_slice() else {
+        return None;
+    };
+    let original = msg
+        .strip_prefix("Unbound variable: '")?
+        .strip_suffix('\'')?;
+    if original.is_empty() || candidate.is_empty() || original == candidate {
+        return None;
+    }
+
+    let source = current_source_text()?;
+    let start = span.start as usize;
+    let end = span.end as usize;
+    if start >= end || source.get(start..end)? != original {
+        return None;
+    }
+    let file = source_map_file()?;
+    // A synthetic / REPL filename is not a safely targetable source file.
+    if file.is_empty() || (file.starts_with('<') && file.ends_with('>')) {
+        return None;
+    }
+
+    Some(JsonSuggestion {
+        message: format!("consider replacing `{original}` with `{candidate}`"),
+        replacement: Some(candidate.clone()),
+        edit: Some(JsonTextEdit {
+            file,
+            start_byte: span.start,
+            end_byte: span.end,
+            expected_text: original.to_string(),
+            new_text: candidate.clone(),
+        }),
+        applicability: Some("requires-review".to_string()),
+    })
 }
 
 /// The core message without position prefixes or structured-field suffixes.
@@ -270,6 +345,94 @@ mod tests {
         assert_eq!(diags.len(), 2);
         assert_eq!(diags[0].code.as_deref(), Some("E0101"));
         assert_eq!(diags[1].code.as_deref(), Some("E0102"));
+    }
+
+
+    #[test]
+    fn test_unbound_variable_exposes_reviewable_text_edit() {
+        let source = "let counter = 1\nlet value = countr + 1\n";
+        set_source_map_with_file(source, Some("program.nula"));
+        let start = source.find("countr +").unwrap() as u32;
+        let error = NuError::unbound_variable(
+            "countr",
+            Span::new(start, start + "countr".len() as u32),
+            Some(vec!["counter".into()]),
+        );
+
+        let diagnostics = diagnostics_from_error(&error);
+        let suggestion = diagnostics[0].suggestion.as_ref().expect("suggestion");
+        assert_eq!(suggestion.replacement.as_deref(), Some("counter"));
+        assert_eq!(suggestion.applicability.as_deref(), Some("requires-review"));
+        let edit = suggestion.edit.as_ref().expect("machine-readable edit");
+        assert_eq!(edit.file, "program.nula");
+        assert_eq!(edit.start_byte, start);
+        assert_eq!(edit.end_byte, start + 6);
+        assert_eq!(edit.expected_text, "countr");
+        assert_eq!(edit.new_text, "counter");
+
+        let report = JsonReport::new("check", Some("program.nula".into()), diagnostics);
+        let json: serde_json::Value = serde_json::from_str(&report.to_json_string()).unwrap();
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["diagnostics"][0]["suggestion"]["edit"]["start_byte"], start);
+        assert_eq!(json["diagnostics"][0]["suggestion"]["edit"]["new_text"], "counter");
+        clear_source_map();
+    }
+
+    #[test]
+    fn test_ambiguous_unbound_variable_does_not_offer_edit() {
+        let source = "let count = 1\nlet value = countr\n";
+        set_source_map_with_file(source, Some("ambiguous.nula"));
+        let start = source.find("countr").unwrap() as u32;
+        let error = NuError::unbound_variable(
+            "countr",
+            Span::new(start, start + 6),
+            Some(vec!["counter".into(), "count".into()]),
+        );
+
+        assert!(diagnostics_from_error(&error)[0].suggestion.is_none());
+        clear_source_map();
+    }
+
+    #[test]
+    fn test_unbound_variable_mismatched_or_missing_source_never_offers_edit() {
+        let source = "let value = different\n";
+        set_source_map_with_file(source, Some("mismatch.nula"));
+        let start = source.find("different").unwrap() as u32;
+        let error = NuError::unbound_variable(
+            "countr",
+            Span::new(start, start + "different".len() as u32),
+            Some(vec!["counter".into()]),
+        );
+        let diagnostic = &diagnostics_from_error(&error)[0];
+        assert!(diagnostic.suggestion.as_ref().and_then(|s| s.edit.as_ref()).is_none());
+        clear_source_map();
+
+        assert!(diagnostics_from_error(&error)[0]
+            .suggestion
+            .as_ref()
+            .and_then(|s| s.edit.as_ref())
+            .is_none());
+    }
+
+    #[test]
+    fn test_unbound_variable_edit_offsets_are_utf8_bytes() {
+        let source = "let café = 1\nlet output = cafè\n";
+        set_source_map_with_file(source, Some("unicode.nula"));
+        let start = source.find("cafè").unwrap() as u32;
+        let end = start + "cafè".len() as u32;
+        let error = NuError::unbound_variable(
+            "cafè",
+            Span::new(start, end),
+            Some(vec!["café".into()]),
+        );
+
+        let diagnostics = diagnostics_from_error(&error);
+        let edit = diagnostics[0].suggestion.as_ref().unwrap().edit.as_ref().unwrap();
+        assert_eq!(edit.start_byte, start);
+        assert_eq!(edit.end_byte, end);
+        assert_eq!(&source[edit.start_byte as usize..edit.end_byte as usize], "cafè");
+        assert_eq!(edit.new_text, "café");
+        clear_source_map();
     }
 
     #[test]
