@@ -78,14 +78,14 @@ impl LlmClient for OllamaClient {
             .unwrap_or_default()
             .into_iter()
             .map(|tc| {
-                let args = parse_arguments(tc.function.arguments);
-                ToolCall {
+                let arguments = crate::response::parse_tool_arguments(tc.function.arguments)?;
+                Ok(ToolCall {
                     id: String::new(),
                     name: tc.function.name,
-                    arguments: args,
-                }
+                    arguments,
+                })
             })
-            .collect();
+            .collect::<Result<_, LlmError>>()?;
 
         let prompt_tokens = response.prompt_eval_count.unwrap_or(0);
         let completion_tokens = response.eval_count.unwrap_or(0);
@@ -125,14 +125,6 @@ fn into_ollama_tool(tool: ToolSchema) -> OllamaTool {
             description: tool.description,
             parameters: tool.parameters,
         },
-    }
-}
-
-fn parse_arguments(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
-    match value {
-        serde_json::Value::Object(map) => map,
-        serde_json::Value::String(s) => serde_json::from_str(&s).unwrap_or_default(),
-        _ => serde_json::Map::new(),
     }
 }
 
