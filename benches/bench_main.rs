@@ -9,6 +9,8 @@ mod aot_bench;
 mod cache_bench;
 mod dist_bench;
 mod gc_bench;
+#[cfg(feature = "native-codegen")]
+mod go_parity_bench;
 mod interp_bench;
 #[cfg(feature = "native-codegen")]
 mod jit_bench;
@@ -26,6 +28,7 @@ criterion_main!(
     cache_bench::benches,
     aot_bench::benches,
     jit_bench::benches,
+    go_parity_bench::benches,
     gc_bench::benches,
     dist_bench::benches,
     persist_bench::benches,
