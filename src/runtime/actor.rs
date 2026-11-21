@@ -561,6 +561,20 @@ impl Actor {
         self.held_object_store = None;
     }
 
+    /// Reinitialize a pooled actor with its default synthetic name while
+    /// retaining the previous String allocation when its capacity suffices.
+    ///
+    /// Used only for the runtime's default `actor_<id>` naming path. Explicit
+    /// caller-supplied names continue through `reset` unchanged.
+    pub(crate) fn reset_with_generated_name(&mut self, id: u64, mailbox_cap: usize) {
+        use std::fmt::Write as _;
+
+        let mut name = std::mem::take(&mut self.name);
+        name.clear();
+        write!(&mut name, "actor_{id}").expect("formatting into String cannot fail");
+        self.reset(id, name, mailbox_cap);
+    }
+
     /// Hibernate this actor: serialize its state and VM continuation,
     /// store in hibernation_state, and return the serialized bytes.
     pub fn hibernate(
@@ -849,6 +863,28 @@ mod tests {
         assert!(!actor.is_agent);
         assert_eq!(actor.max_reductions, 1000);
         assert_eq!(actor.reduction_count, 0);
+    }
+
+    #[test]
+    fn test_pooled_generated_name_reuses_storage_and_resets_actor_state() {
+        let mut actor = Actor::new(7, "actor_00000000000000000000", 0);
+        let name_ptr = actor.name.as_ptr();
+        actor.set_state_field("transient", Value::int(42));
+        actor.run_state = ActorRunState::Queued;
+
+        // The pooled fast path must not allocate a replacement name buffer
+        // when the existing buffer is large enough.
+        actor.reset_with_generated_name(8, 0);
+        assert_eq!(actor.name, "actor_8");
+        assert_eq!(actor.name.as_ptr(), name_ptr);
+        assert_eq!(actor.id, 8);
+        assert!(actor.get_state_field("transient").is_none());
+        assert_eq!(actor.run_state, ActorRunState::Idle);
+
+        // A longer ID may grow the buffer, but the generated name is exact.
+        actor.reset_with_generated_name(u64::MAX, 0);
+        assert_eq!(actor.name, format!("actor_{}", u64::MAX));
+        assert_eq!(actor.id, u64::MAX);
     }
 
     #[test]
