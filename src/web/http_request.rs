@@ -5,7 +5,7 @@
 //! coupling the decoder to the runtime server implementation.
 
 use crate::web::request_bindings::{
-    parse_cookie_header, parse_urlencoded, split_request_target, RequestBindingValues,
+    parse_cookie_header, parse_urlencoded_strict, RequestBindingValues, RequestDecodeError,
 };
 use nulang_ui_protocol::{decode_host_message, ActionPlacement, HostToRuntimeMessage};
 use std::collections::HashMap;
@@ -46,6 +46,8 @@ pub struct HttpRequestBindingInputs {
     pub cookies: HashMap<String, String>,
     pub body: Option<String>,
     pub form: HashMap<String, String>,
+    /// Malformed or ambiguous query/form fields are rejected before any handler.
+    pub input_error: Option<RequestDecodeError>,
     /// Validated renderer-neutral UI/action message carried alongside a
     /// compatibility form submission. Invalid or unsupported envelopes are
     /// ignored rather than becoming runtime authority.
@@ -62,7 +64,11 @@ impl HttpRequestBindingInputs {
     /// must not be reinterpreted as form data merely because a handler declares
     /// a form binding.
     pub fn capture(target: &str, headers: &[(String, String)], body: &[u8]) -> Self {
-        let (_, query) = split_request_target(target);
+        let query_text = target.split_once('?').map_or("", |(_, query)| query);
+        let parsed_query = parse_urlencoded_strict(
+            query_text.as_bytes(),
+            crate::web::bindings::RouteBindingSource::Query,
+        );
 
         let mut cookies = HashMap::new();
         for (_, value) in headers
@@ -73,18 +79,30 @@ impl HttpRequestBindingInputs {
         }
 
         let body_text = (!body.is_empty()).then(|| String::from_utf8_lossy(body).into_owned());
-        let form = if is_urlencoded_form(headers) {
-            parse_urlencoded(body)
+        let parsed_form = if is_urlencoded_form(headers) {
+            parse_urlencoded_strict(body, crate::web::bindings::RouteBindingSource::Form)
         } else {
-            HashMap::new()
+            Ok(HashMap::new())
         };
-        let (ui_message, ui_message_error) = capture_ui_action_message(&form);
+        let input_error = parsed_query
+            .as_ref()
+            .err()
+            .cloned()
+            .or_else(|| parsed_form.as_ref().err().cloned());
+        let query = parsed_query.unwrap_or_default();
+        let form = parsed_form.unwrap_or_default();
+        let (ui_message, ui_message_error) = if input_error.is_some() {
+            (None, None)
+        } else {
+            capture_ui_action_message(&form)
+        };
 
         Self {
             query,
             cookies,
             body: body_text,
             form,
+            input_error,
             ui_message,
             ui_message_error,
         }
@@ -156,6 +174,7 @@ fn is_urlencoded_form(headers: &[(String, String)]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::web::request_bindings::RequestDecodeErrorKind;
 
     #[test]
     fn captures_query_cookies_body_and_urlencoded_form() {
@@ -189,6 +208,46 @@ mod tests {
             captured.form.get("title").map(String::as_str),
             Some("hello world")
         );
+    }
+
+    #[test]
+    fn duplicate_query_parameter_fails_capture_closed() {
+        let captured = HttpRequestBindingInputs::capture("/projects?tenant=a&tenant=b", &[], b"");
+        let error = captured.input_error.expect("ambiguous query must fail");
+        assert_eq!(error.kind, RequestDecodeErrorKind::DuplicateInput);
+        assert_eq!(error.http_status(), 400);
+    }
+
+    #[test]
+    fn duplicate_ui_action_field_is_never_dispatched() {
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        let captured = HttpRequestBindingInputs::capture(
+            "/",
+            &headers,
+            b"__nulang_action=save&__nulang_action=delete",
+        );
+        assert_eq!(
+            captured.input_error.as_ref().map(|error| error.kind),
+            Some(RequestDecodeErrorKind::DuplicateInput)
+        );
+        assert!(captured.ui_message.is_none());
+    }
+
+    #[test]
+    fn malformed_form_encoding_fails_before_binding() {
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        let captured = HttpRequestBindingInputs::capture("/", &headers, b"name=%FF");
+        assert_eq!(
+            captured.input_error.as_ref().map(|error| error.kind),
+            Some(RequestDecodeErrorKind::InvalidEncoding)
+        );
+        assert!(captured.form.is_empty());
     }
 
     #[test]
