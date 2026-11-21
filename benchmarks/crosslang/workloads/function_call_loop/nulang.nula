@@ -1,0 +1,11 @@
+fn add(x: Int, y: Int) -> Int { x + y };
+var sum = 0;
+var i = 0;
+while i < 9000000 {
+    sum = add(sum, i * 3 - i / 7);
+    if sum > 1000000000 then {
+        sum = sum - 1000000000;
+    };
+    i = i + 1;
+};
+sum

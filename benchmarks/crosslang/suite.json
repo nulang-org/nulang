@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "workloads": [
+    {
+      "name": "arithmetic_loop",
+      "category": "compute",
+      "description": "9,000,000 iterations of integer multiply/add/divide in a hot loop.",
+      "iterations": 9000000,
+      "expected_stdout": "115714276714285",
+      "languages": [
+        "nulang",
+        "cpp",
+        "rust",
+        "go",
+        "java",
+        "node",
+        "python"
+      ]
+    },
+    {
+      "name": "function_call_loop",
+      "category": "compute",
+      "description": "9,000,000 source-level calls to add(sum, delta) in a bounded state-dependent recurrence; optimizing runtimes may inline.",
+      "iterations": 9000000,
+      "expected_stdout": "276714285",
+      "languages": [
+        "nulang",
+        "cpp",
+        "rust",
+        "go",
+        "java",
+        "node",
+        "python"
+      ]
+    },
+    {
+      "name": "actor_mailbox",
+      "category": "concurrency",
+      "description": "One state-owning actor/task receives 250,000 ordered increment messages followed by a report message.",
+      "iterations": 250000,
+      "expected_stdout": "250000",
+      "languages": [
+        "nulang",
+        "go",
+        "erlang"
+      ]
+    },
+    {
+      "name": "actor_self_chain",
+      "category": "concurrency",
+      "description": "One actor/task performs 250,000 turns by sending the next tick to its own mailbox, then reports the completed turn count.",
+      "iterations": 250000,
+      "expected_stdout": "250000",
+      "languages": [
+        "nulang",
+        "go",
+        "erlang"
+      ]
+    },
+    {
+      "name": "actor_fanout_fanin",
+      "category": "concurrency",
+      "description": "64 independent workers each process 2,000 ordered work messages, then fan in their counters to one collector.",
+      "iterations": 128000,
+      "expected_stdout": "128000",
+      "languages": [
+        "nulang",
+        "go",
+        "erlang"
+      ]
+    },
+    {
+      "name": "actor_runtime_baseline",
+      "category": "concurrency",
+      "description": "Start the language runtime in actor-capable mode, create no actors/tasks/processes, print 0, and exit.",
+      "iterations": 1,
+      "expected_stdout": "0",
+      "languages": [
+        "nulang",
+        "go",
+        "erlang"
+      ]
+    },
+    {
+      "name": "actor_spawn_100k",
+      "category": "concurrency",
+      "description": "Create 100,000 lightweight actors/processes/goroutines that remain resident until process exit.",
+      "iterations": 100000,
+      "expected_stdout": "100000",
+      "languages": [
+        "nulang",
+        "go",
+        "erlang"
+      ]
+    }
+  ]
+}

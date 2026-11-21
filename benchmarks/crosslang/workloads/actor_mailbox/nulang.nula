@@ -1,0 +1,22 @@
+actor Counter {
+    state count: Int = 0
+
+    behavior inc() {
+        self.count = self.count + 1
+    }
+
+    behavior report() {
+        perform IO.print(self.count)
+    }
+}
+
+fn main() {
+    let counter = spawn Counter {}
+    var i = 0
+    while i < 250000 {
+        send counter inc()
+        i = i + 1
+    }
+    send counter report()
+    unit
+}
