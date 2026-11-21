@@ -155,6 +155,12 @@ pub unsafe fn cstr_to_value(s: *const c_char) -> Value {
     // SAFETY: caller guarantees `s` is a valid, null-terminated C string.
     let cstr = CStr::from_ptr(s);
     let cstring = CString::new(cstr.to_bytes()).unwrap_or_else(|_| CString::default());
+    // Keep CString ownership until the address is known to fit. Calling
+    // into_raw() before the check leaks this allocation when pointer packing
+    // fails on platforms with a virtual address wider than the VM payload.
+    if !crate::value_layout::ptr_fits_payload(cstring.as_ptr() as u64) {
+        return Value::nil();
+    }
     ptr_to_value_checked(cstring.into_raw() as *mut u8)
 }
 
@@ -661,6 +667,15 @@ mod tests {
             unsafe { CStr::from_ptr(round_ptr).to_str().unwrap() },
             "hello ffi"
         );
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn test_marshal_voidptr_rejects_unencodable_address_without_dereference() {
+        // This address is a synthetic value, not a dereferenceable pointer.
+        // Returning nil rather than truncating it prevents forging a VM pointer.
+        let unencodable = (1_u64 << 48) as usize as *mut c_void;
+        assert!(voidptr_to_value(unencodable).is_nil());
     }
 
     #[test]
