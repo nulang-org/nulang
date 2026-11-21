@@ -88,10 +88,35 @@ def measurement_affinity(cpu_mode: str) -> set[int] | None:
     return {allowed[0]}
 
 
+# Criterion's printed benchmark IDs preserve the first group slash (for
+# example, "aot/hot_loop"), but its output directory sanitizes that slash
+# ("aot_hot_loop"). Historical result files use the directory form. Only
+# restore the known top-level bench families; a blind underscore replacement
+# would change legitimate benchmark identifiers and silently widen filters.
+CRITERION_GROUPS = frozenset(
+    ("actor", "aot", "cache", "dist", "gc", "interp", "jit", "persist", "scheduler", "vm")
+)
+
+
+def criterion_display_name(history_name: str) -> str:
+    # Nested groups also flatten their embedded slash in the Criterion
+    # estimates path. Match the most specific prefix first.
+    for history_prefix, display_prefix in (
+        ("vm_perform_direct_", "vm/perform_direct/"),
+        ("vm_perform_", "vm/perform/"),
+    ):
+        if history_name.startswith(history_prefix):
+            return display_prefix + history_name[len(history_prefix):]
+    group, separator, remainder = history_name.partition("_")
+    if separator and group in CRITERION_GROUPS:
+        return f"{group}/{remainder}"
+    return history_name
+
+
 def criterion_filter(benchmarks: list[str]) -> str:
     if not benchmarks:
         raise ValueError("at least one benchmark is required")
-    escaped = "|".join(re.escape(name) for name in benchmarks)
+    escaped = "|".join(re.escape(criterion_display_name(name)) for name in benchmarks)
     return rf"^(?:{escaped})$"
 
 

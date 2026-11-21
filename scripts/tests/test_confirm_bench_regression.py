@@ -22,6 +22,60 @@ class CriterionFilterTests(unittest.TestCase):
         self.assertEqual(r"^(?:group/a\+b|scheduler/foo/1000)$", value)
 
 
+    def test_flattened_history_keys_resolve_to_criterion_display_names(self):
+        # Criterion prints slashes in group names but stores sanitized
+        # directory names in target/criterion, which the history collector uses.
+        self.assertEqual(
+            r"^(?:aot/hot_loop|aot/int_loop)$",
+            confirm.criterion_filter(["aot_hot_loop", "aot_int_loop"]),
+        )
+        self.assertEqual(
+            r"^(?:jit/tiering_profitability/interp/4000|actor/selective_receive_depth/64)$",
+            confirm.criterion_filter(
+                ["jit_tiering_profitability/interp/4000", "actor_selective_receive_depth/64"]
+            ),
+        )
+        self.assertEqual(
+            r"^(?:vm/perform/float_sqrt|vm/perform_direct/custom_handler)$",
+            confirm.criterion_filter(
+                ["vm_perform_float_sqrt", "vm_perform_direct_custom_handler"]
+            ),
+        )
+
+    def test_pair_confirmation_filters_display_names_but_reads_history_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            target = root / "target"
+            def run_fake_criterion(command, **_kwargs):
+                self.assertIn(
+                    r"^(?:aot/hot_loop|aot/int_loop)$", command,
+                    "the Criterion runner must use displayed benchmark IDs",
+                )
+                for benchmark, mean_ns in (
+                    ("aot_hot_loop", 654000),
+                    ("aot_int_loop", 6600),
+                ):
+                    estimates = target / "criterion" / benchmark / "new" / "estimates.json"
+                    estimates.parent.mkdir(parents=True, exist_ok=True)
+                    estimates.write_text(
+                        json.dumps({"mean": {"point_estimate": mean_ns}})
+                    )
+                return ""
+
+            with mock.patch.object(confirm, "command_output", side_effect=run_fake_criterion):
+                means = confirm.run_filtered_benchmarks(
+                    root=root,
+                    env={},
+                    target_dir=target,
+                    benchmarks=["aot_hot_loop", "aot_int_loop"],
+                    affinity=None,
+                )
+
+        self.assertEqual(
+            {"aot_hot_loop": 654000.0, "aot_int_loop": 6600.0}, means
+        )
+
+
 class ManifestValidationTests(unittest.TestCase):
     def test_rejects_non_object_regression_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
