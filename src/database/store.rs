@@ -14,7 +14,10 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::checkpoint::{self, CheckpointError};
-use super::tablet::{MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite};
+use super::tablet::{
+    MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletScanRow, TabletSplitPlan,
+    TabletWrite,
+};
 use super::wal::{FileWal, WalError};
 
 #[derive(Debug)]
@@ -76,6 +79,30 @@ impl WalBackedTablet {
 
     pub fn read_latest(&self, key: &[u8]) -> Option<&[u8]> {
         self.tablet.read_latest(key)
+    }
+
+    /// Return owned rows from one committed snapshot, suitable for a future
+    /// Arrow/columnar batch adapter. This does not expose mutable tablet state.
+    pub fn scan_at(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        snapshot: u64,
+        limit: usize,
+    ) -> Result<Vec<TabletScanRow>, TabletError> {
+        self.tablet.scan_at(start, end, snapshot, limit)
+    }
+
+    /// Derive detached child MVCC tablets from the recovered durable state.
+    ///
+    /// No WAL, routing table or ownership fence is written here. A future
+    /// split coordinator must durably publish the cutover before child writes
+    /// are admitted or the parent is retired.
+    pub fn materialize_split(
+        &self,
+        plan: &TabletSplitPlan,
+    ) -> Result<(MemoryTablet, MemoryTablet), TabletError> {
+        self.tablet.materialize_split(plan)
     }
 
     /// Atomically publish a checkpoint without reclaiming the WAL.
