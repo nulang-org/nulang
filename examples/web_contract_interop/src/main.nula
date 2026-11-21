@@ -1,0 +1,10 @@
+// One compiler-declared Web route is both exported as OpenAPI and served by
+// nula dev. Deliberately use a single typed path binding: mixed path + query
+// direct invocation is being developed separately in the request-codec PR.
+fn read_probe(id: Int from path) -> Int {
+    id
+}
+
+fn main() {
+    perform Web.route("GET", "/probe/{id: Int}", read_probe)
+}

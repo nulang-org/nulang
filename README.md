@@ -150,6 +150,7 @@ perform IO.print("Hello, " + name + "!")
 | Document | Description |
 |----------|-------------|
 | [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) | Installation, values, effects, actors, pattern matching — with runnable code snippets |
+| [`docs/INTEROPERABILITY.md`](docs/INTEROPERABILITY.md) | Experimental OpenAPI Web clients for JavaScript/TypeScript and Python; tracing, HTTP, databases and cloud integration gaps |
 | [`docs/ADOPTION_PILOT.md`](docs/ADOPTION_PILOT.md) | Independent-developer pilot protocol and measurable adoption gate (#809) |
 | [`docs/TUTORIAL.md`](docs/TUTORIAL.md) | **Tutorial:** Build a Weather CLI step by step — variables, functions, HTTP, JSON, pattern matching, records, file I/O |
 | [`docs/PITFALLS.md`](docs/PITFALLS.md) | Common mistakes: `::` vs `.`, `let` vs `var`, `perform` keyword, `catch`/`fail`, record syntax, and more |

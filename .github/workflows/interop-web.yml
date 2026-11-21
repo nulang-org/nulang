@@ -1,0 +1,76 @@
+name: Web Interoperability
+
+on:
+  pull_request:
+    paths:
+      - "interop/web/**"
+      - "examples/export_web_openapi.rs"
+      - "examples/web_live_interop.nula"
+      - "examples/web_contract_interop/**"
+      - "interop/web/javascript/contract_server_smoke.mjs"
+      - "scripts/smoke_web_contract_clients.py"
+      - "scripts/smoke_web_client_interop.py"
+      - "docs/INTEROPERABILITY.md"
+      - ".github/workflows/interop-web.yml"
+  push:
+    branches: [main]
+    paths:
+      - "interop/web/**"
+      - "examples/export_web_openapi.rs"
+      - "examples/web_live_interop.nula"
+      - "examples/web_contract_interop/**"
+      - "interop/web/javascript/contract_server_smoke.mjs"
+      - "scripts/smoke_web_contract_clients.py"
+      - "scripts/smoke_web_client_interop.py"
+      - "docs/INTEROPERABILITY.md"
+      - ".github/workflows/interop-web.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  clients:
+    name: Python and JavaScript HTTP contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Python loopback integration
+        run: python3 -m unittest discover -s interop/web/python -p 'test_*.py'
+      - name: JavaScript Fetch contract
+        run: node --test interop/web/javascript/client.test.mjs
+      - name: TypeScript definitions
+        run: |
+          npm exec --yes --package=typescript@5.9.3 -- tsc --noEmit --strict \
+            --module nodenext --moduleResolution nodenext --target ES2022 \
+            --lib ES2022,DOM interop/web/javascript/typecheck.mts
+
+  export-example:
+    name: OpenAPI Rust example compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check validated-contract exporter without optional features
+        run: cargo check --locked --no-default-features --example export_web_openapi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build native CLI with TCP HTTP server, without Python ABI
+        run: cargo build --locked --no-default-features --features tcp --bin nulang
+      - name: Real native HTTP and compiler-bound Web contracts with Python and JS
+        run: |
+          # Respect .cargo/config.toml, CARGO_TARGET_DIR, and future CI target paths.
+          target_dir="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+          binary="${target_dir}/debug/nulang"
+          test -x "$binary"
+          python3 scripts/smoke_web_client_interop.py --nulang-bin "$binary"
+          python3 scripts/smoke_web_contract_clients.py --nulang-bin "$binary"

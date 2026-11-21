@@ -1,0 +1,10 @@
+[package]
+name = "web-contract-interop"
+version = "0.1.0"
+
+[dependencies]
+
+[web]
+port = 0
+static_dir = "public"
+output_dir = "dist"

@@ -1,0 +1,13 @@
+// A minimal real Nulang HTTP server for the polyglot client wire smoke.
+// It tests native HTTP transport, NOT compiler-generated route bindings.
+fn greeting(body: String) -> String {
+    "nulang-web-live"
+}
+
+fn main() {
+    let port = perform Http.serve(0, greeting)
+    perform IO.print("PORT=" + perform Int.to_string(port))
+    // Keep the listening process alive until the CI harness terminates it.
+    perform IO.read()
+    0
+}
