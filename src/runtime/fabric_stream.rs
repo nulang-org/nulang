@@ -2,14 +2,16 @@
 //!
 //! This is the first stream-storage slice: an append-only segmented log with
 //! monotonic sequence numbers, per-record checksums, crash-tail repair,
-//! persisted consumer cursors, and replay. Replication, retention, consumer
-//! groups, and ACK/NACK redelivery build on this storage contract later.
+//! persisted consumer cursors, replay, and durable consumer delivery leases.
+//! Replication, retention, dead-lettering, and durable consumer-group
+//! assignment build on this storage contract.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +66,14 @@ pub struct FabricStreamRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FabricConsumerDelivery {
+    pub record: FabricStreamRecord,
+    pub attempt: u32,
+    pub redelivered: bool,
+    pub ack_deadline_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FabricStreamInfo {
     pub name: String,
     pub segment_max_bytes: u64,
@@ -85,6 +95,27 @@ struct StreamMetadata {
 struct CursorFile {
     version: u16,
     cursors: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConsumerDeliveryLease {
+    deadline_unix_ms: u64,
+    attempt: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ConsumerDeliveryState {
+    #[serde(default)]
+    inflight: BTreeMap<u64, ConsumerDeliveryLease>,
+    #[serde(default)]
+    acked: BTreeSet<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConsumerDeliveryFile {
+    version: u16,
+    #[serde(default)]
+    consumers: BTreeMap<String, ConsumerDeliveryState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,6 +241,15 @@ impl Default for CursorFile {
         Self {
             version: STREAM_FORMAT_VERSION,
             cursors: BTreeMap::new(),
+        }
+    }
+}
+
+impl Default for ConsumerDeliveryFile {
+    fn default() -> Self {
+        Self {
+            version: STREAM_FORMAT_VERSION,
+            consumers: BTreeMap::new(),
         }
     }
 }
@@ -1043,7 +1083,10 @@ impl FileFabricStreamStore {
         Ok(())
     }
 
-    /// Read records after the consumer's last committed sequence.
+    /// Read records after the consumer's last acknowledged sequence.
+    ///
+    /// Replicated application consumers see only the quorum-committed prefix.
+    /// Raw local records are available separately through read_from.
     pub fn read_consumer(
         &mut self,
         name: &str,
@@ -1051,26 +1094,306 @@ impl FileFabricStreamStore {
         limit: usize,
     ) -> io::Result<Vec<FabricStreamRecord>> {
         let cursor = self.cursor(name, consumer)?;
-        self.read_from(name, cursor.saturating_add(1), limit)
+        if self.consumer_committed_boundary(name, cursor)?.is_some() {
+            self.read_committed(name, cursor.saturating_add(1), limit)
+        } else {
+            self.read_from(name, cursor.saturating_add(1), limit)
+        }
+    }
+
+    /// Returns the durable consumer bound for replicated streams, or None for
+    /// standalone streams. A legacy cursor past the committed index must fail
+    /// closed until the operator resolves the inconsistent persisted state.
+    fn consumer_committed_boundary(
+        &mut self,
+        name: &str,
+        cursor: u64,
+    ) -> io::Result<Option<u64>> {
+        if self.replication_policy(name)?.is_none() {
+            return Ok(None);
+        }
+        let committed = self.committed_sequence(name)?;
+        if cursor > committed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Fabric consumer cursor {cursor} exceeds quorum-committed sequence {committed}"
+                ),
+            ));
+        }
+        Ok(Some(committed))
+    }
+
+    /// Deliver records under a node-local durable acknowledgement lease.
+    ///
+    /// A delivery remains in-flight until it is ACKed, NACKed, or its lease
+    /// expires. Expired or NACKed records are redelivered with an incremented
+    /// attempt count. The durable cursor advances only across a contiguous
+    /// prefix of acknowledged records.
+    ///
+    /// Consumer cursors, ACK gaps, and leases are not replicated with stream
+    /// records. A promoted replica may redeliver an event already ACKed on the
+    /// former leader. Callers must make side effects idempotent.
+    pub fn deliver_consumer(
+        &mut self,
+        name: &str,
+        consumer: &str,
+        limit: usize,
+        ack_wait: Duration,
+    ) -> io::Result<Vec<FabricConsumerDelivery>> {
+        self.deliver_consumer_at(name, consumer, limit, ack_wait, SystemTime::now())
+    }
+
+    /// Deterministic-clock variant of deliver_consumer.
+    pub fn deliver_consumer_at(
+        &mut self,
+        name: &str,
+        consumer: &str,
+        limit: usize,
+        ack_wait: Duration,
+        now: SystemTime,
+    ) -> io::Result<Vec<FabricConsumerDelivery>> {
+        validate_name("consumer", consumer)?;
+        self.ensure_state(name)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let ack_wait_ms = u64::try_from(ack_wait.as_millis()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fabric ACK wait exceeds u64 milliseconds",
+            )
+        })?;
+        if ack_wait_ms == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fabric ACK wait must be greater than zero",
+            ));
+        }
+        let now_ms = system_time_unix_ms(now)?;
+        let deadline_ms = now_ms.checked_add(ack_wait_ms).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Fabric ACK deadline overflow")
+        })?;
+
+        let cursor = self.cursor(name, consumer)?;
+        let replicated = self.consumer_committed_boundary(name, cursor)?.is_some();
+        let path = self.stream_dir(name).join("deliveries.json");
+        let mut delivery_file = read_consumer_deliveries(&path)?;
+        let state = delivery_file
+            .consumers
+            .entry(consumer.to_string())
+            .or_default();
+
+        let acked_before = state.acked.len();
+        let inflight_before = state.inflight.len();
+        state.acked.retain(|sequence| *sequence > cursor);
+        state.inflight.retain(|sequence, _| *sequence > cursor);
+        let mut changed =
+            state.acked.len() != acked_before || state.inflight.len() != inflight_before;
+
+        let mut delivered = Vec::with_capacity(limit.min(256));
+        let mut start = cursor.saturating_add(1);
+        const SCAN_BATCH: usize = 256;
+
+        while delivered.len() < limit {
+            let records = if replicated {
+                self.read_committed(name, start, SCAN_BATCH)?
+            } else {
+                self.read_from(name, start, SCAN_BATCH)?
+            };
+            if records.is_empty() {
+                break;
+            }
+            let last_sequence = records
+                .last()
+                .expect("non-empty Fabric scan batch has a last record")
+                .sequence;
+
+            for record in records {
+                if delivered.len() == limit {
+                    break;
+                }
+                if state.acked.contains(&record.sequence) {
+                    continue;
+                }
+
+                match state.inflight.get_mut(&record.sequence) {
+                    Some(lease) if lease.deadline_unix_ms > now_ms => continue,
+                    Some(lease) => {
+                        lease.attempt = lease.attempt.saturating_add(1);
+                        lease.deadline_unix_ms = deadline_ms;
+                        changed = true;
+                        delivered.push(FabricConsumerDelivery {
+                            record,
+                            attempt: lease.attempt,
+                            redelivered: true,
+                            ack_deadline_unix_ms: deadline_ms,
+                        });
+                    }
+                    None => {
+                        state.inflight.insert(
+                            record.sequence,
+                            ConsumerDeliveryLease {
+                                deadline_unix_ms: deadline_ms,
+                                attempt: 1,
+                            },
+                        );
+                        changed = true;
+                        delivered.push(FabricConsumerDelivery {
+                            record,
+                            attempt: 1,
+                            redelivered: false,
+                            ack_deadline_unix_ms: deadline_ms,
+                        });
+                    }
+                }
+            }
+
+            if last_sequence == u64::MAX {
+                break;
+            }
+            start = last_sequence + 1;
+        }
+
+        // Do not rewrite and fsync consumer state for an empty/no-change poll.
+        // Active leases are still durable, and stale state is persisted if pruned.
+        if changed {
+            write_json_atomic(&path, &delivery_file)?;
+            sync_dir(&self.stream_dir(name))?;
+        }
+        Ok(delivered)
+    }
+
+    /// ACK one previously delivered sequence on this node.
+    ///
+    /// ACKs may arrive out of order, but the durable cursor only advances when
+    /// every sequence from the current cursor through the ACKed sequence has
+    /// been acknowledged. An ACK is not replicated to future leaders and is
+    /// not fenced against an expired worker attempt.
+    pub fn ack_consumer(&mut self, name: &str, consumer: &str, sequence: u64) -> io::Result<()> {
+        validate_name("consumer", consumer)?;
+        self.ensure_state(name)?;
+        let cursor = self.cursor(name, consumer)?;
+        let committed = self.consumer_committed_boundary(name, cursor)?;
+        if sequence <= cursor {
+            return Ok(());
+        }
+
+        let tail = committed.unwrap_or_else(|| {
+            self.states
+                .get(name)
+                .and_then(|state| state.next_sequence.checked_sub(1))
+                .filter(|&seq| seq > 0)
+                .unwrap_or(0)
+        });
+        if sequence > tail {
+            let bound = if committed.is_some() {
+                "quorum-committed sequence"
+            } else {
+                "stream tail"
+            };
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Fabric ACK {sequence} is beyond {bound} {tail}"),
+            ));
+        }
+
+        let path = self.stream_dir(name).join("deliveries.json");
+        let mut delivery_file = read_consumer_deliveries(&path)?;
+        let state = delivery_file.consumers.get_mut(consumer).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Fabric consumer {consumer} has no deliveries to ACK"),
+            )
+        })?;
+
+        if !state.acked.contains(&sequence) && state.inflight.remove(&sequence).is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Fabric sequence {sequence} was not delivered to consumer {consumer}"),
+            ));
+        }
+        state.acked.insert(sequence);
+
+        let mut next_cursor = cursor;
+        loop {
+            let Some(candidate) = next_cursor.checked_add(1) else {
+                break;
+            };
+            if !state.acked.remove(&candidate) {
+                break;
+            }
+            state.inflight.remove(&candidate);
+            next_cursor = candidate;
+        }
+
+        // Cursor is the authoritative progress record. Commit it first so a
+        // crash can leave only stale delivery bookkeeping, never lost progress.
+        if next_cursor > cursor {
+            self.commit_cursor(name, consumer, next_cursor)?;
+            state.acked.retain(|pending| *pending > next_cursor);
+            state.inflight.retain(|pending, _| *pending > next_cursor);
+        }
+
+        write_json_atomic(&path, &delivery_file)?;
+        sync_dir(&self.stream_dir(name))
+    }
+
+    /// NACK one in-flight delivery and make it immediately eligible for
+    /// redelivery while preserving its attempt counter.
+    pub fn nack_consumer(&mut self, name: &str, consumer: &str, sequence: u64) -> io::Result<()> {
+        validate_name("consumer", consumer)?;
+        self.ensure_state(name)?;
+        if sequence <= self.cursor(name, consumer)? {
+            return Ok(());
+        }
+
+        let path = self.stream_dir(name).join("deliveries.json");
+        let mut delivery_file = read_consumer_deliveries(&path)?;
+        let state = delivery_file.consumers.get_mut(consumer).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Fabric consumer {consumer} has no deliveries to NACK"),
+            )
+        })?;
+        let lease = state.inflight.get_mut(&sequence).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Fabric sequence {sequence} is not in-flight for consumer {consumer}"),
+            )
+        })?;
+        lease.deadline_unix_ms = 0;
+        write_json_atomic(&path, &delivery_file)?;
+        sync_dir(&self.stream_dir(name))
     }
 
     /// Persist a consumer's last fully processed sequence.
     ///
-    /// Cursors are monotonic. Committing beyond the stream tail or moving a
-    /// cursor backwards is rejected.
+    /// Replicated cursors cannot exceed the durable quorum-committed prefix.
+    /// Standalone streams preserve the existing local-tail bound.
     pub fn commit_cursor(&mut self, name: &str, consumer: &str, sequence: u64) -> io::Result<()> {
         validate_name("consumer", consumer)?;
         self.ensure_state(name)?;
-        let last_sequence = self
-            .states
-            .get(name)
-            .and_then(|state| state.next_sequence.checked_sub(1))
-            .filter(|&seq| seq > 0)
-            .unwrap_or(0);
+        let replicated = self.replication_policy(name)?.is_some();
+        let last_sequence = if replicated {
+            self.committed_sequence(name)?
+        } else {
+            self.states
+                .get(name)
+                .and_then(|state| state.next_sequence.checked_sub(1))
+                .filter(|&seq| seq > 0)
+                .unwrap_or(0)
+        };
         if sequence > last_sequence {
+            let bound = if replicated {
+                "quorum-committed sequence"
+            } else {
+                "stream tail"
+            };
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Fabric cursor {sequence} is beyond stream tail {last_sequence}"),
+                format!("Fabric cursor {sequence} is beyond {bound} {last_sequence}"),
             ));
         }
 
@@ -1151,6 +1474,37 @@ impl Runtime {
     ) -> io::Result<Vec<FabricStreamRecord>> {
         self.fabric_stream_store_mut()?
             .read_consumer(name, consumer, limit)
+    }
+
+    pub fn fabric_stream_deliver_consumer(
+        &mut self,
+        name: &str,
+        consumer: &str,
+        limit: usize,
+        ack_wait: Duration,
+    ) -> io::Result<Vec<FabricConsumerDelivery>> {
+        self.fabric_stream_store_mut()?
+            .deliver_consumer(name, consumer, limit, ack_wait)
+    }
+
+    pub fn fabric_stream_ack_consumer(
+        &mut self,
+        name: &str,
+        consumer: &str,
+        sequence: u64,
+    ) -> io::Result<()> {
+        self.fabric_stream_store_mut()?
+            .ack_consumer(name, consumer, sequence)
+    }
+
+    pub fn fabric_stream_nack_consumer(
+        &mut self,
+        name: &str,
+        consumer: &str,
+        sequence: u64,
+    ) -> io::Result<()> {
+        self.fabric_stream_store_mut()?
+            .nack_consumer(name, consumer, sequence)
     }
 
     pub fn fabric_stream_commit_cursor(
@@ -1757,6 +2111,39 @@ fn read_cursors(path: &Path) -> io::Result<CursorFile> {
     Ok(cursors)
 }
 
+fn read_consumer_deliveries(path: &Path) -> io::Result<ConsumerDeliveryFile> {
+    if !path.exists() {
+        return Ok(ConsumerDeliveryFile::default());
+    }
+    let bytes = fs::read(path)?;
+    let deliveries: ConsumerDeliveryFile = serde_json::from_slice(&bytes).map_err(json_error)?;
+    if deliveries.version != STREAM_FORMAT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported Fabric consumer delivery version {}",
+                deliveries.version
+            ),
+        ));
+    }
+    Ok(deliveries)
+}
+
+fn system_time_unix_ms(now: SystemTime) -> io::Result<u64> {
+    let duration = now.duration_since(UNIX_EPOCH).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Fabric consumer clock is before the Unix epoch",
+        )
+    })?;
+    u64::try_from(duration.as_millis()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Fabric consumer clock exceeds u64 milliseconds",
+        )
+    })
+}
+
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     let bytes = serde_json::to_vec_pretty(value).map_err(json_error)?;
     let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -2197,6 +2584,76 @@ mod tests {
             restarted.fabric_stream_append("audit", b"second").unwrap(),
             2
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn leased_record_from_before_replication_policy_cannot_be_acked_early() {
+        let root = test_dir("lease-before-replication");
+        let mut store = FileFabricStreamStore::open(&root).unwrap();
+        store
+            .create_stream("events", FabricStreamConfig::default())
+            .unwrap();
+        store.append("events", b"pending").unwrap();
+        let instant = std::time::UNIX_EPOCH + Duration::from_secs(100);
+        let leased = store
+            .deliver_consumer_at("events", "worker", 1, Duration::from_secs(30), instant)
+            .unwrap();
+        assert_eq!(leased.len(), 1);
+
+        // Upgrade to a replicated policy while an old local lease is persisted.
+        store
+            .establish_replication_policy(
+                "events",
+                FabricStreamReplicationPolicy {
+                    partition: 0,
+                    epoch: FABRIC_STREAM_INITIAL_EPOCH,
+                    leader: 10,
+                    membership_fingerprint: 44,
+                    replication_factor: 2,
+                    replicas: vec![10, 11],
+                },
+            )
+            .unwrap();
+        assert!(store.ack_consumer("events", "worker", 1).is_err());
+        assert_eq!(store.cursor("events", "worker").unwrap(), 0);
+
+        store.commit_through("events", 1).unwrap();
+        store.ack_consumer("events", "worker", 1).unwrap();
+        assert_eq!(store.cursor("events", "worker").unwrap(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn leased_consumer_rejects_legacy_cursor_above_quorum_index() {
+        let root = test_dir("legacy-cursor-above-quorum");
+        let mut store = FileFabricStreamStore::open(&root).unwrap();
+        store
+            .create_stream("events", FabricStreamConfig::default())
+            .unwrap();
+        store.append("events", b"pending").unwrap();
+        store.commit_cursor("events", "worker", 1).unwrap();
+        store
+            .establish_replication_policy(
+                "events",
+                FabricStreamReplicationPolicy {
+                    partition: 0,
+                    epoch: FABRIC_STREAM_INITIAL_EPOCH,
+                    leader: 10,
+                    membership_fingerprint: 44,
+                    replication_factor: 2,
+                    replicas: vec![10, 11],
+                },
+            )
+            .unwrap();
+
+        let instant = std::time::UNIX_EPOCH + Duration::from_secs(100);
+        assert!(store.read_consumer("events", "worker", 10).is_err());
+        assert!(store.deliver_consumer_at(
+            "events", "worker", 10, Duration::from_secs(30), instant
+        ).is_err());
+        assert!(store.ack_consumer("events", "worker", 1).is_err());
+        assert_eq!(store.cursor("events", "worker").unwrap(), 1);
         let _ = fs::remove_dir_all(root);
     }
 }
