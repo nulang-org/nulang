@@ -1043,7 +1043,12 @@ impl FileFabricStreamStore {
         Ok(())
     }
 
-    /// Read records after the consumer's last committed sequence.
+    /// Read records after the consumer's last acknowledged sequence.
+    ///
+    /// A stream with a durable replication policy exposes only quorum-committed
+    /// records to application consumers. Raw local-tail reads remain available
+    /// through `read_from` for replication and diagnostics. Standalone streams
+    /// retain their existing local-tail consumer semantics.
     pub fn read_consumer(
         &mut self,
         name: &str,
@@ -1051,26 +1056,45 @@ impl FileFabricStreamStore {
         limit: usize,
     ) -> io::Result<Vec<FabricStreamRecord>> {
         let cursor = self.cursor(name, consumer)?;
-        self.read_from(name, cursor.saturating_add(1), limit)
+        if self.replication_policy(name)?.is_some() {
+            let committed = self.committed_sequence(name)?;
+            if cursor > committed {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Fabric consumer cursor {cursor} exceeds quorum-committed sequence {committed}"
+                    ),
+                ));
+            }
+            self.read_committed(name, cursor.saturating_add(1), limit)
+        } else {
+            self.read_from(name, cursor.saturating_add(1), limit)
+        }
     }
 
     /// Persist a consumer's last fully processed sequence.
     ///
-    /// Cursors are monotonic. Committing beyond the stream tail or moving a
-    /// cursor backwards is rejected.
+    /// Cursors are monotonic. Replicated consumers may acknowledge only through
+    /// the durable quorum-committed boundary, not the local uncommitted tail.
+    /// Unreplicated streams retain the local-tail bound.
     pub fn commit_cursor(&mut self, name: &str, consumer: &str, sequence: u64) -> io::Result<()> {
         validate_name("consumer", consumer)?;
         self.ensure_state(name)?;
-        let last_sequence = self
-            .states
-            .get(name)
-            .and_then(|state| state.next_sequence.checked_sub(1))
-            .filter(|&seq| seq > 0)
-            .unwrap_or(0);
+        let replicated = self.replication_policy(name)?.is_some();
+        let last_sequence = if replicated {
+            self.committed_sequence(name)?
+        } else {
+            self.states
+                .get(name)
+                .and_then(|state| state.next_sequence.checked_sub(1))
+                .filter(|&seq| seq > 0)
+                .unwrap_or(0)
+        };
         if sequence > last_sequence {
+            let bound = if replicated { "quorum-committed sequence" } else { "stream tail" };
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Fabric cursor {sequence} is beyond stream tail {last_sequence}"),
+                format!("Fabric cursor {sequence} is beyond {bound} {last_sequence}"),
             ));
         }
 
