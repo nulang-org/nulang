@@ -57,7 +57,7 @@ int main(void) {
     NulangValue greeting = nulang_call_function(rt, handle, "greet", args, 1);
     print_error(rt, "call error");
 
-    const char *greeting_str = nulang_value_to_string(rt, greeting);
+    const char *greeting_str = nulang_value_to_string_in_module(rt, handle, greeting);
     printf("greet(\"world\") = %s\n", greeting_str ? greeting_str : "(null)");
     nulang_free_string(rt, greeting_str);
 

@@ -148,6 +148,12 @@ For untrusted programs, the CLI offers an allowlist: `--ffi-sandbox --ffi-allow 
 
 `include/nulang.h` exposes a stable C ABI (implemented in `src/ffi/c_api.rs`): create a runtime, compile source, run the top-level expression or call exported functions by name, and register native C callbacks for Nulang to call back into the host. This is the intended integration point for C/C++ applications — link against `libnulang.so` and drive the language from there.
 
+**String provenance:** `NulangValue` contains raw tagged bits, so two compiled modules may reuse the same string-pool id for different strings. Convert returned string values with `nulang_value_to_string_in_module(runtime, module_handle, value)`, passing the handle of the module that produced them. The legacy `nulang_value_to_string(runtime, value)` remains available for primitives and unambiguous strings, but returns `NULL` and an error when the raw string id cannot be resolved consistently across all compiled modules. Both functions return runtime-owned C strings that may be released with `nulang_free_string`.
+
+The module-qualified API is an incremental safety improvement, **not** a fully provenance-checked value-handle system: a caller supplying the wrong valid module handle can still resolve the same raw id to a different string. Treat cross-module string passing as unsupported until an owned value-handle API is introduced.
+
+**Embedding limitations:** This C interface currently compiles and invokes modules through individual VM instances; it does not expose a persistent actor scheduler, durability lifecycle, or per-runtime native FFI registry. The `nulang_register_native_function` registry is process-global. Do not assume tenant isolation or sandboxing from separate `NulangRuntime` instances; use process isolation for untrusted native code.
+
 ## See also
 
 - [Algebraic Effects](/language/effects/) — how `perform` and effect rows work.
