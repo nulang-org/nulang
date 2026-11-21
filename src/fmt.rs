@@ -108,8 +108,15 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             ret_type,
             body,
             effect,
+            annotations,
             ..
         } => {
+            if annotations
+                .iter()
+                .any(|annotation| matches!(annotation, crate::ast::FunctionAnnotation::NoAlloc))
+            {
+                out.push_str(&format!("{}@noalloc\n", sp));
+            }
             out.push_str(&format!("{}fn {}(", sp, name));
             for (i, p) in params.iter().enumerate() {
                 let pn = &p.name;
@@ -1328,6 +1335,17 @@ impl Eq Int {
             "got: {out}"
         );
         assert!(out.contains("on_entry Connecting {"), "got: {out}");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn test_fmt_noalloc_annotation_is_preserved() {
+        let src = "@noalloc\nfn add(a: Int, b: Int) -> Int { a + b }\n";
+        let out = format_source(src).expect("noalloc function formats");
+        assert!(
+            out.contains("@noalloc\nfn add"),
+            "formatter must not erase the checked @noalloc contract: {out}"
+        );
         assert_idempotent(src);
     }
 
