@@ -1674,6 +1674,14 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                 return (*self.runtime).perform_grain_builtin(op_name, constants, regs);
             }
 
+            // Actor behavior execution uses the raw runtime callback path.
+            // Keep Python effect dispatch aligned with RuntimeVmCallbacks;
+            // perform_builtin_effect_in_module authorizes the host effect first.
+            #[cfg(feature = "python")]
+            if effect_name == "Python" {
+                return (*self.runtime).perform_python_builtin(op_name, constants, regs);
+            }
+
             if effect_name == "Crdt" {
                 return (*self.runtime).perform_crdt_builtin(
                     Some(self.actor_id),

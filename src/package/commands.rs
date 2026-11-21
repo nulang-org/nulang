@@ -1750,14 +1750,20 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
     }
 
     let mut tests: Vec<TestCase> = Vec::new();
-    let temp_dir = std::env::temp_dir().join("nula_test");
-    let _ = std::fs::create_dir_all(&temp_dir);
+    static TEST_RUN_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let run_id = TEST_RUN_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp_dir =
+        std::env::temp_dir().join(format!("nula_test_{}_{}", std::process::id(), run_id));
+    std::fs::create_dir_all(&temp_dir).map_err(|error| NuError::PackageError {
+        msg: format!("could not create test-wrapper directory: {error}"),
+        span: Span::default(),
+    })?;
 
-    for file in &test_files {
-        let content = match std::fs::read_to_string(file) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+    for (file_index, file) in test_files.iter().enumerate() {
+        let content = std::fs::read_to_string(file).map_err(|error| NuError::PackageError {
+            msg: format!("could not read test file {}: {error}", file.display()),
+            span: Span::default(),
+        })?;
         let test_fns = discover_test_functions(&content);
         let relative = file
             .strip_prefix(&tests_dir.parent().unwrap_or(&tests_dir))
@@ -1777,17 +1783,21 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
             }
             // Strip fn main() for per-function wrappers
             let stripped = strip_main_function(&content);
-            for fn_name in &test_fns {
+            for (test_index, fn_name) in test_fns.iter().enumerate() {
                 let wrapper = format!(
                     "{}{}\nfn main() {{ {}() }}\n",
                     stripped,
                     if stripped.ends_with('\n') { "" } else { "\n" },
                     fn_name
                 );
-                let temp_path = temp_dir.join(format!("test_{}.nula", fn_name));
-                if std::fs::write(&temp_path, &wrapper).is_err() {
-                    continue;
-                }
+                let temp_path = per_function_wrapper_path(&temp_dir, file_index, test_index);
+                std::fs::write(&temp_path, &wrapper).map_err(|error| NuError::PackageError {
+                    msg: format!(
+                        "could not write test-wrapper file {}: {error}",
+                        temp_path.display()
+                    ),
+                    span: Span::default(),
+                })?;
                 tests.push(TestCase {
                     display: fn_name.clone(),
                     file_to_run: temp_path,
@@ -1916,54 +1926,139 @@ fn cmd_test_watch(filter: Option<&str>, verbose: bool) -> NuResult<()> {
     }
 }
 
-/// Find all `fn test_*` function names in a source string.
-fn discover_test_functions(source: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut rest = source;
-    while let Some(pos) = rest.find("fn test_") {
-        let start = pos + 3; // skip "fn "
-        let after_fn = &rest[start..];
-        // Find end of identifier: whitespace or '('
-        let end = after_fn
-            .find(|c: char| c.is_whitespace() || c == '(')
-            .unwrap_or(after_fn.len());
-        let name = after_fn[..end].trim().to_string();
-        if !name.is_empty() {
-            names.push(name);
-        }
-        rest = &after_fn[end..];
-    }
-    names
+/// Construct a collision-free path for a generated test wrapper.
+///
+/// Source files may use identical function names; the runner must never
+/// overwrite one file's wrapper while preparing another file's tests.
+fn per_function_wrapper_path(temp_dir: &Path, file_index: usize, test_index: usize) -> PathBuf {
+    temp_dir.join(format!("test_{file_index}_{test_index}.nula"))
 }
 
-/// Strip the `fn main() { ... }` block from source, keeping everything else.
+/// Discover top-level, zero-argument test functions from parsed declarations.
+///
+/// A textual scan falsely matched `fn test_*` inside comments and strings.
+/// Invalid source is left to the normal compilation step to diagnose.
+fn discover_test_functions(source: &str) -> Vec<String> {
+    let tokens = match crate::lexer::Lexer::new(source).lex() {
+        Ok(tokens) => tokens,
+        Err(_) => return Vec::new(),
+    };
+    let module = match crate::parser::Parser::new(tokens).parse_module() {
+        Ok(module) => module,
+        Err(_) => return Vec::new(),
+    };
+    module
+        .decls
+        .into_iter()
+        .filter_map(|decl| match decl {
+            crate::ast::Decl::Function {
+                name,
+                params,
+                using_params,
+                ..
+            } if name.starts_with("test_") && params.is_empty() && using_params.is_empty() => {
+                Some(name)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Remove a parsed top-level block-bodied `main` from a per-function test
+/// wrapper without misidentifying comments, string literals or nested braces.
+///
+/// Only a real top-level declaration is eligible. The AST identifies `main`;
+/// lexer spans then locate the exact source range, preserving every other
+/// declaration byte-for-byte. An unparseable source is left intact so the
+/// normal test compiler can report the original syntax error.
 fn strip_main_function(source: &str) -> String {
-    if let Some(pos) = source.find("fn main") {
-        // Find the opening brace after "fn main"
-        if let Some(brace_start) = source[pos..].find('{') {
-            let abs_brace = pos + brace_start;
-            // Count braces to find matching close
-            let mut depth = 0;
-            let mut end = abs_brace;
-            for (i, ch) in source[abs_brace..].char_indices() {
-                match ch {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = abs_brace + i + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
+    use crate::lexer::TokenKind;
+
+    let Ok(tokens) = crate::lexer::Lexer::new(source).lex() else {
+        return source.to_string();
+    };
+    let Ok(parsed) = crate::parser::Parser::new(tokens.clone()).parse_module() else {
+        return source.to_string();
+    };
+
+    let Some((fn_start, body_end)) = parsed.decls.iter().find_map(|decl| match decl {
+        crate::ast::Decl::Function {
+            name,
+            span,
+            body: crate::ast::Expr::Block { .. },
+            ..
+        } if name == "main" => {
+            // The current block parser sets its span to the token immediately
+            // following the closing brace, rather than to the opening brace.
+            let body_end = match decl {
+                crate::ast::Decl::Function { body, .. } => body.span().start,
+                _ => unreachable!(),
+            };
+            Some((span.start, body_end))
+        }
+        _ => None,
+    }) else {
+        return source.to_string();
+    };
+
+    let Some(fn_index) = tokens
+        .iter()
+        .position(|token| matches!(token.kind, TokenKind::Fn) && token.span.start == fn_start)
+    else {
+        return source.to_string();
+    };
+
+    // The nearest closing brace preceding the AST's post-body token is
+    // the closing brace of the function's block. Braces inside strings
+    // and comments have no brace tokens.
+    let Some(close_index) = tokens
+        .iter()
+        .enumerate()
+        .skip(fn_index)
+        .take_while(|(_, token)| token.span.end <= body_end)
+        .filter(|(_, token)| matches!(token.kind, TokenKind::RBrace))
+        .map(|(index, _)| index)
+        .last()
+    else {
+        return source.to_string();
+    };
+
+    let mut brace_depth = 0usize;
+    let mut open_index = None;
+    for index in (fn_index..=close_index).rev() {
+        match tokens[index].kind {
+            TokenKind::RBrace => brace_depth += 1,
+            TokenKind::LBrace => {
+                brace_depth -= 1;
+                if brace_depth == 0 {
+                    open_index = Some(index);
+                    break;
                 }
             }
-            let before = &source[..pos];
-            let after = &source[end..];
-            return format!("{}{}", before, after);
+            _ => {}
         }
     }
-    source.to_string()
+    if open_index.is_none() {
+        return source.to_string();
+    }
+
+    // Include the visibility keyword if the function was declared `pub`.
+    let mut first_index = fn_index;
+    let mut previous = fn_index;
+    while previous > 0 && matches!(tokens[previous - 1].kind, TokenKind::Newline) {
+        previous -= 1;
+    }
+    if previous > 0 && matches!(tokens[previous - 1].kind, TokenKind::Pub) {
+        first_index = previous - 1;
+    }
+
+    let start = tokens[first_index].span.start as usize;
+    let end = tokens[close_index].span.end as usize;
+    if start >= end || end > source.len() {
+        return source.to_string();
+    }
+
+    format!("{}{}", &source[..start], &source[end..])
 }
 /// Run a test file via `nulang`, capturing stderr so error messages appear
 /// after the test name (avoiding interleaved output).
@@ -2606,6 +2701,81 @@ fn cmd_remove(name: Option<&str>) -> NuResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_discovery_ignores_comments_and_string_literals() {
+        let source = r#"
+            // fn test_from_comment() {}
+            fn helper() { "fn test_from_string()" }
+            fn test_actual() { 42 }
+            fn test_second() { 7 }
+        "#;
+        assert_eq!(
+            discover_test_functions(source),
+            vec!["test_actual".to_string(), "test_second".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_discovery_skips_functions_that_require_arguments() {
+        let source = r#"
+            fn test_needs_argument(value: Int) { value }
+            fn test_zero_args() { 1 }
+        "#;
+        assert_eq!(
+            discover_test_functions(source),
+            vec!["test_zero_args".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_strip_main_ignores_strings_and_comments() {
+        let source = r#"
+            // fn main() { this is only a comment }
+            fn helper() { "fn main() { not a declaration }" }
+            fn main() { let label = "{ literal }"; 0 }
+            fn test_real() { helper() }
+        "#;
+        let stripped = strip_main_function(source);
+        assert!(stripped.contains("fn helper()"));
+        assert!(stripped.contains("fn test_real()"));
+        assert!(stripped.contains("fn main() { not a declaration }"));
+        assert!(!stripped.contains("let label"));
+    }
+
+    #[test]
+    fn test_strip_main_handles_nested_braces_and_public_declaration() {
+        let source = r#"
+            pub fn main() {
+                let v = if true then { 1 } else { 2 }
+                v
+            }
+            fn test_real() { 42 }
+        "#;
+        let stripped = strip_main_function(source);
+        assert!(!stripped.contains("pub fn main"));
+        assert!(!stripped.contains("let v"));
+        assert!(stripped.contains("fn test_real()"));
+        assert!(discover_test_functions(&stripped).contains(&"test_real".to_string()));
+    }
+
+    #[test]
+    fn test_strip_main_does_not_remove_other_names() {
+        let source = "fn mainframe() { 1 }\nfn test_real() { 2 }\n";
+        assert_eq!(strip_main_function(source), source);
+    }
+
+    #[test]
+    fn test_wrapper_paths_are_unique_across_files_with_same_test_name() {
+        let temp_dir = std::env::temp_dir().join("nula-test-wrapper-fixtures");
+        let first = per_function_wrapper_path(&temp_dir, 0, 0);
+        let second_file = per_function_wrapper_path(&temp_dir, 1, 0);
+        let second_test = per_function_wrapper_path(&temp_dir, 0, 1);
+
+        assert_ne!(first, second_file);
+        assert_ne!(first, second_test);
+        assert_ne!(second_file, second_test);
+    }
 
     #[test]
     fn test_manifest_language_pin() {
