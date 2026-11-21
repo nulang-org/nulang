@@ -8489,6 +8489,165 @@ fn workflow_broken_json_store() -> (JsonFileStore, std::path::PathBuf) {
 }
 
 #[test]
+fn resumed_workflow_step_records_completion_and_checkpoint_together_on_success() {
+    let mut rt = Runtime::new();
+    let models = HashMap::from([("step_index".to_string(), StateModel::Durable)]);
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "resume_success",
+            Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+            models,
+        )
+        .unwrap();
+
+    // Regression: LLM and signal resumes previously left the suspension
+    // marker visible after the terminal workflow step committed.
+    rt.actors.get_mut(&actor_id).unwrap().waiting_signal = Some("__llm_ask_pending__".to_string());
+    assert!(workflow::finish_resumed_workflow_step(
+        &mut rt,
+        actor_id,
+        None,
+        "wait".to_string(),
+    ));
+    assert_eq!(
+        rt.persistence
+            .load_snapshot(actor_id)
+            .unwrap()
+            .state
+            .get("step_index"),
+        Some(&PersistedValue::Int(1)),
+    );
+    assert!(matches!(
+        rt.persistence.read_workflow_events(actor_id).last(),
+        Some(WorkflowEvent::StepCompleted { step_name, .. }) if step_name == "wait"
+    ));
+    assert_eq!(
+        rt.actors.get(&actor_id).unwrap().waiting_signal,
+        None,
+        "terminal completion must remove the active suspension marker"
+    );
+}
+
+#[test]
+fn resumed_workflow_terminal_append_failure_quarantines_uncommitted_actor() {
+    let mut rt = Runtime::new();
+    let models = HashMap::from([("step_index".to_string(), StateModel::Durable)]);
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "resume_terminal_rejected",
+            Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+            models,
+        )
+        .unwrap();
+    let (store, path) = workflow_broken_json_store();
+    rt.persistence = Box::new(store);
+
+    assert!(!workflow::finish_resumed_workflow_step(
+        &mut rt,
+        actor_id,
+        None,
+        "wait".to_string(),
+    ));
+    assert!(
+        !rt.actors.contains_key(&actor_id),
+        "a workflow must not dispatch uncommitted resumed state after terminal persistence fails"
+    );
+    assert!(rt.persistence.read_workflow_events(actor_id).is_empty());
+    let _ = std::fs::remove_file(path);
+}
+
+/// Inject a failure after StepCompleted is appended, at the subsequent
+/// legacy checkpoint boundary. The durable event must not authorize the live
+/// actor to continue with its uncommitted in-memory step_index.
+struct RejectWorkflowCheckpointStore {
+    inner: MemoryStore,
+}
+
+impl PersistenceStore for RejectWorkflowCheckpointStore {
+    fn save_snapshot(&mut self, _snapshot: ActorSnapshot) -> std::io::Result<()> {
+        Err(std::io::Error::other("injected checkpoint rejection"))
+    }
+
+    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        self.inner.load_snapshot(actor_id)
+    }
+
+    fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> std::io::Result<()> {
+        self.inner.append_journal(actor_id, entry)
+    }
+
+    fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
+        self.inner.read_journal(actor_id)
+    }
+
+    fn append_workflow_event(
+        &mut self,
+        actor_id: u64,
+        event: WorkflowEvent,
+    ) -> std::io::Result<()> {
+        self.inner.append_workflow_event(actor_id, event)
+    }
+
+    fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
+        self.inner.read_workflow_events(actor_id)
+    }
+
+    fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> std::io::Result<()> {
+        self.inner.append_event(actor_id, entry)
+    }
+
+    fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
+        self.inner.read_events(actor_id)
+    }
+
+    fn latest_sequence(&self, actor_id: u64) -> u64 {
+        self.inner.latest_sequence(actor_id)
+    }
+
+    fn clear(&mut self, actor_id: u64) -> std::io::Result<()> {
+        self.inner.clear(actor_id)
+    }
+}
+
+#[test]
+fn resumed_workflow_checkpoint_failure_quarantines_partial_terminal_history() {
+    let mut rt = Runtime::new();
+    let models = HashMap::from([("step_index".to_string(), StateModel::Durable)]);
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "resume_checkpoint_rejected",
+            Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+            models,
+        )
+        .unwrap();
+    let safe_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    let mut backing = MemoryStore::new();
+    backing.save_snapshot(safe_snapshot).unwrap();
+    rt.persistence = Box::new(RejectWorkflowCheckpointStore { inner: backing });
+
+    assert!(!workflow::finish_resumed_workflow_step(
+        &mut rt,
+        actor_id,
+        None,
+        "wait".to_string(),
+    ));
+    assert!(!rt.actors.contains_key(&actor_id));
+    assert!(matches!(
+        rt.persistence.read_workflow_events(actor_id).last(),
+        Some(WorkflowEvent::StepCompleted { step_name, .. }) if step_name == "wait"
+    ));
+    assert_eq!(
+        rt.persistence
+            .load_snapshot(actor_id)
+            .unwrap()
+            .state
+            .get("step_index"),
+        Some(&PersistedValue::Int(0)),
+        "the failed checkpoint must not commit the advanced step_index"
+    );
+}
+
+#[test]
 fn workflow_command_is_not_executed_when_durable_admission_fails() {
     let mut rt = Runtime::new();
     let actor_id = rt
