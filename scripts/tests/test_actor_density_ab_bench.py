@@ -100,6 +100,30 @@ class ComparisonTests(unittest.TestCase):
         self.assertIsNone(result["construct"]["rss"])
         self.assertIsNotNone(result["idle"]["rss"])
 
+    def test_comparisons_report_idle_scheduler_settle_reduction(self):
+        samples = {
+            "base": {
+                "construct": [{"ns_per_actor": 100.0, "rss_bytes_per_actor": 2800.0, "actor_struct_bytes": 2800, "actor_count": 10000, "scheduler_settle_seconds": None}],
+                "idle": [
+                    {"ns_per_actor": 200.0, "rss_bytes_per_actor": 4000.0, "actor_struct_bytes": 2800, "actor_count": 10000, "scheduler_settle_seconds": 0.010},
+                    {"ns_per_actor": 210.0, "rss_bytes_per_actor": 4100.0, "actor_struct_bytes": 2800, "actor_count": 10000, "scheduler_settle_seconds": 0.012},
+                ],
+            },
+            "candidate": {
+                "construct": [{"ns_per_actor": 90.0, "rss_bytes_per_actor": 2400.0, "actor_struct_bytes": 2400, "actor_count": 10000, "scheduler_settle_seconds": None}],
+                "idle": [
+                    {"ns_per_actor": 180.0, "rss_bytes_per_actor": 3600.0, "actor_struct_bytes": 2400, "actor_count": 10000, "scheduler_settle_seconds": 0.004},
+                    {"ns_per_actor": 185.0, "rss_bytes_per_actor": 3650.0, "actor_struct_bytes": 2400, "actor_count": 10000, "scheduler_settle_seconds": 0.005},
+                ],
+            },
+        }
+
+        result = actor_density_ab_bench.comparisons(samples)
+        settle = result["idle"]["scheduler_settle"]
+        self.assertEqual(2, settle["pairs"])
+        self.assertGreater(settle["median_reduction_pct"], 50.0)
+        self.assertGreater(settle["ci95_lower"], 1.0)
+
     def test_measurement_order_counterbalances_variant_and_mode_order(self):
         self.assertEqual(
             [("base", "construct"), ("base", "idle"), ("candidate", "construct"), ("candidate", "idle")],
