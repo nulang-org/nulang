@@ -450,6 +450,84 @@ mod tests {
     }
 
     #[test]
+    fn test_seeded_fault_schedules_replay_production_cluster_state() {
+        // Compare two independently allocated production ClusterState meshes.
+        // Their HashMaps have different randomized seeds, but the explicit
+        // simulator seed and the same directed fault schedule must produce
+        // identical observable membership, fencing and heartbeat behavior.
+        // Unlike the lightweight DST message recorder, this executes the
+        // real membership/failure-detection state machine on every round.
+        let addresses = addrs(5, 10200);
+        let config = static_quorum(5);
+
+        for seed in 0..16u64 {
+            let mut first = SimCluster::new(&addresses, &config);
+            let mut replay = SimCluster::new(&addresses, &config);
+            first.run_to_healthy_mesh(200);
+            replay.run_to_healthy_mesh(200);
+            assert!(
+                first.mesh_healthy() && replay.mesh_healthy(),
+                "seed {seed}: initial mesh did not converge"
+            );
+
+            let mut faults = crate::dst::DeterministicRng::new(seed);
+            for phase in 0..3 {
+                // Replace the network partition each phase, including
+                // asymmetric links. Downed nodes are *not* resurrected
+                // when links heal, just as in the real transport lifecycle.
+                for from in 0..5 {
+                    for to in 0..5 {
+                        if from == to {
+                            continue;
+                        }
+                        if faults.next() % 4 == 0 {
+                            first.cut_link(from, to);
+                            replay.cut_link(from, to);
+                        } else {
+                            first.heal_link(from, to);
+                            replay.heal_link(from, to);
+                        }
+                    }
+                }
+
+                for round in 0..80 {
+                    // Virtual time must advance to exercise suspicion,
+                    // failure detection, quorum fencing and probe recovery.
+                    first.step();
+                    replay.step();
+                    assert_eq!(
+                        first.last_round_heartbeats,
+                        replay.last_round_heartbeats,
+                        "seed {seed}, phase {phase}, round {round}: heartbeat fanout diverged"
+                    );
+                    for node in 0..5 {
+                        assert_eq!(
+                            first.is_down(node),
+                            replay.is_down(node),
+                            "seed {seed}, phase {phase}, round {round}: node {node} fencing diverged"
+                        );
+                        let mut first_active = first.node(node).active_view().to_vec();
+                        let mut replay_active = replay.node(node).active_view().to_vec();
+                        first_active.sort_unstable();
+                        replay_active.sort_unstable();
+                        assert_eq!(
+                            first_active, replay_active,
+                            "seed {seed}, phase {phase}, round {round}: node {node} active view diverged"
+                        );
+                        for peer in 0..5 {
+                            assert_eq!(
+                                first.status_of(node, peer),
+                                replay.status_of(node, peer),
+                                "seed {seed}, phase {phase}, round {round}: node {node} peer {peer} status diverged"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_quorum_holds_under_random_partitions() {
         // Seed-driven invariant sweep: for 50 random directed cut sets on
         // a 5-node mesh, the resolver must never down a node that still
