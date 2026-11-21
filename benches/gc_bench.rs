@@ -94,23 +94,23 @@ fn bench_orca_foreign_ref_send(c: &mut Criterion) {
     group.throughput(Throughput::Elements(REFS as u64));
 
     group.bench_function("256", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || foreign_ref_fixture(REFS),
-            |(mut rt, owner, target, ptrs)| {
-                rt.current_actor = Some(owner);
-                for ptr in ptrs {
+            |(rt, owner, target, ptrs)| {
+                rt.current_actor = Some(*owner);
+                for &ptr in ptrs.iter() {
                     // SAFETY: every pointer comes from the live owner actor's
                     // heap in this iteration and the Runtime owns that heap for
                     // the entire send sequence.
                     let value = unsafe { Value::ptr(ptr) };
-                    rt.send_message_by_id(target, 0, &[value]);
+                    rt.send_message_by_id(*target, 0, &[value]);
                 }
                 assert_eq!(
                     rt.gc_stats().foreign_refs_sent,
                     REFS as u64,
                     "ORCA benchmark must record every injected foreign ref"
                 );
-                black_box(rt);
+                black_box(&*rt);
             },
             BatchSize::SmallInput,
         )
