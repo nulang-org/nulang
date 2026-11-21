@@ -15,7 +15,10 @@ use crate::bytecode::Instruction;
 
 use super::simd_analyzer::SimdRegion;
 use super::typed_compiler::TypeMetadata;
-use super::{compiler, simd_compiler, typed_compiler, CodegenOptimization};
+use super::{compiler, typed_compiler, CodegenOptimization};
+
+#[path = "simd_compute.rs"]
+mod simd_compute;
 
 /// Specialization requested from a native code generator.
 #[derive(Clone, Copy)]
@@ -155,15 +158,14 @@ impl CraneliftCodegen {
                 )
                 .map_err(|e| format!("{e:?}"))
             }
-            NativeCompileKind::Simd { region } => simd_compiler::compile_simd_region(
+            NativeCompileKind::Simd { region } => simd_compute::compile_simd_region(
                 module,
                 builder_context,
                 ctx,
                 request.symbol,
                 request.instructions,
                 region,
-            )
-            .map_err(|e| format!("{e:?}")),
+            ),
         }
     }
 }
