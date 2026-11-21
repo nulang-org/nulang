@@ -45,6 +45,10 @@ full = ["native-codegen", "python", "sqlite", "lsp", "ai-runtime", "tls", "ffi",
 # without linking against the runner's exact libpython SONAME. Developers who
 # need Python interoperability can explicitly build --features full.
 release-cli = ["native-codegen", "sqlite", "lsp", "ai-runtime", "tls", "ffi", "tcp", "ureq"]
+// Small, self-hosted server: bytecode runtime + inbound HTTP/TCP/TLS, outbound
+// HTTP, and embedded durable SQLite. Opt in with --no-default-features.
+// Keep Python, AI providers, editor tooling, FFI and native JIT out.
+server = ["sqlite", "tls", "tcp", "ureq"]
 # Cranelift-backed tiered JIT plus the current native/AOT backend.
 native-codegen = [
     "dep:cranelift",
