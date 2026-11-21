@@ -42,6 +42,16 @@ jobs:
             --features native-codegen \
             test_tier2_replaces_baseline_with_typed_code
 
+      # Regression is Linux-only and test-only; the JIT's production
+      # compilation/dispatch path incurs no /proc access or extra checks.
+      - name: Verify native JIT entrypoints preserve W^X
+        run: |
+          cargo test --locked --release \
+            --no-default-features \
+            --features native-codegen \
+            --lib jit::native_codegen::tests::test_cranelift_codegen_compiles_fast_and_optimized_scalar_requests \
+            -- --exact
+
       - name: Run JIT telemetry workloads
         env:
           REPEAT: "${{ github.event_name == 'pull_request' && '1' || inputs.repeat || '5' }}"
