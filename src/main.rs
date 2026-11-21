@@ -8,6 +8,7 @@
 //!   nulang --lsp
 //!   nulang --dap [FILE]
 //!   nulang agent <init|run|chat|goals|graph>
+//!   nulang query <symbols|symbol> ...
 //!   nulang nula <new|build|build-wasm|test|run|add|remove|publish|deploy|watch|doc>
 //!   nulang fmt [--check] [<file>]
 //!
@@ -238,6 +239,14 @@ fn main() {
     // actor node (shard 0, network-enabled).
     if args[1] == "node" {
         if let Err(e) = run_node_cmd(&args[2..]) {
+            print_error(&e, true);
+            std::process::exit(exit_code(&e));
+        }
+        return;
+    }
+
+    if args[1] == "query" {
+        if let Err(e) = nulang::code_query::run(&args[2..]) {
             print_error(&e, true);
             std::process::exit(exit_code(&e));
         }
@@ -819,18 +828,19 @@ fn main() {
             let code = exit_code(&e);
             if opts.json {
                 // Machine-readable mode: the JSON report is the ONLY output on
-                // stdout; nothing human-rendered is printed.
-                let diags = if opts.all_errors {
-                    let all = collect_all_frontend_errors(&source, Some(&path));
-                    if all.is_empty() {
-                        nulang::json_diagnostics::diagnostics_from_error(&e)
-                    } else {
-                        all.iter()
-                            .flat_map(nulang::json_diagnostics::diagnostics_from_error)
-                            .collect()
-                    }
-                } else {
-                    nulang::json_diagnostics::diagnostics_from_error(&e)
+                // stdout; nothing human-rendered is printed. Import resolution
+                // may have installed a dependency's thread-local source map, so
+                // restore the requested file before turning spans into edits.
+                let all = opts
+                    .all_errors
+                    .then(|| collect_all_frontend_errors(&source, Some(&path)));
+                nulang::types::set_source_map_with_file(&source, Some(&path));
+                let diags = match all {
+                    Some(all) if !all.is_empty() => all
+                        .iter()
+                        .flat_map(nulang::json_diagnostics::diagnostics_from_error)
+                        .collect(),
+                    _ => nulang::json_diagnostics::diagnostics_from_error(&e),
                 };
                 let report =
                     nulang::json_diagnostics::JsonReport::new("check", Some(path.clone()), diags);
