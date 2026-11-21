@@ -84,6 +84,7 @@ pub mod prelude_source;
 pub mod primitives;
 pub mod protocol;
 pub mod protocol_wire;
+pub mod public_interface;
 #[cfg(feature = "python")]
 pub mod python;
 pub mod registry;
