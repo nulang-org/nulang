@@ -171,6 +171,48 @@ fn bench_ab_enqueue_payload_sweep() {
     }
 }
 
+/// Lower-bound scheduler/actor-dispatch cost with a registered native noop
+/// handler. Enqueue occurs entirely outside timing, matching actor-drain probes.
+/// This is NOT equivalent to the state-mutating bytecode/AOT actor workload;
+/// compare it only as a lower bound after mailbox and routing admission.
+#[test]
+fn bench_ab_native_noop_drain() {
+    const N: usize = 100_000;
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(Vec::new));
+    rt.actors
+        .get_mut(&actor_id)
+        .expect("native noop actor exists")
+        .register_behavior("handle", ab_noop_handler);
+    rt.run_scheduler();
+
+    for _ in 0..N {
+        rt.send_message_by_id(actor_id, 0, &[Value::int(1)]);
+    }
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .expect("native noop actor exists")
+            .mailbox
+            .len(),
+        N,
+        "all N messages must be queued before timing"
+    );
+
+    let start = Instant::now();
+    rt.run_scheduler();
+    let elapsed = start.elapsed();
+    assert!(
+        rt.actors
+            .get(&actor_id)
+            .expect("native noop actor exists after drain")
+            .mailbox
+            .is_empty(),
+        "native noop actor must drain all messages"
+    );
+    report_ab("native_noop_drain", N as u64, elapsed);
+}
+
 #[cfg(feature = "native-codegen")]
 fn run_ab_jit_warm_execution_probe() {
     const REPEATS: usize = 10;
@@ -339,10 +381,10 @@ fn bench_ab_aot_actor_drain() {
     let code =
         crate::mir_codegen::compile_mir(&mut mir, "bench-ab-aot").expect("bench: codegen failed");
 
-    // Matched bytecode/JIT path. Warm past the current tier-up threshold so
-    // the timed drain represents steady-state tiered execution rather than
-    // first-run compilation cost. Enqueue remains outside the timed region,
-    // matching the AOT measurement below.
+    // JIT-enabled bytecode path. Warm past the nominal hot-count threshold,
+    // but do not assume this *short* actor behavior is actually compilable:
+    // the JIT may deliberately reject unprofitable straight-line regions.
+    // Enqueue remains outside the timed region, matching AOT below.
     let mut bytecode_rt = Runtime::new();
     let bytecode_actor = bytecode_rt
         .spawn_from_module(&code, 0, Vec::new())
@@ -352,6 +394,8 @@ fn bench_ab_aot_actor_drain() {
         bytecode_rt.send_message_by_id(bytecode_actor, 0, &[Value::int(1)]);
     }
     bytecode_rt.run_scheduler();
+    let jit_compiled_regions = bytecode_rt.benchmark_jit_compiled_count();
+    let jit_compilation_verified = jit_compiled_regions > 0;
     bytecode_rt
         .actors
         .get_mut(&bytecode_actor)
@@ -373,9 +417,12 @@ fn bench_ab_aot_actor_drain() {
     assert_eq!(
         bytecode_total,
         Some(N as i64),
-        "warmed bytecode/JIT actor must process every message"
+        "warmed JIT-enabled bytecode actor must process every message"
     );
     report_ab("bytecode_actor_drain_warm", N as u64, bytecode_elapsed);
+    println!(
+        "[backend-provenance] workload=actor_drain jit_compiled_regions={jit_compiled_regions} jit_compilation_verified={jit_compilation_verified}"
+    );
 
     // AOT path over the exact same source and bytecode companion module.
     let mut aot_rt = Runtime::new();
@@ -417,7 +464,7 @@ fn bench_ab_aot_actor_drain() {
     let bytecode_ns = bytecode_elapsed.as_nanos() as f64;
     let aot_ns = aot_elapsed.as_nanos() as f64;
     println!(
-        "[backend-bench] workload=actor_drain messages={N} bytecode_jit_ns={} aot_ns={} aot_speedup_x={:.3}",
+        "[backend-bench] workload=actor_drain messages={N} jit_enabled_bytecode_ns={} aot_ns={} aot_speedup_x={:.3} jit_compiled_regions={jit_compiled_regions} jit_compilation_verified={jit_compilation_verified}",
         bytecode_elapsed.as_nanos(),
         aot_elapsed.as_nanos(),
         bytecode_ns / aot_ns
