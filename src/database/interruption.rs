@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::store::{WalBackedError, WalBackedTablet};
 use super::tablet::{KeyRange, TabletDescriptor, TabletId, TabletMutation};
 use super::wal::{FileWal, WalError};
+use super::wal_batch::BinaryBatchWal;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StorageInterruptionPoint {
@@ -14,6 +15,15 @@ pub(crate) enum StorageInterruptionPoint {
     WalAfterPayload,
     WalAfterChecksum,
     WalAfterSync,
+    BatchWalAfterHeader,
+    BatchWalAfterPayload,
+    BatchWalAfterChecksum,
+    BatchWalAfterSync,
+    WalBatchAfterHeader,
+    WalBatchAfterPayload,
+    WalBatchAfterChecksum,
+    WalBatchAfterFrames,
+    WalBatchAfterSync,
     CheckpointAfterTempWrite,
     CheckpointAfterTempSync,
     CheckpointAfterRename,
@@ -111,6 +121,104 @@ mod tests {
             )
             .unwrap();
         tablet.commit(write).unwrap();
+    }
+
+    fn batch_writes() -> Vec<super::super::tablet::TabletWrite> {
+        let mut tablet = super::super::tablet::MemoryTablet::new(descriptor());
+        let mut writes = Vec::new();
+        for value in [b"v1".as_slice(), b"v2".as_slice()] {
+            let sequence = tablet.current_sequence();
+            let write = tablet
+                .prepare_write(
+                    7,
+                    sequence,
+                    vec![TabletMutation::Put {
+                        key: b"k".to_vec(),
+                        value: value.to_vec(),
+                    }],
+                )
+                .unwrap();
+            tablet.commit(write.clone()).unwrap();
+            writes.push(write);
+        }
+        writes
+    }
+
+    #[test]
+    fn binary_batch_wal_interruption_matrix_recovers_valid_prefix() {
+        for (point, expected_sequence) in [
+            (StorageInterruptionPoint::BatchWalAfterHeader, 0),
+            (StorageInterruptionPoint::BatchWalAfterPayload, 0),
+            (StorageInterruptionPoint::BatchWalAfterChecksum, 2),
+            (StorageInterruptionPoint::BatchWalAfterSync, 2),
+        ] {
+            let wal_path = temp_wal("binary_batch");
+            cleanup(&wal_path);
+            let writes = batch_writes();
+
+            let mut wal = BinaryBatchWal::open(&wal_path).unwrap();
+            let result = with_interruption(point, || wal.append_batch(&writes));
+            assert!(result.is_err(), "{point:?} must interrupt the append");
+            assert_eq!(
+                wal.append_batch(&writes).unwrap_err(),
+                super::super::wal_batch::BatchWalError::Poisoned,
+                "live batch WAL must require reopen after {point:?}"
+            );
+            drop(wal);
+
+            let reopened = BinaryBatchWal::open(&wal_path).unwrap();
+            assert_eq!(
+                reopened.last_sequence(),
+                expected_sequence,
+                "unexpected recovered sequence after {point:?}"
+            );
+            cleanup(&wal_path);
+        }
+    }
+
+    #[test]
+    fn wal_group_commit_interruption_matrix_recovers_a_valid_prefix_and_requires_reopen() {
+        for (point, expected_sequence) in [
+            (StorageInterruptionPoint::WalBatchAfterHeader, 0),
+            (StorageInterruptionPoint::WalBatchAfterPayload, 0),
+            (StorageInterruptionPoint::WalBatchAfterChecksum, 1),
+            (StorageInterruptionPoint::WalBatchAfterFrames, 2),
+            (StorageInterruptionPoint::WalBatchAfterSync, 2),
+        ] {
+            let wal_path = temp_wal("wal_batch");
+            cleanup(&wal_path);
+            let writes = batch_writes();
+
+            let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+            let result = with_interruption(point, || tablet.commit_batch(writes));
+            assert!(result.is_err(), "{point:?} must interrupt the group commit");
+
+            let retry_sequence = tablet.current_sequence();
+            let retry = tablet
+                .prepare_write(
+                    7,
+                    retry_sequence,
+                    vec![TabletMutation::Put {
+                        key: b"retry".to_vec(),
+                        value: b"blocked".to_vec(),
+                    }],
+                )
+                .unwrap();
+            assert_eq!(
+                tablet.commit(retry).unwrap_err(),
+                WalBackedError::Wal(WalError::Poisoned),
+                "live tablet must require reopen after {point:?}"
+            );
+            drop(tablet);
+
+            let reopened = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+            assert_eq!(
+                reopened.current_sequence(),
+                expected_sequence,
+                "unexpected recovered sequence after {point:?}"
+            );
+            cleanup(&wal_path);
+        }
     }
 
     #[test]
@@ -219,11 +327,6 @@ mod tests {
             let result = with_interruption(point, || tablet.checkpoint());
             assert!(result.is_err(), "{point:?} must interrupt WAL reclamation");
 
-            // Once reclamation starts, any error must make the live WAL
-            // unusable. After rename, self.file can still refer to the old
-            // unlinked inode while the canonical path names the replacement;
-            // accepting another commit in that state could acknowledge data
-            // that disappears on restart.
             let sequence = tablet.current_sequence();
             let retry = tablet
                 .prepare_write(
