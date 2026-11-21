@@ -13,8 +13,25 @@ use crate::types::{NuError, NuResult, Span};
 /// Returns an error if any construct is not yet supported by the formatter
 /// (rather than silently dropping or corrupting it).
 pub fn format_source(source: &str) -> Result<String, String> {
+    // The AST does not preserve comments or shebangs. Refuse to rewrite
+    // such input until the formatter has a lossless trivia representation.
+    if source.starts_with("#!") {
+        return Err("shebangs are not yet preserved by the formatter; the file was not modified".to_string());
+    }
     let mut lexer = crate::lexer::Lexer::new(source);
-    let tokens = lexer.lex().map_err(|e| e.to_string())?;
+    let all_tokens = lexer.lex_with_comments().map_err(|e| e.to_string())?;
+    if all_tokens.iter().any(|token| {
+        matches!(
+            &token.kind,
+            crate::lexer::TokenKind::Comment(_) | crate::lexer::TokenKind::DocComment(_)
+        )
+    }) {
+        return Err("comments are not yet preserved by the formatter; the file was not modified".to_string());
+    }
+    let tokens = all_tokens
+        .into_iter()
+        .filter(|token| !matches!(&token.kind, crate::lexer::TokenKind::Comment(_)))
+        .collect();
     let mut parser = crate::parser::Parser::new(tokens);
     let ast = parser.parse_module().map_err(|e| e.to_string())?;
 
@@ -1225,6 +1242,25 @@ mod tests {
             once, twice,
             "formatting must be idempotent\n--- once ---\n{once}\n--- twice ---\n{twice}"
         );
+    }
+
+    #[test]
+    fn test_formatter_refuses_to_erase_comments() {
+        for source in [
+            "fn f() { 1 } // trailing comment\n",
+            "/// API documentation\nfn f() { 1 }\n",
+            "fn f() { /* nested comment */ 1 }\n",
+            "#!/usr/bin/env nulang\nfn main() { 1 }\n",
+        ] {
+            let result = format_source(source);
+            assert!(result.is_err(), "should preserve comment/shebang source");
+        }
+    }
+
+    #[test]
+    fn test_formatter_does_not_confuse_urls_with_comments() {
+        let source = "fn url() -> String { \"https://example.org/path\" }";
+        assert!(format_source(source).is_ok(), "URL text is not a comment");
     }
 
     #[test]
