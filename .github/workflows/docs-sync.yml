@@ -77,12 +77,11 @@ jobs:
         # This step validates the exact generated site before assets are
         # proposed to protected main through the generated-assets PR.
 
-      - name: Open or update generated-assets PR
+      - name: Open generated-assets PR
         env:
           # Optional PAT/GitHub-App token avoids the approval gate GitHub
           # applies to PR workflows created by GITHUB_TOKEN. Without it, the
-          # generated-assets PR is still created safely but a maintainer must
-          # approve its workflow runs in the PR UI.
+          # generated-assets PR still needs maintainer approval for CI.
           GH_TOKEN: ${{ secrets.DOCS_SYNC_TOKEN || github.token }}
         run: |
           git config user.name "github-actions[bot]"
@@ -94,23 +93,20 @@ jobs:
             exit 0
           fi
 
-          sync_branch="automation/docs-sync"
-          git checkout -B "$sync_branch"
+          # The former persistent automation/docs-sync ref is protected by
+          # repository rules: force-pushing it fails with GH013. Each workflow
+          # attempt instead proposes generated output from its own branch,
+          # without rewriting any existing branch or bypassing PR review.
+          sync_branch="docs-sync/run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git checkout -b "$sync_branch"
           git commit -m "docs: auto-sync generated site assets"
-          git push --force origin "HEAD:$sync_branch"
+          git push origin "HEAD:refs/heads/$sync_branch"
 
-          pr_number="$(gh pr list --head "$sync_branch" --base main --state open --json number --jq '.[0].number // empty')"
-          if [ -n "$pr_number" ]; then
-            gh pr edit "$pr_number" \
-              --title "docs: sync generated site assets" \
-              --body "Automated refresh of generated standard-library/API docs and the browser-playground bundle from the current main branch."
-          else
-            gh pr create \
-              --base main \
-              --head "$sync_branch" \
-              --title "docs: sync generated site assets" \
-              --body "Automated refresh of generated standard-library/API docs and the browser-playground bundle from the current main branch."
-          fi
+          gh pr create \
+            --base main \
+            --head "$sync_branch" \
+            --title "docs: sync generated site assets" \
+            --body "Automated refresh of generated standard-library/API docs and the browser-playground bundle from the current main branch. Review before merging; this job never force-pushes protected refs."
 
       - name: Ping DeepWiki to refresh index
         # Best-effort request to encourage DeepWiki to re-index the repo docs.
