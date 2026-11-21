@@ -1750,8 +1750,17 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
     }
 
     let mut tests: Vec<TestCase> = Vec::new();
-    let temp_dir = std::env::temp_dir().join("nula_test");
-    let _ = std::fs::create_dir_all(&temp_dir);
+    // Private per-run directory: concurrent packages must never overwrite
+    // each other's generated entry points.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_dir = std::env::temp_dir().join(format!("nula_test_{}_{}", std::process::id(), nonce));
+    std::fs::create_dir_all(&temp_dir).map_err(|e| NuError::PackageError {
+        msg: format!("cannot create test directory {}: {}", temp_dir.display(), e),
+        span: Span::default(),
+    })?;
 
     for file in &test_files {
         let content = match std::fs::read_to_string(file) {
@@ -1784,10 +1793,11 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
                     if stripped.ends_with('\n') { "" } else { "\n" },
                     fn_name
                 );
-                let temp_path = temp_dir.join(format!("test_{}.nula", fn_name));
-                if std::fs::write(&temp_path, &wrapper).is_err() {
-                    continue;
-                }
+                let temp_path = temp_dir.join(format!("test_{}_{}.nula", tests.len(), fn_name));
+                std::fs::write(&temp_path, &wrapper).map_err(|e| NuError::PackageError {
+                    msg: format!("cannot write generated test {}: {}", temp_path.display(), e),
+                    span: Span::default(),
+                })?;
                 tests.push(TestCase {
                     display: fn_name.clone(),
                     file_to_run: temp_path,
@@ -1916,55 +1926,77 @@ fn cmd_test_watch(filter: Option<&str>, verbose: bool) -> NuResult<()> {
     }
 }
 
-/// Find all `fn test_*` function names in a source string.
+/// Find top-level `fn test_*` declarations using the real parser, not
+/// substring matches that also see comments and string literals.
 fn discover_test_functions(source: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut rest = source;
-    while let Some(pos) = rest.find("fn test_") {
-        let start = pos + 3; // skip "fn "
-        let after_fn = &rest[start..];
-        // Find end of identifier: whitespace or '('
-        let end = after_fn
-            .find(|c: char| c.is_whitespace() || c == '(')
-            .unwrap_or(after_fn.len());
-        let name = after_fn[..end].trim().to_string();
-        if !name.is_empty() {
-            names.push(name);
-        }
-        rest = &after_fn[end..];
-    }
-    names
+    let tokens = match crate::lexer::Lexer::new(source).lex() {
+        Ok(tokens) => tokens,
+        Err(_) => return Vec::new(), // Let the normal compiler report errors.
+    };
+    let module = match crate::parser::Parser::new(tokens).parse_module() {
+        Ok(module) => module,
+        Err(_) => return Vec::new(),
+    };
+    module
+        .decls
+        .into_iter()
+        .filter_map(|decl| match decl {
+            crate::ast::Decl::Function { name, .. } if name.starts_with("test_") => Some(name),
+            _ => None,
+        })
+        .collect()
 }
 
-/// Strip the `fn main() { ... }` block from source, keeping everything else.
+/// Strip an ordinary block-bodied `fn main() { ... }` before adding a test
+/// entry point. Token spans ensure braces inside strings are not treated as
+/// syntax. For unsupported signatures, retain source and let compilation
+/// fail rather than making an unsafe textual cut.
 fn strip_main_function(source: &str) -> String {
-    if let Some(pos) = source.find("fn main") {
-        // Find the opening brace after "fn main"
-        if let Some(brace_start) = source[pos..].find('{') {
-            let abs_brace = pos + brace_start;
-            // Count braces to find matching close
-            let mut depth = 0;
-            let mut end = abs_brace;
-            for (i, ch) in source[abs_brace..].char_indices() {
-                match ch {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = abs_brace + i + 1;
-                            break;
+    use crate::lexer::TokenKind;
+    let tokens = match crate::lexer::Lexer::new(source).lex() {
+        Ok(tokens) => tokens,
+        Err(_) => return source.to_owned(),
+    };
+    let significant: Vec<_> = tokens
+        .iter()
+        .filter(|t| {
+            !matches!(
+                &t.kind,
+                TokenKind::Newline | TokenKind::DocComment(_) | TokenKind::Eof
+            )
+        })
+        .collect();
+    for (i, tokens) in significant.windows(5).enumerate() {
+        if !matches!(&tokens[0].kind, TokenKind::Fn)
+            || !matches!(&tokens[1].kind, TokenKind::Ident(name) if name == "main")
+            || !matches!(&tokens[2].kind, TokenKind::LParen)
+            || !matches!(&tokens[3].kind, TokenKind::RParen)
+            || !matches!(&tokens[4].kind, TokenKind::LBrace)
+        {
+            continue;
+        }
+        let start = tokens[0].span.start as usize;
+        let mut depth = 0_usize;
+        for token in &significant[i + 4..] {
+            match &token.kind {
+                TokenKind::LBrace => depth += 1,
+                TokenKind::RBrace => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let end = token.span.end as usize;
+                        if source.is_char_boundary(start) && source.is_char_boundary(end) {
+                            return format!("{}{}", &source[..start], &source[end..]);
                         }
+                        break;
                     }
-                    _ => {}
                 }
+                _ => {}
             }
-            let before = &source[..pos];
-            let after = &source[end..];
-            return format!("{}{}", before, after);
         }
     }
-    source.to_string()
+    source.to_owned()
 }
+
 /// Run a test file via `nulang`, capturing stderr so error messages appear
 /// after the test name (avoiding interleaved output).
 /// Returns `Ok(())` on success, `Err(stderr_string)` on failure.
@@ -3162,5 +3194,23 @@ app "counter" {
 
         // Unknown subcommands should not be intercepted.
         assert!(try_module_subcommand(&["unknown".to_string()]).is_none());
+    }
+    #[test]
+    fn test_discover_test_functions_ignores_comments_and_strings() {
+        let source = r#"
+            // fn test_comment() {}
+            fn helper() { "fn test_inside_string() {}" }
+            fn test_actual() { 1 }
+        "#;
+        assert_eq!(
+            discover_test_functions(source),
+            vec!["test_actual".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_strip_main_ignores_braces_inside_string_literals() {
+        let source = "fn main() {\n  let s = \"}\"\n  perform IO.print(s)\n}\nfn test_ok() { 1 }\n";
+        assert_eq!(strip_main_function(source).trim(), "fn test_ok() { 1 }");
     }
 }

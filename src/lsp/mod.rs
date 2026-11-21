@@ -1297,53 +1297,9 @@ impl NulangLanguageServer {
     }
 
     fn fmt_source(&self, source: &str) -> String {
-        let mut out = String::with_capacity(source.len());
-        let mut indent: usize = 0;
-        let w: usize = 4;
-        let mut prev = false;
-        for line in source.lines() {
-            let t = line.trim();
-            if t.is_empty() {
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                prev = true;
-                continue;
-            }
-            let close = t
-                .chars()
-                .filter(|&c| c == '}' || c == ']' || c == ')')
-                .count();
-            let open = t
-                .chars()
-                .filter(|&c| c == '{' || c == '[' || c == '(')
-                .count();
-            let net = open as isize - close as isize;
-            if close > 0 && close >= open {
-                indent = indent.saturating_sub((close - open) * w);
-            }
-            if t.starts_with("in ") || t == "in" {
-                indent = indent.saturating_sub(w);
-            }
-            if !prev && !out.is_empty() {
-                out.push('\n');
-            }
-            for _ in 0..indent / w {
-                out.push_str("    ");
-            }
-            out.push_str(t);
-            if net > 0 {
-                indent += net as usize * w;
-            }
-            if (t.ends_with("in") || t.ends_with("then")) && !t.contains('{') {
-                indent += w;
-            }
-            prev = false;
-        }
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out
+        // Editor formatting must obey the same non-destructive guarantees as
+        // the CLI. A rejected edit is a no-op, not a heuristic rewrite.
+        crate::fmt::format_source(source).unwrap_or_else(|_| source.to_owned())
     }
 
     fn sem_tokens(&self, source: &str) -> Vec<SemanticToken> {

@@ -364,8 +364,18 @@ impl<'a> Lexer<'a> {
     }
 
     /// Run the lexer, producing a vector of tokens. Newlines are preserved
-    /// for semicolon insertion logic but comments are filtered out.
+    /// for semicolon insertion logic but regular comments are filtered out.
     pub fn lex(&mut self) -> NuResult<Vec<Token>> {
+        self.lex_impl(false)
+    }
+
+    /// Lex source for lossless tooling checks. Unlike `lex`, this retains
+    /// regular comments so a formatter cannot silently discard them.
+    pub fn lex_with_comments(&mut self) -> NuResult<Vec<Token>> {
+        self.lex_impl(true)
+    }
+
+    fn lex_impl(&mut self, keep_comments: bool) -> NuResult<Vec<Token>> {
         let mut tokens = Vec::new();
         loop {
             let tok = self.next_token()?;
@@ -374,10 +384,7 @@ impl<'a> Lexer<'a> {
                     tokens.push(tok);
                     break;
                 }
-                // Filter out regular comments, keep doc comments as tokens
-                TokenKind::Comment(_) => {
-                    // skip regular comments
-                }
+                TokenKind::Comment(_) if !keep_comments => {}
                 _ => tokens.push(tok),
             }
         }

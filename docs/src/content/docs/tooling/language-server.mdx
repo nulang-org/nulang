@@ -107,7 +107,12 @@ nulang fmt [--check] [<file>]
 ```
 
 Formats a file in place (or checks formatting with `--check`). The language
-server exposes the same formatter via `textDocument/formatting`.
+server uses the same canonical formatter via `textDocument/formatting`.
+
+Until trivia-preserving formatting is implemented, both clients deliberately
+refuse rewrites that would drop comments, visibility, generics, defaults, or
+other significant tokens. A refused CLI format leaves the file unchanged;
+the language server returns no formatting edit.
 
 ## Debug Adapter
 
