@@ -24,6 +24,17 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "benchmarks" / "cross_runtime"
 BUILD = ROOT / "target" / "cross-runtime"
 BENCHMARKS = ("counting", "ping_pong", "thread_ring", "fork_join")
+# Changes to fixture sizes must be coordinated across all four runtimes.
+# Reject silently altered work counts instead of publishing misleading ratios.
+EXPECTED_MESSAGES = {
+    "counting": 200_000,
+    "ping_pong": 40_001,
+    "thread_ring": 20_000,
+    "fork_join": 100_000,
+}
+# Nulang's standalone runner also emits Skynet; there is no matched
+# Go/Rust/Erlang fixture for it, so validate and exclude it from comparisons.
+NULANG_ONLY_MESSAGES = {"skynet": 1110}
 RECORD_RE = re.compile(
     r"\[cross-bench\]\s+runtime=(?P<runtime>[a-z0-9_-]+)\s+"
     r"benchmark=(?P<benchmark>[a-z0-9_-]+)\s+"
@@ -73,17 +84,40 @@ def maybe_version(command: list[str]) -> str | None:
 
 def parse_records(output: str, expected_runtime: str) -> dict[str, dict[str, int]]:
     records: dict[str, dict[str, int]] = {}
+    seen: set[str] = set()
+    allowed_messages = dict(EXPECTED_MESSAGES)
+    if expected_runtime == "nulang":
+        allowed_messages.update(NULANG_ONLY_MESSAGES)
+
     for match in RECORD_RE.finditer(output):
         runtime = match.group("runtime")
         if runtime != expected_runtime:
-            continue
+            raise RuntimeError(
+                f"unexpected runtime {runtime!r}; expected {expected_runtime!r}"
+            )
         name = match.group("benchmark")
-        if name not in BENCHMARKS:
-            continue
-        records[name] = {
-            "messages": int(match.group("messages")),
-            "elapsed_ns": int(match.group("elapsed_ns")),
-        }
+        if name not in allowed_messages:
+            raise RuntimeError(f"{expected_runtime}: unexpected benchmark {name!r}")
+        if name in seen:
+            raise RuntimeError(f"{expected_runtime}: duplicate benchmark {name}")
+        seen.add(name)
+
+        messages = int(match.group("messages"))
+        expected_messages = allowed_messages[name]
+        if messages != expected_messages:
+            raise RuntimeError(
+                f"{expected_runtime}/{name}: got {messages} messages; "
+                f"expected {expected_messages}"
+            )
+        elapsed_ns = int(match.group("elapsed_ns"))
+        if elapsed_ns <= 0:
+            raise RuntimeError(
+                f"{expected_runtime}/{name}: elapsed_ns must be positive"
+            )
+
+        # Nulang-only controls are checked but excluded from the matched table.
+        if name in BENCHMARKS:
+            records[name] = {"messages": messages, "elapsed_ns": elapsed_ns}
 
     missing = [name for name in BENCHMARKS if name not in records]
     if missing:
@@ -92,6 +126,17 @@ def parse_records(output: str, expected_runtime: str) -> dict[str, dict[str, int
             f"{expected_runtime} did not emit records for: {', '.join(missing)}"
         )
     return records
+
+def measurement_order(selected: list[str], round_idx: int) -> list[str]:
+    """Rotate measured runtime order to counterbalance within-round drift.
+
+    Every runtime occupies every position over a complete cycle of len(selected)
+    measurement rounds. Warmup rounds are independent of measured rounds.
+    """
+    if not selected:
+        return []
+    offset = round_idx % len(selected)
+    return selected[offset:] + selected[:offset]
 
 
 def build_commands(selected: list[str]) -> dict[str, list[str]]:
@@ -323,6 +368,8 @@ def main() -> int:
     unknown = sorted(set(selected) - {"nulang", "rust", "go", "erlang"})
     if unknown:
         parser.error(f"unknown runtimes: {', '.join(unknown)}")
+    if not selected:
+        parser.error("--runtimes must include at least one runtime")
 
     cpu_affinity = measurement_affinity(args.cpu_mode)
     if cpu_affinity is not None:
@@ -350,7 +397,10 @@ def main() -> int:
         measured = round_idx >= args.warmup
         phase = "sample" if measured else "warmup"
         index = round_idx - args.warmup + 1 if measured else round_idx + 1
-        for runtime in selected:
+        # A complete cycle positions each runtime first/second/etc. once.
+        # Do not let discarded warmups shift the measured rotation.
+        order = measurement_order(selected, index - 1)
+        for runtime in order:
             print(f"[{phase} {index}] {runtime}", flush=True)
             output = command_output(
                 commands[runtime],
