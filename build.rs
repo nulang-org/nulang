@@ -28,9 +28,7 @@ fn main() {
     // libpython3.X.so symlink in OUT_DIR and adding OUT_DIR to the library
     // search path.
     //
-    // Unix-only: `std::os::unix::fs::symlink` does not exist on Windows,
-    // and the searched paths are Linux multiarch dirs anyway. On Windows
-    // pyo3 links the Python import lib directly.
+    // Unix-only: `std::os::unix::fs::symlink` does not exist on Windows.
     #[cfg(unix)]
     {
         let out_dir = env::var_os("OUT_DIR")
@@ -40,7 +38,7 @@ fn main() {
         let version = detect_python_version();
         let soname = format!("libpython{}.so", version);
 
-        if let Some(lib) = find_python_lib(&version) {
+        if let Some(lib) = find_python_lib(&version, &target_arch) {
             let link = out_dir.join(&soname);
             if link.exists() || std::os::unix::fs::symlink(&lib, &link).is_ok() {
                 println!("cargo:rustc-link-search=native={}", out_dir.display());
@@ -80,8 +78,24 @@ fn python_version_from_exe(exe: &str) -> Option<String> {
 }
 
 #[cfg(unix)]
-fn find_python_lib(version: &str) -> Option<PathBuf> {
-    let search_dirs = ["/usr/lib64", "/lib64", "/usr/lib/x86_64-linux-gnu"];
+fn find_python_lib(version: &str, target_arch: &str) -> Option<PathBuf> {
+    // Debian/Ubuntu install architecture-specific libraries under GNU
+    // multiarch directories. Keep the generic lib64 locations for Fedora and
+    // similar distributions, then add the native target's multiarch path.
+    let multiarch = match target_arch {
+        "x86_64" => Some("x86_64-linux-gnu"),
+        "aarch64" => Some("aarch64-linux-gnu"),
+        "riscv64" => Some("riscv64-linux-gnu"),
+        "s390x" => Some("s390x-linux-gnu"),
+        _ => None,
+    };
+
+    let mut search_dirs = vec![PathBuf::from("/usr/lib64"), PathBuf::from("/lib64")];
+    if let Some(triple) = multiarch {
+        search_dirs.push(PathBuf::from(format!("/usr/lib/{triple}")));
+        search_dirs.push(PathBuf::from(format!("/lib/{triple}")));
+    }
+
     let candidates = [
         format!("libpython{}.so.1.0", version),
         format!("libpython{}.so", version),
