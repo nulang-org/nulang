@@ -53,7 +53,7 @@ fn commit_put(tablet: &mut WalBackedTablet, key: &[u8], value: &[u8]) {
     tablet.commit(write).unwrap();
 }
 
-fn run_until_ack_then_kill(wal_path: &Path, action: &str) -> String {
+fn spawn_until_ack(wal_path: &Path, action: &str) -> (std::process::Child, String) {
     let ack_path = ack_path(wal_path);
     let _ = fs::remove_file(&ack_path);
 
@@ -79,14 +79,18 @@ fn run_until_ack_then_kill(wal_path: &Path, action: &str) -> String {
         thread::sleep(Duration::from_millis(5));
     }
 
-    child.kill().unwrap();
-    let status = child.wait().unwrap();
-
     let ack = ack.expect("fixture did not publish a durability acknowledgement");
     assert!(
         ack.starts_with("ACK "),
         "fixture must acknowledge only after its durability boundary, got {ack:?}"
     );
+    (child, ack)
+}
+
+fn run_until_ack_then_kill(wal_path: &Path, action: &str) -> String {
+    let (mut child, ack) = spawn_until_ack(wal_path, action);
+    child.kill().unwrap();
+    let status = child.wait().unwrap();
     assert!(!status.success(), "fixture unexpectedly exited gracefully");
     ack
 }
@@ -102,7 +106,17 @@ fn crash_fixture_child() {
     let ack_path = std::env::var_os("NULANG_NUDB_CRASH_CHILD_ACK")
         .expect("crash fixture ack path must be supplied by parent");
 
+    // Keep the writer alive through acknowledgement for the cross-process
+    // exclusion fixture. Other crash fixtures still drop it before ACK.
+    let mut _held_writer = None;
     let acknowledgement = match action.as_str() {
+        "hold-lock" => {
+            let mut writer = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+            commit_put(&mut writer, b"k", b"from-child");
+            writer.checkpoint().unwrap();
+            _held_writer = Some(writer);
+            "ACK WRITER_LOCK 1".to_string()
+        }
         "commit" => {
             let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
             let sequence = tablet.current_sequence();
@@ -208,5 +222,29 @@ fn reclaimed_wal_survives_immediate_process_kill() {
     commit_put(&mut tablet, b"k", b"v3");
     assert_eq!(tablet.current_sequence(), 3);
 
+    cleanup(&wal_path);
+}
+
+#[test]
+fn competing_process_cannot_write_until_checkpoint_owner_exits() {
+    let wal_path = temp_wal("cross_process_lock");
+    cleanup(&wal_path);
+
+    let (mut child, ack) = spawn_until_ack(&wal_path, "hold-lock");
+    let lock_denied = WalBackedTablet::open(descriptor(), &wal_path).is_err();
+
+    // Reap the parked child even if the assertion fails (RED test safety).
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+    assert_eq!(ack.trim(), "ACK WRITER_LOCK 1");
+    assert!(
+        lock_denied,
+        "a child retaining its writer lock must exclude this process"
+    );
+
+    let writer = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+    assert_eq!(writer.current_sequence(), 1);
+    assert_eq!(writer.read_latest(b"k"), Some(&b"from-child"[..]));
+    drop(writer);
     cleanup(&wal_path);
 }
