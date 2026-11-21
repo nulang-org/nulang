@@ -4,6 +4,8 @@ const site = 'https://nulang.org';
 const isHome = Astro.url.pathname === '/';
 const is404 = entry.id === '404';
 const canonical = new URL(Astro.url.pathname, site).href;
+// Static Markdown twins are generated for Starlight document pages, excluding the splash homepage.
+const markdownUrl = new URL(Astro.url.pathname.replace(/\/$/, '') + '.md', site).href;
 
 const segments = Astro.url.pathname.split('/').filter(Boolean);
 const titleCase = (s: string) =>
@@ -106,4 +108,6 @@ const pageDescription =
 <meta name="twitter:title" content={pageTitle} />
 <meta name="twitter:description" content={pageDescription} />
 {is404 && <meta name="robots" content="noindex, nofollow" />}
+{!is404 && <link rel="describedby" type="text/plain" href={`${site}/llms.txt`} />}
+{!isHome && !is404 && <link rel="alternate" type="text/markdown" href={markdownUrl} />}
 {!is404 && <script type="application/ld+json" set:html={jsonld} />}
