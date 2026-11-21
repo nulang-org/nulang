@@ -266,6 +266,10 @@ pub struct ActorHeap {
     limit: *mut u8,
     /// Total size of the active block (bytes).
     total_size: usize,
+    /// Minimum size used for chained blocks after the initial block fills.
+    /// Keeping this separate from `total_size` lets actor heaps start small
+    /// without forcing large actors to grow forever in tiny increments.
+    growth_floor: usize,
     /// Bytes committed by the bump pointer in the active block
     /// (i.e. `current - base`).
     used_bytes: usize,
@@ -334,7 +338,16 @@ impl ActorHeap {
     ///
     /// Panics if `total_size` is zero.
     pub fn new(total_size: usize) -> Self {
-        assert!(total_size > 0, "ActorHeap size must be > 0");
+        Self::new_with_growth_floor(total_size, total_size)
+    }
+
+    /// Create a heap whose lazy first block may be smaller than its steady-state
+    /// chained blocks. This is intended for actor heaps: most actors allocate
+    /// little or nothing, while actors that outgrow the first block should not
+    /// pay repeated tiny-block allocation overhead.
+    pub(crate) fn new_with_growth_floor(initial_size: usize, growth_floor: usize) -> Self {
+        assert!(initial_size > 0, "ActorHeap size must be > 0");
+        assert!(growth_floor > 0, "ActorHeap growth floor must be > 0");
 
         ActorHeap {
             actor_id: 0,
@@ -344,7 +357,8 @@ impl ActorHeap {
             // Before the first allocation this stores the configured initial
             // block size. After activation it stores the actual pooled or
             // freshly allocated block size.
-            total_size,
+            total_size: initial_size,
+            growth_floor: growth_floor.max(initial_size),
             used_bytes: 0,
             prior_used: 0,
             retired_blocks: Vec::new(),
@@ -693,17 +707,27 @@ impl ActorHeap {
         debug_assert!(self.limit.is_null());
 
         let requested = self.total_size.max(min_capacity);
-        let (base, actual_size) = HEAP_POOL
-            .with(|pool| pool.borrow_mut().acquire(requested))
-            .unwrap_or_else(|| {
-                let layout = std::alloc::Layout::from_size_align(requested, ALIGN)
-                    .expect("invalid ActorHeap layout");
-                let base = unsafe { std::alloc::alloc(layout) };
-                if base.is_null() {
-                    std::alloc::handle_alloc_error(layout);
-                }
-                (base, requested)
-            });
+        // A tiered heap (growth_floor > initial capacity) needs its compact
+        // first block to be a real size tier, not merely a minimum request.
+        // Otherwise best-fit reuse can hand a 16 KiB recycled growth block to
+        // every new 4 KiB actor and erase the density win indefinitely.
+        let pooled = HEAP_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if self.growth_floor > self.total_size && requested == self.total_size {
+                pool.acquire_exact(requested)
+            } else {
+                pool.acquire(requested)
+            }
+        });
+        let (base, actual_size) = pooled.unwrap_or_else(|| {
+            let layout = std::alloc::Layout::from_size_align(requested, ALIGN)
+                .expect("invalid ActorHeap layout");
+            let base = unsafe { std::alloc::alloc(layout) };
+            if base.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            (base, requested)
+        });
 
         self.base = base;
         self.current = base;
@@ -720,22 +744,34 @@ impl ActorHeap {
     /// registers, other actors' foreign refs, and JIT code).  Retired blocks
     /// are deallocated on `reset`/`drop`.
     ///
-    /// The new block is the same size as the exhausted one, or `min_capacity`
-    /// when a single allocation needs more.  Equal-size chaining (rather than
-    /// doubling) keeps per-actor memory growth linear and predictable: an
-    /// actor's footprint stays proportional to the data it actually holds.
+    /// The new block is at least the heap's configured growth floor, the size
+    /// of the exhausted block, or `min_capacity` when a single allocation
+    /// needs more. This lets small actor heaps use a compact first block while
+    /// retaining linear, predictable steady-state growth instead of geometric
+    /// over-allocation.
     ///
     /// Returns `None` only when the global allocator fails.
     fn grow_bump_block(&mut self, min_capacity: usize) -> Option<()> {
         debug_assert!(!self.base.is_null(), "grow requires an active bump block");
-        let new_size = self.total_size.max(min_capacity);
-        let layout = std::alloc::Layout::from_size_align(new_size, ALIGN).ok()?;
-        // SAFETY: layout has non-zero size (`total_size` > 0) and is valid.
-        let base = unsafe { std::alloc::alloc(layout) };
-        if base.is_null() {
-            // Report OS OOM as exhaustion, matching alloc's `None` contract.
-            return None;
-        }
+        let new_size = self.total_size.max(self.growth_floor).max(min_capacity);
+        // Reuse only an exact-size pooled block. The configured growth floor
+        // is a real memory tier, not merely a minimum: accepting a larger
+        // best-fit block here would make actor footprint depend on unrelated
+        // prior heap sizes on this shard.
+        let pooled = HEAP_POOL.with(|pool| pool.borrow_mut().acquire_exact(new_size));
+        let base = match pooled {
+            Some((base, _)) => base,
+            None => {
+                let layout = std::alloc::Layout::from_size_align(new_size, ALIGN).ok()?;
+                // SAFETY: layout has non-zero size and is valid.
+                let base = unsafe { std::alloc::alloc(layout) };
+                if base.is_null() {
+                    // Report OS OOM as exhaustion, matching alloc's `None` contract.
+                    return None;
+                }
+                base
+            }
+        };
 
         // Retire the exhausted block; its contents stay exactly where they are.
         self.retired_blocks.push((self.base, self.total_size));
@@ -982,6 +1018,17 @@ impl HeapPool {
             }
         }
         best_idx.map(|i| self.blocks.swap_remove(i))
+    }
+
+    /// Acquire a recycled block whose allocation size exactly matches
+    /// `size`. Tiered actor heaps use this for their compact first block so a
+    /// pooled steady-state 16 KiB block cannot silently turn a 4 KiB request
+    /// back into a 16 KiB actor footprint.
+    fn acquire_exact(&mut self, size: usize) -> Option<(*mut u8, usize)> {
+        self.blocks
+            .iter()
+            .position(|&(_base, block_size)| block_size == size)
+            .map(|index| self.blocks.swap_remove(index))
     }
 
     /// Return a block to the pool for reuse.
@@ -1267,6 +1314,66 @@ fn test_free_list_reuse() {
 
     // Free list should be empty now.
     assert_eq!(heap.free_list_count(), 0);
+}
+
+#[test]
+fn test_heap_pool_exact_acquire_does_not_substitute_larger_block() {
+    let mut pool = HeapPool::new(8, 128 * 1024);
+    let small_layout = std::alloc::Layout::from_size_align(4 * 1024, ALIGN).unwrap();
+    let large_layout = std::alloc::Layout::from_size_align(16 * 1024, ALIGN).unwrap();
+    let small = unsafe { std::alloc::alloc(small_layout) };
+    let large = unsafe { std::alloc::alloc(large_layout) };
+    assert!(!small.is_null() && !large.is_null());
+
+    pool.release(large, 16 * 1024);
+    assert!(
+        pool.acquire_exact(4 * 1024).is_none(),
+        "a larger pooled block must not satisfy an exact compact-tier request"
+    );
+
+    pool.release(small, 4 * 1024);
+    let (base, size) = pool
+        .acquire_exact(4 * 1024)
+        .expect("exact-size pooled block should be reused");
+    assert_eq!(base, small);
+    assert_eq!(size, 4 * 1024);
+
+    // The acquired small block is no longer owned by the pool.
+    unsafe { std::alloc::dealloc(base, small_layout) };
+    // The 16 KiB block remains in the pool and is released by HeapPool::drop.
+}
+
+#[test]
+fn test_tiered_heap_reuses_exact_growth_blocks() {
+    // Seed the thread-local pool with a 16 KiB block by materializing and
+    // dropping a generic heap of that exact size.
+    {
+        let mut donor = ActorHeap::new(16 * 1024);
+        donor.alloc(8, TypeTag::Raw).expect("donor allocation");
+    }
+
+    let mut heap = ActorHeap::new_with_growth_floor(4 * 1024, 16 * 1024);
+    // Materialize the 4 KiB first tier.
+    heap.alloc(8, TypeTag::Raw).expect("initial allocation");
+
+    // Force growth with an allocation that fits the 16 KiB tier but not the
+    // remaining first block. The active block must become exactly 16 KiB.
+    while heap.free_bytes() >= 256 {
+        heap.alloc(128, TypeTag::Raw).expect("fill first block");
+    }
+    heap.alloc(128, TypeTag::Raw).expect("growth allocation");
+    assert_eq!(heap.total_size, 16 * 1024);
+}
+
+#[test]
+fn test_tiered_heap_keeps_small_initial_capacity_and_larger_growth_floor() {
+    let heap = ActorHeap::new_with_growth_floor(4 * 1024, 16 * 1024);
+    assert_eq!(heap.total_size, 4 * 1024);
+    assert_eq!(heap.growth_floor, 16 * 1024);
+    assert!(
+        heap.base.is_null(),
+        "tiered heap must remain lazy at construction"
+    );
 }
 
 #[test]
