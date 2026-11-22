@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Fail-closed legacy snapshots schema validation (draft) — 2026-11-22
+- **Reject pre-existing SQLite `snapshots` tables missing mandatory `actor_id`, `sequence`, or `state` columns before adding optional columns.** Previously, `CREATE TABLE IF NOT EXISTS` accepted an incomplete table and startup could succeed despite an unusable durable-state schema.
+- **Match SQLite column names case-insensitively during optional migrations**, preserving compatible older schemas with uppercased optional column identifiers. The change applies only to the audited SQLite integration candidate, remains draft, and requires exact-head regression and migration/recovery qualification before release.
+
 ### Bounded local SQLite result materialization (draft) — 2026-11-20
 - **Fail closed when an eager local SQLite query would buffer more than 100,000 rows or an estimated 64 MiB of row/value storage.** Reject the query with a pagination hint rather than returning a truncated result or retaining an unbounded in-memory buffer. Text/blob byte lengths are checked before cloning each cell.
 - The limit affects only local SQLite in the security integration adapter; remote Turso/Hrana and downstream JSON serialization have separate memory behavior. Existing large-result callers must paginate. Exact-head testing and review are required before release.
