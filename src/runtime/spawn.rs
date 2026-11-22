@@ -159,10 +159,10 @@ fn try_spawn_actor_with_id(
     };
 
     let mut actor = if let Some(mut pooled) = rt.actor_pool.pop() {
-        pooled.reset(id, format!("actor_{}", id), 0);
+        pooled.reset(id, format!("actor_{}", id), rt.default_mailbox_capacity);
         pooled
     } else {
-        Actor::new(id, format!("actor_{}", id), 0)
+        Actor::new(id, format!("actor_{}", id), rt.default_mailbox_capacity)
     };
     let state_fields = init();
     for (name, value) in state_fields {
