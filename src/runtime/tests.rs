@@ -2619,13 +2619,17 @@ fn test_libsql_store_migrates_casefolded_optional_snapshot_columns_without_dupli
         .expect("create valid schema with uppercase optional column names");
     }
 
-    let store = LibsqlStore::new(&path)
-        .expect("SQLite identifiers are case-insensitive; optional columns must not be added twice");
+    let store = LibsqlStore::new(&path).expect(
+        "SQLite identifiers are case-insensitive; optional columns must not be added twice",
+    );
     let columns = store
         .query("PRAGMA table_info(snapshots)", &[])
         .expect("inspect migrated schema");
     assert_eq!(
-        columns.iter().filter(|c| c.to_ascii_lowercase().contains("activation_epoch")).count(),
+        columns
+            .iter()
+            .filter(|c| c.to_ascii_lowercase().contains("activation_epoch"))
+            .count(),
         1,
         "legacy activation_epoch must not be duplicated"
     );
