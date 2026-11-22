@@ -2517,6 +2517,125 @@ fn test_libsql_store_persists_to_disk() {
 
 #[cfg(feature = "sqlite")]
 #[test]
+fn test_libsql_store_disposable_legacy_backup_upgrade_reopen_restore() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "nulang-sqlite-upgrade-rollback-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create disposable SQLite fixture directory");
+    let legacy_path = dir.join("legacy.db");
+    let backup_path = dir.join("pre-upgrade.db");
+    let restored_path = dir.join("restored.db");
+
+    {
+        let legacy = rusqlite::Connection::open(&legacy_path).expect("open old-schema fixture");
+        legacy
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA synchronous=FULL;
+                 CREATE TABLE snapshots (
+                     actor_id INTEGER PRIMARY KEY,
+                     sequence INTEGER NOT NULL,
+                     state TEXT NOT NULL,
+                     waiting_signal TEXT
+                 );
+                 CREATE TABLE journal (
+                     actor_id INTEGER NOT NULL,
+                     sequence INTEGER NOT NULL,
+                     behavior_id INTEGER NOT NULL,
+                     payload TEXT NOT NULL,
+                     PRIMARY KEY (actor_id, sequence)
+                 );
+                 INSERT INTO snapshots (actor_id, sequence, state, waiting_signal)
+                     VALUES (7, 3, '{}', NULL);
+                 INSERT INTO journal (actor_id, sequence, behavior_id, payload)
+                     VALUES (7, 4, 2, '[]');",
+            )
+            .expect("commit durable old-schema state and journal");
+
+        // VACUUM INTO exports one consistent SQLite snapshot, including
+        // committed WAL state, rather than incorrectly copying a live .db file.
+        legacy
+            .execute(
+                "VACUUM INTO ?1",
+                [backup_path.to_str().expect("temporary backup path is UTF-8")],
+            )
+            .expect("create immutable pre-upgrade backup from legacy fixture");
+    }
+
+    {
+        let backup = rusqlite::Connection::open(&backup_path).expect("verify backup");
+        let integrity: String = backup
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .expect("run backup integrity check");
+        assert_eq!(integrity, "ok");
+    }
+
+    {
+        let mut upgraded = LibsqlStore::new(&legacy_path).expect("upgrade old schema in place");
+        assert_eq!(upgraded.load_snapshot(7).expect("legacy snapshot").sequence, 3);
+        assert_eq!(upgraded.latest_sequence(7), 4);
+        assert_eq!(upgraded.read_journal(7).len(), 1);
+
+        let mut state = HashMap::new();
+        state.insert("count".to_string(), PersistedValue::Int(5));
+        upgraded
+            .save_snapshot(ActorSnapshot {
+                actor_id: 7,
+                sequence: 5,
+                activation_epoch: 1,
+                state,
+                waiting_signal: None,
+                crdt_snapshot: None,
+                crdt_field_map: None,
+                schema_name: None,
+                authority_tokens: Default::default(),
+            })
+            .expect("persist an upgraded actor snapshot");
+        upgraded
+            .append_journal(
+                7,
+                JournalEntry {
+                    sequence: 6,
+                    behavior_id: 3,
+                    payload: vec![PersistedValue::Int(5)],
+                },
+            )
+            .expect("persist a post-upgrade journal entry");
+    }
+    {
+        let reopened = LibsqlStore::new(&legacy_path).expect("reopen upgraded SQLite store");
+        let snapshot = reopened.load_snapshot(7).expect("upgraded snapshot survives reopen");
+        assert_eq!(snapshot.sequence, 5);
+        assert_eq!(snapshot.state.get("count"), Some(&PersistedValue::Int(5)));
+        assert_eq!(reopened.latest_sequence(7), 6);
+        assert_eq!(reopened.read_journal(7).len(), 2);
+    }
+
+    // Rollback requires restoring the *pre-upgrade* backup to a clean
+    // directory. Merely reverting the binary against upgraded files is unsafe.
+    std::fs::copy(&backup_path, &restored_path).expect("restore immutable backup");
+    {
+        let restored = LibsqlStore::new(&restored_path).expect("read restored legacy snapshot");
+        let snapshot = restored.load_snapshot(7).expect("pre-upgrade actor state");
+        assert_eq!(snapshot.sequence, 3);
+        assert!(snapshot.state.get("count").is_none());
+        assert_eq!(restored.latest_sequence(7), 4);
+        assert_eq!(restored.read_journal(7).len(), 1);
+    }
+
+    // This verifies the new adapter's restored-copy path, not a separate old
+    // binary's ability to reopen the restored database or live Turso behavior.
+    std::fs::remove_dir_all(&dir).expect("clean up disposable SQLite fixtures");
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
 fn test_libsql_store_crdt_snapshot_roundtrip() {
     let mut store = LibsqlStore::in_memory().unwrap();
     store
