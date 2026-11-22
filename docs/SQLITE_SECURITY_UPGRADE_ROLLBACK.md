@@ -85,6 +85,27 @@ modify it to imply an upgrade succeeded.
   reconciliation procedure. Restoring the backup alone **loses those writes**.
   If safe replay cannot be proven, defer rollback/promotion and escalate.
 
+## Disposable legacy backup/upgrade/restore rehearsal (draft)
+
+The SQLite-gated Rust regression
+`test_libsql_store_disposable_legacy_backup_upgrade_reopen_restore` constructs
+a disposable legacy `snapshots` and `journal` fixture, enables SQLite WAL
+mode, exports a consistent immutable pre-upgrade copy through `VACUUM INTO`,
+and verifies `PRAGMA integrity_check` on that copy. The test then opens the
+legacy schema using the patched `LibsqlStore`, verifies the original snapshot
+and journal, writes a new snapshot and journal entry, reopens the upgraded
+store, and checks the new sequence and state. Finally, it restores the
+pre-upgrade backup to a separate path and verifies the original sequence and
+journal are intact without the post-upgrade writes.
+
+**Qualification boundary:** Passing this test would prove the patched Rust
+adapter can migrate a simple old-schema fixture and reopen a consistent
+restored backup. It does **not** prove an independently built legacy Nulang
+binary can read the restored copy, recovery from a hard-killed process with an
+uncheckpointed WAL, crash-consistent copying of live files, or a production
+rollback. Those requirements remain stop-ship until independently rehearsed.
+No production data or credentials are used by this test.
+
 ## Required remote Turso / libSQL qualification (still open)
 
 Use only an explicitly disposable test database and limited-scope test token;
