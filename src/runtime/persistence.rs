@@ -1559,9 +1559,23 @@ impl LibsqlStore {
                         format!("invalid snapshots schema column: {e}"),
                     )
                 })?;
-                columns.insert(column);
+                // SQLite column identifiers are case-insensitive. Normalize
+                // before comparing against the canonical schema so a legacy
+                // uppercased column is not mistaken for a missing column.
+                columns.insert(column.to_ascii_lowercase());
             }
             drop(rows);
+            // Required columns cannot be added safely to an existing store:
+            // silently accepting such a schema would defer corruption or
+            // missing-data errors until the first durable actor write.
+            for required in ["actor_id", "sequence", "state"] {
+                if !columns.contains(required) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("snapshots table is missing required column {required}"),
+                    ));
+                }
+            }
             // Legacy snapshots omit some optional columns. Only add genuinely
             // missing columns and propagate every real migration failure.
             for (name, definition) in [
