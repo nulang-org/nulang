@@ -2559,6 +2559,82 @@ fn test_libsql_store_crdt_snapshot_roundtrip() {
 
 #[cfg(feature = "sqlite")]
 #[test]
+fn test_libsql_store_rejects_snapshot_table_missing_required_state_column() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "nulang-snapshot-missing-state-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create disposable directory");
+    let path = dir.join("legacy.db");
+    {
+        let db = rusqlite::Connection::open(&path).expect("create legacy SQLite fixture");
+        db.execute(
+            "CREATE TABLE snapshots (actor_id INTEGER PRIMARY KEY, sequence INTEGER NOT NULL)",
+            [],
+        )
+        .expect("create malformed legacy schema missing state");
+    }
+
+    let error = LibsqlStore::new(&path)
+        .err()
+        .expect("startup must reject snapshots missing required state column");
+    assert!(
+        error.to_string().contains("state"),
+        "report the missing required snapshot column: {error}"
+    );
+    std::fs::remove_dir_all(&dir).expect("clean up disposable fixture");
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn test_libsql_store_migrates_casefolded_optional_snapshot_columns_without_duplication() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "nulang-snapshot-casefolded-columns-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create disposable directory");
+    let path = dir.join("legacy.db");
+    {
+        let db = rusqlite::Connection::open(&path).expect("create legacy SQLite fixture");
+        db.execute(
+            "CREATE TABLE snapshots (
+                actor_id INTEGER PRIMARY KEY,
+                sequence INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                ACTIVATION_EPOCH INTEGER NOT NULL DEFAULT 1,
+                CRDT_SNAPSHOT TEXT
+            )",
+            [],
+        )
+        .expect("create valid schema with uppercase optional column names");
+    }
+
+    let store = LibsqlStore::new(&path)
+        .expect("SQLite identifiers are case-insensitive; optional columns must not be added twice");
+    let columns = store
+        .query("PRAGMA table_info(snapshots)", &[])
+        .expect("inspect migrated schema");
+    assert_eq!(
+        columns.iter().filter(|c| c.to_ascii_lowercase().contains("activation_epoch")).count(),
+        1,
+        "legacy activation_epoch must not be duplicated"
+    );
+    drop(store);
+    std::fs::remove_dir_all(&dir).expect("clean up disposable fixture");
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
 fn test_libsql_store_rejects_incompatible_snapshot_view_before_accepting_writes() {
     use std::time::{SystemTime, UNIX_EPOCH};
     let unique = SystemTime::now()
