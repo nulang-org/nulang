@@ -2563,7 +2563,9 @@ fn test_libsql_store_disposable_legacy_backup_upgrade_reopen_restore() {
         legacy
             .execute(
                 "VACUUM INTO ?1",
-                [backup_path.to_str().expect("temporary backup path is UTF-8")],
+                [backup_path
+                    .to_str()
+                    .expect("temporary backup path is UTF-8")],
             )
             .expect("create immutable pre-upgrade backup from legacy fixture");
     }
@@ -2578,7 +2580,10 @@ fn test_libsql_store_disposable_legacy_backup_upgrade_reopen_restore() {
 
     {
         let mut upgraded = LibsqlStore::new(&legacy_path).expect("upgrade old schema in place");
-        assert_eq!(upgraded.load_snapshot(7).expect("legacy snapshot").sequence, 3);
+        assert_eq!(
+            upgraded.load_snapshot(7).expect("legacy snapshot").sequence,
+            3
+        );
         assert_eq!(upgraded.latest_sequence(7), 4);
         assert_eq!(upgraded.read_journal(7).len(), 1);
 
@@ -2610,7 +2615,9 @@ fn test_libsql_store_disposable_legacy_backup_upgrade_reopen_restore() {
     }
     {
         let reopened = LibsqlStore::new(&legacy_path).expect("reopen upgraded SQLite store");
-        let snapshot = reopened.load_snapshot(7).expect("upgraded snapshot survives reopen");
+        let snapshot = reopened
+            .load_snapshot(7)
+            .expect("upgraded snapshot survives reopen");
         assert_eq!(snapshot.sequence, 5);
         assert_eq!(snapshot.state.get("count"), Some(&PersistedValue::Int(5)));
         assert_eq!(reopened.latest_sequence(7), 6);
