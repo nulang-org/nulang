@@ -8710,3 +8710,53 @@ fn confirmed_node_removal_forgets_crdt_receiver_knowledge() {
         "a peer that rejoins after confirmed removal must receive full state"
     );
 }
+
+// Hosted runtimes can opt into a finite normal-message budget without
+// changing the standalone/runtime compatibility default.
+#[test]
+fn hosted_mailbox_capacity_is_opt_in_and_backpressures_normal_messages() {
+    let mut legacy = Runtime::new();
+    let legacy_id = legacy.spawn_actor(Box::new(Vec::new));
+    assert_eq!(legacy.actors[&legacy_id].mailbox.capacity(), 0);
+
+    let mut hosted = Runtime::with_default_mailbox_capacity(1);
+    let id = hosted.spawn_actor(Box::new(Vec::new));
+    let actor = hosted.actors.get_mut(&id).unwrap();
+    assert_eq!(actor.mailbox.capacity(), 1);
+    let message = Message {
+        behavior_id: 0,
+        payload: MessagePayload::from_slice(&[]),
+        sender: 1,
+        priority: MessagePriority::Normal,
+        trace_id: None,
+    };
+    assert!(actor.mailbox.push(message.clone()).is_ok());
+    assert!(actor.mailbox.push(message.clone()).is_err());
+    assert_eq!(actor.mailbox.len(), 1);
+
+    // Supervision/control messages retain their pre-existing bypass contract.
+    let system_message = Message {
+        priority: MessagePriority::System,
+        ..message
+    };
+    assert!(actor.mailbox.push(system_message).is_ok());
+}
+
+#[test]
+fn hosted_mailbox_capacity_survives_actor_pool_reuse_and_persistent_recovery() {
+    let mut rt = Runtime::with_default_mailbox_capacity(3);
+    let pooled_id = rt.spawn_actor(Box::new(Vec::new));
+    rt.actor_pool.push(rt.actors.remove(&pooled_id).unwrap());
+    let recycled_id = rt.spawn_actor(Box::new(Vec::new));
+    assert_eq!(rt.actors[&recycled_id].mailbox.capacity(), 3);
+
+    let durable_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
+    assert_eq!(rt.actors[&durable_id].mailbox.capacity(), 3);
+    rt.checkpoint_actor(durable_id);
+    rt.actors.remove(&durable_id);
+    assert_eq!(rt.recover_actor(durable_id), Some(durable_id));
+    assert_eq!(rt.actors[&durable_id].mailbox.capacity(), 3);
+
+    let supervisor_id = rt.create_supervisor("hosted-supervisor", RestartStrategy::OneForOne);
+    assert_eq!(rt.actors[&supervisor_id].mailbox.capacity(), 3);
+}
