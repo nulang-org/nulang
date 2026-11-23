@@ -1000,6 +1000,18 @@ mod tests {
         }
     }
 
+    /// Regression from nightly fuzz shard 6 at 448cfa8 (2026-10-27/28):
+    /// float division by zero feeding an array-indexed addition must yield
+    /// the same observable value after JIT tier-up as in the cold VM.
+    #[test]
+    fn differential_nil_float_add_array_regression() {
+        let source = "let a = [1.5, 2.5]; 1.0 / 0.0 + a[1]";
+        match differential_fuzz_one(source) {
+            Ok(DiffOutcome::Agreed { .. }) => {}
+            other => panic!("interpreter/JIT parity regression: {other:?}"),
+        }
+    }
+
     /// Differential regression cases: known kernels that must agree across
     /// all backends. Added from nightly fuzz captures (2026-10-10).
     #[test]
