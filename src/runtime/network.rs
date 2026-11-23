@@ -2587,6 +2587,44 @@ fn connection_reader(
     );
 }
 
+/// Read a complete frame segment across short socket read timeouts.
+///
+/// `Read::read_exact` may consume prefix bytes before returning WouldBlock
+/// or TimedOut. Retrying read_exact with a new slice loses those bytes,
+/// shifting the NUL0 frame boundary and silently dropping subsequent packets.
+/// Keep the exact count of consumed bytes instead, and honor transport shutdown.
+#[cfg(feature = "tcp")]
+fn read_exact_across_timeouts<R: Read>(
+    stream: &mut R,
+    buf: &mut [u8],
+    shutdown_flag: &AtomicBool,
+) -> io::Result<()> {
+    let mut consumed = 0;
+    while consumed < buf.len() {
+        if shutdown_flag.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "transport shutting down",
+            ));
+        }
+        match stream.read(&mut buf[consumed..]) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => consumed += n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(ref e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Read framed packets from `stream` until disconnect or shutdown, then
 /// remove the peer from the connection pool.
 ///
@@ -2607,35 +2645,21 @@ fn connection_read_loop(
             break;
         }
 
-        // Read 4-byte length prefix.
-        let len = loop {
-            let mut len_buf = [0u8; 4];
-            match stream.read_exact(&mut len_buf) {
-                Ok(()) => break u32::from_be_bytes(len_buf),
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    // TLS read timeout: release lock briefly so the
-                    // sender thread can acquire it.
-                    std::thread::sleep(Duration::from_millis(1));
-                    continue;
-                }
-                Err(_) => break 'read_loop, // Disconnect or timeout.
-            }
-        };
+        // Reassemble length even if a timeout interrupts the middle of
+        // the 4-byte prefix; never restart after consuming partial bytes.
+        let mut len_buf = [0u8; 4];
+        if read_exact_across_timeouts(&mut stream, &mut len_buf, &shutdown_flag).is_err() {
+            break 'read_loop;
+        }
+        let len = u32::from_be_bytes(len_buf);
         if len == 0 || len > MAX_PACKET_LEN {
             break 'read_loop; // Protocol error or DoS.
         }
 
-        // Read payload.
+        // Same rule for the body: preserve already-read bytes across timeouts.
         let mut payload = vec![0u8; len as usize];
-        loop {
-            match stream.read_exact(&mut payload) {
-                Ok(()) => break,
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(1));
-                    continue;
-                }
-                Err(_) => break 'read_loop,
-            }
+        if read_exact_across_timeouts(&mut stream, &mut payload, &shutdown_flag).is_err() {
+            break 'read_loop;
         }
 
         // Update last-activity timestamp.
@@ -2849,6 +2873,75 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     #[cfg(feature = "tcp")]
     use std::thread::sleep;
+
+    // Regress a real TCP failure mode: a short socket read timeout can
+    // interrupt a frame *after* some bytes were already consumed. Retrying
+    // read_exact with a fresh buffer drops those bytes, shifts the next
+    // NUL0 frame boundary, and can lose a post-partition actor message.
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_fragmented_nul0_frame_survives_timeout_between_bytes() {
+        struct Fragmented {
+            bytes: Vec<u8>,
+            offset: usize,
+            calls: usize,
+        }
+
+        impl Read for Fragmented {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                self.calls += 1;
+                match self.calls % 4 {
+                    2 => return Err(io::ErrorKind::WouldBlock.into()),
+                    3 => return Err(io::ErrorKind::TimedOut.into()),
+                    0 => return Err(io::ErrorKind::Interrupted.into()),
+                    _ => {}
+                }
+                if self.offset == self.bytes.len() {
+                    return Ok(0);
+                }
+                out[0] = self.bytes[self.offset];
+                self.offset += 1;
+                Ok(1)
+            }
+        }
+
+        let body = b"NUL0actor-payload";
+        let mut wire = (body.len() as u32).to_be_bytes().to_vec();
+        wire.extend_from_slice(body);
+        let mut source = Fragmented {
+            bytes: wire.clone(),
+            offset: 0,
+            calls: 0,
+        };
+        let stopped = AtomicBool::new(false);
+        let mut length = [0u8; 4];
+        read_exact_across_timeouts(&mut source, &mut length, &stopped)
+            .expect("partial prefix must survive WouldBlock and TimedOut");
+        assert_eq!(u32::from_be_bytes(length), body.len() as u32);
+        let mut recovered = vec![0u8; body.len()];
+        read_exact_across_timeouts(&mut source, &mut recovered, &stopped)
+            .expect("partial body must survive WouldBlock and TimedOut");
+        assert_eq!(recovered, body);
+        assert_eq!(source.offset, wire.len());
+    }
+
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_nul0_frame_read_aborts_cleanly_on_eof_or_shutdown() {
+        let stopped = AtomicBool::new(false);
+        let mut truncated = io::Cursor::new(vec![1u8, 2]);
+        let mut output = [0u8; 4];
+        let error = read_exact_across_timeouts(&mut truncated, &mut output, &stopped)
+            .expect_err("truncated frame must never be accepted");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+
+        let stopped = AtomicBool::new(true);
+        let mut input = io::Cursor::new([1u8, 2, 3, 4]);
+        let error = read_exact_across_timeouts(&mut input, &mut output, &stopped)
+            .expect_err("shutdown must unblock a pending reader");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(input.position(), 0);
+    }
 
     // ------------------------------------------------------------------
     // 1. NodeId hashing
