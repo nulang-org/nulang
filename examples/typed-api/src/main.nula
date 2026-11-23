@@ -1,0 +1,21 @@
+// Demonstrates compiler-bound request inputs used by Web Contract IR v1.
+// This is not a persistent CRUD service; no authorization is installed.
+
+@placement(server)
+fn health() -> String { "ok" }
+
+@placement(server)
+fn show_item(id: Int from path("item_id"), details: Bool from query) -> String {
+    if details then { "item " + perform Int.to_string(id) } else { "item" }
+}
+
+@placement(server)
+fn create_item(title: String from form("title")) -> String {
+    "received: " + title
+}
+
+app "typed-api" {
+    route "GET" "/health" -> health
+    route "GET" "/items/{item_id: Int}" -> show_item
+    route "POST" "/items" -> create_item
+}
