@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Local SQLite persistence with rusqlite — 2026-10-30
+- Replace the libSQL client with bundled SQLite through rusqlite for local actor persistence. Keep the public LibsqlStore type as a compatibility alias to SqliteStore and retain SQLite schema, WAL, and FULL/NORMAL/OFF synchronous configuration.
+- Remove libSQL and its legacy TLS/HTTP2 dependency tree. Remote construction now fails with Unsupported until a separate remote persistence adapter is provided; no silent remote downgrade.
+- Add tests for the SqliteStore type alias, remote fail-closed behavior, and synchronous durability. The interim row-collection adapter buffers SQL results; large-result streaming must be qualified before merging.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.

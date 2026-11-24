@@ -1283,16 +1283,94 @@ impl PersistenceStore for JsonFileStore {
 }
 
 // ---------------------------------------------------------------------------
-// LibsqlStore — libSQL-backed persistence (local, remote Turso, or replica)
+#[cfg(feature = "sqlite")]
+struct SqliteRow {
+    values: Vec<rusqlite::types::Value>,
+}
+
+#[cfg(feature = "sqlite")]
+impl SqliteRow {
+    fn get<T: rusqlite::types::FromSql>(&self, index: usize) -> rusqlite::Result<T> {
+        let value = self
+            .values
+            .get(index)
+            .ok_or(rusqlite::Error::InvalidColumnIndex(index))?;
+        T::column_result(rusqlite::types::ValueRef::from(value)).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(index, value.data_type(), Box::new(err))
+        })
+    }
+}
+
+#[cfg(feature = "sqlite")]
+struct SqliteRows {
+    values: std::collections::VecDeque<SqliteRow>,
+}
+
+#[cfg(feature = "sqlite")]
+impl SqliteRows {
+    fn next(&mut self) -> rusqlite::Result<Option<SqliteRow>> {
+        Ok(self.values.pop_front())
+    }
+}
+
+#[cfg(feature = "sqlite")]
+fn collect_sqlite_rows<P: rusqlite::Params>(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: P,
+) -> rusqlite::Result<SqliteRows> {
+    let mut stmt = conn.prepare(sql)?;
+    let count = stmt.column_count();
+    let mut rows = stmt.query(params)?;
+    let mut values = std::collections::VecDeque::new();
+    while let Some(row) = rows.next()? {
+        let mut columns = Vec::with_capacity(count);
+        for i in 0..count {
+            columns.push(row.get(i)?);
+        }
+        values.push_back(SqliteRow { values: columns });
+    }
+    Ok(SqliteRows { values })
+}
+
+#[cfg(feature = "sqlite")]
+trait SqliteQuery {
+    fn query_rows<P: rusqlite::Params>(&self, sql: &str, params: P)
+        -> rusqlite::Result<SqliteRows>;
+}
+
+#[cfg(feature = "sqlite")]
+impl SqliteQuery for rusqlite::Connection {
+    fn query_rows<P: rusqlite::Params>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> rusqlite::Result<SqliteRows> {
+        collect_sqlite_rows(self, sql, params)
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl SqliteQuery for rusqlite::Transaction<'_> {
+    fn query_rows<P: rusqlite::Params>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> rusqlite::Result<SqliteRows> {
+        collect_sqlite_rows(self, sql, params)
+    }
+}
+
+// SqliteStore — embedded SQLite durable persistence
 // ---------------------------------------------------------------------------
 
-/// libSQL-backed persistence store.
+/// SQLite-backed persistence store.
 ///
 /// Each actor gets one row in the `snapshots` table and zero or more rows in
 /// the `journal` and `workflow_events` tables, same schema as the old SQLite
 /// store.  State and payloads are serialized to JSON and stored as TEXT.
 ///
-/// The same store also serves `perform DB.query(sql, params)` from Nulang
+/// The same store also serves `perform DB.query_rows(sql, params)` from Nulang
 /// code via the `query()` method exposed through `PersistenceStore::query`.
 /// Explicit durability/speed tradeoff for the local SQLite journal.
 #[cfg(feature = "sqlite")]
@@ -1313,14 +1391,19 @@ pub enum SqliteSyncMode {
 }
 
 #[cfg(feature = "sqlite")]
-pub struct LibsqlStore {
-    conn: std::sync::Mutex<libsql::Connection>,
-    rt: tokio::runtime::Runtime,
+pub struct SqliteStore {
+    conn: std::sync::Mutex<rusqlite::Connection>,
     path: PathBuf,
 }
 
+/// Compatibility alias for existing source callers. The implementation is local
+/// SQLite only; \`new_remote\` now returns Unsupported instead of making a
+/// network connection.
 #[cfg(feature = "sqlite")]
-impl LibsqlStore {
+pub type LibsqlStore = SqliteStore;
+
+#[cfg(feature = "sqlite")]
+impl SqliteStore {
     /// Open (or create) a local file database with the default
     /// `SqliteSyncMode::Full` durability.  Pass `":memory:"` for an
     /// ephemeral in-memory store.
@@ -1333,25 +1416,10 @@ impl LibsqlStore {
     /// store.
     pub fn with_sync_mode<P: AsRef<Path>>(path: P, sync_mode: SqliteSyncMode) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let db_path = if path == Path::new(":memory:") {
-            ":memory:".to_string()
-        } else {
-            path.to_string_lossy().into_owned()
-        };
-        let rt =
-            tokio::runtime::Runtime::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        let db = rt.block_on(async {
-            libsql::Builder::new_local(&db_path)
-                .build()
-                .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
-        })?;
-        let conn = db
-            .connect()
+        let conn = rusqlite::Connection::open(&path)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        let store = LibsqlStore {
+        let store = SqliteStore {
             conn: std::sync::Mutex::new(conn),
-            rt,
             path,
         };
         // Journal pragmas must be applied on the same connection that
@@ -1364,36 +1432,19 @@ impl LibsqlStore {
         Self::new(":memory:")
     }
 
-    /// Connect to a remote Turso database.
-    ///
-    /// Journal pragmas (`journal_mode`, `synchronous`) are deliberately
-    /// skipped: a Turso server manages its own journal and durability
-    /// policy.
-    pub fn new_remote(url: &str, auth_token: &str) -> io::Result<Self> {
-        let rt =
-            tokio::runtime::Runtime::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        let db = rt.block_on(async {
-            libsql::Builder::new_remote(url.to_string(), auth_token.to_string())
-                .build()
-                .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
-        })?;
-        let conn = db
-            .connect()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        let store = LibsqlStore {
-            conn: std::sync::Mutex::new(conn),
-            rt,
-            path: PathBuf::from(url),
-        };
-        store.ensure_tables()?;
-        Ok(store)
+    /// Remote libSQL URLs cannot be opened by the embedded SQLite engine.
+    /// Callers must migrate to an explicitly configured remote adapter.
+    pub fn new_remote(_url: &str, _auth_token: &str) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "remote libSQL is no longer bundled; configure an explicit remote adapter",
+        ))
     }
     pub fn path(&self) -> &Path {
         &self.path
     }
     /// Acquire the database connection lock.
-    fn conn(&self) -> std::sync::MutexGuard<'_, libsql::Connection> {
+    fn conn(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
         self.conn.lock().unwrap()
     }
 
@@ -1404,17 +1455,15 @@ impl LibsqlStore {
     /// per-connection.
     fn apply_pragmas(&self, sync_mode: SqliteSyncMode) -> io::Result<()> {
         let conn = self.conn();
-        self.rt.block_on(async {
+        (|| {
             // Drain the result rows: `journal_mode` returns one,
             // `synchronous` returns none.  libsql `query` handles both
             // shapes.
             let mut rows = conn
-                .query("PRAGMA journal_mode=WAL", ())
-                .await
+                .query_rows("PRAGMA journal_mode=WAL", ())
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             while rows
                 .next()
-                .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
                 .is_some()
             {}
@@ -1425,22 +1474,20 @@ impl LibsqlStore {
             };
             let sql = format!("PRAGMA synchronous={level}");
             let mut rows = conn
-                .query(&sql, ())
-                .await
+                .query_rows(&sql, ())
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             while rows
                 .next()
-                .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
                 .is_some()
             {}
             Ok(())
-        })
+        })()
     }
 
     fn ensure_tables(&self) -> io::Result<()> {
         let conn = self.conn();
-        self.rt.block_on(async {
+        (|| {
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS snapshots (
                     actor_id INTEGER PRIMARY KEY,
@@ -1455,38 +1502,25 @@ impl LibsqlStore {
                 )",
                 (),
             )
-            .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             // Durable activation fencing was added after the original snapshot schema.
             // Legacy rows represent the initial activation and therefore default to 1.
-            let _ = conn
-                .execute(
-                    "ALTER TABLE snapshots ADD COLUMN activation_epoch INTEGER NOT NULL DEFAULT 1",
-                    (),
-                )
-                .await;
+            let _ = conn.execute(
+                "ALTER TABLE snapshots ADD COLUMN activation_epoch INTEGER NOT NULL DEFAULT 1",
+                (),
+            );
             // Migrate databases created before the waiting_signal column existed.
-            let _ = conn
-                .execute("ALTER TABLE snapshots ADD COLUMN waiting_signal TEXT", ())
-                .await;
+            let _ = conn.execute("ALTER TABLE snapshots ADD COLUMN waiting_signal TEXT", ());
             // Migrate databases created before the crdt_snapshot column existed.
-            let _ = conn
-                .execute("ALTER TABLE snapshots ADD COLUMN crdt_snapshot TEXT", ())
-                .await;
+            let _ = conn.execute("ALTER TABLE snapshots ADD COLUMN crdt_snapshot TEXT", ());
             // Migrate databases created before the crdt_field_map column existed.
-            let _ = conn
-                .execute("ALTER TABLE snapshots ADD COLUMN crdt_field_map TEXT", ())
-                .await;
+            let _ = conn.execute("ALTER TABLE snapshots ADD COLUMN crdt_field_map TEXT", ());
             // Durable schema identity was added after the original persistence
             // schema. Legacy rows remain NULL and follow the explicit legacy policy.
-            let _ = conn
-                .execute("ALTER TABLE snapshots ADD COLUMN schema_name TEXT", ())
-                .await;
+            let _ = conn.execute("ALTER TABLE snapshots ADD COLUMN schema_name TEXT", ());
             // Authority was added after the original persistence schema. Old rows
             // remain NULL and therefore restore with empty (deny-by-default) authority.
-            let _ = conn
-                .execute("ALTER TABLE snapshots ADD COLUMN authority_tokens TEXT", ())
-                .await;
+            let _ = conn.execute("ALTER TABLE snapshots ADD COLUMN authority_tokens TEXT", ());
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS journal (
                     actor_id INTEGER NOT NULL,
@@ -1497,7 +1531,6 @@ impl LibsqlStore {
                 )",
                 (),
             )
-            .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS workflow_events (
@@ -1508,7 +1541,6 @@ impl LibsqlStore {
                 )",
                 (),
             )
-            .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS events (
@@ -1522,7 +1554,6 @@ impl LibsqlStore {
                 )",
                 (),
             )
-            .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             // Atomic durable-transition storage (RFC 0022). These tables are
             // additive to the legacy snapshot/journal tables so historical
@@ -1537,7 +1568,6 @@ impl LibsqlStore {
                 )",
                 (),
             )
-            .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS durable_transitions (
@@ -1550,7 +1580,6 @@ impl LibsqlStore {
                 )",
                 (),
             )
-            .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS durable_workflow_events (
@@ -1562,7 +1591,6 @@ impl LibsqlStore {
                 )",
                 (),
             )
-            .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS durable_domain_events (
@@ -1574,7 +1602,6 @@ impl LibsqlStore {
                 )",
                 (),
             )
-            .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS durable_effect_records (
@@ -1586,7 +1613,6 @@ impl LibsqlStore {
                 )",
                 (),
             )
-            .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS durable_outbox (
@@ -1600,16 +1626,15 @@ impl LibsqlStore {
                 )",
                 (),
             )
-            .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             Ok(())
-        })
+        })()
     }
 
     /// Execute a SQL query and return rows as a Vec of JSON strings.
     pub fn query(&self, sql: &str, params: &[Value]) -> io::Result<Vec<String>> {
         let conn = self.conn();
-        self.rt.block_on(async {
+        (|| {
             let param_values: Vec<String> = params
                 .iter()
                 .map(|v| {
@@ -1625,31 +1650,38 @@ impl LibsqlStore {
                 })
                 .collect();
             let param_refs: Vec<&str> = param_values.iter().map(|s| s.as_str()).collect();
-            let mut rows = conn
-                .query(sql, libsql::params_from_iter(param_refs))
-                .await
+            // Stream through SQLite's cursor; do not materialize an additional
+            // copy of the full query before constructing the API response.
+            let mut statement = conn
+                .prepare(sql)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let column_count = statement.column_count();
+            let mut rows = statement
+                .query(rusqlite::params_from_iter(param_refs))
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             let mut results = Vec::new();
             loop {
-                match rows.next().await {
+                match rows.next() {
                     Ok(Some(row)) => {
                         let mut cols: Vec<serde_json::Value> = Vec::new();
-                        for i in 0..row.column_count() {
+                        for i in 0..column_count {
                             let val = row
-                                .get_value(i)
+                                .get::<_, rusqlite::types::Value>(i)
                                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
                             let json_val = match val {
-                                libsql::Value::Null => serde_json::Value::Null,
-                                libsql::Value::Integer(n) => {
+                                rusqlite::types::Value::Null => serde_json::Value::Null,
+                                rusqlite::types::Value::Integer(n) => {
                                     serde_json::value::Number::from_i128(n as i128)
                                         .map(serde_json::Value::Number)
                                         .unwrap_or(serde_json::Value::Null)
                                 }
-                                libsql::Value::Real(f) => serde_json::value::Number::from_f64(f)
-                                    .map(serde_json::Value::Number)
-                                    .unwrap_or(serde_json::Value::Null),
-                                libsql::Value::Text(s) => serde_json::Value::String(s),
-                                libsql::Value::Blob(_) => serde_json::Value::Null,
+                                rusqlite::types::Value::Real(f) => {
+                                    serde_json::value::Number::from_f64(f)
+                                        .map(serde_json::Value::Number)
+                                        .unwrap_or(serde_json::Value::Null)
+                                }
+                                rusqlite::types::Value::Text(s) => serde_json::Value::String(s),
+                                rusqlite::types::Value::Blob(_) => serde_json::Value::Null,
                             };
                             cols.push(json_val);
                         }
@@ -1662,28 +1694,26 @@ impl LibsqlStore {
                 }
             }
             Ok(results)
-        })
+        })()
     }
 }
 
 #[cfg(feature = "sqlite")]
-impl PersistenceStore for LibsqlStore {
+impl PersistenceStore for SqliteStore {
     fn load_durable_tail_position(&self, actor_id: u64) -> io::Result<Option<DurableTailPosition>> {
         let conn = self.conn();
-        self.rt.block_on(async {
+        (|| {
             let mut rows = conn
-                .query(
+                .query_rows(
                     "SELECT activation_epoch, sequence
                      FROM durable_tails
                      WHERE actor_id = ?1",
-                    libsql::params![actor_id as i64],
+                    rusqlite::params![actor_id as i64],
                 )
-                .await
                 .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
 
             match rows
                 .next()
-                .await
                 .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
             {
                 Some(row) => {
@@ -1700,7 +1730,7 @@ impl PersistenceStore for LibsqlStore {
                 }
                 None => Ok(None),
             }
-        })
+        })()
     }
 
     fn load_durable_effect(
@@ -1709,20 +1739,22 @@ impl PersistenceStore for LibsqlStore {
         effect_id: DurableEffectId,
     ) -> io::Result<Option<DurableEffectPersistenceRecord>> {
         let conn = self.conn();
-        self.rt.block_on(async {
-            let mut rows = conn
-                .query(
+        (|| {
+            // Scan the cursor incrementally. Durable-effect history may be
+            // large, and a matching receipt can appear before the final row.
+            let mut statement = conn
+                .prepare(
                     "SELECT record FROM durable_effect_records
                      WHERE actor_id = ?1
                      ORDER BY sequence DESC, ordinal DESC",
-                    libsql::params![actor_id as i64],
                 )
-                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+            let mut rows = statement
+                .query(rusqlite::params![actor_id as i64])
                 .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
 
             while let Some(row) = rows
                 .next()
-                .await
                 .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
             {
                 let json: String = row.get(0).map_err(|error| {
@@ -1735,7 +1767,7 @@ impl PersistenceStore for LibsqlStore {
                 }
             }
             Ok(None)
-        })
+        })()
     }
 
     fn commit_transition(&mut self, transition: DurableTransition) -> io::Result<DurableCommit> {
@@ -1806,37 +1838,34 @@ impl PersistenceStore for LibsqlStore {
             })
             .collect::<io::Result<Vec<_>>>()?;
 
-        let conn = self.conn();
-        self.rt.block_on(async {
+        let mut conn = self.conn();
+        (|| {
             let tx = conn
-                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
-                .await
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
             let current_tail = {
                 let mut rows = tx
-                    .query(
+                    .query_rows(
                         "SELECT activation_epoch, sequence, digest
                          FROM durable_tails WHERE actor_id = ?1",
-                        libsql::params![transition.actor_id as i64],
+                        rusqlite::params![transition.actor_id as i64],
                     )
-                    .await
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
                 match rows
                     .next()
-                    .await
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
                 {
                     Some(row) => {
-                        let epoch: i64 = row
-                            .get(0)
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                        let sequence: i64 = row
-                            .get(1)
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                        let stored_digest: String = row
-                            .get(2)
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                        let epoch: i64 = row.get(0).map_err(|e| {
+                            io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                        })?;
+                        let sequence: i64 = row.get(1).map_err(|e| {
+                            io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                        })?;
+                        let stored_digest: String = row.get(2).map_err(|e| {
+                            io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                        })?;
                         Some((epoch as u64, sequence as u64, stored_digest))
                     }
                     None => None,
@@ -1847,7 +1876,6 @@ impl PersistenceStore for LibsqlStore {
                 if transition.activation_epoch == *epoch && transition.sequence == *sequence {
                     if stored_digest == &digest_hex {
                         tx.commit()
-                            .await
                             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
                         return Ok(DurableCommit {
                             actor_id: transition.actor_id,
@@ -1856,14 +1884,14 @@ impl PersistenceStore for LibsqlStore {
                             digest,
                         });
                     }
-                    let _ = tx.rollback().await;
+                    let _ = tx.rollback();
                     return Err(io::Error::new(
                         io::ErrorKind::AlreadyExists,
                         "conflicting durable transition already committed at this epoch/sequence",
                     ));
                 }
                 if transition.activation_epoch < *epoch {
-                    let _ = tx.rollback().await;
+                    let _ = tx.rollback();
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         format!(
@@ -1873,7 +1901,7 @@ impl PersistenceStore for LibsqlStore {
                     ));
                 }
                 if transition.expected_previous_sequence != *sequence {
-                    let _ = tx.rollback().await;
+                    let _ = tx.rollback();
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
@@ -1887,7 +1915,7 @@ impl PersistenceStore for LibsqlStore {
                 // evaluated inside the same write transaction so no legacy
                 // writer can advance the tail between validation and commit.
                 let mut rows = tx
-                    .query(
+                    .query_rows(
                         "SELECT COALESCE(MAX(sequence), 0) FROM (
                             SELECT sequence FROM snapshots WHERE actor_id = ?1
                             UNION ALL
@@ -1897,13 +1925,11 @@ impl PersistenceStore for LibsqlStore {
                             UNION ALL
                             SELECT sequence FROM events WHERE actor_id = ?1
                          )",
-                        libsql::params![transition.actor_id as i64],
+                        rusqlite::params![transition.actor_id as i64],
                     )
-                    .await
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
                 let row = rows
                     .next()
-                    .await
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
                     .ok_or_else(|| {
                         io::Error::new(
@@ -1916,7 +1942,7 @@ impl PersistenceStore for LibsqlStore {
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                 drop(rows);
                 if transition.expected_previous_sequence != legacy_tail as u64 {
-                    let _ = tx.rollback().await;
+                    let _ = tx.rollback();
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
@@ -1945,7 +1971,7 @@ impl PersistenceStore for LibsqlStore {
                        crdt_field_map=excluded.crdt_field_map,
                        schema_name=excluded.schema_name,
                        authority_tokens=excluded.authority_tokens",
-                    libsql::params![
+                    rusqlite::params![
                         snapshot.actor_id as i64,
                         snapshot.sequence as i64,
                         snapshot.activation_epoch as i64,
@@ -1957,7 +1983,7 @@ impl PersistenceStore for LibsqlStore {
                         authority_json.as_str()
                     ],
                 )
-                .await
+
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             }
 
@@ -1965,14 +1991,13 @@ impl PersistenceStore for LibsqlStore {
                 tx.execute(
                     "INSERT INTO journal (actor_id, sequence, behavior_id, payload)
                      VALUES (?1, ?2, ?3, ?4)",
-                    libsql::params![
+                    rusqlite::params![
                         transition.actor_id as i64,
                         command.sequence as i64,
                         command.behavior_id as i64,
                         payload_json.as_str()
                     ],
                 )
-                .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             }
 
@@ -1980,14 +2005,13 @@ impl PersistenceStore for LibsqlStore {
                 tx.execute(
                     "INSERT INTO durable_workflow_events (actor_id, sequence, ordinal, event)
                      VALUES (?1, ?2, ?3, ?4)",
-                    libsql::params![
+                    rusqlite::params![
                         transition.actor_id as i64,
                         transition.sequence as i64,
                         ordinal as i64,
                         event_json.as_str()
                     ],
                 )
-                .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             }
 
@@ -1995,14 +2019,13 @@ impl PersistenceStore for LibsqlStore {
                 tx.execute(
                     "INSERT INTO durable_domain_events (actor_id, sequence, ordinal, event)
                      VALUES (?1, ?2, ?3, ?4)",
-                    libsql::params![
+                    rusqlite::params![
                         transition.actor_id as i64,
                         transition.sequence as i64,
                         ordinal as i64,
                         event_json.as_str()
                     ],
                 )
-                .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             }
 
@@ -2010,14 +2033,13 @@ impl PersistenceStore for LibsqlStore {
                 tx.execute(
                     "INSERT INTO durable_effect_records (actor_id, sequence, ordinal, record)
                      VALUES (?1, ?2, ?3, ?4)",
-                    libsql::params![
+                    rusqlite::params![
                         transition.actor_id as i64,
                         transition.sequence as i64,
                         ordinal as i64,
                         record_json.as_str()
                     ],
                 )
-                .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             }
 
@@ -2026,7 +2048,7 @@ impl PersistenceStore for LibsqlStore {
                     "INSERT INTO durable_outbox
                      (actor_id, sequence, ordinal, destination_actor_id, behavior_id, payload)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    libsql::params![
+                    rusqlite::params![
                         transition.actor_id as i64,
                         transition.sequence as i64,
                         message.ordinal as i64,
@@ -2035,7 +2057,6 @@ impl PersistenceStore for LibsqlStore {
                         payload_json.as_str()
                     ],
                 )
-                .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             }
 
@@ -2043,7 +2064,7 @@ impl PersistenceStore for LibsqlStore {
                 "INSERT INTO durable_transitions
                  (actor_id, sequence, activation_epoch, expected_previous_sequence, digest)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                libsql::params![
+                rusqlite::params![
                     transition.actor_id as i64,
                     transition.sequence as i64,
                     transition.activation_epoch as i64,
@@ -2051,7 +2072,6 @@ impl PersistenceStore for LibsqlStore {
                     digest_hex.as_str()
                 ],
             )
-            .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
             if let Some((old_epoch, old_sequence, old_digest)) = current_tail {
@@ -2063,7 +2083,7 @@ impl PersistenceStore for LibsqlStore {
                            AND activation_epoch = ?5
                            AND sequence = ?6
                            AND digest = ?7",
-                        libsql::params![
+                        rusqlite::params![
                             transition.activation_epoch as i64,
                             transition.sequence as i64,
                             digest_hex.as_str(),
@@ -2073,10 +2093,9 @@ impl PersistenceStore for LibsqlStore {
                             old_digest.as_str()
                         ],
                     )
-                    .await
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
                 if changed != 1 {
-                    let _ = tx.rollback().await;
+                    let _ = tx.rollback();
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "durable tail changed while committing transition",
@@ -2087,19 +2106,17 @@ impl PersistenceStore for LibsqlStore {
                     "INSERT INTO durable_tails
                      (actor_id, activation_epoch, sequence, digest)
                      VALUES (?1, ?2, ?3, ?4)",
-                    libsql::params![
+                    rusqlite::params![
                         transition.actor_id as i64,
                         transition.activation_epoch as i64,
                         transition.sequence as i64,
                         digest_hex.as_str()
                     ],
                 )
-                .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             }
 
             tx.commit()
-                .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
             Ok(DurableCommit {
@@ -2108,7 +2125,7 @@ impl PersistenceStore for LibsqlStore {
                 sequence: transition.sequence,
                 digest,
             })
-        })
+        })()
     }
 
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
@@ -2121,26 +2138,26 @@ impl PersistenceStore for LibsqlStore {
         let authority_json = serde_json::to_string(&snapshot.authority_tokens)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let conn = self.conn();
-        self.rt.block_on(async {
+        (|| {
             conn.execute(
                 "INSERT INTO snapshots (actor_id, sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, activation_epoch=excluded.activation_epoch, state=excluded.state, waiting_signal=excluded.waiting_signal, crdt_snapshot=excluded.crdt_snapshot, crdt_field_map=excluded.crdt_field_map, schema_name=excluded.schema_name, authority_tokens=excluded.authority_tokens",
-                libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, snapshot.activation_epoch as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str(), crdt_field_map_json.as_str(), snapshot.schema_name.as_deref(), authority_json.as_str()],
-            ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
-        })
+                rusqlite::params![snapshot.actor_id as i64, snapshot.sequence as i64, snapshot.activation_epoch as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str(), crdt_field_map_json.as_str(), snapshot.schema_name.as_deref(), authority_json.as_str()],
+            ).map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+        })()
     }
 
     fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
         let conn = self.conn();
-        self.rt.block_on(async {
+        (|| {
             let mut rows = conn
-                .query(
+                .query_rows(
                     "SELECT sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens FROM snapshots WHERE actor_id = ?1",
-                    libsql::params![actor_id as i64],
+                    rusqlite::params![actor_id as i64],
                 )
-                .await
+
                 .ok()?;
-            let row = rows.next().await.ok()??;
+            let row = rows.next().ok()??;
             let sequence: i64 = row.get(0).ok()?;
             let activation_epoch: i64 = row.get(1).ok()?;
             let state_json: String = row.get(2).ok()?;
@@ -2182,38 +2199,35 @@ impl PersistenceStore for LibsqlStore {
                 schema_name,
                 authority_tokens,
             })
-        })
+        })()
     }
 
     fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> io::Result<()> {
         let payload_json = serde_json::to_string(&entry.payload)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let conn = self.conn();
-        self.rt.block_on(async {
+        (|| {
             conn.execute(
                 "INSERT INTO journal (actor_id, sequence, behavior_id, payload) VALUES (?1, ?2, ?3, ?4)",
-                libsql::params![actor_id as i64, entry.sequence as i64, entry.behavior_id as i64, payload_json],
-            ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
-        })
+                rusqlite::params![actor_id as i64, entry.sequence as i64, entry.behavior_id as i64, payload_json],
+            ).map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+        })()
     }
 
     fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
         let conn = self.conn();
-        self.rt.block_on(async {
-            let mut rows = match conn
-                .query(
-                    "SELECT sequence, behavior_id, payload FROM journal
+        (|| {
+            let mut rows = match conn.query_rows(
+                "SELECT sequence, behavior_id, payload FROM journal
                  WHERE actor_id = ?1 ORDER BY sequence ASC",
-                    libsql::params![actor_id as i64],
-                )
-                .await
-            {
+                rusqlite::params![actor_id as i64],
+            ) {
                 Ok(r) => r,
                 Err(_) => return Vec::new(),
             };
             let mut entries = Vec::new();
             loop {
-                match rows.next().await {
+                match rows.next() {
                     Ok(Some(row)) => {
                         let seq: i64 = match row.get(0) {
                             Ok(v) => v,
@@ -2243,39 +2257,35 @@ impl PersistenceStore for LibsqlStore {
                 }
             }
             entries
-        })
+        })()
     }
 
     fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()> {
         let event_json = serde_json::to_string(&event)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let conn = self.conn();
-        self.rt.block_on(async {
+        (|| {
             conn.execute(
                 "INSERT INTO workflow_events (actor_id, sequence, event) VALUES (?1, ?2, ?3)",
-                libsql::params![actor_id as i64, event.sequence() as i64, event_json],
+                rusqlite::params![actor_id as i64, event.sequence() as i64, event_json],
             )
-            .await
             .map(|_| ())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
-        })
+        })()
     }
 
     fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
         let conn = self.conn();
-        self.rt.block_on(async {
+        (|| {
             let mut events = Vec::new();
 
-            if let Ok(mut rows) = conn
-                .query(
-                    "SELECT event FROM workflow_events
+            if let Ok(mut rows) = conn.query_rows(
+                "SELECT event FROM workflow_events
                      WHERE actor_id = ?1 ORDER BY sequence ASC",
-                    libsql::params![actor_id as i64],
-                )
-                .await
-            {
+                rusqlite::params![actor_id as i64],
+            ) {
                 loop {
-                    match rows.next().await {
+                    match rows.next() {
                         Ok(Some(row)) => {
                             let event_json: String = match row.get(0) {
                                 Ok(value) => value,
@@ -2290,16 +2300,13 @@ impl PersistenceStore for LibsqlStore {
                 }
             }
 
-            if let Ok(mut rows) = conn
-                .query(
-                    "SELECT event FROM durable_workflow_events
+            if let Ok(mut rows) = conn.query_rows(
+                "SELECT event FROM durable_workflow_events
                      WHERE actor_id = ?1 ORDER BY sequence ASC, ordinal ASC",
-                    libsql::params![actor_id as i64],
-                )
-                .await
-            {
+                rusqlite::params![actor_id as i64],
+            ) {
                 loop {
-                    match rows.next().await {
+                    match rows.next() {
                         Ok(Some(row)) => {
                             let event_json: String = match row.get(0) {
                                 Ok(value) => value,
@@ -2316,38 +2323,35 @@ impl PersistenceStore for LibsqlStore {
 
             events.sort_by_key(WorkflowEvent::sequence);
             events
-        })
+        })()
     }
 
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
         let args_json = serde_json::to_string(&entry.args)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let conn = self.conn();
-        self.rt.block_on(async {
+        (|| {
             let value_json = serde_json::to_string(&entry.value)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             conn.execute(
                 "INSERT INTO events (actor_id, sequence, field_name, event_name, args, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                libsql::params![actor_id as i64, entry.sequence as i64, entry.field_name, entry.event_name, args_json, value_json],
-            ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
-        })
+                rusqlite::params![actor_id as i64, entry.sequence as i64, entry.field_name, entry.event_name, args_json, value_json],
+            ).map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+        })()
     }
 
     fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
         let conn = self.conn();
-        self.rt.block_on(async {
+        (|| {
             let mut entries = Vec::new();
 
-            if let Ok(mut rows) = conn
-                .query(
-                    "SELECT sequence, field_name, event_name, args, value FROM events
+            if let Ok(mut rows) = conn.query_rows(
+                "SELECT sequence, field_name, event_name, args, value FROM events
                      WHERE actor_id = ?1 ORDER BY sequence ASC",
-                    libsql::params![actor_id as i64],
-                )
-                .await
-            {
+                rusqlite::params![actor_id as i64],
+            ) {
                 loop {
-                    match rows.next().await {
+                    match rows.next() {
                         Ok(Some(row)) => {
                             let sequence: i64 = match row.get(0) {
                                 Ok(value) => value,
@@ -2390,16 +2394,13 @@ impl PersistenceStore for LibsqlStore {
                 }
             }
 
-            if let Ok(mut rows) = conn
-                .query(
-                    "SELECT event FROM durable_domain_events
+            if let Ok(mut rows) = conn.query_rows(
+                "SELECT event FROM durable_domain_events
                      WHERE actor_id = ?1 ORDER BY sequence ASC, ordinal ASC",
-                    libsql::params![actor_id as i64],
-                )
-                .await
-            {
+                rusqlite::params![actor_id as i64],
+            ) {
                 loop {
-                    match rows.next().await {
+                    match rows.next() {
                         Ok(Some(row)) => {
                             let event_json: String = match row.get(0) {
                                 Ok(value) => value,
@@ -2416,72 +2417,65 @@ impl PersistenceStore for LibsqlStore {
 
             entries.sort_by_key(|entry| entry.sequence);
             entries
-        })
+        })()
     }
 
     fn latest_sequence(&self, actor_id: u64) -> u64 {
         let conn = self.conn();
-        self.rt.block_on(async {
-            let snapshot_seq: Option<i64> = async {
+        (|| {
+            let snapshot_seq: Option<i64> = (|| {
                 let mut rows = conn
-                    .query(
+                    .query_rows(
                         "SELECT sequence FROM snapshots WHERE actor_id = ?1",
-                        libsql::params![actor_id as i64],
+                        rusqlite::params![actor_id as i64],
                     )
-                    .await
                     .ok()?;
-                let row = rows.next().await.ok()??;
+                let row = rows.next().ok()??;
                 row.get(0).ok()
-            }
-            .await;
-            let journal_seq: Option<i64> = async {
+            })();
+            let journal_seq: Option<i64> = (|| {
                 let mut rows = conn
-                    .query(
+                    .query_rows(
                         "SELECT sequence FROM journal WHERE actor_id = ?1 ORDER BY sequence DESC LIMIT 1",
-                        libsql::params![actor_id as i64],
+                        rusqlite::params![actor_id as i64],
                     )
-                    .await
+
                     .ok()?;
-                let row = rows.next().await.ok()??;
+                let row = rows.next().ok()??;
                 row.get(0).ok()
-            }
-            .await;
-            let wf_event_seq: Option<i64> = async {
+            })();
+            let wf_event_seq: Option<i64> = (|| {
                 let mut rows = conn
-                    .query(
+                    .query_rows(
                         "SELECT sequence FROM workflow_events WHERE actor_id = ?1 ORDER BY sequence DESC LIMIT 1",
-                        libsql::params![actor_id as i64],
+                        rusqlite::params![actor_id as i64],
                     )
-                    .await
+
                     .ok()?;
-                let row = rows.next().await.ok()??;
+                let row = rows.next().ok()??;
                 row.get(0).ok()
-            }
-            .await;
-            let event_seq: Option<i64> = async {
+            })();
+            let event_seq: Option<i64> = (|| {
                 let mut rows = conn
-                    .query(
+                    .query_rows(
                         "SELECT sequence FROM events WHERE actor_id = ?1 ORDER BY sequence DESC LIMIT 1",
-                        libsql::params![actor_id as i64],
+                        rusqlite::params![actor_id as i64],
                     )
-                    .await
+
                     .ok()?;
-                let row = rows.next().await.ok()??;
+                let row = rows.next().ok()??;
                 row.get(0).ok()
-            }
-            .await;
-            let atomic_seq: Option<i64> = async {
+            })();
+            let atomic_seq: Option<i64> = (|| {
                 let mut rows = conn
-                    .query(
+                    .query_rows(
                         "SELECT sequence FROM durable_tails WHERE actor_id = ?1",
-                        libsql::params![actor_id as i64],
+                        rusqlite::params![actor_id as i64],
                     )
-                    .await
                     .ok()?;
-                let row = rows.next().await.ok()??;
+                let row = rows.next().ok()??;
                 row.get(0).ok()
-            }
-            .await;
+            })();
 
             snapshot_seq
                 .unwrap_or(0)
@@ -2489,12 +2483,12 @@ impl PersistenceStore for LibsqlStore {
                 .max(wf_event_seq.unwrap_or(0))
                 .max(event_seq.unwrap_or(0))
                 .max(atomic_seq.unwrap_or(0)) as u64
-        })
+        })()
     }
 
     fn clear(&mut self, actor_id: u64) -> io::Result<()> {
         let conn = self.conn();
-        self.rt.block_on(async {
+        (|| {
             for table in [
                 "snapshots",
                 "journal",
@@ -2508,12 +2502,11 @@ impl PersistenceStore for LibsqlStore {
                 "durable_tails",
             ] {
                 let sql = format!("DELETE FROM {table} WHERE actor_id = ?1");
-                conn.execute(&sql, libsql::params![actor_id as i64])
-                    .await
+                conn.execute(&sql, rusqlite::params![actor_id as i64])
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             }
             Ok(())
-        })
+        })()
     }
 }
 
@@ -4165,6 +4158,38 @@ mod durable_transition_tests {
 mod libsql_atomic_transition_tests {
     use super::*;
 
+    #[test]
+    fn local_sqlite_defaults_to_full_synchronous_wal() {
+        let store = SqliteStore::in_memory().expect("in-memory SQLite");
+        let conn = store.conn();
+        let sync: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            sync, 2,
+            "FULL synchronous mode required for durable commits"
+        );
+    }
+
+    #[test]
+    fn remote_compat_constructor_fails_closed() {
+        let err = SqliteStore::new_remote("libsql://example.com", "opaque-token")
+            .err()
+            .expect("remote support must not be silently emulated");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn sqlite_store_replaces_libsql_and_retains_legacy_alias() {
+        let mut store = SqliteStore::in_memory().expect("local SQLite store");
+        store
+            .commit_transition(transition(840, 1, 1))
+            .expect("atomic commit");
+        assert_eq!(store.latest_sequence(840), 1);
+        let legacy: LibsqlStore = SqliteStore::in_memory().expect("compat alias");
+        assert_eq!(legacy.latest_sequence(840), 0);
+    }
+
     fn snapshot(actor_id: u64, sequence: u64, count: i64) -> ActorSnapshot {
         let mut state = HashMap::new();
         state.insert("count".to_string(), PersistedValue::Int(count));
@@ -4308,18 +4333,13 @@ mod libsql_atomic_transition_tests {
         // error.
         {
             let conn = store.conn();
-            store
-                .rt
-                .block_on(async {
-                    conn.execute(
-                        "INSERT INTO durable_outbox
-                         (actor_id, sequence, ordinal, destination_actor_id, behavior_id, payload)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                        libsql::params![42_i64, 1_i64, 0_i64, 999_i64, 1_i64, "[]"],
-                    )
-                    .await
-                })
-                .unwrap();
+            conn.execute(
+                "INSERT INTO durable_outbox
+                 (actor_id, sequence, ordinal, destination_actor_id, behavior_id, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![42_i64, 1_i64, 0_i64, 999_i64, 1_i64, "[]"],
+            )
+            .unwrap();
         }
 
         let error = store.commit_transition(transition(42, 1, 1)).unwrap_err();

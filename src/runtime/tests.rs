@@ -2564,22 +2564,17 @@ fn test_libsql_store_migrates_old_schema_crdt_column() {
         std::env::temp_dir().join(format!("nulang_libsql_migrate_{}.db", std::process::id()));
     {
         // Create a database with the pre-crdt_snapshot four-column schema.
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let db = libsql::Builder::new_local(&path).build().await.unwrap();
-            let conn = db.connect().unwrap();
-            conn.execute(
-                "CREATE TABLE snapshots (
-                    actor_id INTEGER PRIMARY KEY,
-                    sequence INTEGER NOT NULL,
-                    state TEXT NOT NULL,
-                    waiting_signal TEXT
-                )",
-                (),
-            )
-            .await
-            .unwrap();
-        });
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "CREATE TABLE snapshots (
+                actor_id INTEGER PRIMARY KEY,
+                sequence INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                waiting_signal TEXT
+            )",
+            [],
+        )
+        .unwrap();
     }
 
     {
