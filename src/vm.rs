@@ -3307,8 +3307,32 @@ impl VM {
     /// Run the loaded program starting from the entry point of the last module.
     ///
     /// Returns the value in register 0 of the final frame, or unit if no frame.
+    /// An execution's terminal outcome abandons any effect continuations
+    /// remaining on its handler stack. Suspension and cooperative yield are
+    /// *not* terminal: the actor runtime must be able to transfer the whole
+    /// handler stack through `take_suspended_state` and later `resume`.
+    ///
+    /// This releases VM snapshots only. It does not invoke language-level
+    /// deferred cleanup or external resource destructors.
+    fn retire_terminal_effect_handlers(&mut self, outcome: &NuResult<Value>) {
+        if self.yield_pending || matches!(outcome, Err(NuError::Suspended(_))) {
+            return;
+        }
+        self.handler_stack.clear();
+    }
+
+    /// Execute an independent program, without inheriting any prior handler
+    /// scopes. A genuinely suspended computation uses `resume`, not `run`.
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn run(&mut self) -> NuResult<Value> {
+        self.handler_stack.clear();
+        self.yield_pending = false;
+        let outcome = self.run_inner();
+        self.retire_terminal_effect_handlers(&outcome);
+        outcome
+    }
+
+    fn run_inner(&mut self) -> NuResult<Value> {
         let module_idx = self.modules.len().saturating_sub(1);
         let entry_point = self
             .modules
@@ -3383,6 +3407,15 @@ impl VM {
     /// reuse it; otherwise create a fresh frame. This lets actor behavior
     /// handlers receive their arguments.
     pub fn run_from(&mut self, module_idx: usize, pc: usize) -> NuResult<Value> {
+        // run_from starts a new behavior/function invocation. A restored
+        // suspended continuation is resumed via resume() instead.
+        self.handler_stack.clear();
+        let outcome = self.run_from_inner(module_idx, pc);
+        self.retire_terminal_effect_handlers(&outcome);
+        outcome
+    }
+
+    fn run_from_inner(&mut self, module_idx: usize, pc: usize) -> NuResult<Value> {
         self.yield_pending = false;
 
         if self.frames.is_empty() {
@@ -3488,6 +3521,14 @@ impl VM {
     /// Continues from the current frame state (set by `restore_suspended_state`)
     /// until the program halts, yields again, or errors.
     pub fn resume(&mut self) -> NuResult<Value> {
+        // Preserve restored handler frames while resuming. Dispose of any
+        // continuation not consumed before a terminal outcome.
+        let outcome = self.resume_inner();
+        self.retire_terminal_effect_handlers(&outcome);
+        outcome
+    }
+
+    fn resume_inner(&mut self) -> NuResult<Value> {
         self.yield_pending = false;
         loop {
             if let Some(idx) = self.current_frame_idx {
@@ -6760,6 +6801,124 @@ mod vm_tests {
             result.unwrap().as_int(),
             Some(42),
             "Should get 42 from effect handler"
+        );
+    }
+
+    /// A non-resuming handler may terminate execution without a Resume or
+    /// Unwind. Its captured continuation is abandoned at the terminal boundary;
+    /// a reused VM must not retain that continuation or its handler binding.
+    #[test]
+    fn test_terminal_abort_discards_captured_effect_continuation() {
+        let mut module = module_with_handler_table(vec![HandlerBinding {
+            effect_name: "E.op".into(),
+            handler_offset: 4,
+            arg_count: 0,
+            result_reg: 0,
+            single_shot: false,
+        }]);
+        let effect = module.add_constant(Constant::String("E.op".into()));
+        module.emit(Instruction::new1(OpCode::Handle, 0));
+        module.emit(Instruction::new3(
+            OpCode::Perform,
+            ((effect >> 8) & 0xff) as u8,
+            (effect & 0xff) as u8,
+            1,
+        ));
+        module.emit(Instruction::new0(OpCode::Unwind)); // must never execute
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.emit(Instruction::new1(OpCode::Const1, 0)); // handler aborts
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
+
+        let mut vm = VM::new_without_jit();
+        vm.load_module(module);
+        assert_eq!(vm.run().unwrap().as_int(), Some(1));
+        assert!(
+            vm.handler_stack.is_empty(),
+            "terminal abort must release the captured continuation"
+        );
+        assert_eq!(vm.run_from(0, 0).unwrap().as_int(), Some(1));
+        assert!(
+            vm.handler_stack.is_empty(),
+            "run_from terminal abort must also retire the captured continuation"
+        );
+
+        // A subsequent independent run must not inherit the handler binding.
+        let mut unhandled = CodeModule::new("unhandled_after_abort");
+        let effect = unhandled.add_constant(Constant::String("E.op".into()));
+        unhandled.emit(Instruction::new3(
+            OpCode::Perform,
+            ((effect >> 8) & 0xff) as u8,
+            (effect & 0xff) as u8,
+            0,
+        ));
+        unhandled.emit(Instruction::new0(OpCode::Halt));
+        unhandled.entry_point = Some(0);
+        vm.load_module(unhandled);
+        let err = vm
+            .run()
+            .expect_err("stale handler must not intercept new run");
+        assert!(format!("{err}").contains("Unhandled effect"), "{err}");
+        assert!(vm.handler_stack.is_empty());
+    }
+
+    /// A terminal failure also abandons any handler scope: it must never
+    /// survive into the next independent VM invocation.
+    #[test]
+    fn test_terminal_error_disposes_effect_handler_frames() {
+        let mut module = module_with_handler_table(vec![]);
+        module.emit(Instruction::new1(OpCode::Handle, 0));
+        module.emit(Instruction::new1(OpCode::Resume, 0)); // no captured continuation
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
+        let mut vm = VM::new_without_jit();
+        vm.load_module(module);
+        assert!(vm.run().is_err());
+        assert!(vm.handler_stack.is_empty());
+    }
+
+    /// Genuine suspended state is transferred into a suspension receipt and
+    /// restored by resume(); terminal cleanup must not run at capture time.
+    #[test]
+    fn test_captured_suspension_retains_handler_until_resume() {
+        let mut module = module_with_handler_table(vec![]);
+        module.emit(Instruction::new1(OpCode::Handle, 0));
+        module.emit(Instruction::new0(OpCode::Unwind));
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
+        let mut vm = VM::new_without_jit();
+        vm.load_module(module);
+        vm.set_current_frame(Frame::new(None, 0));
+        vm.step().unwrap();
+        assert_eq!(vm.handler_stack.len(), 1);
+        let suspended = vm.take_suspended_state().expect("suspend frame");
+        assert!(vm.handler_stack.is_empty());
+        assert_eq!(suspended.handler_stack.len(), 1);
+        vm.restore_suspended_state(suspended);
+        vm.resume()
+            .expect("resume must preserve and unwind the handler");
+        assert!(vm.handler_stack.is_empty());
+    }
+
+    #[test]
+    fn test_resume_terminal_abort_disposes_restored_handler_state() {
+        let mut module = module_with_handler_table(vec![]);
+        module.emit(Instruction::new1(OpCode::Handle, 0));
+        module.emit(Instruction::new1(OpCode::Const1, 0));
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
+
+        let mut vm = VM::new_without_jit();
+        vm.load_module(module);
+        vm.set_current_frame(Frame::new(None, 0));
+        vm.step().unwrap(); // install handler frame
+        let suspended = vm.take_suspended_state().expect("suspended frame");
+        assert_eq!(suspended.handler_stack.len(), 1);
+        vm.restore_suspended_state(suspended);
+        assert_eq!(vm.resume().unwrap().as_int(), Some(1));
+        assert!(
+            vm.handler_stack.is_empty(),
+            "terminal resume must dispose the restored abandoned handler"
         );
     }
 
