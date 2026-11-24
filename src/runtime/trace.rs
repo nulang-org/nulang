@@ -19,13 +19,16 @@
 //! The optional `otel` feature can bridge those fields into real OTLP spans
 //! via `tracing-opentelemetry`.
 
+use rand_core::RngCore;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 /// Thread-safe stateless PRNG for trace / span id generation.
 ///
-/// A monotonically incremented counter fed through splitmix64. Deterministic
-/// seeding is fine here — trace ids are correlation keys, not a security
-/// boundary, and this avoids pulling in `rand`/`getrandom`.
+/// A monotonically incremented counter fed through splitmix64. Unlike a
+/// fixed process seed, an OS-randomized seed prevents independent nodes from
+/// producing identical trace-ID sequences. IDs are correlation keys, not
+/// security tokens. The OS entropy is acquired once per process.
 struct Rng {
     state: AtomicU64,
 }
@@ -41,13 +44,23 @@ impl Rng {
     }
 }
 
-static RNG: Rng = Rng {
-    state: AtomicU64::new(0x4D59_5DF4_D0F3_3173),
-};
+static RNG: OnceLock<Rng> = OnceLock::new();
+
+fn rng() -> &'static Rng {
+    RNG.get_or_init(|| {
+        let mut seed = [0u8; 8];
+        rand_core::OsRng
+            .try_fill_bytes(&mut seed)
+            .expect("W3C trace ID generation requires platform entropy");
+        Rng {
+            state: AtomicU64::new(u64::from_le_bytes(seed)),
+        }
+    })
+}
 
 fn nonzero_u64() -> u64 {
     loop {
-        let v = RNG.next_u64();
+        let v = rng().next_u64();
         if v != 0 {
             return v;
         }
@@ -56,7 +69,7 @@ fn nonzero_u64() -> u64 {
 
 fn nonzero_u128() -> u128 {
     let hi = nonzero_u64();
-    let lo = RNG.next_u64();
+    let lo = rng().next_u64();
     let v = ((hi as u128) << 64) | lo as u128;
     if v == 0 {
         1
