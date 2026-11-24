@@ -92,6 +92,26 @@ pub fn run(args: &[String]) -> NuResult<()> {
             }
         }
         Some("build-wasm") => cmd_build_wasm(),
+        Some("ci") => {
+            let mut web = false;
+            let mut fmt = false;
+            for flag in &args[1..] {
+                match flag.as_str() {
+                    "--web" if !web => web = true,
+                    "--fmt" if !fmt => fmt = true,
+                    other => {
+                        return Err(NuError::PackageError {
+                            msg: format!(
+                                "unknown or duplicate nula ci option '{}' (usage: nula ci [--web] [--fmt])",
+                                other
+                            ),
+                            span: Span::default(),
+                        });
+                    }
+                }
+            }
+            cmd_ci(web, fmt)
+        },
         Some("test") => {
             let mut filter: Option<&str> = None;
             let mut verbose = false;
@@ -266,7 +286,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
 
         Some(other) => Err(NuError::PackageError {
             msg: format!(
-                "unknown nula subcommand '{}' (expected new, init, build, build-wasm, test, run, add, remove, publish, deploy, watch, doc, list, or clean)",
+                "unknown nula subcommand '{}' (expected new, init, build, build-wasm, ci, test, run, add, remove, publish, deploy, watch, doc, list, or clean)",
                 other
             ),
             span: Span::default(),
@@ -290,6 +310,7 @@ fn print_usage() {
     println!("  init          Scaffold a new package in the current directory");
     println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
     println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
+    println!("  ci [--web] [--fmt]  Build and test; --web adds web build, --fmt checks formatting");
     println!("  test [--filter <substr>] [--verbose|-v] [--watch|-w]  Run .nula test files");
     println!("  run           Build and run the package entry point");
     println!("  run --watch   Build and re-run on source changes");
@@ -359,6 +380,68 @@ fn run_auth_enable(_args: &[String]) -> NuResult<()> {
     }
     println!("Set the cloud config key AUTH_COOKIE_SECRET on deploy.");
     Ok(())
+}
+
+/// Small, deterministic package CI plan. This is deliberately independent from
+/// compiler repository CI (scripts/ci-local.sh), which has many more gates.
+/// Never interpret passing a package CI plan as a production deploy approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CiStep {
+    Format,
+    Build,
+    Test,
+    BuildWeb,
+}
+
+fn ci_steps(web: bool, fmt: bool) -> &'static [CiStep] {
+    const CORE: &[CiStep] = &[CiStep::Build, CiStep::Test];
+    const CORE_FMT: &[CiStep] = &[CiStep::Format, CiStep::Build, CiStep::Test];
+    const WEB: &[CiStep] = &[CiStep::Build, CiStep::Test, CiStep::BuildWeb];
+    const WEB_FMT: &[CiStep] = &[
+        CiStep::Format,
+        CiStep::Build,
+        CiStep::Test,
+        CiStep::BuildWeb,
+    ];
+    match (web, fmt) {
+        (false, false) => CORE,
+        (false, true) => CORE_FMT,
+        (true, false) => WEB,
+        (true, true) => WEB_FMT,
+    }
+}
+
+fn run_ci_steps(
+    web: bool,
+    fmt: bool,
+    mut execute: impl FnMut(CiStep) -> NuResult<()>,
+) -> NuResult<()> {
+    for &step in ci_steps(web, fmt) {
+        eprintln!("CI gate: {step:?}");
+        execute(step)?;
+    }
+    println!("All requested package CI gates passed.");
+    Ok(())
+}
+
+/// `nula ci [--web] [--fmt]` runs the existing package operations
+/// in a fixed fail-fast sequence. No shell commands are evaluated.
+fn cmd_ci(web: bool, fmt: bool) -> NuResult<()> {
+    let root = package_root()?;
+    // Preflight: reject non-project directories before running any gate.
+    Manifest::load(&root)?;
+    run_ci_steps(web, fmt, |step| match step {
+        CiStep::Format => {
+            crate::fmt::format_directory(&root.join("src"), true)?;
+            if root.join("tests").is_dir() {
+                crate::fmt::format_directory(&root.join("tests"), true)?;
+            }
+            Ok(())
+        }
+        CiStep::Build => cmd_build(false),
+        CiStep::Test => cmd_test(None, false, false),
+        CiStep::BuildWeb => cmd_build_web(),
+    })
 }
 
 /// `nula new <name> [--template <name>]`: scaffold a package directory.
@@ -2752,6 +2835,67 @@ mod tests {
         assert!(matches!(err, NuError::PackageError { msg: _, span: _ }));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_ci_plan_is_deterministic_and_optional_gates_are_explicit() {
+        assert_eq!(ci_steps(false, false), &[CiStep::Build, CiStep::Test]);
+        assert_eq!(
+            ci_steps(false, true),
+            &[CiStep::Format, CiStep::Build, CiStep::Test]
+        );
+        assert_eq!(
+            ci_steps(true, false),
+            &[CiStep::Build, CiStep::Test, CiStep::BuildWeb]
+        );
+        assert_eq!(
+            ci_steps(true, true),
+            &[
+                CiStep::Format,
+                CiStep::Build,
+                CiStep::Test,
+                CiStep::BuildWeb
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ci_stops_on_first_failed_gate() {
+        let mut completed = Vec::new();
+        let error = run_ci_steps(true, false, |step| {
+            completed.push(step);
+            if step == CiStep::Test {
+                Err(NuError::PackageError {
+                    msg: "tests failed".into(),
+                    span: Span::default(),
+                })
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("failed tests must prevent web build");
+        assert!(error.to_string().contains("tests failed"));
+        assert_eq!(completed, [CiStep::Build, CiStep::Test]);
+    }
+
+    #[test]
+    fn test_ci_unknown_and_duplicate_flags_fail_closed() {
+        for args in [
+            vec!["ci".into(), "--skip-tests".into()],
+            vec!["ci".into(), "--web".into(), "--web".into()],
+        ] {
+            let error = run(&args).expect_err("unknown CI flags must not silently weaken gates");
+            assert!(error.to_string().contains("nula ci"));
+        }
+    }
+
+    #[test]
+    fn test_ci_outside_package_fails_before_any_gate() {
+        let dir = std::env::temp_dir().join(format!("nulang_ci_no_package_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = ChangeDir::new(&dir);
+        let error = cmd_ci(false, false).expect_err("CI requires a manifest");
+        assert!(error.to_string().contains("Nulang.toml"));
     }
 
     #[test]
