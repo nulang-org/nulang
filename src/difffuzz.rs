@@ -235,10 +235,14 @@ impl Gen {
     // explicit `if d == 0 then 1 else d` guard to exercise the comparison
     // path too.
 
+    // Keep the guard condition starting with `not`: inline divisors can
+    // themselves be `if` expressions, and `if if ... == 0` is ambiguous
+    // under Nulang's intentionally restricted condition grammar. Double
+    // negation preserves the equality predicate without changing the RNG.
     fn nonzero_int(&mut self, depth: usize) -> String {
         if self.chance(30) {
             let d = self.expr(Ty::Int, depth.saturating_sub(1));
-            format!("(if {} == 0 then 1 else ({}))", strip_parens(&d), d)
+            format!("(if not (not (({d}) == 0)) then 1 else ({d}))")
         } else {
             let d = self.expr(Ty::Int, depth.saturating_sub(1));
             format!("(({}) * 2 + 1)", d)
@@ -248,7 +252,7 @@ impl Gen {
     fn nonzero_float(&mut self, depth: usize) -> String {
         if self.chance(30) {
             let d = self.expr(Ty::Float, depth.saturating_sub(1));
-            format!("(if {} == 0.0 then 1.0 else ({}))", strip_parens(&d), d)
+            format!("(if not (not (({d}) == 0.0)) then 1.0 else ({d}))")
         } else {
             // |x| + 1.0 is always >= 1.0. Nulang has no abs in the grammar
             // subset we target, so square and add: e*e >= 0. The whole
@@ -966,6 +970,33 @@ mod tests {
                 failures.len()
             );
         }
+    }
+
+    /// Regression seeds captured from a wider cross-backend campaign. Every
+    /// generated denominator guard must compile before semantic comparison.
+    #[test]
+    fn generated_divisor_guard_regression_seeds_compile() {
+        let seeds: [u64; 6] = [
+            1_000_050,
+            3_000_014,
+            3_000_243,
+            9_999_256,
+            9_999_331,
+            9_223_372_036_854_771_226,
+        ];
+        let failures: Vec<_> = seeds
+            .into_iter()
+            .filter_map(|seed| {
+                let src = generate_program(seed);
+                crate::fuzz::compile_for_diff_verbose(&src)
+                    .err()
+                    .map(|diagnostic| (seed, diagnostic))
+            })
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "generated invalid programs: {failures:#?}"
+        );
     }
 
     /// CI smoke test: 50 fixed seeds, interpreter vs forced-JIT vs AOT all
