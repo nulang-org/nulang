@@ -1,9 +1,10 @@
 // Nulang standard library — list/array operations over native arrays.
 // Language version: 2.0.0-alpha
 //
-// Polymorphic functions (map, filter, reverse, take, drop, range, length,
-// contains, index_of, find, any, all) work with any element type. Functions with explicit
-// [Int] annotations (sum, fold, max_of, min_of, sort, append, zip, enumerate,
+// Polymorphic functions (map, filter, filter_map, flat_map, partition,
+// fold, reverse, take, drop, range, length, contains, index_of, find,
+// any, all) work with compatible element types. Functions with explicit
+// [Int] annotations (sum, max_of, min_of, sort, append, zip, enumerate,
 // uniq) are Int-only for now.
 //
 // Built on `perform Array.push` / `perform Array.new` / `perform Array.length`
@@ -69,7 +70,7 @@ pub fn find(pred, xs) {
 }
 
 /// Left fold: fold(f, init, [a, b, c]) = f(f(f(init, a), b), c).
-pub fn fold(f, init: Int, xs: [Int]) -> Int {
+pub fn fold(f, init, xs) {
     var acc = init;
     for x in xs {
         acc = f(acc, x)
@@ -123,7 +124,45 @@ pub fn filter(pred, xs) {
     result
 }
 
-/// Reverse: return new array with elements in reverse order.
+/// Filter and transform in one traversal.
+/// The callback returns Some(value) to include it or None to skip.
+pub fn filter_map(f, xs) {
+    var result = [];
+    for x in xs {
+        match f(x) {
+            | Some(value) => { result = perform Array.push(result, value) }
+            | None => {}
+        }
+    };
+    result
+}
+
+/// Map each element to an array and concatenate the arrays in input order.
+pub fn flat_map(f, xs) {
+    var result = [];
+    for x in xs {
+        for value in f(x) {
+            result = perform Array.push(result, value)
+        }
+    };
+    result
+}
+
+/// Split elements into matching and non-matching arrays, retaining order.
+pub fn partition(pred, xs) {
+    var matched = [];
+    var unmatched = [];
+    for x in xs {
+        if pred(x) then {
+            matched = perform Array.push(matched, x)
+        } else {
+            unmatched = perform Array.push(unmatched, x)
+        }
+    };
+    (matched, unmatched)
+}
+
+/// Reverse: return a new array with elements in reverse order.
 pub fn reverse(xs) {
     var result = [];
     var i = perform Array.length(xs) - 1;
