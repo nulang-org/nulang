@@ -250,3 +250,13 @@ rcgen = "0.14"
 [[bench]]
 name = "bench_main"
 harness = false
+
+# Opt-in diagnostic probes; excluded from the rolling Criterion history.
+[[bench]]
+name = "trace_profile"
+harness = false
+
+# Opt-in actor trace dispatch diagnostic; setup and teardown are not timed.
+[[bench]]
+name = "trace_actor_profile"
+harness = false
