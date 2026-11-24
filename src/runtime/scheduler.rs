@@ -26,6 +26,25 @@
 use super::actor::ActorPriority;
 use crossbeam::deque::{Injector, Steal, Stealer, Worker};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+// Opt-in weighted fairness for the single-owner runtime dequeue path.
+// High retains the largest share, while sustained High traffic cannot starve
+// Normal or Low work. Generic multi-worker paths remain strict-priority.
+const FAIR_OWNER_SEQUENCE: [ActorPriority; 13] = [
+    ActorPriority::High,
+    ActorPriority::High,
+    ActorPriority::High,
+    ActorPriority::High,
+    ActorPriority::High,
+    ActorPriority::High,
+    ActorPriority::High,
+    ActorPriority::High,
+    ActorPriority::Normal,
+    ActorPriority::Normal,
+    ActorPriority::Normal,
+    ActorPriority::Normal,
+    ActorPriority::Low,
+];
 use std::thread;
 
 /// Best-effort pin of the calling thread to a specific logical CPU.
@@ -157,6 +176,8 @@ pub struct Scheduler {
 
     worker_count: usize,
     processed_count: AtomicUsize,
+    fair_scheduling: bool,
+    fair_cursor: AtomicUsize,
     stats: SchedulerStatsInternal,
 }
 
@@ -190,6 +211,8 @@ impl Scheduler {
             stealers_low,
             worker_count,
             processed_count: AtomicUsize::new(0),
+            fair_scheduling: false,
+            fair_cursor: AtomicUsize::new(0),
             stats: SchedulerStatsInternal {
                 tasks_from_local_queue: AtomicU64::new(0),
                 tasks_from_global_queue: AtomicU64::new(0),
@@ -199,6 +222,19 @@ impl Scheduler {
                 empty_polls: AtomicU64::new(0),
             },
         }
+    }
+
+    /// Enable or disable bounded-share fairness for the live owner dequeue path.
+    /// Existing strict-priority behavior remains the default. Call while the
+    /// runtime is not executing actor turns; this does not affect next_task or
+    /// steal_one, which retain their documented strict-priority semantics.
+    pub fn set_fair_scheduling(&mut self, enabled: bool) {
+        self.fair_scheduling = enabled;
+        self.fair_cursor.store(0, Ordering::Relaxed);
+    }
+
+    pub fn fair_scheduling_enabled(&self) -> bool {
+        self.fair_scheduling
     }
 
     #[inline]
@@ -420,6 +456,29 @@ impl Scheduler {
         None
     }
 
+    /// Weighted-fair selection for the single-owner live runtime only.
+    /// Missing priority bands are skipped without consuming a slot; when all
+    /// bands remain continuously busy, High/Normal/Low receive 8/4/1 turns
+    /// per 13 successful dequeues. The same local/global fast paths and stats
+    /// accounting are used as for strict-priority scheduling.
+    fn next_owner_task_fair(&self, worker_idx: usize) -> Option<u64> {
+        let start = self.fair_cursor.load(Ordering::Relaxed);
+        for offset in 0..FAIR_OWNER_SEQUENCE.len() {
+            let slot = (start + offset) % FAIR_OWNER_SEQUENCE.len();
+            let priority = FAIR_OWNER_SEQUENCE[slot];
+            let task = self
+                .pop_local(worker_idx, priority)
+                .or_else(|| self.steal_global_batch_for(worker_idx, priority));
+            if let Some(task) = task {
+                self.fair_cursor
+                    .store((slot + 1) % FAIR_OWNER_SEQUENCE.len(), Ordering::Relaxed);
+                return Some(task);
+            }
+        }
+        self.stats.empty_polls.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
     /// Pop the next task for the live runtime scheduler thread.
     ///
     /// Worker slot 0 is the runtime's locality anchor. This path intentionally
@@ -427,7 +486,11 @@ impl Scheduler {
     /// remaining slots today. Generic multi-worker callers should use
     /// [`Scheduler::next_task`].
     pub fn dequeue(&self) -> Option<u64> {
-        self.next_owner_task(0)
+        if self.fair_scheduling {
+            self.next_owner_task_fair(0)
+        } else {
+            self.next_owner_task(0)
+        }
     }
 
     /// Steal one task from any source without owning a local worker slot.
@@ -667,6 +730,53 @@ mod scheduler_tests {
 
         s.enqueue_with_priority(777, ActorPriority::Normal);
         assert_eq!(s.next_task(0), Some(777));
+    }
+
+    #[test]
+    fn test_fair_dequeue_services_low_under_continuous_high_load() {
+        let mut s = Scheduler::new(1);
+        s.set_fair_scheduling(true);
+        s.enqueue_with_priority(777, ActorPriority::Low);
+        for id in 1000..1100 {
+            s.enqueue_with_priority(id, ActorPriority::High);
+        }
+
+        let mut low_seen = false;
+        for _ in 0..13 {
+            if s.dequeue() == Some(777) {
+                low_seen = true;
+                break;
+            }
+        }
+        assert!(
+            low_seen,
+            "a ready Low actor must not starve under High load"
+        );
+    }
+
+    #[test]
+    fn test_fair_dequeue_services_all_queued_priorities_without_losing_tasks() {
+        let mut s = Scheduler::new(1);
+        s.set_fair_scheduling(true);
+        s.enqueue_with_priority(10, ActorPriority::Normal);
+        s.enqueue_with_priority(20, ActorPriority::Low);
+        for id in 100..130 {
+            s.enqueue_with_priority(id, ActorPriority::High);
+        }
+
+        let first_thirteen: Vec<_> = (0..13).map(|_| s.dequeue().unwrap()).collect();
+        assert!(
+            first_thirteen.contains(&10),
+            "Normal work must make progress"
+        );
+        assert!(first_thirteen.contains(&20), "Low work must make progress");
+
+        let mut all = first_thirteen;
+        all.extend(std::iter::from_fn(|| s.dequeue()));
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), 32, "no actor may be dropped or duplicated");
+        assert_eq!(s.stats().total_tasks_processed, 32);
     }
 
     #[test]
