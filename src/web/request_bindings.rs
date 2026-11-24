@@ -7,6 +7,52 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fmt;
 
+/// Trusted identity resolved by an authentication/tenant-membership provider.
+///
+/// This value is distinct from HTTP headers, cookies, form values, and path
+/// parameters. It must only be created *after* verifying the session and the
+/// principal's right to use the selected tenant. Nulang's built-in development
+/// server currently has no provider and consequently injects no scope.
+#[derive(Debug, Clone)]
+pub struct VerifiedRequestScope {
+    principal_id: String,
+    tenant_id: Option<String>,
+}
+
+impl VerifiedRequestScope {
+    // Deliberately not a public, request-facing constructor. A future trusted
+    // host adapter may integrate its verified session resolver here.
+    #[allow(dead_code)]
+    pub(crate) fn from_verified_identity(
+        principal_id: String,
+        tenant_id: Option<String>,
+    ) -> Option<Self> {
+        if principal_id.trim().is_empty()
+            || tenant_id.as_deref().is_some_and(|id| id.trim().is_empty())
+        {
+            return None;
+        }
+        Some(Self {
+            principal_id,
+            tenant_id,
+        })
+    }
+
+    #[cfg(test)]
+    fn for_test(principal_id: &str, tenant_id: Option<&str>) -> Self {
+        Self::from_verified_identity(principal_id.to_string(), tenant_id.map(str::to_string))
+            .expect("valid test identity")
+    }
+
+    fn get(&self, name: &str) -> Option<&str> {
+        match name {
+            "principal_id" => Some(&self.principal_id),
+            "tenant_id" => self.tenant_id.as_deref(),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct RequestBindingValues<'a> {
     pub path: &'a HashMap<String, String>,
@@ -15,12 +61,18 @@ pub struct RequestBindingValues<'a> {
     pub cookies: &'a HashMap<String, String>,
     pub body: Option<&'a str>,
     pub form: &'a HashMap<String, String>,
+    /// Only trusted host code may supply a scope. Never populate from request.
+    pub scope: Option<&'a VerifiedRequestScope>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestDecodeErrorKind {
     Missing,
     InvalidType,
+    /// No host-verified principal was provided.
+    Unauthenticated,
+    /// Verified principal has no authorized value for the required scope.
+    ScopeUnavailable,
     DuplicateHandlerSlot,
     InvalidHandlerSlot,
     IncompleteBindingPlan,
@@ -43,7 +95,10 @@ impl RequestDecodeError {
     pub fn is_client_error(&self) -> bool {
         matches!(
             self.kind,
-            RequestDecodeErrorKind::Missing | RequestDecodeErrorKind::InvalidType
+            RequestDecodeErrorKind::Missing
+                | RequestDecodeErrorKind::InvalidType
+                | RequestDecodeErrorKind::Unauthenticated
+                | RequestDecodeErrorKind::ScopeUnavailable
         )
     }
 
@@ -53,10 +108,11 @@ impl RequestDecodeError {
     /// those are compiler/runtime defects and must not be presented as client
     /// mistakes.
     pub fn http_status(&self) -> u16 {
-        if self.is_client_error() {
-            400
-        } else {
-            500
+        match self.kind {
+            RequestDecodeErrorKind::Unauthenticated => 401,
+            RequestDecodeErrorKind::ScopeUnavailable => 403,
+            RequestDecodeErrorKind::Missing | RequestDecodeErrorKind::InvalidType => 400,
+            _ => 500,
         }
     }
 
@@ -66,6 +122,8 @@ impl RequestDecodeError {
         match self.kind {
             RequestDecodeErrorKind::Missing => "missing_request_input",
             RequestDecodeErrorKind::InvalidType => "invalid_request_input",
+            RequestDecodeErrorKind::Unauthenticated => "unauthenticated",
+            RequestDecodeErrorKind::ScopeUnavailable => "scope_unavailable",
             RequestDecodeErrorKind::DuplicateHandlerSlot => "duplicate_handler_slot",
             RequestDecodeErrorKind::InvalidHandlerSlot => "invalid_handler_slot",
             RequestDecodeErrorKind::IncompleteBindingPlan => "incomplete_binding_plan",
@@ -76,10 +134,13 @@ impl RequestDecodeError {
     /// this as `application/problem+json`; non-HTTP transports can consume the
     /// same structured fields without parsing the display message.
     pub fn problem_details(&self) -> Value {
-        let title = if self.is_client_error() {
-            "Invalid request input"
-        } else {
-            "Invalid request binding plan"
+        let title = match self.kind {
+            RequestDecodeErrorKind::Unauthenticated => "Authentication required",
+            RequestDecodeErrorKind::ScopeUnavailable => "Required scope unavailable",
+            RequestDecodeErrorKind::Missing | RequestDecodeErrorKind::InvalidType => {
+                "Invalid request input"
+            }
+            _ => "Invalid request binding plan",
         };
         let mut problem = json!({
             "type": format!("urn:nulang:web:{}", self.code()),
@@ -179,17 +240,40 @@ pub fn bind_request_arguments(
             ));
         }
 
-        let raw = lookup(binding, values).ok_or_else(|| {
-            error(
+        // A trusted scope is not a client-controlled request source. Missing
+        // authentication must produce 401 (not 400), and a verified principal
+        // without this tenant field must produce 403 (not a silent fallback).
+        if binding.source == RouteBindingSource::Scope
+            && !matches!(binding.source_name.as_str(), "principal_id" | "tenant_id")
+        {
+            return Err(error(
                 binding,
-                RequestDecodeErrorKind::Missing,
+                RequestDecodeErrorKind::InvalidHandlerSlot,
+                "unknown trusted scope field in binding plan".to_string(),
+            ));
+        }
+        let raw = lookup(binding, values).ok_or_else(|| {
+            let kind = if binding.source == RouteBindingSource::Scope {
+                if values.scope.is_some() {
+                    RequestDecodeErrorKind::ScopeUnavailable
+                } else {
+                    RequestDecodeErrorKind::Unauthenticated
+                }
+            } else {
+                RequestDecodeErrorKind::Missing
+            };
+            // Do not include a principal/tenant identifier in an auth failure.
+            let message = if binding.source == RouteBindingSource::Scope {
+                "trusted request scope unavailable".to_string()
+            } else {
                 format!(
                     "missing {} input '{}' for handler parameter '{}'",
                     source_name(binding.source),
                     binding.source_name,
                     binding.handler_param
-                ),
-            )
+                )
+            };
+            error(binding, kind, message)
         })?;
         let value = decode_scalar_constant(raw, binding.ty.as_deref()).map_err(|message| {
             error(
@@ -257,6 +341,9 @@ fn lookup<'a>(
         RouteBindingSource::Cookie => values.cookies.get(&binding.source_name).map(String::as_str),
         RouteBindingSource::Body => values.body,
         RouteBindingSource::Form => values.form.get(&binding.source_name).map(String::as_str),
+        RouteBindingSource::Scope => values
+            .scope
+            .and_then(|scope| scope.get(&binding.source_name)),
     }
 }
 
@@ -268,6 +355,7 @@ fn source_name(source: RouteBindingSource) -> &'static str {
         RouteBindingSource::Cookie => "cookie",
         RouteBindingSource::Body => "body",
         RouteBindingSource::Form => "form",
+        RouteBindingSource::Scope => "scope",
     }
 }
 
@@ -385,6 +473,81 @@ mod tests {
     }
 
     #[test]
+    fn unverified_request_cannot_spoof_scope_from_client_inputs() {
+        let spoof = HashMap::from([("tenant_id".to_string(), "attacker".to_string())]);
+        let headers = vec![("X-Tenant-Id".to_string(), "attacker".to_string())];
+        let values = RequestBindingValues {
+            path: &spoof,
+            query: &spoof,
+            headers: &headers,
+            cookies: &spoof,
+            body: Some("tenant_id=attacker"),
+            form: &spoof,
+            scope: None,
+        };
+        let error = bind_request_arguments(
+            &[binding(RouteBindingSource::Scope, "tenant_id", 0, "String")],
+            1,
+            &values,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, RequestDecodeErrorKind::Unauthenticated);
+        assert_eq!(error.http_status(), 401);
+        assert_eq!(error.problem_details()["code"], "unauthenticated");
+        assert!(error.problem_details().get("handler_param").is_none());
+    }
+
+    #[test]
+    fn verified_scope_binds_only_host_derived_identity() {
+        let spoof = HashMap::from([("tenant_id".to_string(), "attacker".to_string())]);
+        let headers = vec![("X-Tenant-Id".to_string(), "attacker".to_string())];
+        let scope = VerifiedRequestScope::for_test("alice", Some("trusted-tenant"));
+        let values = RequestBindingValues {
+            path: &spoof,
+            query: &spoof,
+            headers: &headers,
+            cookies: &spoof,
+            body: Some("tenant_id=attacker"),
+            form: &spoof,
+            scope: Some(&scope),
+        };
+        let bindings = [
+            binding(RouteBindingSource::Scope, "principal_id", 0, "String"),
+            binding(RouteBindingSource::Scope, "tenant_id", 1, "String"),
+        ];
+        let args = bind_request_arguments(&bindings, 2, &values).unwrap();
+        assert_eq!(args[0].value, Constant::String("alice".to_string()));
+        assert_eq!(
+            args[1].value,
+            Constant::String("trusted-tenant".to_string())
+        );
+    }
+
+    #[test]
+    fn authenticated_principal_without_tenant_cannot_access_tenant_scope() {
+        let empty = HashMap::new();
+        let headers = vec![];
+        let scope = VerifiedRequestScope::for_test("alice", None);
+        let values = RequestBindingValues {
+            path: &empty,
+            query: &empty,
+            headers: &headers,
+            cookies: &empty,
+            body: None,
+            form: &empty,
+            scope: Some(&scope),
+        };
+        let err = bind_request_arguments(
+            &[binding(RouteBindingSource::Scope, "tenant_id", 0, "String")],
+            1,
+            &values,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, RequestDecodeErrorKind::ScopeUnavailable);
+        assert_eq!(err.http_status(), 403);
+    }
+
+    #[test]
     fn binds_all_request_sources() {
         let path = HashMap::from([("id".into(), "42".into())]);
         let query = HashMap::from([("limit".into(), "25".into())]);
@@ -398,6 +561,7 @@ mod tests {
             cookies: &cookies,
             body: Some("payload"),
             form: &form,
+            scope: None,
         };
         let bindings = vec![
             binding(RouteBindingSource::Path, "id", 0, "Int"),
@@ -425,6 +589,7 @@ mod tests {
             cookies: &empty,
             body: None,
             form: &empty,
+            scope: None,
         };
         let err = bind_request_arguments(
             &[binding(RouteBindingSource::Query, "limit", 0, "Int")],
@@ -461,6 +626,7 @@ mod tests {
             cookies: &empty,
             body: None,
             form: &empty,
+            scope: None,
         };
         let err = bind_request_arguments(&[], 1, &values).unwrap_err();
         assert_eq!(err.kind, RequestDecodeErrorKind::IncompleteBindingPlan);
@@ -481,6 +647,7 @@ mod tests {
             cookies: &empty,
             body: None,
             form: &empty,
+            scope: None,
         };
         let err = bind_request_arguments(
             &[binding(RouteBindingSource::Header, "X-Trace", 0, "String")],

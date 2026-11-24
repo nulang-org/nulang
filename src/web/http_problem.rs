@@ -61,6 +61,7 @@ mod tests {
             cookies: &empty,
             body: None,
             form: &empty,
+            scope: None,
         };
         let binding = RouteBindingContract {
             source: RouteBindingSource::Query,

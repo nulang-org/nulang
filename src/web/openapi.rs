@@ -100,6 +100,19 @@ fn operation_for(route: &RouteContract) -> Value {
     }
     operation.insert("responses".to_string(), Value::Object(responses));
 
+    // Scope bindings are trusted host inputs, not parameters that callers can
+    // supply. Advertise the requirement without inventing an authentication
+    // scheme before Nulang has a verified production auth provider.
+    let scope_fields: Vec<_> = binding_compilation
+        .bindings
+        .iter()
+        .filter(|binding| binding.source == RouteBindingSource::Scope)
+        .map(|binding| binding.source_name.as_str())
+        .collect();
+    if !scope_fields.is_empty() {
+        operation.insert("x-nulang-trusted-scope".to_string(), json!(scope_fields));
+    }
+
     if !binding_compilation.bindings.is_empty() {
         operation.insert(
             "x-nulang-request-bindings".to_string(),
@@ -165,9 +178,10 @@ fn binding_parameter(binding: &RouteBindingContract) -> Option<Value> {
         RouteBindingSource::Query => "query",
         RouteBindingSource::Header => "header",
         RouteBindingSource::Cookie => "cookie",
-        RouteBindingSource::Path | RouteBindingSource::Body | RouteBindingSource::Form => {
-            return None
-        }
+        RouteBindingSource::Path
+        | RouteBindingSource::Body
+        | RouteBindingSource::Form
+        | RouteBindingSource::Scope => return None,
     };
 
     Some(json!({
@@ -241,6 +255,7 @@ fn binding_source_name(source: RouteBindingSource) -> &'static str {
         RouteBindingSource::Cookie => "cookie",
         RouteBindingSource::Body => "body",
         RouteBindingSource::Form => "form",
+        RouteBindingSource::Scope => "scope",
     }
 }
 
@@ -369,6 +384,39 @@ mod tests {
         assert_eq!(operation["x-nulang-placement"], "server");
         assert_eq!(operation["x-nulang-effects"][0], "DB");
         assert_eq!(operation["x-nulang-request-bindings"][0]["source"], "path");
+    }
+
+    #[test]
+    fn trusted_scope_does_not_become_spoofable_openapi_parameter() {
+        let scope = binding(RouteBindingSource::Scope, "tenant_id", "String");
+        assert!(binding_parameter(&scope).is_none());
+        assert_eq!(binding_extension(&scope)["source"], "scope");
+        let mut route = route();
+        route.path = "/secure".to_string();
+        route.params.clear();
+        route.handler_params.clear();
+        route
+            .handler_params
+            .push(crate::web::contracts::HandlerParamContract {
+                name: "tenant".to_string(),
+                ty: Some("String".to_string()),
+                capability: None,
+                request: Some(crate::web::contracts::RequestParamBindingContract {
+                    source: RouteBindingSource::Scope,
+                    source_name: "tenant_id".to_string(),
+                }),
+            });
+        let doc = generate_openapi(
+            &crate::web::contracts::ContractCompilation {
+                routes: vec![route],
+                diagnostics: vec![],
+            },
+            "Test",
+            "0.1",
+        );
+        let get = &doc["paths"]["/secure"]["get"];
+        assert_eq!(get["x-nulang-trusted-scope"][0], "tenant_id");
+        assert!(get.get("parameters").is_none());
     }
 
     #[test]

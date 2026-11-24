@@ -83,6 +83,34 @@ impl DeploymentIr {
     }
 }
 
+/// A trusted identity dependency cannot be resolved by a static site builder.
+pub fn route_requires_trusted_scope(contract: &crate::web::contracts::RouteContract) -> bool {
+    contract.handler_params.iter().any(|param| {
+        param.request.as_ref().is_some_and(|binding| {
+            binding.source == crate::web::contracts::RequestParamSource::Scope
+        })
+    })
+}
+
+/// Prevent the static-only builder from rendering routes requiring host-verified
+/// authentication. A hybrid dynamic deployment is a separate future backend.
+pub fn validate_static_scope_routes(
+    contracts: &crate::web::contracts::ContractCompilation,
+) -> Result<(), String> {
+    if let Some(route) = contracts
+        .routes
+        .iter()
+        .find(|route| route_requires_trusted_scope(route))
+    {
+        Err(format!(
+            "cannot statically render {} {}: trusted request scope requires an authenticated dynamic host",
+            route.method, route.path
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Generate the deployment IR for a web package.
 ///
 /// `routes` are the routes collected by running the compiled entry point.
@@ -112,9 +140,15 @@ pub fn generate_deployment_ir(
             .get(&(method.clone(), route.path.clone()))
             .copied();
         let binding_compilation = contract.map(compile_route_bindings);
-        let placement = contract
-            .and_then(|contract| contract.placement.clone())
-            .unwrap_or_else(|| default_route_placement(&method, &route.path));
+        let placement = if contract.is_some_and(route_requires_trusted_scope) {
+            // Even an incorrectly unvalidated contract cannot advertise a
+            // trusted-scope route as a public static artifact.
+            "server".to_string()
+        } else {
+            contract
+                .and_then(|contract| contract.placement.clone())
+                .unwrap_or_else(|| default_route_placement(&method, &route.path))
+        };
         let artifact = if placement == "static" {
             Some(route_path_to_artifact(&route.path))
         } else {
@@ -309,6 +343,75 @@ fn collect_nulang_imports(source: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_web_build_rejects_trusted_scope_routes_without_executing_handler() {
+        use crate::web::contracts::{RequestParamBindingContract, RequestParamSource};
+        let secure = RouteContract {
+            method: "GET".into(),
+            path: "/account".into(),
+            handler_params: vec![HandlerParamContract {
+                name: "tenant".into(),
+                ty: Some("String".into()),
+                capability: None,
+                request: Some(RequestParamBindingContract {
+                    source: RequestParamSource::Scope,
+                    source_name: "tenant_id".into(),
+                }),
+            }],
+            ..RouteContract::default()
+        };
+        let contracts = ContractCompilation {
+            routes: vec![secure],
+            diagnostics: vec![],
+        };
+        let error = validate_static_scope_routes(&contracts).unwrap_err();
+        assert!(
+            error.contains("cannot statically render GET /account"),
+            "{error}"
+        );
+        assert!(error.contains("authenticated dynamic host"));
+        assert!(validate_static_scope_routes(&ContractCompilation::default()).is_ok());
+    }
+
+    #[test]
+    fn scope_bound_get_route_cannot_be_emitted_as_static_artifact() {
+        use crate::web::contracts::{RequestParamBindingContract, RequestParamSource};
+        let contract = RouteContract {
+            method: "GET".into(),
+            path: "/account".into(),
+            handler: Some("account".into()),
+            handler_params: vec![HandlerParamContract {
+                name: "tenant".into(),
+                ty: Some("String".into()),
+                capability: None,
+                request: Some(RequestParamBindingContract {
+                    source: RequestParamSource::Scope,
+                    source_name: "tenant_id".into(),
+                }),
+            }],
+            ..RouteContract::default()
+        };
+        let routes = vec![WebRoute {
+            method: crate::runtime::HttpMethod::Get,
+            path: "/account".into(),
+            handler_module: crate::bytecode::CodeModule::new("scoped"),
+            handler_func_idx: 0,
+        }];
+        let ir = generate_deployment_ir(
+            &routes,
+            None,
+            Path::new("/missing/source/tree"),
+            &BudgetsSection::default(),
+            &ContractCompilation {
+                routes: vec![contract.clone()],
+                diagnostics: vec![],
+            },
+        );
+        assert!(route_requires_trusted_scope(&contract));
+        assert_eq!(ir.routes[0].placement, "server");
+        assert_eq!(ir.routes[0].artifact, None);
+    }
 
     #[test]
     fn deployment_ir_and_runtime_use_the_same_validated_contract() {

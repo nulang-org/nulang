@@ -36,6 +36,7 @@ pub enum RequestParamSource {
     Cookie,
     Body,
     Form,
+    Scope,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -408,6 +409,7 @@ fn request_source_contract(source: WebRequestParamSource) -> RequestParamSource 
         WebRequestParamSource::Cookie => RequestParamSource::Cookie,
         WebRequestParamSource::Body => RequestParamSource::Body,
         WebRequestParamSource::Form => RequestParamSource::Form,
+        WebRequestParamSource::Scope => RequestParamSource::Scope,
     }
 }
 
@@ -681,6 +683,60 @@ mod tests {
     fn parse(source: &str) -> AstModule {
         let tokens = Lexer::new(source).lex().unwrap();
         Parser::new(tokens).parse_module().unwrap()
+    }
+
+    #[test]
+    fn host_verified_scope_source_is_preserved_in_contract_ir() {
+        let module = parse(
+            r#"
+@placement(server)
+fn profile(principal: String from scope("principal_id"),
+           tenant: String from scope("tenant_id")) -> String {
+    principal
+}
+
+fn web_main() {
+    perform Web.route("GET", "/profile", profile)
+}
+"#,
+        );
+        let compilation = compile_module_contracts(&module);
+        assert!(
+            compilation.diagnostics.is_empty(),
+            "{:?}",
+            compilation.diagnostics
+        );
+        let route = &compilation.routes[0];
+        assert_eq!(route.placement.as_deref(), Some("server"));
+        let bindings = crate::web::bindings::compile_route_bindings(route);
+        assert!(
+            bindings.diagnostics.is_empty(),
+            "{:?}",
+            bindings.diagnostics
+        );
+        assert_eq!(bindings.bindings.len(), 2);
+        assert_eq!(bindings.bindings[0].source, RequestParamSource::Scope);
+        assert_eq!(bindings.bindings[0].source_name, "principal_id");
+        assert_eq!(bindings.bindings[1].source_name, "tenant_id");
+    }
+
+    #[test]
+    fn client_cannot_supply_scope_from_query_through_route_metadata() {
+        let module = parse(
+            r#"
+@placement(static)
+fn profile(tenant: String from scope("tenant_id")) -> String { tenant }
+
+fn web_main() {
+    perform Web.route("GET", "/profile", profile)
+}
+"#,
+        );
+        let route = &compile_module_contracts(&module).routes[0];
+        let diagnostics = crate::web::bindings::compile_route_bindings(route).diagnostics;
+        assert!(diagnostics
+            .iter()
+            .any(|d| d.contains("requires server execution")));
     }
 
     #[test]

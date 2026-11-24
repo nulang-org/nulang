@@ -80,6 +80,58 @@ fn web_main() {
 
 An explicit `from path("missing")` binding is rejected when `missing` is not a route capture.
 
+## Trusted scope bindings (experimental, fail-closed)
+
+Web handlers may declare a **host-verified identity source** independently of
+request-controlled inputs:
+
+```nulang
+@placement(server)
+fn account(principal: String from scope("principal_id"),
+           tenant: String from scope("tenant_id")) -> String {
+    // The host must first validate the principal and selected tenant membership.
+    principal
+}
+
+fn web_main() {
+    perform Web.route("GET", "/account", account)
+}
+```
+
+This is deliberately a narrow first slice of Phoenix-style scopes, **not** an
+authentication system or an authorization proof. Only `principal_id` and
+`tenant_id` are accepted, and current handlers use `String` as their type.
+A future nominal/capability-backed `AuthenticatedScope` type and role/policy
+checks must be designed separately. Tenant isolation in application persistence
+still needs database and resource-level authorization.
+
+Source provenance is encoded as `scope` in the same compiler-owned route
+binding IR as `path`, `query`, and the other request sources. Scope inputs are
+absent from OpenAPI client parameters (they are represented by
+`x-nulang-trusted-scope` instead). Scope bindings to unsupported names or
+static/client-placed handlers are compile-time contract errors.
+
+At request dispatch, the scope can only come from a Rust
+`VerifiedRequestScope` constructed by trusted host code after authenticating
+the session and verifying tenant membership. A missing verified principal
+produces **401**, and an authenticated principal with no authorized tenant
+for a requested `tenant_id` produces **403**. Client-provided headers, path
+parameters, query values, cookies, and forms cannot fill this binding. Invalid
+host scope binding plans are server errors, not user-authentication failures.
+
+The static-only `nula build --web` command **rejects** packages containing
+trusted-scope routes before rendering their handlers; it cannot generate a
+public static HTML page for a protected endpoint. A future hybrid deployment
+adapter must implement server-side rendering separately.
+
+**Important:** The built-in `nula dev` listener does **not** have a verified
+session provider. It supplies no trusted scope, therefore guarded routes fail
+closed with 401. Do not turn this into insecure "authentication" by accepting
+`X-User`, `X-Tenant`, or unsigned cookies. A real provider should be wired
+through an explicitly trusted host integration with session validation, tenant
+membership checks, and revocation/revalidation semantics before recommending
+this functionality for production.
+
 ## Package-wide extraction and validation
 
 Contract extraction parses the package source tree and builds package-level analysis so a route in one file can retain handler metadata declared in another. Public `route(...)` and `route_method(...)` helpers lower to the same contract representation.
