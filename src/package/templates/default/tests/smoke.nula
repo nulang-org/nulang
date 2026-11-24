@@ -1,0 +1,3 @@
+fn main() {
+    perform Test.assert_eq(2 + 2, 4)
+}
