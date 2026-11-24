@@ -318,19 +318,22 @@ pub extern "C" fn nulang_icmp_ge(a: u64, b: u64) -> u64 {
     }
 }
 
+// JIT fallback arithmetic must use the same tagged-value coercion as
+// VM::run_from: a nil or other non-float operand contributes 0.0.
+// The typed CLIF fast path is unchanged for statically known float inputs.
 #[no_mangle]
 pub extern "C" fn nulang_fadd(a: u64, b: u64) -> u64 {
-    Value::float(f64::from_bits(a) + f64::from_bits(b)).as_raw()
+    Value::float(fval(a) + fval(b)).as_raw()
 }
 
 #[no_mangle]
 pub extern "C" fn nulang_fsub(a: u64, b: u64) -> u64 {
-    Value::float(f64::from_bits(a) - f64::from_bits(b)).as_raw()
+    Value::float(fval(a) - fval(b)).as_raw()
 }
 
 #[no_mangle]
 pub extern "C" fn nulang_fmul(a: u64, b: u64) -> u64 {
-    Value::float(f64::from_bits(a) * f64::from_bits(b)).as_raw()
+    Value::float(fval(a) * fval(b)).as_raw()
 }
 
 /// Float arithmetic that coerces a non-float (nil) operand to 0.0, matching
@@ -487,41 +490,73 @@ thread_local! {
     static JIT_CALLBACKS: UnsafeCell<CbPair> = UnsafeCell::new(CbPair::NULL);
 }
 
+/// Minimal typed error information retained across the native ABI.
+/// Compiled helpers cannot unwind, but the AOT driver must report the same
+/// category as the interpreter rather than converting every failure to a
+/// generic RuntimeError. The interpreter remains the semantic authority.
+#[derive(Clone, Debug)]
+pub(crate) enum PendingNativeError {
+    Runtime(String),
+    Effect(String),
+}
+
+impl PendingNativeError {
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            Self::Runtime(msg) | Self::Effect(msg) => msg,
+        }
+    }
+
+    pub(crate) fn into_nu_error(self) -> crate::types::NuError {
+        match self {
+            Self::Runtime(msg) => {
+                crate::types::NuError::runtime_error(msg, crate::types::Span::default())
+            }
+            Self::Effect(msg) => {
+                crate::types::NuError::effect_error(msg, crate::types::Span::default())
+            }
+        }
+    }
+}
+
 thread_local! {
-    /// Pending runtime-error message set by arithmetic helpers (pow/neg/...)
-    /// when the interpreter would raise (48-bit overflow, type error).
-    /// JIT-compiled code cannot unwind, so the helper records the error here
-    /// and returns nil; `AotModule::run` (which CAN return an error) checks
-    /// this after the compiled entry point returns, keeping the AOT backend
-    /// in lockstep with the interpreter's checked arithmetic.
-    static AOT_PENDING_ERROR: std::cell::RefCell<Option<String>> =
+    /// First error emitted by a native helper. Nested JIT regions preserve
+    /// this category alongside the message when saving execution state.
+    static AOT_PENDING_ERROR: std::cell::RefCell<Option<PendingNativeError>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Record a runtime error for retrieval by the AOT driver (no-op semantics
-/// for the tiered JIT, which never inspects this slot).
-///
-/// First-write-wins: compiled code cannot unwind, so a helper records the
-/// error and yields its nil/replacement value, and later statements keep
-/// executing and may record *their* own errors. The interpreter aborts at
-/// the FIRST arithmetic/type error, so to stay in lockstep the AOT driver
-/// must surface that first error, not the last one recorded by downstream
-/// statements that ran on the error-replacement value. E.g. `--(1 + 2,)`:
-/// the inner neg fails on the tuple pointer ("got ptr"), yields nil, and the
-/// OUTER neg on nil would otherwise overwrite the slot with "got nil".
-pub fn aot_set_pending_error(msg: String) {
-    // First-write-wins: the interpreter aborts at the FIRST error and never
-    // runs later statements, so that first error is the observable one.
-    AOT_PENDING_ERROR.with(|e| {
-        if e.borrow().is_none() {
-            *e.borrow_mut() = Some(msg);
+/// Preserve the first failure: native code cannot unwind, and subsequent
+/// instructions can encounter secondary errors on the replacement value.
+fn aot_set_pending_native_error(error: PendingNativeError) {
+    AOT_PENDING_ERROR.with(|slot| {
+        let mut pending = slot.borrow_mut();
+        if pending.is_none() {
+            *pending = Some(error);
         }
     });
 }
 
-/// Take (and clear) the pending AOT runtime error, if any.
+/// Record a runtime arithmetic/type failure without allowing later failures
+/// to overwrite its original category or payload.
+pub fn aot_set_pending_error(msg: String) {
+    aot_set_pending_native_error(PendingNativeError::Runtime(msg));
+}
+
+/// Record an unhandled effect as an EffectError, not a RuntimeError.
+pub(crate) fn aot_set_pending_effect_error(msg: String) {
+    aot_set_pending_native_error(PendingNativeError::Effect(msg));
+}
+
+/// Consume the first pending native failure with its category intact.
+pub(crate) fn aot_take_pending_native_error() -> Option<PendingNativeError> {
+    AOT_PENDING_ERROR.with(|slot| slot.borrow_mut().take())
+}
+
+/// Legacy message-only consumer retained for JIT callbacks and callers that
+/// do not cross an AOT driver error-category boundary.
 pub fn aot_take_pending_error() -> Option<String> {
-    AOT_PENDING_ERROR.with(|e| e.borrow_mut().take())
+    aot_take_pending_native_error().map(PendingNativeError::into_message)
 }
 
 pub unsafe fn set_jit_callbacks(cb: *mut dyn crate::vm::ActorVmCallbacks) {
@@ -822,7 +857,7 @@ struct JitThreadState {
     safepoint: *mut u64,
     yield_pc: u64,
     branch_exit_pc: u64,
-    pending_error: Option<String>,
+    pending_error: Option<PendingNativeError>,
     leaf_calls: Vec<JitLeafCallEntry>,
     leaf_constants: *const u64,
 }
@@ -932,8 +967,8 @@ pub unsafe extern "C" fn nulang_jit_direct_call(
                 JIT_YIELD_PC.with(|slot| slot.set(saved_yield));
                 JIT_BRANCH_EXIT_PC.with(|slot| slot.set(saved_branch));
 
-                if let Some(msg) = leaf_error {
-                    set_jit_pending_vm_error(msg);
+                if let Some(error) = leaf_error {
+                    set_jit_pending_vm_error(error.into_message());
                     return 1;
                 }
 
@@ -2131,6 +2166,25 @@ pub unsafe extern "C" fn nulang_aot_receive_pop() -> u64 {
 mod tests {
 
     #[test]
+    fn test_jit_float_arithmetic_coerces_tagged_values_like_interpreter() {
+        use crate::vm::Value;
+
+        let nil = Value::nil().as_raw();
+        let zero = Value::float(0.0).as_raw();
+        let two_point_five = Value::float(2.5).as_raw();
+
+        assert_eq!(super::nulang_fadd(nil, two_point_five), two_point_five);
+        assert_eq!(super::nulang_fadd(two_point_five, nil), two_point_five);
+        assert_eq!(super::nulang_fsub(two_point_five, nil), two_point_five);
+        assert_eq!(
+            super::nulang_fsub(nil, two_point_five),
+            Value::float(-2.5).as_raw()
+        );
+        assert_eq!(super::nulang_fmul(nil, two_point_five), zero);
+        assert_eq!(super::nulang_fmul(two_point_five, nil), zero);
+    }
+
+    #[test]
     fn test_native_float_division_coerces_nil_like_interpreter() {
         use crate::vm::Value;
 
@@ -2167,6 +2221,50 @@ mod tests {
         assert_eq!(super::nulang_fmod(seven, nil), zero);
         assert_eq!(super::nulang_fmod(nil, two), zero);
         assert_eq!(super::nulang_fmod(nil, nil), zero);
+    }
+
+    #[test]
+    fn test_native_pending_error_preserves_effect_kind_and_first_write() {
+        // The compiled backend keeps executing after a helper records an
+        // error, so a later arithmetic failure must not reclassify the first
+        // unhandled effect.
+        let _ = super::aot_take_pending_native_error();
+        super::aot_set_pending_effect_error(
+            "Unhandled effect: 'non-exhaustive match.raise'".to_string(),
+        );
+        super::aot_set_pending_error("subsequent arithmetic failure".to_string());
+        let pending = super::aot_take_pending_native_error().expect("first error must be recorded");
+        assert!(matches!(
+            pending.into_nu_error(),
+            crate::types::NuError::EffectError { msg, .. }
+                if msg == "Unhandled effect: 'non-exhaustive match.raise'"
+        ));
+        assert!(super::aot_take_pending_native_error().is_none());
+    }
+
+    #[test]
+    fn test_native_pending_error_preserves_runtime_kind_and_first_write() {
+        let _ = super::aot_take_pending_native_error();
+        super::aot_set_pending_error("integer overflow".to_string());
+        super::aot_set_pending_effect_error("later unhandled effect".to_string());
+        let pending = super::aot_take_pending_native_error().expect("first error must be recorded");
+        assert!(matches!(
+            pending.into_nu_error(),
+            crate::types::NuError::RuntimeError { msg, .. }
+                if msg == "integer overflow"
+        ));
+        assert!(super::aot_take_pending_native_error().is_none());
+    }
+
+    #[test]
+    fn test_native_pending_error_legacy_message_consumer() {
+        let _ = super::aot_take_pending_native_error();
+        super::aot_set_pending_effect_error("Unhandled effect: 'Ghost.vanish'".to_string());
+        assert_eq!(
+            super::aot_take_pending_error().as_deref(),
+            Some("Unhandled effect: 'Ghost.vanish'")
+        );
+        assert!(super::aot_take_pending_native_error().is_none());
     }
 
     #[test]
