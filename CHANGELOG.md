@@ -1,4 +1,10 @@
 # Nulang Changelog
+
+### October RustSec dependency remediation (validation pending) — 2026-10-25
+- **Updated Wasmtime 48.0.7, compatible Cranelift/Pulley packages, rustls-webpki 0.103.16, webpki-roots 1.0.10 and ctutils 0.4.4** with Cargo's dependency resolver.
+- **Migrated libSQL remote TLS to a custom connector based on supported rustls 0.23 and tokio-rustls 0.26.** This retains libSQL local/remote behavior, native root certificates, server-name verification and Hyper 0.14 protocol compatibility without pulling unsupported rustls-webpki 0.102.
+- **Release status:** tests of the certificate verifier, local SQLite behavior, full cargo audit and exact-head CI are mandatory before promotion. No security advisory is waived. See #2093.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
