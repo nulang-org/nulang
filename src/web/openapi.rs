@@ -6,16 +6,16 @@
 
 use crate::web::bindings::{compile_route_bindings, RouteBindingContract, RouteBindingSource};
 use crate::web::contracts::{ContractCompilation, RouteContract, RouteParamContract};
+use crate::web::response::ResponseKind;
 use serde_json::{json, Map, Value};
 
 pub const OPENAPI_VERSION: &str = "3.1.0";
 
 /// Generate an OpenAPI 3.1 document from a validated Web Contract compilation.
 ///
-/// Response media types are intentionally not invented here. The current Web
-/// runtime still has HTML-oriented response behavior and the typed response
-/// algebra (`Json[T]`, `Html`, `Stream[T]`, etc.) has not landed yet. We retain
-/// the Nulang response/error type as extensions until that contract is explicit.
+/// Response media types are generated only for explicitly recognized nominal
+/// results (`Html`, `Json`, and `Text`). Other return types stay extensions; we
+/// never guess a JSON content type from an arbitrary domain type.
 pub fn generate_openapi(contracts: &ContractCompilation, title: &str, version: &str) -> Value {
     let mut paths = Map::new();
 
@@ -76,6 +76,20 @@ fn operation_for(route: &RouteContract) -> Value {
             "x-nulang-response-type".to_string(),
             Value::String(response_type.clone()),
         );
+    }
+
+    if let Some(kind) = ResponseKind::explicit(route.response_type.as_deref()) {
+        let schema = match kind {
+            ResponseKind::Html | ResponseKind::Text => json!({ "type": "string" }),
+            // Json represents arbitrary JsonValue; do not invent object fields.
+            ResponseKind::Json => json!({}),
+        };
+        let mut media = Map::new();
+        media.insert(
+            kind.openapi_media_type().to_string(),
+            json!({ "schema": schema }),
+        );
+        success.insert("content".to_string(), Value::Object(media));
     }
 
     let mut responses = Map::new();
@@ -335,6 +349,31 @@ mod tests {
             openapi_path("/orgs/{org: OrgId}/users/{user}"),
             "/orgs/{org}/users/{user}"
         );
+    }
+
+    #[test]
+    fn explicit_response_types_describe_actual_media_contracts() {
+        for (ty, mime) in [
+            ("Html", "text/html"),
+            ("Json", "application/json"),
+            ("Text", "text/plain"),
+        ] {
+            let mut contract = route();
+            contract.response_type = Some(ty.into());
+            let document = generate_openapi(
+                &ContractCompilation {
+                    routes: vec![contract],
+                    diagnostics: Vec::new(),
+                },
+                "Response types",
+                "1.0",
+            );
+            let response = &document["paths"]["/users/{id}"]["get"]["responses"]["200"];
+            assert!(
+                response["content"].get(mime).is_some(),
+                "missing {mime} for {ty}"
+            );
+        }
     }
 
     #[test]

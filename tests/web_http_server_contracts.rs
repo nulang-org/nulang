@@ -165,3 +165,134 @@ fn legacy_route_still_falls_back_over_real_http() {
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
     assert!(response_body(&response).starts_with("legacy"), "{response}");
 }
+
+fn explicit_response_route(kind: &str, payload: &str, path: &str) -> RuntimeWebRoute {
+    let op = match kind {
+        "Json" => "json",
+        "Text" => "plaintext",
+        _ => panic!("unsupported response kind"),
+    };
+    let source = format!(
+        r#"
+opaque type Json = String
+opaque type Text = String
+fn endpoint() -> {kind} ! {{Web}} {{ perform Web.{op}({payload}) }}
+fn web_main() {{ perform Web.route("GET", "{path}", endpoint) }}
+"#
+    );
+    let (module, handler_func_idx) = compile_handler(&source, "endpoint");
+    let ast = Parser::new(Lexer::new(&source).lex().unwrap())
+        .parse_module()
+        .unwrap();
+    let contracts = compile_module_contracts(&ast);
+    assert!(
+        contracts.diagnostics.is_empty(),
+        "{:?}",
+        contracts.diagnostics
+    );
+    assert_eq!(
+        contracts.routes[0].response_type.as_deref(),
+        Some(kind),
+        "compiler response type: {:?}",
+        contracts.routes[0]
+    );
+    let plan = compile_runtime_route_plan(&contracts.routes[0]).unwrap();
+    assert_ne!(
+        plan.response_kind,
+        nulang::web::response::ResponseKind::Html
+    );
+    RuntimeWebRoute {
+        route: WebRoute {
+            method: HttpMethod::Get,
+            path: path.into(),
+            handler_module: module,
+            handler_func_idx,
+        },
+        plan: Some(plan),
+    }
+}
+
+#[test]
+fn explicit_json_response_has_json_media_type_without_html_injection() {
+    let route = explicit_response_route("Json", r#""{\"ok\":true}""#, "/json");
+    let server = WebDevServer::bind_runtime(0, None, None, vec![route]).unwrap();
+    let response = send_raw_request(
+        server.port,
+        "GET /json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(response.contains("Content-Type: application/json; charset=utf-8\r\n"));
+    assert_eq!(response_body(&response), r#"{"ok":true}"#);
+}
+
+#[test]
+fn explicit_plaintext_response_preserves_markup_without_script_injection() {
+    let route = explicit_response_route("Text", r#""<p>hello</p>""#, "/text");
+    let server = WebDevServer::bind_runtime(0, None, None, vec![route]).unwrap();
+    let response = send_raw_request(
+        server.port,
+        "GET /text HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(response.contains("Content-Type: text/plain; charset=utf-8\r\n"));
+    assert_eq!(response_body(&response), "<p>hello</p>");
+}
+
+#[test]
+fn invalid_json_response_fails_closed_without_leaking_payload() {
+    let route = explicit_response_route("Json", r#""not valid JSON""#, "/invalid-json");
+    let server = WebDevServer::bind_runtime(0, None, None, vec![route]).unwrap();
+    let response = send_raw_request(
+        server.port,
+        "GET /invalid-json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+        "{response}"
+    );
+    assert_eq!(response_body(&response), "Internal server error");
+}
+
+#[test]
+fn imported_nominal_json_response_compiles_and_serves_json() {
+    // This test exercises the direct compiler/VM seam. Module-function imports
+    // are linked by the package pipeline, not by TypeChecker::check_module.
+    let source = r#"
+import stdlib::web::types
+fn endpoint() -> Json ! {Web} {
+    perform Web.json("{\"ok\":true}")
+}
+fn web_main() { perform Web.route("GET", "/health", endpoint) }
+"#;
+    let (module, handler_func_idx) = compile_handler(source, "endpoint");
+    let ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_module()
+        .unwrap();
+    let contracts = compile_module_contracts(&ast);
+    assert!(
+        contracts.diagnostics.is_empty(),
+        "{:?}",
+        contracts.diagnostics
+    );
+    assert_eq!(contracts.routes[0].response_type.as_deref(), Some("Json"));
+    let route = RuntimeWebRoute {
+        route: WebRoute {
+            method: HttpMethod::Get,
+            path: "/health".into(),
+            handler_module: module,
+            handler_func_idx,
+        },
+        plan: Some(compile_runtime_route_plan(&contracts.routes[0]).unwrap()),
+    };
+    let server = WebDevServer::bind_runtime(0, None, None, vec![route]).unwrap();
+    let response = send_raw_request(
+        server.port,
+        "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(response.contains("Content-Type: application/json; charset=utf-8\r\n"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(response_body(&response)).unwrap()["ok"],
+        true
+    );
+}

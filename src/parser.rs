@@ -5712,7 +5712,11 @@ impl Parser {
             self.pos += 1; // also skip 'type' after 'opaque'
         }
         self.skip_newlines();
-        let decl_result = if self.peek_kind() == &TokenKind::Alias {
+        // `opaque type Name = T` is an alias even without the explicit
+        // `alias` keyword. Re-parsing it as a regular type declaration would
+        // erase its nominal identity and leak the underlying type into
+        // function signatures, contracts, and type checking.
+        let decl_result = if is_opaque || self.peek_kind() == &TokenKind::Alias {
             self.parse_type_alias(false, is_opaque)
         } else {
             self.parse_type_decl_variant_or_record(false, vec![])
@@ -7035,6 +7039,34 @@ mod tests {
                 assert_eq!(body, &Type::Primitive(PrimitiveType::Int));
             }
             _ => panic!("Expected type alias declaration"),
+        }
+    }
+
+    #[test]
+    fn opaque_alias_in_function_result_keeps_nominal_identity() {
+        let ast = parse("opaque type Json = String\nfn endpoint() -> Json { nil }").unwrap();
+        match &ast.decls[1] {
+            Decl::Function { ret_type, .. } => {
+                assert!(
+                    matches!(ret_type, Some(Type::Nominal { name, .. }) if name == "Json"),
+                    "opaque result unexpectedly erased: {ret_type:?}"
+                );
+            }
+            _ => panic!("expected function declaration"),
+        }
+    }
+
+    #[test]
+    fn imported_opaque_response_type_remains_nominal() {
+        let ast = parse("import stdlib::web::types\nfn endpoint() -> Json { nil }").unwrap();
+        match &ast.decls[1] {
+            Decl::Function { ret_type, .. } => {
+                assert!(
+                    matches!(ret_type, Some(Type::Nominal { name, .. }) if name == "Json"),
+                    "imported response type unexpectedly erased: {ret_type:?}"
+                );
+            }
+            _ => panic!("expected function declaration"),
         }
     }
 

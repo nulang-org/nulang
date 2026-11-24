@@ -416,6 +416,10 @@ pub(crate) fn perform_web_builtin(
             let s = resolve(constants, *regs.first()?);
             Some(callbacks.alloc_string(&s))
         }
+        Some("json") | Some("plaintext") => {
+            let body = resolve(constants, *regs.first()?);
+            Some(callbacks.alloc_string(&body))
+        }
         Some("route") => Some(crate::vm::Value::unit()),
         Some("redirect") => {
             let url = resolve(constants, *regs.first()?);

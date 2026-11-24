@@ -23,3 +23,9 @@ opaque type CssClass = String
 
 /// A path parameter captured from a route.
 opaque type RouteParam = String
+
+/// JSON HTTP response body. Construct through `stdlib::web::response.json`.
+opaque type Json = String
+
+/// Plain-text HTTP response body. Construct through `stdlib::web::response.plaintext`.
+opaque type Text = String

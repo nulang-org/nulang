@@ -100,7 +100,32 @@ app "hello" {
 }
 ```
 
-An `app` block desugars into `perform Web.route(method, path, handler)` calls plus a `serve_static` fallback — `route "GET" "/path" -> handler` is exactly `perform Web.route("GET", "/path", handler)`. Handlers are `fn() -> Html` (for POST routes, the handler reads the request via the request-access operations below and still returns `Html`).
+An `app` block desugars into `perform Web.route(method, path, handler)` calls plus a `serve_static` fallback — `route "GET" "/path" -> handler` is exactly `perform Web.route("GET", "/path", handler)`. HTML handlers use `fn() -> Html`. Experimental explicit `Json` and `Text` handler results also select matching HTTP media types.
+
+### Explicit JSON and plain-text responses
+
+The `stdlib::web::types` module declares nominal `Json` and `Text` result types. The `stdlib::web::response` helpers construct them from `JsonValue` and `String` respectively. The compiler carries the handler result type into the runtime route plan and OpenAPI. JSON is validated as a complete document before sending. Plain text is sent unescaped; neither format receives the HTML client-runtime script. Other or untyped handler results retain the HTML-oriented compatibility path.
+
+```nulang
+import stdlib::web::types
+import stdlib::web::response
+import stdlib::json
+
+fn health() -> Json {
+    json(JsonObject([("ok", JsonBool(true))]))
+}
+
+fn robots() -> Text {
+    plaintext("User-agent: *\nDisallow: /private")
+}
+
+app "api" {
+    route "GET" "/health" -> health
+    route "GET" "/robots.txt" -> robots
+}
+```
+
+This is an experimental, status-200 result surface. Generic typed JSON results (`Json[T]`), custom status codes, streaming, and content negotiation are not yet implemented.
 
 ### Building HTML
 
