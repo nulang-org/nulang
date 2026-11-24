@@ -101,10 +101,8 @@ are:
 | `StrBuilder` | `new`, `push`, `to_string`, `len`, `reset` | Efficient string building |
 | `FS` | `read`, `write`, `append`, `exists` | File-system access |
 | `Env` | `get` | Environment variables |
-| `Process` | `run` | Trusted/standalone shell command execution |
+| `Process` | `run`, `exec` | Trusted standalone shell/direct-process execution |
 | `Debug` | `inspect` | Labeled value inspection |
-
-> `Process.run` is intentionally not dispatched by actor-backed production runtimes. The standalone VM implementation uses `/bin/sh -c`, which inherits host OS authority and is therefore unsuitable for untrusted actor execution until a separate isolated process sandbox with explicit resource and filesystem/network policy exists.
 | `Test` | `assert`, `assert_eq`, `assert_true` | Test assertions |
 | `Random` | `int` | Random numbers |
 | `Time` | `now` | Wall-clock time |
@@ -118,6 +116,35 @@ are:
 | `Web` | `html`, `text`, `route`, `param`, `header`, `cookie`, … | Web framework primitives |
 | `Python` | `import`, `call`, `get_attr` | Python interop (PyO3) |
 | `System` | `arg` | Command-line arguments |
+
+### Standalone process execution
+
+To run a trusted script using process effects, explicitly grant the OS
+capability with `nulang --with os script.nula`.
+
+`Process.exec` passes a program and argv array directly to the operating system,
+without implicit `sh -c` interpretation. Unlike `Process.run`, it provides
+the process exit code, stdout and stderr separately:
+
+```nulang
+let result = perform Process.exec("printf", ["%s", "hello world"], 1000, 4096)
+perform IO.print(result.1)
+```
+
+The four arguments are `(program, args, timeout_ms, max_output_bytes)`.
+Timeouts must be 1–60,000 milliseconds; output limits must be 1–16,777,216
+bytes **combined** for stdout and stderr. The result is a
+`(Int, String, String)` tuple: `(exit_code, stdout, stderr)`. Exit codes are
+`-1` when the OS reports termination without an exit code. Invalid arguments,
+launch failures, timeouts, and exceeded limits currently return `nil`.
+Output is lossy UTF-8 text, not an arbitrary binary stream.
+
+This is a **trusted standalone host API**, **not** a sandbox. On Unix,
+timeouts and output violations terminate the child process group. It is
+unavailable in actor-backed production runtimes until process sandboxing,
+resource admission, and external-authority enforcement are implemented.
+External commands are not replay-safe durable workflow operations by default.
+
 | `Realtime` | `broadcast` | Realtime channel broadcast |
 
 `perform LLM.ask(prompt)` remains accepted as a legacy alias for

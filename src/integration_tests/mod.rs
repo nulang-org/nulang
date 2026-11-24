@@ -238,6 +238,37 @@ mod tests {
     // Tests
     // -----------------------------------------------------------------------
 
+    #[cfg(unix)]
+    #[test]
+    fn test_process_exec_typed_argv_and_status_end_to_end() {
+        assert_int(
+            r#"let out = perform Process.exec("printf", ["%s", "literal; $(echo not-run)"], 1000, 4096) in
+               if out.1 == "literal; $(echo not-run)" then out.0 else 99"#,
+            0,
+        );
+        assert_int(
+            r#"let out = perform Process.exec("sh", ["-c", "printf error >&2; exit 7"], 1000, 4096) in
+               if out.2 == "error" then out.0 else 99"#,
+            7,
+        );
+        assert_int(
+            r#"let out = perform Process.exec("true", [], 1000, 4096) in out.0"#,
+            0,
+        );
+        assert_bool(
+            r#"perform Process.exec("sh", ["-c", "exec sleep 1"], 30, 4096) == nil"#,
+            true,
+        );
+        assert_bool(
+            r#"perform Process.exec("sh", ["-c", "yes x"], 1000, 128) == nil"#,
+            true,
+        );
+        assert_bool(
+            r#"perform Process.exec("nulang-command-not-found-18642", [], 1000, 4096) == nil"#,
+            true,
+        );
+    }
+
     #[test]
     fn test_literal_int() {
         assert_int("42", 42);

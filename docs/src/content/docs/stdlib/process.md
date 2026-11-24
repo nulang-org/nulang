@@ -16,6 +16,7 @@ The `Process` effect provides the following built-in operations, wired into the 
 
 | Operation | Signature | Description |
 |-----------|-----------|-------------|
-| `Process.run` | `run(cmd: String) -> String` | Execute a shell command via /bin/sh -c and return its stdout; returns nil on error or non-zero exit. |
+| `Process.run` | `run(cmd: String) -> String` | Trusted/standalone host primitive: execute a shell command via /bin/sh -c and return stdout; actor-backed runtimes do not dispatch it until an isolated process sandbox exists. |
+| `Process.exec` | `exec(program: String, args: [String], timeout_ms: Int, max_output_bytes: Int) -> (Int, String, String)` | Trusted standalone-only direct argv execution (no implicit shell). Returns (exit_code, stdout, stderr), or nil for launch errors, timeouts, output-limit violations, or invalid arguments. UTF-8 output is lossily decoded. Bounds: timeout 1..60000ms, combined output 1..16777216 bytes. Actor-backed hosts fail closed. |
 
 _Implementation site: Standalone VM_
