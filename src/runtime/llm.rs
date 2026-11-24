@@ -42,7 +42,7 @@ pub struct LlmState {
 
     /// Channel to dispatch work to the persistent LLM worker thread.
     /// `None` after the runtime is dropped (sender half is owned by the
-    /// worker thread, which outlives the runtime).
+    /// worker thread; dropping the sender closes the worker's receive loop).
     pub(crate) request_tx: Option<crossbeam::channel::Sender<LlmWorkItem>>,
 }
 
@@ -55,7 +55,9 @@ impl LlmState {
     pub fn new() -> Self {
         let (llm_tx, llm_rx) = std::sync::mpsc::channel();
         let llm_tx_worker = llm_tx.clone();
-        let (llm_request_tx, llm_request_rx) = crossbeam::channel::unbounded::<LlmWorkItem>();
+        // One slow external provider must not accumulate unlimited work in memory.
+        // Keep worker admission non-blocking so the actor scheduler stays responsive.
+        let (llm_request_tx, llm_request_rx) = crossbeam::channel::bounded::<LlmWorkItem>(64);
 
         // Spawn a persistent LLM worker thread.
         let _worker = std::thread::Builder::new()
@@ -368,17 +370,25 @@ pub(crate) fn dispatch_llm_request(
     let Some(tx) = rt.llm.request_tx.as_ref() else {
         return false;
     };
+    // Only accepted work is counted as in-flight. The worker queue may be
+    // full, or the receiver may have exited: neither case may block this
+    // scheduler thread or consume another actor's in-flight accounting.
+    if tx
+        .try_send(LlmWorkItem {
+            actor_id,
+            request,
+            client,
+        })
+        .is_err()
+    {
+        return false;
+    }
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.llm_inflight = true;
         actor.llm_pending_prompt = Some(prompt.to_string());
     }
     rt.llm.inflight_count += 1;
-    tx.send(LlmWorkItem {
-        actor_id,
-        request,
-        client,
-    })
-    .is_ok()
+    true
 }
 
 /// Prune an agent's episodic memory to fit within `max_tokens`, using a
@@ -523,4 +533,63 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
     // up while the behavior was suspended, schedule the actor to drain
     // them — step_actor leaves mail untouched while a suspension is live.
     rt.requeue_if_mail_pending(actor_id);
+}
+
+#[cfg(test)]
+mod bounded_queue_tests {
+    use super::*;
+    use nulang_ai::MockLlmClient;
+
+    #[test]
+    fn llm_request_queue_is_bounded_by_default() {
+        let state = LlmState::new();
+        assert_eq!(
+            state.request_tx.as_ref().unwrap().capacity(),
+            Some(64),
+            "a stalled external provider must not create an unlimited work backlog"
+        );
+    }
+
+    #[test]
+    fn disconnected_worker_does_not_increment_inflight_accounting() {
+        let mut runtime = Runtime::new();
+        runtime.llm.client = Some(Arc::new(MockLlmClient::text("ok")));
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        drop(rx);
+        runtime.llm.request_tx = Some(tx);
+
+        assert!(!dispatch_llm_request(
+            &mut runtime,
+            100,
+            LlmRequest::default(),
+            "hello"
+        ));
+        assert_eq!(runtime.llm.inflight_count, 0);
+    }
+
+    #[test]
+    fn full_worker_queue_rejects_without_blocking_or_counting_rejected_work() {
+        let mut runtime = Runtime::new();
+        runtime.llm.client = Some(Arc::new(MockLlmClient::text("ok")));
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        runtime.llm.request_tx = Some(tx);
+
+        assert!(dispatch_llm_request(
+            &mut runtime,
+            100,
+            LlmRequest::default(),
+            "accepted"
+        ));
+        assert_eq!(runtime.llm.inflight_count, 1);
+        assert_eq!(rx.len(), 1);
+
+        assert!(!dispatch_llm_request(
+            &mut runtime,
+            101,
+            LlmRequest::default(),
+            "backpressured"
+        ));
+        assert_eq!(runtime.llm.inflight_count, 1);
+        assert_eq!(rx.len(), 1);
+    }
 }
