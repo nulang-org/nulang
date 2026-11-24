@@ -10,6 +10,17 @@ use crate::value_layout;
 
 pub type Value = u64;
 
+/// Match the reference VM's integer fallback on untrusted bytecode.
+/// Legacy nil remains zero, but other tags must never be interpreted as
+/// signed integer payloads.
+fn checked_numeric_operand(raw: Value, opcode: &str) -> Result<i64, String> {
+    if value_layout::is_int_raw(raw) || raw == value_layout::TAG_NIL {
+        Ok(value_layout::as_int_raw(raw))
+    } else {
+        Err(format!("{opcode} requires numeric operands"))
+    }
+}
+
 /// Flag bit in a `TAG_CLOSURE` payload marking an env-carrying closure (the
 /// payload then indexes `closure_envs` rather than being the function index).
 /// Mirrors `CLOSURE_ENV_FLAG` in `src/vm.rs`.
@@ -263,20 +274,20 @@ impl CoreVM {
             }
 
             OpCode::IAdd => {
-                let a = value_layout::as_int_raw(self.frames[frame_idx].regs[op1 as usize]);
-                let b = value_layout::as_int_raw(self.frames[frame_idx].regs[op2 as usize]);
+                let a = checked_numeric_operand(self.frames[frame_idx].regs[op1 as usize], "IAdd")?;
+                let b = checked_numeric_operand(self.frames[frame_idx].regs[op2 as usize], "IAdd")?;
                 self.frames[frame_idx].regs[op3 as usize] =
                     value_layout::tag_int(a.wrapping_add(b));
             }
             OpCode::ISub => {
-                let a = value_layout::as_int_raw(self.frames[frame_idx].regs[op1 as usize]);
-                let b = value_layout::as_int_raw(self.frames[frame_idx].regs[op2 as usize]);
+                let a = checked_numeric_operand(self.frames[frame_idx].regs[op1 as usize], "ISub")?;
+                let b = checked_numeric_operand(self.frames[frame_idx].regs[op2 as usize], "ISub")?;
                 self.frames[frame_idx].regs[op3 as usize] =
                     value_layout::tag_int(a.wrapping_sub(b));
             }
             OpCode::IMul => {
-                let a = value_layout::as_int_raw(self.frames[frame_idx].regs[op1 as usize]);
-                let b = value_layout::as_int_raw(self.frames[frame_idx].regs[op2 as usize]);
+                let a = checked_numeric_operand(self.frames[frame_idx].regs[op1 as usize], "IMul")?;
+                let b = checked_numeric_operand(self.frames[frame_idx].regs[op2 as usize], "IMul")?;
                 self.frames[frame_idx].regs[op3 as usize] =
                     value_layout::tag_int(a.wrapping_mul(b));
             }
@@ -719,6 +730,96 @@ mod tests {
         assert_int("10 / 3", 3);
         assert_int("10 % 3", 1);
         assert_int("-5", -5);
+    }
+
+    #[test]
+    fn test_core_arithmetic_rejects_invalid_tagged_operands() {
+        for op in [OpCode::IAdd, OpCode::ISub, OpCode::IMul] {
+            for invalid_left in [true, false] {
+                let mut module = CodeModule::new("invalid_integer_arithmetic");
+                let bool_idx = module.add_constant(Constant::Bool(true));
+                let int_idx = module.add_constant(Constant::Int(3));
+                let (left, right) = if invalid_left {
+                    (bool_idx, int_idx)
+                } else {
+                    (int_idx, bool_idx)
+                };
+                module.emit(Instruction::new3(
+                    OpCode::ConstU,
+                    ((left >> 8) & 0xff) as u8,
+                    (left & 0xff) as u8,
+                    0,
+                ));
+                module.emit(Instruction::new3(
+                    OpCode::ConstU,
+                    ((right >> 8) & 0xff) as u8,
+                    (right & 0xff) as u8,
+                    1,
+                ));
+                module.emit(Instruction::new3(op, 0, 1, 2));
+                module.emit(Instruction::new0(OpCode::Halt));
+                module.entry_point = Some(0);
+
+                let mut vm = CoreVM::new();
+                let idx = vm.load_module_from_code(&module).unwrap();
+                let err = vm
+                    .run(idx, 0)
+                    .expect_err("invalid arithmetic must fail closed");
+                assert!(
+                    err.contains("requires numeric operands"),
+                    "{op:?} invalid_left={invalid_left}: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_core_arithmetic_preserves_nil_zero_compatibility() {
+        for (op, left_expected, right_expected) in [
+            (OpCode::IAdd, 3, 3),
+            (OpCode::ISub, -3, 3),
+            (OpCode::IMul, 0, 0),
+        ] {
+            for nil_left in [true, false] {
+                let mut module = CodeModule::new("nil_arithmetic_compatibility");
+                let nil_idx = module.add_constant(Constant::Nil);
+                let int_idx = module.add_constant(Constant::Int(3));
+                let (left, right) = if nil_left {
+                    (nil_idx, int_idx)
+                } else {
+                    (int_idx, nil_idx)
+                };
+                module.emit(Instruction::new3(
+                    OpCode::ConstU,
+                    ((left >> 8) & 0xff) as u8,
+                    (left & 0xff) as u8,
+                    0,
+                ));
+                module.emit(Instruction::new3(
+                    OpCode::ConstU,
+                    ((right >> 8) & 0xff) as u8,
+                    (right & 0xff) as u8,
+                    1,
+                ));
+                module.emit(Instruction::new3(op, 0, 1, 0));
+                module.emit(Instruction::new0(OpCode::Halt));
+                module.entry_point = Some(0);
+
+                let mut vm = CoreVM::new();
+                let idx = vm.load_module_from_code(&module).unwrap();
+                let result = vm.run(idx, 0).expect("nil remains numeric zero");
+                let expected = if nil_left {
+                    left_expected
+                } else {
+                    right_expected
+                };
+                assert_eq!(
+                    result,
+                    value_layout::tag_int(expected),
+                    "{op:?} nil_left={nil_left}"
+                );
+            }
+        }
     }
 
     #[test]
