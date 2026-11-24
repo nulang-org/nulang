@@ -1,4 +1,9 @@
 # Nulang Changelog
+### October 30 RustSec dependency patch set (candidate) — 2026-10-30
+- **Patched lockfile dependencies without suppressing advisories:** Wasmtime 48.0.8 (with matching Cranelift and component-runtime crates), ctutils 0.4.4, libz-sys 1.1.31, rustls-webpki 0.103.16 and webpki-roots 1.0.10. Keep Nulang's direct Wasmtime lower bound at the patched version.
+- **Residual upstream blocker:** libsql 0.10.0-pre.4 still pulls hyper-rustls 0.25 / rustls 0.22 / rustls-webpki 0.102.8, which is exposed to a newer WebPKI trust-chain advisory. Do not claim clean cargo-audit or remote Turso TLS safety until that dependency chain is remediated and verified; the existing audit exceptions remain unchanged.
+- Native/default, minimal-feature, WASM-feature, TLS integration and exact-head hosted security checks remain promotion gates; do not relax audit enforcement to merge unrelated language changes.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
