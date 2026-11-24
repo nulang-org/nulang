@@ -71,6 +71,12 @@ const WORKLOADS: &[Workload] = &[
         name: "call_loop",
         source: "fn add(x: Int, y: Int) -> Int { x + y }; var sum = 0; var i = 0; while i < 50000 { sum = add(sum, i); i = i + 1; }; sum",
     },
+    // Measures nested native-leaf dispatch and compares the identical source
+    // against bytecode interpretation and the cold JIT tier-up path.
+    Workload {
+        name: "call_chain_loop",
+        source: "fn increment(x: Int) -> Int { x + 1 }; fn twice(x: Int) -> Int { increment(increment(x)) }; fn thrice(x: Int) -> Int { twice(increment(x)) }; var sum = 0; var i = 0; while i < 50000 { sum = thrice(sum); i = i + 1; }; sum",
+    },
     Workload {
         name: "branch_loop",
         source: "var sum = 0; var i = 0; while i < 100000 { if i < 50000 then { sum = sum + i } else { sum = sum - 1 }; i = i + 1; }; sum",
