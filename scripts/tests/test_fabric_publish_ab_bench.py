@@ -24,6 +24,17 @@ class FixtureContractTests(unittest.TestCase):
         base, candidate = fixture_sources()
         self.assertEqual(candidate, mod.matched_fixture(base, candidate))
 
+    def test_existing_identical_fixture_is_valid_without_overlay(self):
+        _, with_fixture = fixture_sources()
+        self.assertEqual(with_fixture, mod.matched_fixture(with_fixture, with_fixture))
+
+    def test_existing_fixture_rejects_unrelated_candidate_changes(self):
+        _, with_fixture = fixture_sources()
+        with self.assertRaisesRegex(RuntimeError, "differ beyond"):
+            mod.matched_fixture(
+                with_fixture, with_fixture.replace("fn other()", "fn changed()")
+            )
+
     def test_unrelated_benchmark_edit_fails_closed(self):
         base, candidate = fixture_sources()
         with self.assertRaisesRegex(RuntimeError, "differ beyond"):

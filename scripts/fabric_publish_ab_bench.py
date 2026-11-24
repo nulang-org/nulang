@@ -36,6 +36,12 @@ def matched_fixture(base: str, candidate: str) -> str:
     """Reject any benchmark differences other than this one measured fixture."""
     if candidate.count(START) != 1 or candidate.count(CANDIDATE_GROUP_TAIL) != 1:
         raise RuntimeError("expected exactly one Fabric benchmark fixture and group entry")
+    # The fixture may already exist in the exact base. In that case, retain
+    # identical benchmark source instead of attempting a second overlay.
+    # Reject differing benchmark bodies; the paired run must use the same
+    # fixture in both revisions.
+    if base == candidate:
+        return candidate
     begin = candidate.index(START)
     end = candidate.find(GROUP, begin)
     if end < 0:
