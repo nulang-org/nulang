@@ -246,6 +246,30 @@ fn validate_default_wasm_semantics(module: &MirModule) -> NuResult<()> {
             }
 
             for stmt in &block.stmts {
+                // A non-exhaustive match lowers to a reserved, unhandled
+                // effect. WASM host dispatch currently maps absent results
+                // to nil, losing the interpreter's EffectError. Until WASM
+                // has typed error propagation, reject this program instead
+                // of silently changing its observable language semantics.
+                if matches!(
+                    stmt,
+                    crate::mir::Stmt::Assign {
+                        op: crate::mir::RValue::Perform {
+                            effect,
+                            op,
+                            resolved_handler: None,
+                            ..
+                        },
+                        ..
+                    } if effect == "non-exhaustive match" && op == "raise"
+                ) {
+                    return Err(crate::types::NuError::VMError {
+                        msg: "WASM backend restricted profile: non-exhaustive match requires unhandled-effect error propagation; use the bytecode backend"
+                            .into(),
+                        span: crate::types::Span::default(),
+                    });
+                }
+
                 let unsupported = matches!(
                     stmt,
                     crate::mir::Stmt::EnterHandle { .. } | crate::mir::Stmt::PopHandler

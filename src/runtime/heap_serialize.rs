@@ -451,7 +451,8 @@ fn write_objects(buf: &mut Vec<u8>, ctx: &SerializeCtx) {
 ///
 /// TAG_PTR → low 48 bits = object ID.
 /// TAG_STRING → low 48 bits = string table index.
-/// All other tags pass through unchanged.
+/// Foreign native pointers are process-local and become nil.
+/// All remaining portable tags pass through unchanged.
 fn serialize_one_value(value: Value, ctx: &SerializeCtx) -> u64 {
     let raw = value.as_raw();
     let tag = raw & TAG_MASK;
@@ -463,6 +464,11 @@ fn serialize_one_value(value: Value, ctx: &SerializeCtx) -> u64 {
             }
         }
         // Unreachable pointer — serialize as nil.
+        return value_layout::TAG_NIL;
+    }
+
+    if tag == value_layout::TAG_FOREIGN_PTR {
+        // Native addresses have no valid meaning across durable restarts.
         return value_layout::TAG_NIL;
     }
 
@@ -745,9 +751,10 @@ fn deserialize_one_value(
         return Value::nil();
     }
 
-    // All other tags pass through unchanged.
-    // SAFETY: TAG_PTR and TAG_STRING were validated/remapped above; this path contains only immediate/non-pointer tags.
-    unsafe { Value::from_raw(raw) }
+    // Never reconstitute a native address from a snapshot, including crafted
+    // legacy snapshots. The untrusted decoder rejects both pointer tags;
+    // TAG_PTR and TAG_STRING were already remapped above.
+    Value::try_from_untrusted_bits(raw).unwrap_or_else(|_| Value::nil())
 }
 
 fn read_closures(
@@ -951,6 +958,35 @@ impl TypeTag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreign_pointer_never_roundtrips_through_durable_continuations() {
+        let mut address = 9u64;
+        let native = Value::foreign_ptr((&mut address as *mut u64).cast());
+        let ctx = SerializeCtx {
+            obj_ids: HashMap::new(),
+            string_table: Vec::new(),
+            string_ids: HashMap::new(),
+            string_value_to_idx: HashMap::new(),
+            objects: Vec::new(),
+            closures: Vec::new(),
+            frames: Vec::new(),
+            handlers: Vec::new(),
+        };
+        // Persisted bytes must never retain process-local host addresses.
+        assert_eq!(serialize_one_value(native, &ctx), Value::nil().as_raw());
+        // Even a crafted/legacy continuation cannot rehydrate a host pointer.
+        let mut vm = VM::new();
+        let recovered = deserialize_one_value(native.as_raw(), &[], &HashMap::new(), &mut vm);
+        assert!(
+            recovered.is_nil(),
+            "foreign pointer must not survive restore"
+        );
+        assert_eq!(
+            serialize_one_value(Value::int(42), &ctx),
+            Value::int(42).as_raw()
+        );
+    }
 
     #[test]
     fn test_format_constants() {

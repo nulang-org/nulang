@@ -65,6 +65,9 @@ struct HostState {
     /// tests to verify the compiler's marshaling. Cleared by
     /// [`WasmRuntime::take_last_dispatch`].
     last_dispatch: std::sync::Arc<parking_lot::Mutex<Option<(Vec<u8>, Vec<u8>)>>>,
+    /// Native callbacks explicitly granted to this particular WASM runtime.
+    /// A global native registration is not an authorization for every guest.
+    ffi_grants: std::collections::HashMap<String, crate::ffi::native::NativeFunction>,
 }
 
 impl Default for HostState {
@@ -75,6 +78,7 @@ impl Default for HostState {
             input: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
             dispatch_result: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             last_dispatch: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            ffi_grants: std::collections::HashMap::new(),
         }
     }
 }
@@ -234,6 +238,41 @@ impl WasmRuntime {
     /// clearing it. Returns `None` if dispatch was never called.
     pub fn take_last_dispatch(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
         self.store.data().last_dispatch.clone().lock().take()
+    }
+
+    /// Explicitly allow this guest to call one already registered host callback.
+    /// New runtimes grant **nothing**, even if other runtimes or the native VM
+    /// have registered the same name process-wide. The callback and its ABI
+    /// are snapshotted into this runtime, so later global registry updates do
+    /// not silently change its authority. Library-scoped registrations are
+    /// never eligible, and this method never loads a dynamic library.
+    ///
+    /// Only the trusted embedding host should call this method; a WASM guest
+    /// cannot grant itself capabilities. The host must ensure the underlying
+    /// native function remains valid for the lifetime of this grant.
+    pub fn grant_registered_ffi_callback(&mut self, symbol: &str) -> NuResult<()> {
+        let registry = crate::ffi::native::FFI_REGISTRY
+            .get_or_init(|| std::sync::Mutex::new(crate::ffi::native::FfiRegistry::new()));
+        let reg = registry.lock().map_err(|_| {
+            NuError::runtime_error("ffi registry lock".to_string(), Span::default())
+        })?;
+        let func = reg.resolve(None, symbol).ok_or_else(|| {
+            NuError::runtime_error(
+                format!("WASM FFI callback is not explicitly registered: {symbol}"),
+                Span::default(),
+            )
+        })?;
+        self.store
+            .data_mut()
+            .ffi_grants
+            .insert(symbol.to_owned(), func);
+        Ok(())
+    }
+
+    /// Revoke a grant for this guest without affecting other guests or the
+    /// process-wide native registry. Returns whether the grant existed.
+    pub fn revoke_ffi_callback(&mut self, symbol: &str) -> bool {
+        self.store.data_mut().ffi_grants.remove(symbol).is_some()
     }
 
     pub fn run(&mut self) -> NuResult<crate::vm::Value> {
@@ -615,22 +654,38 @@ fn host_fneg(_caller: Caller<'_, HostState>, a: i64) -> Result<i64, Error> {
     }
 }
 
-/// Read a TAG_STRING value's null-terminated bytes from WASM linear memory.
-fn read_wasm_string(mut caller: &mut Caller<'_, HostState>, v: i64) -> String {
-    let v = v as u64;
-    if (v & value_layout::TAG_MASK) != value_layout::TAG_STRING {
-        return String::new();
+/// Bound every guest-controlled FFI string *before* allocating host memory.
+/// The previous implementation duplicated the entire guest linear memory on
+/// every FFI call, including for denied symbols, enabling memory amplification
+/// as tenants grew their WASM memory. No guest pointer is ever dereferenced as
+/// a native address: offsets refer strictly to this instance's linear memory.
+const MAX_WASM_FFI_SYMBOL_BYTES: usize = 256;
+const MAX_WASM_FFI_CSTR_BYTES: usize = 1024 * 1024;
+
+fn read_wasm_ffi_string(
+    caller: &mut Caller<'_, HostState>,
+    v: i64,
+    max_bytes: usize,
+    kind: &str,
+) -> Result<String, Error> {
+    let raw = v as u64;
+    if (raw & value_layout::TAG_MASK) != value_layout::TAG_STRING {
+        return Err(Error::msg(format!("WASM FFI {kind} must be a string")));
     }
-    let off = (v & value_layout::PAYLOAD_MASK) as usize;
-    let data = match get_memory(&mut caller) {
-        Ok(m) => m.data(&caller).to_vec(),
-        Err(_) => return String::new(),
-    };
-    let bytes: Vec<u8> = data
-        .get(off..)
-        .map(|s| s.iter().take_while(|&&c| c != 0).copied().collect())
-        .unwrap_or_default();
-    String::from_utf8_lossy(&bytes).into_owned()
+    let offset = (raw & value_layout::PAYLOAD_MASK) as usize;
+    let memory = get_memory(caller)?;
+    let data = memory.data(&*caller);
+    let tail = data
+        .get(offset..)
+        .ok_or_else(|| Error::msg(format!("WASM FFI {kind} offset out of bounds")))?;
+    let terminator = tail
+        .iter()
+        .take(max_bytes + 1)
+        .position(|&byte| byte == 0)
+        .ok_or_else(|| Error::msg(format!("WASM FFI {kind} exceeds maximum length")))?;
+    let text = std::str::from_utf8(&tail[..terminator])
+        .map_err(|_| Error::msg(format!("WASM FFI {kind} must be valid UTF-8")))?;
+    Ok(text.to_owned())
 }
 
 /// `env.ffi_call_N(lib, sym, sig, arg0..argN-1) -> i64`
@@ -641,13 +696,14 @@ fn read_wasm_string(mut caller: &mut Caller<'_, HostState>, v: i64) -> String {
 /// CStr params are read from WASM memory. Reuses the AOT FFI registry + marshalling.
 fn host_ffi_call_impl(
     mut caller: &mut Caller<'_, HostState>,
-    lib: i64,
+    _lib: i64,
     sym: i64,
     sig: i64,
     args: &[i64],
 ) -> Result<i64, Error> {
-    let lib_s = read_wasm_string(&mut caller, lib);
-    let sym_s = read_wasm_string(&mut caller, sym);
+    // The guest library name is intentionally ignored. WASM may only call
+    // explicitly registered host symbols, never choose a native library.
+    let sym_s = read_wasm_ffi_string(&mut caller, sym, MAX_WASM_FFI_SYMBOL_BYTES, "symbol")?;
     let sig = sig as u64;
     let ret_tag = sig & 0b111;
     let mut params: Vec<crate::ffi::marshal::CType> = Vec::with_capacity(args.len());
@@ -656,16 +712,35 @@ fn host_ffi_call_impl(
         params.push(crate::jit::runtime::aot_ctype_from_tag(tag));
     }
     let ret = crate::jit::runtime::aot_ctype_from_tag(ret_tag);
+    // Never return a native process address to linear-memory-only WASM.
+    // VoidPtr and CStr both carry host pointers. Reject *before* resolving
+    // or invoking a native symbol (also avoids leaking temporary CStr copies).
+    if matches!(
+        ret,
+        crate::ffi::marshal::CType::VoidPtr | crate::ffi::marshal::CType::CStr
+    ) {
+        return Err(Error::msg(
+            "WASM cannot return native pointers (VoidPtr/CStr)",
+        ));
+    }
     let signature = crate::ffi::marshal::Signature::new(params.clone(), ret);
-    let func = {
-        let registry = crate::ffi::native::FFI_REGISTRY
-            .get_or_init(|| std::sync::Mutex::new(crate::ffi::native::FfiRegistry::new()));
-        let mut reg = registry
-            .lock()
-            .map_err(|_| Error::msg("ffi registry lock"))?;
-        unsafe { reg.resolve_or_load(&lib_s, &sym_s, signature) }
-            .map_err(|_| Error::msg("ffi resolve"))?
-    };
+    // The host must explicitly grant the callback *to this guest*. Merely
+    // registering it globally for another runtime or the native interpreter
+    // confers no WASM authority. No guest-controlled dlopen/dlsym occurs here.
+    let func = caller
+        .data()
+        .ffi_grants
+        .get(&sym_s)
+        .cloned()
+        .ok_or_else(|| Error::msg("WASM FFI callback not granted for runtime"))?;
+    // Pre-registered callbacks carry their own authoritative signature.
+    // The guest's declaration is untrusted: call_native uses func.signature,
+    // not the packed guest signature checked above. A mismatch could make a
+    // guest-requested scalar return execute a native VoidPtr-return function,
+    // leaking a process-local host address through the WASM i64 result.
+    if func.signature != signature {
+        return Err(Error::msg("WASM FFI signature mismatch"));
+    }
     // Marshal CStr params from WASM memory into CStrings valid for the call.
     // All other values must be safe to represent as host Values; in
     // particular a guest TAG_PTR is a linear-memory offset, not a host pointer.
@@ -673,7 +748,7 @@ fn host_ffi_call_impl(
     let mut cargs: Vec<crate::vm::Value> = Vec::with_capacity(args.len());
     for (i, p) in params.iter().enumerate() {
         if *p == crate::ffi::marshal::CType::CStr {
-            let s = read_wasm_string(&mut caller, args[i]);
+            let s = read_wasm_ffi_string(&mut caller, args[i], MAX_WASM_FFI_CSTR_BYTES, "CStr")?;
             let c = std::ffi::CString::new(s).map_err(|_| Error::msg("bad cstr"))?;
             cargs.push(unsafe { /* SAFETY: host-side storage owns this pointer for the duration required by the guest/host bridge. */ crate::vm::Value::ptr(c.as_ptr() as *mut u8) });
             cstrings.push(c);
@@ -1079,6 +1154,245 @@ pub fn load_precompiled(cwasm_bytes: &[u8]) -> NuResult<WasmRuntime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // These fixtures are pre-registered under an isolated symbol. No host
+    // libraries, production keys, or external processes are involved.
+    static WASM_FFI_TEST_TOKEN: u64 = 0x1234_5678_ABCD;
+
+    extern "C" fn fixture_native_host_address() -> *mut std::ffi::c_void {
+        std::ptr::addr_of!(WASM_FFI_TEST_TOKEN) as *mut std::ffi::c_void
+    }
+
+    extern "C" fn fixture_native_scalar() -> i64 {
+        42
+    }
+
+    static WASM_CSTR_TEST_CALLED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    extern "C" fn fixture_native_cstr() -> *const std::ffi::c_char {
+        WASM_CSTR_TEST_CALLED.store(true, std::sync::atomic::Ordering::SeqCst);
+        c"native pointer return".as_ptr()
+    }
+
+    fn ffi_test_wasm(symbol: &str, return_ctype: u64) -> Vec<u8> {
+        ffi_test_wasm_for_library("test-native-ffi", symbol, return_ctype)
+    }
+
+    fn ffi_test_wasm_for_library(library: &str, symbol: &str, return_ctype: u64) -> Vec<u8> {
+        // A real WASM guest imports the same host FFI function used by the
+        // compiled backend, then returns its raw i64 result to the test.
+        let library_tag = crate::vm::Value::string(128).as_raw();
+        let symbol_tag = crate::vm::Value::string(160).as_raw();
+        let wat = format!(
+            r#"(module
+                (import "env" "memory" (memory 1))
+                (import "env" "ffi_call_0" (func $ffi (param i64 i64 i64) (result i64)))
+                (data (i32.const 128) "{library}\00")
+                (data (i32.const 160) "{symbol}\00")
+                (func (export "nulang_init") (result i64)
+                    i64.const {library_tag}
+                    i64.const {symbol_tag}
+                    i64.const {return_ctype}
+                    call $ffi))"#
+        );
+        wat::parse_str(&wat).expect("valid host FFI guest")
+    }
+
+    #[test]
+    fn wasm_ffi_rejects_library_scoped_native_registry_entries() {
+        let symbol = "nulang_p0_wasm_cached_dynamic_symbol";
+        let library = "p0-local-only-native-library";
+        let reg = crate::ffi::native::FFI_REGISTRY
+            .get_or_init(|| std::sync::Mutex::new(crate::ffi::native::FfiRegistry::new()));
+        reg.lock().unwrap().register(unsafe {
+            crate::ffi::native::NativeFunction::new(
+                fixture_native_scalar as *const std::ffi::c_void,
+                crate::ffi::marshal::Signature::new(vec![], crate::ffi::marshal::CType::I64),
+                Some(library.into()),
+                symbol.into(),
+            )
+        });
+        let wasm = ffi_test_wasm_for_library(library, symbol, 0);
+        let mut runtime = WasmRuntime::new(&wasm, None).unwrap();
+        assert!(runtime.grant_registered_ffi_callback(symbol).is_err());
+        let err = runtime
+            .init_func
+            .call(&mut runtime.store, ())
+            .expect_err("WASM guest must not reuse native library-scoped cache entries");
+        assert!(format!("{err:?}").contains("WASM FFI callback not granted for runtime"));
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "ffi"))]
+    fn wasm_ffi_unregistered_native_library_must_not_load() {
+        // gethostid() is harmless and has the exact C ABI `long(void)` on
+        // Linux x86_64. No function was pre-registered under this symbol.
+        // A guest must not cause an unrequested dlopen/dlsym and C invocation.
+        let wasm = ffi_test_wasm_for_library("libc.so.6", "gethostid", 0);
+        let mut runtime = WasmRuntime::new(&wasm, None).unwrap();
+        let err = runtime
+            .init_func
+            .call(&mut runtime.store, ())
+            .expect_err("WASM guest must not load arbitrary host libraries");
+        assert!(
+            format!("{err:?}").contains("WASM FFI callback not granted for runtime"),
+            "must reject unregistered host dynamic symbols before loading: {err:?}"
+        );
+    }
+
+    #[test]
+    fn wasm_ffi_voidptr_result_must_not_expose_host_address() {
+        let symbol = "nulang_p0_wasm_foreign_address_return";
+        unsafe {
+            crate::ffi::native::register_native_function(
+                symbol,
+                fixture_native_host_address as *const std::ffi::c_void,
+                crate::ffi::marshal::Signature::new(vec![], crate::ffi::marshal::CType::VoidPtr),
+            )
+        }
+        .expect("pre-register trusted test function");
+        let wasm = ffi_test_wasm(symbol, 4);
+        let mut runtime = WasmRuntime::new(&wasm, None).unwrap();
+        runtime.grant_registered_ffi_callback(symbol).unwrap();
+        match runtime.init_func.call(&mut runtime.store, ()) {
+            Ok(raw) => panic!(
+                "guest observed a host FFI result instead of a rejection: {:#018x}",
+                raw as u64
+            ),
+            Err(e) => assert!(
+                format!("{e:?}").contains("WASM cannot return native pointers"),
+                "wrong failure; must reject pointer result before FFI execution: {e:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn wasm_ffi_cstr_return_rejected_before_native_call() {
+        let symbol = "nulang_p0_wasm_cstr_pointer_return";
+        WASM_CSTR_TEST_CALLED.store(false, std::sync::atomic::Ordering::SeqCst);
+        unsafe {
+            crate::ffi::native::register_native_function(
+                symbol,
+                fixture_native_cstr as *const std::ffi::c_void,
+                crate::ffi::marshal::Signature::new(vec![], crate::ffi::marshal::CType::CStr),
+            )
+        }
+        .expect("register valid native CStr fixture");
+        let wasm = ffi_test_wasm(symbol, 3);
+        let mut runtime = WasmRuntime::new(&wasm, None).unwrap();
+        runtime.grant_registered_ffi_callback(symbol).unwrap();
+        let error = runtime
+            .init_func
+            .call(&mut runtime.store, ())
+            .expect_err("WASM guest cannot receive a native CStr pointer");
+        assert!(format!("{error:?}").contains("WASM cannot return native pointers"));
+        assert!(
+            !WASM_CSTR_TEST_CALLED.load(std::sync::atomic::Ordering::SeqCst),
+            "reject unsafe native return signatures before invoking C"
+        );
+    }
+
+    #[test]
+    fn wasm_ffi_cannot_disguise_registered_native_pointer_as_scalar() {
+        // A malicious guest declares I64 while the trusted registry entry
+        // actually has a pointer-returning ABI. The registered signature,
+        // not the guest declaration, governs call_native's conversion.
+        let symbol = "nulang_p0_wasm_foreign_address_signature_spoof";
+        unsafe {
+            crate::ffi::native::register_native_function(
+                symbol,
+                fixture_native_host_address as *const std::ffi::c_void,
+                crate::ffi::marshal::Signature::new(vec![], crate::ffi::marshal::CType::VoidPtr),
+            )
+        }
+        .expect("pre-register trusted foreign pointer function");
+
+        // Guest lies: 0 is I64. On the old code, the host checks I64, then
+        // call_native uses the registered VoidPtr ABI and emits TAG_FOREIGN_PTR.
+        let wasm = ffi_test_wasm(symbol, 0);
+        let mut runtime = WasmRuntime::new(&wasm, None).unwrap();
+        runtime.grant_registered_ffi_callback(symbol).unwrap();
+        match runtime.init_func.call(&mut runtime.store, ()) {
+            Ok(raw) => panic!(
+                "WASM guest bypassed return guard using signature spoof: {:#018x}",
+                raw as u64
+            ),
+            Err(e) => assert!(
+                format!("{e:?}").contains("WASM FFI signature mismatch"),
+                "must fail closed on registered signature mismatch: {e:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn wasm_ffi_rejects_oversized_guest_symbol_before_registry_lookup() {
+        // A hostile WASM guest controls the TAG_STRING offset and length;
+        // no symbol can legitimately need several kilobytes of text.
+        // The old reader duplicated all guest memory before scanning it,
+        // then attempted a registry lookup with this huge untrusted key.
+        let symbol = "x".repeat(4097);
+        let wasm = ffi_test_wasm_for_library("unused", &symbol, 0);
+        let mut runtime = WasmRuntime::new(&wasm, None).unwrap();
+        let err = runtime
+            .init_func
+            .call(&mut runtime.store, ())
+            .expect_err("WASM FFI symbol must have a fixed size bound");
+        assert!(
+            format!("{err:?}").contains("WASM FFI symbol exceeds maximum length"),
+            "must reject oversized symbol before registry lookup: {err:?}"
+        );
+    }
+
+    #[test]
+    fn wasm_ffi_global_callback_must_not_be_ambient_to_other_runtimes() {
+        let symbol = "nulang_p0_wasm_tenant_isolation_fixture";
+        unsafe {
+            crate::ffi::native::register_native_function(
+                symbol,
+                fixture_native_scalar as *const std::ffi::c_void,
+                crate::ffi::marshal::Signature::new(vec![], crate::ffi::marshal::CType::I64),
+            )
+        }
+        .expect("register fixture in process-wide native registry");
+        let wasm = ffi_test_wasm(symbol, 0);
+        let mut tenant_a = WasmRuntime::new(&wasm, None).unwrap();
+        let mut tenant_b = WasmRuntime::new(&wasm, None).unwrap();
+        // The host chooses A, not B, for this process-global callback.
+        assert!(tenant_a.run().is_err(), "new runtimes must default deny");
+        tenant_a.grant_registered_ffi_callback(symbol).unwrap();
+        assert_eq!(tenant_a.run().unwrap().as_int(), Some(42));
+        assert!(
+            tenant_b.run().is_err(),
+            "a separate WASM guest must not inherit tenant A's native callback"
+        );
+        tenant_b.grant_registered_ffi_callback(symbol).unwrap();
+        assert_eq!(tenant_b.run().unwrap().as_int(), Some(42));
+        assert!(tenant_a.revoke_ffi_callback(symbol));
+        assert!(
+            tenant_a.run().is_err(),
+            "revoking A must take effect immediately"
+        );
+        assert_eq!(tenant_b.run().unwrap().as_int(), Some(42));
+        assert!(!tenant_a.revoke_ffi_callback(symbol));
+    }
+
+    #[test]
+    fn wasm_ffi_scalar_result_still_roundtrips() {
+        let symbol = "nulang_p0_wasm_scalar_result";
+        unsafe {
+            crate::ffi::native::register_native_function(
+                symbol,
+                fixture_native_scalar as *const std::ffi::c_void,
+                crate::ffi::marshal::Signature::new(vec![], crate::ffi::marshal::CType::I64),
+            )
+        }
+        .expect("pre-register trusted scalar fixture");
+        let wasm = ffi_test_wasm(symbol, 0);
+        let mut runtime = WasmRuntime::new(&wasm, None).unwrap();
+        runtime.grant_registered_ffi_callback(symbol).unwrap();
+        assert_eq!(runtime.run().unwrap().as_int(), Some(42));
+    }
 
     #[test]
     fn guest_non_pointer_value_rejects_host_pointer_tag() {
