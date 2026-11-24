@@ -28,8 +28,8 @@ cargo check --locked --tests
 # later change makes the default profile smaller.
 cargo check --locked --all-targets --no-default-features --features full
 
-cargo check --locked --all-targets --all-features
-cargo clippy --locked --all-targets --all-features -- -D clippy::correctness
+cargo check --locked --all-targets --no-default-features --features "$(python3 scripts/ci/compatible-cargo-features.py)"
+cargo clippy --locked --all-targets --no-default-features --features "$(python3 scripts/ci/compatible-cargo-features.py)" -- -D clippy::correctness
 
 # Repository-specific forbidden-pattern and zero-warning gate.
 python3 scripts/verify_implementation.py

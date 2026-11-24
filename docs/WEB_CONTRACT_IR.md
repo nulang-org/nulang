@@ -168,6 +168,63 @@ The transport-neutral `RequestDecodeError` exposes stable machine-readable codes
 
 Compiler/runtime binding defects deliberately remain server errors. They must not be presented as mistakes made by the caller.
 
+## Initial HTTP response media contract
+
+The experimental native `WebDevServer` consumes `RouteContract.response_type`
+through the same validated `RuntimeRoutePlan` used by request dispatch.
+This is an intentionally small first slice of the response algebra:
+
+- Explicit `Html` returns `200 text/html; charset=utf-8` and permits the
+  existing browser runtime injection.
+- Explicit `String`, `Int`, `Float`, and `Bool` return
+  `200 text/plain; charset=utf-8` with no client runtime injection.
+- Legacy routes with no compiler-return-type metadata retain the existing
+  HTML response behavior.
+- Other explicitly declared types return `500` without serializing the
+  handler value. Do not assume `Json[T]`, byte streams, or a custom record
+  have a safe wire format until the response algebra and codecs are defined.
+
+This is **not** a general `Response[T]` API yet. Explicit status, headers,
+binary payloads, streaming, and JSON schema serialization remain follow-up
+work. `Web.redirect` behavior is separately tracked in PR #2084. WASM/Cloud
+host equivalence must be demonstrated before presenting any response type
+as Cloud portable.
+
+## Explicit status and JSON response host effects (experimental)
+
+For routes running in the native `WebDevServer`, the optional response host
+effects provide a bounded first step toward status-aware responses:
+
+```nulang
+fn create() {
+    perform Web.respond_json(201, "{\"created\":true}")
+}
+
+fn invalid() {
+    perform Web.respond_text(422, "validation failed")
+}
+```
+
+`Web.respond_json(status, body)` takes a **JSON string**, not an arbitrary
+Nulang record. It verifies the JSON using the host JSON decoder and serializes
+it canonically with `Content-Type: application/json`. Do not treat this as a
+`Json[T]` schema or a generic value codec.
+
+`Web.respond_text(status, body)` uses
+`text/plain; charset=utf-8`. Both accept only explicitly supported success
+and error status codes. A `204` response must have an empty text body;
+redirects remain owned by `Web.redirect`. Unsupported status codes, malformed
+JSON, responses larger than the request-sized host budget, and multiple
+response declarations fail closed with HTTP 500. Response metadata is scoped
+to a single request, and a route cannot supply status or JSON transport
+semantics by forging a string payload.
+
+These effects operate only while serving a routed native HTTP request. They
+are not currently a portable Cloud/WASM response contract and are not safe to
+use as a substitute for a production HTTP framework. Explicit headers,
+binary/streaming bodies, schema-typed `Json[T]`, and Cloud host parity remain
+future work.
+
 ## OpenAPI
 
 OpenAPI 3.1 generation consumes the same `ContractCompilation` and binding IR; it does not reparse Nulang source.

@@ -582,6 +582,22 @@ impl StdLib {
                     description: "Produce a redirect response to the given URL.",
                 },
                 BuiltinOp {
+                    name: "Web.respond_json",
+                    effect: "Web",
+                    op: "respond_json",
+                    signature: "respond_json(status: Int, body: String) -> String",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Send a validated JSON HTTP response with explicit status.",
+                },
+                BuiltinOp {
+                    name: "Web.respond_text",
+                    effect: "Web",
+                    op: "respond_text",
+                    signature: "respond_text(status: Int, body: String) -> String",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Send a plain-text HTTP response with explicit status.",
+                },
+                BuiltinOp {
                     name: "Web.serve_static",
                     effect: "Web",
                     op: "serve_static",

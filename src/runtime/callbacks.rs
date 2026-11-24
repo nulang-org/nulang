@@ -419,11 +419,35 @@ pub(crate) fn perform_web_builtin(
         Some("route") => Some(crate::vm::Value::unit()),
         Some("redirect") => {
             let url = resolve(constants, *regs.first()?);
-            let out = format!(
-                "<html><head><meta http-equiv=\"refresh\" content=\"0;url={}\"></head></html>",
-                url
-            );
-            Some(callbacks.alloc_string(&out))
+            if crate::runtime::http_server::register_explicit_http_redirect(&url) {
+                Some(callbacks.alloc_string(""))
+            } else if crate::runtime::http_server::valid_explicit_redirect_target(&url) {
+                // Non-HTTP rendering keeps a safe, escaped local fallback.
+                let out = format!(
+                    "<html><head><meta http-equiv=\"refresh\" content=\"0;url={}\"></head></html>",
+                    html_escape(&url)
+                );
+                Some(callbacks.alloc_string(&out))
+            } else {
+                // Do not generate scriptable meta refreshes outside HTTP.
+                Some(callbacks.alloc_string(""))
+            }
+        }
+        Some("respond_json") | Some("respond_text") => {
+            let status = regs
+                .first()
+                .and_then(|value| value.as_int())
+                .and_then(|value| u16::try_from(value).ok())
+                .unwrap_or(0);
+            let body = resolve(constants, *regs.get(1)?);
+            let is_json = op_name == Some("respond_json");
+            if crate::runtime::http_server::register_explicit_http_response(status, &body, is_json)
+            {
+                Some(callbacks.alloc_string(""))
+            } else {
+                // A response has no meaning outside a routed HTTP request.
+                Some(crate::vm::Value::nil())
+            }
         }
         Some("serve_static") => {
             let path = resolve(constants, *regs.first()?);

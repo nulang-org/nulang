@@ -20,5 +20,5 @@ cargo test --locked --workspace || (
 
 cargo test --locked --workspace --no-default-features
 cargo test --locked --workspace --features wasm-backend
-cargo test --locked --workspace --all-targets --all-features
+cargo test --locked --workspace --all-targets --no-default-features --features "$(python3 scripts/ci/compatible-cargo-features.py)"
 cargo test --locked --doc

@@ -41,6 +41,17 @@ pub fn redirect(url: String) -> Html ! {Web, Respond} {
     perform Web.redirect(url)
 }
 
+/// Return validated JSON in a routed HTTP request with explicit status.
+/// Fails closed for invalid JSON or unsupported status codes.
+pub fn respond_json(status: Int, body: String) -> String ! {Web, Respond} {
+    perform Web.respond_json(status, body)
+}
+
+/// Return plain text in a routed HTTP request with explicit status.
+pub fn respond_text(status: Int, body: String) -> String ! {Web, Respond} {
+    perform Web.respond_text(status, body)
+}
+
 /// Serve the contents of a static file as an HTML response.
 pub fn serve_static(path: String) -> Html ! {Web, Request} {
     perform Web.serve_static(path)

@@ -1,4 +1,9 @@
 # Nulang Changelog
+
+### Experimental Web response header/cookie safety — 2026-10-17
+- The HTTP/1.1 response writer now rejects invalid header names/values and caller-supplied `Content-Length` / `Transfer-Encoding`, emitting a fixed 500 rather than serializing unsafe framing or CR/LF.
+- `Web.set_cookie` and `Web.clear_cookie` fail closed on malformed cookie names or values; the effect interface still returns `Unit` rather than a typed validation error. Focused wire-response and cookie regression tests cover unsafe input and unaffected valid cookies.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
@@ -6,6 +11,10 @@
 ### Fabric on-demand mailbox scoring — 2026-10-18
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
 - **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
+
+### Experimental Web mutation-origin admission — 2026-10-17
+- **The experimental routed Web development host rejects missing, cross-origin, or ambiguous provenance on state-changing requests before dispatching handlers.** It verifies Host, Origin/Referer, and Sec-Fetch-Site using an explicit trusted public origin for proxied deployments; malformed requests return HTTP 403. Standalone `Http.serve` is outside this Web admission policy.
+- This is a browser CSRF defense, not session authentication or resource authorization. Existing non-browser API POST callers must supply an appropriate Origin; tests cover direct loopback HTTP and independent origin validation.
 
 ### Bounded Nulang Web development-server connections — 2026-10-16
 - **The experimental Web development listener caps active connections at 64**, including SSE, and returns `503` with `Retry-After: 1` when full.
