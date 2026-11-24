@@ -1223,14 +1223,34 @@ fn lower_let_chain(first_body: &Expr, body: &mut hir::Body) -> hir::Operand {
     }
 }
 
+/// Preserve an exit operand's already-evaluated value before deferred
+/// cleanup mutates its source bindings. This uses existing `RValue::Use`.
+fn snapshot_exit_operand(value: hir::Operand, span: Span, body: &mut hir::Body) -> hir::Operand {
+    let name = fresh_temp_name();
+    body.push(hir::Stmt::Let {
+        name: name.clone(),
+        ty: Type::unit(),
+        value: hir::RValue::Use(value),
+        span,
+    });
+    hir::Operand::Var(name, Type::unit())
+}
+
+fn snapshot_exit_value(expr: &Expr, span: Span, body: &mut hir::Body) -> hir::Operand {
+    let value = lower_expr(expr, body);
+    snapshot_exit_operand(value, span, body)
+}
+
 /// Emit all active deferred expressions from all scopes in LIFO order.
 /// Snapshots the defer stack to avoid RefCell double-borrow when deferred
 /// expressions themselves contain blocks/if/match (which re-enter the stack).
 fn emit_all_defers(body: &mut hir::Body) {
     let snapshot = DEFER_SCOPES.with(|s| s.borrow().clone());
     for scope in snapshot.iter().rev() {
-        for (expr, _error_only) in scope.iter().rev() {
-            let _ = lower_expr(expr, body);
+        for (expr, error_only) in scope.iter().rev() {
+            if !error_only {
+                let _ = lower_expr(expr, body);
+            }
         }
     }
 }
@@ -1242,8 +1262,10 @@ fn emit_defers_for_break(body: &mut hir::Body) {
     });
     for scope_idx in (boundary..snapshot.len()).rev() {
         if let Some(scope) = snapshot.get(scope_idx) {
-            for (expr, _error_only) in scope.iter().rev() {
-                let _ = lower_expr(expr, body);
+            for (expr, error_only) in scope.iter().rev() {
+                if !error_only {
+                    let _ = lower_expr(expr, body);
+                }
             }
         }
     }
@@ -1659,7 +1681,7 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
             });
             hir::Operand::Var(temp, ty)
         }
-        Expr::Block { exprs, span: _ } => {
+        Expr::Block { exprs, span } => {
             push_defer_scope();
             let mut last = hir::Operand::Unit;
             for e in exprs {
@@ -1677,11 +1699,16 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
             }
             if !body.is_terminated() {
                 let scope = pop_defer_scope();
-                for (expr, _error_only) in scope.into_iter().rev() {
+                if scope.iter().any(|(_, error_only)| !error_only) {
+                    last = snapshot_exit_operand(last, *span, body);
+                }
+                for (expr, error_only) in scope.into_iter().rev() {
                     if body.is_terminated() {
                         break;
                     }
-                    let _ = lower_expr(&expr, body);
+                    if !error_only {
+                        let _ = lower_expr(&expr, body);
+                    }
                 }
             } else {
                 let _ = pop_defer_scope();
@@ -1718,11 +1745,16 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
             }
             if !body.is_terminated() {
                 let scope = pop_defer_scope();
-                for (expr, _error_only) in scope.into_iter().rev() {
+                if scope.iter().any(|(_, error_only)| !error_only) {
+                    last = snapshot_exit_operand(last, *span, body);
+                }
+                for (expr, error_only) in scope.into_iter().rev() {
                     if body.is_terminated() {
                         break;
                     }
-                    let _ = lower_expr(&expr, body);
+                    if !error_only {
+                        let _ = lower_expr(&expr, body);
+                    }
                 }
                 body.push(hir::Stmt::ParallelMarker {
                     marker: crate::parallel_marker::ParallelRegionMarker::End,
@@ -2218,16 +2250,19 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
             };
             lower_expr(&app, body)
         }
-        Expr::Return(val, _span) => {
-            // Emit all active defers before return (all scopes, LIFO).
+        Expr::Return(val, span) => {
+            // Evaluate and *snapshot* the result before running deferred
+            // cleanup. An Operand::Var alone is insufficient: a deferred
+            // assignment could mutate its binding before the return is read.
+            let op = val.as_ref().map(|e| snapshot_exit_value(e, *span, body));
             emit_all_defers(body);
-            let op = val.as_ref().map(|e| lower_expr(e, body));
             body.set_terminator(hir::Terminator::FnReturn(op));
             hir::Operand::Unit
         }
-        Expr::Break(val, _span) => {
+        Expr::Break(val, span) => {
+            // Break values follow the same evaluation-before-cleanup rule.
+            let op = val.as_ref().map(|e| snapshot_exit_value(e, *span, body));
             emit_defers_for_break(body);
-            let op = val.as_ref().map(|e| lower_expr(e, body));
             body.set_terminator(hir::Terminator::Break(op));
             hir::Operand::Unit
         }
