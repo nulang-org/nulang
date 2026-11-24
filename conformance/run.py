@@ -3,9 +3,9 @@ import os, subprocess, json, sys
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)) + "/..")
 subprocess.run(["cargo", "build", "--quiet"], check=True)
-# Resolve the binary through cargo so the repo's `target-dir` override in
-# `.cargo/config.toml` (currently `/tmp/cargo-target`) is respected — a
-# hardcoded `./target/debug/nulang` runs a stale or missing binary.
+# Resolve the binary through Cargo metadata so repo config and an explicit
+# CARGO_TARGET_DIR override are both respected. Hardcoded paths could launch
+# a stale binary after switching target directories.
 target_dir = json.loads(
     subprocess.check_output(["cargo", "metadata", "--format-version", "1", "--no-deps"])
 )["target_directory"]

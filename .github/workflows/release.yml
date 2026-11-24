@@ -16,9 +16,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # The repo's .cargo/config.toml sets target-dir=/tmp/cargo-target for
-  # local dev; override it here so the strip/package steps can use the
-  # conventional target/<triple>/ paths.
+  # Pin target paths for the release packaging steps, independent of any
+  # local developer configuration or CARGO_TARGET_DIR override.
   CARGO_TARGET_DIR: target
 
 jobs:

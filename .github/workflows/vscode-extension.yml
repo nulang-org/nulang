@@ -80,8 +80,8 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      # .cargo/config.toml redirects target-dir to /tmp/cargo-target; override
-      # so the binary lands at ./target/debug/nulang where NULANG_PATH points.
+      # Keep the compiled binary at ./target/debug/nulang, matching the
+      # NULANG_PATH used by the VS Code extension tests.
       - name: Build nulang
         run: cargo build --bin nulang
         env:

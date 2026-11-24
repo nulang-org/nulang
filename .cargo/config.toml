@@ -9,8 +9,11 @@ PYO3_USE_ABI3_FORWARD_COMPATIBILITY = "1"
 # transitively. Force-include it so the `rocksdb` feature compiles.
 CXXFLAGS = "-include cstdint"
 
+# Keep build artifacts on persistent storage. /tmp is tmpfs on some developer
+# machines (including Gertrude) and cannot safely hold large Rust target trees.
+# Developers can override this with CARGO_TARGET_DIR on dedicated build hosts.
 [build]
-target-dir = "/tmp/cargo-target"
+target-dir = "target"
 
 # quick-xml 0.14 (pulled in transitively by `inferno` for flamegraph support)
 # carries a future-incompat lint for code that a future Rust release will
