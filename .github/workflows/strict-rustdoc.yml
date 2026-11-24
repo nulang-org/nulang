@@ -1,0 +1,36 @@
+name: Strict Rustdoc (advisory)
+
+# Intentionally an independent, non-required check while the existing
+# rustdoc warning backlog is repaired. A failed rustdoc command stays red.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: strict-rustdoc-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  strict-rustdoc:
+    name: Strict rustdoc (-D warnings)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-dev
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Fail on rustdoc warnings
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps
