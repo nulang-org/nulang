@@ -110,3 +110,8 @@ pub fn set_cookie(name: String, value: String) -> Unit ! {Web, Respond} {
 pub fn clear_cookie(name: String) -> Unit ! {Web, Respond} {
     perform Web.clear_cookie(name)
 }
+/// Set an HTTP response header. Invalid, reserved, and framing headers are ignored.
+/// Headers only apply to the current Web route and are discarded on handler errors.
+pub fn set_header(name: String, value: String) -> Unit ! {Web, Respond} {
+    perform Web.set_header(name, value)
+}

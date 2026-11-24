@@ -1,0 +1,34 @@
+import stdlib::web::htmx
+import stdlib::web::html
+import stdlib::web::types
+
+fn results() -> Html {
+    el("ul", [], [el("li", [], [text("Result")])])
+}
+
+fn search() -> Html {
+    if is_fragment() then {
+        results()
+    } else {
+        document(
+            head([title("Search")]),
+            body([
+                el("form", [("action", text("/search")), ("method", text("GET"))], [
+                    el("input", [
+                        ("name", text("q")),
+                        get("/search"),
+                        target("#results"),
+                        trigger("input changed delay:250ms"),
+                        sync("this:replace")
+                    ], []),
+                    el("button", [("type", text("submit"))], [text("Search")])
+                ]),
+                el("div", [("id", text("results"))], [results()])
+            ])
+        )
+    }
+}
+
+app "htmx-compat" {
+    route "GET" "/search" -> search
+}
