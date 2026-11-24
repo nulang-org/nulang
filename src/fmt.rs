@@ -14,7 +14,18 @@ use crate::types::{NuError, NuResult, Span};
 /// (rather than silently dropping or corrupting it).
 pub fn format_source(source: &str) -> Result<String, String> {
     let mut lexer = crate::lexer::Lexer::new(source);
-    let tokens = lexer.lex().map_err(|e| e.to_string())?;
+    let tokens = lexer.lex_with_trivia().map_err(|e| e.to_string())?;
+    // The formatter reconstructs source from the AST, which does not retain
+    // ordinary comments. Reject comment-bearing input rather than silently
+    // discarding comments (including documentation) on `fmt` or `fmt --check`.
+    if tokens.iter().any(|token| {
+        matches!(
+            token.kind,
+            crate::lexer::TokenKind::Comment(_) | crate::lexer::TokenKind::DocComment(_)
+        )
+    }) {
+        return Err("cannot safely format comments yet; the file was not modified".into());
+    }
     let mut parser = crate::parser::Parser::new(tokens);
     let ast = parser.parse_module().map_err(|e| e.to_string())?;
 
@@ -1238,6 +1249,37 @@ mod tests {
         assert!(out.contains("op: Int -> Bool"), "got: {out}");
         assert!(out.contains("op2: (Int, String) -> Bool"), "got: {out}");
         assert_idempotent(src);
+    }
+
+    #[test]
+    fn test_fmt_does_not_silently_discard_comments() {
+        let input = "// important license header\nfn main() {\n    perform IO.print(\"ok\")\n}\n";
+        match format_source(input) {
+            Ok(output) => assert!(
+                output.contains("// important license header"),
+                "formatter lost a source comment"
+            ),
+            Err(error) => assert!(
+                error.contains("comment"),
+                "unexpected formatting failure: {error}"
+            ),
+        }
+    }
+
+    #[test]
+    fn test_fmt_rejects_doc_comments_without_losing_them() {
+        let input = "/// Public API documentation\nfn greet() -> String {\n    \"hello\"\n}\n";
+        let err = format_source(input).expect_err("doc comments must not be dropped");
+        assert!(err.contains("comment"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_fmt_comment_markers_in_strings_are_not_comments() {
+        let input = "fn main() {\n    perform IO.print(\"https://example.com/a//b\")\n}\n";
+        assert!(
+            format_source(input).is_ok(),
+            "comment text inside string is not trivia"
+        );
     }
 
     #[test]

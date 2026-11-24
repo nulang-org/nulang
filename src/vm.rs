@@ -1555,7 +1555,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                     #[cfg(feature = "ureq")]
                     {
                         match ureq::get(&url).call() {
-                            Ok(response) => match response.into_string() {
+                            Ok(mut response) => match response.body_mut().read_to_string() {
                                 Ok(body) => {
                                     let bytes = body.into_bytes();
                                     match self.heap.alloc(bytes.len() + 1, HeapTypeTag::String) {
@@ -1613,8 +1613,8 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         .unwrap_or_default();
                     #[cfg(feature = "ureq")]
                     {
-                        match ureq::post(&url).send_string(&body) {
-                            Ok(response) => match response.into_string() {
+                        match ureq::post(&url).send(&body) {
+                            Ok(mut response) => match response.body_mut().read_to_string() {
                                 Ok(body) => {
                                     let bytes = body.into_bytes();
                                     match self.heap.alloc(bytes.len() + 1, HeapTypeTag::String) {

@@ -67,6 +67,8 @@ pub mod crdt_reg;
 mod distribution;
 mod exit;
 mod http_server;
+#[cfg(feature = "sqlite-remote")]
+mod libsql_tls;
 #[cfg(feature = "ai-runtime")]
 mod llm;
 mod metrics;

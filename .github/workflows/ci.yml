@@ -249,12 +249,51 @@ jobs:
           echo "$output" | grep -F '"benchmark":"ping_pong"'
 
   # -----------------------------------------------------------------------
+  # SQLite feature isolation: local builds must not pull the legacy remote
+  # Hyper/h2 graph; opt-in remote TLS contracts must remain executable.
+  # -----------------------------------------------------------------------
+  sqlite-boundary:
+    name: SQLite local/remote feature boundary
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Local SQLite API fails closed without remote opt-in
+        run: cargo test --locked --no-default-features --features sqlite --test sqlite_feature_boundary
+
+      - name: Remote libSQL TLS/URL rejection remains tested
+        run: cargo test --locked --no-default-features --features sqlite-remote --lib runtime::libsql_tls::tests
+
+  # -----------------------------------------------------------------------
   # WASM backend
   # -----------------------------------------------------------------------
   wasm-backend:
     name: Build & Test (wasm-backend feature)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # Wasmtime's all-targets linker output exhausted the standard runner's
+    # 14 GB disk on 2026-11-04. Keep build and executable test gates intact,
+    # but omit large debug sections and avoid parallel link/disk spikes.
+    # Limit these overrides to the WASM lane (not the release profile).
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
     steps:
       - uses: actions/checkout@v7
 
