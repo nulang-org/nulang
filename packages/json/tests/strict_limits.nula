@@ -1,0 +1,32 @@
+// Verify the generated registry package exposes the strict bounded parser.
+import lib
+import stdlib::test
+
+fn main() {
+    match parse_strict_limited("{\"ok\":true}", 11, 2) {
+        Ok(JsonObject(fields)) => assert_eq(perform Array.length(fields), 1),
+        Ok(_) => fail_with("expected JSON object"),
+        Error(_) => fail_with("valid payload rejected"),
+    };
+
+    match parse_strict_limited("\"café\"", 7, 1) {
+        Ok(JsonString(s)) => assert(s == "café", "unicode roundtrip"),
+        Ok(_) => fail_with("expected JSON string"),
+        Error(_) => fail_with("valid unicode rejected"),
+    };
+
+    match parse_strict_limited("[[1]]", 5, 1) {
+        Error(e) => assert(e.reason == "maximum depth exceeded", "depth budget"),
+        Ok(_) => fail_with("depth violation accepted"),
+    };
+
+    match parse_strict_limited("{}", 1, 1) {
+        Error(e) => assert_eq(e.offset, 1),
+        Ok(_) => fail_with("byte budget violation accepted"),
+    };
+
+    match parse_strict_limited("null", 1, -1) {
+        Error(e) => assert(e.reason == "invalid max_depth limit", "invalid depth"),
+        Ok(_) => fail_with("negative budget accepted"),
+    }
+}

@@ -19,6 +19,12 @@ fn typecheck_example_with_imports(path: &Path) -> nulang::types::NuResult<nulang
     let tokens = Lexer::new(&source).lex()?;
     let mut ast = Parser::new(tokens).parse_module()?;
 
+    // Match production compilation order: resolve imports before prepending
+    // prelude variants. Imports are prepended, and their function bodies may
+    // reference Option/Result constructors (Some, Ok, Error).
+    let mut visited = HashSet::new();
+    nulang::resolver::resolve_imports(&mut ast, path, &mut visited)?;
+
     let mut prelude_variants: Vec<Decl> = prelude_ast
         .decls
         .into_iter()
@@ -26,9 +32,6 @@ fn typecheck_example_with_imports(path: &Path) -> nulang::types::NuResult<nulang
         .collect();
     prelude_variants.append(&mut ast.decls);
     ast.decls = prelude_variants;
-
-    let mut visited = HashSet::new();
-    nulang::resolver::resolve_imports(&mut ast, path, &mut visited)?;
 
     TypeChecker::new().check_module(&ast)
 }

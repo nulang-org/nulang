@@ -11842,7 +11842,14 @@ match { a: 2, b: 9 } with {
         let mut parser = Parser::new(tokens);
         let mut ast = parser.parse_module()?;
 
-        // 3. Merge prelude variant types into the AST
+        // 3. Resolve imports before injecting the prelude. Imports prepend
+        // declarations, so doing this after prelude injection would place
+        // imported functions that use Ok/Error/Some ahead of their variant
+        // constructors. Mirror main.rs::run_frontend ordering exactly.
+        let mut visited = HashSet::new();
+        crate::resolver::resolve_imports(&mut ast, path, &mut visited)?;
+
+        // 4. Inject prelude variants in front of all imported declarations.
         let mut pd: Vec<crate::ast::Decl> = pa
             .decls
             .into_iter()
@@ -11850,10 +11857,6 @@ match { a: 2, b: 9 } with {
             .collect();
         pd.append(&mut ast.decls);
         ast.decls = pd;
-
-        // 4. Resolve imports (stdlib::json, stdlib::datetime, etc.)
-        let mut visited = HashSet::new();
-        crate::resolver::resolve_imports(&mut ast, path, &mut visited)?;
 
         // 5. Type check
         let mut type_checker = TypeChecker::new();

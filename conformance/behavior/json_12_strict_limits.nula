@@ -1,0 +1,29 @@
+// Caller-controlled limits must only narrow strict JSON acceptance.
+import stdlib::json
+
+fn check(input: String, bytes: Int, depth: Int) -> String {
+    match parse_strict_limited(input, bytes, depth) {
+        Ok(value) => "ok:" + stringify(value),
+        Error(e) => "error:" + e.reason,
+    }
+}
+
+fn main() {
+    perform IO.print("small=" + check("{}", 2, 1))
+    perform IO.print("small_over=" + check("{}", 1, 1))
+    perform IO.print("nested_ok=" + check("[1]", 3, 1))
+    perform IO.print("nested_over=" + check("[[1]]", 5, 1))
+    perform IO.print("zero_depth_scalar=" + check("42", 2, 0))
+    perform IO.print("zero_depth_array=" + check("[1]", 3, 0))
+    perform IO.print("invalid_zero_bytes=" + check("1", 0, 1))
+    perform IO.print("invalid_negative_bytes=" + check("1", -1, 1))
+    perform IO.print("invalid_large_bytes=" + check("1", 65537, 1))
+    perform IO.print("invalid_negative_depth=" + check("1", 1, -1))
+    perform IO.print("invalid_large_depth=" + check("1", 1, 65))
+    perform IO.print("unicode_over=" + check("\"é\"", 3, 1))
+    perform IO.print("unicode_ok=" + check("\"é\"", 4, 1))
+    perform IO.print("normal_default=" + match parse_strict("42") {
+        Ok(_) => "ok",
+        Error(_) => "error",
+    })
+}
