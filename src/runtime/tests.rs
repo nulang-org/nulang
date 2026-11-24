@@ -5552,6 +5552,75 @@ fn active_views_converged(nodes: &[&Runtime], ids: &[NodeId]) -> bool {
     })
 }
 
+/// Capture the observer's active-view convergence state only on test failure.
+/// Use each runtime's logical clock because these tests advance virtual time
+/// while transport packets are delivered on real TCP reader threads.
+#[cfg(feature = "tcp")]
+fn active_view_failure_diagnostic(nodes: &[&Runtime], ids: &[NodeId]) -> String {
+    nodes
+        .iter()
+        .map(|rt| {
+            let local = rt.distributed.node_id.expect("distributed test node");
+            let cluster = rt.distributed.cluster.as_ref().expect("cluster");
+            let active = cluster.active_view();
+            let missing: Vec<_> = ids
+                .iter()
+                .copied()
+                .filter(|id| *id != local && !active.contains(id))
+                .collect();
+            let observations: Vec<String> = ids
+                .iter()
+                .copied()
+                .filter(|id| *id != local)
+                .map(|id| match cluster.get_node(id) {
+                    Some(info) => format!(
+                        "{id:?}: status={:?}, address={}, last_heartbeat_age_ms={}, incarnation={}",
+                        info.status,
+                        info.address,
+                        rt.now()
+                            .saturating_duration_since(info.last_heartbeat)
+                            .as_millis(),
+                        info.metadata
+                            .get("_incarnation")
+                            .map(String::as_str)
+                            .unwrap_or("unknown")
+                    ),
+                    None => format!(
+                        "{id:?}: status=unknown, address=unknown, last_heartbeat_age_ms=unknown, incarnation=unknown"
+                    ),
+                })
+                .collect();
+            format!(
+                "observer={local:?} missing_active={missing:?} active={active:?} passive={:?} probationary={:?} peers=[{}]",
+                cluster.passive_view(),
+                cluster.probationary().iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                observations.join("; ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(feature = "tcp")]
+#[test]
+fn active_view_failure_diagnostic_reports_missing_peers_without_mutating_membership() {
+    let node_a = start_virtual_clock_node();
+    let node_b = start_virtual_clock_node();
+    let a_id = node_a.distributed.node_id.unwrap();
+    let b_id = node_b.distributed.node_id.unwrap();
+    let expected = [a_id, b_id];
+    let report = active_view_failure_diagnostic(&[&node_a, &node_b], &expected);
+    assert!(report.contains("missing_active="), "{report}");
+    assert!(report.contains("active="), "{report}");
+    assert!(report.contains("passive="), "{report}");
+    assert!(report.contains("probationary="), "{report}");
+    assert!(report.contains("last_heartbeat_age_ms="), "{report}");
+    assert!(report.contains("status="), "{report}");
+    assert!(report.contains(&format!("{a_id:?}")), "{report}");
+    assert!(report.contains(&format!("{b_id:?}")), "{report}");
+    assert!(!active_views_converged(&[&node_a, &node_b], &expected));
+}
+
 #[cfg(feature = "tcp")]
 /// PLAN.md Phase 1 bullet 4 (chaos suite): split-brain — two mutually
 /// invisible healthy sub-clusters, NOT one node dying. Three real
@@ -5594,7 +5663,8 @@ fn test_three_node_cluster_split_brain_detects_and_heals() {
     }
     assert!(
         converged,
-        "cluster did not converge to fully-armed failure detection (active views)"
+        "cluster did not converge to fully-armed failure detection (active views):\n{}",
+        active_view_failure_diagnostic(&[&rt_a, &rt_b, &rt_c], &[node_a, node_b, node_c])
     );
 
     // Inject the partition: {A,B} | {C}. A and B keep talking to each
@@ -5900,7 +5970,8 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
     }
     assert!(
         converged,
-        "5-node cluster did not converge to fully-armed failure detection (active views)"
+        "5-node cluster did not converge to fully-armed failure detection (active views):\n{}",
+        active_view_failure_diagnostic(&nodes.iter().collect::<Vec<_>>(), &ids)
     );
 
     // Split {A,B} | {C,D,E}.
