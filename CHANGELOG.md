@@ -1,4 +1,9 @@
 # Nulang Changelog
+### FFI C-string ownership and pointer representation — 2026-10-30
+- Native C-string return temporaries now transfer into RAII ownership before VM heap allocation, preventing a leak if the allocation fails. The copied heap value is constructed through alloc_value, preserving the allocator provenance contract.
+- C-string temporaries are checked before CString::into_raw relinquishes ownership, and an unrepresentable non-null void pointer return now reports an FFI error instead of masquerading as C NULL. Raw foreign pointers remain an unsafe in-process FFI boundary; this is not a full capability-handle implementation.
+- Focused regression coverage targets return ownership, null/non-pointer validation, and oversized native addresses. Exact-head CI and broader cross-backend FFI validation remain required before merge.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
