@@ -53,6 +53,7 @@ use region_planner::{
 use region_planner::{native_leaf_plan, region_has_internal_back_edge, RegionPlanner};
 
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Hot Counter
@@ -121,6 +122,8 @@ struct NativeLeafCall {
     ptr: *const u8,
     return_reg: u8,
     required_args: usize,
+    /// Maximum synchronous call-chain depth, counting this leaf itself.
+    call_depth: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +176,9 @@ pub struct JitSession {
     /// native regions. These are not ordinary hot-entry regions: they execute
     /// against an isolated register buffer owned by the direct-call helper.
     native_leaf_calls: FxHashMap<(usize, usize), NativeLeafCall>,
+    /// Immutable snapshots rebuilt only when a new native leaf is compiled.
+    /// Repeated hot-region executions reuse these tables without heap churn.
+    native_leaf_tables: FxHashMap<usize, Arc<[runtime::JitLeafCallEntry]>>,
     /// Monotonic suffix for replacement compilations. Cranelift keeps prior
     /// function declarations alive, so every promotion needs a fresh symbol.
     promotion_serial: u64,
@@ -195,6 +201,7 @@ impl JitSession {
             region_planner: RegionPlanner::default(),
             tier2_counters: FxHashMap::default(),
             native_leaf_calls: FxHashMap::default(),
+            native_leaf_tables: FxHashMap::default(),
             promotion_serial: 0,
         })
     }
@@ -466,19 +473,67 @@ impl JitSession {
         self.tier2_counters.clear();
     }
 
+    fn rebuild_native_leaf_table(&mut self, module_idx: usize) {
+        let mut entries: Vec<_> = self
+            .native_leaf_calls
+            .iter()
+            .filter_map(|(&(leaf_module, func_idx), call)| {
+                (leaf_module == module_idx).then_some(runtime::JitLeafCallEntry {
+                    func_idx,
+                    ptr: call.ptr,
+                    return_reg: call.return_reg,
+                    required_args: call.required_args,
+                })
+            })
+            .collect();
+        entries.sort_unstable_by_key(|entry| entry.func_idx);
+        self.native_leaf_tables.insert(module_idx, entries.into());
+    }
+
     fn ensure_native_leaf_call(
         &mut self,
         module_idx: usize,
         func_idx: usize,
         module: &crate::bytecode::CodeModule,
     ) -> Option<NativeLeafCall> {
+        self.ensure_native_leaf_call_at_depth(module_idx, func_idx, module, 0)
+    }
+
+    fn ensure_native_leaf_call_at_depth(
+        &mut self,
+        module_idx: usize,
+        func_idx: usize,
+        module: &crate::bytecode::CodeModule,
+        depth: usize,
+    ) -> Option<NativeLeafCall> {
+        // Native leaves use host-stack frames. Include the full transitive
+        // depth even when a cached callee was compiled in an earlier plan.
+        const MAX_LEAF_CALL_DEPTH: usize = 8;
+        if depth >= MAX_LEAF_CALL_DEPTH {
+            return None;
+        }
         if let Some(call) = self.native_leaf_calls.get(&(module_idx, func_idx)).copied() {
-            return Some(call);
+            return (depth + call.call_depth <= MAX_LEAF_CALL_DEPTH).then_some(call);
         }
 
-        let plan = native_leaf_plan(module, func_idx)?;
+        let plan = {
+            let (may_suspend, recursive) = self.region_planner.call_safety(module_idx, module);
+            native_leaf_plan(module, func_idx, may_suspend, recursive)?
+        };
+        // Resolve every nested callee before installing its parent; a branchy,
+        // recursive or suspending dependency keeps the parent on the safe VM
+        // fallback rather than creating a partially compiled native call chain.
+        let mut call_depth = 1usize;
+        for &callee in plan.native_calls.values() {
+            let nested =
+                self.ensure_native_leaf_call_at_depth(module_idx, callee, module, depth + 1)?;
+            call_depth = call_depth.max(nested.call_depth + 1);
+        }
+        if depth + call_depth > MAX_LEAF_CALL_DEPTH {
+            return None;
+        }
+
         let symbol = format!("nulang_jit_leaf_{module_idx}_{func_idx}");
-        let native_calls = std::collections::HashMap::new();
         let started = std::time::Instant::now();
         let ptr = self
             .codegen
@@ -489,7 +544,7 @@ impl JitSession {
                 instructions: &module.instructions,
                 optimization: CodegenOptimization::Fast,
                 kind: NativeCompileKind::Scalar {
-                    native_calls: &native_calls,
+                    native_calls: &plan.native_calls,
                 },
             })
             .ok()?;
@@ -504,8 +559,10 @@ impl JitSession {
             ptr,
             return_reg: plan.return_reg,
             required_args: plan.required_args,
+            call_depth,
         };
         self.native_leaf_calls.insert((module_idx, func_idx), call);
+        self.rebuild_native_leaf_table(module_idx);
         Some(call)
     }
 
@@ -1057,19 +1114,10 @@ impl crate::backends::JitBackend for JitSession {
             return crate::backends::TieredAction::RanJit;
         }
 
-        let leaf_calls: Vec<(usize, *const u8, u8, usize)> = self
-            .native_leaf_calls
-            .iter()
-            .filter_map(|(&(leaf_module, func_idx), call)| {
-                (leaf_module == module_idx).then_some((
-                    func_idx,
-                    call.ptr,
-                    call.return_reg,
-                    call.required_args,
-                ))
-            })
-            .collect();
-        crate::jit::runtime::set_jit_leaf_calls(&leaf_calls, constants.as_ptr());
+        crate::jit::runtime::set_jit_leaf_calls(
+            self.native_leaf_tables.get(&module_idx),
+            constants.as_ptr(),
+        );
         func(regs.as_mut_ptr(), constants.as_ptr());
         crate::jit::runtime::clear_jit_leaf_calls();
         crate::backends::TieredAction::RanJit
