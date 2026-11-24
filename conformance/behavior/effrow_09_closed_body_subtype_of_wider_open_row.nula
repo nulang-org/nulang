@@ -1,4 +1,7 @@
-fn f() -> Unit ! {IO, FS, | row} {
+// The closed {IO} body satisfies its wider open declaration.
+// Time widens the known effects without triggering an unrelated FS authority gate.
+// Do not call f at the top level: its unresolved tail cannot be discharged
+// without a compatible caller effect row or an explicit row substitution.
+fn f() -> Unit ! {IO, Time, | row} {
     perform IO.print("subset")
 }
-f()
