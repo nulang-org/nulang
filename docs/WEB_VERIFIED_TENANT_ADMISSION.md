@@ -87,3 +87,29 @@ the native permissions package or OpenFGA. Do not expose policy details to the
 client. Resource-level checks in the same database transaction remain necessary
 for mutations; independent CSRF and database isolation remain mandatory. This
 hook does not secure static files or SSE subscriptions.
+
+## Native RBAC adapter (experimental)
+
+Use `web::native_permissions::NativePermissions::compile()` at server setup,
+then attach `native.authorizer(Arc::new(loader))` with
+`TenantAuthGuard::with_authorizer`. The loader runs for each authenticated
+request, returns a `PolicyInput` with canonical resource ownership and fresh
+role assignments/rules, and returns `None` on lookup or policy-store failure.
+The principal and tenant supplied to the native evaluator come exclusively
+from `VerifiedTenant`. Route parameters are untrusted lookup keys.
+
+The adapter compiles the bundled `@nulang/permissions` source once and invokes
+its existing `decision_reason` via the typed VM ABI. Policy values are passed
+as constants, never interpolated into program source. Only the exact native
+allow result admits the request; VM errors and oversized inputs deny.
+The current ABI allows at most 21 role assignments and 12 permission rules
+per check, with at most 256 UTF-8 bytes per field. Never truncate a snapshot:
+omitting a deny rule can cause an incorrect allow. These are experimental
+limits, not recommended production capacity. Larger policies require a
+reviewed typed materialization path or a separate external PDP.
+
+The application still owns the authoritative store, fresh session membership,
+canonical resource lookup, timeout/error handling for that store, and
+transactional authorization/RLS for the actual protected resource. The adapter
+does not establish policy revision consistency, prevent resource changes
+between authorization and use, or secure private SSE/static content.
