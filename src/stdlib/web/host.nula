@@ -2,6 +2,8 @@
 // Import: `import stdlib::web`
 //
 // The `Web` effect is the runtime host for the compiler-first web framework.
+// String-valued request accessors and kv_get return an empty String when
+// a value is absent; they never return Nil for a String return type.
 // Wrapper functions also declare the placement effects (`Request`, `Render`,
 // `Respond`) so the compiler can infer placements.
 
