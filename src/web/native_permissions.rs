@@ -4,17 +4,17 @@ use crate::bytecode::Constant;
 use crate::mir_codegen::CompiledWebModule;
 use crate::runtime::HttpMethod;
 use crate::web::handler_call::{
-    render_typed_bound_handler, TypedBoundRouteArgument, TypedWebValue,
+    render_trusted_policy_handler, TypedBoundRouteArgument, TypedWebValue,
 };
 use crate::web::tenant_auth::{TenantRouteAuthorizer, VerifiedTenant};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 const SOURCE: &str = include_str!("../../packages/nulang-permissions/src/lib.nula");
-// The existing typed VM ABI caps scalar arrays at 64 entries. Never truncate:
-// omission of a deny rule can turn a denial into an allow.
-const MAX_ASSIGNMENTS: usize = 64 / 3;
-const MAX_RULES: usize = 64 / 5;
+// Separate trusted-policy budget (not the browser form budget). Bound the
+// native evaluator's worst-case nested loop. Never truncate matching rules.
+const MAX_ASSIGNMENTS: usize = 128;
+const MAX_RULES: usize = 128;
 const MAX_FIELD_BYTES: usize = 256;
 
 const BRIDGE: &str = r#"
@@ -75,6 +75,72 @@ pub type PolicyLoader = dyn Fn(&VerifiedTenant, HttpMethod, &str, &HashMap<Strin
     + Send
     + Sync;
 
+/// Immutable tenant-scoped policy materialization. The authoritative loader
+/// must fetch memberships, rules and revision in one consistent read and must
+/// select the current revision; this value alone cannot prove freshness.
+pub struct PolicySnapshot {
+    tenant_id: String,
+    revision: u64,
+    assignments: Vec<RoleAssignment>,
+    rules: Vec<PermissionRule>,
+}
+
+impl PolicySnapshot {
+    pub fn new(
+        tenant_id: &str,
+        revision: u64,
+        assignments: Vec<RoleAssignment>,
+        rules: Vec<PermissionRule>,
+    ) -> Result<Self, String> {
+        if revision == 0 || tenant_id.is_empty() || tenant_id.len() > MAX_FIELD_BYTES {
+            return Err("invalid policy snapshot tenant or revision".into());
+        }
+        if assignments.len() > MAX_ASSIGNMENTS || rules.len() > MAX_RULES {
+            return Err("policy snapshot exceeds evaluation budget".into());
+        }
+        if assignments.iter().any(|a| a.tenant_id != tenant_id)
+            || rules.iter().any(|r| r.tenant_id != tenant_id)
+        {
+            return Err("policy snapshot contains foreign tenant entries".into());
+        }
+        if assignments.iter().any(|a| {
+            [&a.tenant_id, &a.subject_id, &a.role]
+                .iter()
+                .any(|s| s.len() > MAX_FIELD_BYTES)
+        }) || rules.iter().any(|r| {
+            [&r.tenant_id, &r.role, &r.resource, &r.action, &r.outcome]
+                .iter()
+                .any(|s| s.len() > MAX_FIELD_BYTES)
+        }) {
+            return Err("policy snapshot field exceeds evaluation budget".into());
+        }
+        Ok(Self {
+            tenant_id: tenant_id.into(),
+            revision,
+            assignments,
+            rules,
+        })
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub fn tenant_id(&self) -> &str {
+        &self.tenant_id
+    }
+}
+
+pub struct SnapshotPolicyInput {
+    pub resource_tenant_id: String,
+    pub resource: String,
+    pub action: String,
+    pub snapshot: Arc<PolicySnapshot>,
+}
+
+pub type SnapshotPolicyLoader = dyn Fn(&VerifiedTenant, HttpMethod, &str, &HashMap<String, String>) -> Option<SnapshotPolicyInput>
+    + Send
+    + Sync;
+
 pub struct NativePermissions {
     compiled: CompiledWebModule,
     function_index: usize,
@@ -128,24 +194,62 @@ impl NativePermissions {
         })
     }
 
+    /// Load a single immutable policy revision for this request. Never cache
+    /// a revision here: the loader owns freshness and revocation semantics.
+    pub fn snapshot_authorizer(
+        self,
+        loader: Arc<SnapshotPolicyLoader>,
+    ) -> Arc<TenantRouteAuthorizer> {
+        Arc::new(move |principal, method, route, params| {
+            loader(principal, method, route, params).is_some_and(|input| {
+                input.snapshot.tenant_id() == principal.tenant_id()
+                    && self.evaluate(
+                        principal,
+                        &input.resource_tenant_id,
+                        &input.resource,
+                        &input.action,
+                        &input.snapshot.assignments,
+                        &input.snapshot.rules,
+                    )
+            })
+        })
+    }
+
     fn permits(&self, principal: &VerifiedTenant, input: &PolicyInput) -> bool {
-        if input.assignments.len() > MAX_ASSIGNMENTS || input.rules.len() > MAX_RULES {
+        self.evaluate(
+            principal,
+            &input.resource_tenant_id,
+            &input.resource,
+            &input.action,
+            &input.assignments,
+            &input.rules,
+        )
+    }
+
+    fn evaluate(
+        &self,
+        principal: &VerifiedTenant,
+        resource_tenant_id: &str,
+        resource: &str,
+        action: &str,
+        assignments: &[RoleAssignment],
+        rules: &[PermissionRule],
+    ) -> bool {
+        if assignments.len() > MAX_ASSIGNMENTS || rules.len() > MAX_RULES {
             return false;
         }
         let scalars = [
             principal.tenant_id(),
             principal.subject_id(),
-            &input.resource_tenant_id,
-            &input.resource,
-            &input.action,
+            resource_tenant_id,
+            resource,
+            action,
         ];
-        let assignments: Vec<&str> = input
-            .assignments
+        let assignments: Vec<&str> = assignments
             .iter()
             .flat_map(|a| [a.tenant_id.as_str(), a.subject_id.as_str(), a.role.as_str()])
             .collect();
-        let rules: Vec<&str> = input
-            .rules
+        let rules: Vec<&str> = rules
             .iter()
             .flat_map(|r| {
                 [
@@ -180,7 +284,7 @@ impl NativePermissions {
                 value: TypedWebValue::ArrayScalars(fields.into_iter().map(constant).collect()),
             });
         }
-        render_typed_bound_handler(&self.compiled, self.function_index, 7, &args)
+        render_trusted_policy_handler(&self.compiled, self.function_index, 7, &args)
             .is_ok_and(|decision| decision == "allow")
     }
 }

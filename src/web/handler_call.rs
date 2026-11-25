@@ -98,6 +98,27 @@ pub fn render_typed_bound_handler(
     handler_param_count: usize,
     args: &[TypedBoundRouteArgument],
 ) -> Result<String, String> {
+    render_typed_with_array_limit(compiled, func_idx, handler_param_count, args, 64)
+}
+
+/// Crate-private policy ABI; only the bundled policy bridge may supply these
+/// larger, server-owned argument banks. HTTP forms retain their 64-item cap.
+pub(crate) fn render_trusted_policy_handler(
+    compiled: &crate::mir_codegen::CompiledWebModule,
+    func_idx: usize,
+    handler_param_count: usize,
+    args: &[TypedBoundRouteArgument],
+) -> Result<String, String> {
+    render_typed_with_array_limit(compiled, func_idx, handler_param_count, args, 640)
+}
+
+fn render_typed_with_array_limit(
+    compiled: &crate::mir_codegen::CompiledWebModule,
+    func_idx: usize,
+    handler_param_count: usize,
+    args: &[TypedBoundRouteArgument],
+    array_limit: usize,
+) -> Result<String, String> {
     // The MIR compiler reserves r0..r11 for call arguments.
     if handler_param_count > 12 || args.len() != handler_param_count {
         return Err(
@@ -172,8 +193,10 @@ pub fn render_typed_bound_handler(
                 executable.emit(Instruction::new3(OpCode::RecS, dst, payload, ELEM_REG));
             }
             TypedWebValue::ArrayScalars(values) => {
-                if values.len() > 64 {
-                    return Err("typed web array exceeds 64 element form limit".into());
+                if values.len() > array_limit {
+                    return Err(format!(
+                        "typed web array exceeds {array_limit} element limit"
+                    ));
                 }
                 for value in values {
                     validate_typed_constant(value)?;

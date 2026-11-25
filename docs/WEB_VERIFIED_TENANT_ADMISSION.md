@@ -102,8 +102,9 @@ The adapter compiles the bundled `@nulang/permissions` source once and invokes
 its existing `decision_reason` via the typed VM ABI. Policy values are passed
 as constants, never interpolated into program source. Only the exact native
 allow result admits the request; VM errors and oversized inputs deny.
-The current ABI allows at most 21 role assignments and 12 permission rules
-per check, with at most 256 UTF-8 bytes per field. Never truncate a snapshot:
+The trusted policy ABI allows at most 128 role assignments and 128 permission
+rules per check, with at most 256 UTF-8 bytes per field. The browser form ABI
+retains its separate 64-element array limit. Never truncate a snapshot:
 omitting a deny rule can cause an incorrect allow. These are experimental
 limits, not recommended production capacity. Larger policies require a
 reviewed typed materialization path or a separate external PDP.
@@ -111,5 +112,19 @@ reviewed typed materialization path or a separate external PDP.
 The application still owns the authoritative store, fresh session membership,
 canonical resource lookup, timeout/error handling for that store, and
 transactional authorization/RLS for the actual protected resource. The adapter
-does not establish policy revision consistency, prevent resource changes
+does not establish durable policy-store revision consistency, prevent resource changes
 between authorization and use, or secure private SSE/static content.
+
+### Immutable policy snapshots
+
+Use `PolicySnapshot::new(tenant_id, revision, assignments, rules)` and
+`NativePermissions::snapshot_authorizer` for one immutable, tenant-scoped
+policy revision per evaluation. The loader returns `SnapshotPolicyInput`
+with an `Arc<PolicySnapshot>` and canonical resource details. Invalid revisions,
+foreign tenant entries and oversized snapshots are rejected; the evaluator
+also rejects a snapshot whose tenant differs from the verified principal.
+The adapter does not cache snapshots. A loader must atomically fetch the
+current revision and its associated assignments and rules, and must reject
+stale revisions or store failures. A revision label is not proof of freshness;
+this API does not enforce monotonic updates across requests or processes.
+Do not use this as a substitute for transactional mutation authorization.
