@@ -7,6 +7,7 @@
 
 use crate::runtime::HttpMethod;
 use crate::web::runtime_bindings::RuntimeWebRoute;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Principal constructed by a trusted session+membership verifier.
@@ -48,11 +49,19 @@ impl VerifiedTenant {
 /// on backend errors, and never treat a client-provided tenant id as authority.
 pub type TenantSessionResolver = dyn Fn(&str) -> Option<VerifiedTenant> + Send + Sync;
 
+/// Application-owned policy decision point. Only invoked after verified session
+/// resolution. Matched route parameters are untrusted lookup keys, not authority.
+/// Return false on missing policy, denial, or backend error. Do not cache stale
+/// membership or permission decisions; resolve canonical resource ownership.
+pub type TenantRouteAuthorizer =
+    dyn Fn(&VerifiedTenant, HttpMethod, &str, &HashMap<String, String>) -> bool + Send + Sync;
+
 #[derive(Clone)]
 pub struct TenantAuthGuard {
     cookie_name: String,
     protected_routes: Vec<(HttpMethod, String)>,
     resolver: Arc<TenantSessionResolver>,
+    authorizer: Option<Arc<TenantRouteAuthorizer>>,
 }
 
 impl std::fmt::Debug for TenantAuthGuard {
@@ -61,6 +70,7 @@ impl std::fmt::Debug for TenantAuthGuard {
             .field("cookie_name", &self.cookie_name)
             .field("protected_routes", &self.protected_routes)
             .field("resolver", &"[redacted]")
+            .field("policy_configured", &self.authorizer.is_some())
             .finish()
     }
 }
@@ -118,6 +128,26 @@ impl TenantAuthGuard {
             cookie_name: cookie_name.into(),
             protected_routes,
             resolver,
+            authorizer: None,
+        })
+    }
+
+    /// Opt into authorization in addition to session admission. Existing
+    /// guards without this hook are identity-only, not policy-enforced.
+    pub fn with_authorizer(mut self, authorizer: Arc<TenantRouteAuthorizer>) -> Self {
+        self.authorizer = Some(authorizer);
+        self
+    }
+
+    pub(crate) fn permits(
+        &self,
+        principal: &VerifiedTenant,
+        method: HttpMethod,
+        route: &str,
+        params: &HashMap<String, String>,
+    ) -> bool {
+        self.authorizer.as_ref().map_or(true, |authorize| {
+            authorize(principal, method, route, params)
         })
     }
 

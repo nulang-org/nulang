@@ -1738,6 +1738,7 @@ impl WebDevServer {
 
         let path = request.path.clone();
 
+        let mut protected_response = false;
         let mut response = if path.starts_with(Self::SSE_PATH_PREFIX) {
             let room = &path[Self::SSE_PATH_PREFIX.len()..];
             Self::serve_sse(room, &mut stream, shutdown.clone());
@@ -1751,10 +1752,11 @@ impl WebDevServer {
         {
             // Only a registered guarded route can acquire a tenant identity.
             // A raw tenant header, query value or cookie payload is never trusted.
-            let authenticated = tenant_guard
+            let guard = tenant_guard
                 .as_deref()
-                .filter(|guard| guard.protects(route.route.method, &route.route.path))
-                .map(|guard| guard.resolve(&request.headers));
+                .filter(|guard| guard.protects(route.route.method, &route.route.path));
+            protected_response = guard.is_some();
+            let authenticated = guard.map(|guard| guard.resolve(&request.headers));
             if matches!(authenticated, Some(None)) {
                 HttpResponse {
                     status: 401,
@@ -1764,6 +1766,17 @@ impl WebDevServer {
                         ("WWW-Authenticate".into(), "Session".into()),
                     ],
                     body: b"Authentication required".to_vec(),
+                }
+            } else if guard
+                .zip(authenticated.as_ref().and_then(|id| id.as_ref()))
+                .is_some_and(|(guard, principal)| {
+                    !guard.permits(principal, route.route.method, &route.route.path, &params)
+                })
+            {
+                HttpResponse {
+                    status: 403,
+                    headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+                    body: b"Forbidden".to_vec(),
                 }
             } else if let Some(response) = invalid_ui_action_response(&captured) {
                 response
@@ -1886,6 +1899,14 @@ impl WebDevServer {
         } else {
             Self::serve_static(static_dir.as_deref(), output_dir.as_deref(), &request.path)
         };
+        if protected_response {
+            response
+                .headers
+                .retain(|(name, _)| !name.eq_ignore_ascii_case("Cache-Control"));
+            response
+                .headers
+                .push(("Cache-Control".into(), "no-store".into()));
+        }
         for cookie in take_response_cookies() {
             response.headers.push(("Set-Cookie".into(), cookie));
         }
