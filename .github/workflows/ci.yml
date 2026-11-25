@@ -78,7 +78,7 @@ jobs:
   # -----------------------------------------------------------------------
   test:
     name: Build & Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
@@ -86,7 +86,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y python3-dev
+        run: bash scripts/ci/install-python-dev.sh
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -140,13 +140,13 @@ jobs:
   # -----------------------------------------------------------------------
   release:
     name: Release Build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v7
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y python3-dev
+        run: bash scripts/ci/install-python-dev.sh
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -253,13 +253,13 @@ jobs:
   # -----------------------------------------------------------------------
   wasm-backend:
     name: Build & Test (wasm-backend feature)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y python3-dev
+        run: bash scripts/ci/install-python-dev.sh
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -280,13 +280,13 @@ jobs:
   # -----------------------------------------------------------------------
   lint:
     name: Format, Clippy & Audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y python3-dev
+        run: bash scripts/ci/install-python-dev.sh
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -394,7 +394,7 @@ jobs:
   # -----------------------------------------------------------------------
   bench:
     name: Benchmarks (regression-gated)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
       contents: write  # Persist rolling benchmark history after regression checks pass
@@ -407,7 +407,7 @@ jobs:
           # Git commit time instead of unreliable filesystem mtimes.
           fetch-depth: 0
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y python3-dev
+        run: bash scripts/ci/install-python-dev.sh
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
