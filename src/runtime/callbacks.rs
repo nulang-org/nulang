@@ -424,6 +424,18 @@ pub(crate) fn perform_web_builtin(
             let s = resolve(constants, *regs.first()?);
             Some(callbacks.alloc_string(&s))
         }
+        Some("turbo_stream") => {
+            let action = resolve(constants, *regs.first()?);
+            let target = resolve(constants, *regs.get(1)?);
+            let content = resolve(constants, *regs.get(2)?);
+            match crate::web::turbo::render_stream(&action, &target, &content) {
+                Some(stream) => {
+                    crate::runtime::http_server::mark_turbo_stream_response();
+                    Some(callbacks.alloc_string(&stream))
+                }
+                None => Some(crate::vm::Value::nil()),
+            }
+        }
         Some("route") => Some(crate::vm::Value::unit()),
         Some("redirect") => {
             let url = resolve(constants, *regs.first()?);
@@ -454,6 +466,10 @@ pub(crate) fn perform_web_builtin(
                 crate::runtime::http_server::current_request_header(&name),
             ))
         }
+        Some("verified_tenant_id") => Some(string_or_empty(
+            callbacks,
+            crate::runtime::http_server::current_verified_tenant_id(),
+        )),
         Some("cookie") => {
             let name = resolve(constants, *regs.first()?);
             Some(string_or_empty(
