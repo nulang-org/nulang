@@ -190,3 +190,16 @@ fn typed_array_rejects_heterogeneous_or_out_of_range_scalar_values() {
         "i64 overflow must not truncate into VM int48"
     );
 }
+
+#[test]
+fn browser_form_array_limit_is_not_relaxed_by_trusted_policy_materialization() {
+    let (compiled, idx) = compiled("fn endpoint(items: [Int]) -> Int { items[0] }");
+    let args = |len| {
+        [arg(
+            0,
+            TypedWebValue::ArrayScalars(vec![Constant::Int(1); len]),
+        )]
+    };
+    assert!(render_typed_bound_handler(&compiled, idx, 1, &args(64)).is_ok());
+    assert!(render_typed_bound_handler(&compiled, idx, 1, &args(65)).is_err());
+}

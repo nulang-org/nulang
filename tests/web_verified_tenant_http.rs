@@ -368,7 +368,7 @@ fn native_permissions_authorizer_enforces_current_trusted_resource_policy() {
                 outcome: "malformed".into(),
                 ..input.rules[0].clone()
             }),
-            4 => input.rules = vec![input.rules[0].clone(); 13],
+            4 => input.rules = vec![input.rules[0].clone(); 129],
             5 => return None,
             _ => {}
         }
@@ -417,4 +417,86 @@ fn native_permissions_authorizer_enforces_current_trusted_resource_policy() {
             "mode {value}: {denied}"
         );
     }
+}
+
+#[test]
+fn native_policy_snapshots_support_large_policies_and_preserve_late_denies() {
+    use nulang::web::native_permissions::{
+        NativePermissions, PermissionRule, PolicySnapshot, RoleAssignment, SnapshotPolicyInput,
+    };
+    use std::sync::RwLock;
+    let membership = RoleAssignment {
+        tenant_id: "tenant-a".into(),
+        subject_id: "user-a".into(),
+        role: "reader".into(),
+    };
+    let rule = PermissionRule {
+        tenant_id: "tenant-a".into(),
+        role: "reader".into(),
+        resource: "document".into(),
+        action: "read".into(),
+        outcome: "allow".into(),
+    };
+    let mut assignments = vec![
+        RoleAssignment {
+            subject_id: "unrelated".into(),
+            ..membership.clone()
+        };
+        127
+    ];
+    assignments.push(membership.clone());
+    let mut rules = vec![
+        PermissionRule {
+            resource: "unrelated".into(),
+            ..rule.clone()
+        };
+        127
+    ];
+    rules.push(rule.clone());
+    let first =
+        Arc::new(PolicySnapshot::new("tenant-a", 1, assignments.clone(), rules.clone()).unwrap());
+    assert_eq!(first.revision(), 1);
+    assert!(PolicySnapshot::new("tenant-a", 0, assignments.clone(), rules.clone()).is_err());
+    assert!(PolicySnapshot::new("tenant-b", 1, assignments.clone(), rules.clone()).is_err());
+    assert!(
+        PolicySnapshot::new("tenant-a", 2, vec![membership.clone(); 129], rules.clone()).is_err()
+    );
+    assert!(
+        PolicySnapshot::new("tenant-a", 2, assignments.clone(), vec![rule.clone(); 129]).is_err()
+    );
+    let current = Arc::new(RwLock::new(first.clone()));
+    let store = current.clone();
+    let native = NativePermissions::compile().unwrap();
+    let authorizer = native.snapshot_authorizer(Arc::new(move |_, _, _, _| {
+        Some(SnapshotPolicyInput {
+            resource_tenant_id: "tenant-a".into(),
+            resource: "document".into(),
+            action: "read".into(),
+            snapshot: store.read().ok()?.clone(),
+        })
+    }));
+    let server = WebDevServer::bind_with_tenant_guard(
+        0,
+        None,
+        None,
+        vec![route("/secure")],
+        guard().with_authorizer(authorizer),
+    )
+    .unwrap();
+    let a = [("Cookie", format!("__Host-nulang_tenant={SESSION_A}"))];
+    let b = [("Cookie", format!("__Host-nulang_tenant={SESSION_B}"))];
+    let allowed = get(server.port, "/secure", &a);
+    assert!(allowed.starts_with("HTTP/1.1 200 OK"), "{allowed}");
+    let foreign = get(server.port, "/secure", &b);
+    assert!(foreign.starts_with("HTTP/1.1 403 Forbidden"), "{foreign}");
+    rules[126] = rule.clone();
+    rules[127] = PermissionRule {
+        outcome: "deny".into(),
+        ..rule.clone()
+    };
+    let second = Arc::new(PolicySnapshot::new("tenant-a", 2, assignments, rules).unwrap());
+    *current.write().unwrap() = second;
+    let denied = get(server.port, "/secure", &a);
+    assert!(denied.starts_with("HTTP/1.1 403 Forbidden"), "{denied}");
+    assert_eq!(first.revision(), 1);
 }
