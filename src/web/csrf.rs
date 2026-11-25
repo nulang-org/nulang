@@ -49,11 +49,52 @@ fn configured_authority(origin: &str) -> Result<&str, OriginCheckError> {
         || rest
             .bytes()
             .any(|byte| matches!(byte, b'/' | b'?' | b'#' | b'@' | 92))
-        || rest.starts_with(':')
     {
         return Err(OriginCheckError::InvalidConfiguration);
     }
+
+    let port = if let Some(bracketed) = rest.strip_prefix('[') {
+        let (ip, suffix) = bracketed
+            .split_once(']')
+            .ok_or(OriginCheckError::InvalidConfiguration)?;
+        if ip.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(OriginCheckError::InvalidConfiguration);
+        }
+        if suffix.is_empty() {
+            None
+        } else {
+            Some(
+                suffix
+                    .strip_prefix(':')
+                    .ok_or(OriginCheckError::InvalidConfiguration)?,
+            )
+        }
+    } else {
+        let (host, port) = rest
+            .split_once(':')
+            .map_or((rest, None), |(host, port)| (host, Some(port)));
+        if host.is_empty()
+            || host.starts_with('.')
+            || host.contains("..")
+            || !host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+        {
+            return Err(OriginCheckError::InvalidConfiguration);
+        }
+        port
+    };
+
+    if port.is_some_and(|port| port.parse::<u16>().map_or(true, |value| value == 0)) {
+        return Err(OriginCheckError::InvalidConfiguration);
+    }
     Ok(rest)
+}
+
+/// Validate a trusted public origin before accepting connections. An invalid
+/// deployment configuration must not leave a partially usable Web listener.
+pub(crate) fn validate_public_origin(origin: &str) -> Result<(), OriginCheckError> {
+    configured_authority(origin).map(|_| ())
 }
 
 fn direct_host_allowed(host: &str, local: SocketAddr) -> bool {
@@ -75,21 +116,20 @@ fn direct_host_allowed(host: &str, local: SocketAddr) -> bool {
     false
 }
 
-/// Verify provenance before invoking any state-changing Web route.
+/// Validate the Host for every Web request before dispatch, then require
+/// same-origin provenance for state-changing requests.
 ///
-/// Configure public_origin for a trusted HTTPS reverse proxy. Without it,
-/// only the local listening IP or localhost are admitted to prevent malicious
-/// DNS-rebinding Host spoofing. Referer is fallback when Origin is absent.
+/// This also protects read-only routes and SSE subscriptions from DNS
+/// rebinding. Configure public_origin for a trusted reverse proxy. Without it,
+/// only the local listening IP or localhost are accepted. The Origin/Referer
+/// checks are required for unsafe methods only. This is not authentication.
 pub fn validate_mutation_origin(
     method: &str,
     headers: &[(String, String)],
     local_addr: Option<SocketAddr>,
     public_origin: Option<&str>,
 ) -> Result<(), OriginCheckError> {
-    if matches!(method, "GET" | "HEAD" | "OPTIONS") {
-        return Ok(());
-    }
-
+    let safe_method = matches!(method, "GET" | "HEAD" | "OPTIONS");
     let host = single_header(headers, "Host")?.ok_or(OriginCheckError::MissingHost)?;
     let expected = if let Some(origin) = public_origin {
         let trusted_authority = configured_authority(origin)?;
@@ -99,11 +139,25 @@ pub fn validate_mutation_origin(
         origin.to_string()
     } else {
         let local = local_addr.ok_or(OriginCheckError::UntrustedHost)?;
-        if !direct_host_allowed(host, local) {
+        // Legacy read-only HTTP fixtures send Host: localhost without a port.
+        // This name cannot be DNS-rebound by an attacker-controlled hostname.
+        // Unsafe requests retain the strict authority-with-port policy.
+        let legacy_loopback_read = safe_method
+            && local.ip().is_loopback()
+            && (host.eq_ignore_ascii_case("localhost")
+                || host.eq_ignore_ascii_case(&local.ip().to_string()));
+        if !direct_host_allowed(host, local) && !legacy_loopback_read {
             return Err(OriginCheckError::UntrustedHost);
         }
         format!("http://{host}")
     };
+
+    // Safe reads need neither Origin nor Referer, but must have passed Host
+    // admission above. Otherwise an attacker-controlled DNS name resolving to
+    // localhost can read sensitive GET pages using its own browser origin.
+    if safe_method {
+        return Ok(());
+    }
 
     if let Some(site) = single_header(headers, "Sec-Fetch-Site")? {
         if site != "same-origin" && site != "none" {
@@ -147,10 +201,61 @@ mod tests {
     }
 
     #[test]
-    fn safe_requests_need_no_origin_or_host() {
+    fn safe_requests_require_a_trusted_host_but_no_origin() {
         for method in ["GET", "HEAD", "OPTIONS"] {
-            assert_eq!(validate_mutation_origin(method, &[], None, None), Ok(()));
+            let trusted = headers(&[("Host", "localhost:8080")]);
+            assert_eq!(
+                validate_mutation_origin(method, &trusted, Some(loopback()), None),
+                Ok(())
+            );
+            // Existing Web HTTP smoke fixtures use this loopback-only form.
+            let legacy = headers(&[("Host", "localhost")]);
+            assert_eq!(
+                validate_mutation_origin(method, &legacy, Some(loopback()), None),
+                Ok(())
+            );
+            assert_eq!(
+                validate_mutation_origin(method, &[], Some(loopback()), None),
+                Err(OriginCheckError::MissingHost)
+            );
+            let rebound = headers(&[("Host", "attacker.example:8080")]);
+            assert_eq!(
+                validate_mutation_origin(method, &rebound, Some(loopback()), None),
+                Err(OriginCheckError::UntrustedHost)
+            );
+            let duplicate = headers(&[
+                ("Host", "localhost:8080"),
+                ("Host", "attacker.example:8080"),
+            ]);
+            assert_eq!(
+                validate_mutation_origin(method, &duplicate, Some(loopback()), None),
+                Err(OriginCheckError::DuplicateHeader)
+            );
         }
+    }
+
+    #[test]
+    fn read_requests_through_proxy_require_configured_public_host() {
+        let wrong_host = headers(&[("Host", "attacker.example")]);
+        assert_eq!(
+            validate_mutation_origin(
+                "GET",
+                &wrong_host,
+                Some(loopback()),
+                Some("https://app.example.com")
+            ),
+            Err(OriginCheckError::UntrustedHost)
+        );
+        let trusted = headers(&[("Host", "app.example.com")]);
+        assert_eq!(
+            validate_mutation_origin(
+                "GET",
+                &trusted,
+                Some(loopback()),
+                Some("https://app.example.com")
+            ),
+            Ok(())
+        );
     }
 
     #[test]
