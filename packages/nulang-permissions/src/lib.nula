@@ -25,8 +25,59 @@ pub fn permission_rule(
     { tenant_id: tenant_id, role: role, resource: resource, action: action, outcome: outcome }
 }
 
-/// Pure policy decision. No role, missing policy, or missing identity => deny.
+/// Stable internal decision reason. All values except "allow" deny.
+/// Do not expose reasons to untrusted clients: they can reveal policy details.
 /// resource_tenant_id must come from the loaded object, not a request parameter.
+pub fn decision_reason(
+    tenant_id: String,
+    subject_id: String,
+    resource_tenant_id: String,
+    resource: String,
+    action: String,
+    assignments,
+    rules
+) -> String {
+    if tenant_id == "" || subject_id == "" || resource_tenant_id == ""
+        || resource == "" || action == "" then {
+        "invalid_request"
+    } else if tenant_id != resource_tenant_id then {
+        "tenant_mismatch"
+    } else {
+        var allowed = false;
+        var denied = false;
+        var invalid = false;
+        var member = false;
+        for membership in assignments {
+            if membership.tenant_id == tenant_id
+                && membership.subject_id == subject_id
+                && membership.role != "" then {
+                member = true;
+                for rule in rules {
+                    if rule.tenant_id == tenant_id
+                        && rule.role == membership.role
+                        && rule.resource == resource
+                        && rule.action == action then {
+                        if rule.outcome == "allow" then {
+                            allowed = true
+                        } else if rule.outcome == "deny" then {
+                            denied = true
+                        } else {
+                            invalid = true
+                        }
+                    } else {}
+                }
+            } else {}
+        };
+        if invalid then { "invalid_policy" }
+        else if denied then { "explicit_deny" }
+        else if allowed then { "allow" }
+        else if !member then { "no_membership" }
+        else { "no_matching_allow" }
+    }
+}
+
+
+// Compatibility wrapper: only an explicit allow permits access.
 pub fn is_allowed(
     tenant_id: String,
     subject_id: String,
@@ -36,31 +87,5 @@ pub fn is_allowed(
     assignments,
     rules
 ) -> Bool {
-    if tenant_id == "" || subject_id == "" || resource_tenant_id == ""
-        || resource == "" || action == "" || tenant_id != resource_tenant_id then {
-        false
-    } else {
-        var allowed = false;
-        var denied = false;
-        for membership in assignments {
-            if membership.tenant_id == tenant_id
-                && membership.subject_id == subject_id
-                && membership.role != "" then {
-                for rule in rules {
-                    if rule.tenant_id == tenant_id
-                        && rule.role == membership.role
-                        && rule.resource == resource
-                        && rule.action == action then {
-                        if rule.outcome == "allow" then {
-                            allowed = true
-                        } else {
-                            // "deny" and malformed/unknown effects both deny.
-                            denied = true
-                        }
-                    } else {}
-                }
-            } else {}
-        };
-        allowed && !denied
-    }
+    decision_reason(tenant_id, subject_id, resource_tenant_id, resource, action, assignments, rules) == "allow"
 }
