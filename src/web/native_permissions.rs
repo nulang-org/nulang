@@ -10,6 +10,9 @@ use crate::web::tenant_auth::{TenantRouteAuthorizer, VerifiedTenant};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[cfg(feature = "sqlite")]
+pub mod sqlite_store;
+
 const SOURCE: &str = include_str!("../../packages/nulang-permissions/src/lib.nula");
 // Separate trusted-policy budget (not the browser form budget). Bound the
 // native evaluator's worst-case nested loop. Never truncate matching rules.
@@ -45,14 +48,14 @@ fn native_web_permission(
 }
 "#;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RoleAssignment {
     pub tenant_id: String,
     pub subject_id: String,
     pub role: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PermissionRule {
     pub tenant_id: String,
     pub role: String,
