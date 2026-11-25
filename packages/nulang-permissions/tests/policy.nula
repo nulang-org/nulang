@@ -49,4 +49,15 @@ fn main() {
   assert(is_allowed("tenant-a", "alice", "tenant-a", "document", "read", alice, foreign_deny), "foreign tenant deny does not affect this tenant");
   let blank_role = [role_assignment("tenant-a", "alice", "")];
   assert(!is_allowed("tenant-a", "alice", "tenant-a", "document", "read", blank_role, rules), "blank roles never grant permission");
+  assert(decision_reason("tenant-a", "alice", "tenant-a", "document", "read", alice, rules) == "allow", "explain allow");
+  assert(decision_reason("tenant-a", "alice", "tenant-b", "document", "read", alice, rules) == "tenant_mismatch", "explain tenant mismatch");
+  assert(decision_reason("tenant-a", "", "tenant-a", "document", "read", alice, rules) == "invalid_request", "explain missing identity");
+  assert(decision_reason("tenant-a", "bob", "tenant-a", "document", "read", alice, rules) == "no_membership", "explain missing membership");
+  assert(decision_reason("tenant-a", "alice", "tenant-a", "document", "delete", alice, rules) == "no_matching_allow", "explain absent rule");
+  assert(decision_reason("tenant-a", "alice", "tenant-a", "document", "read", alice, denied) == "explicit_deny", "explain explicit deny");
+  assert(decision_reason("tenant-a", "alice", "tenant-a", "document", "read", alice, malformed_with_allow) == "invalid_policy", "explain malformed effect");
+  let both = [permission_rule("tenant-a", "reader", "document", "read", "deny"), permission_rule("tenant-a", "editor", "document", "read", "alow")];
+  let both_reversed = [permission_rule("tenant-a", "editor", "document", "read", "alow"), permission_rule("tenant-a", "reader", "document", "read", "deny")];
+  assert(decision_reason("tenant-a", "alice", "tenant-a", "document", "read", alice, both) == "invalid_policy", "invalid policy reason takes precedence");
+  assert(decision_reason("tenant-a", "alice", "tenant-a", "document", "read", alice, both_reversed) == "invalid_policy", "reason independent of rule ordering");
 }

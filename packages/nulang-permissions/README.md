@@ -56,3 +56,12 @@ The test file checks legitimate allow paths and cross-tenant, impersonation, inv
 ## Next steps
 
 Integrate with a **verified** tenant resolver (see draft Nulang PR #2606), enforce decisions before handler dispatch, add a shared policy-store interface with revisions, and test database/HTTP E2E tenant boundaries before making production-security claims.
+
+
+### Internal decision diagnostics
+
+`decision_reason(...)` accepts the same inputs as `is_allowed(...)`.
+Precedence: invalid_request, tenant_mismatch, invalid_policy, explicit_deny,
+allow, no_membership, no_matching_allow. Only allow grants access.
+Unknown matching outcomes deny. Keep detailed reasons in trusted server-side
+diagnostics, not client-facing errors; they may reveal policy details.
