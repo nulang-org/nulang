@@ -202,3 +202,61 @@ fn unsafe_protected_route_cannot_start_without_registered_csrf_form_guard() {
         "a server-owned tenant session is not a replacement for mutation CSRF admission"
     );
 }
+
+#[test]
+fn policy_admission_denies_authenticated_but_unauthorized_requests_before_handler() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let enabled = Arc::new(AtomicBool::new(true));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let live = Arc::clone(&enabled);
+    let count = Arc::clone(&calls);
+    let guard = guard().with_authorizer(Arc::new(move |principal, method, route, params| {
+        count.fetch_add(1, Ordering::SeqCst);
+        live.load(Ordering::SeqCst)
+            && principal.subject_id() == "user-a"
+            && principal.tenant_id() == "tenant-a"
+            && method == HttpMethod::Get
+            && route == "/secure"
+            && params.is_empty()
+    }));
+    let server = WebDevServer::bind_with_tenant_guard(
+        0,
+        None,
+        None,
+        vec![route("/secure"), route("/public")],
+        guard,
+    )
+    .unwrap();
+    let a = [("Cookie", format!("__Host-nulang_tenant={SESSION_A}"))];
+    let b = [
+        ("Cookie", format!("__Host-nulang_tenant={SESSION_B}")),
+        ("X-Tenant-Id", "tenant-a".into()),
+        ("X-Role", "owner".into()),
+    ];
+    let anonymous = get(server.port, "/secure", &[]);
+    assert!(
+        anonymous.starts_with("HTTP/1.1 401 Unauthorized"),
+        "{anonymous}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let allowed = get(server.port, "/secure", &a);
+    assert!(
+        allowed.starts_with("HTTP/1.1 200 OK") && allowed.ends_with("tenant-a"),
+        "{allowed}"
+    );
+    assert!(allowed.contains("Cache-Control: no-store"), "{allowed}");
+    let denied = get(server.port, "/secure", &b);
+    assert!(denied.starts_with("HTTP/1.1 403 Forbidden"), "{denied}");
+    assert!(
+        denied.contains("Cache-Control: no-store") && !denied.contains("tenant-b"),
+        "{denied}"
+    );
+    enabled.store(false, Ordering::SeqCst);
+    let revoked = get(server.port, "/secure", &a);
+    assert!(revoked.starts_with("HTTP/1.1 403 Forbidden"), "{revoked}");
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    let public = get(server.port, "/public", &a);
+    assert!(public.starts_with("HTTP/1.1 200 OK"), "{public}");
+    assert!(!public.contains("tenant-a"), "{public}");
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}

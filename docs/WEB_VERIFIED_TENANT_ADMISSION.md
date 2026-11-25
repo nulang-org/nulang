@@ -68,3 +68,22 @@ PostgreSQL feature build and RLS negative tests, default/minimal/release/WASM
 profiles, and security audit. The audited SQLite dependency graph still does
 not support remote libSQL/Turso; resolve that separately before promotion.
 No production deploy or merge is implied.
+
+## Optional server-side route authorization
+
+Attach an application-owned policy decision point with
+`TenantAuthGuard::with_authorizer(Arc::new(|principal, method, route, params| ...))`.
+It receives the verified principal, matched method and route template, and path
+parameters. The callback runs only after successful session resolution, before
+form validation and handler dispatch. Missing or invalid sessions return 401;
+a negative policy decision returns a generic 403. Guarded responses are marked
+`Cache-Control: no-store`, including successful responses.
+
+The existing constructor alone remains identity-only. The authorizer must load
+trusted current memberships and policies, treat path parameters only as lookup
+keys, verify canonical resource ownership, and return false on error or denial.
+It is an adapter seam for local RBAC or a remote PDP, not an implementation of
+the native permissions package or OpenFGA. Do not expose policy details to the
+client. Resource-level checks in the same database transaction remain necessary
+for mutations; independent CSRF and database isolation remain mandatory. This
+hook does not secure static files or SSE subscriptions.
