@@ -128,3 +128,32 @@ current revision and its associated assignments and rules, and must reject
 stale revisions or store failures. A revision label is not proof of freshness;
 this API does not enforce monotonic updates across requests or processes.
 Do not use this as a substitute for transactional mutation authorization.
+
+### Durable local policy store (optional SQLite feature)
+
+`web::native_permissions::sqlite_store::SqlitePolicyStore::open(path)` opens
+an application-owned database with a dedicated current-policy table.
+`publish(None, snapshot)` initializes revision 1; subsequent publication
+requires `publish(Some(previous_revision), snapshot)` with exactly the next
+revision. Both revision and complete policy collections are replaced in one
+atomic SQLite statement. A stale writer or skipped revision returns false;
+backend errors return an error. Do not retry by blindly overwriting the
+current policy: read the latest revision and reapply the intended change.
+Revoke by publishing a successor snapshot (including an empty one), not by
+removing or resetting the row.
+
+`NativePermissions::sqlite_authorizer(Arc::new(store), resource_loader)`
+loads the current policy row using only the verified principal's tenant,
+with no request-selected revision or cached fallback. Resource lookup must
+provide canonical ownership and action. Missing, corrupt, foreign or
+unavailable policy state denies. The trusted policy administration path
+must be independently authenticated and authorized.
+
+This is a single-database local store, not distributed consensus, an audit
+history, or an anti-rollback guarantee against database restoration or file
+tampering. Protect the database path, filesystem permissions and backups.
+The publication and current-row read are individually atomic; a decision
+already in flight may race a later revocation. Resource ownership and
+mutations still require authorization inside the relevant transaction.
+Use one authoritative database for all participating writers/readers; do not
+replicate this file asynchronously and assume immediate revocation.
