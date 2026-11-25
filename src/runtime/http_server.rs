@@ -22,11 +22,13 @@ use crate::value_layout::PAYLOAD_MASK;
 use crate::vm::{resolve_value_string, Value, CLOSURE_ENV_FLAG, VM};
 use crate::web::csrf::validate_mutation_origin;
 use crate::web::dispatch::{render_direct_request, DirectRequestRenderError};
-use crate::web::http_problem::request_decode_problem_response;
+use crate::web::form_guard::{FormGuardError, GuardedFormRoute};
+use crate::web::http_problem::{form_validation_problem_response, request_decode_problem_response};
 use crate::web::http_request::HttpRequestBindingInputs;
 use crate::web::reactivity::inject_client_runtime_script;
 use crate::web::request_bindings::percent_decode_form;
 use crate::web::runtime_bindings::RuntimeWebRoute;
+use crate::web::tenant_auth::{TenantAuthGuard, VerifiedTenant};
 
 /// HTTP method — must match the Nulang-level variant type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -725,7 +727,9 @@ pub struct RequestContext {
 
 thread_local! {
     static CURRENT_REQUEST: RefCell<Option<RequestContext>> = const { RefCell::new(None) };
+    static VERIFIED_TENANT: RefCell<Option<VerifiedTenant>> = const { RefCell::new(None) };
     static RESPONSE_COOKIES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static RESPONSE_MEDIA_TYPE: RefCell<Option<&'static str>> = const { RefCell::new(None) };
 }
 
 /// Set the request context for the current thread, run `f`, then clear it.
@@ -735,9 +739,44 @@ where
 {
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = Some(ctx));
     RESPONSE_COOKIES.with(|c| c.borrow_mut().clear());
+    RESPONSE_MEDIA_TYPE.with(|c| *c.borrow_mut() = None);
     let result = f();
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = None);
     result
+}
+
+/// Access only the tenant identity resolved from a server-side opaque session.
+pub fn current_verified_tenant_id() -> Option<String> {
+    VERIFIED_TENANT.with(|ctx| ctx.borrow().as_ref().map(|id| id.tenant_id().to_owned()))
+}
+
+fn with_verified_tenant<F, R>(identity: Option<VerifiedTenant>, operation: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    struct Restore(Option<VerifiedTenant>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            VERIFIED_TENANT.with(|ctx| *ctx.borrow_mut() = self.0.take());
+        }
+    }
+    let previous = VERIFIED_TENANT.with(|ctx| ctx.replace(identity));
+    let _restore = Restore(previous);
+    operation()
+}
+
+/// Select the Turbo Stream media type only inside a live Web request.
+pub fn mark_turbo_stream_response() {
+    CURRENT_REQUEST.with(|ctx| {
+        if ctx.borrow().is_some() {
+            RESPONSE_MEDIA_TYPE
+                .with(|media| *media.borrow_mut() = Some(crate::web::turbo::TURBO_STREAM_MIME));
+        }
+    });
+}
+
+fn take_response_media_type() -> Option<&'static str> {
+    RESPONSE_MEDIA_TYPE.with(|media| media.borrow_mut().take())
 }
 
 /// Generate a cryptographically random, 256-bit opaque session secret.
@@ -991,8 +1030,6 @@ pub fn realtime_subscribe(room: &str) -> (Vec<String>, Receiver<String>) {
 pub enum Middleware {
     SecurityHeaders,
     RequestLog,
-    #[allow(dead_code)]
-    Csrf,
 }
 
 impl Middleware {
@@ -1019,9 +1056,6 @@ impl Middleware {
                     request.path,
                     response.status
                 );
-            }
-            Middleware::Csrf => {
-                // Phase 2: generate CSRF token cookie and validate on POST.
             }
         }
     }
@@ -1079,6 +1113,11 @@ pub fn render_route_handler(
     module.emit(Instruction::new0(OpCode::Ret));
     vm.load_module(module);
     let mut run = || match vm.run_from(0, entry_offset) {
+        // An invalid HTML host operation returns a VM nil. It is not a valid
+        // rendered response and must not become a successful "nil" document.
+        // Check the actual tagged Value, not its string representation:
+        // returning the legitimate String "nil" still means HTTP 200.
+        Ok(result) if result.is_nil() => None,
         Ok(result) => Some(vm.value_to_string(0, result)),
         Err(_) => None,
     };
@@ -1368,6 +1407,17 @@ fn session_csrf_allowed(request: &HttpRequest, captured: &HttpRequestBindingInpu
     bool::from(submitted.as_bytes().ct_eq(expected.as_bytes()))
 }
 
+fn configured_web_public_origin() -> std::io::Result<Option<String>> {
+    match std::env::var("NULANG_WEB_PUBLIC_ORIGIN") {
+        Ok(origin) => Ok(Some(origin)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid NULANG_WEB_PUBLIC_ORIGIN: {error}"),
+        )),
+    }
+}
+
 /// Dev server that dispatches registered `Web.route` handlers and falls back
 /// to static files for unmatched paths.
 #[derive(Debug)]
@@ -1439,7 +1489,7 @@ impl WebDevServer {
         )
     }
 
-    /// Validates host limits and public origin before opening a listening socket.
+    /// Validate host limits and configured origin through the shared admission path.
     pub fn bind_runtime_with_options(
         port: u16,
         static_dir: Option<PathBuf>,
@@ -1447,25 +1497,135 @@ impl WebDevServer {
         routes: Vec<RuntimeWebRoute>,
         options: WebServerOptions,
     ) -> std::io::Result<Self> {
-        let public_origin = match std::env::var("NULANG_WEB_PUBLIC_ORIGIN") {
-            Ok(value) => Some(value),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(error) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("invalid NULANG_WEB_PUBLIC_ORIGIN: {error}"),
-                ));
-            }
-        };
-        Self::bind_runtime_configured(port, static_dir, output_dir, routes, public_origin, options)
+        Self::bind_runtime_guarded_configured(
+            port,
+            static_dir,
+            output_dir,
+            routes,
+            Vec::new(),
+            configured_web_public_origin()?,
+            None,
+            options,
+        )
     }
 
+    /// Opt-in, independently verified session admission on explicitly guarded routes.
+    pub fn bind_with_tenant_guard(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<WebRoute>,
+        tenant_guard: TenantAuthGuard,
+    ) -> std::io::Result<Self> {
+        let routes = routes
+            .into_iter()
+            .map(|route| RuntimeWebRoute { route, plan: None })
+            .collect();
+        Self::bind_runtime_with_tenant_guard(
+            port,
+            static_dir,
+            output_dir,
+            routes,
+            Vec::new(),
+            tenant_guard,
+        )
+    }
+
+    /// Composes tenant session admission with compiler-validated guarded forms.
+    pub fn bind_runtime_with_tenant_guard(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        guarded_forms: Vec<GuardedFormRoute>,
+        tenant_guard: TenantAuthGuard,
+    ) -> std::io::Result<Self> {
+        Self::bind_runtime_with_tenant_guard_and_options(
+            port,
+            static_dir,
+            output_dir,
+            routes,
+            guarded_forms,
+            tenant_guard,
+            WebServerOptions::default(),
+        )
+    }
+
+    /// Apply host limits and tenant/form admission through the same startup gate.
+    pub fn bind_runtime_with_tenant_guard_and_options(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        guarded_forms: Vec<GuardedFormRoute>,
+        tenant_guard: TenantAuthGuard,
+        options: WebServerOptions,
+    ) -> std::io::Result<Self> {
+        Self::bind_runtime_guarded_configured(
+            port,
+            static_dir,
+            output_dir,
+            routes,
+            guarded_forms,
+            configured_web_public_origin()?,
+            Some(tenant_guard),
+            options,
+        )
+    }
+
+    /// Attach compiler-validated form guards before opening a listening socket.
+    /// Public-origin configuration is validated before accepting connections.
+    pub fn bind_runtime_with_form_guards(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        guarded_forms: Vec<GuardedFormRoute>,
+    ) -> std::io::Result<Self> {
+        let public_origin = configured_web_public_origin()?;
+        Self::bind_runtime_guarded_configured(
+            port,
+            static_dir,
+            output_dir,
+            routes,
+            guarded_forms,
+            public_origin,
+            None,
+            WebServerOptions::default(),
+        )
+    }
+
+    // Keep the explicit-configuration entry point for the existing startup
+    // regression tests without bypassing the common guarded admission path.
+    #[cfg(test)]
     fn bind_runtime_configured(
         port: u16,
         static_dir: Option<PathBuf>,
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
         public_origin: Option<String>,
+        options: WebServerOptions,
+    ) -> std::io::Result<Self> {
+        Self::bind_runtime_guarded_configured(
+            port,
+            static_dir,
+            output_dir,
+            routes,
+            Vec::new(),
+            public_origin,
+            None,
+            options,
+        )
+    }
+
+    fn bind_runtime_guarded_configured(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        guarded_forms: Vec<GuardedFormRoute>,
+        public_origin: Option<String>,
+        tenant_guard: Option<TenantAuthGuard>,
         options: WebServerOptions,
     ) -> std::io::Result<Self> {
         options.validate()?;
@@ -1477,6 +1637,46 @@ impl WebDevServer {
                 )
             })?;
         }
+
+        let mut form_guards = HashMap::new();
+        for guard in guarded_forms {
+            let mut matches = routes.iter().filter(|route| {
+                route.route.method.as_str() == guard.form.method
+                    && route.route.path == guard.form.path
+            });
+            let route = matches.next().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "form guard references an unknown runtime route",
+                )
+            })?;
+            if matches.next().is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "guarded form route has duplicate runtime registrations",
+                ));
+            }
+            guard.check_route(route).map_err(|message| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+            })?;
+            let key = (guard.form.method.clone(), guard.form.path.clone());
+            if form_guards.insert(key, guard).is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "multiple guards target the same form route",
+                ));
+            }
+        }
+
+        if let Some(guard) = &tenant_guard {
+            guard
+                .validate_routes(&routes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+            let form_keys = form_guards.keys().cloned().collect();
+            guard
+                .validate_mutation_routes(&form_keys)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        }
         let listener = TcpListener::bind(("0.0.0.0", port))?;
         let actual_port = listener.local_addr()?.port();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1484,6 +1684,9 @@ impl WebDevServer {
         let connection_slots = Arc::new(ConnectionSlots::new(options.max_concurrent_connections));
         let slots_for_listener = Arc::clone(&connection_slots);
         let routes_clone = routes;
+        let form_guards = Arc::new(form_guards);
+        let guards_clone = Arc::clone(&form_guards);
+        let tenant_guard = tenant_guard.map(Arc::new);
         let static_dir_clone = static_dir.clone();
         let output_dir_clone = output_dir.clone();
 
@@ -1496,6 +1699,8 @@ impl WebDevServer {
                     output_dir_clone,
                     routes_clone,
                     public_origin,
+                    guards_clone,
+                    tenant_guard,
                     shutdown_clone,
                     slots_for_listener,
                     options,
@@ -1516,6 +1721,8 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
         public_origin: Option<String>,
+        form_guards: Arc<HashMap<(String, String), GuardedFormRoute>>,
+        tenant_guard: Option<Arc<TenantAuthGuard>>,
         shutdown: Arc<AtomicBool>,
         slots: Arc<ConnectionSlots>,
         options: WebServerOptions,
@@ -1564,6 +1771,8 @@ impl WebDevServer {
                     let output_dir = output_dir.clone();
                     let routes = Arc::clone(&routes);
                     let public_origin = public_origin.clone();
+                    let form_guards = Arc::clone(&form_guards);
+                    let tenant_guard = tenant_guard.clone();
                     let shutdown = Arc::clone(&shutdown);
                     // A failed spawn drops the closure and lease, returning capacity.
                     if let Err(error) = std::thread::Builder::new()
@@ -1576,6 +1785,8 @@ impl WebDevServer {
                                 output_dir,
                                 routes,
                                 public_origin,
+                                form_guards,
+                                tenant_guard,
                                 shutdown,
                             );
                         })
@@ -1597,6 +1808,8 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Arc<Vec<RuntimeWebRoute>>,
         public_origin: Option<String>,
+        form_guards: Arc<HashMap<(String, String), GuardedFormRoute>>,
+        tenant_guard: Option<Arc<TenantAuthGuard>>,
         shutdown: Arc<AtomicBool>,
     ) {
         let request = match read_http_request(&mut stream) {
@@ -1635,6 +1848,7 @@ impl WebDevServer {
 
         let path = request.path.clone();
 
+        let mut protected_response = false;
         let mut response = if path.starts_with(Self::SSE_PATH_PREFIX) {
             let room = &path[Self::SSE_PATH_PREFIX.len()..];
             Self::serve_sse(room, &mut stream, shutdown.clone());
@@ -1646,30 +1860,129 @@ impl WebDevServer {
                 crate::web::dispatch::match_route(r, &request.path).map(|params| (r, params))
             })
         {
-            if let Some(response) = invalid_ui_action_response(&captured) {
+            // Only a registered guarded route can acquire a tenant identity.
+            // A raw tenant header, query value or cookie payload is never trusted.
+            let guard = tenant_guard
+                .as_deref()
+                .filter(|guard| guard.protects(route.route.method, &route.route.path));
+            protected_response = guard.is_some();
+            let authenticated = guard.map(|guard| guard.resolve(&request.headers));
+            if matches!(authenticated, Some(None)) {
+                HttpResponse {
+                    status: 401,
+                    headers: vec![
+                        ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+                        ("Cache-Control".into(), "no-store".into()),
+                        ("WWW-Authenticate".into(), "Session".into()),
+                    ],
+                    body: b"Authentication required".to_vec(),
+                }
+            } else if guard
+                .zip(authenticated.as_ref().and_then(|id| id.as_ref()))
+                .is_some_and(|(guard, principal)| {
+                    !guard.permits(principal, route.route.method, &route.route.path, &params)
+                })
+            {
+                HttpResponse {
+                    status: 403,
+                    headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+                    body: b"Forbidden".to_vec(),
+                }
+            } else if let Some(response) = invalid_ui_action_response(&captured) {
                 response
+            } else if let Some(error) = form_guards
+                .get(&(
+                    route.route.method.as_str().to_string(),
+                    route.route.path.clone(),
+                ))
+                .and_then(|guard| {
+                    guard
+                        .preflight(request.method.as_str(), &request.headers, &captured)
+                        .err()
+                })
+            {
+                match error {
+                    FormGuardError::Forbidden => HttpResponse {
+                        status: 403,
+                        headers: vec![
+                            ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+                            ("Cache-Control".into(), "no-store".into()),
+                        ],
+                        body: b"Forbidden".to_vec(),
+                    },
+                    FormGuardError::Validation(errors) => {
+                        let problem = form_validation_problem_response(&errors);
+                        let mut headers = problem.headers;
+                        headers.push(("Cache-Control".into(), "no-store".into()));
+                        HttpResponse {
+                            status: problem.status,
+                            headers,
+                            body: problem.body,
+                        }
+                    }
+                }
             } else {
                 let values = captured.values(&params, &request.headers);
                 let ctx = RequestContext {
                     request: request.clone(),
                     params: params.clone(),
                 };
-                let rendered =
-                    with_request_context(ctx, || match render_direct_request(route, &values) {
-                        Ok(Some(rendered)) => Ok(Some(rendered)),
-                        Ok(None) => Ok(render_route_handler(
-                            &route.route.handler_module,
-                            route.route.handler_func_idx,
-                            None,
-                        )),
-                        Err(error) => Err(error),
-                    });
+                let guard_key = (
+                    route.route.method.as_str().to_string(),
+                    route.route.path.clone(),
+                );
+                // Typed and legacy handlers share one request scope. Without it,
+                // typed form VM calls cannot mark Turbo Stream response metadata.
+                let verified_tenant = authenticated.flatten();
+                let rendered = with_request_context(ctx, || {
+                    with_verified_tenant(verified_tenant, || {
+                        if let Some(guard) =
+                            form_guards.get(&guard_key).filter(|guard| guard.is_typed())
+                        {
+                            guard
+                                .render_typed(route, &captured)
+                                .map(Some)
+                                .map_err(DirectRequestRenderError::Execution)
+                        } else {
+                            match render_direct_request(route, &values) {
+                                Ok(Some(rendered)) => Ok(Some(rendered)),
+                                Ok(None) => Ok(render_route_handler(
+                                    &route.route.handler_module,
+                                    route.route.handler_func_idx,
+                                    None,
+                                )),
+                                Err(error) => Err(error),
+                            }
+                        }
+                    })
+                });
+                // Turbo responses must retain their own MIME and avoid
+                // normal client-runtime injection.
+                let response_media_type = take_response_media_type();
                 match rendered {
-                    Ok(Some(html)) => HttpResponse {
-                        status: 200,
-                        headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())],
-                        body: inject_client_runtime_script(&html).into_bytes(),
-                    },
+                    Ok(Some(html)) => {
+                        let is_turbo =
+                            response_media_type == Some(crate::web::turbo::TURBO_STREAM_MIME);
+                        HttpResponse {
+                            status: 200,
+                            headers: vec![(
+                                "Content-Type".into(),
+                                if is_turbo {
+                                    format!(
+                                        "{}; charset=utf-8",
+                                        crate::web::turbo::TURBO_STREAM_MIME
+                                    )
+                                } else {
+                                    "text/html; charset=utf-8".into()
+                                },
+                            )],
+                            body: if is_turbo {
+                                html.into_bytes()
+                            } else {
+                                inject_client_runtime_script(&html).into_bytes()
+                            },
+                        }
+                    }
                     Ok(None) => HttpResponse {
                         status: 500,
                         headers: vec![("Content-Type".into(), "text/plain".into())],
@@ -1696,6 +2009,14 @@ impl WebDevServer {
         } else {
             Self::serve_static(static_dir.as_deref(), output_dir.as_deref(), &request.path)
         };
+        if protected_response {
+            response
+                .headers
+                .retain(|(name, _)| !name.eq_ignore_ascii_case("Cache-Control"));
+            response
+                .headers
+                .push(("Cache-Control".into(), "no-store".into()));
+        }
         for cookie in take_response_cookies() {
             response.headers.push(("Set-Cookie".into(), cookie));
         }
@@ -2800,6 +3121,42 @@ mod tests {
         assert!(String::from_utf8(response.body)
             .unwrap()
             .contains("Invalid UI action envelope"));
+    }
+
+    #[test]
+    fn turbo_mime_is_only_selected_inside_the_current_request() {
+        fn context() -> RequestContext {
+            RequestContext {
+                request: HttpRequest {
+                    method: HttpMethod::Post,
+                    path: "/todos".to_string(),
+                    headers: vec![],
+                    body: vec![],
+                },
+                params: HashMap::new(),
+            }
+        }
+
+        mark_turbo_stream_response();
+        assert_eq!(take_response_media_type(), None);
+
+        with_request_context(context(), || {
+            mark_turbo_stream_response();
+            assert_eq!(
+                take_response_media_type(),
+                Some(crate::web::turbo::TURBO_STREAM_MIME)
+            );
+            mark_turbo_stream_response();
+        });
+        assert_eq!(
+            take_response_media_type(),
+            Some(crate::web::turbo::TURBO_STREAM_MIME)
+        );
+
+        with_request_context(context(), || {
+            assert_eq!(take_response_media_type(), None);
+        });
+        assert_eq!(take_response_media_type(), None);
     }
 
     #[test]
