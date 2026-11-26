@@ -165,3 +165,147 @@ fn legacy_route_still_falls_back_over_real_http() {
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
     assert!(response_body(&response).starts_with("legacy"), "{response}");
 }
+
+fn legacy_route_at(method: HttpMethod, path: &str, label: &str) -> WebRoute {
+    let source = format!("fn page() -> String {{ \"{label}\" }}");
+    let (handler_module, handler_func_idx) = compile_handler(&source, "page");
+    WebRoute {
+        method,
+        path: path.to_string(),
+        handler_module,
+        handler_func_idx,
+    }
+}
+
+#[test]
+fn literal_routes_win_over_parameter_routes_regardless_of_registration_order() {
+    for literal_first in [true, false] {
+        let literal = legacy_route_at(HttpMethod::Get, "/users/me", "literal");
+        let param = legacy_route_at(HttpMethod::Get, "/users/:id", "parameter");
+        let routes = if literal_first {
+            vec![literal, param]
+        } else {
+            vec![param, literal]
+        };
+        let server = WebDevServer::bind(0, None, None, routes).expect("bind routes");
+        let response = send_raw_request(
+            server.port,
+            "GET /users/me HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert_eq!(response_body(&response), "literal");
+    }
+}
+
+#[test]
+fn unsupported_method_returns_405_and_accurate_allow_header() {
+    let server = WebDevServer::bind(
+        0,
+        None,
+        None,
+        vec![legacy_route_at(HttpMethod::Get, "/resource", "ok")],
+    )
+    .expect("bind route");
+    let response = send_raw_request(
+        server.port,
+        "POST /resource HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+        "{response}"
+    );
+    assert!(
+        response.contains("Allow: GET, HEAD, OPTIONS\r\n"),
+        "{response}"
+    );
+}
+
+#[test]
+fn options_automatically_reports_allowed_methods() {
+    let server = WebDevServer::bind(
+        0,
+        None,
+        None,
+        vec![legacy_route_at(HttpMethod::Get, "/resource", "ok")],
+    )
+    .expect("bind route");
+    let response = send_raw_request(
+        server.port,
+        "OPTIONS /resource HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 204 No Content\r\n"),
+        "{response}"
+    );
+    assert!(
+        response.contains("Allow: GET, HEAD, OPTIONS\r\n"),
+        "{response}"
+    );
+    assert!(response_body(&response).is_empty(), "{response}");
+}
+
+#[test]
+fn head_falls_back_to_get_and_sends_no_body_with_representation_length() {
+    let server = WebDevServer::bind(
+        0,
+        None,
+        None,
+        vec![legacy_route_at(HttpMethod::Get, "/resource", "hello")],
+    )
+    .expect("bind route");
+    let response = send_raw_request(
+        server.port,
+        "HEAD /resource HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(response.contains("Content-Length: 5\r\n"), "{response}");
+    assert!(response_body(&response).is_empty(), "{response}");
+}
+
+#[test]
+fn static_files_reject_post_and_serve_head_without_body() {
+    let path = std::env::temp_dir().join(format!(
+        "nulang-web-static-method-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    std::fs::write(path.join("sample.txt"), b"contents").unwrap();
+    let server = WebDevServer::bind(0, Some(path.clone()), None, vec![]).unwrap();
+
+    let post = send_raw_request(
+        server.port,
+        "POST /sample.txt HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(
+        post.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+        "{post}"
+    );
+    assert!(post.contains("Allow: GET, HEAD, OPTIONS\r\n"), "{post}");
+
+    let head = send_raw_request(
+        server.port,
+        "HEAD /sample.txt HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+    assert!(head.contains("Content-Length: 8\r\n"), "{head}");
+    assert!(response_body(&head).is_empty(), "{head}");
+
+    drop(server);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn sse_endpoint_does_not_stream_for_post() {
+    let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
+    let response = send_raw_request(
+        server.port,
+        "POST /__nulang/sse/room HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+        "{response}"
+    );
+}

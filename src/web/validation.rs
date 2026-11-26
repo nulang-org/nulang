@@ -8,6 +8,7 @@
 use crate::web::bindings::compile_route_bindings;
 use crate::web::contracts::ContractCompilation;
 use crate::web::package_contracts::compile_contracts_from_tree;
+use crate::web::runtime_bindings::{compare_route_patterns, RoutePatternRelation};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -62,6 +63,25 @@ pub fn validation_diagnostics(compilation: &ContractCompilation) -> Vec<String> 
     let mut diagnostics = compilation.diagnostics.clone();
     for route in &compilation.routes {
         diagnostics.extend(compile_route_bindings(route).diagnostics);
+    }
+
+    // Apply the same specificity relation used by HTTP dispatch. A literal
+    // subroute can safely shadow a parameter route; two overlapping routes
+    // that are incomparable must fail during compilation, not at runtime.
+    for (index, left) in compilation.routes.iter().enumerate() {
+        for right in compilation.routes.iter().skip(index + 1) {
+            if left.method != right.method {
+                continue;
+            }
+            if let Ok(RoutePatternRelation::Ambiguous) =
+                compare_route_patterns(&left.path, &right.path)
+            {
+                diagnostics.push(format!(
+                    "ambiguous {} routes '{}' and '{}': neither pattern is strictly more specific",
+                    left.method, left.path, right.path
+                ));
+            }
+        }
     }
 
     let mut seen = HashSet::new();
@@ -181,5 +201,47 @@ mod tests {
         let diagnostics = validate_compilation(compilation).unwrap_err();
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].contains("has no same-named parameter"));
+    }
+    #[test]
+    fn ambiguous_path_patterns_fail_validation_before_serving() {
+        let mut first = contract("/users/{first}", Vec::new());
+        first.params.clear();
+        let mut second = contract("/users/{second}", Vec::new());
+        second.params.clear();
+        let diagnostics = validation_diagnostics(&ContractCompilation {
+            routes: vec![first, second],
+            diagnostics: Vec::new(),
+        });
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0].contains("ambiguous"), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn crossing_literal_and_parameter_patterns_are_ambiguous() {
+        let mut first = contract("/{a}/fixed", Vec::new());
+        first.params.clear();
+        let mut second = contract("/fixed/{b}", Vec::new());
+        second.params.clear();
+        let diagnostics = validation_diagnostics(&ContractCompilation {
+            routes: vec![first, second],
+            diagnostics: Vec::new(),
+        });
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0].contains("ambiguous"), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn strict_literal_specificity_and_different_methods_are_allowed() {
+        let mut parameter = contract("/users/{id}", Vec::new());
+        parameter.params.clear();
+        let mut literal = contract("/users/me", Vec::new());
+        literal.params.clear();
+        let mut post = parameter.clone();
+        post.method = "POST".into();
+        let diagnostics = validation_diagnostics(&ContractCompilation {
+            routes: vec![parameter, literal, post],
+            diagnostics: Vec::new(),
+        });
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 }

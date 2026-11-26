@@ -179,6 +179,50 @@ fn match_segments(
     Some(params)
 }
 
+/// Relationship between two route patterns for the same HTTP method.
+///
+/// Overlapping patterns are ordered only when one matches a strict subset of
+/// the requests matched by the other. Crossed literal/parameter positions are
+/// ambiguous rather than resolved by a fragile numeric specificity score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutePatternRelation {
+    Disjoint,
+    MoreSpecific,
+    LessSpecific,
+    Ambiguous,
+}
+
+pub fn compare_route_patterns(left: &str, right: &str) -> Result<RoutePatternRelation, String> {
+    let left = compile_route_segments(left)?;
+    let right = compile_route_segments(right)?;
+    if left.len() != right.len() {
+        return Ok(RoutePatternRelation::Disjoint);
+    }
+    let mut left_specific = false;
+    let mut right_specific = false;
+    for (a, b) in left.iter().zip(right.iter()) {
+        match (a, b) {
+            (RuntimeRouteSegment::Literal(a), RuntimeRouteSegment::Literal(b)) if a != b => {
+                return Ok(RoutePatternRelation::Disjoint);
+            }
+            (RuntimeRouteSegment::Literal(_), RuntimeRouteSegment::PathParam(_)) => {
+                left_specific = true;
+            }
+            (RuntimeRouteSegment::PathParam(_), RuntimeRouteSegment::Literal(_)) => {
+                right_specific = true;
+            }
+            _ => {}
+        }
+    }
+    Ok(match (left_specific, right_specific) {
+        (true, false) => RoutePatternRelation::MoreSpecific,
+        (false, true) => RoutePatternRelation::LessSpecific,
+        // Identical patterns and crossing specificity both overlap without
+        // either route being strictly more specific.
+        _ => RoutePatternRelation::Ambiguous,
+    })
+}
+
 fn compile_route_segments(path: &str) -> Result<Vec<RuntimeRouteSegment>, String> {
     compile_segments(path, true)
 }
