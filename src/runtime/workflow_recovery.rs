@@ -18,6 +18,8 @@ pub type NativeWorkflowHandler = (String, fn(&mut Actor, &[Value]));
 pub struct NativeWorkflowRecoveryConfig {
     pub page_size: usize,
     pub retry_interval: Duration,
+    /// Maximum automatic recovery reservations per open activation.
+    pub max_attempts: u32,
 }
 
 impl Default for NativeWorkflowRecoveryConfig {
@@ -25,6 +27,7 @@ impl Default for NativeWorkflowRecoveryConfig {
         Self {
             page_size: 64,
             retry_interval: Duration::from_millis(100),
+            max_attempts: 3,
         }
     }
 }
@@ -200,6 +203,8 @@ impl Runtime {
         if self.current_actor.is_some()
             || config.page_size == 0
             || config.page_size > MAX_WORKFLOW_OUTBOX_PAGE
+            || config.max_attempts == 0
+            || config.max_attempts > super::MAX_NATIVE_WORKFLOW_RECOVERY_ATTEMPTS
             || config.retry_interval < Duration::from_millis(1)
             || config.retry_interval > Duration::from_secs(300)
         {
@@ -224,6 +229,19 @@ impl Runtime {
             cooldown_since: None,
         }));
         Ok(())
+    }
+
+    /// Inspect the persisted reservation budget for the current open command.
+    /// Exhausted means no more automatic replay; the last reserved execution
+    /// may still be resident/runnable. Closed commands have no open status.
+    pub fn native_workflow_retry_status(
+        &self,
+        actor_id: u64,
+    ) -> io::Result<Option<super::NativeWorkflowRetryStatus>> {
+        if actor_id == 0 || actor_id % u64::from(self.shard_count) != u64::from(self.shard_idx) {
+            return Err(invalid("native recovery status requires the owning shard"));
+        }
+        self.persistence.load_native_workflow_retry_status(actor_id)
     }
 
     pub fn disable_native_workflow_recovery(&mut self) {
@@ -267,7 +285,7 @@ impl Runtime {
             ..Default::default()
         };
         for &id in &page.actors {
-            match self.restore_native_workflow(id) {
+            match self.restore_native_workflow(id, recovery.config.max_attempts) {
                 Ok(true) => report.restored += 1,
                 Ok(false) => report.deferred += 1,
                 Err(error) => {
@@ -291,7 +309,7 @@ impl Runtime {
         Ok(Some(report))
     }
 
-    fn restore_native_workflow(&mut self, actor_id: u64) -> io::Result<bool> {
+    fn restore_native_workflow(&mut self, actor_id: u64, max_attempts: u32) -> io::Result<bool> {
         if self.actors.contains_key(&actor_id) {
             return Ok(false);
         }
@@ -371,6 +389,19 @@ impl Runtime {
             || usize::from(entry.behavior_id) > recipe.len()
         {
             return Err(invalid("native recovery command or behavior mismatch"));
+        }
+        // Charge the reservation durably *before* reconstructing or running
+        // the command. A crash after this write uses a slot even if the
+        // handler was never reached. Never execute on an ambiguous write.
+        let Some(attempt) = self
+            .persistence
+            .reserve_native_workflow_recovery_attempt(open, max_attempts)?
+        else {
+            return Ok(false);
+        };
+        if attempt.is_exhausted() {
+            tracing::warn!(actor_id, command_sequence = sequence, attempts = attempt.attempts_reserved,
+                "native workflow recovery reserved final automatic attempt; further replay disabled if still open");
         }
         // Verify persisted values before making executable native handlers visible.
         // The existing recovery path independently checks the admission and tail.

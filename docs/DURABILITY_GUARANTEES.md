@@ -485,9 +485,10 @@ code. Changing a handler or its behavior layout requires a different
 revision and a separately qualified new workflow identity.
 
 The supervisor is disabled by default. It attempts one page per scheduler
-iteration (default 64, maximum 1024), with a bounded four-page idle sweep
-and a retry interval (default 100 ms, range 1 ms–300 s). The scheduler's
-logical clock controls cooldown; it does not sleep solely for recovery.
+iteration (default 64, maximum 1024), with a bounded four-page idle sweep,
+a retry interval (default 100 ms, range 1 ms–300 s), and an automatic
+recovery attempt budget (default 3, range 1–1024) per open activation.
+The scheduler's logical clock controls cooldown; it does not sleep solely for recovery.
 Embedded hosts must drive subsequent scheduler turns; deterministic hosts
 must advance their clock. `poll_native_workflow_recovery()` reports the
 number examined, restored, deferred and failed, not successful handler
@@ -508,13 +509,45 @@ before spawning new actors on restart; the runtime reserves the discovered
 open bound IDs but does not provide a global durable actor-ID allocator.
 Resident actors (including ones manually recovered without handlers),
 unbound legacy actors, idle/closed actors, and post-effect intermediate
-history are not automatically reconstructed. A permanently failing command
-can remain open and be retried across sweeps. There is no persistent retry
-budget, poison-command quarantine, panic containment, automatic ownership
+history are not automatically reconstructed.
+
+#### Durable retry budget and quarantine
+
+Before reconstructing a storage-proven open command, the supervisor
+reserves an automatic recovery attempt in the same store, fenced by actor
+ID, command sequence and epoch. A failed reservation prevents execution.
+A process crash after committing a reservation (including before handler
+execution) conservatively uses one slot. Initial ordinary live admission
+is not counted. Missing recipes and invalid history before the reservation
+do not consume attempts. The first reservation pins the configured limit
+for that command (subsequent configuration changes do not reset or enlarge
+it). A subsequent distinct admitted command gets its own budget. MemoryStore
+retains reservations for its lifetime; local SQLite retains them after
+process loss. Reservation does not advance the durable command tail.
+
+When the final reserved attempt leaves the command open, it is quarantined
+from further automatic recovery. The storage scan excludes exhausted
+commands but retains their IDs in its watermark, and the original inbox
+receipt, command journal, safe snapshot and open admission remain.
+No later command is admitted past the quarantined one. Hosts can inspect
+`Runtime::native_workflow_retry_status(actor_id)`: it reports the current
+open activation, epoch, reserved attempts and pinned limit (or None if
+unreserved/closed); `is_exhausted()` means no further automatic replay.
+The final reserved execution may still be runnable; successful closure is
+permitted. This does not count successful execution or prove every reserved
+attempt reached the handler. Explicit trusted-host manual recovery remains
+a separate operation, not an automatic redrive API. There is no snapshot
+deletion, command cancellation, receipt replacement or automatic release
+from quarantine. Store-level metadata is not a security boundary against a
+trusted host editing its database.
+
+There is no panic containment, automatic ownership
 acquisition, or cross-shard recovery. No durable external-effect guarantee
 is added. Tests exercise MemoryStore and SQLite, exact recipe matching,
 bounded pages, real process termination after admission, integrated outbox
-restart, and injected terminal commit failure/repair.
+restart, injected terminal commit failure/repair, pinned retry limits,
+reservation write faults and process termination after the final
+reservation but before handler execution.
 
 ## What is not yet a production-wide guarantee
 
