@@ -2207,7 +2207,7 @@ impl Runtime {
                     },
                 );
             }
-            let _ = self.dispatch_native_handler(actor_id, behavior_idx, args);
+            let _ = self.dispatch_native_handler(actor_id, behavior_idx, args, false);
             self.checkpoint_actor(actor_id);
             self.current_actor = None;
             return Ok(Value::nil());
@@ -2256,7 +2256,7 @@ impl Runtime {
             } else if self.has_native_handler(actor_id, behavior_idx) {
                 let prev = self.current_actor;
                 self.current_actor = Some(actor_id);
-                let _ = self.dispatch_native_handler(actor_id, behavior_idx, &msg.payload);
+                let _ = self.dispatch_native_handler(actor_id, behavior_idx, &msg.payload, false);
                 self.checkpoint_actor(actor_id);
                 self.current_actor = prev;
             }
@@ -4234,7 +4234,12 @@ impl Runtime {
                         }
                     }
                 }
-                processed = self.dispatch_native_handler(actor_id, behavior_idx, &msg.payload);
+                processed = self.dispatch_native_handler(
+                    actor_id,
+                    behavior_idx,
+                    &msg.payload,
+                    atomic_workflow_turn,
+                );
                 if processed && !atomic_workflow_turn {
                     self.checkpoint_actor(actor_id);
                 }
@@ -5977,7 +5982,7 @@ impl Runtime {
                         .collect()
                 };
                 if self.has_native_handler(actor_id, behavior_idx) {
-                    let _ = self.dispatch_native_handler(actor_id, behavior_idx, &payload);
+                    let _ = self.dispatch_native_handler(actor_id, behavior_idx, &payload, false);
                     if let Some(actor) = self.actors.get_mut(&actor_id) {
                         actor.sequence = entry.sequence;
                     }
@@ -6496,6 +6501,7 @@ impl Runtime {
         actor_id: u64,
         behavior_idx: usize,
         args: &[Value],
+        stage_workflow_outbox: bool,
     ) -> bool {
         let handler = self
             .actors
@@ -6532,7 +6538,13 @@ impl Runtime {
         }
 
         if let Some(actor) = self.actors.get_mut(&actor_id) {
+            if stage_workflow_outbox {
+                actor.begin_workflow_outbox_staging();
+            }
             handler(actor, args);
+            if stage_workflow_outbox {
+                actor.seal_workflow_outbox_staging();
+            }
             true
         } else {
             false

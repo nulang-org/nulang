@@ -310,6 +310,27 @@ suspension and production cross-epoch recovery remain unqualified.
 The general compiled workflow scheduler still uses the legacy journal path
 and **must not** use this adapter until those paths are qualified.
 
+### Scheduled Rust workflow message staging (experimental)
+
+A scheduled, atomically admitted ordinary Rust workflow handler may call
+`Actor::stage_workflow_message` with a local destination, behavior ID and
+explicitly serialized `PersistedValue` payload. Staging is not a send:
+messages remain private to the executing turn, with zero-based ordinals in
+call order. The buffer is bound to the live activation and epoch, sealed on
+handler return, and committed with the reconciled terminal snapshot. A rejected
+staging attempt poisons the turn even when its error is ignored. At most 1024
+messages may be staged per turn; non-finite floats are rejected.
+
+The terminal helper checks that each receiver is a live, same-shard,
+non-hibernated persistent workflow with an ordinary Rust behavior and an
+existing snapshot in the same store. Grain, migrated, internal and AOT
+destinations are excluded. Failed terminal commits discard the in-memory
+activation and recover the original admitted command; no messages are
+published to mailboxes. A replay reconstructs the staging buffer. Native
+handler registration and stable destination behavior IDs remain host
+responsibilities. Ordinary send semantics and bytecode/AOT dispatch are
+unchanged. No automatic outbox delivery or inbox acknowledgment is enabled.
+
 The existing SQLite VM fixture exercises this opt-in path with compiled
 workflow bytecode, a committed command sequence, lost provider reply,
 repeated dynamic execution of one site, and replay from a reopened store

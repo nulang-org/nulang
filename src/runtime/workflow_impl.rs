@@ -319,6 +319,43 @@ pub(crate) fn commit_step_completed(
             None
         };
 
+    let outbox = rt
+        .actors
+        .get(&actor_id)
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "workflow sender missing")
+        })?
+        .staged_workflow_messages()?
+        .to_vec();
+    for message in &outbox {
+        let destination = message.destination_actor_id;
+        let behavior = message.behavior_id as usize;
+        let valid_target = rt.actors.get(&destination).is_some_and(|actor| {
+            actor.persistent
+                && actor.state != crate::runtime::ActorState::Terminated
+                && matches!(actor.role(), Ok(ActorRole::Workflow))
+                && !actor.is_hibernated()
+        }) && rt.has_native_handler(destination, behavior)
+            && !rt.is_internal_behavior(destination, behavior)
+            && !rt.migrated_actors.contains_key(&destination)
+            && !rt.actor_grain_id.contains_key(&destination)
+            && destination % rt.shard_count as u64 == rt.shard_idx as u64
+            && rt.persistence.load_snapshot(destination).is_some();
+        #[cfg(feature = "native-codegen")]
+        let valid_target = valid_target
+            && rt
+                .actors
+                .get(&destination)
+                .and_then(|actor| actor.aot_targets.get(behavior))
+                .is_none_or(|target| target.is_none());
+        if workflow_effects_consumed.is_none() || !valid_target {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "workflow outbox requires a live same-shard persistent Rust workflow destination",
+            ));
+        }
+    }
+
     rt.persistence.commit_transition(DurableTransition {
         version: DURABLE_TRANSITION_VERSION,
         actor_id,
@@ -337,13 +374,14 @@ pub(crate) fn commit_step_completed(
         }],
         domain_events: vec![],
         durable_effects: vec![],
-        outbox: vec![],
+        outbox,
     })?;
 
     rt.maybe_shadow_replicate(actor_id, &snapshot);
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.sequence = sequence;
         actor.dirty_fields.clear();
+        actor.clear_workflow_outbox_staging();
     }
     Ok(())
 }
