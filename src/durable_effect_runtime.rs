@@ -795,6 +795,7 @@ impl<'a> DurableEffectCoordinator<'a> {
             expected_previous_sequence: previous,
             command: None,
             workflow_admission: false,
+            workflow_inbox: None,
             workflow_effects_consumed: None,
             snapshot: None,
             workflow_events: Vec::new(),

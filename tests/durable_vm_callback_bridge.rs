@@ -683,6 +683,7 @@ fn workflow_terminal_transition(
         expected_previous_sequence,
         command: None,
         workflow_admission: false,
+        workflow_inbox: None,
         workflow_effects_consumed: consumed,
         snapshot: Some(ActorSnapshot {
             actor_id: activation.actor_id,
@@ -932,6 +933,7 @@ fn workflow_cursor_pins_pending_request_and_separates_new_commands() {
             expected_previous_sequence: terminal_seq - 1,
             command: None,
             workflow_admission: false,
+            workflow_inbox: None,
             workflow_effects_consumed: Some(workflow_terminal_effect_count(&actor).unwrap()),
             snapshot: Some(ActorSnapshot {
                 actor_id: ACTOR_ID,
@@ -1190,6 +1192,7 @@ fn workflow_later_occurrence_recovers_after_new_owner_claim() {
             expected_previous_sequence: 4,
             command: None,
             workflow_admission: false,
+            workflow_inbox: None,
             workflow_effects_consumed: None,
             snapshot: None,
             workflow_events: vec![],
@@ -1472,6 +1475,7 @@ fn workflow_closed_admission_rejects_completed_receipt_on_fresh_actor() {
             expected_previous_sequence: sequence - 1,
             command: None,
             workflow_admission: false,
+            workflow_inbox: None,
             workflow_effects_consumed: Some(workflow_terminal_effect_count(&actor).unwrap()),
             snapshot: Some(ActorSnapshot {
                 actor_id: ACTOR_ID,

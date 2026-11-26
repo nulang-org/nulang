@@ -59,6 +59,7 @@ fn timer_preparation_replay_survives_process_restart_without_duplicate_history_o
                     payload: vec![],
                 }),
                 workflow_admission: false,
+                workflow_inbox: None,
                 workflow_effects_consumed: None,
                 snapshot: None,
                 workflow_events: vec![],

@@ -327,6 +327,7 @@ pub(crate) fn commit_step_completed(
         expected_previous_sequence,
         command: None,
         workflow_admission: false,
+        workflow_inbox: None,
         workflow_effects_consumed,
         snapshot: Some(snapshot.clone()),
         workflow_events: vec![WorkflowEvent::StepCompleted {
