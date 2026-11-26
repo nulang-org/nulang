@@ -68,9 +68,10 @@ pub fn core_pinning_enabled() -> bool {
 
 /// Lightweight, atomics-based profiling metrics for the scheduler.
 ///
-/// All counters are monotonically increasing unless reset via
-/// [`Scheduler::reset_stats`]. They are snapshots of the underlying atomic
-/// counters and are therefore not guaranteed to be mutually consistent in a
+/// Cumulative counters are monotonically increasing unless reset via
+/// [`Scheduler::reset_stats`]. The queued_* fields are instantaneous gauges,
+/// not cumulative counters, and may increase or decrease between snapshots.
+/// Neither the counters nor the queue samples are mutually consistent under
 /// concurrent execution.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct SchedulerStats {
@@ -925,6 +926,25 @@ mod scheduler_tests {
         assert_eq!(stats.queued_high, 1);
         assert_eq!(stats.queued_normal, 1);
         assert_eq!(stats.queued_low, 1);
+    }
+
+    #[test]
+    fn test_stats_serialize_existing_counters_and_new_queue_gauges() {
+        let s = Scheduler::new(1);
+        s.enqueue_with_priority(1, ActorPriority::High);
+        s.enqueue_with_priority(2, ActorPriority::Normal);
+        s.enqueue_local_with_priority(0, 3, ActorPriority::Low);
+        let json = serde_json::to_value(s.stats()).unwrap();
+        assert_eq!(json["total_tasks_processed"], 0);
+        assert_eq!(json["tasks_from_local_queue"], 0);
+        assert_eq!(json["tasks_from_global_queue"], 0);
+        assert_eq!(json["tasks_from_steal"], 0);
+        assert_eq!(json["steal_attempts"], 0);
+        assert_eq!(json["steal_successes"], 0);
+        assert_eq!(json["empty_polls"], 0);
+        assert_eq!(json["queued_high"], 1);
+        assert_eq!(json["queued_normal"], 1);
+        assert_eq!(json["queued_low"], 1);
     }
 
     #[test]
