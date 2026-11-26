@@ -54,7 +54,8 @@ the license match the published tag `v0.3.0-alpha.4` (commit
 Use `sha256sum public/syntyr.core.css public/syntyr.semantic.css public/SYNTYR-LICENSE.txt`
 to verify the installed assets. Any upgrade should copy both release files,
 keep the license, update the pin and hashes and run the scaffold/build regression
-tests. A static build copies the public notice with the assets.
+tests. A web build copies the public notice with the assets; the Todo routes
+remain server-rendered and do not produce static HTML.
 
 ## Design boundaries
 

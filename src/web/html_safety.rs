@@ -103,8 +103,27 @@ fn url_attribute(name: &str) -> bool {
     )
 }
 
-fn safe_url_attribute(value: &str) -> bool {
+/// Validate a logical (not HTML-entity-escaped) URL before serialization.
+/// Markdown's parser supplies decoded destinations; the HTML writer escapes
+/// them. The existing HTML element ABI additionally checks entity syntax.
+pub(crate) fn safe_logical_url(value: &str) -> bool {
     if value.trim() != value || value.contains('\\') || value.chars().any(char::is_control) {
+        return false;
+    }
+    if let Some((prefix, _)) = value.split_once(':') {
+        // A slash, query or fragment before ':' means a relative URL.
+        if !prefix.contains(&['/', '?', '#'][..]) {
+            return matches!(
+                prefix.to_ascii_lowercase().as_str(),
+                "http" | "https" | "mailto" | "tel"
+            );
+        }
+    }
+    true
+}
+
+fn safe_url_attribute(value: &str) -> bool {
+    if !safe_logical_url(value) {
         return false;
     }
     // The host receives pre-rendered Html. Allow the HTML-safe ampersands
@@ -116,16 +135,6 @@ fn safe_url_attribute(value: &str) -> bool {
             return false;
         }
         rest = &rest[index + "&amp;".len()..];
-    }
-
-    if let Some((prefix, _)) = value.split_once(':') {
-        // A slash, query or fragment before ':' means a relative URL.
-        if !prefix.contains(&['/', '?', '#'][..]) {
-            return matches!(
-                prefix.to_ascii_lowercase().as_str(),
-                "http" | "https" | "mailto" | "tel"
-            );
-        }
     }
     true
 }

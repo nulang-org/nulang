@@ -1,5 +1,16 @@
 # Nulang Changelog
 
+### Transitive static web effect proof — 2026-11-26
+- **Experimental:** before rendering, validate every emitted instruction in the linked handler's transitive direct-call graph against the existing rendering allowlist. Cold branches, imported helpers, and recursive direct-call cycles are analyzed; unresolved indirect calls and invalid control-flow ranges fail closed. Inferred candidates remain server routes; explicit static/prerender failures preserve the prior output.
+- Preserve the source file path during NBC emission so sibling imports use the same resolution context as the signal-analysis and run paths. No new dependency, IR field, or frozen bytecode format change. Retain the interpreter guard; this does not prove termination or sandbox untrusted programs.
+
+### Finite parameterized static web routes — 2026-11-26
+- **Experimental:** `[web.prerender]` maps exact parameterized GET route patterns to finite concrete URL lists. Build-time rendering shares the HTTP request decoder and handler-call ABI; concrete Deployment IR v1 entries retain the original pattern and require no runtime parameter binding.
+- Reject invalid or overlapping URL lists, unsupported request inputs, contradictory placement, and executed non-render effects. Sort enumeration deterministically and preserve the prior generated site on failures. Dev dispatch is unchanged; finite deployments do not imply a server fallback.
+
+### Checked static web builds — 2026-11-26
+- **Experimental:** web builds emit HTML only for eligible, checked GET renderers, leave request-bound and mutation routes in Deployment IR without artifacts, and reject explicit static placement violations. Registration and rendering run under an interpreter instruction allowlist.
+- Stage and replace generated output after validation, reject unsafe paths and asset collisions, and preserve prior output on ordinary build errors. Static publishing no longer snapshots the server-dependent Todo starter; its native HTTP rendering and vendored styles remain supported. No full transitive effect proof or crash-atomic publication is claimed.
 ### Fail-closed SQLite history recovery and trusted streaming — 2026-11-26
 - **Keep untrusted `DB.query` results bounded** while visiting fixed internal actor snapshot, journal, workflow/domain event and durable-effect rows incrementally. Recovery no longer mistakes histories beyond the general 100,000-row/64 MiB adapter buffer budget for absent data.
 - Introduce checked persistence-history reads for actor/virtual-actor activation. SQLite query, decode or corruption failures now refuse recovery before publishing a partially restored actor; legacy reader APIs retain compatibility, with warnings for their fallback paths.

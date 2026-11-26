@@ -44,6 +44,10 @@ impl Default for WebSection {
             port: default_web_port(),
             static_dir: default_static_dir(),
             output_dir: default_output_dir(),
+            prerender: BTreeMap::new(),
+            collections: BTreeMap::new(),
+            content: BTreeMap::new(),
+            site_url: None,
         }
     }
 }
@@ -98,6 +102,18 @@ pub struct WebSection {
     /// Directory where `nula build --web` emits the static site.
     #[serde(default = "default_output_dir")]
     pub output_dir: String,
+    /// Exact GET route patterns mapped to a finite list of concrete URL paths.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub prerender: BTreeMap<String, Vec<String>>,
+    /// Exact GET route patterns mapped to pure zero-argument route-key providers.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub collections: BTreeMap<String, String>,
+    /// Named Markdown content bundles, relative to the package root.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub content: BTreeMap<String, String>,
+    /// Optional public HTTP(S) origin for generating sitemap.xml.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_url: Option<String>,
 }
 
 fn default_web_port() -> u16 {
@@ -319,6 +335,48 @@ mod tests {
         assert_eq!(manifest.web.port, 3000);
         assert_eq!(manifest.web.static_dir, "public");
         assert_eq!(manifest.web.output_dir, "site");
+    }
+
+    #[test]
+    fn test_web_enumeration_manifest_roundtrip() {
+        let manifest = Manifest::parse(
+            r#"
+[package]
+name = "docs"
+version = "0.1.0"
+[web.prerender]
+"/docs/{slug}" = ["/docs/intro", "/docs/install"]
+[web.collections]
+"/articles/{slug}" = "article_keys"
+[web.content]
+articles = "content/articles"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.web.prerender["/docs/{slug}"],
+            ["/docs/intro", "/docs/install"]
+        );
+        assert_eq!(manifest.web.collections["/articles/{slug}"], "article_keys");
+        assert_eq!(manifest.web.content["articles"], "content/articles");
+        assert_eq!(
+            Manifest::parse(&manifest.to_toml().unwrap()).unwrap(),
+            manifest
+        );
+        assert!(
+            Manifest::parse("[package]\nname = \"docs\"\nversion = \"0.1.0\"")
+                .unwrap()
+                .web
+                .prerender
+                .is_empty()
+        );
+        assert!(
+            Manifest::parse("[package]\nname = \"docs\"\nversion = \"0.1.0\"")
+                .unwrap()
+                .web
+                .collections
+                .is_empty()
+        );
     }
 
     #[test]

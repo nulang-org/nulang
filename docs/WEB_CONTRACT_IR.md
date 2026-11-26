@@ -44,15 +44,55 @@ This Web surface is experimental and is intentionally documented here rather tha
 Route metadata includes the existing method/path/placement/artifact fields plus:
 
 - `handler`: statically resolved handler name when available.
+- `route_template`: original registered pattern for an explicitly enumerated static page, omitted for other routes.
 - `params`: route path parameter names and source-level types when known.
 - `handler_params`: handler parameter names, types, Nulang reference capabilities, and optional request-source metadata.
 - `bindings`: deterministic request-source-to-handler-slot bindings for `path`, `query`, `header`, `cookie`, `body`, and `form`. Each binding records `source_name`, `handler_param`, `handler_index`, and resolved source-level type.
 - `response_type`: declared handler return type.
 - `error_type`: declared typed-error type.
-- `effects`: declared handler effect row.
+- `effects`: declared handler effect row (not a transitive proof).
 - `reference_capability`: the existing Pony-style handler capability (`iso`, `ref`, `val`, etc.).
 
 Bindings are ordered by handler slot rather than URL segment order. The runtime therefore stages arguments directly into the call ABI without inferring argument order from route text.
+
+For `[web.prerender]` or `[web.collections]` in the package manifest, a
+parameterized GET route is replaced in deployment IR by a finite set of concrete static routes,
+one per successfully rendered URL. The original pattern is preserved in
+`route_template`; its path/handler parameter and request binding metadata is
+not copied onto the concrete routes because those inputs have already been
+consumed at build time. There is no implicit runtime fallback for unlisted
+URLs. Existing v1 consumers see ordinary static routes and artifacts, not
+a new placement kind. The dev server and source-level contracts remain
+unchanged.
+
+A collection names a compiled zero-argument Nulang function that returns a
+nonempty array of route keys. One capture uses scalar rows; multiple captures
+use tuple rows in URL order, with each value matching its compiler path binding
+type. The provider is proved and evaluated before rendering; its concrete URL
+list enters the same validation, sorting, binding, and artifact pipeline as
+manual enumeration. No record schema or provider metadata is added to the IR.
+
+`[web.content]` adds a local Markdown/TOML ingestion step before compilation.
+It snapshots typed content records in a private generated module, excludes
+drafts, validates source paths and portable slugs, and passes the same snapshot
+to build, dev and deploy compiler invocations. The manifest's collection
+provider still projects the route keys; content records and source paths do
+not expand the Deployment IR schema. Entries retain the Markdown source in
+`body: String` and provide `html: Html`, a CommonMark fragment with raw HTML
+escaped and URLs checked before serialization. Build and deploy verify
+root-relative Markdown references against staged artifacts and retained
+server GET routes before publication; no additional route or content schema
+is added to the IR.
+
+Static placement is validated before artifact emission against the linked
+compiler-produced bytecode, independently of the declared effect row. Every
+instruction in the handler's transitive direct-call graph must meet the
+rendering allowlist, and unverifiable indirect calls or control-flow boundaries
+disqualify static placement. An inferred candidate becomes server-only;
+explicit `@placement(static)` or finite prerender fails the build. The existing
+checked interpreter remains active. No IR or NBC format change is required;
+this is an operation-level pre-render proof, not a language-wide effect
+inference, termination, or untrusted-code safety guarantee.
 
 The package-level `capabilities` field remains unchanged for compatibility. It is not the same concept as an authorization/resource capability.
 
