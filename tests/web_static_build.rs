@@ -1260,3 +1260,153 @@ fn dev_server_uses_content_snapshot_and_does_not_publish_drafts() {
         .filter_map(Result::ok)
         .any(|e| e.file_name().to_string_lossy().starts_with("web-content-")));
 }
+
+const MARKDOWN_HTML_APP: &str = r#"
+import stdlib::web::html
+import stdlib::web::types
+import @nulang/web_content
+
+fn article_keys() -> [String] {
+    var keys = [];
+    for item in content_articles() {
+        keys = perform Array.push(keys, item.slug)
+    }
+    keys
+}
+fn article(slug: String) -> Html {
+    var page = text("not found");
+    for item in content_articles() {
+        if item.slug == slug then { page = item.html } else {}
+    }
+    page
+}
+fn preview(slug: String) -> Html { text(slug) }
+app "content site" {
+    route "GET" "/articles/{slug}" -> article
+    route "GET" "/preview/{slug}" -> preview
+}
+"#;
+
+#[test]
+fn commonmark_content_renders_typed_html_with_validated_links() {
+    let site = content_site();
+    site.source(MARKDOWN_HTML_APP);
+    markdown_file(
+        &site, "content/articles/a.md",
+        "+++\nslug = \"a\"\ntitle = \"A\"\n+++\n# Heading\n\n**Bold** *emphasis*\n\n- item\n\n[B](/articles/b/?a=1&b=2#top) ![Photo](/images/caf%C3%A9.png) [Preview](/preview/demo)\n\n<iframe src=x></iframe>\n\nHello <img src=x onerror=alert(1)>\n",
+    );
+    markdown_file(
+        &site,
+        "content/articles/b.md",
+        "+++\nslug = \"b\"\ntitle = \"B\"\n+++\nAnother page\n",
+    );
+    markdown_file(&site, "public/images/café.png", "test image");
+    success(site.build());
+    let html = String::from_utf8(site.read("dist/articles/a/index.html")).unwrap();
+    for fragment in [
+        "<h1>Heading</h1>",
+        "<strong>Bold</strong>",
+        "<em>emphasis</em>",
+        "<li>item</li>",
+        "href=\"/articles/b/?a=1&amp;b=2#top\"",
+        "src=\"/images/caf%C3%A9.png\" alt=\"Photo\"",
+        "href=\"/preview/demo\"",
+        "&lt;iframe src=x&gt;&lt;/iframe&gt;",
+        "&lt;img src=x onerror=alert(1)&gt;",
+    ] {
+        assert!(html.contains(fragment), "expected {fragment}: {html}");
+    }
+    assert!(!html.contains("<iframe"));
+    assert!(!html.contains("<img src=x"));
+
+    // Compiled HTTP handlers return the identical typed fragment.
+    let artifact = nulang::bytecode::CodeModule::from_nbc(&site.read(".nula/build.nbc")).unwrap();
+    let mut vm = nulang::vm::VM::new();
+    vm.load_module(artifact.module);
+    vm.run().unwrap();
+    let routes =
+        nulang::web::dispatch::compile_runtime_routes(vm.take_web_routes(), &site.0.join("src"))
+            .unwrap();
+    let route = routes
+        .iter()
+        .find(|route| route.route.path == "/articles/{slug}")
+        .unwrap();
+    let params = nulang::web::dispatch::match_route(route, "/articles/a").unwrap();
+    assert_eq!(
+        nulang::web::dispatch::render_direct_route(route, &params)
+            .unwrap()
+            .unwrap(),
+        html
+    );
+}
+
+#[test]
+fn unsafe_markdown_and_broken_root_links_fail_without_publishing() {
+    let site = content_site();
+    site.source(MARKDOWN_HTML_APP);
+    markdown_file(
+        &site,
+        "content/articles/a.md",
+        "+++\nslug = \"a\"\ntitle = \"A\"\n+++\nStable\n",
+    );
+    markdown_file(
+        &site,
+        "content/articles/draft.md",
+        "+++\nslug = \"hidden\"\ntitle = \"Hidden\"\ndraft = true\n+++\n[unsafe](javascript:run)\n",
+    );
+    success(site.build());
+    let old = site.read("dist/articles/a/index.html");
+    for (body, diagnostic) in [
+        ("[x](JaVaScRiPt&colon;alert%281%29)", "unsafe Markdown URL"),
+        ("![x](data:image/svg+xml;base64,xyz)", "unsafe Markdown URL"),
+        ("[x](/articles/hidden)", "broken root-relative Markdown URL"),
+        (
+            "[x](/articles/missing)",
+            "broken root-relative Markdown URL",
+        ),
+        ("![x](/images/no.png)", "broken root-relative Markdown URL"),
+        ("[x](/%2e%2e/secret)", "invalid root-relative Markdown URL"),
+        (
+            "[x](/images/%2fsecret)",
+            "invalid root-relative Markdown URL",
+        ),
+    ] {
+        markdown_file(
+            &site,
+            "content/articles/a.md",
+            &format!("+++\nslug = \"a\"\ntitle = \"A\"\n+++\n{body}\n"),
+        );
+        let result = site.build();
+        assert!(!result.status.success(), "{body}");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(diagnostic) && stderr.contains("content/articles/a.md"),
+            "{body}: {stderr}"
+        );
+        assert_eq!(site.read("dist/articles/a/index.html"), old);
+    }
+}
+
+#[test]
+fn root_links_validate_against_new_not_previous_artifacts() {
+    let site = content_site();
+    site.source(MARKDOWN_HTML_APP);
+    markdown_file(
+        &site,
+        "content/articles/a.md",
+        "+++\nslug = \"a\"\ntitle = \"A\"\n+++\n[B](/articles/b/)\n",
+    );
+    markdown_file(
+        &site,
+        "content/articles/b.md",
+        "+++\nslug = \"b\"\ntitle = \"B\"\n+++\nB\n",
+    );
+    success(site.build());
+    let old = site.read("dist/articles/a/index.html");
+    std::fs::remove_file(site.0.join("content/articles/b.md")).unwrap();
+    let result = site.build();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("broken root-relative Markdown URL"));
+    assert_eq!(site.read("dist/articles/a/index.html"), old);
+    assert!(site.0.join("dist/articles/b/index.html").exists());
+}

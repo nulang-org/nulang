@@ -77,8 +77,12 @@ It snapshots typed content records in a private generated module, excludes
 drafts, validates source paths and portable slugs, and passes the same snapshot
 to build, dev and deploy compiler invocations. The manifest's collection
 provider still projects the route keys; content records and source paths do
-not expand the Deployment IR schema. Markdown bodies remain source strings
-in this version, not trusted HTML.
+not expand the Deployment IR schema. Entries retain the Markdown source in
+`body: String` and provide `html: Html`, a CommonMark fragment with raw HTML
+escaped and URLs checked before serialization. Build and deploy verify
+root-relative Markdown references against staged artifacts and retained
+server GET routes before publication; no additional route or content schema
+is added to the IR.
 
 Static placement is validated before artifact emission against the linked
 compiler-produced bytecode, independently of the declared effect row. Every

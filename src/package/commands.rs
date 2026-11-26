@@ -1597,6 +1597,14 @@ fn build_web(
     if static_dir.is_dir() {
         copy_dir_contents(&static_dir, output_dir)?;
     }
+    if let Some(content) = content {
+        content
+            .validate_links(&ir, &runtime_routes, output_dir)
+            .map_err(|msg| NuError::PackageError {
+                msg,
+                span: Span::default(),
+            })?;
+    }
 
     // Enforce performance budgets declared in Nulang.toml.
     if let Err(violations) = crate::web::budget::check_initial_js_budget(
