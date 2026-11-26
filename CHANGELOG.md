@@ -3,6 +3,19 @@
 - **The five-node TCP cluster chaos test now waits for healthy peer statuses as well as active-view convergence after a healed network partition.** The address resolver refuses one-shot sends when peers still have `Suspect` or `Failed` status; merely appearing in the active view is not sufficient to establish post-heal send readiness.
 - **Tighten diagnostics before cross-boundary delivery.** The test asserts A/E agree they are healthy, then preserves the original one-shot send and delivery assertion; no runtime transport/retry semantics are changed.
 - **Evidence:** the original test failed on one of two repeated local runs with the same remote-delivery assertion seen on PR #2540; the stricter test passed 12 consecutive local runs. Further high-contention CI confirmation remains necessary.
+### Per-priority scheduler runnable backlog diagnostics — 2026-11-20
+- **Expose approximate queued High, Normal, and Low runnable task counts** in the existing scheduler metrics snapshot, including global injector and worker-local queues, without adding counters to scheduling hot paths.
+- **Regression tests cover mixed priority queues, dequeues, and metrics-counter reset.** Queue depths are sampled non-atomically for diagnostics only; they are not admission, fairness, or backpressure guarantees.
+
+### NUL0 TCP partial-frame recovery across read timeouts — 2026-11-10
+- **Preserve bytes already consumed from NUL0 frame prefixes and payloads when socket reads return `WouldBlock`, `TimedOut`, or `Interrupted`.** Retry from the unconsumed offset rather than restarting `read_exact` with a fresh buffer, preventing frame misalignment and lost actor packets.
+- **Cover fragmented reads, shutdown and premature EOF with deterministic regressions.** Existing maximum-frame-size limits and transport failure semantics are retained. The intermittent five-node post-heal delivery problem still requires separate qualification; this change does not establish that it is fully resolved.
+- **2026-11-20 bounded-frame follow-up:** Once the first prefix byte arrives, enforce a 30-second no-progress timeout and a 60-second base total assembly budget plus payload-size allowance at 64 KiB/s, shared across prefix and payload. A healthy idle connection before the first byte is not expired by the frame deadline. New regressions exercise stalls, trickle traffic, and cross-segment deadline continuity; the five-node recovery issue remains separately gated.
+
+### Optional Syntyr styling preset for Web scaffolds — 2026-11-15
+- **The existing `nula new --template web` now supports opt-in `--style syntyr`.** Generated apps include pinned, self-hosted Syntyr 0.3.0-alpha.4 core and semantic styles, MIT attribution, scoped Studio styling, a responsive Todo UI, and no mandatory npm/CDN/JavaScript dependency. The default web template remains unstyled.
+- **Generated Todo forms support standard no-JavaScript POST submissions.** Hidden action fields distinguish add, toggle and delete operations; web starter type annotations incompatible with route-contract parsing have been removed. The original preset branch verified both styled and unstyled builds locally.
+- **Pin the stylesheet hashes and carry the license into static builds.** Add executable CLI scaffold/build coverage for both variants without a Cargo executable on PATH. The standalone CLI locates itself before attempting Cargo metadata, avoiding an unnecessary Rust toolchain dependency.
 
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.

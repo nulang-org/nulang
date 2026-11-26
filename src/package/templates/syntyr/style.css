@@ -1,0 +1,28 @@
+/* App-owned layout overrides. Syntyr supplies scoped component styling. */
+body { margin: 0; }
+.app-shell {
+  max-width: 52rem;
+  margin-inline: auto;
+  padding: clamp(1.25rem, 4vw, 3rem);
+  min-height: 100vh;
+}
+.app-header { margin-block: 1rem 2rem; }
+.app-eyebrow { font-size: 0.75rem; letter-spacing: 0.12em; text-transform: uppercase; }
+.new-todo { display: grid; gap: 0.75rem; margin-bottom: 1.5rem; }
+.new-todo-controls { display: flex; align-items: stretch; gap: 0.5rem; flex-wrap: wrap; }
+.new-todo-controls input { flex: 1 1 16rem; min-width: 0; }
+.todos { list-style: none; padding: 0; margin: 0; }
+.todos li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.75rem 0;
+  border-top: 1px solid var(--syn-border-default, #ddd);
+}
+.todos li > span { flex: 1 1 12rem; overflow-wrap: anywhere; }
+.todos li.done > span { text-decoration: line-through; opacity: 0.65; }
+.todos li form { margin: 0; }
+@media (max-width: 34rem) {
+  .new-todo-controls > button { flex: 1 1 auto; }
+}

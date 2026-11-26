@@ -68,9 +68,10 @@ pub fn core_pinning_enabled() -> bool {
 
 /// Lightweight, atomics-based profiling metrics for the scheduler.
 ///
-/// All counters are monotonically increasing unless reset via
-/// [`Scheduler::reset_stats`]. They are snapshots of the underlying atomic
-/// counters and are therefore not guaranteed to be mutually consistent in a
+/// Cumulative counters are monotonically increasing unless reset via
+/// [`Scheduler::reset_stats`]. The queued_* fields are instantaneous gauges,
+/// not cumulative counters, and may increase or decrease between snapshots.
+/// Neither the counters nor the queue samples are mutually consistent under
 /// concurrent execution.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct SchedulerStats {
@@ -91,6 +92,12 @@ pub struct SchedulerStats {
     pub steal_successes: u64,
     /// Times a scheduler lookup found no work anywhere it was allowed to look.
     pub empty_polls: u64,
+    /// Approximate queued tasks across global and worker-local High queues.
+    pub queued_high: usize,
+    /// Approximate queued tasks across global and worker-local Normal queues.
+    pub queued_normal: usize,
+    /// Approximate queued tasks across global and worker-local Low queues.
+    pub queued_low: usize,
 }
 
 /// Profiling counters touched by worker threads. Padded to a cache line so
@@ -121,6 +128,9 @@ impl SchedulerStatsInternal {
             steal_attempts: self.steal_attempts.load(Ordering::Relaxed),
             steal_successes: self.steal_successes.load(Ordering::Relaxed),
             empty_polls: self.empty_polls.load(Ordering::Relaxed),
+            queued_high: 0,
+            queued_normal: 0,
+            queued_low: 0,
         }
     }
 
@@ -568,9 +578,29 @@ impl Scheduler {
         self.processed_count.store(0, Ordering::Relaxed);
     }
 
-    /// Snapshot scheduler profiling counters.
+    /// Approximate runnable backlog for a priority band.
+    ///
+    /// Each queue length is a non-transactional snapshot: concurrent enqueues,
+    /// dequeues, and batch transfers can make the sum temporarily inconsistent.
+    /// This is diagnostic data, not a scheduling or resource-limit guarantee.
+    fn queued_for(&self, priority: ActorPriority) -> usize {
+        self.workers_for(priority)
+            .iter()
+            .fold(self.global_for(priority).len(), |total, worker| {
+                total.saturating_add(worker.len())
+            })
+    }
+
+    /// Snapshot scheduler profiling counters and queued work by priority.
+    ///
+    /// Resetting counters does not remove runnable tasks. Queue depths are
+    /// sampled on demand, avoiding any hot-path increment/decrement overhead.
     pub fn stats(&self) -> SchedulerStats {
-        self.stats.snapshot()
+        let mut stats = self.stats.snapshot();
+        stats.queued_high = self.queued_for(ActorPriority::High);
+        stats.queued_normal = self.queued_for(ActorPriority::Normal);
+        stats.queued_low = self.queued_for(ActorPriority::Low);
+        stats
     }
 
     /// Reset scheduler profiling counters.
@@ -875,6 +905,58 @@ mod scheduler_tests {
         // steal_one has no owner slot, so it probes the one worker in each of
         // the three priority bands.
         assert_eq!(stats.steal_attempts, 3);
+    }
+
+    #[test]
+    fn test_stats_report_queued_work_by_priority_across_global_and_local() {
+        let s = Scheduler::new(2);
+        s.enqueue_with_priority(10, ActorPriority::High);
+        s.enqueue_local_with_priority(0, 11, ActorPriority::High);
+        s.enqueue_with_priority(12, ActorPriority::Normal);
+        s.enqueue_local_with_priority(1, 13, ActorPriority::Low);
+
+        let stats = s.stats();
+        assert_eq!(stats.queued_high, 2);
+        assert_eq!(stats.queued_normal, 1);
+        assert_eq!(stats.queued_low, 1);
+        assert_eq!(stats.total_tasks_processed, 0);
+
+        assert_eq!(s.dequeue(), Some(11));
+        let stats = s.stats();
+        assert_eq!(stats.queued_high, 1);
+        assert_eq!(stats.queued_normal, 1);
+        assert_eq!(stats.queued_low, 1);
+    }
+
+    #[test]
+    fn test_stats_serialize_existing_counters_and_new_queue_gauges() {
+        let s = Scheduler::new(1);
+        s.enqueue_with_priority(1, ActorPriority::High);
+        s.enqueue_with_priority(2, ActorPriority::Normal);
+        s.enqueue_local_with_priority(0, 3, ActorPriority::Low);
+        let json = serde_json::to_value(s.stats()).unwrap();
+        assert_eq!(json["total_tasks_processed"], 0);
+        assert_eq!(json["tasks_from_local_queue"], 0);
+        assert_eq!(json["tasks_from_global_queue"], 0);
+        assert_eq!(json["tasks_from_steal"], 0);
+        assert_eq!(json["steal_attempts"], 0);
+        assert_eq!(json["steal_successes"], 0);
+        assert_eq!(json["empty_polls"], 0);
+        assert_eq!(json["queued_high"], 1);
+        assert_eq!(json["queued_normal"], 1);
+        assert_eq!(json["queued_low"], 1);
+    }
+
+    #[test]
+    fn test_reset_stats_does_not_hide_pending_priority_backlog() {
+        let s = Scheduler::new(1);
+        s.enqueue_with_priority(42, ActorPriority::Low);
+        s.reset_stats();
+        let stats = s.stats();
+        assert_eq!(stats.total_tasks_processed, 0);
+        assert_eq!(stats.queued_high, 0);
+        assert_eq!(stats.queued_normal, 0);
+        assert_eq!(stats.queued_low, 1);
     }
 
     #[test]
