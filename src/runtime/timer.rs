@@ -379,13 +379,24 @@ impl TimerWheel {
 
     /// Earliest fire time among active (non-cancelled) timers.
     ///
-    /// Returns `None` when no active timer is scheduled. O(n) over the
-    /// wheel; intended for the scheduler's drain path, not the hot loop.
+    /// O(1) when the heap head is active. If the head was lazily cancelled,
+    /// fall back to an O(n) scan without mutating timer or cancellation state.
+    /// This keeps the ordinary scheduler sleep decision independent of the
+    /// number of pending timers.
     pub fn next_deadline(&self) -> Option<Instant> {
         let timers = match self.timers.read() {
             Ok(t) => t,
             Err(_) => return None,
         };
+        // The heap is ordered by fire_at. A live head is necessarily the
+        // earliest active timer; no need to inspect the other entries.
+        let head = timers.peek()?;
+        if !head.cancelled.load(Ordering::SeqCst) {
+            return Some(head.fire_at);
+        }
+
+        // Cancellation is lazy and does not remove heap entries until tick.
+        // The cancelled head may precede live timers deeper in the heap.
         timers
             .iter()
             .filter(|e| !e.cancelled.load(Ordering::SeqCst))
@@ -515,6 +526,51 @@ mod tests {
         // Virtual clock preserves its base
         assert!(clock.now() > start);
         assert!(clock.elapsed() >= Duration::from_secs(6));
+    }
+
+    #[test]
+    fn test_next_deadline_returns_earliest_live_timer() {
+        let wheel = TimerWheel::new();
+        let now = Instant::now();
+        wheel.timer_sleep_wake_at(now, Duration::from_secs(30), 42);
+        wheel.timer_sleep_wake_at(now, Duration::from_secs(5), 42);
+        wheel.timer_sleep_wake_at(now, Duration::from_secs(10), 42);
+
+        assert_eq!(wheel.next_deadline(), Some(now + Duration::from_secs(5)));
+        assert_eq!(wheel.len(), 3);
+    }
+
+    #[test]
+    fn test_next_deadline_skips_cancelled_heap_head() {
+        let wheel = TimerWheel::new();
+        let now = Instant::now();
+        let earliest = wheel.timer_sleep_wake_at(now, Duration::from_secs(1), 42);
+        wheel.timer_sleep_wake_at(now, Duration::from_secs(3), 42);
+        let last = wheel.timer_sleep_wake_at(now, Duration::from_secs(8), 42);
+
+        assert!(wheel.cancel(earliest));
+        assert_eq!(wheel.next_deadline(), Some(now + Duration::from_secs(3)));
+        assert_eq!(wheel.len(), 2);
+
+        assert!(wheel.cancel(last));
+        assert_eq!(wheel.next_deadline(), Some(now + Duration::from_secs(3)));
+        assert_eq!(wheel.tick(now + Duration::from_secs(10)).len(), 1);
+        assert_eq!(wheel.next_deadline(), None);
+    }
+
+    #[test]
+    fn test_next_deadline_none_when_empty_or_all_cancelled() {
+        let wheel = TimerWheel::new();
+        assert_eq!(wheel.next_deadline(), None);
+
+        let now = Instant::now();
+        let first = wheel.timer_sleep_wake_at(now, Duration::from_secs(1), 42);
+        let second = wheel.timer_sleep_wake_at(now, Duration::from_secs(2), 42);
+        assert!(wheel.cancel(first));
+        assert!(wheel.cancel(second));
+
+        assert_eq!(wheel.next_deadline(), None);
+        assert!(wheel.is_empty());
     }
 
     #[test]
