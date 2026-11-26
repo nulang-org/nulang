@@ -392,6 +392,14 @@ pub struct DurableOutboxMessage {
     pub payload: Vec<PersistedValue>,
 }
 
+/// Stable identity of a message in a committed sender transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct DurableOutboxId {
+    pub sender_actor_id: u64,
+    pub sequence: u64,
+    pub ordinal: u32,
+}
+
 /// One logical durable actor/workflow/entity transition.
 #[derive(Debug, Clone)]
 pub struct DurableTransition {
@@ -403,6 +411,8 @@ pub struct DurableTransition {
     pub command: Option<JournalEntry>,
     /// Explicit standalone workflow admission; generic/legacy commands are not proof of admission.
     pub workflow_admission: bool,
+    /// Optional same-store source message identity, committed with admission.
+    pub workflow_inbox: Option<DurableOutboxId>,
     /// Number of terminal effects actually consumed by the current execution.
     /// Required for tracked workflow closure; None on generic/legacy transitions.
     pub workflow_effects_consumed: Option<u32>,
@@ -447,6 +457,41 @@ struct WorkflowAdmission {
 
 fn workflow_admission_error(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn validate_workflow_inbox(
+    transition: &DurableTransition,
+    source: Option<DurableOutboxMessage>,
+    previous: Option<WorkflowActivationId>,
+) -> io::Result<()> {
+    if previous.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "durable message already admitted",
+        ));
+    }
+    let source = source.ok_or_else(|| {
+        workflow_admission_error("durable inbox source is not a committed outbox message")
+    })?;
+    let command = transition
+        .command
+        .as_ref()
+        .ok_or_else(|| workflow_admission_error("inbox admission requires a command"))?;
+    if source.destination_actor_id != transition.actor_id
+        || source.behavior_id != command.behavior_id
+        || source
+            .payload
+            .iter()
+            .chain(&command.payload)
+            .any(|value| matches!(value, PersistedValue::Float(f) if !f.is_finite()))
+        || serde_json::to_vec(&source.payload).map_err(io::Error::other)?
+            != serde_json::to_vec(&command.payload).map_err(io::Error::other)?
+    {
+        return Err(workflow_admission_error(
+            "inbox command does not match committed outbox destination, behavior or payload",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_open_boundary(
@@ -519,10 +564,7 @@ fn validate_workflow_admission_transition(
         let activation = WorkflowActivationId::new(transition.actor_id, open.command_sequence);
         let closes = transition.workflow_events.len() == 1
             && transition.workflow_events[0].activation_id() == Some(activation);
-        if transition.command.is_some()
-            || !transition.domain_events.is_empty()
-            || !transition.outbox.is_empty()
-        {
+        if transition.command.is_some() || !transition.domain_events.is_empty() {
             return Err(workflow_admission_error(
                 "unqualified transition while workflow command is open",
             ));
@@ -543,6 +585,7 @@ fn validate_workflow_admission_transition(
         }
         if transition.snapshot.is_some()
             || !transition.workflow_events.is_empty()
+            || !transition.outbox.is_empty()
             || transition.durable_effects.iter().any(|record| {
                 record.workflow_binding().map(|binding| binding.activation) != Some(activation)
             })
@@ -615,6 +658,7 @@ impl DurableTransition {
                 payload,
             }),
             workflow_admission: true,
+            workflow_inbox: None,
             workflow_effects_consumed: None,
             snapshot: None,
             workflow_events: vec![],
@@ -665,6 +709,12 @@ impl DurableTransition {
             ));
         }
 
+        if let Some(source) = self.workflow_inbox {
+            if !self.workflow_admission || source.sequence == 0 || source.sequence > i64::MAX as u64
+            {
+                return Err(workflow_admission_error("inbox identity requires standalone workflow admission and a valid source sequence"));
+            }
+        }
         if self.workflow_effects_consumed.is_some()
             && (self.workflow_admission
                 || self.command.is_some()
@@ -672,11 +722,21 @@ impl DurableTransition {
                 || self.workflow_events.len() != 1
                 || self.workflow_events[0].activation_id().is_none()
                 || !self.durable_effects.is_empty()
-                || !self.domain_events.is_empty()
-                || !self.outbox.is_empty())
+                || !self.domain_events.is_empty())
         {
             return Err(workflow_admission_error(
                 "workflow effect cursor evidence requires a standalone terminal transition",
+            ));
+        }
+        if self.workflow_effects_consumed.is_some()
+            && !self.outbox.is_empty()
+            && !matches!(
+                self.workflow_events.as_slice(),
+                [WorkflowEvent::StepCompleted { .. }]
+            )
+        {
+            return Err(workflow_admission_error(
+                "workflow outbox requires successful terminal completion",
             ));
         }
         if self.workflow_admission
@@ -777,6 +837,16 @@ impl DurableTransition {
 
         let mut ordinals = BTreeSet::new();
         for message in &self.outbox {
+            if self.workflow_effects_consumed.is_some()
+                && message
+                    .payload
+                    .iter()
+                    .any(|value| matches!(value, PersistedValue::Float(f) if !f.is_finite()))
+            {
+                return Err(workflow_admission_error(
+                    "workflow outbox payload contains a non-finite float",
+                ));
+            }
             if !ordinals.insert(message.ordinal) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -808,6 +878,8 @@ impl DurableTransition {
             #[serde(skip_serializing_if = "is_false")]
             workflow_admission: bool,
             #[serde(skip_serializing_if = "Option::is_none")]
+            workflow_inbox: Option<DurableOutboxId>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             workflow_effects_consumed: Option<u32>,
             snapshot: &'a Option<ActorSnapshot>,
             workflow_events: &'a [WorkflowEvent],
@@ -834,6 +906,7 @@ impl DurableTransition {
             expected_previous_sequence: self.expected_previous_sequence,
             command: &self.command,
             workflow_admission: self.workflow_admission,
+            workflow_inbox: self.workflow_inbox,
             workflow_effects_consumed: self.workflow_effects_consumed,
             snapshot: &self.snapshot,
             workflow_events: &self.workflow_events,
@@ -1036,6 +1109,29 @@ pub trait PersistenceStore: Send + Sync {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "atomic durable transitions are not supported by this persistence backend",
+        ))
+    }
+
+    /// Recover a staged message by its stable sender transition identity.
+    /// This does not deliver or acknowledge the message.
+    fn load_durable_outbox_message(
+        &self,
+        _id: DurableOutboxId,
+    ) -> io::Result<Option<DurableOutboxMessage>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable outbox reads are not supported",
+        ))
+    }
+
+    /// Return the original accepted command for this message, even after closure.
+    fn load_workflow_inbox_admission(
+        &self,
+        _id: DurableOutboxId,
+    ) -> io::Result<Option<WorkflowActivationId>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable inbox reads are not supported",
         ))
     }
 
@@ -1280,6 +1376,35 @@ impl MemoryStore {
 }
 
 impl PersistenceStore for MemoryStore {
+    fn load_durable_outbox_message(
+        &self,
+        id: DurableOutboxId,
+    ) -> io::Result<Option<DurableOutboxMessage>> {
+        Ok(self
+            .committed_transitions(id.sender_actor_id)
+            .iter()
+            .find(|transition| transition.sequence == id.sequence)
+            .and_then(|transition| {
+                transition
+                    .outbox
+                    .iter()
+                    .find(|message| message.ordinal == id.ordinal)
+            })
+            .cloned())
+    }
+
+    fn load_workflow_inbox_admission(
+        &self,
+        id: DurableOutboxId,
+    ) -> io::Result<Option<WorkflowActivationId>> {
+        Ok(self
+            .committed_transitions
+            .values()
+            .flatten()
+            .find(|transition| transition.workflow_inbox == Some(id))
+            .map(|transition| WorkflowActivationId::new(transition.actor_id, transition.sequence)))
+    }
+
     fn load_open_workflow_command(&self, actor_id: u64) -> io::Result<Option<OpenWorkflowCommand>> {
         let Some(admission) = self
             .workflow_admissions
@@ -1493,6 +1618,13 @@ impl PersistenceStore for MemoryStore {
                 })
                 .map(|snapshot| snapshot.sequence),
         )?;
+        if let Some(id) = transition.workflow_inbox {
+            validate_workflow_inbox(
+                &transition,
+                self.load_durable_outbox_message(id)?,
+                self.load_workflow_inbox_admission(id)?,
+            )?;
+        }
         if let Some(closed) = admission.filter(|a| a.closed_sequence.is_some()) {
             let activation =
                 WorkflowActivationId::new(transition.actor_id, closed.command_sequence);
@@ -2324,6 +2456,19 @@ impl LibsqlStore {
             )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS durable_workflow_inbox (
+                    actor_id INTEGER NOT NULL,
+                    command_sequence INTEGER NOT NULL,
+                    sender_actor_id INTEGER NOT NULL,
+                    sender_sequence INTEGER NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    PRIMARY KEY (sender_actor_id, sender_sequence, ordinal)
+                )",
+                (),
+            )
+            .await
+            .map_err(io::Error::other)?;
             Ok(())
         })
     }
@@ -2482,7 +2627,87 @@ async fn read_workflow_admission(
 }
 
 #[cfg(feature = "sqlite")]
+async fn decode_durable_outbox(
+    mut rows: libsql::Rows,
+    id: DurableOutboxId,
+) -> io::Result<Option<DurableOutboxMessage>> {
+    let Some(row) = rows.next().await.map_err(io::Error::other)? else {
+        return Ok(None);
+    };
+    let destination: i64 = row.get(0).map_err(io::Error::other)?;
+    let behavior: i64 = row.get(1).map_err(io::Error::other)?;
+    let payload: String = row.get(2).map_err(io::Error::other)?;
+    Ok(Some(DurableOutboxMessage {
+        destination_actor_id: destination as u64,
+        ordinal: id.ordinal,
+        behavior_id: u16::try_from(behavior).map_err(io::Error::other)?,
+        payload: serde_json::from_str(&payload).map_err(io::Error::other)?,
+    }))
+}
+
+#[cfg(feature = "sqlite")]
+async fn decode_workflow_inbox(mut rows: libsql::Rows) -> io::Result<Option<WorkflowActivationId>> {
+    let Some(row) = rows.next().await.map_err(io::Error::other)? else {
+        return Ok(None);
+    };
+    let actor: i64 = row.get(0).map_err(io::Error::other)?;
+    let command: i64 = row.get(1).map_err(io::Error::other)?;
+    if command <= 0 {
+        return Err(workflow_admission_error("invalid inbox command sequence"));
+    }
+    Ok(Some(WorkflowActivationId::new(
+        actor as u64,
+        command as u64,
+    )))
+}
+
+#[cfg(feature = "sqlite")]
+const DURABLE_OUTBOX_QUERY: &str = "SELECT o.destination_actor_id, o.behavior_id, o.payload
+    FROM durable_outbox o JOIN durable_transitions t ON t.actor_id=o.actor_id AND t.sequence=o.sequence
+    WHERE o.actor_id=?1 AND o.sequence=?2 AND o.ordinal=?3";
+
+#[cfg(feature = "sqlite")]
+const DURABLE_INBOX_QUERY: &str = "SELECT actor_id, command_sequence FROM durable_workflow_inbox
+    WHERE sender_actor_id=?1 AND sender_sequence=?2 AND ordinal=?3";
+
+#[cfg(feature = "sqlite")]
 impl PersistenceStore for LibsqlStore {
+    fn load_durable_outbox_message(
+        &self,
+        id: DurableOutboxId,
+    ) -> io::Result<Option<DurableOutboxMessage>> {
+        let sequence = i64::try_from(id.sequence).map_err(io::Error::other)?;
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let rows = conn
+                .query(
+                    DURABLE_OUTBOX_QUERY,
+                    libsql::params![id.sender_actor_id as i64, sequence, id.ordinal as i64],
+                )
+                .await
+                .map_err(io::Error::other)?;
+            decode_durable_outbox(rows, id).await
+        })
+    }
+
+    fn load_workflow_inbox_admission(
+        &self,
+        id: DurableOutboxId,
+    ) -> io::Result<Option<WorkflowActivationId>> {
+        let sequence = i64::try_from(id.sequence).map_err(io::Error::other)?;
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let rows = conn
+                .query(
+                    DURABLE_INBOX_QUERY,
+                    libsql::params![id.sender_actor_id as i64, sequence, id.ordinal as i64],
+                )
+                .await
+                .map_err(io::Error::other)?;
+            decode_workflow_inbox(rows).await
+        })
+    }
+
     fn load_open_workflow_command(&self, actor_id: u64) -> io::Result<Option<OpenWorkflowCommand>> {
         let conn = self.conn();
         self.rt.block_on(async {
@@ -2796,6 +3021,17 @@ impl PersistenceStore for LibsqlStore {
                 Ok(admission) => admission,
                 Err(error) => { let _ = tx.rollback().await; return Err(error); }
             };
+            if let Some(id) = transition.workflow_inbox {
+                let validation = async {
+                    let params = libsql::params![id.sender_actor_id as i64, id.sequence as i64, id.ordinal as i64];
+                    let rows = tx.query(DURABLE_OUTBOX_QUERY, params).await.map_err(io::Error::other)?;
+                    let source = decode_durable_outbox(rows, id).await?;
+                    let rows = tx.query(DURABLE_INBOX_QUERY, libsql::params![id.sender_actor_id as i64, id.sequence as i64, id.ordinal as i64]).await.map_err(io::Error::other)?;
+                    let previous = decode_workflow_inbox(rows).await?;
+                    validate_workflow_inbox(&transition, source, previous)
+                }.await;
+                if let Err(error) = validation { let _ = tx.rollback().await; return Err(error); }
+            }
             if let Some(closed) = admission.filter(|a| a.closed_sequence.is_some()) {
                 let validation = async {
                     let command_sequence = i64::try_from(closed.command_sequence)
@@ -2886,6 +3122,15 @@ impl PersistenceStore for LibsqlStore {
                 )
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            }
+
+            if let Some(id) = transition.workflow_inbox {
+                tx.execute(
+                    "INSERT INTO durable_workflow_inbox (actor_id, command_sequence, sender_actor_id, sender_sequence, ordinal)
+                    VALUES (?1, ?2, ?3, ?4, ?5)",
+                    libsql::params![transition.actor_id as i64, transition.sequence as i64,
+                        id.sender_actor_id as i64, id.sequence as i64, id.ordinal as i64],
+                ).await.map_err(io::Error::other)?;
             }
 
             for (ordinal, event_json) in workflow_json.iter().enumerate() {
@@ -3428,6 +3673,7 @@ impl PersistenceStore for LibsqlStore {
                 "durable_effect_records",
                 "durable_outbox",
                 "durable_workflow_admissions",
+                "durable_workflow_inbox",
                 "durable_transitions",
                 "durable_tails",
             ] {
@@ -4874,6 +5120,7 @@ mod durable_transition_tests {
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }),
             workflow_admission: false,
+            workflow_inbox: None,
             workflow_effects_consumed: None,
             snapshot: Some(ActorSnapshot {
                 activation_epoch: epoch,
@@ -5116,6 +5363,7 @@ mod libsql_atomic_transition_tests {
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }),
             workflow_admission: false,
+            workflow_inbox: None,
             workflow_effects_consumed: None,
             snapshot: Some(ActorSnapshot {
                 activation_epoch: epoch,

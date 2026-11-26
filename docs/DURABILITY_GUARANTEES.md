@@ -276,11 +276,39 @@ schema migration; mixed-version writers remain unqualified.
 
 This experimental path scans the post-command portion of effect history; there
 is no dedicated index or throughput claim yet. Backends without slot recovery
-return Unsupported. Inbox/outbox integration, atomic intermediate events,
-timers and suspension, and production recovery with a new ownership epoch
-remain future work. The general compiled workflow scheduler still uses the
-legacy journal path and **must not** use this adapter until those paths are
-qualified.
+return Unsupported.
+
+### Same-store workflow inbox/outbox (experimental storage contract)
+
+A successful tracked terminal transition may stage outbound actor messages.
+The snapshot, terminal event, cursor reconciliation, admission closure and
+outbox records commit together. A failed step or intermediate effect
+transition cannot stage messages. Duplicate ordinals and non-finite floating
+point payloads are rejected. Each message is identified by sender actor ID,
+committed transition sequence and ordinal; ownership epochs are not part of
+the logical message identity.
+
+A receiver sharing the same persistence store may set the optional
+`workflow_inbox` identity on its standalone workflow command admission.
+MemoryStore and SQLite verify that the source outbox record is committed and
+matches the receiver, behavior and serialized payload. Admission and the
+deduplication receipt commit atomically with the command journal and fenced
+tail. A duplicate cannot create a new command after the original admission
+closes. Exact-tail commit retries remain idempotent. The lookup
+`load_workflow_inbox_admission` returns the original accepted activation,
+**not** proof of execution or delivery completion. A receiver must recover
+an unfinished admitted activation rather than dispatch it again.
+
+SQLite adds the `durable_workflow_inbox` table; absence of the optional
+identity preserves existing transition digests. No transport, mailbox,
+acknowledgment, or automatic dispatch is enabled by this contract.
+It assumes a trusted host, a shared store, and stable actor identities
+without destructive clear/reuse or mixed-version writers. Cross-store
+delivery, outbox polling/acknowledgment and retention, remote libSQL
+qualification, mailbox staging, atomic intermediate events, timers,
+suspension and production cross-epoch recovery remain unqualified.
+The general compiled workflow scheduler still uses the legacy journal path
+and **must not** use this adapter until those paths are qualified.
 
 The existing SQLite VM fixture exercises this opt-in path with compiled
 workflow bytecode, a committed command sequence, lost provider reply,

@@ -38,6 +38,7 @@ fn transition(
         expected_previous_sequence: previous,
         command: None,
         workflow_admission: false,
+        workflow_inbox: None,
         workflow_effects_consumed: None,
         snapshot: None,
         workflow_events: vec![],
@@ -460,6 +461,7 @@ fn assert_workflow_admission_contract(store: &mut dyn PersistenceStore) {
         expected_previous_sequence: expected,
         command: None,
         workflow_admission: false,
+        workflow_inbox: None,
         workflow_effects_consumed: Some(1),
         snapshot: Some(ActorSnapshot {
             actor_id: 42,
@@ -613,6 +615,7 @@ fn sqlite_admission_and_terminal_marker_rollback_and_reopen() {
         expected_previous_sequence: 1,
         command: None,
         workflow_admission: false,
+        workflow_inbox: None,
         workflow_effects_consumed: Some(0),
         snapshot: Some(ActorSnapshot {
             actor_id: 42,
@@ -682,6 +685,7 @@ fn terminal_after_two_effects(store: &mut dyn PersistenceStore) -> DurableTransi
         expected_previous_sequence: sequence - 1,
         command: None,
         workflow_admission: false,
+        workflow_inbox: None,
         workflow_effects_consumed: Some(2),
         snapshot: Some(ActorSnapshot {
             actor_id: 42,
@@ -777,5 +781,274 @@ fn sqlite_terminal_rejects_missing_earlier_intent_even_with_valid_last_receipt()
     assert!(store.load_open_workflow_command(42).unwrap().is_some());
     drop(raw);
     drop(store);
+    std::fs::remove_file(path).unwrap();
+}
+
+fn assert_terminal_outbox_contract(store: &mut dyn PersistenceStore) {
+    use nulang::runtime::{DurableOutboxId, DurableOutboxMessage, PersistedValue, WorkflowEvent};
+    let mut terminal = terminal_after_two_effects(store);
+    let message = DurableOutboxMessage {
+        destination_actor_id: 77,
+        ordinal: 0,
+        behavior_id: 3,
+        payload: vec![PersistedValue::Int(9)],
+    };
+    terminal.outbox.push(message.clone());
+    let id = DurableOutboxId {
+        sender_actor_id: 42,
+        sequence: terminal.sequence,
+        ordinal: 0,
+    };
+    assert!(store.load_durable_outbox_message(id).unwrap().is_none());
+    let mut failed = terminal.clone();
+    failed.workflow_events = vec![WorkflowEvent::StepFailed {
+        sequence: terminal.sequence,
+        activation: Some(WorkflowActivationId::new(42, 1)),
+        step_name: "step".into(),
+        error: "failed".into(),
+    }];
+    assert!(store.commit_transition(failed).is_err());
+    let mut malformed = terminal.clone();
+    malformed.outbox[0].payload = vec![PersistedValue::Float(f64::NAN)];
+    assert!(store.commit_transition(malformed).is_err());
+    let mut duplicate = terminal.clone();
+    duplicate.outbox.push(message.clone());
+    assert!(store.commit_transition(duplicate).is_err());
+    let mut incomplete = terminal.clone();
+    incomplete.workflow_effects_consumed = Some(1);
+    assert!(store.commit_transition(incomplete).is_err());
+    assert_eq!(store.latest_sequence(42), 5);
+    assert_eq!(store.load_snapshot(42).unwrap().sequence, 0);
+    let mut intermediate = transition(store, 42, 1, bound_prepared(slot(2, 1), b"request"));
+    intermediate.outbox.push(message.clone());
+    assert!(store.commit_transition(intermediate).is_err());
+    assert!(store.load_durable_outbox_message(id).unwrap().is_none());
+    let committed = store.commit_transition(terminal.clone()).unwrap();
+    assert_eq!(
+        store.load_durable_outbox_message(id).unwrap(),
+        Some(message)
+    );
+    assert_eq!(
+        store.commit_transition(terminal.clone()).unwrap(),
+        committed
+    );
+    let mut changed = terminal;
+    changed.outbox[0].behavior_id += 1;
+    assert!(store.commit_transition(changed).is_err());
+    assert_eq!(store.load_snapshot(42).unwrap().sequence, 6);
+    assert!(store.load_open_workflow_command(42).unwrap().is_none());
+}
+
+#[test]
+fn memory_workflow_terminal_can_stage_outbox_atomically() {
+    assert_terminal_outbox_contract(&mut MemoryStore::new());
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_workflow_terminal_can_stage_outbox_atomically() {
+    assert_terminal_outbox_contract(&mut nulang::runtime::LibsqlStore::in_memory().unwrap());
+}
+
+fn committed_message(store: &mut dyn PersistenceStore) -> nulang::runtime::DurableOutboxId {
+    use nulang::runtime::{DurableOutboxId, DurableOutboxMessage, PersistedValue};
+    let mut terminal = terminal_after_two_effects(store);
+    terminal.outbox.push(DurableOutboxMessage {
+        destination_actor_id: 77,
+        ordinal: 0,
+        behavior_id: 3,
+        payload: vec![PersistedValue::String("payload".into())],
+    });
+    let id = DurableOutboxId {
+        sender_actor_id: 42,
+        sequence: terminal.sequence,
+        ordinal: 0,
+    };
+    store.commit_transition(terminal).unwrap();
+    store
+        .save_snapshot(ActorSnapshot {
+            actor_id: 77,
+            activation_epoch: 1,
+            ..ActorSnapshot::default()
+        })
+        .unwrap();
+    id
+}
+
+fn receiving_admission(id: nulang::runtime::DurableOutboxId, previous: u64) -> DurableTransition {
+    use nulang::runtime::PersistedValue;
+    let mut admission = DurableTransition::workflow_command(
+        77,
+        1,
+        previous,
+        3,
+        vec![PersistedValue::String("payload".into())],
+    )
+    .unwrap();
+    admission.workflow_inbox = Some(id);
+    admission
+}
+
+fn close_receiver(store: &mut dyn PersistenceStore) {
+    use nulang::runtime::WorkflowEvent;
+    let activation = WorkflowActivationId::new(77, 1);
+    let sequence = store.latest_sequence(77) + 1;
+    store
+        .commit_transition(DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id: 77,
+            activation_epoch: 1,
+            sequence,
+            expected_previous_sequence: sequence - 1,
+            command: None,
+            workflow_admission: false,
+            workflow_inbox: None,
+            workflow_effects_consumed: Some(0),
+            snapshot: Some(ActorSnapshot {
+                actor_id: 77,
+                activation_epoch: 1,
+                sequence,
+                ..ActorSnapshot::default()
+            }),
+            workflow_events: vec![WorkflowEvent::StepCompleted {
+                sequence,
+                activation: Some(activation),
+                step_name: "receive".into(),
+            }],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![],
+        })
+        .unwrap();
+}
+
+fn assert_same_store_inbox(store: &mut dyn PersistenceStore) {
+    use nulang::runtime::PersistedValue;
+    let id = committed_message(store);
+    let admission = receiving_admission(id, 0);
+    assert!(store.load_workflow_inbox_admission(id).unwrap().is_none());
+    let mut no_source = admission.clone();
+    no_source.workflow_inbox.as_mut().unwrap().ordinal = 99;
+    assert!(store.commit_transition(no_source).is_err());
+    let mut wrong_payload = admission.clone();
+    wrong_payload.command.as_mut().unwrap().payload = vec![PersistedValue::String("other".into())];
+    assert!(store.commit_transition(wrong_payload).is_err());
+    let mut wrong_behavior = admission.clone();
+    wrong_behavior.command.as_mut().unwrap().behavior_id += 1;
+    assert!(store.commit_transition(wrong_behavior).is_err());
+    let mut wrong_destination = admission.clone();
+    wrong_destination.actor_id = 88;
+    store
+        .save_snapshot(ActorSnapshot {
+            actor_id: 88,
+            activation_epoch: 1,
+            ..ActorSnapshot::default()
+        })
+        .unwrap();
+    assert!(store.commit_transition(wrong_destination).is_err());
+    assert!(store.read_journal(77).is_empty());
+    assert!(store.load_workflow_inbox_admission(id).unwrap().is_none());
+    let mut unbound = admission.clone();
+    unbound.workflow_inbox = None;
+    assert_ne!(admission.digest().unwrap(), unbound.digest().unwrap());
+    let committed = store.commit_transition(admission.clone()).unwrap();
+    assert_eq!(store.commit_transition(admission).unwrap(), committed);
+    assert_eq!(
+        store.load_workflow_inbox_admission(id).unwrap(),
+        Some(WorkflowActivationId::new(77, 1))
+    );
+    assert!(store.commit_transition(receiving_admission(id, 1)).is_err());
+    close_receiver(store);
+    let error = store
+        .commit_transition(receiving_admission(id, 2))
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(store.read_journal(77).len(), 1);
+    assert_eq!(store.load_snapshot(77).unwrap().sequence, 2);
+    assert!(store.load_open_workflow_command(77).unwrap().is_none());
+}
+
+#[test]
+fn memory_same_store_inbox_deduplicates_committed_message() {
+    assert_same_store_inbox(&mut MemoryStore::new());
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_same_store_inbox_deduplicates_committed_message() {
+    assert_same_store_inbox(&mut nulang::runtime::LibsqlStore::in_memory().unwrap());
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_workflow_outbox_and_inbox_rollback_and_reopen() {
+    use nulang::runtime::{DurableOutboxId, DurableOutboxMessage, LibsqlStore, PersistedValue};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let path = std::env::temp_dir().join(format!(
+        "nulang-inbox-outbox-{}-{}.db",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut store = LibsqlStore::new(&path).unwrap();
+    let mut terminal = terminal_after_two_effects(&mut store);
+    terminal.outbox.push(DurableOutboxMessage {
+        destination_actor_id: 77,
+        ordinal: 0,
+        behavior_id: 3,
+        payload: vec![PersistedValue::String("payload".into())],
+    });
+    let id = DurableOutboxId {
+        sender_actor_id: 42,
+        sequence: terminal.sequence,
+        ordinal: 0,
+    };
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute_batch("CREATE TRIGGER fail_close BEFORE UPDATE ON durable_workflow_admissions BEGIN SELECT RAISE(ABORT, 'closure fault'); END;").unwrap();
+    assert!(store.commit_transition(terminal.clone()).is_err());
+    assert!(store.load_durable_outbox_message(id).unwrap().is_none());
+    assert_eq!(store.latest_sequence(42), 5);
+    assert_eq!(store.load_snapshot(42).unwrap().sequence, 0);
+    assert!(store.read_workflow_events(42).is_empty());
+    raw.execute_batch("DROP TRIGGER fail_close;").unwrap();
+    store.commit_transition(terminal).unwrap();
+    store
+        .save_snapshot(ActorSnapshot {
+            actor_id: 77,
+            activation_epoch: 1,
+            ..ActorSnapshot::default()
+        })
+        .unwrap();
+    raw.execute_batch("CREATE TRIGGER fail_admit BEFORE INSERT ON durable_workflow_admissions WHEN NEW.actor_id=77 BEGIN SELECT RAISE(ABORT, 'admission fault'); END;").unwrap();
+    let admission = receiving_admission(id, 0);
+    assert!(store.commit_transition(admission.clone()).is_err());
+    assert!(store.read_journal(77).is_empty());
+    assert!(store.load_workflow_inbox_admission(id).unwrap().is_none());
+    assert_eq!(store.latest_sequence(77), 0);
+    raw.execute_batch("DROP TRIGGER fail_admit;").unwrap();
+    store.commit_transition(admission).unwrap();
+    drop(store);
+    let mut store = LibsqlStore::new(&path).unwrap();
+    assert_eq!(
+        store.load_workflow_inbox_admission(id).unwrap(),
+        Some(WorkflowActivationId::new(77, 1))
+    );
+    assert!(store.load_open_workflow_command(77).unwrap().is_some());
+    close_receiver(&mut store);
+    drop(store);
+    let mut store = LibsqlStore::new(&path).unwrap();
+    assert_eq!(
+        store
+            .commit_transition(receiving_admission(id, 2))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(store.read_journal(77).len(), 1);
+    assert!(store.load_durable_outbox_message(id).unwrap().is_some());
+    drop(store);
+    drop(raw);
     std::fs::remove_file(path).unwrap();
 }
