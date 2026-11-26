@@ -208,6 +208,42 @@ authority, atomic actor-turn/inbox completion, real provider cooperation or
 multi-owner safety. Default runtime integration remains gated on these
 requirements.
 
+### Activation-scoped workflow occurrences (experimental)
+
+The opt-in `execute_workflow_vm_async_text_with_deduplication` adapter
+derives the execution key from the live actor's `WorkflowActivationId`:
+`workflow-command:v1:<accepted-command-sequence>`. The effect ID additionally
+includes the actor identity, compiler-owned semantic site, and a deterministic
+activation-local occurrence ordinal. The ownership epoch is a fence, not part
+of the logical effect ID.
+
+A lazily allocated actor-owned cursor tracks the next occurrence separately
+from custom workflow-event replay. It advances only after a terminal text
+receipt is successfully returned, including receipt replay. A failed attempt
+keeps the current occurrence and pins the site/request while the actor lives.
+Retry with a different site or request, invalid/mismatched activation, an
+older command, or a transferred cursor fails closed. A current atomic tail
+with the same epoch is required even for receipt replay.
+
+The trusted host must establish that the command actually was atomically
+accepted and remains open, use the same verified/pinned bytecode, and replay
+from its safe pre-command boundary. A tail alone does not prove admission
+or command openness. The ordinal is reconstructed by deterministic execution
+of the recovered command, not serialized as a continuation or inferred by
+counting journal records. Independently persisted ordinal-to-site bindings
+and terminal actor state/inbox integration remain future work. The compiled
+workflow scheduler still uses the legacy journal path and **must not** use
+this adapter until its atomic command lifecycle is qualified.
+
+The existing SQLite VM fixture exercises this opt-in path with compiled
+workflow bytecode, a committed command sequence, lost provider reply,
+repeated dynamic execution of one site, and replay from a reopened store
+with a fresh actor. Distinct occurrences and new commands produce distinct
+keys, while replay of completed occurrences does not call the provider.
+The later-occurrence case also checks a newer ownership epoch, pending site
+drift, and reuse of the original logical key after replay of an earlier receipt.
+These are trusted fixture results, not proof of production workflow recovery.
+
 ## What is not yet a production-wide guarantee
 
 Passing this gate does **not** prove that every `perform`, workflow activity,
