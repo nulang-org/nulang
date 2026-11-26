@@ -8760,3 +8760,40 @@ fn hosted_mailbox_capacity_survives_actor_pool_reuse_and_persistent_recovery() {
     let supervisor_id = rt.create_supervisor("hosted-supervisor", RestartStrategy::OneForOne);
     assert_eq!(rt.actors[&supervisor_id].mailbox.capacity(), 3);
 }
+
+#[test]
+fn hosted_mailbox_capacity_applies_to_every_shard_and_single_shard_fast_path() {
+    for count in [1, 4] {
+        let mut legacy = Runtime::new_sharded(count);
+        assert_eq!(legacy.len(), count);
+        for shard in &mut legacy {
+            let id = shard.spawn_actor(Box::new(Vec::new));
+            assert_eq!(shard.actors[&id].mailbox.capacity(), 0);
+        }
+
+        let mut hosted = Runtime::new_sharded_with_default_mailbox_capacity(count, 2);
+        assert_eq!(hosted.len(), count);
+        for shard in &mut hosted {
+            let id = shard.spawn_actor(Box::new(Vec::new));
+            let actor = shard.actors.get_mut(&id).unwrap();
+            assert_eq!(actor.mailbox.capacity(), 2);
+            let message = Message {
+                behavior_id: 0,
+                payload: MessagePayload::from_slice(&[]),
+                sender: 1,
+                priority: MessagePriority::Normal,
+                trace_id: None,
+            };
+            assert!(actor.mailbox.push(message.clone()).is_ok());
+            assert!(actor.mailbox.push(message.clone()).is_ok());
+            assert!(actor.mailbox.push(message.clone()).is_err());
+            assert!(actor
+                .mailbox
+                .push(Message {
+                    priority: MessagePriority::System,
+                    ..message
+                })
+                .is_ok());
+        }
+    }
+}

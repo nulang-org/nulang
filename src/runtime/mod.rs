@@ -799,9 +799,19 @@ impl Runtime {
     /// Cross-shard messages carry only value types (no heap pointers), keeping
     /// ORCA reference counting local to each shard.
     pub fn new_sharded(num_shards: usize) -> Vec<Runtime> {
+        Self::new_sharded_with_default_mailbox_capacity(num_shards, 0)
+    }
+
+    /// Create sharded runtimes with the same opt-in per-actor mailbox capacity
+    /// on every shard. Zero preserves the unbounded legacy default.
+    /// System messages and internal dead-letter mailboxes remain exempt.
+    pub fn new_sharded_with_default_mailbox_capacity(
+        num_shards: usize,
+        capacity: usize,
+    ) -> Vec<Runtime> {
         assert!(num_shards > 0, "num_shards must be >= 1");
         if num_shards == 1 {
-            return vec![Runtime::new()];
+            return vec![Runtime::with_default_mailbox_capacity(capacity)];
         }
 
         // Create a sync_channel per shard (bounded, 1024 messages deep).
@@ -816,13 +826,15 @@ impl Runtime {
         let object_store = ObjectStore::new();
         let mut shards = Vec::with_capacity(num_shards);
         for (i, (_tx, rx)) in channels.into_iter().enumerate() {
-            shards.push(Runtime::new_shard(
+            let mut shard = Runtime::new_shard(
                 i as u16,
                 num_shards as u16,
                 senders.clone(),
                 rx,
                 object_store.clone(),
-            ));
+            );
+            shard.default_mailbox_capacity = capacity;
+            shards.push(shard);
         }
         shards
     }
