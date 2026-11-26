@@ -101,6 +101,7 @@ fn durable_transition_rejects_snapshot_activation_epoch_mismatch() {
         expected_previous_sequence: 0,
         command: None,
         workflow_admission: false,
+        workflow_effects_consumed: None,
         snapshot: Some(ActorSnapshot {
             actor_id,
             sequence: 1,
@@ -151,6 +152,7 @@ fn libsql_atomic_transition_preserves_snapshot_activation_epoch() {
             expected_previous_sequence: 0,
             command: None,
             workflow_admission: false,
+            workflow_effects_consumed: None,
             snapshot: Some(ActorSnapshot {
                 actor_id,
                 sequence: 1,

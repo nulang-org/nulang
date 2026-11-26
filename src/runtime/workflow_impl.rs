@@ -297,6 +297,27 @@ pub(crate) fn commit_step_completed(
         )
     })?;
     let activation_epoch = snapshot.activation_epoch;
+    let workflow_effects_consumed =
+        if let Some(open) = rt.persistence.load_open_workflow_command(actor_id)? {
+            let actor = rt.actors.get(&actor_id).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "workflow actor missing at terminal commit",
+                )
+            })?;
+            if activation != Some(open.activation)
+                || actor.current_workflow_activation != Some(open.activation)
+                || activation_epoch != open.tail.activation_epoch
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "terminal workflow execution does not match open admission",
+                ));
+            }
+            Some(crate::durable_effect_runtime::workflow_terminal_effect_count(actor)?)
+        } else {
+            None
+        };
 
     rt.persistence.commit_transition(DurableTransition {
         version: DURABLE_TRANSITION_VERSION,
@@ -306,6 +327,7 @@ pub(crate) fn commit_step_completed(
         expected_previous_sequence,
         command: None,
         workflow_admission: false,
+        workflow_effects_consumed,
         snapshot: Some(snapshot.clone()),
         workflow_events: vec![WorkflowEvent::StepCompleted {
             sequence,
