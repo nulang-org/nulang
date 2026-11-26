@@ -7,7 +7,7 @@ app "hello" {
 
 @placement(static)
 fn home() -> Html {
-    document(
+    document_lang("en",
         head([
             title("Hello Nulang Web"),
             el("link", [("rel", text("stylesheet")), ("href", text("/style.css"))], [])

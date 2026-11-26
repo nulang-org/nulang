@@ -87,7 +87,7 @@ import stdlib::web::html
 import stdlib::web::types
 
 fn home() -> Html {
-    document(
+    document_lang("en",
         head([title("Hello Nulang Web")]),
         body([
             el("h1", [], [text("Hello, Nulang Web!")])
@@ -111,7 +111,9 @@ The `stdlib::web::types` module defines `Html` as an **opaque type** — a compi
 - `perform Web.raw(s: String) -> Html` — wrap without escaping (trusted markup only)
 - `perform Web.redirect(url: String) -> Html` — a redirect response
 
-The `stdlib::web::html` module adds ergonomic helpers: `el`, `txt`, `attr`, `body`, `head`, `title`, `document`. It re-exports `text`, `raw`, and `redirect` from `stdlib::web::host`.
+The `stdlib::web::html` module adds ergonomic helpers: `el`, `txt`, `attr`, `body`, `head`, `title`, `document`, `document_lang`. It re-exports `text`, `raw`, and `redirect` from `stdlib::web::host`.
+
+Use `document_lang("en", head(...), body(...))` (or the actual BCP 47 language, such as `pt-BR`) for complete pages so assistive technologies can select the correct language. The legacy `document(head, body)` helper remains available and does not guess a language. Both generate the HTML5 doctype through the host serializer. Void elements such as `br`, `input`, `img`, `meta` and `link` must have empty children; the renderer emits only a start tag. The unsafe tag and attribute validation rules still apply.
 
 :::note
 `Web.redirect` produces an HTML page with a `<meta http-equiv="refresh">` and is sent with status 200 — not an HTTP 3xx. Browsers follow it; API clients will not.
@@ -145,7 +147,7 @@ import stdlib::web::html
 import stdlib::web::types
 
 fn page(page_title: String, content: [Html]) -> Html {
-    document(
+    document_lang("en",
         head([title(page_title)]),
         body(content)
     )
