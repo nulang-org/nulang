@@ -12,7 +12,7 @@ use crate::types::{NuError, NuResult, Span};
 use crate::web::modules::{ModuleRegistry, ModuleSpec};
 
 use crate::bytecode::CodeModule;
-use crate::runtime::{render_route_handler, WebDevServer};
+use crate::runtime::WebDevServer;
 use crate::vm::VM;
 
 use crate::registry::RegistryClient;
@@ -634,7 +634,8 @@ fn template_files(name: &str) -> Vec<(&'static str, &'static str)> {
                 "src/main.nula",
                 r#"// Nulang Web app — a compiler-first full-stack Todo list.
 //
-// Run with: `nula dev` (development server) or `nula build --web` (SSG).
+// Run with: `nula dev` (development server). A web build emits the server
+// route contract and public assets, not a snapshot of request-time state.
 //
 // The server renders the initial HTML and handles form POSTs with an
 // ephemeral in-memory store. The generated `app.client.js` intercepts
@@ -1427,11 +1428,13 @@ fn cmd_build_web() -> NuResult<()> {
     let nbc_path = build_dir.join("build.nbc");
     let nbc_path_str = nbc_path.to_string_lossy().into_owned();
 
-    let output_dir = root.join(&manifest.web.output_dir);
-    std::fs::create_dir_all(&output_dir).map_err(|e| NuError::PackageError {
-        msg: format!("cannot create {}: {}", output_dir.display(), e),
-        span: Span::default(),
-    })?;
+    let static_dir = root.join(&manifest.web.static_dir);
+    let output = super::web_output::BuildOutput::new(&root, &manifest.web.output_dir, &static_dir)
+        .map_err(|msg| NuError::PackageError {
+            msg,
+            span: Span::default(),
+        })?;
+    let output_dir = output.path();
 
     let client_js_path = output_dir.join("app.client.js");
     let client_js_path_str = client_js_path.to_string_lossy().into_owned();
@@ -1456,13 +1459,12 @@ fn cmd_build_web() -> NuResult<()> {
         span: Span::default(),
     })?;
 
-    let mut vm = VM::new();
-    vm.load_module(artifact.module);
-    vm.run().map_err(|e| NuError::PackageError {
-        msg: format!("runtime error in {}: {}", entry.display(), e),
-        span: Span::default(),
+    let routes = crate::web::static_build::discover_routes(artifact.module).map_err(|msg| {
+        NuError::PackageError {
+            msg,
+            span: Span::default(),
+        }
     })?;
-    let routes = vm.take_web_routes();
     let src_root = root.join("src");
     // Validate once: runtime route plans and deployment IR must consume the
     // same compiler-owned contracts rather than re-extracting source.
@@ -1482,9 +1484,8 @@ fn cmd_build_web() -> NuResult<()> {
         span: Span::default(),
     })?;
 
-    // OpenAPI has additional path-item identity constraints. Check those
-    // before rendering and publishing the generated artifacts, without imposing
-    // documentation-specific restrictions on the HTTP dispatcher.
+    // The checked OpenAPI document must succeed before the staged tree is
+    // published and consumes the same validated contracts as route attachment.
     let openapi = crate::web::openapi::generate_checked_openapi(
         &validated_contracts,
         &manifest.package.name,
@@ -1495,16 +1496,36 @@ fn cmd_build_web() -> NuResult<()> {
         span: Span::default(),
     })?;
 
-    eprintln!("  Rendering {} route(s)...", routes.len());
-    for route in &routes {
-        let html = render_route_handler(&route.handler_module, route.handler_func_idx, None)
-            .ok_or_else(|| NuError::PackageError {
-                msg: format!("failed to render route {:?} {}", route.method, route.path),
-                span: Span::default(),
-            })?;
-        let html = crate::web::reactivity::inject_client_runtime_script(&html);
-        let out_file = route_path_to_output_file(&route.path);
-        let dest = output_dir.join(&out_file);
+    // Emit the signal graph and generate provisional deployment metadata.
+    let signals_path = output_dir.join("app.signals.json");
+    nulang_exe(&[
+        "--emit-signals",
+        &signals_path.to_string_lossy(),
+        &entry_str,
+    ])?;
+    let mut ir = crate::web::ir::generate_deployment_ir(
+        &routes,
+        Some(&signals_path),
+        &src_root,
+        &manifest.budgets,
+        &validated_contracts,
+    );
+
+    // Rendering and deployment metadata share the same route decisions.
+    // Known dynamic handlers are skipped; inferred static candidates may
+    // execute only the checked, deterministic rendering subset.
+    let pages = crate::web::static_build::render_pages(&routes, &validated_contracts, &mut ir)
+        .map_err(|msg| NuError::PackageError {
+            msg,
+            span: Span::default(),
+        })?;
+    eprintln!(
+        "  Rendering {} static page(s) of {} route(s)...",
+        pages.len(),
+        routes.len()
+    );
+    for (path, html) in pages {
+        let dest = output_dir.join(path);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| NuError::PackageError {
                 msg: format!("cannot create {}: {}", parent.display(), e),
@@ -1515,30 +1536,8 @@ fn cmd_build_web() -> NuResult<()> {
             msg: format!("cannot write {}: {}", dest.display(), e),
             span: Span::default(),
         })?;
-        eprintln!("    {} -> {}", route.path, dest.display());
+        eprintln!("    {}", dest.display());
     }
-
-    let static_dir = root.join(&manifest.web.static_dir);
-    if static_dir.is_dir() {
-        copy_dir_contents(&static_dir, &output_dir)?;
-    }
-
-    // Emit compile-time signal graph if the entry uses `signal` declarations.
-    let signals_path = output_dir.join("app.signals.json");
-    nulang_exe(&[
-        "--emit-signals",
-        &signals_path.to_string_lossy(),
-        &entry_str,
-    ])?;
-
-    // Generate deployment IR consumed by adapters and Nulang Cloud.
-    let ir = crate::web::ir::generate_deployment_ir(
-        &routes,
-        Some(&signals_path),
-        &src_root,
-        &manifest.budgets,
-        &validated_contracts,
-    );
     let ir_path = output_dir.join("nulang-app.ir.json");
     let ir_json = ir.to_json();
     std::fs::write(&ir_path, ir_json).map_err(|e| NuError::PackageError {
@@ -1546,23 +1545,26 @@ fn cmd_build_web() -> NuResult<()> {
         span: Span::default(),
     })?;
     eprintln!("  Wrote {}", ir_path.display());
-
-    // Publish API documentation generated from the same checked contracts.
+    // Write the contract before copying assets so the same fail-closed asset
+    // collision policy protects it, along with the IR and signal metadata.
+    let openapi_path = output_dir.join("openapi.json");
     let openapi_json =
         serde_json::to_vec_pretty(&openapi).map_err(|error| NuError::PackageError {
             msg: format!("cannot serialize OpenAPI document: {error}"),
             span: Span::default(),
         })?;
-    let openapi_file = output_dir.join("openapi.json");
-    std::fs::write(&openapi_file, openapi_json).map_err(|error| NuError::PackageError {
-        msg: format!("cannot write {}: {error}", openapi_file.display()),
+    std::fs::write(&openapi_path, openapi_json).map_err(|e| NuError::PackageError {
+        msg: format!("cannot write {}: {e}", openapi_path.display()),
         span: Span::default(),
     })?;
-    eprintln!("  Wrote {}", openapi_file.display());
+    eprintln!("  Wrote {}", openapi_path.display());
+    if static_dir.is_dir() {
+        copy_dir_contents(&static_dir, output_dir)?;
+    }
 
     // Enforce performance budgets declared in Nulang.toml.
     if let Err(violations) = crate::web::budget::check_initial_js_budget(
-        &output_dir,
+        output_dir,
         manifest.budgets.initial_js_max_bytes(),
     ) {
         let mut lines = vec!["performance budget exceeded:".to_string()];
@@ -1578,45 +1580,66 @@ fn cmd_build_web() -> NuResult<()> {
         });
     }
 
-    println!("Web build succeeded: {}", output_dir.display());
+    output.publish().map_err(|msg| NuError::PackageError {
+        msg,
+        span: Span::default(),
+    })?;
+    println!(
+        "Web build succeeded: {}",
+        root.join(&manifest.web.output_dir).display()
+    );
     Ok(())
 }
 
-fn route_path_to_output_file(path: &str) -> PathBuf {
-    let trimmed = path.trim_start_matches('/');
-    if trimmed.is_empty() {
-        PathBuf::from("index.html")
-    } else {
-        PathBuf::from(trimmed).join("index.html")
-    }
-}
-
 fn copy_dir_contents(src: &Path, dst: &Path) -> NuResult<()> {
-    for entry in std::fs::read_dir(src)
-        .map_err(|e| NuError::PackageError {
-            msg: format!("cannot read {}: {}", src.display(), e),
+    fn package_error(error: impl std::fmt::Display) -> NuError {
+        NuError::PackageError {
+            msg: error.to_string(),
             span: Span::default(),
-        })?
-        .flatten()
-    {
+        }
+    }
+
+    let mut entries = std::fs::read_dir(src)
+        .map_err(package_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(package_error)?;
+    entries.sort_by_key(|entry| entry.file_name());
+    let mut siblings = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(dst).map_err(package_error)? {
+        let entry = entry.map_err(package_error)?;
+        let name = entry.file_name();
+        siblings.insert(
+            name.to_string_lossy().to_ascii_lowercase(),
+            (name, entry.file_type().map_err(package_error)?.is_dir()),
+        );
+    }
+    for entry in entries {
         let path = entry.path();
-        let dest = dst.join(path.file_name().unwrap_or(path.as_os_str()));
-        if path.is_dir() {
-            std::fs::create_dir_all(&dest).map_err(|e| NuError::PackageError {
-                msg: format!("cannot create {}: {}", dest.display(), e),
-                span: Span::default(),
-            })?;
-            copy_dir_contents(&path, &dest)?;
+        let name = entry.file_name();
+        let dest = dst.join(&name);
+        let kind = entry.file_type().map_err(package_error)?;
+        // Case-insensitive sibling conflicts are rejected on every platform.
+        let key = name.to_string_lossy().to_ascii_lowercase();
+        if let Some((existing_name, existing_dir)) = siblings.get(&key) {
+            if existing_name != &name || !kind.is_dir() || !existing_dir {
+                return Err(package_error(format!(
+                    "static asset conflicts with generated output: {}",
+                    dest.display()
+                )));
+            }
         } else {
-            std::fs::copy(&path, &dest).map_err(|e| NuError::PackageError {
-                msg: format!(
-                    "cannot copy {} to {}: {}",
-                    path.display(),
-                    dest.display(),
-                    e
-                ),
-                span: Span::default(),
-            })?;
+            siblings.insert(key, (name, kind.is_dir()));
+        }
+        if kind.is_dir() {
+            std::fs::create_dir_all(&dest).map_err(package_error)?;
+            copy_dir_contents(&path, &dest)?;
+        } else if kind.is_file() {
+            std::fs::copy(&path, &dest).map_err(package_error)?;
+        } else {
+            return Err(package_error(format!(
+                "static asset must be a regular file or directory: {}",
+                path.display()
+            )));
         }
     }
     Ok(())
@@ -3287,19 +3310,18 @@ app "counter" {
         let _guard = ChangeDir::new(&dir);
         cmd_build_web().expect("web build should succeed");
 
-        // The generated API contract and deployment IR must describe the same
-        // validated routes; OpenAPI is a build artifact, not a separate parser.
-        let openapi: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(dir.join("dist/openapi.json"))
-                .expect("OpenAPI document should be emitted with the web build"),
-        )
-        .expect("OpenAPI document must be valid JSON");
+        // Compiler-generated contract, IR and hydration metadata must agree.
+        let openapi: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("dist/openapi.json")).unwrap()).unwrap();
         assert_eq!(openapi["openapi"], "3.1.0");
         assert_eq!(openapi["info"]["title"], "signal-app");
-        assert!(openapi["paths"]["/"]["get"].is_object());
         let ir: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("dist/nulang-app.ir.json")).unwrap())
                 .unwrap();
+        let signals: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("dist/app.signals.json")).unwrap())
+                .unwrap();
+        assert_eq!(signals, ir["signals"]);
         let routes = ir["routes"].as_array().unwrap();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0]["method"], "GET");

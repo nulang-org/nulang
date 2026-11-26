@@ -3383,6 +3383,28 @@ impl VM {
     /// reuse it; otherwise create a fresh frame. This lets actor behavior
     /// handlers receive their arguments.
     pub fn run_from(&mut self, module_idx: usize, pc: usize) -> NuResult<Value> {
+        self.run_from_impl(module_idx, pc, |_, _| Ok(()))
+    }
+
+    /// Interpreter-only execution with an instruction policy checked before
+    /// every step, including calls into helpers. The policy must not be
+    /// bypassed by JIT execution. Used by build-time web rendering.
+    pub(crate) fn run_from_checked(
+        &mut self,
+        module_idx: usize,
+        pc: usize,
+        check: impl FnMut(&CodeModule, &Instruction) -> NuResult<()>,
+    ) -> NuResult<Value> {
+        self.jit_session = None;
+        self.run_from_impl(module_idx, pc, check)
+    }
+
+    fn run_from_impl(
+        &mut self,
+        module_idx: usize,
+        pc: usize,
+        mut check: impl FnMut(&CodeModule, &Instruction) -> NuResult<()>,
+    ) -> NuResult<Value> {
         self.yield_pending = false;
 
         if self.frames.is_empty() {
@@ -3423,6 +3445,7 @@ impl VM {
                             .unwrap_or(Value::unit());
                         return Ok(v);
                     }
+                    check(module, &module.instructions[pc])?;
                 } else {
                     return Ok(Value::unit());
                 }

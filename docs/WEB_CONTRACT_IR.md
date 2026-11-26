@@ -205,7 +205,12 @@ The web build writes an experimental dist/openapi.json from the same validated
 ContractCompilation used by runtime dispatch and deployment IR. Existing unique
 handler-based operation IDs are preserved; when the same handler is reused by
 multiple routes, deterministic route-based suffixes keep operation IDs distinct
-for client generators regardless of route registration order.
+for client generators regardless of route registration order. The document
+is staged and published with the deployment IR and hydration metadata only after
+the build and performance budgets succeed. Routes and static assets cannot
+claim the reserved generated filename. An ordinary failed build preserves the
+previous site; successful rebuilds replace the tree instead of retaining stale
+artifacts. Two-rename publication is not crash-atomic.
 
 The shared runtime validator rejects unsupported HTTP method spellings using
 the same method parser as VM registration (currently GET, POST, PUT, DELETE,

@@ -17,3 +17,5 @@ pub mod lockfile;
 pub mod manifest;
 pub mod module_invalidation;
 pub mod resolver;
+
+mod web_output;

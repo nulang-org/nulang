@@ -83,7 +83,8 @@ impl DeploymentIr {
     }
 }
 
-/// Generate the deployment IR for a web package.
+/// Generate the provisional deployment IR for a web package. Static
+/// candidates receive their artifact paths only after checked page rendering.
 ///
 /// `routes` are the routes collected by running the compiled entry point.
 /// `signal_graph_path` is the optional path to `app.signals.json` emitted by
@@ -115,17 +116,12 @@ pub fn generate_deployment_ir(
         let placement = contract
             .and_then(|contract| contract.placement.clone())
             .unwrap_or_else(|| default_route_placement(&method, &route.path));
-        let artifact = if placement == "static" {
-            Some(route_path_to_artifact(&route.path))
-        } else {
-            None
-        };
 
         ir_routes.push(IrRoute {
             method,
             path: route.path.clone(),
             placement,
-            artifact,
+            artifact: None,
             handler: contract.and_then(|c| c.handler.clone()),
             params: contract.map(|c| c.params.clone()).unwrap_or_default(),
             handler_params: contract
@@ -180,19 +176,10 @@ pub fn generate_deployment_ir(
 
 fn default_route_placement(method: &str, path: &str) -> String {
     let dynamic_path = path.contains(':') || (path.contains('{') && path.contains('}'));
-    if dynamic_path || !matches!(method, "GET" | "HEAD") {
+    if dynamic_path || method != "GET" {
         "server".to_string()
     } else {
         "static".to_string()
-    }
-}
-
-fn route_path_to_artifact(path: &str) -> String {
-    let trimmed = path.trim_start_matches('/');
-    if trimmed.is_empty() {
-        "index.html".to_string()
-    } else {
-        format!("{}/index.html", trimmed)
     }
 }
 
@@ -377,16 +364,6 @@ mod tests {
     }
 
     #[test]
-    fn test_route_path_to_artifact() {
-        assert_eq!(route_path_to_artifact("/"), "index.html");
-        assert_eq!(route_path_to_artifact("/about"), "about/index.html");
-        assert_eq!(
-            route_path_to_artifact("/blog/:slug"),
-            "blog/:slug/index.html"
-        );
-    }
-
-    #[test]
     fn test_default_route_placement_understands_typed_params() {
         assert_eq!(default_route_placement("GET", "/about"), "static");
         assert_eq!(default_route_placement("GET", "/users/:id"), "server");
@@ -395,6 +372,7 @@ mod tests {
             "server"
         );
         assert_eq!(default_route_placement("POST", "/users"), "server");
+        assert_eq!(default_route_placement("HEAD", "/users"), "server");
     }
 
     #[test]

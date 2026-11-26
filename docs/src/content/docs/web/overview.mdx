@@ -100,7 +100,7 @@ app "hello" {
 }
 ```
 
-An `app` block desugars into `perform Web.route(method, path, handler)` calls plus a `serve_static` fallback — `route "GET" "/path" -> handler` is exactly `perform Web.route("GET", "/path", handler)`. Handlers are `fn() -> Html` (for POST routes, the handler reads the request via the request-access operations below and still returns `Html`).
+An `app` block desugars into `perform Web.route(method, path, handler)` calls; the package host handles the configured static-directory fallback — `route "GET" "/path" -> handler` is exactly `perform Web.route("GET", "/path", handler)`. Handlers are `fn() -> Html` (for POST routes, the handler reads the request via the request-access operations below and still returns `Html`).
 
 ### Building HTML
 
@@ -220,15 +220,47 @@ curl http://127.0.0.1:8080/last             # "Last message: hi"
 
 ## Static HTML and Static Sites
 
-Handlers that only perform `Web`/`Render` operations are **statically renderable** — the compiler can run them at build time. `nula build --web` does exactly that:
+Static builds select eligible request-independent GET handlers, then interpret
+them under a restrictive build-time rendering policy:
 
 ```bash
 nulang nula build --web
 ```
 
-It runs the route registrations, renders every route to `dist/<path>/index.html`, copies `static_dir` into `dist/`, and emits a deployment IR file (`nulang-app.ir.json`). The result is plain HTML + JS you can host on any static file server. Dynamic operations (`Web.param`, form parsing, the kv store, `Realtime.broadcast`) work under `nula dev` but render at their pattern path in a static build — e.g. `/hello/:name` becomes a literal `dist/hello/:name/index.html`.
+The build writes ordinary HTML to `dist/<path>/index.html`, copies the
+configured `static_dir`, and emits `nulang-app.ir.json`. Only successful
+static pages have an artifact in the deployment IR. Server routes remain in
+the IR without an HTML artifact. POST, HEAD, parameterized routes, explicit
+server placement, request-bound arguments, and request-dependent effects are
+not statically published. A parameterized URL needs a future explicit
+enumeration of concrete values; no literal `dist/hello/:name/index.html`
+is produced.
 
-For a pure static response without the `app` machinery, `Web.text`/`Web.raw` are enough on their own — any `fn() -> Html` can be rendered by the same pipeline.
+The renderer checks instructions as they execute, including calls to helpers,
+and permits HTML construction and selected deterministic local operations. An
+inferred route that reaches a disallowed operation stays on the server; an
+explicit `@placement(static)` route that cannot be rendered fails the build.
+Plain pages have no injected client script; HTML with signal/action markers
+still receives the existing progressive-enhancement runtime.
+
+The output directory must be a generated directory within the package,
+separate from source, assets, and build metadata. Successful builds replace
+the generated directory, removing stale HTML; a failed build preserves the
+previous output. Concurrent builds targeting the same directory are rejected.
+Publication uses two filesystem renames and is not crash-atomic; after a
+process kill, inspect the retained staging/backup directory and stale build
+lock before retrying. Generated pages and public assets may not overwrite one
+another. Route paths must map to portable, contained file paths. Non-generated
+output directories are rejected.
+
+The same instruction policy is used for route registration, with the additional
+permission to register routes. Application startup with external or
+request-dependent effects is rejected during a web build. This is a conservative
+**build execution policy**, not a complete static proof of all branches or an
+untrusted-build sandbox. Dependency resolution still uses the existing package
+pipeline and may perform network operations.
+Static-only deployments can serve the output directly; mixed deployments
+require a separately configured runtime for server routes.
 
 ## Realtime Broadcast
 
@@ -250,7 +282,7 @@ The `examples/chat-web` package shows the full pattern: an SSE `<script>` in the
 Two paths, depending on what your app does:
 
 - **Dynamic server** (uses request data, forms, kv store, broadcast): run the native runtime — `nulang --with net server.nula` for `Http.serve`-style programs, or ship the package and run `nulang nula dev` (the dev server is currently the runtime host for `Web`-routed apps). Native runtime required.
-- **Static site** (render-only handlers): `nulang nula build --web` and deploy `dist/` to any static host.
+- **Static site** (eligible request-independent GET handlers): `nulang nula build --web` and deploy `dist/` to any static host.
 
 :::caution
 The WASM backends (`--backend wasm`, `wasm-run`, `wasm-aot`, and `nula build-wasm`) are **not** a deployment target for web servers: they support `IO.print`/`IO.read` only — no user-defined effect handlers, and no `Http`/`Web`/`Realtime` host. WASM output is for compute-only programs today; serve on the native runtime.

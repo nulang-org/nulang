@@ -5997,14 +5997,9 @@ impl Parser {
             }
         }
         let span = apps[0].span;
-        let serve_static = Expr::Perform {
-            effect: "Web".to_string(),
-            op: "serve_static".to_string(),
-            args: vec![Expr::Literal(Literal::String("public".to_string()), span)],
-            span,
-        };
-        let mut web_main_body = vec![serve_static];
-        web_main_body.extend(route_exprs);
+        // Static files are served/copied by the package host using the
+        // manifest's static_dir. Registration must not perform a file read.
+        let web_main_body = route_exprs;
         let web_main = Decl::Function {
             name: "web_main".to_string(),
             type_params: vec![],

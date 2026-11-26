@@ -87,7 +87,49 @@ fn test_web_syntyr_scaffold_and_build_are_self_contained() {
 
     run_nula(&app, &["build", "--web"]);
 
-    let html = std::fs::read_to_string(app.join("dist/index.html")).unwrap();
+    // The Todo page uses request state; the SSG must not publish a snapshot.
+    assert!(!app.join("dist/index.html").exists());
+    let ir: nulang::web::ir::DeploymentIr =
+        serde_json::from_slice(&std::fs::read(app.join("dist/nulang-app.ir.json")).unwrap())
+            .unwrap();
+    assert!(ir
+        .routes
+        .iter()
+        .all(|route| route.placement == "server" && route.artifact.is_none()));
+    // Preserve the original HTML assertions, but exercise the real server path.
+    let artifact = nulang::bytecode::CodeModule::from_nbc(
+        &std::fs::read(app.join(".nula/build.nbc")).unwrap(),
+    )
+    .unwrap();
+    let mut vm = nulang::vm::VM::new();
+    vm.load_module(artifact.module);
+    vm.run().unwrap();
+    let routes =
+        nulang::web::dispatch::compile_runtime_routes(vm.take_web_routes(), &app.join("src"))
+            .unwrap();
+    let server = nulang::runtime::WebDevServer::bind_runtime(
+        0,
+        Some(app.join("public")),
+        Some(app.join("dist")),
+        routes,
+    )
+    .unwrap();
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    use std::io::{Read, Write};
+    write!(
+        stream,
+        "GET / HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
+        server.port
+    )
+    .unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let html = response.split_once("\r\n\r\n").unwrap().1;
     for required in [
         "lang=\"en\"",
         "data-syn-theme=\"studio\"",
@@ -113,6 +155,8 @@ fn test_web_syntyr_scaffold_and_build_are_self_contained() {
     assert!(plain.join("public/style.css").is_file());
     assert!(!plain.join("public/syntyr.core.css").exists());
     run_nula(&plain, &["build", "--web"]);
-    assert!(plain.join("dist/index.html").is_file());
+    assert!(!plain.join("dist/index.html").exists());
+    assert!(plain.join("dist/nulang-app.ir.json").is_file());
+    assert!(plain.join("dist/style.css").is_file());
     assert!(!plain.join("dist/syntyr.core.css").exists());
 }
