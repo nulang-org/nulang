@@ -103,7 +103,12 @@ pub(crate) fn render_pages(
                 ));
             }
         }
-        for reserved in ["app.client.js", "app.signals.json", "nulang-app.ir.json"] {
+        for reserved in [
+            "app.client.js",
+            "app.signals.json",
+            "nulang-app.ir.json",
+            "openapi.json",
+        ] {
             if key == reserved || key.starts_with(&format!("{reserved}/")) {
                 return Err(format!(
                     "{label}: output path '{path}' conflicts with {reserved}"

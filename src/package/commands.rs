@@ -1484,6 +1484,18 @@ fn cmd_build_web() -> NuResult<()> {
         span: Span::default(),
     })?;
 
+    // The checked OpenAPI document must succeed before the staged tree is
+    // published and consumes the same validated contracts as route attachment.
+    let openapi = crate::web::openapi::generate_checked_openapi(
+        &validated_contracts,
+        &manifest.package.name,
+        &manifest.package.version,
+    )
+    .map_err(|diagnostics| NuError::PackageError {
+        msg: format!("invalid OpenAPI contract:\n{}", diagnostics.join("\n")),
+        span: Span::default(),
+    })?;
+
     // Emit the signal graph and generate provisional deployment metadata.
     let signals_path = output_dir.join("app.signals.json");
     nulang_exe(&[
@@ -1533,6 +1545,19 @@ fn cmd_build_web() -> NuResult<()> {
         span: Span::default(),
     })?;
     eprintln!("  Wrote {}", ir_path.display());
+    // Write the contract before copying assets so the same fail-closed asset
+    // collision policy protects it, along with the IR and signal metadata.
+    let openapi_path = output_dir.join("openapi.json");
+    let openapi_json =
+        serde_json::to_vec_pretty(&openapi).map_err(|error| NuError::PackageError {
+            msg: format!("cannot serialize OpenAPI document: {error}"),
+            span: Span::default(),
+        })?;
+    std::fs::write(&openapi_path, openapi_json).map_err(|e| NuError::PackageError {
+        msg: format!("cannot write {}: {e}", openapi_path.display()),
+        span: Span::default(),
+    })?;
+    eprintln!("  Wrote {}", openapi_path.display());
     if static_dir.is_dir() {
         copy_dir_contents(&static_dir, output_dir)?;
     }
@@ -3284,6 +3309,27 @@ app "counter" {
 
         let _guard = ChangeDir::new(&dir);
         cmd_build_web().expect("web build should succeed");
+
+        // Compiler-generated contract, IR and hydration metadata must agree.
+        let openapi: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("dist/openapi.json")).unwrap()).unwrap();
+        assert_eq!(openapi["openapi"], "3.1.0");
+        assert_eq!(openapi["info"]["title"], "signal-app");
+        let ir: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("dist/nulang-app.ir.json")).unwrap())
+                .unwrap();
+        let signals: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("dist/app.signals.json")).unwrap())
+                .unwrap();
+        assert_eq!(signals, ir["signals"]);
+        let routes = ir["routes"].as_array().unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0]["method"], "GET");
+        assert_eq!(routes[0]["path"], "/");
+        assert_eq!(
+            openapi["paths"]["/"]["get"]["operationId"],
+            routes[0]["handler"]
+        );
 
         let html =
             std::fs::read_to_string(dir.join("dist/index.html")).expect("index.html should exist");

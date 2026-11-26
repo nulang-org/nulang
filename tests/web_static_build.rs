@@ -61,6 +61,22 @@ output_dir = "dist"
     fn ir(&self) -> DeploymentIr {
         serde_json::from_slice(&self.read("dist/nulang-app.ir.json")).unwrap()
     }
+
+    fn openapi(&self) -> serde_json::Value {
+        serde_json::from_slice(&self.read("dist/openapi.json")).unwrap()
+    }
+
+    fn published_metadata(&self) -> Vec<Vec<u8>> {
+        [
+            "dist/index.html",
+            "dist/openapi.json",
+            "dist/nulang-app.ir.json",
+            "dist/app.signals.json",
+        ]
+        .into_iter()
+        .map(|path| self.read(path))
+        .collect()
+    }
 }
 
 impl Drop for Site {
@@ -123,6 +139,20 @@ app "mixed" {
     assert_eq!(home, b"hello static");
     let ir = site.ir();
     assert_eq!(ir.routes.len(), 6);
+    let openapi = site.openapi();
+    for (path, method) in [
+        ("/", "get"),
+        ("/", "post"),
+        ("/account", "get"),
+        ("/users/{name}", "get"),
+        ("/query", "get"),
+        ("/server", "get"),
+    ] {
+        assert!(
+            openapi["paths"][path][method].is_object(),
+            "{path} {method}"
+        );
+    }
     for route in ir.routes {
         if route.method == "GET" && route.path == "/" {
             assert_eq!(route.placement, "static");
@@ -140,13 +170,17 @@ app "mixed" {
 #[test]
 fn repeated_builds_are_identical_and_removed_routes_do_not_survive() {
     let site = Site::new();
-    site.source(STATIC);
+    site.source(&STATIC.replace(
+        r#"route "GET" "/" -> home"#,
+        r#"route "GET" "/" -> home
+    route "GET" "/obsolete" -> home"#,
+    ));
     success(site.build());
-    let old_html = site.read("dist/index.html");
-    let old_ir = site.read("dist/nulang-app.ir.json");
+    let old = site.published_metadata();
+    assert!(site.0.join("dist/obsolete/index.html").is_file());
+    assert!(site.openapi()["paths"]["/obsolete"]["get"].is_object());
     success(site.build());
-    assert_eq!(site.read("dist/index.html"), old_html);
-    assert_eq!(site.read("dist/nulang-app.ir.json"), old_ir);
+    assert_eq!(site.published_metadata(), old);
 
     site.source(
         r#"
@@ -161,6 +195,9 @@ app "site" {
     success(site.build());
     assert!(!site.0.join("dist/index.html").exists());
     assert_eq!(site.ir().routes[0].placement, "server");
+    assert!(!site.0.join("dist/obsolete").exists());
+    assert!(site.openapi()["paths"].get("/obsolete").is_none());
+    assert!(site.openapi()["paths"]["/"]["get"].is_object());
 }
 
 #[test]
@@ -168,12 +205,106 @@ fn failed_build_preserves_previous_output_and_rejects_asset_collisions() {
     let site = Site::new();
     site.source(STATIC);
     success(site.build());
-    let old = site.read("dist/index.html");
-    std::fs::write(site.0.join("public/index.html"), "unintended override").unwrap();
+    let old = site.published_metadata();
+    for name in [
+        "index.html",
+        "openapi.json",
+        "app.signals.json",
+        "nulang-app.ir.json",
+    ] {
+        let collision = site.0.join("public").join(name);
+        std::fs::write(&collision, "unintended override").unwrap();
+        let failed = site.build();
+        assert!(!failed.status.success(), "{name}");
+        assert!(
+            String::from_utf8_lossy(&failed.stderr).contains("static asset conflicts"),
+            "{name}"
+        );
+        assert_eq!(site.published_metadata(), old);
+        std::fs::remove_file(collision).unwrap();
+    }
+}
+
+#[test]
+fn checked_openapi_failure_preserves_the_whole_published_site() {
+    let site = Site::new();
+    site.source(STATIC);
+    success(site.build());
+    let old = site.published_metadata();
+    site.source(
+        r#"
+fn user(id: Int) -> Int { id }
+fn update(user_id: Int) -> Int { user_id }
+app "site" {
+    route "GET" "/users/{id: Int}" -> user
+    route "POST" "/users/{user_id: Int}" -> update
+}
+"#,
+    );
     let failed = site.build();
     assert!(!failed.status.success());
-    assert!(String::from_utf8_lossy(&failed.stderr).contains("static asset conflicts"));
-    assert_eq!(site.read("dist/index.html"), old);
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("ambiguous OpenAPI path templates"),
+        "{}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    assert_eq!(site.published_metadata(), old);
+}
+
+#[test]
+fn reserved_openapi_filename_cannot_be_a_static_route_directory() {
+    let site = Site::new();
+    site.source(&STATIC.replace(
+        r#"route "GET" "/" -> home"#,
+        r#"route "GET" "/openapi.json" -> home"#,
+    ));
+    let failed = site.build();
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("conflicts with openapi.json"));
+    assert!(!site.0.join("dist").exists());
+}
+
+#[test]
+fn budget_failure_preserves_previous_output_and_never_publishes_a_first_build() {
+    let site = Site::new();
+    site.source(STATIC);
+    let manifest = site.0.join("Nulang.toml");
+    let original = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(
+        &manifest,
+        format!("{original}\n[budgets]\ninitial_js = \"10B\"\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(site.0.join("public/assets")).unwrap();
+    std::fs::write(
+        site.0.join("public/assets/over-budget.js"),
+        "x".repeat(1024),
+    )
+    .unwrap();
+    let failed = site.build();
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("performance budget exceeded"));
+    assert!(!site.0.join("dist").exists());
+
+    std::fs::write(&manifest, &original).unwrap();
+    std::fs::remove_file(site.0.join("public/assets/over-budget.js")).unwrap();
+    success(site.build());
+    let old = site.published_metadata();
+    std::fs::write(
+        &manifest,
+        format!("{original}\n[budgets]\ninitial_js = \"10B\"\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        site.0.join("public/assets/over-budget.js"),
+        "x".repeat(1024),
+    )
+    .unwrap();
+    let failed = site.build();
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("performance budget exceeded"));
+    assert_eq!(site.published_metadata(), old);
+    assert!(!site.0.join("dist/assets/over-budget.js").exists());
 }
 
 #[test]

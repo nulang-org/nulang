@@ -17,7 +17,7 @@ use crate::web::runtime_bindings::{
     attach_runtime_route_plans, match_attached_route, render_bound_route_handler, RuntimeRoutePlan,
     RuntimeRouteSegment, RuntimeWebRoute,
 };
-use crate::web::validation::compile_validated_contracts_from_tree;
+use crate::web::validation::{compile_validated_contracts_from_tree, validation_diagnostics};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
@@ -48,6 +48,13 @@ pub fn compile_runtime_routes_from_contracts(
     routes: Vec<WebRoute>,
     contracts: &ContractCompilation,
 ) -> Result<Vec<RuntimeWebRoute>, Vec<String>> {
+    // Public callers may bypass compile_validated_contracts_from_tree and
+    // hand us a best-effort or stale compilation. Reject it before turning
+    // any registration into an executable runtime route.
+    let diagnostics = validation_diagnostics(contracts);
+    if !diagnostics.is_empty() {
+        return Err(diagnostics);
+    }
     let attachment = attach_runtime_route_plans(routes, contracts);
     if attachment.diagnostics.is_empty() {
         Ok(attachment.routes)
