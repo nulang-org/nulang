@@ -13,6 +13,7 @@ pub mod http_problem;
 pub mod http_request;
 pub mod ir;
 pub mod modules;
+pub mod native_permissions;
 pub mod openapi;
 pub mod package_contracts;
 pub mod reactivity;

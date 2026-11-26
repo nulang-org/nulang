@@ -322,3 +322,99 @@ fn tenant_admission_and_custom_host_options_share_one_startup_gate() {
         "{anonymous}"
     );
 }
+
+#[test]
+fn native_permissions_authorizer_enforces_current_trusted_resource_policy() {
+    use nulang::web::native_permissions::{
+        NativePermissions, PermissionRule, PolicyInput, RoleAssignment,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mode = Arc::new(AtomicUsize::new(0));
+    let policy_mode = mode.clone();
+    let native = NativePermissions::compile().expect("compile bundled policy evaluator");
+    let authorizer = native.authorizer(Arc::new(move |_, method, template, params| {
+        if method != HttpMethod::Get || template != "/secure/:id" {
+            return None;
+        }
+        let resource_tenant_id = match params.get("id").map(String::as_str) {
+            Some("a") => "tenant-a",
+            Some("b") => "tenant-b",
+            _ => return None,
+        };
+        let mut input = PolicyInput {
+            resource_tenant_id: resource_tenant_id.into(),
+            resource: "document".into(),
+            action: "read".into(),
+            assignments: vec![RoleAssignment {
+                tenant_id: "tenant-a".into(),
+                subject_id: "user-a".into(),
+                role: "reader".into(),
+            }],
+            rules: vec![PermissionRule {
+                tenant_id: "tenant-a".into(),
+                role: "reader".into(),
+                resource: "document".into(),
+                action: "read".into(),
+                outcome: "allow".into(),
+            }],
+        };
+        match policy_mode.load(Ordering::SeqCst) {
+            1 => input.assignments.clear(),
+            2 => input.rules.push(PermissionRule {
+                outcome: "deny".into(),
+                ..input.rules[0].clone()
+            }),
+            3 => input.rules.push(PermissionRule {
+                outcome: "malformed".into(),
+                ..input.rules[0].clone()
+            }),
+            4 => input.rules = vec![input.rules[0].clone(); 13],
+            5 => return None,
+            _ => {}
+        }
+        Some(input)
+    }));
+    let resolver = Arc::new(|session: &str| match session {
+        SESSION_A => VerifiedTenant::new("user-a", "tenant-a"),
+        SESSION_B => VerifiedTenant::new("user-b", "tenant-b"),
+        _ => None,
+    });
+    let guard = TenantAuthGuard::new(
+        "__Host-nulang_tenant",
+        vec![(HttpMethod::Get, "/secure/:id".into())],
+        resolver,
+    )
+    .unwrap()
+    .with_authorizer(authorizer);
+    let server =
+        WebDevServer::bind_with_tenant_guard(0, None, None, vec![route("/secure/:id")], guard)
+            .unwrap();
+    let a = [("Cookie", format!("__Host-nulang_tenant={SESSION_A}"))];
+    let b = [
+        ("Cookie", format!("__Host-nulang_tenant={SESSION_B}")),
+        ("X-Role", "reader".into()),
+        ("X-Tenant-Id", "tenant-a".into()),
+    ];
+    let allowed = get(server.port, "/secure/a", &a);
+    assert!(allowed.starts_with("HTTP/1.1 200 OK"), "{allowed}");
+    for (path, headers) in [
+        ("/secure/b", &a[..]),
+        ("/secure/a", &b[..]),
+        ("/secure/missing", &a[..]),
+    ] {
+        let denied = get(server.port, path, headers);
+        assert!(denied.starts_with("HTTP/1.1 403 Forbidden"), "{denied}");
+        assert!(
+            !denied.contains("tenant_mismatch") && !denied.contains("no_membership"),
+            "{denied}"
+        );
+    }
+    for value in 1..=5 {
+        mode.store(value, Ordering::SeqCst);
+        let denied = get(server.port, "/secure/a", &a);
+        assert!(
+            denied.starts_with("HTTP/1.1 403 Forbidden"),
+            "mode {value}: {denied}"
+        );
+    }
+}
