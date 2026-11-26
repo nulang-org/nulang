@@ -572,16 +572,24 @@ impl Runtime {
     /// Stop immediate terminal-failure replay for locally bound actors. The
     /// open admission is authoritative; only a later due sweep may retry it.
     pub(crate) fn defer_native_workflow_terminal_failure(&mut self, actor_id: u64) -> bool {
+        self.defer_native_workflow_failure(
+            actor_id,
+            NativeWorkflowRecoveryFailure::TerminalCommitFailed,
+        )
+    }
+
+    pub(crate) fn defer_native_workflow_failure(
+        &mut self,
+        actor_id: u64,
+        failure: NativeWorkflowRecoveryFailure,
+    ) -> bool {
         if !self.native_workflow_recovery_bound.contains(&actor_id)
             || self.native_workflow_recovery.is_none()
         {
             return false;
         }
         match self.native_workflow_retry_status(actor_id) {
-            Ok(Some(status)) => self.record_native_recovery_failure(
-                status,
-                NativeWorkflowRecoveryFailure::TerminalCommitFailed,
-            ),
+            Ok(Some(status)) => self.record_native_recovery_failure(status, failure),
             Ok(None) => {} // No reserved replay, or an ambiguous commit actually closed.
             Err(error) => {
                 tracing::warn!(actor_id, %error, "native workflow failure diagnostic status unavailable")

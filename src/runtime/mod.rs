@@ -4303,6 +4303,12 @@ impl Runtime {
                     &msg.payload,
                     atomic_workflow_turn,
                 );
+                // A contained native panic discards the activation. Never
+                // fall through into bytecode dispatch or terminal completion.
+                if atomic_workflow_turn && !self.actors.contains_key(&actor_id) {
+                    self.current_actor = None;
+                    return;
+                }
                 if processed && !atomic_workflow_turn {
                     self.checkpoint_actor(actor_id);
                 }
@@ -6592,11 +6598,35 @@ impl Runtime {
             }
         }
 
+        let contain_panic = stage_workflow_outbox
+            && self.native_workflow_recovery.is_some()
+            && self.native_workflow_recovery_bound.contains(&actor_id);
         if let Some(actor) = self.actors.get_mut(&actor_id) {
             if stage_workflow_outbox {
                 actor.begin_workflow_outbox_staging();
             }
-            handler(actor, args);
+            if contain_panic {
+                // Only trusted, bound ordinary Rust workflow handlers qualify.
+                // Do not catch runtime or persistence panics, nor resume this
+                // partially mutated actor after a handler unwind.
+                if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handler(actor, args);
+                })) {
+                    self.defer_native_workflow_failure(
+                        actor_id,
+                        NativeWorkflowRecoveryFailure::HandlerPanicked,
+                    );
+                    // A custom panic payload can itself panic on drop.
+                    if let Err(secondary) =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
+                    {
+                        std::mem::forget(secondary);
+                    }
+                    return false;
+                }
+            } else {
+                handler(actor, args);
+            }
             if stage_workflow_outbox {
                 actor.seal_workflow_outbox_staging();
             }

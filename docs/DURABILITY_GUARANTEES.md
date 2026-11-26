@@ -576,8 +576,20 @@ diagnostic is not proof of successful execution. SQLite audit persists
 across reopen; destructive actor clear removes its audit. There is no
 automatic redrive or cross-owner claiming.
 
-There is no panic containment, automatic ownership
-acquisition, or cross-shard recovery. No durable external-effect guarantee
+#### Native handler panic containment
+
+With supervision enabled, an ordinary Rust handler in a bound atomic
+workflow turn is isolated if it unwinds. The runtime discards the actor
+and uncommitted staging, leaves the original admission and safe snapshot,
+and applies the existing recovery cooldown and reserved retry budget.
+A reserved replay that panics records the classified HandlerPanicked
+diagnostic on a best-effort basis; the initial live turn is not counted.
+The standard panic hook still runs. This does not catch aborts,
+panic=abort builds, double panics during unwinding, runtime/storage
+panics or arbitrary native/compiled handlers. Trusted host handlers must
+maintain unwind-safe external state and avoid non-idempotent effects.
+
+There is no automatic ownership acquisition or cross-shard recovery. No durable external-effect guarantee
 is added. Tests exercise MemoryStore and SQLite, exact recipe matching,
 bounded pages, real process termination after admission, integrated outbox
 restart, injected terminal commit failure/repair, pinned retry limits,

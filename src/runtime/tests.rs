@@ -11107,3 +11107,115 @@ fn workflow_native_redrive_requires_exact_exhausted_nonresident_command_sqlite()
     rt.persistence = Box::new(LibsqlStore::in_memory().unwrap());
     assert_native_workflow_redrive(&mut rt);
 }
+
+#[cfg(panic = "unwind")]
+fn panic_workflow_handler(actor: &mut Actor, args: &[Value]) {
+    receive_workflow_outbox(actor, args);
+    actor
+        .stage_workflow_message(actor.id, 1, vec![PersistedValue::Int(123)])
+        .unwrap();
+    panic!("test handler panic after mutating state");
+}
+
+#[cfg(panic = "unwind")]
+fn assert_workflow_native_panic_contained(rt: &mut Runtime) {
+    rt.install_virtual_clock();
+    let (_, bad, behavior, first, second) = dispatch_fixture(rt);
+    let (_, good, _, other, _) = dispatch_fixture(rt);
+    rt.actors.get_mut(&bad).unwrap().behavior_table[behavior as usize].handler_fn =
+        panic_workflow_handler;
+    rt.register_native_workflow_recovery_recipe(
+        "receiver",
+        "panic-v1",
+        vec![("receive".into(), panic_workflow_handler)],
+    )
+    .unwrap();
+    rt.bind_native_workflow_recovery(bad, "receiver", "panic-v1")
+        .unwrap();
+    rt.enable_native_workflow_recovery(NativeWorkflowRecoveryConfig {
+        max_attempts: 2,
+        ..Default::default()
+    })
+    .unwrap();
+    let receipt = match rt.dispatch_workflow_outbox(first).unwrap() {
+        WorkflowOutboxDispatch::Admitted(receipt) => receipt,
+        result => panic!("unexpected dispatch {result:?}"),
+    };
+    assert!(matches!(
+        rt.dispatch_workflow_outbox(other).unwrap(),
+        WorkflowOutboxDispatch::Admitted(_)
+    ));
+    rt.run_scheduler();
+    assert!(!rt.actors.contains_key(&bad));
+    assert!(rt.current_actor.is_none());
+    assert_received(rt, good, 1, PersistedValue::String("first".into()));
+    assert!(rt.persistence.load_snapshot(bad).unwrap().state.is_empty());
+    assert_eq!(rt.persistence.read_journal(bad).len(), 1);
+    assert!(rt
+        .pending_workflow_outbox(bad, None, 10)
+        .unwrap()
+        .is_empty());
+    assert!(rt
+        .persistence
+        .load_open_workflow_command(bad)
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        rt.dispatch_workflow_outbox(first).unwrap(),
+        WorkflowOutboxDispatch::AlreadyAdmitted(receipt)
+    );
+    assert_eq!(
+        rt.dispatch_workflow_outbox(second).unwrap(),
+        WorkflowOutboxDispatch::Deferred
+    );
+    for _ in 0..2 {
+        rt.advance_time(Duration::from_millis(100));
+        rt.run_scheduler();
+        assert!(!rt.actors.contains_key(&bad));
+        assert!(rt.persistence.load_snapshot(bad).unwrap().state.is_empty());
+    }
+    let exhausted = rt.native_workflow_retry_status(bad).unwrap().unwrap();
+    assert_eq!(exhausted.attempts_reserved, 2);
+    assert!(exhausted.is_exhausted());
+    rt.advance_time(Duration::from_millis(100));
+    rt.run_scheduler();
+    assert_eq!(
+        rt.native_workflow_retry_status(bad).unwrap(),
+        Some(exhausted)
+    );
+    assert_eq!(rt.persistence.read_journal(bad).len(), 1);
+    assert!(rt
+        .pending_workflow_outbox(bad, None, 10)
+        .unwrap()
+        .is_empty());
+    assert!(rt
+        .persistence
+        .load_open_workflow_command(bad)
+        .unwrap()
+        .is_some());
+    let audit = rt
+        .native_workflow_recovery_audit(receipt, exhausted.activation_epoch)
+        .unwrap();
+    assert_eq!(audit.len(), 2);
+    for (i, event) in audit.iter().enumerate() {
+        assert!(
+            matches!(event, NativeWorkflowRecoveryAuditEvent::AttemptFailed {
+            status, failure: NativeWorkflowRecoveryFailure::HandlerPanicked
+        } if status.attempts_reserved == i as u32 + 1 && status.activation == receipt)
+        );
+    }
+}
+
+#[test]
+#[cfg(panic = "unwind")]
+fn workflow_native_panic_containment_memory() {
+    assert_workflow_native_panic_contained(&mut Runtime::new());
+}
+
+#[test]
+#[cfg(all(feature = "sqlite", panic = "unwind"))]
+fn workflow_native_panic_containment_sqlite() {
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(LibsqlStore::in_memory().unwrap());
+    assert_workflow_native_panic_contained(&mut rt);
+}
