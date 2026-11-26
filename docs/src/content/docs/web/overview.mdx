@@ -398,11 +398,11 @@ fn article_keys() -> [String] {
 }
 
 fn article(slug: String) -> Html {
-    var body = "Not found";
+    var page = text("Not found");
     for item in content_articles() {
-        if item.slug == slug then { body = item.body } else {}
+        if item.slug == slug then { page = item.html } else {}
     }
-    text(body)
+    page
 }
 
 app "articles" {
@@ -412,7 +412,8 @@ app "articles" {
 
 The bundle name becomes `content_<name>() -> [WebContentEntry]`.
 Each entry has `slug`, `title`, `summary`, `body`, and `source`
-strings, plus `tags: [String]`. `source` is a slash-separated path
+strings, plus `tags: [String]` and `html: Html`. `body` remains the original
+Markdown source; `html` is the rendered fragment. `source` is a slash-separated path
 relative to the package. Names use lowercase ASCII letters, digits and
 underscores, starting with a letter. Entries are sorted by source path;
 CRLF line endings are normalized to LF.
@@ -427,11 +428,25 @@ within the package and must not overlap each other, output, static assets,
 `.git` or `.nula`; symlinks are rejected. The loader is intended for a
 trusted local project, not a concurrently mutated hostile filesystem.
 
-This initial interface ingests **Markdown source**, not rendered Markdown
-HTML. `text(body)` safely escapes the source; do not pass untrusted Markdown
-to `Web.raw`. Full Markdown-to-HTML parsing, cross-document link validation,
-automatic asset copying, custom metadata schemas and globbing are deliberately
-not included. Use the existing static asset directory for public files.
+Published entries are rendered as CommonMark fragments. Use `item.html`
+directly in a page or component, or `text(item.body)` to display Markdown
+source. Inline and block HTML in the source are escaped, not executed.
+Links and images are checked after Markdown parsing: unsafe URL schemes,
+protocol-relative URLs and ambiguous root-relative paths fail with source
+diagnostics. Local references and the existing web URL schemes (HTTP,
+HTTPS, mailto, tel) are supported. Do not pass untrusted Markdown to
+`Web.raw`.
+
+Build and deploy check root-relative links and images against the newly
+staged files, generated pages and retained server GET routes before
+publishing. A missing target fails the build without replacing the previous
+site. Query strings and fragments are ignored for target existence; external
+URLs are not fetched. Relative links and fragment identifiers are left
+unchanged because content fragments can be embedded in multiple routes.
+Dev renders the same safe fragments, but the full staged-site link check
+runs on build and deploy. Automatic asset copying, custom metadata schemas
+and globbing are deliberately not included. Use the existing static asset
+directory for public files.
 A configured route with no published keys follows the usual empty-collection
 error rule rather than silently publishing an empty route set.
 
