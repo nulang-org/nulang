@@ -19,23 +19,7 @@ pub(crate) fn render_element(
         return None;
     }
 
-    let void_element = matches!(
-        tag.to_ascii_lowercase().as_str(),
-        "area"
-            | "base"
-            | "br"
-            | "col"
-            | "embed"
-            | "hr"
-            | "img"
-            | "input"
-            | "link"
-            | "meta"
-            | "param"
-            | "source"
-            | "track"
-            | "wbr"
-    );
+    let void_element = is_void_element(tag);
     // Void elements cannot contain children or have an end tag in HTML.
     // Validate before output rather than silently dropping content.
     if void_element && !children.is_empty() {
@@ -77,6 +61,26 @@ pub(crate) fn render_element(
     html.push_str(tag);
     html.push('>');
     Some(html)
+}
+
+pub(crate) fn is_void_element(tag: &str) -> bool {
+    matches!(
+        tag.to_ascii_lowercase().as_str(),
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
 }
 
 fn safe_identifier(name: &str) -> bool {

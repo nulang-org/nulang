@@ -115,6 +115,8 @@ The `stdlib::web::html` module adds ergonomic helpers: `el`, `txt`, `attr`, `bod
 
 Use `document_lang("en", head(...), body(...))` (or the actual BCP 47 language, such as `pt-BR`) for complete pages so assistive technologies can select the correct language. The legacy `document(head, body)` helper remains available and does not guess a language. Both generate the HTML5 doctype through the host serializer. Void elements such as `br`, `input`, `img`, `meta` and `link` must have empty children; the renderer emits only a start tag. The unsafe tag and attribute validation rules still apply.
 
+The compiler emits source-positioned warnings `W0201`–`W0204` for statically knowable issues in HTML syntax and explicit `perform Web.html(...)`: missing/empty document language, missing image `alt`, empty buttons or links without a local accessible name, and void elements with children. Decorative `img` may use `alt=""`; dynamic attributes and children are not guessed. Unqualified helpers such as `el` and `document` are not assumed to be stdlib calls, and raw HTML, cross-element label relationships, and imported source warnings are outside this pass. These are advisory checks, not a WCAG audit. `nulang --deny-warnings --check path.nula` escalates warnings for the checked source to errors.
+
 :::note
 `Web.redirect` produces an HTML page with a `<meta http-equiv="refresh">` and is sent with status 200 — not an HTTP 3xx. Browsers follow it; API clients will not.
 :::
