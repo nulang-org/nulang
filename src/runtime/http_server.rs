@@ -1489,6 +1489,22 @@ impl WebDevServer {
         )
     }
 
+    /// Serve only published build output, keeping the static preview
+    /// loopback-only and without registered handlers or realtime endpoints.
+    pub(crate) fn bind_static_site(port: u16, output_dir: PathBuf) -> std::io::Result<Self> {
+        Self::bind_runtime_guarded_configured(
+            port,
+            None,
+            Some(output_dir),
+            Vec::new(),
+            Vec::new(),
+            configured_web_public_origin()?,
+            None,
+            WebServerOptions::default(),
+            true,
+        )
+    }
+
     /// Validate host limits and configured origin through the shared admission path.
     pub fn bind_runtime_with_options(
         port: u16,
@@ -1506,6 +1522,7 @@ impl WebDevServer {
             configured_web_public_origin()?,
             None,
             options,
+            false,
         )
     }
 
@@ -1570,6 +1587,7 @@ impl WebDevServer {
             configured_web_public_origin()?,
             Some(tenant_guard),
             options,
+            false,
         )
     }
 
@@ -1592,6 +1610,7 @@ impl WebDevServer {
             public_origin,
             None,
             WebServerOptions::default(),
+            false,
         )
     }
 
@@ -1615,6 +1634,7 @@ impl WebDevServer {
             public_origin,
             None,
             options,
+            false,
         )
     }
 
@@ -1627,6 +1647,7 @@ impl WebDevServer {
         public_origin: Option<String>,
         tenant_guard: Option<TenantAuthGuard>,
         options: WebServerOptions,
+        static_only: bool,
     ) -> std::io::Result<Self> {
         options.validate()?;
         if let Some(origin) = public_origin.as_deref() {
@@ -1677,7 +1698,8 @@ impl WebDevServer {
                 .validate_mutation_routes(&form_keys)
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
         }
-        let listener = TcpListener::bind(("0.0.0.0", port))?;
+        let bind_host = if static_only { "127.0.0.1" } else { "0.0.0.0" };
+        let listener = TcpListener::bind((bind_host, port))?;
         let actual_port = listener.local_addr()?.port();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
@@ -1704,6 +1726,7 @@ impl WebDevServer {
                     shutdown_clone,
                     slots_for_listener,
                     options,
+                    static_only,
                 );
             })?;
 
@@ -1726,6 +1749,7 @@ impl WebDevServer {
         shutdown: Arc<AtomicBool>,
         slots: Arc<ConnectionSlots>,
         options: WebServerOptions,
+        static_only: bool,
     ) {
         listener.set_nonblocking(true).ok();
         // Route tables contain compiled modules; share them rather than
@@ -1788,6 +1812,7 @@ impl WebDevServer {
                                 form_guards,
                                 tenant_guard,
                                 shutdown,
+                                static_only,
                             );
                         })
                     {
@@ -1811,6 +1836,7 @@ impl WebDevServer {
         form_guards: Arc<HashMap<(String, String), GuardedFormRoute>>,
         tenant_guard: Option<Arc<TenantAuthGuard>>,
         shutdown: Arc<AtomicBool>,
+        static_only: bool,
     ) {
         let request = match read_http_request(&mut stream) {
             Ok(Some(request)) => request,
@@ -1849,7 +1875,7 @@ impl WebDevServer {
         let path = request.path.clone();
 
         let mut protected_response = false;
-        let mut response = if path.starts_with(Self::SSE_PATH_PREFIX) {
+        let mut response = if !static_only && path.starts_with(Self::SSE_PATH_PREFIX) {
             let room = &path[Self::SSE_PATH_PREFIX.len()..];
             Self::serve_sse(room, &mut stream, shutdown.clone());
             return;
@@ -2123,11 +2149,15 @@ fn contained_static_file(root: &Path, relative: &str) -> Option<(PathBuf, PathBu
 
 fn guess_content_type(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
-        Some("html") => "text/html; charset=utf-8",
+        Some("html") | Some("htm") => "text/html; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
         Some("js") => "application/javascript; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
         Some("png") => "image/png",
         Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("svg") => "image/svg+xml",
+        Some("ico") => "image/x-icon",
+        Some("wasm") => "application/wasm",
         _ => "application/octet-stream",
     }
 }

@@ -1627,98 +1627,24 @@ fn cmd_dev(port_override: Option<u16>) -> NuResult<()> {
         &entry_str,
     ])?;
 
-    if runtime_routes.is_empty() {
+    let static_only = runtime_routes.is_empty();
+    let server = if static_only {
         cmd_build_web()?;
-        let output_dir = root.join(&manifest.web.output_dir);
-        let addr = format!("127.0.0.1:{}", port);
-        let listener = std::net::TcpListener::bind(&addr).map_err(|e| NuError::PackageError {
-            msg: format!("cannot bind dev server to {}: {}", addr, e),
-            span: Span::default(),
-        })?;
-        println!("Serving static files at http://{}/", addr);
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    let root = output_dir.clone();
-                    std::thread::spawn(move || {
-                        serve_static_file(stream, &root);
-                    });
-                }
-                Err(e) => eprintln!("connection error: {}", e),
-            }
-        }
-        Ok(())
+        WebDevServer::bind_static_site(port, output_dir)
     } else {
-        let server = WebDevServer::bind_runtime(
-            port,
-            Some(static_dir),
-            Some(output_dir.clone()),
-            runtime_routes,
-        )
-        .map_err(|e| NuError::PackageError {
-            msg: format!("cannot bind dev server: {}", e),
-            span: Span::default(),
-        })?;
-        let actual_port = server.port;
-        println!("Dev server listening on http://127.0.0.1:{}/", actual_port);
-        loop {
-            std::thread::park();
-        }
+        WebDevServer::bind_runtime(port, Some(static_dir), Some(output_dir), runtime_routes)
     }
-}
-
-fn serve_static_file(mut stream: std::net::TcpStream, root: &Path) {
-    use std::io::{BufRead, BufReader, Write};
-    let mut reader = BufReader::new(&stream);
-    let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
-        return;
+    .map_err(|e| NuError::PackageError {
+        msg: format!("cannot bind dev server: {}", e),
+        span: Span::default(),
+    })?;
+    if static_only {
+        println!("Serving static files at http://127.0.0.1:{}/", server.port);
+    } else {
+        println!("Dev server listening on http://127.0.0.1:{}/", server.port);
     }
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    let path = parts.get(1).unwrap_or(&"/").trim_start_matches('/');
-    let file_path = if path.is_empty() {
-        root.join("index.html")
-    } else {
-        root.join(path)
-    };
-    let (status, content_type, body) = if file_path.is_file() {
-        match std::fs::read(&file_path) {
-            Ok(data) => ("200 OK", guess_content_type(&file_path), data),
-            Err(_) => (
-                "404 Not Found",
-                "text/plain; charset=utf-8",
-                b"Not found".to_vec(),
-            ),
-        }
-    } else {
-        (
-            "404 Not Found",
-            "text/plain; charset=utf-8",
-            b"Not found".to_vec(),
-        )
-    };
-    let response = format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        status,
-        content_type,
-        body.len()
-    );
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.write_all(&body);
-}
-
-fn guess_content_type(path: &Path) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("html") | Some("htm") => "text/html; charset=utf-8",
-        Some("css") => "text/css; charset=utf-8",
-        Some("js") => "application/javascript; charset=utf-8",
-        Some("json") => "application/json; charset=utf-8",
-        Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("svg") => "image/svg+xml",
-        Some("ico") => "image/x-icon",
-        Some("wasm") => "application/wasm",
-        _ => "application/octet-stream",
+    loop {
+        std::thread::park();
     }
 }
 
