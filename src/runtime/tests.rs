@@ -9031,3 +9031,239 @@ fn confirmed_node_removal_forgets_crdt_receiver_knowledge() {
         "a peer that rejoins after confirmed removal must receive full state"
     );
 }
+
+fn workflow_staging_fixture(rt: &mut Runtime) -> (u64, u64, u16) {
+    let receiver = rt.spawn_workflow_actor("receiver", Box::new(Vec::new), HashMap::new());
+    declare_test_behavior(rt, receiver, "receive");
+    let behavior = rt.behavior_id_for(receiver, "receive").unwrap();
+    let sender = rt.spawn_workflow_actor(
+        "sender",
+        Box::new(move || {
+            vec![
+                ("destination".into(), Value::int(receiver as i64)),
+                ("count".into(), Value::int(0)),
+            ]
+        }),
+        HashMap::from([
+            ("destination".into(), StateModel::Durable),
+            ("count".into(), StateModel::Durable),
+        ]),
+    );
+    (sender, receiver, behavior)
+}
+
+fn stage_test_messages(actor: &mut Actor, args: &[Value]) {
+    let destination = actor
+        .get_state_field("destination")
+        .unwrap()
+        .as_int()
+        .unwrap() as u64;
+    let behavior = args[0].as_int().unwrap() as u16;
+    let count = actor.get_state_field("count").unwrap().as_int().unwrap();
+    actor.set_state_field("count", Value::int(count + 1));
+    actor
+        .stage_workflow_message(
+            destination,
+            behavior,
+            vec![PersistedValue::String("first".into())],
+        )
+        .unwrap();
+    actor
+        .stage_workflow_message(destination, behavior, vec![PersistedValue::Int(9)])
+        .unwrap();
+}
+
+fn assert_staged_messages(rt: &Runtime, sender: u64, receiver: u64, behavior: u16) {
+    let sequence = rt.persistence.latest_sequence(sender);
+    for (ordinal, payload) in [
+        PersistedValue::String("first".into()),
+        PersistedValue::Int(9),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let message = rt
+            .persistence
+            .load_durable_outbox_message(DurableOutboxId {
+                sender_actor_id: sender,
+                sequence,
+                ordinal: ordinal as u32,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.destination_actor_id, receiver);
+        assert_eq!(message.behavior_id, behavior);
+        assert_eq!(message.payload, vec![payload]);
+    }
+    assert!(rt.actors[&receiver].mailbox.is_empty());
+    assert!(rt
+        .persistence
+        .load_open_workflow_command(sender)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        rt.persistence
+            .load_snapshot(sender)
+            .unwrap()
+            .state
+            .get("count"),
+        Some(&PersistedValue::Int(1))
+    );
+}
+
+#[test]
+fn workflow_native_staging_commits_messages_without_mailbox_delivery() {
+    let mut rt = Runtime::new();
+    let (sender, receiver, behavior) = workflow_staging_fixture(&mut rt);
+    rt.actors
+        .get_mut(&sender)
+        .unwrap()
+        .register_behavior("send", stage_test_messages);
+    assert!(rt
+        .actors
+        .get_mut(&sender)
+        .unwrap()
+        .stage_workflow_message(receiver, behavior, vec![])
+        .is_err());
+    rt.send_message(sender, "send", &[Value::int(behavior as i64)]);
+    run_ready_actor_turn(&mut rt, sender);
+    assert_staged_messages(&rt, sender, receiver, behavior);
+    assert!(rt
+        .actors
+        .get_mut(&sender)
+        .unwrap()
+        .stage_workflow_message(receiver, behavior, vec![])
+        .is_err());
+}
+
+#[test]
+fn workflow_native_staging_rejects_internal_target_without_committing() {
+    let mut rt = Runtime::new();
+    let (sender, receiver, _) = workflow_staging_fixture(&mut rt);
+    let internal = rt.behavior_id_for(receiver, "__timer_fired").unwrap();
+    rt.actors
+        .get_mut(&sender)
+        .unwrap()
+        .register_behavior("send", stage_test_messages);
+    rt.send_message(sender, "send", &[Value::int(internal as i64)]);
+    run_ready_actor_turn(&mut rt, sender);
+    let open = rt
+        .persistence
+        .load_open_workflow_command(sender)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rt.persistence
+            .load_snapshot(sender)
+            .unwrap()
+            .state
+            .get("count"),
+        Some(&PersistedValue::Int(0))
+    );
+    assert!(rt
+        .persistence
+        .load_durable_outbox_message(DurableOutboxId {
+            sender_actor_id: sender,
+            sequence: open.tail.sequence + 1,
+            ordinal: 0,
+        })
+        .unwrap()
+        .is_none());
+    assert!(rt.actors[&receiver].mailbox.is_empty());
+}
+
+#[test]
+fn workflow_native_staging_ignored_error_poisons_terminal_commit() {
+    let mut rt = Runtime::new();
+    let (sender, receiver, behavior) = workflow_staging_fixture(&mut rt);
+    rt.actors
+        .get_mut(&sender)
+        .unwrap()
+        .register_behavior("send", |actor, args| {
+            stage_test_messages(actor, args);
+            assert!(actor.stage_workflow_message(0, 0, vec![]).is_err());
+        });
+    rt.send_message(sender, "send", &[Value::int(behavior as i64)]);
+    run_ready_actor_turn(&mut rt, sender);
+    let open = rt
+        .persistence
+        .load_open_workflow_command(sender)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rt.persistence
+            .load_snapshot(sender)
+            .unwrap()
+            .state
+            .get("count"),
+        Some(&PersistedValue::Int(0))
+    );
+    assert!(rt
+        .persistence
+        .load_durable_outbox_message(DurableOutboxId {
+            sender_actor_id: sender,
+            sequence: open.tail.sequence + 1,
+            ordinal: 0,
+        })
+        .unwrap()
+        .is_none());
+    assert!(rt.actors[&receiver].mailbox.is_empty());
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn workflow_native_staging_sqlite_failure_recovers_original_command() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "nulang-native-outbox-{}-{nonce}.db",
+        std::process::id()
+    ));
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(LibsqlStore::new(&path).unwrap());
+    let (sender, receiver, behavior) = workflow_staging_fixture(&mut rt);
+    rt.actors
+        .get_mut(&sender)
+        .unwrap()
+        .register_behavior("send", stage_test_messages);
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute_batch("CREATE TRIGGER fail_outbox BEFORE INSERT ON durable_outbox BEGIN SELECT RAISE(ABORT, 'outbox fault'); END;").unwrap();
+    rt.send_message(sender, "send", &[Value::int(behavior as i64)]);
+    run_ready_actor_turn(&mut rt, sender);
+    let open = rt
+        .persistence
+        .load_open_workflow_command(sender)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rt.persistence
+            .load_snapshot(sender)
+            .unwrap()
+            .state
+            .get("count"),
+        Some(&PersistedValue::Int(0))
+    );
+    assert!(rt
+        .persistence
+        .load_durable_outbox_message(DurableOutboxId {
+            sender_actor_id: sender,
+            sequence: open.tail.sequence + 1,
+            ordinal: 0,
+        })
+        .unwrap()
+        .is_none());
+    assert!(rt.actors[&receiver].mailbox.is_empty());
+    raw.execute_batch("DROP TRIGGER fail_outbox;").unwrap();
+    rt.actors
+        .get_mut(&sender)
+        .unwrap()
+        .register_behavior("send", stage_test_messages);
+    run_ready_actor_turn(&mut rt, sender);
+    assert_staged_messages(&rt, sender, receiver, behavior);
+    assert_eq!(rt.persistence.read_journal(sender).len(), 1);
+    drop(raw);
+    drop(rt);
+    std::fs::remove_file(path).unwrap();
+}

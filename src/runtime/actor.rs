@@ -315,6 +315,8 @@ pub struct Actor {
     /// legacy custom-event ordinal; ordinary actors allocate no cursor.
     pub(crate) workflow_effect_cursor:
         Option<Box<crate::durable_effect_runtime::WorkflowEffectReplayCursor>>,
+    /// Lazily allocated only for a scheduled atomic Rust workflow turn.
+    workflow_outbox_staging: Option<Box<WorkflowOutboxStaging>>,
     /// Sentinel heap object used by the cycle detector to represent this
     /// actor as a holder of foreign references.
     cycle_sentinel: Option<*mut OrcaHeader>,
@@ -421,6 +423,15 @@ pub struct BehaviorEntry {
     pub handler_fn: fn(&mut Actor, &[Value]),
 }
 
+/// Execution-local buffer. Never published directly to a mailbox.
+struct WorkflowOutboxStaging {
+    activation: WorkflowActivationId,
+    epoch: u64,
+    sealed: bool,
+    poisoned: bool,
+    messages: Vec<DurableOutboxMessage>,
+}
+
 impl Actor {
     pub fn new(id: u64, name: impl Into<String>, mailbox_cap: usize) -> Self {
         Actor {
@@ -468,6 +479,7 @@ impl Actor {
             workflow_replay_activation: None,
             workflow_replay_event_ordinal: 0,
             workflow_effect_cursor: None,
+            workflow_outbox_staging: None,
             cycle_sentinel: None,
             suspended_execution: None,
             waiting_signal: None,
@@ -539,6 +551,7 @@ impl Actor {
         self.workflow_replay_activation = None;
         self.workflow_replay_event_ordinal = 0;
         self.workflow_effect_cursor = None;
+        self.workflow_outbox_staging = None;
         self.cycle_sentinel = None;
         self.suspended_execution = None;
         self.waiting_signal = None;
@@ -733,6 +746,86 @@ impl Actor {
             name: name.into(),
             handler_fn: handler,
         });
+    }
+
+    pub(crate) fn begin_workflow_outbox_staging(&mut self) {
+        self.workflow_outbox_staging = self.current_workflow_activation.map(|activation| {
+            Box::new(WorkflowOutboxStaging {
+                activation,
+                epoch: self.activation_epoch,
+                sealed: false,
+                poisoned: false,
+                messages: Vec::new(),
+            })
+        });
+    }
+
+    pub(crate) fn seal_workflow_outbox_staging(&mut self) {
+        if let Some(staging) = &mut self.workflow_outbox_staging {
+            staging.sealed = true;
+        }
+    }
+
+    pub(crate) fn clear_workflow_outbox_staging(&mut self) {
+        self.workflow_outbox_staging = None;
+    }
+
+    /// Stage an explicitly serialized message during a scheduled, atomically
+    /// admitted Rust workflow handler. This is not a mailbox send or delivery
+    /// guarantee. A rejected staging attempt poisons the turn even if the
+    /// handler ignores the error. Ordinary and compiled handlers are not enabled.
+    pub fn stage_workflow_message(
+        &mut self,
+        destination_actor_id: u64,
+        behavior_id: u16,
+        payload: Vec<PersistedValue>,
+    ) -> std::io::Result<()> {
+        let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
+        let staging = self
+            .workflow_outbox_staging
+            .as_mut()
+            .filter(|staging| !staging.sealed)
+            .ok_or_else(|| {
+                invalid("workflow outbox staging requires an active atomic Rust handler")
+            })?;
+        if staging.poisoned
+            || Some(staging.activation) != self.current_workflow_activation
+            || staging.activation.actor_id != self.id
+            || staging.epoch != self.activation_epoch
+            || destination_actor_id == 0
+            || staging.messages.len() >= 1024
+            || payload
+                .iter()
+                .any(|v| matches!(v, PersistedValue::Float(f) if !f.is_finite()))
+        {
+            staging.poisoned = true;
+            return Err(invalid("invalid or exhausted workflow outbox staging"));
+        }
+        staging.messages.push(DurableOutboxMessage {
+            destination_actor_id,
+            ordinal: staging.messages.len() as u32,
+            behavior_id,
+            payload,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn staged_workflow_messages(&self) -> std::io::Result<&[DurableOutboxMessage]> {
+        let Some(staging) = self.workflow_outbox_staging.as_ref() else {
+            return Ok(&[]);
+        };
+        if !staging.sealed
+            || staging.poisoned
+            || Some(staging.activation) != self.current_workflow_activation
+            || staging.activation.actor_id != self.id
+            || staging.epoch != self.activation_epoch
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "workflow outbox staging is incomplete, poisoned or stale",
+            ));
+        }
+        Ok(&staging.messages)
     }
 
     /// Reset the per-turn reduction budget (called after yielding or when the
