@@ -186,7 +186,13 @@ impl CodeModule {
         let instr_count = u32::from_be_bytes(bytes[44..48].try_into().unwrap()) as usize;
 
         // --- Instruction stream -----------------------------------------
-        let instr_block = 48..48 + instr_count * 4;
+        let instr_end = instr_count
+            .checked_mul(4)
+            .and_then(|len| NBC_HEADER_LEN.checked_add(len))
+            .ok_or_else(|| {
+                FormatError::BodyDecode("instruction span exceeds addressable size".into())
+            })?;
+        let instr_block = NBC_HEADER_LEN..instr_end;
         if bytes.len() < instr_block.end {
             return Err(FormatError::Truncated {
                 need: instr_block.end,
@@ -205,16 +211,19 @@ impl CodeModule {
 
         // --- Metadata body ----------------------------------------------
         let meta_len_off = instr_block.end;
-        if bytes.len() < meta_len_off + 4 {
+        let meta_off = meta_len_off.checked_add(4).ok_or_else(|| {
+            FormatError::BodyDecode("metadata length field exceeds addressable size".into())
+        })?;
+        if bytes.len() < meta_off {
             return Err(FormatError::Truncated {
-                need: meta_len_off + 4,
+                need: meta_off,
                 have: bytes.len(),
             });
         }
         let meta_len =
-            u32::from_be_bytes(bytes[meta_len_off..meta_len_off + 4].try_into().unwrap()) as usize;
-        let meta_off = meta_len_off + 4;
-        if bytes.len() < meta_off + meta_len {
+            u32::from_be_bytes(bytes[meta_len_off..meta_off].try_into().unwrap()) as usize;
+        // Compare against the remaining bytes before adding the untrusted length.
+        if meta_len > bytes.len() - meta_off {
             return Err(FormatError::LengthMismatch {
                 declared: meta_len as u32,
                 actual: bytes.len() - meta_off,
@@ -329,6 +338,35 @@ mod tests {
             FormatError::Truncated {
                 need: NBC_HEADER_LEN,
                 have: 10
+            }
+        );
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn test_nbc_rejects_unrepresentable_instruction_span() {
+        let mut bytes = sample_module().to_nbc(None).unwrap();
+        for count in [u32::MAX, u32::MAX / 4] {
+            bytes[44..48].copy_from_slice(&count.to_be_bytes());
+            assert!(matches!(
+                CodeModule::from_nbc(&bytes),
+                Err(FormatError::BodyDecode(_))
+            ));
+        }
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn test_nbc_rejects_unrepresentable_metadata_span() {
+        let module = sample_module();
+        let mut bytes = module.to_nbc(None).unwrap();
+        let meta_len_off = NBC_HEADER_LEN + module.instructions.len() * 4;
+        bytes[meta_len_off..meta_len_off + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(
+            CodeModule::from_nbc(&bytes).unwrap_err(),
+            FormatError::LengthMismatch {
+                declared: u32::MAX,
+                actual: bytes.len() - meta_len_off - 4,
             }
         );
     }

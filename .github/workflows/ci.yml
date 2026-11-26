@@ -37,7 +37,7 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: '1.95.0'
-          targets: wasm32-unknown-unknown
+          targets: wasm32-unknown-unknown, wasm32-wasip1
 
       - name: Cache playground build
         uses: Swatinem/rust-cache@v2
@@ -47,6 +47,11 @@ jobs:
 
       - name: Smoke test browser playground
         run: node playground/web/test/smoke.mjs
+
+      - name: Test shared NBC decoder on WASM32
+        run: |
+          cargo build --locked --manifest-path crates/nulang-playground/Cargo.toml --target wasm32-wasip1 --example nbc_wasm32_regression --target-dir "$RUNNER_TEMP/nbc-wasi-target"
+          node scripts/tests/nbc_wasm32.mjs "$RUNNER_TEMP/nbc-wasi-target/wasm32-wasip1/debug/examples/nbc_wasm32_regression.wasm"
 
       - name: Smoke test Nulang Web action events
         run: node scripts/tests/web_action_events.mjs
