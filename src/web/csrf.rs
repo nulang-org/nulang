@@ -116,20 +116,14 @@ fn direct_host_allowed(host: &str, local: SocketAddr) -> bool {
     false
 }
 
-/// Validate the Host for every Web request before dispatch, then require
-/// same-origin provenance for state-changing requests.
-///
-/// This also protects read-only routes and SSE subscriptions from DNS
-/// rebinding. Configure public_origin for a trusted reverse proxy. Without it,
-/// only the local listening IP or localhost are accepted. The Origin/Referer
-/// checks are required for unsafe methods only. This is not authentication.
-pub fn validate_mutation_origin(
-    method: &str,
+// Keep authority admission identical for ordinary reads, mutations, and
+// long-lived SSE subscriptions. No forwarded-header trust is introduced.
+fn trusted_request_origin(
     headers: &[(String, String)],
     local_addr: Option<SocketAddr>,
     public_origin: Option<&str>,
-) -> Result<(), OriginCheckError> {
-    let safe_method = matches!(method, "GET" | "HEAD" | "OPTIONS");
+    safe_method: bool,
+) -> Result<String, OriginCheckError> {
     let host = single_header(headers, "Host")?.ok_or(OriginCheckError::MissingHost)?;
     let expected = if let Some(origin) = public_origin {
         let trusted_authority = configured_authority(origin)?;
@@ -152,6 +146,41 @@ pub fn validate_mutation_origin(
         format!("http://{host}")
     };
 
+    Ok(expected)
+}
+
+fn validate_fetch_site(headers: &[(String, String)]) -> Result<(), OriginCheckError> {
+    if let Some(site) = single_header(headers, "Sec-Fetch-Site")? {
+        if site != "same-origin" && site != "none" {
+            return Err(OriginCheckError::CrossOriginFetch);
+        }
+    }
+    Ok(())
+}
+
+fn referer_matches(referer: &str, expected: &str) -> bool {
+    referer == expected
+        || referer
+            .strip_prefix(expected)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+/// Validate the Host for every Web request before dispatch, then require
+/// same-origin provenance for state-changing requests.
+///
+/// This also protects read-only routes and SSE subscriptions from DNS
+/// rebinding. Configure public_origin for a trusted reverse proxy. Without it,
+/// only the local listening IP or localhost are accepted. The Origin/Referer
+/// checks are required for unsafe methods only. This is not authentication.
+pub fn validate_mutation_origin(
+    method: &str,
+    headers: &[(String, String)],
+    local_addr: Option<SocketAddr>,
+    public_origin: Option<&str>,
+) -> Result<(), OriginCheckError> {
+    let safe_method = matches!(method, "GET" | "HEAD" | "OPTIONS");
+    let expected = trusted_request_origin(headers, local_addr, public_origin, safe_method)?;
+
     // Safe reads need neither Origin nor Referer, but must have passed Host
     // admission above. Otherwise an attacker-controlled DNS name resolving to
     // localhost can read sensitive GET pages using its own browser origin.
@@ -159,11 +188,7 @@ pub fn validate_mutation_origin(
         return Ok(());
     }
 
-    if let Some(site) = single_header(headers, "Sec-Fetch-Site")? {
-        if site != "same-origin" && site != "none" {
-            return Err(OriginCheckError::CrossOriginFetch);
-        }
-    }
+    validate_fetch_site(headers)?;
 
     if let Some(origin) = single_header(headers, "Origin")? {
         return if origin == expected {
@@ -174,12 +199,34 @@ pub fn validate_mutation_origin(
     }
 
     let referer = single_header(headers, "Referer")?.ok_or(OriginCheckError::MissingProvenance)?;
-    let path = referer.strip_prefix(&expected);
-    if referer == expected || path.is_some_and(|suffix| suffix.starts_with('/')) {
+    if referer_matches(referer, &expected) {
         Ok(())
     } else {
         Err(OriginCheckError::OriginMismatch)
     }
+}
+
+/// EventSource may omit Origin/Referer (non-browser or same-origin clients).
+/// If browser provenance is present, it must be unambiguous and same-origin.
+/// This is a subscription admission control, not room authentication.
+pub(crate) fn validate_sse_origin(
+    headers: &[(String, String)],
+    local_addr: Option<SocketAddr>,
+    public_origin: Option<&str>,
+) -> Result<(), OriginCheckError> {
+    let expected = trusted_request_origin(headers, local_addr, public_origin, true)?;
+    validate_fetch_site(headers)?;
+    if let Some(origin) = single_header(headers, "Origin")? {
+        if origin != expected {
+            return Err(OriginCheckError::OriginMismatch);
+        }
+    }
+    if let Some(referer) = single_header(headers, "Referer")? {
+        if !referer_matches(referer, &expected) {
+            return Err(OriginCheckError::OriginMismatch);
+        }
+    }
+    Ok(())
 }
 
 // Origin policy regression tests for the experimental HTTP server.
@@ -198,6 +245,57 @@ mod tests {
             .iter()
             .map(|(name, value)| (name.to_string(), value.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn sse_origin_uses_same_configured_authority_without_requiring_browser_headers() {
+        let check = |values: &[(&str, &str)]| {
+            super::validate_sse_origin(
+                &headers(values),
+                Some(loopback()),
+                Some("https://app.example.com"),
+            )
+        };
+        assert_eq!(check(&[("Host", "app.example.com")]), Ok(()));
+        assert_eq!(
+            check(&[
+                ("Host", "app.example.com"),
+                ("Origin", "https://app.example.com"),
+                ("Referer", "https://app.example.com/dashboard?tab=1"),
+                ("Sec-Fetch-Site", "same-origin"),
+            ]),
+            Ok(())
+        );
+        assert_eq!(
+            check(&[
+                ("Host", "app.example.com"),
+                ("Origin", "https://app.example.com.evil.example"),
+            ]),
+            Err(OriginCheckError::OriginMismatch)
+        );
+        assert_eq!(
+            check(&[
+                ("Host", "app.example.com"),
+                ("Origin", "https://app.example.com"),
+                ("Referer", "https://app.example.com.evil.example/path"),
+            ]),
+            Err(OriginCheckError::OriginMismatch)
+        );
+        assert_eq!(
+            check(&[
+                ("Host", "app.example.com"),
+                ("Referer", "https://app.example.com/a"),
+                ("Referer", "https://app.example.com/b"),
+            ]),
+            Err(OriginCheckError::DuplicateHeader)
+        );
+        assert_eq!(
+            check(&[
+                ("Host", "evil.example"),
+                ("X-Forwarded-Host", "app.example.com"),
+            ]),
+            Err(OriginCheckError::UntrustedHost)
+        );
     }
 
     #[test]

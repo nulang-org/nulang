@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use crate::bytecode::CodeModule;
 use crate::value_layout::PAYLOAD_MASK;
 use crate::vm::{resolve_value_string, Value, CLOSURE_ENV_FLAG, VM};
-use crate::web::csrf::validate_mutation_origin;
+use crate::web::csrf::{validate_mutation_origin, validate_sse_origin};
 use crate::web::dispatch::{render_direct_request, DirectRequestRenderError};
 use crate::web::form_guard::{FormGuardError, GuardedFormRoute};
 use crate::web::http_problem::{form_validation_problem_response, request_decode_problem_response};
@@ -1344,6 +1344,36 @@ fn unsafe_origin_response(
     })
 }
 
+/// Shared admission for streaming routes, before allocating room state.
+/// The general host authority and unsafe-request checks still run first.
+fn sse_request_rejection(
+    request: &HttpRequest,
+    local_addr: Option<std::net::SocketAddr>,
+    public_origin: Option<&str>,
+) -> Option<HttpResponse> {
+    if request.method != HttpMethod::Get {
+        return Some(HttpResponse {
+            status: 405,
+            headers: vec![
+                ("Allow".into(), "GET".into()),
+                ("Cache-Control".into(), "no-store".into()),
+                ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+            ],
+            body: b"Method Not Allowed".to_vec(),
+        });
+    }
+    let failure = validate_sse_origin(&request.headers, local_addr, public_origin).err()?;
+    eprintln!("Nulang Web denied SSE admission: {failure:?}");
+    Some(HttpResponse {
+        status: 403,
+        headers: vec![
+            ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+            ("Cache-Control".into(), "no-store".into()),
+        ],
+        body: b"Forbidden: invalid SSE request origin".to_vec(),
+    })
+}
+
 fn invalid_ui_action_response(captured: &HttpRequestBindingInputs) -> Option<HttpResponse> {
     captured
         .ui_message_error
@@ -2068,9 +2098,15 @@ impl WebDevServer {
 
         let mut protected_response = false;
         let mut response = if !static_only && path.starts_with(Self::SSE_PATH_PREFIX) {
-            let room = &path[Self::SSE_PATH_PREFIX.len()..];
-            Self::serve_sse(room, &mut stream, shutdown.clone());
-            return;
+            if let Some(rejection) =
+                sse_request_rejection(&request, stream.local_addr().ok(), public_origin.as_deref())
+            {
+                rejection
+            } else {
+                let room = &path[Self::SSE_PATH_PREFIX.len()..];
+                Self::serve_sse(room, &mut stream, shutdown.clone());
+                return;
+            }
         } else if let Some((route, params)) = routes
             .iter()
             .filter(|r| r.route.method == request.method)
