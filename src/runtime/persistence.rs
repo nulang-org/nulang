@@ -9,7 +9,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use crate::durable_effect::DurableEffectId;
+use crate::durable_effect::{DurableEffectId, DurableEffectRecord};
 use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
 use crate::vm::Value;
 
@@ -545,6 +545,23 @@ impl DurableTransition {
             ));
         }
 
+        // The experimental workflow adapter commits one bound effect at a
+        // time. Prevent mixed/duplicate slots inside a single transition.
+        for record in &self.durable_effects {
+            if let Some(binding) = record.workflow_binding() {
+                if self.durable_effects.len() != 1
+                    || binding.activation.actor_id != self.actor_id
+                    || binding.activation.command_sequence == 0
+                    || binding.activation.command_sequence >= self.sequence
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid workflow effect transition binding",
+                    ));
+                }
+            }
+        }
+
         let mut ordinals = BTreeSet::new();
         for message in &self.outbox {
             if !ordinals.insert(message.ordinal) {
@@ -632,6 +649,140 @@ fn canonicalize_json(value: &mut serde_json::Value) {
     }
 }
 
+/// Validate the append-only history of one slot. An intent fixes the site,
+/// spec and request digest before dispatch, and a single completion may
+/// advance it. New-sequence duplicates cannot overwrite either record.
+fn validate_workflow_effect_append(
+    previous: Option<&DurableEffectPersistenceRecord>,
+    next: &DurableEffectPersistenceRecord,
+) -> io::Result<()> {
+    let valid = match previous {
+        None => matches!(next.effect(), DurableEffectRecord::Prepared { .. }),
+        Some(previous) => {
+            previous.workflow_binding() == next.workflow_binding()
+                && previous.effect().spec() == next.effect().spec()
+                && previous.effect().request_digest() == next.effect().request_digest()
+                && matches!(previous.effect(), DurableEffectRecord::Prepared { .. })
+                && matches!(next.effect(), DurableEffectRecord::Completed { .. })
+        }
+    };
+    if !valid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "workflow effect occurrence binding or state conflicts with committed history",
+        ));
+    }
+    Ok(())
+}
+
+/// Scan only an activation's post-command effect history, without requiring
+/// the caller to guess the semantic site in order to find a prior record.
+/// Unbound legacy effects in that window are ambiguous (including old draft
+/// workflow adapter records); never interpret them as an unused slot.
+struct WorkflowOccurrenceHistory {
+    activation: WorkflowActivationId,
+    occurrence: u32,
+    latest: Option<DurableEffectPersistenceRecord>,
+    last: Option<DurableEffectPersistenceRecord>,
+}
+
+impl WorkflowOccurrenceHistory {
+    fn new(activation: WorkflowActivationId, occurrence: u32) -> Self {
+        Self {
+            activation,
+            occurrence,
+            latest: None,
+            last: None,
+        }
+    }
+
+    fn observe(&mut self, record: DurableEffectPersistenceRecord) -> io::Result<()> {
+        let binding = record
+            .workflow_binding()
+            .filter(|binding| binding.activation == self.activation)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unbound or foreign effect in workflow activation history",
+                )
+            })?;
+        // The adapter emits slots serially. Validate the entire relevant
+        // history (not just the target) so a gap, duplicate, or unfinished
+        // predecessor cannot be mistaken for a new effect.
+        let predecessor = self.last.as_ref().and_then(|last| last.workflow_binding());
+        if predecessor.is_some_and(|prior| prior.occurrence == binding.occurrence) {
+            validate_workflow_effect_append(self.last.as_ref(), &record)?;
+        } else {
+            let expected = self.next_unused_occurrence()?;
+            if binding.occurrence != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "workflow effect occurrence history is not contiguous",
+                ));
+            }
+            validate_workflow_effect_append(None, &record)?;
+        }
+        if binding.occurrence == self.occurrence {
+            self.latest = Some(record.clone());
+        }
+        self.last = Some(record);
+        Ok(())
+    }
+
+    fn next_unused_occurrence(&self) -> io::Result<u32> {
+        match &self.last {
+            None => Ok(0),
+            Some(last) if matches!(last.effect(), DurableEffectRecord::Completed { .. }) => last
+                .workflow_binding()
+                .unwrap()
+                .occurrence
+                .checked_add(1)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "workflow effect occurrence exhausted",
+                    )
+                }),
+            Some(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "prior workflow effect occurrence is still prepared",
+            )),
+        }
+    }
+
+    fn finish(self) -> io::Result<Option<DurableEffectPersistenceRecord>> {
+        if self.latest.is_none() && self.occurrence != self.next_unused_occurrence()? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "requested workflow effect occurrence is not the next unused slot",
+            ));
+        }
+        Ok(self.latest)
+    }
+}
+
+#[cfg(feature = "sqlite")]
+async fn read_workflow_occurrence_rows(
+    mut rows: libsql::Rows,
+    activation: WorkflowActivationId,
+    occurrence: u32,
+) -> io::Result<Option<DurableEffectPersistenceRecord>> {
+    let mut history = WorkflowOccurrenceHistory::new(activation, occurrence);
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+    {
+        let json: String = row
+            .get(0)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let record = DurableEffectPersistenceRecord::from_json(json.as_bytes())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        history.observe(record)?;
+    }
+    history.finish()
+}
+
 /// Persistence backend trait. Implementations may be in-memory or disk-backed.
 pub trait PersistenceStore: Send + Sync {
     /// Atomically commit one logical durable transition.
@@ -673,6 +824,21 @@ pub trait PersistenceStore: Send + Sync {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "durable effect recovery reads are not supported by this persistence backend",
+        ))
+    }
+
+    /// Recover by activation-local dynamic ordinal independently of the
+    /// semantic site. Unsupported backends must fail closed, never return
+    /// a false empty slot. History implementations reject ambiguous legacy
+    /// unbound effects within this activation's command window.
+    fn load_workflow_effect_occurrence(
+        &self,
+        _activation: WorkflowActivationId,
+        _occurrence: u32,
+    ) -> io::Result<Option<DurableEffectPersistenceRecord>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "workflow effect occurrence recovery is not supported",
         ))
     }
 
@@ -882,6 +1048,24 @@ impl PersistenceStore for MemoryStore {
             .cloned())
     }
 
+    fn load_workflow_effect_occurrence(
+        &self,
+        activation: WorkflowActivationId,
+        occurrence: u32,
+    ) -> io::Result<Option<DurableEffectPersistenceRecord>> {
+        let mut history = WorkflowOccurrenceHistory::new(activation, occurrence);
+        for transition in self
+            .committed_transitions(activation.actor_id)
+            .iter()
+            .filter(|transition| transition.sequence > activation.command_sequence)
+        {
+            for record in &transition.durable_effects {
+                history.observe(record.clone())?;
+            }
+        }
+        history.finish()
+    }
+
     fn commit_transition(&mut self, transition: DurableTransition) -> io::Result<DurableCommit> {
         transition.validate_structure()?;
         let digest = transition.digest()?;
@@ -957,6 +1141,14 @@ impl PersistenceStore for MemoryStore {
                         transition.expected_previous_sequence, legacy_tail
                     ),
                 ));
+            }
+        }
+
+        for record in &transition.durable_effects {
+            if let Some(binding) = record.workflow_binding() {
+                let previous =
+                    self.load_workflow_effect_occurrence(binding.activation, binding.occurrence)?;
+                validate_workflow_effect_append(previous.as_ref(), record)?;
             }
         }
 
@@ -1850,6 +2042,32 @@ impl PersistenceStore for LibsqlStore {
         })
     }
 
+    fn load_workflow_effect_occurrence(
+        &self,
+        activation: WorkflowActivationId,
+        occurrence: u32,
+    ) -> io::Result<Option<DurableEffectPersistenceRecord>> {
+        let command_sequence = i64::try_from(activation.command_sequence).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "workflow command sequence out of SQLite range",
+            )
+        })?;
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let rows = conn
+                .query(
+                    "SELECT record FROM durable_effect_records
+                 WHERE actor_id = ?1 AND sequence > ?2
+                 ORDER BY sequence ASC, ordinal ASC",
+                    libsql::params![activation.actor_id as i64, command_sequence],
+                )
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            read_workflow_occurrence_rows(rows, activation, occurrence).await
+        })
+    }
+
     fn commit_transition(&mut self, transition: DurableTransition) -> io::Result<DurableCommit> {
         transition.validate_structure()?;
         let digest = transition.digest()?;
@@ -2036,6 +2254,31 @@ impl PersistenceStore for LibsqlStore {
                             transition.expected_previous_sequence, legacy_tail
                         ),
                     ));
+                }
+            }
+
+            // Validate the immutable slot inside the same immediate write
+            // transaction as Prepared/Completed and the fenced tail update.
+            // A stale pre-dispatch lookup cannot race a conflicting binding
+            // into the same slot using a newer predecessor sequence.
+            for record in &transition.durable_effects {
+                if let Some(binding) = record.workflow_binding() {
+                    let validation = async {
+                        let command_sequence = i64::try_from(binding.activation.command_sequence)
+                            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "workflow command sequence out of SQLite range"))?;
+                        let rows = tx.query(
+                            "SELECT record FROM durable_effect_records
+                             WHERE actor_id = ?1 AND sequence > ?2
+                             ORDER BY sequence ASC, ordinal ASC",
+                            libsql::params![binding.activation.actor_id as i64, command_sequence],
+                        ).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                        let previous = read_workflow_occurrence_rows(rows, binding.activation, binding.occurrence).await?;
+                        validate_workflow_effect_append(previous.as_ref(), record)
+                    }.await;
+                    if let Err(error) = validation {
+                        let _ = tx.rollback().await;
+                        return Err(error);
+                    }
                 }
             }
 

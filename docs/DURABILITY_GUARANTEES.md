@@ -230,10 +230,25 @@ accepted and remains open, use the same verified/pinned bytecode, and replay
 from its safe pre-command boundary. A tail alone does not prove admission
 or command openness. The ordinal is reconstructed by deterministic execution
 of the recovered command, not serialized as a continuation or inferred by
-counting journal records. Independently persisted ordinal-to-site bindings
-and terminal actor state/inbox integration remain future work. The compiled
-workflow scheduler still uses the legacy journal path and **must not** use
-this adapter until its atomic command lifecycle is qualified.
+counting journal records. The new version-2 workflow-effect envelope binds the
+activation and occurrence to the semantic site and canonical effect ID in the
+same atomic transition as Prepared; Completed retains that binding and request
+digest. The MemoryStore and SQLite implementations find the slot without the
+caller guessing its site and check the binding and monotonic state inside the
+commit boundary. Gaps, duplicate new transitions, completion without an intent,
+and changed site/request/receipt fail closed. Generic v1 effect and compensation
+records retain their previous encoding. An unbound effect in the active command
+window is ambiguous and is refused rather than automatically migrated. Older
+readers do not support the v2 envelope; reverting after a v2 write requires a
+compatible recovery path, such as restoring a consistent pre-v2 backup. Live
+upgrade and rollback are not qualified.
+
+This experimental path scans the post-command portion of effect history; there
+is no dedicated index or throughput claim yet. Backends without slot recovery
+return Unsupported. Terminal actor state/inbox integration, detecting omitted
+trailing effects, and open-command/admission verification remain future work.
+The compiled workflow scheduler still uses the legacy journal path and **must
+not** use this adapter until its atomic command lifecycle is qualified.
 
 The existing SQLite VM fixture exercises this opt-in path with compiled
 workflow bytecode, a committed command sequence, lost provider reply,
@@ -242,6 +257,11 @@ with a fresh actor. Distinct occurrences and new commands produce distinct
 keys, while replay of completed occurrences does not call the provider.
 The later-occurrence case also checks a newer ownership epoch, pending site
 drift, and reuse of the original logical key after replay of an earlier receipt.
+A reopened-store regression rejects site drift with an empty in-memory cursor
+both before and after completion and replays the original receipt without a
+provider call. Storage tests exercise immutable bindings, monotonic completion,
+idempotent exact-tail retry and rollback of conflicting writes in both MemoryStore
+and SQLite.
 These are trusted fixture results, not proof of production workflow recovery.
 
 ## What is not yet a production-wide guarantee
