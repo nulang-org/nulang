@@ -207,8 +207,10 @@ handler-based operation IDs are preserved; when the same handler is reused by
 multiple routes, deterministic route-based suffixes keep operation IDs distinct
 for client generators regardless of route registration order.
 
-The shared runtime validator rejects duplicate or indistinguishable same-method
-routes. OpenAPI publication additionally requires a single normalized path
+The shared runtime validator rejects unsupported HTTP method spellings using
+the same method parser as VM registration (currently GET, POST, PUT, DELETE,
+PATCH, HEAD, and OPTIONS, uppercase), as well as duplicate or indistinguishable
+same-method routes. OpenAPI publication additionally requires a single normalized path
 spelling for each compiled matching shape across HTTP methods. For example,
 `GET /users/{id: Int}` and `POST /users/:id` share one path item; using different
 capture names for those methods is valid for runtime dispatch but fails the

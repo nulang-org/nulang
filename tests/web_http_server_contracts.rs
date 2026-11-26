@@ -5,7 +5,7 @@ use nulang::runtime::{HttpMethod, WebDevServer, WebRoute};
 use nulang::typechecker::TypeChecker;
 use nulang::web::contracts::compile_module_contracts;
 use nulang::web::dispatch::{compile_runtime_routes, compile_runtime_routes_from_contracts};
-use nulang::web::openapi::generate_openapi;
+use nulang::web::openapi::{generate_checked_openapi, generate_openapi};
 use nulang::web::runtime_bindings::{compile_runtime_route_plan, RuntimeWebRoute};
 use nulang::web::validation::compile_validated_contracts_from_tree;
 use std::io::{Read, Write};
@@ -211,6 +211,44 @@ fn web_main() {
             .iter()
             .any(|diagnostic| diagnostic.contains("ambiguous route GET")),
         "{error:?}"
+    );
+}
+
+#[test]
+fn runtime_and_openapi_reject_methods_the_vm_cannot_register() {
+    let source = r#"
+fn endpoint() -> String { "ok" }
+fn web_main() {
+    perform Web.route("get", "/lowercase", endpoint)
+    perform Web.route("TRACE", "/trace", endpoint)
+    perform Web.route("CONNECT", "/connect", endpoint)
+}
+"#;
+    let tokens = Lexer::new(source).lex().expect("lex route contracts");
+    let module = Parser::new(tokens)
+        .parse_module()
+        .expect("parse route contracts");
+    let contracts = compile_module_contracts(&module);
+    assert_eq!(contracts.routes.len(), 3);
+
+    // The VM silently omits registrations whose method is unsupported.
+    // Both attachment and publication must fail instead of describing a
+    // route that will never serve requests.
+    let expected = compile_runtime_routes_from_contracts(Vec::new(), &contracts)
+        .expect_err("unsupported methods must block runtime attachment");
+    assert_eq!(expected.len(), 3, "{expected:?}");
+    for method in ["get", "TRACE", "CONNECT"] {
+        assert!(
+            expected
+                .iter()
+                .any(|diagnostic| diagnostic
+                    .contains(&format!("unsupported HTTP method '{method}'"))),
+            "{expected:?}"
+        );
+    }
+    assert_eq!(
+        generate_checked_openapi(&contracts, "Test", "1").unwrap_err(),
+        expected
     );
 }
 
