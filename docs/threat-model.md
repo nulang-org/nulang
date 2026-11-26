@@ -37,7 +37,7 @@
 | D4 | **CRDT delta flooding** — malicious node sends oversized delta-sync packets | `sync_crdts_delta` limits delta batches to changed entries only. Full sync is rate-limited by `CRDT_FULL_SYNC_INTERVAL` (16 rounds). | Implemented. |
 | D5 | **Remote spawn abuse** — attacker spawns arbitrary behaviors on remote nodes | `register_spawnable_behavior` is required; unknown names return `SpawnResponse{success:false}`. | Implemented. |
 | D6 | **Gossip amplification** — forged gossip packets propagate false membership | `ClusterState::merge_membership` only applies higher-incarnation entries; equal incarnation only refreshes heartbeat. | Implemented. |
-| D7 | **Mailbox overflow** — unbounded mailbox growth causes OOM | `Mailbox` is a `SegQueue` (unbounded). Current policy: never drop. Mitigation: per-turn reduction budget (1000 msgs) and actor GC. | Accepted risk: operators must monitor. |
+| D7 | **Mailbox overflow** — unbounded actor or system-message queues can exhaust memory | `Mailbox` separates system, local, and normal traffic. Configured capacity uses atomic slot reservation and rejects excess normal/bulk sends with explicit backpressure; system messages bypass the limit. Newly spawned actors default to unbounded mailboxes, and neither reduction limits nor actor GC bound queued message growth. | Partially mitigated: configure bounded mailboxes where supported, monitor queue depth, and use application-level acknowledgments/retry. Default and system-lane OOM risk remains. |
 
 ### 2.2 FFI & Native Code (Critical)
 
