@@ -101,7 +101,7 @@ fn main() {
             verify(&store, false);
         }
         "check-old" => verify(&store, false),
-        "upgrade" => {
+        "upgrade" | "upgrade-crash" => {
             verify(&store, false);
             store.save_snapshot(snapshot(5, 9)).unwrap();
             store
@@ -118,6 +118,17 @@ fn main() {
                 .append_timer_fired(ACTOR, 5, "reminder".into())
                 .unwrap();
             verify(&store, true);
+            if args[1] == "upgrade-crash" {
+                // The committed state is verified, but the store is still
+                // open. Only the parent test harness may terminate this
+                // child, preventing normal Drop/last-connection checkpoint.
+                use std::io::Write;
+                println!("NULANG_WAL_CRASH_READY");
+                std::io::stdout().flush().unwrap();
+                loop {
+                    std::thread::park();
+                }
+            }
         }
         "check-new" => verify(&store, true),
         _ => panic!("invalid probe mode"),
