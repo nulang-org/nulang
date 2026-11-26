@@ -23,7 +23,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "benchmarks" / "cross_runtime"
 BUILD = ROOT / "target" / "cross-runtime"
-BENCHMARKS = ("counting", "ping_pong", "thread_ring", "fork_join")
+# The matched fixtures have fixed logical message counts. A consistent but
+# incorrect count in one runtime would otherwise skew cross-language throughput.
+MESSAGE_COUNTS = {
+    "counting": 200_000,
+    "ping_pong": 40_001,
+    "thread_ring": 20_000,
+    "fork_join": 100_000,
+}
+BENCHMARKS = tuple(MESSAGE_COUNTS)
+# The standalone Nulang runner also emits its own non-comparative workload.
+NULANG_ONLY_MESSAGE_COUNTS = {"skynet": 1_110}
 RECORD_RE = re.compile(
     r"\[cross-bench\]\s+runtime=(?P<runtime>[a-z0-9_-]+)\s+"
     r"benchmark=(?P<benchmark>[a-z0-9_-]+)\s+"
@@ -73,17 +83,40 @@ def maybe_version(command: list[str]) -> str | None:
 
 def parse_records(output: str, expected_runtime: str) -> dict[str, dict[str, int]]:
     records: dict[str, dict[str, int]] = {}
-    for match in RECORD_RE.finditer(output):
+    seen: set[str] = set()
+    for line in output.splitlines():
+        line = line.strip()
+        if not line.startswith("[cross-bench]"):
+            continue
+        match = RECORD_RE.fullmatch(line)
+        if match is None:
+            raise RuntimeError(f"{expected_runtime}: malformed benchmark record: {line!r}")
+
         runtime = match.group("runtime")
         if runtime != expected_runtime:
-            continue
+            raise RuntimeError(
+                f"{expected_runtime}: unexpected runtime {runtime!r} in benchmark record"
+            )
         name = match.group("benchmark")
-        if name not in BENCHMARKS:
-            continue
-        records[name] = {
-            "messages": int(match.group("messages")),
-            "elapsed_ns": int(match.group("elapsed_ns")),
-        }
+        expected_count = MESSAGE_COUNTS.get(name)
+        if expected_count is None and runtime == "nulang":
+            expected_count = NULANG_ONLY_MESSAGE_COUNTS.get(name)
+        if expected_count is None:
+            raise RuntimeError(f"{runtime}: unexpected benchmark {name!r}")
+        if name in seen:
+            raise RuntimeError(f"{runtime}/{name}: duplicate benchmark record")
+        seen.add(name)
+
+        messages = int(match.group("messages"))
+        elapsed_ns = int(match.group("elapsed_ns"))
+        if messages != expected_count:
+            raise RuntimeError(
+                f"{runtime}/{name}: expected message count {expected_count}, got {messages}"
+            )
+        if elapsed_ns <= 0:
+            raise RuntimeError(f"{runtime}/{name}: elapsed_ns must be positive")
+        if name in MESSAGE_COUNTS:
+            records[name] = {"messages": messages, "elapsed_ns": elapsed_ns}
 
     missing = [name for name in BENCHMARKS if name not in records]
     if missing:
@@ -320,6 +353,8 @@ def main() -> int:
         parser.error("--runs must be >= 1 and --warmup must be >= 0")
 
     selected = [item.strip() for item in args.runtimes.split(",") if item.strip()]
+    if not selected or len(selected) != len(set(selected)):
+        parser.error("--runtimes must select at least one runtime without duplicates")
     unknown = sorted(set(selected) - {"nulang", "rust", "go", "erlang"})
     if unknown:
         parser.error(f"unknown runtimes: {', '.join(unknown)}")
