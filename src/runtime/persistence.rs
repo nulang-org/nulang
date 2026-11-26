@@ -4351,6 +4351,148 @@ mod libsql_atomic_transition_tests {
     }
 
     #[test]
+    fn libsql_tail_update_failure_preserves_prior_commit_across_reopen_and_retry() {
+        use crate::durable_effect::{DurableEffectRecord, DurableEffectSpec};
+        use crate::primitives::{DeliverySemantics, EffectBoundary};
+
+        struct TestDir(PathBuf);
+        impl Drop for TestDir {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = TestDir(
+            std::env::temp_dir().join(format!("nulang-atomic-tail-{}-{nonce}", std::process::id())),
+        );
+        fs::create_dir(&dir.0).unwrap();
+        let path = dir.0.join("atomic.db");
+        let actor_id = 42;
+        let spec = DurableEffectSpec::new(
+            DurableEffectId::derive(actor_id, "atomic-tail-test", 0, "Provider.ask"),
+            "Provider.ask",
+            EffectBoundary::External,
+            DeliverySemantics::AtLeastOnce,
+        );
+        let prepared = DurableEffectRecord::prepare(spec.clone(), b"request");
+        let completed = prepared.clone().complete(b"receipt".to_vec());
+        let mut first = transition(actor_id, 1, 1);
+        first
+            .durable_effects
+            .push(DurableEffectPersistenceRecord::from_effect(
+                prepared.clone(),
+            ));
+        let mut second = transition(actor_id, 1, 2);
+        second
+            .durable_effects
+            .push(DurableEffectPersistenceRecord::from_effect(
+                completed.clone(),
+            ));
+
+        {
+            let mut store = LibsqlStore::new(&path).unwrap();
+            store.commit_transition(first).unwrap();
+            // The tail UPDATE is the final write before COMMIT; this forces
+            // rollback after every component, including the outbox, was staged.
+            {
+                let conn = store.conn();
+                store
+                    .rt
+                    .block_on(conn.execute(
+                        "CREATE TRIGGER fail_tail_update BEFORE UPDATE ON durable_tails
+                     WHEN NEW.actor_id = 42 AND NEW.sequence = 2
+                     BEGIN SELECT RAISE(ABORT, 'injected tail failure'); END",
+                        (),
+                    ))
+                    .unwrap();
+            }
+            let error = store.commit_transition(second.clone()).unwrap_err();
+            assert!(
+                error.to_string().contains("injected tail failure"),
+                "{error}"
+            );
+        }
+        {
+            let mut store = LibsqlStore::new(&path).unwrap();
+            assert_eq!(store.latest_sequence(actor_id), 1);
+            assert_eq!(store.load_snapshot(actor_id).unwrap().sequence, 1);
+            assert_eq!(store.read_journal(actor_id).len(), 1);
+            assert_eq!(store.read_workflow_events(actor_id).len(), 2);
+            assert_eq!(store.read_events(actor_id).len(), 2);
+            assert_eq!(
+                store
+                    .load_durable_effect(actor_id, spec.id)
+                    .unwrap()
+                    .unwrap()
+                    .effect(),
+                &prepared
+            );
+            for table in [
+                "durable_transitions",
+                "durable_outbox",
+                "durable_effect_records",
+            ] {
+                assert_eq!(
+                    store
+                        .query(
+                            &format!(
+                                "SELECT COUNT(*) FROM {table} WHERE actor_id = 42 AND sequence = 2"
+                            ),
+                            &[]
+                        )
+                        .unwrap(),
+                    vec!["[0]"]
+                );
+            }
+            {
+                let conn = store.conn();
+                store
+                    .rt
+                    .block_on(conn.execute("DROP TRIGGER fail_tail_update", ()))
+                    .unwrap();
+            }
+            let commit = store.commit_transition(second.clone()).unwrap();
+            assert_eq!(store.commit_transition(second).unwrap(), commit);
+        }
+        {
+            let store = LibsqlStore::new(&path).unwrap();
+            assert_eq!(store.latest_sequence(actor_id), 2);
+            assert_eq!(store.load_snapshot(actor_id).unwrap().sequence, 2);
+            assert_eq!(store.read_journal(actor_id).len(), 2);
+            assert_eq!(store.read_workflow_events(actor_id).len(), 4);
+            assert_eq!(store.read_events(actor_id).len(), 4);
+            assert_eq!(
+                store
+                    .load_durable_effect(actor_id, spec.id)
+                    .unwrap()
+                    .unwrap()
+                    .effect(),
+                &completed
+            );
+            for table in [
+                "durable_transitions",
+                "durable_outbox",
+                "durable_effect_records",
+            ] {
+                assert_eq!(
+                    store
+                        .query(
+                            &format!(
+                                "SELECT COUNT(*) FROM {table} WHERE actor_id = 42 AND sequence = 2"
+                            ),
+                            &[]
+                        )
+                        .unwrap(),
+                    vec!["[1]"]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn libsql_atomic_transition_survives_reopen() {
         let path = std::env::temp_dir().join(format!(
             "nulang_atomic_transition_{}_reopen.db",
