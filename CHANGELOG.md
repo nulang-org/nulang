@@ -1,4 +1,10 @@
 # Nulang Changelog
+
+### Fail-closed SQLite history recovery and trusted streaming — 2026-11-26
+- **Keep untrusted `DB.query` results bounded** while visiting fixed internal actor snapshot, journal, workflow/domain event and durable-effect rows incrementally. Recovery no longer mistakes histories beyond the general 100,000-row/64 MiB adapter buffer budget for absent data.
+- Introduce checked persistence-history reads for actor/virtual-actor activation. SQLite query, decode or corruption failures now refuse recovery before publishing a partially restored actor; legacy reader APIs retain compatibility, with warnings for their fallback paths.
+- Regression tests cover over-budget streamed rows/bytes, 100,001 committed events and journal entries, invalid snapshots/events/workflow rows, and preserved user-query limits. Full profile, live Turso and release qualification remain separate.
+
 ### Fail-closed legacy snapshots schema validation (draft) — 2026-11-22
 - **Reject pre-existing SQLite `snapshots` tables missing mandatory `actor_id`, `sequence`, or `state` columns before adding optional columns.** Previously, `CREATE TABLE IF NOT EXISTS` accepted an incomplete table and startup could succeed despite an unusable durable-state schema.
 - **Match SQLite column names case-insensitively during optional migrations**, preserving compatible older schemas with uppercased optional column identifiers. The change applies only to the audited SQLite integration candidate, remains draft, and requires exact-head regression and migration/recovery qualification before release.

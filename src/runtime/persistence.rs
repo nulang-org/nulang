@@ -682,17 +682,31 @@ pub trait PersistenceStore: Send + Sync {
     /// Load the latest snapshot for an actor, if any.
     fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot>;
 
+    /// Fail-closed recovery read. Existing backends retain compatibility;
+    /// SQLite overrides this to distinguish corrupt/oversized data from no row.
+    fn load_snapshot_checked(&self, actor_id: u64) -> io::Result<Option<ActorSnapshot>> {
+        Ok(self.load_snapshot(actor_id))
+    }
+
     /// Append a message to the actor's journal.
     fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> io::Result<()>;
 
     /// Read all journal entries for an actor in order.
     fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry>;
 
+    fn read_journal_checked(&self, actor_id: u64) -> io::Result<Vec<JournalEntry>> {
+        Ok(self.read_journal(actor_id))
+    }
+
     /// Append a workflow event to the actor's event journal.
     fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()>;
 
     /// Read all workflow events for an actor in order.
     fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent>;
+
+    fn read_workflow_events_checked(&self, actor_id: u64) -> io::Result<Vec<WorkflowEvent>> {
+        Ok(self.read_workflow_events(actor_id))
+    }
 
     /// Append a `TimerSet` workflow event.
     fn append_timer_set(
@@ -812,6 +826,10 @@ pub trait PersistenceStore: Send + Sync {
 
     /// Read all event-sourcing entries for an actor in order.
     fn read_events(&self, actor_id: u64) -> Vec<EventEntry>;
+
+    fn read_events_checked(&self, actor_id: u64) -> io::Result<Vec<EventEntry>> {
+        Ok(self.read_events(actor_id))
+    }
 
     /// Highest sequence number known for the actor.
     fn latest_sequence(&self, actor_id: u64) -> u64;
@@ -1822,31 +1840,26 @@ impl PersistenceStore for LibsqlStore {
     ) -> io::Result<Option<DurableEffectPersistenceRecord>> {
         let conn = self.conn();
         self.rt.block_on(async {
-            let mut rows = conn
-                .query(
-                    "SELECT record FROM durable_effect_records
-                     WHERE actor_id = ?1
-                     ORDER BY sequence DESC, ordinal DESC",
-                    libsql::params![actor_id as i64],
-                )
-                .await
-                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
-
-            while let Some(row) = rows
-                .next()
-                .await
-                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
-            {
-                let json: String = row.get(0).map_err(|error| {
-                    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
-                })?;
-                let record = DurableEffectPersistenceRecord::from_json(json.as_bytes())
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                if record.effect().spec().id == effect_id {
-                    return Ok(Some(record));
-                }
-            }
-            Ok(None)
+            let mut found = None;
+            conn.query_each_until(
+                "SELECT record FROM durable_effect_records
+                 WHERE actor_id = ?1
+                 ORDER BY sequence DESC, ordinal DESC",
+                libsql::params![actor_id as i64],
+                |row| {
+                    let json: String = row.get(0)?;
+                    let record = DurableEffectPersistenceRecord::from_json(json.as_bytes())
+                        .map_err(|error| error.to_string())?;
+                    if record.effect().spec().id == effect_id {
+                        found = Some(record);
+                        return Ok(false);
+                    }
+                    Ok(true)
+                },
+            )
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            Ok(found)
         })
     }
 
@@ -2243,57 +2256,66 @@ impl PersistenceStore for LibsqlStore {
     }
 
     fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        self.load_snapshot_checked(actor_id)
+            .unwrap_or_else(|error| {
+                warn!(
+                    "nulang-persist: snapshot read for actor {} failed: {}",
+                    actor_id, error
+                );
+                None
+            })
+    }
+
+    fn load_snapshot_checked(&self, actor_id: u64) -> io::Result<Option<ActorSnapshot>> {
         let conn = self.conn();
         self.rt.block_on(async {
-            let mut rows = conn
-                .query(
-                    "SELECT sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens FROM snapshots WHERE actor_id = ?1",
-                    libsql::params![actor_id as i64],
-                )
-                .await
-                .ok()?;
-            let row = rows.next().await.ok()??;
-            let sequence: i64 = row.get(0).ok()?;
-            let activation_epoch: i64 = row.get(1).ok()?;
-            let state_json: String = row.get(2).ok()?;
-            let waiting_signal: Option<String> = row.get(3).ok()?;
-            let crdt_json: Option<String> = row.get(4).ok()?;
-            let crdt_field_map_json: Option<String> = row.get(5).ok()?;
-            let schema_name: Option<String> = row.get(6).ok()?;
-            let authority_json: Option<String> = row.get(7).ok()?;
-            let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> = match crdt_json {
-                Some(j) => serde_json::from_str(&j).ok()?,
-                None => None,
-            };
-            let crdt_field_map: Option<HashMap<String, u64>> = match crdt_field_map_json {
-                Some(j) => serde_json::from_str(&j).ok()?,
-                None => None,
-            };
-            let authority_tokens: BTreeSet<String> = match authority_json {
-                Some(json) => match serde_json::from_str(&json) {
-                    Ok(tokens) => tokens,
-                    Err(err) => {
-                        warn!(
-                            "nulang-persist: invalid authority metadata for actor {}: {}",
-                            actor_id, err
-                        );
-                        return None;
-                    }
+            let mut snapshot = None;
+            conn.query_each_until(
+                "SELECT sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens
+                 FROM snapshots WHERE actor_id = ?1",
+                libsql::params![actor_id as i64],
+                |row| {
+                    let sequence: i64 = row.get(0)?;
+                    let activation_epoch: i64 = row.get(1)?;
+                    let state_json: String = row.get(2)?;
+                    let waiting_signal: Option<String> = row.get(3)?;
+                    let crdt_json: Option<String> = row.get(4)?;
+                    let crdt_field_map_json: Option<String> = row.get(5)?;
+                    let schema_name: Option<String> = row.get(6)?;
+                    let authority_json: Option<String> = row.get(7)?;
+                    // The stored JSON may itself be the literal null.
+                    // Deserialize as Option<T>, not T wrapped in an outer Option:
+                    // serde_json::from_str::<Vec<_>>("null") is an error.
+                    let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> = match crdt_json {
+                        Some(json) => serde_json::from_str(&json).map_err(|e| e.to_string())?,
+                        None => None,
+                    };
+                    let crdt_field_map: Option<HashMap<String, u64>> = match crdt_field_map_json {
+                        Some(json) => serde_json::from_str(&json).map_err(|e| e.to_string())?,
+                        None => None,
+                    };
+                    let authority_tokens = authority_json
+                        .map(|json| serde_json::from_str(&json).map_err(|e| e.to_string()))
+                        .transpose()?
+                        .unwrap_or_default();
+                    let state = serde_json::from_str(&state_json).map_err(|e| e.to_string())?;
+                    snapshot = Some(ActorSnapshot {
+                        actor_id,
+                        sequence: u64::try_from(sequence).map_err(|e| e.to_string())?,
+                        activation_epoch: u64::try_from(activation_epoch).map_err(|e| e.to_string())?,
+                        state,
+                        waiting_signal,
+                        crdt_snapshot,
+                        crdt_field_map,
+                        schema_name,
+                        authority_tokens,
+                    });
+                    Ok(false)
                 },
-                None => BTreeSet::new(),
-            };
-            let state: HashMap<String, PersistedValue> = serde_json::from_str(&state_json).ok()?;
-            Some(ActorSnapshot {
-                actor_id,
-                sequence: sequence as u64,
-                activation_epoch: activation_epoch as u64,
-                state,
-                waiting_signal,
-                crdt_snapshot,
-                crdt_field_map,
-                schema_name,
-                authority_tokens,
-            })
+            )
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            Ok(snapshot)
         })
     }
 
@@ -2310,51 +2332,41 @@ impl PersistenceStore for LibsqlStore {
     }
 
     fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
+        self.read_journal_checked(actor_id).unwrap_or_else(|error| {
+            warn!(
+                "nulang-persist: journal read for actor {} failed: {}",
+                actor_id, error
+            );
+            Vec::new()
+        })
+    }
+
+    fn read_journal_checked(&self, actor_id: u64) -> io::Result<Vec<JournalEntry>> {
         let conn = self.conn();
         self.rt.block_on(async {
-            let mut rows = match conn
-                .query(
-                    "SELECT sequence, behavior_id, payload FROM journal
-                 WHERE actor_id = ?1 ORDER BY sequence ASC",
-                    libsql::params![actor_id as i64],
-                )
-                .await
-            {
-                Ok(r) => r,
-                Err(_) => return Vec::new(),
-            };
             let mut entries = Vec::new();
-            loop {
-                match rows.next().await {
-                    Ok(Some(row)) => {
-                        let seq: i64 = match row.get(0) {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-                        let bid: i64 = match row.get(1) {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-                        let payload_json: String = match row.get(2) {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-                        let payload: Vec<PersistedValue> = match serde_json::from_str(&payload_json)
-                        {
-                            Ok(p) => p,
-                            Err(_) => continue,
-                        };
-                        entries.push(JournalEntry {
-                            sequence: seq as u64,
-                            behavior_id: bid as u16,
-                            payload,
-                        });
-                    }
-                    Ok(None) => break,
-                    Err(_) => break,
-                }
-            }
-            entries
+            conn.query_each(
+                "SELECT sequence, behavior_id, payload FROM journal
+                 WHERE actor_id = ?1 ORDER BY sequence ASC",
+                libsql::params![actor_id as i64],
+                |row| {
+                    let sequence: i64 = row.get(0)?;
+                    let behavior: i64 = row.get(1)?;
+                    let payload_json: String = row.get(2)?;
+                    let payload = serde_json::from_str(&payload_json).map_err(|e| e.to_string())?;
+                    let sequence = u64::try_from(sequence).map_err(|e| e.to_string())?;
+                    let behavior_id = u16::try_from(behavior).map_err(|e| e.to_string())?;
+                    entries.push(JournalEntry {
+                        sequence,
+                        behavior_id,
+                        payload,
+                    });
+                    Ok(())
+                },
+            )
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            Ok(entries)
         })
     }
 
@@ -2374,60 +2386,37 @@ impl PersistenceStore for LibsqlStore {
     }
 
     fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
+        self.read_workflow_events_checked(actor_id)
+            .unwrap_or_else(|error| {
+                warn!(
+                    "nulang-persist: workflow event read for actor {} failed: {}",
+                    actor_id, error
+                );
+                Vec::new()
+            })
+    }
+
+    fn read_workflow_events_checked(&self, actor_id: u64) -> io::Result<Vec<WorkflowEvent>> {
         let conn = self.conn();
         self.rt.block_on(async {
             let mut events = Vec::new();
-
-            if let Ok(mut rows) = conn
-                .query(
-                    "SELECT event FROM workflow_events
-                     WHERE actor_id = ?1 ORDER BY sequence ASC",
-                    libsql::params![actor_id as i64],
-                )
+            for sql in [
+                "SELECT event FROM workflow_events
+                 WHERE actor_id = ?1 ORDER BY sequence ASC",
+                "SELECT event FROM durable_workflow_events
+                 WHERE actor_id = ?1 ORDER BY sequence ASC, ordinal ASC",
+            ] {
+                conn.query_each(sql, libsql::params![actor_id as i64], |row| {
+                    let event_json: String = row.get(0)?;
+                    let event = serde_json::from_str(&event_json).map_err(|e| e.to_string())?;
+                    events.push(event);
+                    Ok(())
+                })
                 .await
-            {
-                loop {
-                    match rows.next().await {
-                        Ok(Some(row)) => {
-                            let event_json: String = match row.get(0) {
-                                Ok(value) => value,
-                                Err(_) => continue,
-                            };
-                            if let Ok(event) = serde_json::from_str(&event_json) {
-                                events.push(event);
-                            }
-                        }
-                        Ok(None) | Err(_) => break,
-                    }
-                }
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             }
-
-            if let Ok(mut rows) = conn
-                .query(
-                    "SELECT event FROM durable_workflow_events
-                     WHERE actor_id = ?1 ORDER BY sequence ASC, ordinal ASC",
-                    libsql::params![actor_id as i64],
-                )
-                .await
-            {
-                loop {
-                    match rows.next().await {
-                        Ok(Some(row)) => {
-                            let event_json: String = match row.get(0) {
-                                Ok(value) => value,
-                                Err(_) => continue,
-                            };
-                            if let Ok(event) = serde_json::from_str(&event_json) {
-                                events.push(event);
-                            }
-                        }
-                        Ok(None) | Err(_) => break,
-                    }
-                }
-            }
-
             events.sort_by_key(WorkflowEvent::sequence);
-            events
+            Ok(events)
         })
     }
 
@@ -2446,88 +2435,59 @@ impl PersistenceStore for LibsqlStore {
     }
 
     fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
+        self.read_events_checked(actor_id).unwrap_or_else(|error| {
+            warn!(
+                "nulang-persist: event read for actor {} failed: {}",
+                actor_id, error
+            );
+            Vec::new()
+        })
+    }
+
+    fn read_events_checked(&self, actor_id: u64) -> io::Result<Vec<EventEntry>> {
         let conn = self.conn();
         self.rt.block_on(async {
             let mut entries = Vec::new();
-
-            if let Ok(mut rows) = conn
-                .query(
-                    "SELECT sequence, field_name, event_name, args, value FROM events
-                     WHERE actor_id = ?1 ORDER BY sequence ASC",
-                    libsql::params![actor_id as i64],
-                )
-                .await
-            {
-                loop {
-                    match rows.next().await {
-                        Ok(Some(row)) => {
-                            let sequence: i64 = match row.get(0) {
-                                Ok(value) => value,
-                                Err(_) => continue,
-                            };
-                            let field_name: String = match row.get(1) {
-                                Ok(value) => value,
-                                Err(_) => continue,
-                            };
-                            let event_name: String = match row.get(2) {
-                                Ok(value) => value,
-                                Err(_) => continue,
-                            };
-                            let args_json: String = match row.get(3) {
-                                Ok(value) => value,
-                                Err(_) => continue,
-                            };
-                            let value_json: String = match row.get(4) {
-                                Ok(value) => value,
-                                Err(_) => continue,
-                            };
-                            let args = match serde_json::from_str(&args_json) {
-                                Ok(value) => value,
-                                Err(_) => continue,
-                            };
-                            let value = match serde_json::from_str(&value_json) {
-                                Ok(value) => value,
-                                Err(_) => continue,
-                            };
-                            entries.push(EventEntry {
-                                sequence: sequence as u64,
-                                field_name,
-                                event_name,
-                                args,
-                                value,
-                            });
-                        }
-                        Ok(None) | Err(_) => break,
-                    }
-                }
-            }
-
-            if let Ok(mut rows) = conn
-                .query(
-                    "SELECT event FROM durable_domain_events
-                     WHERE actor_id = ?1 ORDER BY sequence ASC, ordinal ASC",
-                    libsql::params![actor_id as i64],
-                )
-                .await
-            {
-                loop {
-                    match rows.next().await {
-                        Ok(Some(row)) => {
-                            let event_json: String = match row.get(0) {
-                                Ok(value) => value,
-                                Err(_) => continue,
-                            };
-                            if let Ok(event) = serde_json::from_str(&event_json) {
-                                entries.push(event);
-                            }
-                        }
-                        Ok(None) | Err(_) => break,
-                    }
-                }
-            }
-
+            conn.query_each(
+                "SELECT sequence, field_name, event_name, args, value FROM events
+                 WHERE actor_id = ?1 ORDER BY sequence ASC",
+                libsql::params![actor_id as i64],
+                |row| {
+                    let sequence: i64 = row.get(0)?;
+                    let field_name: String = row.get(1)?;
+                    let event_name: String = row.get(2)?;
+                    let args_json: String = row.get(3)?;
+                    let value_json: String = row.get(4)?;
+                    let args = serde_json::from_str(&args_json).map_err(|e| e.to_string())?;
+                    let value = serde_json::from_str(&value_json).map_err(|e| e.to_string())?;
+                    let sequence = u64::try_from(sequence).map_err(|e| e.to_string())?;
+                    entries.push(EventEntry {
+                        sequence,
+                        field_name,
+                        event_name,
+                        args,
+                        value,
+                    });
+                    Ok(())
+                },
+            )
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            conn.query_each(
+                "SELECT event FROM durable_domain_events
+                 WHERE actor_id = ?1 ORDER BY sequence ASC, ordinal ASC",
+                libsql::params![actor_id as i64],
+                |row| {
+                    let event_json: String = row.get(0)?;
+                    let event = serde_json::from_str(&event_json).map_err(|e| e.to_string())?;
+                    entries.push(event);
+                    Ok(())
+                },
+            )
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             entries.sort_by_key(|entry| entry.sequence);
-            entries
+            Ok(entries)
         })
     }
 
@@ -3325,6 +3285,181 @@ impl PersistenceStore for PostgresStore {
         Ok(results)
     }
 }
+#[cfg(all(test, feature = "sqlite"))]
+mod sqlite_streamed_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn test_large_local_event_history_is_complete_and_ordered() {
+        let store = LibsqlStore::new(":memory:").unwrap();
+        {
+            let conn = store.conn();
+            let encoded = serde_json::to_string(&PersistedValue::Int(7)).unwrap();
+            store.rt.block_on(async {
+                conn.execute(
+                    "WITH RECURSIVE n(v) AS (
+                       SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v < 100001
+                     )
+                     INSERT INTO events (actor_id, sequence, field_name, event_name, args, value)
+                     SELECT 42, v, 'count', 'set', '[]', ?1 FROM n",
+                    super::libsql::params![encoded],
+                )
+                .await
+                .unwrap();
+            });
+        }
+        let entries = store.read_events_checked(42).unwrap();
+        assert_eq!(entries.len(), 100_001);
+        assert_eq!(entries.first().unwrap().sequence, 1);
+        assert_eq!(entries.last().unwrap().sequence, 100_001);
+        assert_eq!(entries.last().unwrap().value, PersistedValue::Int(7));
+        assert_eq!(store.read_events(42).len(), entries.len());
+    }
+
+    #[test]
+    fn test_large_local_journal_history_is_complete_and_ordered() {
+        let store = LibsqlStore::new(":memory:").unwrap();
+        {
+            let conn = store.conn();
+            let encoded = serde_json::to_string(&vec![PersistedValue::Int(7)]).unwrap();
+            store.rt.block_on(async {
+                conn.execute(
+                    "WITH RECURSIVE n(v) AS (
+                       SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v < 100001
+                     )
+                     INSERT INTO journal (actor_id, sequence, behavior_id, payload)
+                     SELECT 53, v, 3, ?1 FROM n",
+                    super::libsql::params![encoded],
+                )
+                .await
+                .unwrap();
+            });
+        }
+        let entries = store.read_journal_checked(53).unwrap();
+        assert_eq!(entries.len(), 100_001);
+        assert_eq!(entries.first().unwrap().sequence, 1);
+        assert_eq!(entries.last().unwrap().sequence, 100_001);
+        assert_eq!(entries.last().unwrap().behavior_id, 3);
+        assert_eq!(
+            entries.last().unwrap().payload,
+            vec![PersistedValue::Int(7)]
+        );
+    }
+
+    #[test]
+    fn test_corrupted_journal_and_workflow_rows_are_read_errors() {
+        let store = LibsqlStore::new(":memory:").unwrap();
+        {
+            let conn = store.conn();
+            store.rt.block_on(async {
+                conn.execute(
+                    "INSERT INTO journal (actor_id, sequence, behavior_id, payload)
+                     VALUES (61, 1, 2, 'not-json')",
+                    (),
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO workflow_events (actor_id, sequence, event)
+                     VALUES (61, 1, 'not-json')",
+                    (),
+                )
+                .await
+                .unwrap();
+            });
+        }
+        assert_eq!(
+            store.read_journal_checked(61).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            store.read_workflow_events_checked(61).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn test_corrupted_snapshot_is_not_mistaken_for_missing_actor() {
+        let mut store = LibsqlStore::new(":memory:").unwrap();
+        store
+            .save_snapshot(ActorSnapshot {
+                actor_id: 81,
+                sequence: 1,
+                activation_epoch: INITIAL_ACTIVATION_EPOCH,
+                state: HashMap::new(),
+                waiting_signal: None,
+                crdt_snapshot: None,
+                crdt_field_map: None,
+                schema_name: None,
+                authority_tokens: Default::default(),
+            })
+            .unwrap();
+        let healthy = store.load_snapshot_checked(81).unwrap().unwrap();
+        assert_eq!(healthy.sequence, 1);
+        assert!(healthy.crdt_snapshot.is_none());
+        assert!(healthy.crdt_field_map.is_none());
+        {
+            let conn = store.conn();
+            store.rt.block_on(async {
+                conn.execute("UPDATE snapshots SET state='{' WHERE actor_id=81", ())
+                    .await
+                    .unwrap();
+            });
+        }
+        assert_eq!(
+            store.load_snapshot_checked(81).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let mut runtime = crate::runtime::Runtime::new();
+        runtime.persistence = Box::new(store);
+        assert_eq!(runtime.recover_actor(81), None);
+        assert!(!runtime.actors.contains_key(&81));
+    }
+
+    #[test]
+    fn test_corrupted_event_history_fails_closed_before_recovery_publication() {
+        let mut store = LibsqlStore::new(":memory:").unwrap();
+        store
+            .save_snapshot(ActorSnapshot {
+                actor_id: 71,
+                sequence: 1,
+                activation_epoch: INITIAL_ACTIVATION_EPOCH,
+                state: HashMap::new(),
+                waiting_signal: None,
+                crdt_snapshot: None,
+                crdt_field_map: None,
+                schema_name: None,
+                authority_tokens: Default::default(),
+            })
+            .unwrap();
+        {
+            let conn = store.conn();
+            store.rt.block_on(async {
+                conn.execute(
+                    "INSERT INTO events (actor_id, sequence, field_name, event_name, args, value)
+                     VALUES (71, 2, 'count', 'set', '[]', '{')",
+                    (),
+                )
+                .await
+                .unwrap();
+            });
+        }
+        let err = store.read_events_checked(71).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let mut runtime = crate::runtime::Runtime::new();
+        runtime.persistence = Box::new(store);
+        assert_eq!(
+            runtime.recover_actor(71),
+            None,
+            "bad persisted event is not an empty event history"
+        );
+        assert!(
+            !runtime.actors.contains_key(&71),
+            "failed recovery must not publish the actor"
+        );
+    }
+}
+
 #[cfg(test)]
 mod json_file_store_tests {
     use super::*;

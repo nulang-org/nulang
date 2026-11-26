@@ -85,7 +85,11 @@ fn preflight_persistent_snapshot(
     actor_id: u64,
     expected_schema: Option<(&crate::bytecode::CodeModule, &str)>,
 ) -> Result<Option<(ActorSnapshot, AuthorityManifest)>, String> {
-    let Some(snapshot) = rt.persistence.load_snapshot(actor_id) else {
+    let Some(snapshot) = rt
+        .persistence
+        .load_snapshot_checked(actor_id)
+        .map_err(|error| error.to_string())?
+    else {
         return Ok(None);
     };
     let manifest =
@@ -190,7 +194,7 @@ fn try_spawn_actor_with_id(
     // and are unaffected. Workflow actors have their own journal-based
     // recovery path (`recover_actor`), so they are skipped here.
     if persistent && workflow.is_none() {
-        restore_persistent_state(rt, &mut actor, restart_snapshot);
+        restore_persistent_state(rt, &mut actor, restart_snapshot)?;
     }
     if let Some(authority) = initial_authority {
         actor.install_authority_manifest(authority);
@@ -264,7 +268,7 @@ fn restore_persistent_state(
     rt: &Runtime,
     actor: &mut Actor,
     snapshot: Option<(ActorSnapshot, AuthorityManifest)>,
-) {
+) -> std::io::Result<()> {
     // Event-sourced-only actors may have an event log but no snapshot
     // (EventSourced fields are excluded from snapshots by design), so both
     // halves run independently. Authority was parsed in the preflight phase
@@ -279,7 +283,7 @@ fn restore_persistent_state(
             actor.set_state_field(name, v);
         }
     }
-    for entry in rt.persistence.read_events(actor.id) {
+    for entry in rt.persistence.read_events_checked(actor.id)? {
         let v = entry.value.to_value_on_heap(actor);
         actor.set_state_field(&entry.field_name, v);
         let current = actor
@@ -293,6 +297,7 @@ fn restore_persistent_state(
                 .insert(entry.field_name.clone(), entry.sequence);
         }
     }
+    Ok(())
 }
 
 /// Compatibility wrapper for recovery/distribution paths that still carry the

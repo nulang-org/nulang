@@ -5473,7 +5473,17 @@ impl Runtime {
     /// instead of the message journal, restoring the current step index and
     /// any other state captured in workflow events.
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
-        let snapshot = self.persistence.load_snapshot(actor_id)?;
+        let snapshot = match self.persistence.load_snapshot_checked(actor_id) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return None,
+            Err(error) => {
+                warn!(
+                    "nulang-recover: refusing actor {} after snapshot read failed: {}",
+                    actor_id, error
+                );
+                return None;
+            }
+        };
         if snapshot.activation_epoch == 0 {
             warn!(
                 "nulang-recover: refusing actor {} with invalid activation epoch 0",
@@ -5525,7 +5535,16 @@ impl Runtime {
                     return None;
                 }
             };
-        let workflow_events = self.persistence.read_workflow_events(actor_id);
+        let workflow_events = match self.persistence.read_workflow_events_checked(actor_id) {
+            Ok(events) => events,
+            Err(error) => {
+                warn!(
+                    "nulang-recover: refusing actor {} after workflow history read failed: {}",
+                    actor_id, error
+                );
+                return None;
+            }
+        };
         let is_workflow = selected_meta
             .as_ref()
             .map(|meta| meta.is_workflow)
@@ -5556,7 +5575,16 @@ impl Runtime {
                         return None;
                     }
 
-                    let journal = self.persistence.read_journal(actor_id);
+                    let journal = match self.persistence.read_journal_checked(actor_id) {
+                        Ok(journal) => journal,
+                        Err(error) => {
+                            warn!(
+                                "nulang-recover: refusing actor {} after journal read failed: {}",
+                                actor_id, error
+                            );
+                            return None;
+                        }
+                    };
                     if journal.iter().any(|entry| entry.sequence > tail.sequence) {
                         warn!(
                             "nulang-recover: refusing workflow actor {}: command journal extends beyond atomic tail {}",
@@ -5626,9 +5654,14 @@ impl Runtime {
                         return None;
                     }
 
-                    if self
-                        .persistence
-                        .read_events(actor_id)
+                    let domain_events = match self.persistence.read_events_checked(actor_id) {
+                        Ok(events) => events,
+                        Err(error) => {
+                            warn!("nulang-recover: refusing actor {} after domain history read failed: {}", actor_id, error);
+                            return None;
+                        }
+                    };
+                    if domain_events
                         .iter()
                         .any(|event| event.sequence > tail.sequence)
                     {
@@ -5658,11 +5691,19 @@ impl Runtime {
         let journal_to_replay: Vec<JournalEntry> = if is_workflow {
             Vec::new()
         } else {
-            self.persistence
-                .read_journal(actor_id)
-                .into_iter()
-                .filter(|entry| entry.sequence > snapshot.sequence)
-                .collect()
+            match self.persistence.read_journal_checked(actor_id) {
+                Ok(journal) => journal
+                    .into_iter()
+                    .filter(|entry| entry.sequence > snapshot.sequence)
+                    .collect(),
+                Err(error) => {
+                    warn!(
+                        "nulang-recover: refusing actor {} after journal read failed: {}",
+                        actor_id, error
+                    );
+                    return None;
+                }
+            }
         };
         if let (Some(meta), Some((module, _, _))) =
             (selected_meta.as_ref(), self.recovery_modules.get(&actor_id))
@@ -5772,7 +5813,16 @@ impl Runtime {
         // non-trivial apply handlers.  See
         // `integration_tests::test_event_sourced_apply_handler_recovery`
         // which validates this behavior.
-        let events = self.persistence.read_events(actor_id);
+        let events = match self.persistence.read_events_checked(actor_id) {
+            Ok(events) => events,
+            Err(error) => {
+                warn!(
+                    "nulang-recover: refusing actor {} after event history read failed: {}",
+                    actor_id, error
+                );
+                return None;
+            }
+        };
         if !events.is_empty() {
             for entry in &events {
                 actor
@@ -6182,7 +6232,17 @@ impl Runtime {
             grain_type.compensation_offsets.clone(),
         );
 
-        let snapshot = self.persistence.load_snapshot(stable_actor_id);
+        let snapshot = self
+            .persistence
+            .load_snapshot_checked(stable_actor_id)
+            .map_err(|error| NuError::RuntimeError {
+                msg: format!(
+                    "failed to read virtual actor {} snapshot: {}",
+                    grain_id.actor_name(),
+                    error
+                ),
+                span: Span::new(0, 0),
+            })?;
 
         let actor = if let Some(ref snap) = snapshot {
             Self::restore_actor_from_snapshot(
@@ -6225,6 +6285,22 @@ impl Runtime {
             actor
         };
 
+        // A history-read failure must not publish a partially recovered grain.
+        let journal_to_replay = if snapshot.is_some() {
+            self.persistence
+                .read_journal_checked(stable_actor_id)
+                .map_err(|error| NuError::RuntimeError {
+                    msg: format!(
+                        "failed to recover virtual actor {} journal: {}",
+                        grain_id.actor_name(),
+                        error
+                    ),
+                    span: Span::new(0, 0),
+                })?
+        } else {
+            Vec::new()
+        };
+
         // Track canonical schema and grain identity.
         self.recovery_schema_names
             .insert(stable_actor_id, grain_id.grain_type.clone());
@@ -6237,8 +6313,10 @@ impl Runtime {
 
         // Replay message journal entries that arrived after the snapshot.
         if let Some(ref snap) = snapshot {
-            let journal = self.persistence.read_journal(stable_actor_id);
-            for entry in journal.iter().filter(|e| e.sequence > snap.sequence) {
+            for entry in journal_to_replay
+                .iter()
+                .filter(|e| e.sequence > snap.sequence)
+            {
                 let behavior_idx = entry.behavior_id as usize;
                 let payload: Vec<Value> = {
                     let actor = self.actors.get_mut(&stable_actor_id).ok_or_else(|| {
