@@ -1,4 +1,8 @@
 # Nulang Changelog
+
+### Opt-in actor mailbox capacity for hosted runtimes — 2026-11-26
+- **Allow hosts to configure per-actor normal/bulk mailbox capacity across all runtime shards**, including single-shard mode, with explicit backpressure at capacity.
+- Existing constructors remain unbounded by default. System messages and dead-letter mailboxes bypass the limit; this is not a process-wide memory bound.
 ### NUL0 TCP partial-frame recovery across read timeouts — 2026-11-10
 - **Preserve bytes already consumed from NUL0 frame prefixes and payloads when socket reads return `WouldBlock`, `TimedOut`, or `Interrupted`.** Retry from the unconsumed offset rather than restarting `read_exact` with a fresh buffer, preventing frame misalignment and lost actor packets.
 - **Cover fragmented reads, shutdown and premature EOF with deterministic regressions.** Existing maximum-frame-size limits and transport failure semantics are retained. The intermittent five-node post-heal delivery problem still requires separate qualification; this change does not establish that it is fully resolved.
