@@ -272,6 +272,9 @@ pub struct Mailbox {
     /// Same-thread local queue. Only scheduler-owned `&mut self` methods
     /// access it; concurrent producers never touch it.
     local_queue: VecDeque<Message>,
+    // An already committed workflow command must run before any later arrival,
+    // including system-priority traffic. Not visible to selective receive.
+    admitted_workflow: Option<Box<Message>>,
     capacity: usize,
     queued_count: AtomicUsize,
     /// System messages already observed by a selective receive. They remain
@@ -301,6 +304,7 @@ impl Mailbox {
             system_queue: SegQueue::new(),
             normal_queue: SegQueue::new(),
             local_queue: VecDeque::new(),
+            admitted_workflow: None,
             capacity,
             queued_count: AtomicUsize::new(0),
             system_skip_buffer: VecDeque::new(),
@@ -316,6 +320,7 @@ impl Mailbox {
         while let Some(_) = self.system_queue.pop() {}
         while let Some(_) = self.normal_queue.pop() {}
         self.local_queue.clear();
+        self.admitted_workflow = None;
         self.capacity = capacity;
         self.queued_count
             .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -388,20 +393,42 @@ impl Mailbox {
         Ok(())
     }
 
-    /// Pop the highest-priority queued message.
+    /// Queue a journal-proven command, never ordinary traffic. The durable
+    /// admission already happened, so a later system arrival cannot block it
+    /// on mailbox capacity. The caller owns the shard and has only one open
+    /// command.
+    pub(crate) fn push_admitted_workflow(&mut self, msg: Message) {
+        assert!(
+            self.admitted_workflow.is_none(),
+            "second admitted workflow command"
+        );
+        self.reserve_slot(true);
+        self.admitted_workflow = Some(Box::new(msg));
+    }
+
+    pub(crate) fn admitted_workflow_message(&self) -> Option<&Message> {
+        self.admitted_workflow.as_deref()
+    }
+
+    pub(crate) fn admitted_workflow_behavior(&self) -> Option<u16> {
+        self.admitted_workflow.as_ref().map(|msg| msg.behavior_id)
+    }
+
+    /// Pop the highest-priority queued message (admitted command first).
     pub fn pop(&mut self) -> Option<Message> {
         // Staged messages predate newly-arrived messages in the same lane, so
         // they must remain ahead of the concurrent queue after a rejected
         // selective receive.
-        let result = self
-            .system_skip_buffer
-            .pop_front()
-            .map(|(m, _)| m)
-            .or_else(|| self.system_queue.pop())
-            .or_else(|| self.local_skip_buffer.pop_front().map(|(m, _)| m))
-            .or_else(|| self.local_queue.pop_front())
-            .or_else(|| self.skip_buffer.pop_front().map(|(m, _)| m))
-            .or_else(|| self.normal_queue.pop());
+        let result = self.admitted_workflow.take().map(|msg| *msg).or_else(|| {
+            self.system_skip_buffer
+                .pop_front()
+                .map(|(m, _)| m)
+                .or_else(|| self.system_queue.pop())
+                .or_else(|| self.local_skip_buffer.pop_front().map(|(m, _)| m))
+                .or_else(|| self.local_queue.pop_front())
+                .or_else(|| self.skip_buffer.pop_front().map(|(m, _)| m))
+                .or_else(|| self.normal_queue.pop())
+        });
         if result.is_some() {
             self.active_match = None;
             self.invalidate_receive_indexes();
@@ -470,6 +497,9 @@ impl Mailbox {
         // candidate was rejected by its pattern/guard. It remains `tried` for
         // this receive expression but is no longer the commit target.
         self.active_match = None;
+        if self.admitted_workflow.is_some() {
+            return None;
+        }
         self.ensure_receive_indexes();
         self.stage_arrivals();
 
@@ -515,6 +545,7 @@ impl Mailbox {
     /// Snapshot the mailbox without changing logical ownership/counting.
     pub fn drain(&mut self) -> Vec<Message> {
         let mut snapshot = Vec::with_capacity(self.len());
+        snapshot.extend(self.admitted_workflow.as_deref().cloned());
 
         snapshot.extend(self.system_skip_buffer.iter().map(|(m, _)| m.clone()));
         let mut system_live = Vec::new();

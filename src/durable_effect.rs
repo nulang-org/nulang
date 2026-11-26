@@ -82,7 +82,7 @@ impl DurableEffectId {
 
     /// Reuse the canonical site-ID encoding directly from checked bytecode
     /// metadata, rather than duplicating the identity hash in host adapters.
-    fn derive_from_site_bytes(
+    pub(crate) fn derive_from_site_bytes(
         actor_id: u64,
         execution_key: &str,
         site_id: &[u8; 32],
