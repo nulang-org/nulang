@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Static-only Web artifact generation — 2026-11-26
+- **`nula build --web` prerenders only routes with an artifact in validated Deployment IR.** Server-placed routes remain in deployment metadata and OpenAPI without invoking their handlers or publishing their responses as static HTML.
+- Use the same IR artifact filename in the renderer rather than duplicating route-to-output mapping. Mixed static, POST and captured-path GET routes have regression coverage.
+
 ### Web compiler route-conflict validation integration — 2026-11-26
 - **Fail closed on duplicate package route registrations and ambiguous compiled path shapes.** Reuse the authoritative Web Contract compilation/validation boundary and runtime segment parser, without introducing a parallel router.
 - Regression coverage includes duplicate direct/helper routes, capture-shape collisions, cross-module package validation, public runtime attachment, and real TCP HTTP coverage. Different methods and distinct static routes remain supported.

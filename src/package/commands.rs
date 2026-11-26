@@ -1495,16 +1495,43 @@ fn cmd_build_web() -> NuResult<()> {
         span: Span::default(),
     })?;
 
-    eprintln!("  Rendering {} route(s)...", routes.len());
-    for route in &routes {
+    // Stage the graph for deployment IR before rendering; publish it after
+    // copying static assets, as before, so a user asset cannot replace it.
+    let signals_path = build_dir.join("build.signals.json");
+    nulang_exe(&[
+        "--emit-signals",
+        &signals_path.to_string_lossy(),
+        &entry_str,
+    ])?;
+
+    // Generate deployment IR consumed by adapters and Nulang Cloud.
+    let ir = crate::web::ir::generate_deployment_ir(
+        &routes,
+        Some(&signals_path),
+        &src_root,
+        &manifest.budgets,
+        &validated_contracts,
+    );
+    let static_count = ir
+        .routes
+        .iter()
+        .filter(|route| route.artifact.is_some())
+        .count();
+    eprintln!("  Rendering {} static route(s)...", static_count);
+    // Deployment IR preserves the registered route order. Use its artifact
+    // decision and filename directly: server routes must not run during
+    // static generation, and a second path mapping can drift from the IR.
+    for (route, ir_route) in routes.iter().zip(&ir.routes) {
+        let Some(out_file) = &ir_route.artifact else {
+            continue;
+        };
         let html = render_route_handler(&route.handler_module, route.handler_func_idx, None)
             .ok_or_else(|| NuError::PackageError {
                 msg: format!("failed to render route {:?} {}", route.method, route.path),
                 span: Span::default(),
             })?;
         let html = crate::web::reactivity::inject_client_runtime_script(&html);
-        let out_file = route_path_to_output_file(&route.path);
-        let dest = output_dir.join(&out_file);
+        let dest = output_dir.join(out_file);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| NuError::PackageError {
                 msg: format!("cannot create {}: {}", parent.display(), e),
@@ -1523,22 +1550,12 @@ fn cmd_build_web() -> NuResult<()> {
         copy_dir_contents(&static_dir, &output_dir)?;
     }
 
-    // Emit compile-time signal graph if the entry uses `signal` declarations.
-    let signals_path = output_dir.join("app.signals.json");
-    nulang_exe(&[
-        "--emit-signals",
-        &signals_path.to_string_lossy(),
-        &entry_str,
-    ])?;
+    let output_signals_path = output_dir.join("app.signals.json");
+    std::fs::copy(&signals_path, &output_signals_path).map_err(|e| NuError::PackageError {
+        msg: format!("cannot publish {}: {e}", output_signals_path.display()),
+        span: Span::default(),
+    })?;
 
-    // Generate deployment IR consumed by adapters and Nulang Cloud.
-    let ir = crate::web::ir::generate_deployment_ir(
-        &routes,
-        Some(&signals_path),
-        &src_root,
-        &manifest.budgets,
-        &validated_contracts,
-    );
     let ir_path = output_dir.join("nulang-app.ir.json");
     let ir_json = ir.to_json();
     std::fs::write(&ir_path, ir_json).map_err(|e| NuError::PackageError {
@@ -1580,15 +1597,6 @@ fn cmd_build_web() -> NuResult<()> {
 
     println!("Web build succeeded: {}", output_dir.display());
     Ok(())
-}
-
-fn route_path_to_output_file(path: &str) -> PathBuf {
-    let trimmed = path.trim_start_matches('/');
-    if trimmed.is_empty() {
-        PathBuf::from("index.html")
-    } else {
-        PathBuf::from(trimmed).join("index.html")
-    }
 }
 
 fn copy_dir_contents(src: &Path, dst: &Path) -> NuResult<()> {
@@ -3252,6 +3260,59 @@ mod tests {
     }
 
     #[test]
+    fn test_cmd_build_web_does_not_render_server_routes_as_static_artifacts() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_build_web_static_placement_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_package(&dir, "mixed-routes", "web").expect("web scaffold should succeed");
+        std::fs::write(
+            dir.join("src/main.nula"),
+            r#"fn home() -> String { "Static homepage" }
+fn submit() -> String { "Server response" }
+fn detail(id: Int) -> Int { id }
+
+app "mixed-routes" {
+    route "GET" "/" -> home
+    route "POST" "/submit" -> submit
+    route "GET" "/items/{id: Int}" -> detail
+}
+"#,
+        )
+        .unwrap();
+
+        let _guard = ChangeDir::new(&dir);
+        cmd_build_web().expect("mixed static/server Web build should succeed");
+
+        assert!(dir.join("dist/index.html").is_file());
+        assert!(!dir.join("dist/submit/index.html").exists());
+        assert!(!dir.join("dist/items").exists());
+
+        let ir: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("dist/nulang-app.ir.json")).unwrap())
+                .unwrap();
+        let routes = ir["routes"].as_array().unwrap();
+        assert_eq!(routes.len(), 3);
+        let home = routes.iter().find(|route| route["path"] == "/").unwrap();
+        assert_eq!(home["artifact"], "index.html");
+        for path in ["/submit", "/items/{id: Int}"] {
+            let server = routes.iter().find(|route| route["path"] == path).unwrap();
+            assert_eq!(server["placement"], "server");
+            assert!(server["artifact"].is_null());
+        }
+
+        let openapi: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("dist/openapi.json")).unwrap()).unwrap();
+        assert!(openapi["paths"]["/"]["get"].is_object());
+        assert!(openapi["paths"]["/submit"]["post"].is_object());
+        assert!(openapi["paths"]["/items/{id}"]["get"].is_object());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_cmd_build_web_signal_hydration() {
         let dir =
             std::env::temp_dir().join(format!("nulang_build_web_signal_{}", std::process::id()));
@@ -3284,6 +3345,10 @@ app "counter" {
         )
         .unwrap();
 
+        // Generated signal metadata must retain precedence over copied assets.
+        std::fs::create_dir_all(dir.join("public")).unwrap();
+        std::fs::write(dir.join("public/app.signals.json"), r#"{"stale":true}"#).unwrap();
+
         let _guard = ChangeDir::new(&dir);
         cmd_build_web().expect("web build should succeed");
 
@@ -3300,6 +3365,11 @@ app "counter" {
         let ir: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("dist/nulang-app.ir.json")).unwrap())
                 .unwrap();
+        let signals: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("dist/app.signals.json")).unwrap())
+                .unwrap();
+        assert_eq!(signals, ir["signals"]);
+        assert!(signals.get("stale").is_none());
         let routes = ir["routes"].as_array().unwrap();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0]["method"], "GET");
