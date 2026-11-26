@@ -1186,3 +1186,138 @@ fn workflow_later_occurrence_recovers_after_new_owner_claim() {
     assert_eq!(keys[1], canonical(1));
     assert_eq!(store.latest_sequence(ACTOR_ID), 6);
 }
+
+#[test]
+fn workflow_restart_rejects_changed_site_before_provider_and_replays_original_slot() {
+    let db = TestDb::new();
+    let mut store = LibsqlStore::new(&db.path).unwrap();
+    let module = workflow_module();
+    let pc = module.effect_sites[0].pc;
+    let alternate = compile_source_module(
+        r#"workflow Other { step charge { perform Inference.ask("order=42&cents=100") } }"#,
+    );
+    assert_ne!(module.effect_sites[0].id, alternate.effect_sites[0].id);
+    let activation = admit_command(&mut store);
+    let mut actor = workflow_actor(activation);
+    let mut calls = Vec::new();
+    let mut coordinator = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
+    assert!(coordinator
+        .execute_workflow_vm_async_text_with_deduplication(
+            &module,
+            pc,
+            "Inference.ask",
+            &mut actor,
+            &grant(),
+            REQUEST.as_bytes(),
+            |key, _| {
+                calls.push(key.to_owned());
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "provider reply lost",
+                ))
+            }
+        )
+        .is_err());
+    assert_eq!(store.latest_sequence(ACTOR_ID), 2);
+    drop(store);
+
+    // A fresh actor has no pending in-memory cursor. Only persisted binding
+    // prevents the changed site from being treated as a new logical effect.
+    let mut store = LibsqlStore::new(&db.path).unwrap();
+    let prepared = store
+        .load_workflow_effect_occurrence(activation, 0)
+        .unwrap()
+        .unwrap();
+    let binding = prepared.workflow_binding().unwrap();
+    assert_eq!(binding.site_id, module.effect_sites[0].id);
+    assert_eq!(binding.effect_id().idempotency_key(), calls[0]);
+    let mut fresh = workflow_actor(activation);
+    let mut coordinator = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
+    assert!(coordinator
+        .execute_workflow_vm_async_text_with_deduplication(
+            &alternate,
+            alternate.effect_sites[0].pc,
+            "Inference.ask",
+            &mut fresh,
+            &grant(),
+            REQUEST.as_bytes(),
+            |_, _| panic!("a different site after process restart must not dispatch")
+        )
+        .is_err());
+    assert_eq!(store.latest_sequence(ACTOR_ID), 2);
+
+    // Generic callers may not strip workflow metadata or replay a bound
+    // slot through the older free-form key adapter.
+    let mut coordinator = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
+    assert!(coordinator
+        .begin(prepared.effect().spec().clone(), REQUEST.as_bytes())
+        .is_err());
+    assert!(coordinator
+        .complete(binding.effect_id(), REQUEST.as_bytes(), b"forged".to_vec())
+        .is_err());
+    let mut correct = workflow_actor(activation);
+    assert!(coordinator
+        .execute_workflow_vm_async_text_with_deduplication(
+            &module,
+            pc,
+            "Inference.ask",
+            &mut correct,
+            &grant(),
+            b"changed",
+            |_, _| panic!("a changed request after restart must not dispatch")
+        )
+        .is_err());
+    let mut correct = workflow_actor(activation);
+    coordinator
+        .execute_workflow_vm_async_text_with_deduplication(
+            &module,
+            pc,
+            "Inference.ask",
+            &mut correct,
+            &grant(),
+            REQUEST.as_bytes(),
+            |key, _| {
+                calls.push(key.to_owned());
+                Ok(b"receipt".to_vec())
+            },
+        )
+        .unwrap();
+    assert_eq!(calls[0], calls[1]);
+    assert_eq!(store.latest_sequence(ACTOR_ID), 3);
+    drop(store);
+
+    // Terminal history retains the binding as well as the receipt.
+    let mut store = LibsqlStore::new(&db.path).unwrap();
+    let completed = store
+        .load_workflow_effect_occurrence(activation, 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.workflow_binding(), Some(binding));
+    let mut wrong = workflow_actor(activation);
+    let mut coordinator = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
+    assert!(coordinator
+        .execute_workflow_vm_async_text_with_deduplication(
+            &alternate,
+            alternate.effect_sites[0].pc,
+            "Inference.ask",
+            &mut wrong,
+            &grant(),
+            REQUEST.as_bytes(),
+            |_, _| panic!("site drift after terminal receipt must fail closed")
+        )
+        .is_err());
+    let mut replayed = workflow_actor(activation);
+    let result = coordinator
+        .execute_workflow_vm_async_text_with_deduplication(
+            &module,
+            pc,
+            "Inference.ask",
+            &mut replayed,
+            &grant(),
+            REQUEST.as_bytes(),
+            |_, _| panic!("recorded terminal workflow receipt must replay"),
+        )
+        .unwrap();
+    assert!(matches!(result, PerformAsyncResult::Ready(Some(ref value)) if value == "receipt"));
+    assert_eq!(store.latest_sequence(ACTOR_ID), 3);
+}

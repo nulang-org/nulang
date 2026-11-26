@@ -9,10 +9,47 @@ use crate::durable_effect::{
     DurableCompensationRecord, DurableEffectId, DurableEffectRecord, DurableEffectSpec,
 };
 use crate::primitives::{DeliverySemantics, EffectBoundary};
+use crate::runtime::WorkflowActivationId;
 use std::fmt;
 use std::str::FromStr;
 
 pub const DURABLE_EFFECT_PERSISTENCE_VERSION: u16 = 1;
+pub const WORKFLOW_EFFECT_PERSISTENCE_VERSION: u16 = 2;
+
+/// Immutable logical slot binding, separate from the ownership epoch.
+/// The slot can be looked up without first knowing the replayed site ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkflowEffectBinding {
+    pub activation: WorkflowActivationId,
+    pub occurrence: u32,
+    pub site_id: [u8; 32],
+}
+
+impl WorkflowEffectBinding {
+    pub fn execution_key(self) -> String {
+        format!("workflow-command:v1:{}", self.activation.command_sequence)
+    }
+
+    pub fn effect_id(self) -> DurableEffectId {
+        DurableEffectId::derive_from_site_bytes(
+            self.activation.actor_id,
+            &self.execution_key(),
+            &self.site_id,
+            self.occurrence,
+        )
+    }
+
+    fn validate(self, effect: &DurableEffectRecord) -> Result<(), DurableEffectPersistenceError> {
+        if self.activation.command_sequence == 0
+            || effect.spec().id != self.effect_id()
+            || effect.spec().boundary != EffectBoundary::External
+            || effect.spec().delivery != DeliverySemantics::EffectivelyOnceWithDeduplication
+        {
+            return Err(DurableEffectPersistenceError::InvalidWorkflowBinding);
+        }
+        Ok(())
+    }
+}
 
 /// A durable effect restored from the versioned persistence envelope.
 ///
@@ -21,6 +58,10 @@ pub const DURABLE_EFFECT_PERSISTENCE_VERSION: u16 = 1;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DurableEffectPersistenceRecord {
     Effect(DurableEffectRecord),
+    WorkflowOccurrence {
+        binding: WorkflowEffectBinding,
+        effect: DurableEffectRecord,
+    },
     Compensation {
         original_effect_id: DurableEffectId,
         compensation_ordinal: u32,
@@ -33,6 +74,21 @@ impl DurableEffectPersistenceRecord {
         Self::Effect(record)
     }
 
+    pub fn from_workflow_occurrence(
+        binding: WorkflowEffectBinding,
+        effect: DurableEffectRecord,
+    ) -> Result<Self, DurableEffectPersistenceError> {
+        binding.validate(&effect)?;
+        Ok(Self::WorkflowOccurrence { binding, effect })
+    }
+
+    pub fn workflow_binding(&self) -> Option<WorkflowEffectBinding> {
+        match self {
+            Self::WorkflowOccurrence { binding, .. } => Some(*binding),
+            _ => None,
+        }
+    }
+
     pub fn from_compensation(record: &DurableCompensationRecord) -> Self {
         Self::Compensation {
             original_effect_id: record.original_effect_id(),
@@ -43,13 +99,15 @@ impl DurableEffectPersistenceRecord {
 
     pub fn effect(&self) -> &DurableEffectRecord {
         match self {
-            Self::Effect(effect) | Self::Compensation { effect, .. } => effect,
+            Self::Effect(effect)
+            | Self::WorkflowOccurrence { effect, .. }
+            | Self::Compensation { effect, .. } => effect,
         }
     }
 
     pub fn original_effect_id(&self) -> Option<DurableEffectId> {
         match self {
-            Self::Effect(_) => None,
+            Self::Effect(_) | Self::WorkflowOccurrence { .. } => None,
             Self::Compensation {
                 original_effect_id, ..
             } => Some(*original_effect_id),
@@ -58,7 +116,7 @@ impl DurableEffectPersistenceRecord {
 
     pub fn compensation_ordinal(&self) -> Option<u32> {
         match self {
-            Self::Effect(_) => None,
+            Self::Effect(_) | Self::WorkflowOccurrence { .. } => None,
             Self::Compensation {
                 compensation_ordinal,
                 ..
@@ -68,9 +126,15 @@ impl DurableEffectPersistenceRecord {
 
     /// Encode the stable versioned JSON representation.
     pub fn to_json(&self) -> Result<Vec<u8>, DurableEffectPersistenceError> {
-        let envelope = PersistedEnvelopeV1 {
-            version: DURABLE_EFFECT_PERSISTENCE_VERSION,
-            record: PersistedRecordKindV1::from_runtime(self),
+        let version = if let Self::WorkflowOccurrence { binding, effect } = self {
+            binding.validate(effect)?;
+            WORKFLOW_EFFECT_PERSISTENCE_VERSION
+        } else {
+            DURABLE_EFFECT_PERSISTENCE_VERSION
+        };
+        let envelope = PersistedEnvelope {
+            version,
+            record: PersistedRecordKind::from_runtime(self),
         };
         serde_json::to_vec(&envelope).map_err(DurableEffectPersistenceError::from)
     }
@@ -83,12 +147,21 @@ impl DurableEffectPersistenceRecord {
     /// corrupted or inconsistent original-id/ordinal/operation tuple cannot be
     /// accepted as a different logical compensation.
     pub fn from_json(bytes: &[u8]) -> Result<Self, DurableEffectPersistenceError> {
-        let envelope: PersistedEnvelopeV1 =
+        let envelope: PersistedEnvelope =
             serde_json::from_slice(bytes).map_err(DurableEffectPersistenceError::from)?;
-        if envelope.version != DURABLE_EFFECT_PERSISTENCE_VERSION {
-            return Err(DurableEffectPersistenceError::UnsupportedVersion {
-                actual: envelope.version,
-            });
+        let workflow = matches!(
+            &envelope.record,
+            PersistedRecordKind::WorkflowOccurrence { .. }
+        );
+        match (envelope.version, workflow) {
+            (DURABLE_EFFECT_PERSISTENCE_VERSION, false)
+            | (WORKFLOW_EFFECT_PERSISTENCE_VERSION, true) => {}
+            (DURABLE_EFFECT_PERSISTENCE_VERSION | WORKFLOW_EFFECT_PERSISTENCE_VERSION, _) => {
+                return Err(DurableEffectPersistenceError::InvalidWorkflowBinding)
+            }
+            (actual, _) => {
+                return Err(DurableEffectPersistenceError::UnsupportedVersion { actual })
+            }
         }
         envelope.record.into_runtime()
     }
@@ -101,6 +174,7 @@ pub enum DurableEffectPersistenceError {
         actual: u16,
     },
     InvalidEffectId(String),
+    InvalidWorkflowBinding,
     CompensationIdentityMismatch {
         expected: DurableEffectId,
         actual: DurableEffectId,
@@ -113,8 +187,9 @@ impl fmt::Display for DurableEffectPersistenceError {
             Self::Json(message) => write!(f, "invalid durable effect persistence data: {message}"),
             Self::UnsupportedVersion { actual } => write!(
                 f,
-                "unsupported durable effect persistence version {actual}; runtime supports version {DURABLE_EFFECT_PERSISTENCE_VERSION}"
+                "unsupported durable effect persistence version {actual}; runtime supports versions {DURABLE_EFFECT_PERSISTENCE_VERSION} and {WORKFLOW_EFFECT_PERSISTENCE_VERSION}"
             ),
+            Self::InvalidWorkflowBinding => write!(f, "invalid persisted workflow effect slot binding"),
             Self::InvalidEffectId(value) => {
                 write!(f, "invalid durable effect id in persistence data: {value}")
             }
@@ -135,15 +210,22 @@ impl From<serde_json::Error> for DurableEffectPersistenceError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct PersistedEnvelopeV1 {
+struct PersistedEnvelope {
     version: u16,
-    record: PersistedRecordKindV1,
+    record: PersistedRecordKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", content = "value")]
-enum PersistedRecordKindV1 {
+enum PersistedRecordKind {
     Effect(PersistedEffectRecordV1),
+    WorkflowOccurrence {
+        actor_id: u64,
+        command_sequence: u64,
+        occurrence: u32,
+        site_id: [u8; 32],
+        effect: PersistedEffectRecordV1,
+    },
     Compensation {
         original_effect_id: String,
         compensation_ordinal: u32,
@@ -151,11 +233,20 @@ enum PersistedRecordKindV1 {
     },
 }
 
-impl PersistedRecordKindV1 {
+impl PersistedRecordKind {
     fn from_runtime(record: &DurableEffectPersistenceRecord) -> Self {
         match record {
             DurableEffectPersistenceRecord::Effect(effect) => {
                 Self::Effect(PersistedEffectRecordV1::from_runtime(effect))
+            }
+            DurableEffectPersistenceRecord::WorkflowOccurrence { binding, effect } => {
+                Self::WorkflowOccurrence {
+                    actor_id: binding.activation.actor_id,
+                    command_sequence: binding.activation.command_sequence,
+                    occurrence: binding.occurrence,
+                    site_id: binding.site_id,
+                    effect: PersistedEffectRecordV1::from_runtime(effect),
+                }
             }
             DurableEffectPersistenceRecord::Compensation {
                 original_effect_id,
@@ -174,6 +265,20 @@ impl PersistedRecordKindV1 {
             Self::Effect(effect) => Ok(DurableEffectPersistenceRecord::Effect(
                 effect.into_runtime()?,
             )),
+            Self::WorkflowOccurrence {
+                actor_id,
+                command_sequence,
+                occurrence,
+                site_id,
+                effect,
+            } => DurableEffectPersistenceRecord::from_workflow_occurrence(
+                WorkflowEffectBinding {
+                    activation: WorkflowActivationId::new(actor_id, command_sequence),
+                    occurrence,
+                    site_id,
+                },
+                effect.into_runtime()?,
+            ),
             Self::Compensation {
                 original_effect_id,
                 compensation_ordinal,

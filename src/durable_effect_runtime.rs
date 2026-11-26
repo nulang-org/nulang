@@ -12,7 +12,7 @@ use crate::durable_effect::{
     CompiledEffectSpecError, DurableEffectId, DurableEffectRecord, DurableEffectRecoveryAction,
     DurableEffectRequestMismatch, DurableEffectSpec,
 };
-use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
+use crate::durable_effect_persistence::{DurableEffectPersistenceRecord, WorkflowEffectBinding};
 use crate::primitives::{ActorRole, DeliverySemantics, EffectBoundary};
 use crate::runtime::{
     Actor, ActorState, DurableCommit, DurableTransition, PersistenceStore, WorkflowActivationId,
@@ -176,8 +176,8 @@ pub struct DurableVmAsyncInvocation<'a> {
 /// Execution-local cursor for the opt-in workflow adapter. The command
 /// sequence itself is durable; a fresh actor reconstructs occurrences by
 /// replaying the same pinned deterministic command from its safe boundary.
-/// This is not a persisted continuation or an independently persisted
-/// ordinal-to-site index.
+/// The cursor is not persisted, but its slot-to-site binding and receipt are
+/// committed together in the journal before the cursor can advance.
 pub(crate) struct WorkflowEffectReplayCursor {
     activation: WorkflowActivationId,
     activation_epoch: u64,
@@ -240,6 +240,11 @@ impl<'a> DurableEffectCoordinator<'a> {
         request: &[u8],
     ) -> Result<DurableEffectDispatchDecision, DurableEffectRuntimeError> {
         if let Some(existing) = self.store.load_durable_effect(self.actor_id, spec.id)? {
+            if existing.workflow_binding().is_some() {
+                return Err(workflow_binding_error(
+                    "bound workflow effect requires the workflow adapter",
+                ));
+            }
             self.validate_existing(&spec, request, existing.effect())?;
             let recovered = decision(existing.effect());
             // A completed receipt can be read without provider dispatch.
@@ -385,6 +390,70 @@ impl<'a> DurableEffectCoordinator<'a> {
         }
     }
 
+    fn load_bound_workflow_effect(
+        &self,
+        binding: WorkflowEffectBinding,
+        spec: &DurableEffectSpec,
+        request: &[u8],
+    ) -> Result<Option<DurableEffectPersistenceRecord>, DurableEffectRuntimeError> {
+        let existing = self
+            .store
+            .load_workflow_effect_occurrence(binding.activation, binding.occurrence)?;
+        if let Some(record) = &existing {
+            if record.workflow_binding() != Some(binding) {
+                return Err(workflow_binding_error(
+                    "durable workflow occurrence is bound to a different semantic site",
+                ));
+            }
+            self.validate_existing(spec, request, record.effect())?;
+        }
+        Ok(existing)
+    }
+
+    fn execute_bound_workflow_spec<F>(
+        &mut self,
+        binding: WorkflowEffectBinding,
+        spec: DurableEffectSpec,
+        request: &[u8],
+        dispatch: F,
+    ) -> Result<Vec<u8>, DurableAsyncDispatchError>
+    where
+        F: FnOnce(&str, &[u8]) -> io::Result<Vec<u8>>,
+    {
+        self.require_claimed_activation()?;
+        let existing = self.load_bound_workflow_effect(binding, &spec, request)?;
+        if let Some(record) = &existing {
+            if let DurableEffectRecoveryAction::ReplayRecordedResult(receipt) =
+                record.effect().recovery_action()
+            {
+                return Ok(receipt.to_vec());
+            }
+        } else {
+            let prepared = DurableEffectRecord::prepare(spec.clone(), request);
+            self.commit_record(workflow_persistence_record(binding, prepared)?)?;
+        }
+        self.require_claimed_activation()?;
+        let receipt = dispatch(&spec.id.idempotency_key(), request)
+            .map_err(DurableAsyncDispatchError::Provider)?;
+
+        // Re-read the independently keyed slot after provider execution:
+        // never reconstruct a terminal record from an unverified old request.
+        self.require_claimed_activation()?;
+        let record = self
+            .load_bound_workflow_effect(binding, &spec, request)?
+            .ok_or(DurableEffectRuntimeError::MissingPreparedEffect { effect_id: spec.id })?;
+        if let DurableEffectRecoveryAction::ReplayRecordedResult(result) =
+            record.effect().recovery_action()
+        {
+            return Ok(result.to_vec());
+        }
+        self.commit_record(workflow_persistence_record(
+            binding,
+            record.effect().clone().complete(receipt.clone()),
+        )?)?;
+        Ok(receipt)
+    }
+
     /// Opt-in bridge between a real VM `PerformAsync` callback and the
     /// existing durable intent/provider/receipt state machine.
     ///
@@ -467,8 +536,9 @@ impl<'a> DurableEffectCoordinator<'a> {
     /// error or invalid terminal text it remains on that occurrence. Live
     /// retries cannot switch sites or requests. A fresh cursor reconstructs
     /// occurrences through deterministic replay, not by counting journal rows.
-    /// Cross-site replay drift across restart, actor-turn atomicity and
-    /// persistent continuations still require additional integration.
+    /// The durable slot binding rejects cross-site replay drift after restart.
+    /// Detecting omitted trailing effects, actor-turn atomicity and persistent
+    /// continuations still require additional integration.
     pub fn execute_workflow_vm_async_text_with_deduplication<F>(
         &mut self,
         module: &CodeModule,
@@ -525,7 +595,12 @@ impl<'a> DurableEffectCoordinator<'a> {
         }
         // Actor ID is already part of the canonical effect ID. Epoch is an
         // ownership fence, not an invocation identity component.
-        let execution_key = format!("workflow-command:v1:{}", activation.command_sequence);
+        let binding = WorkflowEffectBinding {
+            activation,
+            occurrence,
+            site_id: site.id,
+        };
+        let execution_key = binding.execution_key();
         let spec = self
             .authorized_compiled_spec(actor, authority, module, pc, &execution_key, occurrence)
             .map_err(|error| vm_effect_error(format!("durable VM effect rejected: {error}")))?;
@@ -563,7 +638,7 @@ impl<'a> DurableEffectCoordinator<'a> {
         }
 
         let receipt = self
-            .execute_authorized_spec(spec, request, dispatch)
+            .execute_bound_workflow_spec(binding, spec, request, dispatch)
             .map_err(|error| vm_effect_error(format!("durable VM effect rejected: {error}")))?;
         let result = vm_text_receipt(receipt)?;
         // Only a valid terminal result advances the cursor, including replay.
@@ -587,6 +662,11 @@ impl<'a> DurableEffectCoordinator<'a> {
             return Err(DurableEffectRuntimeError::MissingPreparedEffect { effect_id });
         };
 
+        if existing.workflow_binding().is_some() {
+            return Err(workflow_binding_error(
+                "bound workflow effect requires the workflow adapter",
+            ));
+        }
         existing.effect().validate_request(request)?;
 
         if let DurableEffectRecoveryAction::ReplayRecordedResult(recorded) =
@@ -673,6 +753,18 @@ impl<'a> DurableEffectCoordinator<'a> {
         };
         Ok(self.store.commit_transition(transition)?)
     }
+}
+
+fn workflow_binding_error(message: &str) -> DurableEffectRuntimeError {
+    io::Error::new(io::ErrorKind::InvalidData, message).into()
+}
+
+fn workflow_persistence_record(
+    binding: WorkflowEffectBinding,
+    effect: DurableEffectRecord,
+) -> Result<DurableEffectPersistenceRecord, DurableEffectRuntimeError> {
+    DurableEffectPersistenceRecord::from_workflow_occurrence(binding, effect)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error).into())
 }
 
 fn decision(record: &DurableEffectRecord) -> DurableEffectDispatchDecision {
