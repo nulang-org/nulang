@@ -46,6 +46,7 @@ impl Default for WebSection {
             output_dir: default_output_dir(),
             prerender: BTreeMap::new(),
             collections: BTreeMap::new(),
+            content: BTreeMap::new(),
         }
     }
 }
@@ -106,6 +107,9 @@ pub struct WebSection {
     /// Exact GET route patterns mapped to pure zero-argument route-key providers.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub collections: BTreeMap<String, String>,
+    /// Named Markdown content bundles, relative to the package root.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub content: BTreeMap<String, String>,
 }
 
 fn default_web_port() -> u16 {
@@ -340,6 +344,8 @@ version = "0.1.0"
 "/docs/{slug}" = ["/docs/intro", "/docs/install"]
 [web.collections]
 "/articles/{slug}" = "article_keys"
+[web.content]
+articles = "content/articles"
 "#,
         )
         .unwrap();
@@ -348,6 +354,7 @@ version = "0.1.0"
             ["/docs/intro", "/docs/install"]
         );
         assert_eq!(manifest.web.collections["/articles/{slug}"], "article_keys");
+        assert_eq!(manifest.web.content["articles"], "content/articles");
         assert_eq!(
             Manifest::parse(&manifest.to_toml().unwrap()).unwrap(),
             manifest

@@ -1042,6 +1042,13 @@ fn locate_nulang_exe() -> NuResult<PathBuf> {
 
 /// Run the current `nulang` executable with `args`, inheriting stdio.
 fn nulang_exe(args: &[&str]) -> NuResult<()> {
+    nulang_exe_with_content(args, None)
+}
+
+fn nulang_exe_with_content(
+    args: &[&str],
+    content: Option<&super::web_content::ContentSnapshot>,
+) -> NuResult<()> {
     let exe = locate_nulang_exe()?;
     let mut cmd = Command::new(&exe);
     cmd.args(args);
@@ -1073,6 +1080,26 @@ fn nulang_exe(args: &[&str]) -> NuResult<()> {
             module_path.push(';');
         }
         module_path.push_str(&computed);
+    }
+    if let Some(content) = content {
+        // Do not silently shadow a dependency or caller-provided module.
+        if module_path
+            .split(';')
+            .filter_map(|entry| entry.split_once('='))
+            .any(|(name, _)| {
+                name.trim().trim_start_matches("@nulang/") == super::web_content::IMPORT
+            })
+        {
+            return Err(NuError::PackageError {
+                msg: "configured web content conflicts with @nulang/web_content module".into(),
+                span: Span::default(),
+            });
+        }
+        module_path = if module_path.is_empty() {
+            content.module_path().to_owned()
+        } else {
+            format!("{};{module_path}", content.module_path())
+        };
     }
     if !module_path.is_empty() {
         cmd.env("NULANG_MODULE_PATH", &module_path);
@@ -1418,6 +1445,28 @@ fn cmd_build_web() -> NuResult<()> {
         span: Span::default(),
     })?;
     let entry = prepare_package()?;
+    let content = prepare_web_content(&root, &manifest)?;
+    build_web(&root, &manifest, &entry, content.as_ref())
+}
+
+fn prepare_web_content(
+    root: &Path,
+    manifest: &Manifest,
+) -> NuResult<Option<super::web_content::ContentSnapshot>> {
+    super::web_content::ContentSnapshot::new(root, &manifest.web).map_err(|msg| {
+        NuError::PackageError {
+            msg: format!("invalid web content: {msg}"),
+            span: Span::default(),
+        }
+    })
+}
+
+fn build_web(
+    root: &Path,
+    manifest: &Manifest,
+    entry: &Path,
+    content: Option<&super::web_content::ContentSnapshot>,
+) -> NuResult<()> {
     let entry_str = entry.to_string_lossy().into_owned();
 
     let build_dir = root.join(".nula");
@@ -1429,11 +1478,11 @@ fn cmd_build_web() -> NuResult<()> {
     let nbc_path_str = nbc_path.to_string_lossy().into_owned();
 
     let static_dir = root.join(&manifest.web.static_dir);
-    let output = super::web_output::BuildOutput::new(&root, &manifest.web.output_dir, &static_dir)
+    let output = super::web_output::BuildOutput::new(root, &manifest.web.output_dir, &static_dir)
         .map_err(|msg| NuError::PackageError {
-            msg,
-            span: Span::default(),
-        })?;
+        msg,
+        span: Span::default(),
+    })?;
     let output_dir = output.path();
 
     let client_js_path = output_dir.join("app.client.js");
@@ -1441,14 +1490,17 @@ fn cmd_build_web() -> NuResult<()> {
 
     eprintln!("Building {} (web)...", manifest.package.name);
     eprintln!("  Compiling {}...", entry.display());
-    nulang_exe(&[
-        "--emit-nbc",
-        "--out",
-        &nbc_path_str,
-        "--rewrite-signals",
-        &client_js_path_str,
-        &entry_str,
-    ])?;
+    nulang_exe_with_content(
+        &[
+            "--emit-nbc",
+            "--out",
+            &nbc_path_str,
+            "--rewrite-signals",
+            &client_js_path_str,
+            &entry_str,
+        ],
+        content,
+    )?;
 
     let bytes = std::fs::read(&nbc_path).map_err(|e| NuError::PackageError {
         msg: format!("cannot read {}: {}", nbc_path.display(), e),
@@ -1486,11 +1538,14 @@ fn cmd_build_web() -> NuResult<()> {
 
     // Emit the signal graph and generate provisional deployment metadata.
     let signals_path = output_dir.join("app.signals.json");
-    nulang_exe(&[
-        "--emit-signals",
-        &signals_path.to_string_lossy(),
-        &entry_str,
-    ])?;
+    nulang_exe_with_content(
+        &[
+            "--emit-signals",
+            &signals_path.to_string_lossy(),
+            &entry_str,
+        ],
+        content,
+    )?;
     let mut ir = crate::web::ir::generate_deployment_ir(
         &routes,
         Some(&signals_path),
@@ -1638,6 +1693,7 @@ fn cmd_dev(port_override: Option<u16>) -> NuResult<()> {
     let port = port_override.unwrap_or(manifest.web.port);
 
     let entry = prepare_package()?;
+    let content = prepare_web_content(&root, &manifest)?;
     let entry_str = entry.to_string_lossy().into_owned();
 
     let dev_dir = root.join(".nula");
@@ -1663,14 +1719,17 @@ fn cmd_dev(port_override: Option<u16>) -> NuResult<()> {
     let client_js_path = output_dir.join("app.client.js");
 
     eprintln!("Compiling {} for dev...", entry.display());
-    nulang_exe(&[
-        "--emit-nbc",
-        "--out",
-        &nbc_path_str,
-        "--rewrite-signals",
-        &client_js_path.to_string_lossy(),
-        &entry_str,
-    ])?;
+    nulang_exe_with_content(
+        &[
+            "--emit-nbc",
+            "--out",
+            &nbc_path_str,
+            "--rewrite-signals",
+            &client_js_path.to_string_lossy(),
+            &entry_str,
+        ],
+        content.as_ref(),
+    )?;
 
     let bytes = std::fs::read(&nbc_path).map_err(|e| NuError::PackageError {
         msg: format!("cannot read {}: {}", nbc_path.display(), e),
@@ -1697,14 +1756,18 @@ fn cmd_dev(port_override: Option<u16>) -> NuResult<()> {
             }
         })?;
 
-    nulang_exe(&[
-        "--emit-signals",
-        &signals_path.to_string_lossy(),
-        &entry_str,
-    ])?;
+    nulang_exe_with_content(
+        &[
+            "--emit-signals",
+            &signals_path.to_string_lossy(),
+            &entry_str,
+        ],
+        content.as_ref(),
+    )?;
 
     if runtime_routes.is_empty() {
-        cmd_build_web()?;
+        build_web(&root, &manifest, &entry, content.as_ref())?;
+        drop(content);
         let output_dir = root.join(&manifest.web.output_dir);
         let addr = format!("127.0.0.1:{}", port);
         let listener = std::net::TcpListener::bind(&addr).map_err(|e| NuError::PackageError {
@@ -1725,6 +1788,7 @@ fn cmd_dev(port_override: Option<u16>) -> NuResult<()> {
         }
         Ok(())
     } else {
+        drop(content);
         let server = WebDevServer::bind_runtime(
             port,
             Some(static_dir),
@@ -2313,7 +2377,9 @@ fn cmd_deploy(
     let version = manifest.package.version.clone();
 
     // Build the web output so dist/ contains the IR and static assets.
-    cmd_build_web()?;
+    let entry = prepare_package()?;
+    let content = prepare_web_content(&root, &manifest)?;
+    build_web(&root, &manifest, &entry, content.as_ref())?;
 
     let dist_dir = root.join(&manifest.web.output_dir);
 
@@ -2364,32 +2430,37 @@ fn cmd_deploy(
     })?;
 
     // Always build .nbc (native bytecode tier).
-    let entry = prepare_package()?;
     let entry_str = entry.to_string_lossy().into_owned();
     let nbc_path = nula_dist.join(format!("{}.nbc", name));
     let nbc_path_str = nbc_path.to_string_lossy().into_owned();
     let behavior_path = nula_dist.join(format!("{}.behavior.json", name));
     let behavior_path_str = behavior_path.to_string_lossy().into_owned();
     eprintln!("Compiling {} to .nbc + behavior manifest...", name);
-    nulang_exe(&[
-        "--emit-nbc",
-        "--out",
-        &nbc_path_str,
-        "--emit-behavior-manifest",
-        &behavior_path_str,
-        "--behavior-package-name",
-        &name,
-        "--behavior-package-version",
-        &version,
-        &entry_str,
-    ])?;
+    nulang_exe_with_content(
+        &[
+            "--emit-nbc",
+            "--out",
+            &nbc_path_str,
+            "--emit-behavior-manifest",
+            &behavior_path_str,
+            "--behavior-package-name",
+            &name,
+            "--behavior-package-version",
+            &version,
+            &entry_str,
+        ],
+        content.as_ref(),
+    )?;
 
     // Optionally build .wasm + .cwasm (WASM tier).
     if wasm {
         let wasm_path = nula_dist.join(format!("{}.wasm", name));
         let wasm_path_str = wasm_path.to_string_lossy().into_owned();
         eprintln!("Compiling {} to .wasm + .cwasm...", name);
-        nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
+        nulang_exe_with_content(
+            &["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str],
+            content.as_ref(),
+        )?;
     }
 
     // Bundle into .tar.gz: .nula/dist/ contents + dist/** + Nulang.toml + Nulang.lock.

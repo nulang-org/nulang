@@ -72,6 +72,14 @@ type. The provider is proved and evaluated before rendering; its concrete URL
 list enters the same validation, sorting, binding, and artifact pipeline as
 manual enumeration. No record schema or provider metadata is added to the IR.
 
+`[web.content]` adds a local Markdown/TOML ingestion step before compilation.
+It snapshots typed content records in a private generated module, excludes
+drafts, validates source paths and portable slugs, and passes the same snapshot
+to build, dev and deploy compiler invocations. The manifest's collection
+provider still projects the route keys; content records and source paths do
+not expand the Deployment IR schema. Markdown bodies remain source strings
+in this version, not trusted HTML.
+
 Static placement is validated before artifact emission against the linked
 compiler-produced bytecode, independently of the declared effect row. Every
 instruction in the handler's transitive direct-call graph must meet the
