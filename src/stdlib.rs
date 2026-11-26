@@ -646,6 +646,14 @@ impl StdLib {
                     description: "Broadcast a message to all subscribers of a realtime room.",
                 },
                 BuiltinOp {
+                    name: "Realtime.patch",
+                    effect: "Realtime",
+                    op: "patch",
+                    signature: "patch(room: String, target: String, html: Html) -> Bool",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Publish bounded, revisioned HTML patches to a realtime room.",
+                },
+                BuiltinOp {
                     name: "Actor.link",
                     effect: "Actor",
                     op: "link",

@@ -787,6 +787,7 @@ pub fn generate_client_runtime() -> String {
   // Object.prototype (e.g. constructor, toString, __proto__).
   const signals = Object.create(null);
   const signalBindings = Object.create(null);
+  const hydratedActions = new WeakSet();
 
   function refreshSignal(name) {
     const bindings = signalBindings[name];
@@ -849,8 +850,259 @@ pub fn generate_client_runtime() -> String {
     return body;
   }
 
+  // Reuse matching DOM nodes rather than replacing focused controls, losing
+  // event listeners, or discarding client-owned input state. Keyed siblings
+  // have a stable identity via id or data-nulang-key.
+  function nodeKey(node) {
+    if (node.nodeType !== 1) return null;
+    const key = node.getAttribute('data-nulang-key');
+    if (key !== null) return 'key:' + key;
+    return node.id ? 'id:' + node.id : null;
+  }
+
+  function sameKind(current, incoming) {
+    return current.nodeType === incoming.nodeType &&
+      (current.nodeType !== 1 ||
+       (current.tagName === incoming.tagName &&
+        current.namespaceURI === incoming.namespaceURI));
+  }
+
+  function morphNode(current, incoming) {
+    if (!sameKind(current, incoming) ||
+        (nodeKey(current) !== null && nodeKey(current) !== nodeKey(incoming))) {
+      const replacement = document.importNode(incoming, true);
+      current.replaceWith(replacement);
+      return replacement;
+    }
+    if (current.nodeType !== 1) {
+      if (current.nodeValue !== incoming.nodeValue) {
+        current.nodeValue = incoming.nodeValue;
+      }
+      return current;
+    }
+
+    const focused = document.activeElement === current;
+    const tag = current.tagName;
+    // A user edit is owned by the browser until the application explicitly
+    // resets it. Do not overwrite it with a stale server-rendered default.
+    const dirtyValue = (tag === 'TEXTAREA' ||
+       (tag === 'INPUT' && current.type !== 'file')) &&
+      (focused || current.value !== current.defaultValue);
+    const dirtyChecked = tag === 'INPUT' &&
+      (focused || current.checked !== current.defaultChecked);
+    const dirtySelect = tag === 'SELECT' &&
+      (focused || Array.from(current.options).some(function (option) {
+        return option.selected !== option.defaultSelected;
+      }));
+    const value = dirtyValue ? current.value : null;
+    const checked = dirtyChecked ? current.checked : null;
+    const selected = dirtySelect
+      ? Array.from(current.options).filter(function (option) { return option.selected; })
+          .map(function (option) { return option.value; })
+      : null;
+    const selection = focused && typeof current.selectionStart === 'number'
+      ? [current.selectionStart, current.selectionEnd, current.selectionDirection]
+      : null;
+
+    // Synchronize attributes, including removals, for SSR parity.
+    Array.from(current.attributes).forEach(function (attr) {
+      if (!incoming.hasAttribute(attr.name)) current.removeAttribute(attr.name);
+    });
+    Array.from(incoming.attributes).forEach(function (attr) {
+      if (current.getAttribute(attr.name) !== attr.value) {
+        current.setAttribute(attr.name, attr.value);
+      }
+    });
+
+    const oldChildren = Array.from(current.childNodes);
+    const keyed = new Map();
+    const unkeyed = [];
+    oldChildren.forEach(function (child) {
+      const key = nodeKey(child);
+      if (key === null) {
+        unkeyed.push(child);
+      } else if (!keyed.has(key)) {
+        keyed.set(key, child);
+      }
+    });
+    const reused = new Set();
+    let unkeyedIndex = 0;
+    let position = 0;
+    Array.from(incoming.childNodes).forEach(function (child) {
+      const key = nodeKey(child);
+      let match = null;
+      if (key !== null) {
+        const candidate = keyed.get(key);
+        if (candidate && !reused.has(candidate) && sameKind(candidate, child)) {
+          match = candidate;
+        }
+      } else {
+        while (unkeyedIndex < unkeyed.length) {
+          const candidate = unkeyed[unkeyedIndex++];
+          if (sameKind(candidate, child)) {
+            match = candidate;
+            break;
+          }
+        }
+      }
+      let node;
+      if (match) {
+        reused.add(match);
+        node = morphNode(match, child);
+      } else {
+        node = document.importNode(child, true);
+      }
+      const before = current.childNodes[position] || null;
+      if (node !== before) current.insertBefore(node, before);
+      position++;
+    });
+    oldChildren.forEach(function (child) {
+      if (!reused.has(child) && child.parentNode === current) child.remove();
+    });
+
+    if (dirtyValue) current.value = value;
+    if (dirtyChecked) current.checked = checked;
+    if (dirtySelect) {
+      Array.from(current.options).forEach(function (option) {
+        option.selected = selected.includes(option.value);
+      });
+    }
+    if (selection) {
+      // Selection APIs can throw on unsupported input types.
+      try { current.setSelectionRange(selection[0], selection[1], selection[2]); }
+      catch (_) {}
+    }
+    return current;
+  }
+
+  // Progressive HTML updates are opt-in. The response may contain an entire
+  // server-rendered page or only the element identified by the target ID.
+  // Legacy actions still reload when no target is declared.
+  function applyHtmlUpdate(selector, html) {
+    if (!/^#[A-Za-z][A-Za-z0-9_-]*$/.test(selector)) {
+      throw new Error('invalid Nulang patch target (expected an element ID)');
+    }
+    const page = new DOMParser().parseFromString(html, 'text/html');
+    const incoming = page.querySelector(selector);
+    const current = document.querySelector(selector);
+    if (!incoming || !current) {
+      throw new Error('Nulang patch target not found: ' + selector);
+    }
+    // Tiny DOM stubs used by the existing no-dependency regression test do
+    // not implement the Node interface; real browser nodes take the morph path.
+    if (typeof current.nodeType !== 'number' ||
+        typeof incoming.nodeType !== 'number') {
+      current.replaceWith(document.importNode(incoming, true));
+    } else {
+      // Moving a retained focused node with insertBefore can temporarily
+      // blur it. Restore focus only if that same node survives the morph.
+      const active = document.activeElement;
+      const restoreFocus = active && (active === current || current.contains(active));
+      const selection = restoreFocus && typeof active.selectionStart === 'number'
+        ? [active.selectionStart, active.selectionEnd, active.selectionDirection]
+        : null;
+      morphNode(current, incoming);
+      if (restoreFocus && active.isConnected) {
+        active.focus({ preventScroll: true });
+        if (selection) {
+          try { active.setSelectionRange(selection[0], selection[1], selection[2]); }
+          catch (_) {}
+        }
+      }
+    }
+    hydrate();
+  }
+
+  async function patchActionResponse(response, selector) {
+    const contentType = response.headers.get('content-type') || '';
+    if (!/^text\/html(?:\s*;|\s*$)/i.test(contentType.trim())) {
+      throw new Error('Nulang patch response must be text/html');
+    }
+    applyHtmlUpdate(selector, await response.text());
+  }
+
+  // A new subscription always begins with a full current snapshot. Patches
+  // must be contiguous; duplicates are ignored and gaps force a resnapshot.
+  function stream(room) {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(room)) {
+      throw new Error('invalid Nulang UI stream room');
+    }
+    let closed = false;
+    let connection = null;
+    let revision = null;
+
+    function parseEvent(e, kind) {
+      let msg;
+      try { msg = JSON.parse(e.data); }
+      catch (err) { console.error('nulang: invalid UI stream JSON', err); return null; }
+      if (!msg || msg.protocol !== 'nulang-ui-html/1' ||
+          msg.type !== kind || msg.document_id !== room ||
+          typeof msg.revision !== 'string' ||
+          !/^(0|[1-9][0-9]*)$/.test(msg.revision) ||
+          msg.revision.length > 20 ||
+          BigInt(msg.revision) > 18446744073709551615n) {
+        return null;
+      }
+      return msg;
+    }
+
+    function applyElement(element) {
+      if (!element || typeof element.target !== 'string' ||
+          typeof element.html !== 'string') return;
+      // A room may publish targets absent from the current view.
+      if (!/^#[A-Za-z][A-Za-z0-9_-]*$/.test(element.target) ||
+          !document.querySelector(element.target)) return;
+      applyHtmlUpdate(element.target, element.html);
+    }
+
+    function open() {
+      if (closed) return;
+      revision = null;
+      connection = new window.EventSource('/__nulang/ui-sse/' + encodeURIComponent(room));
+      const active = connection;
+      active.addEventListener('nulang-ui-snapshot', function (e) {
+        if (closed || active !== connection) return;
+        const msg = parseEvent(e, 'snapshot');
+        if (!msg || !Array.isArray(msg.elements) || msg.elements.length > 32) return;
+        if (msg.elements.some(function (el) {
+          return !el || typeof el.target !== 'string' ||
+            !/^#[A-Za-z][A-Za-z0-9_-]*$/.test(el.target) ||
+            typeof el.html !== 'string';
+        })) return;
+        msg.elements.forEach(applyElement);
+        revision = BigInt(msg.revision);
+      });
+      active.addEventListener('nulang-ui-patch', function (e) {
+        if (closed || active !== connection) return;
+        const msg = parseEvent(e, 'patch');
+        if (!msg || revision === null ||
+            typeof msg.base_revision !== 'string' ||
+            !/^(0|[1-9][0-9]*)$/.test(msg.base_revision)) return;
+        const incoming = BigInt(msg.revision);
+        const base = BigInt(msg.base_revision);
+        if (incoming <= revision) return;
+        if (base !== revision || incoming !== base + 1n) {
+          active.close();
+          open();
+          return;
+        }
+        if (!msg.element || typeof msg.element.target !== 'string' ||
+            !/^#[A-Za-z][A-Za-z0-9_-]*$/.test(msg.element.target) ||
+            typeof msg.element.html !== 'string') return;
+        applyElement(msg.element);
+        revision = incoming;
+      });
+    }
+    open();
+    return {close: function () {
+      closed = true;
+      if (connection) connection.close();
+    }};
+  }
+
   async function runServerAction(handler, el) {
     const form = el.closest('form');
+    const target = el.dataset.nulangTarget || (form && form.dataset.nulangTarget);
     const body = formBody(form);
     const message = createActionMessage(handler, 'server', body);
     body.append('__nulang_action', handler);
@@ -859,10 +1111,19 @@ pub fn generate_client_runtime() -> String {
     if (!response.ok) {
       throw new Error('server action failed: ' + response.status);
     }
-    window.location.reload();
+    if (target) {
+      await patchActionResponse(response, target);
+    } else {
+      window.location.reload();
+    }
   }
 
   function hydrate() {
+    // Rebuild the signal index after patches; detached elements must not stay
+    // subscribed. Preserve signal values instead of reinitializing them.
+    Object.keys(signalBindings).forEach(function (name) {
+      signalBindings[name] = [];
+    });
     document.querySelectorAll('[data-signal]').forEach(function (el) {
       const name = el.dataset.signal;
       if (!(name in signals)) {
@@ -875,9 +1136,14 @@ pub fn generate_client_runtime() -> String {
     });
 
     document.querySelectorAll('[data-action]').forEach(function (el) {
-      const handler = el.dataset.action;
-      const placement = el.dataset.actionPlacement;
+      if (hydratedActions.has(el)) return;
+      hydratedActions.add(el);
       const listener = function (e) {
+        // Morphing may change the compiled action on an existing DOM node.
+        // Read the latest binding rather than retaining an obsolete handler.
+        const handler = el.dataset.action;
+        if (!handler) return;
+        const placement = el.dataset.actionPlacement;
         e.preventDefault();
         if (placement === 'server') {
           runServerAction(handler, el).catch(function (err) {
@@ -894,6 +1160,7 @@ pub fn generate_client_runtime() -> String {
   }
 
   window.nulang = {
+    stream: stream,
     signal: function (name) {
       return {
         get: function () { return signals[name]; },
