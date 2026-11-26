@@ -296,7 +296,7 @@ fn print_usage() {
     println!("Commands:");
     println!("  new   <path> [--template <name>] [--style syntyr]");
     println!("                Scaffold a new package directory");
-    println!("                Templates: default, cli, lib, full");
+    println!("                Templates: default, cli, lib, full, distributed, ai-agent, web");
     println!("  init          Scaffold a new package in the current directory");
     println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
     println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
@@ -543,6 +543,10 @@ fn scaffold_package_styled(dir: &Path, name: &str, template: &str, style: &str) 
             ),
             (
                 "SYNTYR-LICENSE",
+                include_str!("templates/syntyr/SYNTYR-LICENSE"),
+            ),
+            (
+                "public/SYNTYR-LICENSE.txt",
                 include_str!("templates/syntyr/SYNTYR-LICENSE"),
             ),
             ("README.md", include_str!("templates/syntyr/README.md")),
@@ -949,8 +953,17 @@ fn try_find_existing_nulang_binary() -> Option<PathBuf> {
         }
     }
 
-    // 2. Binary next to the current test harness: target/<profile>/nulang.
+    // 2. A running standalone CLI is its own compiler. Do this before
+    // probing Cargo or neighboring build profiles: installed releases may
+    // have no Rust toolchain, and a different binary could be a stale version.
     let current_exe = std::env::current_exe().ok();
+    if let Some(p) = current_exe.as_ref() {
+        if p.file_stem() == Some(std::ffi::OsStr::new("nulang")) && p.is_file() {
+            return Some(p.clone());
+        }
+    }
+
+    // 3. Binary next to the current test harness: target/<profile>/nulang.
     if let Some(p) = current_exe.as_ref().and_then(|p| {
         p.parent()
             .and_then(|deps| deps.parent())
@@ -960,7 +973,7 @@ fn try_find_existing_nulang_binary() -> Option<PathBuf> {
         return Some(p);
     }
 
-    // 3. Coverage runs / custom target dirs: ask cargo metadata for the
+    // 4. Coverage runs / custom target dirs: ask cargo metadata for the
     // workspace target directory and look in debug/release profiles.
     let out = std::process::Command::new("cargo")
         .args(["metadata", "--format-version", "1", "--no-deps"])
@@ -976,13 +989,6 @@ fn try_find_existing_nulang_binary() -> Option<PathBuf> {
         let candidate = std::path::Path::new(td).join(profile).join("nulang");
         if candidate.is_file() {
             return Some(candidate);
-        }
-    }
-
-    // 4. If the current process is itself the `nulang` CLI, use it.
-    if let Some(p) = current_exe {
-        if p.file_stem() == Some(std::ffi::OsStr::new("nulang")) && p.is_file() {
-            return Some(p);
         }
     }
 

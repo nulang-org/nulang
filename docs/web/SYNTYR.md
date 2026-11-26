@@ -16,6 +16,10 @@ Open `http://127.0.0.1:8787/`. The app renders server-side, uses POST forms
 that continue working without JavaScript, and can use Nulang's existing client
 progressive enhancement when it is available. The Todo example stores state in
 ephemeral in-memory KV; it is not a production persistence example.
+Nulang Web and this demo are experimental. The development server listens on
+all interfaces: use an isolated trusted network, do not expose the port to the
+Internet, and do not enter sensitive data. Authentication, CSRF protection and
+durable persistence are not demonstrated by this sample.
 
 Without `--style syntyr`, the existing web template is unchanged. You can
 use other CSS libraries or plain HTML and CSS without any change to Nulang.
@@ -30,15 +34,27 @@ The generated project includes:
 | `public/syntyr.core.css` | Pinned Syntyr component/tokens core |
 | `public/syntyr.semantic.css` | Optional scoped native-HTML styling |
 | `public/style.css` | Application-owned layout overrides |
-| `SYNTYR-LICENSE` | Upstream MIT license |
+| `SYNTYR-LICENSE` and `public/SYNTYR-LICENSE.txt` | Upstream MIT license; static build carries the public copy alongside CSS |
 | `README.md` | Generated app's run and customization instructions |
 
 Core and semantic CSS files are byte-for-byte vendored from Syntyr's
 `site-releases/0.3.0-alpha.4/` distribution. Asset versions are pinned
 at Nulang build time using `include_str!`; generating a project never calls
 npm, downloads a remote stylesheet, or executes JavaScript.
-The CSS assets are not loaded by apps that do not opt in. Any upgrade should
-copy both release files, keep the license, and run the scaffold regression tests.
+The CSS assets are not loaded by apps that do not opt in. Both CSS files and
+the license match the published tag `v0.3.0-alpha.4` (commit
+`fd95f24fef8698637d43fdff0012e5c12a0a2783`) byte for byte.
+
+```text
+8d6458bf1f2ae25098a733e7fb88a84260e54b8b285bf05ff07432cccfbdaa6e  public/syntyr.core.css
+0d710710c605f141f47a695cbc5a7e7e89b7556ddd7ea7df48453b6b0d3055f0  public/syntyr.semantic.css
+42f56369ac06362dbfe433d2d50b178bf74c369a55ea22337ab40fd9433521bf  public/SYNTYR-LICENSE.txt
+```
+
+Use `sha256sum public/syntyr.core.css public/syntyr.semantic.css public/SYNTYR-LICENSE.txt`
+to verify the installed assets. Any upgrade should copy both release files,
+keep the license, update the pin and hashes and run the scaffold/build regression
+tests. A static build copies the public notice with the assets.
 
 ## Design boundaries
 
