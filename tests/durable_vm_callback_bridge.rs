@@ -18,7 +18,10 @@ use nulang::mir_lower;
 use nulang::parser::Parser;
 use nulang::primitives::{DeliverySemantics, EffectBoundary};
 use nulang::runtime::heap::{ActorHeap, TypeTag as HeapTypeTag};
-use nulang::runtime::{Actor, LibsqlStore, OrcaGc, PersistenceStore};
+use nulang::runtime::{
+    Actor, ActorSnapshot, DurableTransition, JournalEntry, LibsqlStore, OrcaGc, PersistenceStore,
+    WorkflowActivationId, WorkflowEvent, DURABLE_TRANSITION_VERSION,
+};
 use nulang::typechecker::TypeChecker;
 use nulang::types::{NuError, NuResult, Span};
 use nulang::vm::{ActorVmCallbacks, PerformAsyncResult, Value, VM};
@@ -85,6 +88,10 @@ impl Drop for TestDb {
 fn compile_module() -> CodeModule {
     let source =
         "actor Payments { behavior charge(order: String) { perform Inference.ask(order) } }";
+    compile_source_module(source)
+}
+
+fn compile_source_module(source: &str) -> CodeModule {
     let tokens = Lexer::new(source).lex().unwrap();
     let ast = Parser::new(tokens).parse_module().unwrap();
     let mut types = TypeChecker::new();
@@ -94,8 +101,6 @@ fn compile_module() -> CodeModule {
     let compiled = mir_codegen::compile_mir(&mut mir, "durable-vm-bridge").unwrap();
     let bytes = compiled.to_nbc(None).unwrap();
     let module = CodeModule::from_nbc(&bytes).unwrap().module;
-    assert_eq!(module.effect_sites.len(), 1);
-    assert_eq!(module.behaviors.len(), 1);
     module
 }
 
@@ -230,96 +235,108 @@ impl ActorVmCallbacks for Callback {
                 span: Span::default(),
             })?;
 
-        let invocation = DurableVmAsyncInvocation {
-            actor: &self.actor,
-            authority: &grant(),
-            execution_key: EXECUTION_KEY,
-            occurrence_index: 0,
-            request,
-        };
         let mut coordinator =
             DurableEffectCoordinator::new(&mut self.store, ACTOR_ID, self.actor.activation_epoch);
-        let result = coordinator.execute_vm_async_text_with_deduplication(
-            module,
-            pc,
-            effect_op,
-            invocation,
-            |key, request| {
-                let mut provider = self.provider.borrow_mut();
-                provider.attempts += 1;
-                let response = if let Some(path) = provider.disk_path.clone() {
-                    // The subprocess fake models a provider-side idempotency
-                    // ledger independent of the Nulang effect journal.
-                    if path.try_exists()? {
-                        let saved = fs::read(&path)?;
-                        let split =
-                            saved
-                                .iter()
-                                .position(|byte| *byte == b'\n')
-                                .ok_or_else(|| {
-                                    io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        "invalid provider receipt record",
-                                    )
-                                })?;
-                        if &saved[..split] != key.as_bytes() {
-                            return Err(io::Error::new(
+        let dispatch = |key: &str, request: &[u8]| {
+            let mut provider = self.provider.borrow_mut();
+            provider.attempts += 1;
+            let response = if let Some(path) = provider.disk_path.clone() {
+                // The subprocess fake models a provider-side idempotency
+                // ledger independent of the Nulang effect journal.
+                if path.try_exists()? {
+                    let saved = fs::read(&path)?;
+                    let split = saved
+                        .iter()
+                        .position(|byte| *byte == b'\n')
+                        .ok_or_else(|| {
+                            io::Error::new(
                                 io::ErrorKind::InvalidData,
-                                "provider idempotency key changed on retry",
-                            ));
-                        }
-                        saved[split + 1..].to_vec()
-                    } else {
-                        let response = [b"receipt:".as_slice(), request].concat();
-                        let mut file = fs::OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .open(&path)?;
-                        file.write_all(key.as_bytes())?;
-                        file.write_all(b"\n")?;
-                        file.write_all(&response)?;
-                        file.sync_all()?;
-                        provider.mutations += 1;
-                        if provider.pause_after_commit {
-                            // Publish the checkpoint only after the provider
-                            // ledger has been synced. The parent sends SIGKILL
-                            // while the VM is still inside external dispatch.
-                            drop(file);
-                            let pending = path.with_file_name("provider-ready.pending");
-                            let ready = path.with_file_name("provider-ready");
-                            let mut marker = fs::File::create(&pending)?;
-                            marker.write_all(b"provider-committed")?;
-                            marker.sync_all()?;
-                            drop(marker);
-                            fs::rename(pending, ready)?;
-                            loop {
-                                std::thread::park();
-                            }
-                        }
-                        response
+                                "invalid provider receipt record",
+                            )
+                        })?;
+                    if &saved[..split] != key.as_bytes() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "provider idempotency key changed on retry",
+                        ));
                     }
-                } else if let Some(saved) = provider.committed.get(key) {
-                    saved.clone()
+                    saved[split + 1..].to_vec()
                 } else {
+                    let response = [b"receipt:".as_slice(), request].concat();
+                    let mut file = fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)?;
+                    file.write_all(key.as_bytes())?;
+                    file.write_all(b"\n")?;
+                    file.write_all(&response)?;
+                    file.sync_all()?;
                     provider.mutations += 1;
-                    let response = if provider.invalid_utf8_response {
-                        vec![0xff]
-                    } else {
-                        [b"receipt:".as_slice(), request].concat()
-                    };
-                    provider.committed.insert(key.to_owned(), response.clone());
+                    if provider.pause_after_commit {
+                        // Publish the checkpoint only after the provider
+                        // ledger has been synced. The parent sends SIGKILL
+                        // while the VM is still inside external dispatch.
+                        drop(file);
+                        let pending = path.with_file_name("provider-ready.pending");
+                        let ready = path.with_file_name("provider-ready");
+                        let mut marker = fs::File::create(&pending)?;
+                        marker.write_all(b"provider-committed")?;
+                        marker.sync_all()?;
+                        drop(marker);
+                        fs::rename(pending, ready)?;
+                        loop {
+                            std::thread::park();
+                        }
+                    }
                     response
-                };
-                if provider.lose_first_response {
-                    provider.lose_first_response = false;
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "provider reply lost",
-                    ));
                 }
-                Ok(response)
-            },
-        )?;
+            } else if let Some(saved) = provider.committed.get(key) {
+                saved.clone()
+            } else {
+                provider.mutations += 1;
+                let response = if provider.invalid_utf8_response {
+                    vec![0xff]
+                } else {
+                    [b"receipt:".as_slice(), request].concat()
+                };
+                provider.committed.insert(key.to_owned(), response.clone());
+                response
+            };
+            if provider.lose_first_response {
+                provider.lose_first_response = false;
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "provider reply lost",
+                ));
+            }
+            Ok(response)
+        };
+        let authority = grant();
+        let result = if self.actor.is_workflow {
+            coordinator.execute_workflow_vm_async_text_with_deduplication(
+                module,
+                pc,
+                effect_op,
+                &mut self.actor,
+                &authority,
+                request,
+                dispatch,
+            )
+        } else {
+            coordinator.execute_vm_async_text_with_deduplication(
+                module,
+                pc,
+                effect_op,
+                DurableVmAsyncInvocation {
+                    actor: &self.actor,
+                    authority: &authority,
+                    execution_key: EXECUTION_KEY,
+                    occurrence_index: 0,
+                    request,
+                },
+                dispatch,
+            )
+        }?;
         if let PerformAsyncResult::Ready(Some(content)) = &result {
             self.observed.borrow_mut().push(content.clone());
         }
@@ -337,6 +354,8 @@ fn execute_vm(
     remove_site: bool,
 ) -> NuResult<()> {
     let mut module = compile_module();
+    assert_eq!(module.effect_sites.len(), 1);
+    assert_eq!(module.behaviors.len(), 1);
     let behavior_pc = module.behaviors[0].code_offset;
     let string_id = module.add_string_constant(request);
     if remove_site {
@@ -581,6 +600,311 @@ fn vm_invalid_text_receipt_fails_closed_and_never_redispatches() {
     }
 }
 
+fn admit_command(store: &mut LibsqlStore) -> WorkflowActivationId {
+    let previous = store.latest_sequence(ACTOR_ID);
+    let sequence = previous + 1;
+    let committed = store
+        .commit_transition(DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id: ACTOR_ID,
+            activation_epoch: 1,
+            sequence,
+            expected_previous_sequence: previous,
+            command: Some(JournalEntry {
+                sequence,
+                behavior_id: 0,
+                payload: vec![],
+            }),
+            snapshot: None,
+            workflow_events: vec![],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![],
+        })
+        .unwrap();
+    WorkflowActivationId::new(committed.actor_id, committed.sequence)
+}
+
+fn workflow_actor(activation: WorkflowActivationId) -> Actor {
+    let mut actor = actor(true, 1);
+    actor.is_workflow = true;
+    actor.current_workflow_activation = Some(activation);
+    actor.sequence = activation.command_sequence;
+    actor
+}
+
+fn workflow_module() -> CodeModule {
+    let module = compile_source_module(
+        "workflow Payments { step charge { perform Inference.ask(\"order=42&cents=100\") } }",
+    );
+    assert_eq!(module.effect_sites.len(), 1);
+    module
+}
+
+fn workflow_fixture_vm(
+    db: &TestDb,
+    provider: Rc<RefCell<Provider>>,
+    observed: Rc<RefCell<Vec<String>>>,
+    activation: WorkflowActivationId,
+) -> (VM, usize) {
+    let module = workflow_module();
+    let behavior_pc = module
+        .behaviors
+        .iter()
+        .find(|behavior| behavior.name == "charge" || behavior.name.ends_with(".charge"))
+        .expect("compiled workflow step")
+        .code_offset;
+    let mut callback = Callback::new(db, provider, observed, true, 1);
+    callback.actor = workflow_actor(activation);
+    let mut vm = VM::new_without_jit();
+    vm.load_module(module);
+    vm.set_actor_callbacks(Box::new(callback));
+    (vm, behavior_pc)
+}
+
+#[test]
+fn workflow_vm_occurrences_reconstruct_after_reopen_and_retry() {
+    let db = TestDb::new();
+    let activation = admit_command(&mut LibsqlStore::new(&db.path).unwrap());
+    let provider = Rc::new(RefCell::new(Provider {
+        lose_first_response: true,
+        ..Provider::default()
+    }));
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    {
+        let (mut vm, pc) = workflow_fixture_vm(&db, provider.clone(), observed.clone(), activation);
+        // First occurrence has durable intent and an indeterminate response.
+        assert!(vm.call_function(0, pc, &[]).is_err());
+        assert_eq!(provider.borrow().committed.len(), 1);
+        assert_eq!(
+            LibsqlStore::new(&db.path)
+                .unwrap()
+                .latest_sequence(ACTOR_ID),
+            2
+        );
+        // Same actor/VM retry consumes the first occurrence, not a new one.
+        vm.call_function(0, pc, &[]).unwrap();
+        assert_eq!(provider.borrow().mutations, 1);
+        // The same static site reached again within this activation is distinct.
+        vm.call_function(0, pc, &[]).unwrap();
+        assert_eq!(provider.borrow().attempts, 3);
+        assert_eq!(provider.borrow().mutations, 2);
+        assert_eq!(provider.borrow().committed.len(), 2);
+        assert_eq!(
+            LibsqlStore::new(&db.path)
+                .unwrap()
+                .latest_sequence(ACTOR_ID),
+            5
+        );
+    }
+
+    // The admitted command is persisted; recover its identity from the journal
+    // rather than supplying the old free-form execution key or occurrence.
+    let reopened = LibsqlStore::new(&db.path).unwrap();
+    let commands = reopened.read_journal(ACTOR_ID);
+    assert_eq!(commands.len(), 1);
+    let recovered = WorkflowActivationId::new(ACTOR_ID, commands[0].sequence);
+    assert_eq!(recovered, activation);
+    drop(reopened);
+    let (mut vm, pc) = workflow_fixture_vm(&db, provider.clone(), observed.clone(), recovered);
+    vm.call_function(0, pc, &[]).unwrap();
+    vm.call_function(0, pc, &[]).unwrap();
+    assert_eq!(provider.borrow().attempts, 3);
+    assert_eq!(provider.borrow().mutations, 2);
+    assert_eq!(observed.borrow().len(), 4);
+    assert_eq!(
+        LibsqlStore::new(&db.path)
+            .unwrap()
+            .latest_sequence(ACTOR_ID),
+        5
+    );
+}
+
+#[test]
+fn workflow_cursor_rejects_unadmitted_wrong_actor_and_stale_owners() {
+    let db = TestDb::new();
+    let mut store = LibsqlStore::new(&db.path).unwrap();
+    let module = workflow_module();
+    let pc = module.effect_sites[0].pc;
+    let mut actor = workflow_actor(WorkflowActivationId::new(ACTOR_ID, 1));
+    let denied = |_: &str, _: &[u8]| -> io::Result<Vec<u8>> {
+        panic!("rejected workflow invocation must not dispatch")
+    };
+    // A fabricated activation with no atomic tail is not accepted.
+    let mut coordinator = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
+    assert!(coordinator
+        .execute_workflow_vm_async_text_with_deduplication(
+            &module,
+            pc,
+            "Inference.ask",
+            &mut actor,
+            &grant(),
+            REQUEST.as_bytes(),
+            denied
+        )
+        .is_err());
+    assert_eq!(store.latest_sequence(ACTOR_ID), 0);
+
+    let activation = admit_command(&mut store);
+    actor.current_workflow_activation = Some(WorkflowActivationId::new(
+        ACTOR_ID + 1,
+        activation.command_sequence,
+    ));
+    let mut coordinator = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
+    assert!(coordinator
+        .execute_workflow_vm_async_text_with_deduplication(
+            &module,
+            pc,
+            "Inference.ask",
+            &mut actor,
+            &grant(),
+            REQUEST.as_bytes(),
+            denied
+        )
+        .is_err());
+    actor.current_workflow_activation = None;
+    assert!(coordinator
+        .execute_workflow_vm_async_text_with_deduplication(
+            &module,
+            pc,
+            "Inference.ask",
+            &mut actor,
+            &grant(),
+            REQUEST.as_bytes(),
+            denied
+        )
+        .is_err());
+    actor.current_workflow_activation = Some(activation);
+    actor.activation_epoch = 2;
+    let mut coordinator = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 2);
+    assert!(coordinator
+        .execute_workflow_vm_async_text_with_deduplication(
+            &module,
+            pc,
+            "Inference.ask",
+            &mut actor,
+            &grant(),
+            REQUEST.as_bytes(),
+            denied
+        )
+        .is_err());
+    assert_eq!(store.latest_sequence(ACTOR_ID), 1);
+}
+
+#[test]
+fn workflow_cursor_pins_pending_request_and_separates_new_commands() {
+    let db = TestDb::new();
+    let mut store = LibsqlStore::new(&db.path).unwrap();
+    let module = workflow_module();
+    let pc = module.effect_sites[0].pc;
+    let activation = admit_command(&mut store);
+    let mut actor = workflow_actor(activation);
+    let mut keys = Vec::new();
+    {
+        let mut coordinator = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
+        assert!(coordinator
+            .execute_workflow_vm_async_text_with_deduplication(
+                &module,
+                pc,
+                "Inference.ask",
+                &mut actor,
+                &grant(),
+                REQUEST.as_bytes(),
+                |key, _| {
+                    keys.push(key.to_owned());
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "indeterminate provider reply",
+                    ))
+                }
+            )
+            .is_err());
+        assert!(coordinator
+            .execute_workflow_vm_async_text_with_deduplication(
+                &module,
+                pc,
+                "Inference.ask",
+                &mut actor,
+                &grant(),
+                b"changed",
+                |_, _| panic!("request drift must not dispatch")
+            )
+            .is_err());
+        // A matching retry preserves the key and completes the occurrence.
+        coordinator
+            .execute_workflow_vm_async_text_with_deduplication(
+                &module,
+                pc,
+                "Inference.ask",
+                &mut actor,
+                &grant(),
+                REQUEST.as_bytes(),
+                |key, _| {
+                    keys.push(key.to_owned());
+                    Ok(b"receipt".to_vec())
+                },
+            )
+            .unwrap();
+    }
+    assert_eq!(keys[0], keys[1]);
+    let terminal_seq = store.latest_sequence(ACTOR_ID) + 1;
+    store
+        .commit_transition(DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id: ACTOR_ID,
+            activation_epoch: 1,
+            sequence: terminal_seq,
+            expected_previous_sequence: terminal_seq - 1,
+            command: None,
+            snapshot: Some(ActorSnapshot {
+                actor_id: ACTOR_ID,
+                sequence: terminal_seq,
+                activation_epoch: 1,
+                ..ActorSnapshot::default()
+            }),
+            workflow_events: vec![WorkflowEvent::StepCompleted {
+                sequence: terminal_seq,
+                activation: Some(activation),
+                step_name: "charge".into(),
+            }],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![],
+        })
+        .unwrap();
+    let next = admit_command(&mut store);
+    actor.current_workflow_activation = Some(next);
+    let mut coordinator = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
+    coordinator
+        .execute_workflow_vm_async_text_with_deduplication(
+            &module,
+            pc,
+            "Inference.ask",
+            &mut actor,
+            &grant(),
+            REQUEST.as_bytes(),
+            |key, _| {
+                keys.push(key.to_owned());
+                Ok(b"another receipt".to_vec())
+            },
+        )
+        .unwrap();
+    assert_ne!(keys[1], keys[2]);
+    actor.current_workflow_activation = Some(activation);
+    assert!(coordinator
+        .execute_workflow_vm_async_text_with_deduplication(
+            &module,
+            pc,
+            "Inference.ask",
+            &mut actor,
+            &grant(),
+            REQUEST.as_bytes(),
+            |_, _| panic!("old command must not dispatch")
+        )
+        .is_err());
+    assert_eq!(store.latest_sequence(ACTOR_ID), 7);
+}
+
 /// Guarantee the test reaps its worker even if a checkpoint assertion panics.
 struct CrashWorker(Child);
 
@@ -713,4 +1037,152 @@ fn durable_vm_crash_fixture_child() {
     let observed = Rc::new(RefCell::new(Vec::new()));
     let result = execute_vm(&db, provider, observed, true, 1, REQUEST, false);
     panic!("fixture must be killed while provider receipt is not yet acknowledged: {result:?}");
+}
+
+#[test]
+fn workflow_later_occurrence_recovers_after_new_owner_claim() {
+    let db = TestDb::new();
+    let mut store = LibsqlStore::new(&db.path).unwrap();
+    let module = workflow_module();
+    let pc = module.effect_sites[0].pc;
+    let activation = admit_command(&mut store);
+    let mut old = workflow_actor(activation);
+    let mut keys = Vec::new();
+    {
+        let mut coordinator = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
+        coordinator
+            .execute_workflow_vm_async_text_with_deduplication(
+                &module,
+                pc,
+                "Inference.ask",
+                &mut old,
+                &grant(),
+                REQUEST.as_bytes(),
+                |key, _| {
+                    keys.push(key.to_owned());
+                    Ok(b"first".to_vec())
+                },
+            )
+            .unwrap();
+        assert!(coordinator
+            .execute_workflow_vm_async_text_with_deduplication(
+                &module,
+                pc,
+                "Inference.ask",
+                &mut old,
+                &grant(),
+                REQUEST.as_bytes(),
+                |key, _| {
+                    keys.push(key.to_owned());
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "second provider reply lost",
+                    ))
+                }
+            )
+            .is_err());
+        // A different semantic site must not take over the pending local slot.
+        let alternate = compile_source_module(
+            r#"workflow Other { step charge { perform Inference.ask("order=42&cents=100") } }"#,
+        );
+        assert_ne!(module.effect_sites[0].id, alternate.effect_sites[0].id);
+        assert!(coordinator
+            .execute_workflow_vm_async_text_with_deduplication(
+                &alternate,
+                alternate.effect_sites[0].pc,
+                "Inference.ask",
+                &mut old,
+                &grant(),
+                REQUEST.as_bytes(),
+                |_, _| panic!("changed pending site must not dispatch")
+            )
+            .is_err());
+    }
+    assert_ne!(keys[0], keys[1]);
+    assert_eq!(store.latest_sequence(ACTOR_ID), 4);
+    // An empty atomic transition claims a newer epoch in this controlled
+    // fixture. The accepted command sequence is unchanged.
+    store
+        .commit_transition(DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id: ACTOR_ID,
+            activation_epoch: 2,
+            sequence: 5,
+            expected_previous_sequence: 4,
+            command: None,
+            snapshot: None,
+            workflow_events: vec![],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![],
+        })
+        .unwrap();
+    let mut stale = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
+    assert!(stale
+        .execute_workflow_vm_async_text_with_deduplication(
+            &module,
+            pc,
+            "Inference.ask",
+            &mut old,
+            &grant(),
+            REQUEST.as_bytes(),
+            |_, _| panic!("stale owner must not dispatch")
+        )
+        .is_err());
+    drop(store);
+
+    let mut store = LibsqlStore::new(&db.path).unwrap();
+    let commands = store.read_journal(ACTOR_ID);
+    assert_eq!(commands.len(), 1);
+    let recovered = WorkflowActivationId::new(ACTOR_ID, commands[0].sequence);
+    let mut current = workflow_actor(recovered);
+    current.activation_epoch = 2;
+    let mut coordinator = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 2);
+    let first = coordinator
+        .execute_workflow_vm_async_text_with_deduplication(
+            &module,
+            pc,
+            "Inference.ask",
+            &mut current,
+            &grant(),
+            REQUEST.as_bytes(),
+            |_, _| panic!("first completed occurrence must replay, not dispatch"),
+        )
+        .unwrap();
+    assert!(matches!(first, PerformAsyncResult::Ready(Some(ref text)) if text == "first"));
+    coordinator
+        .execute_workflow_vm_async_text_with_deduplication(
+            &module,
+            pc,
+            "Inference.ask",
+            &mut current,
+            &grant(),
+            REQUEST.as_bytes(),
+            |key, _| {
+                keys.push(key.to_owned());
+                Ok(b"second".to_vec())
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        keys[1], keys[2],
+        "epoch is a fence, not logical effect identity"
+    );
+    let canonical = |ordinal| {
+        DurableEffectSpec::from_compiled_async_site(
+            &module,
+            pc,
+            ACTOR_ID,
+            &format!("workflow-command:v1:{}", recovered.command_sequence),
+            ordinal,
+            EffectBoundary::External,
+            DeliverySemantics::EffectivelyOnceWithDeduplication,
+        )
+        .unwrap()
+        .id
+        .idempotency_key()
+    };
+    assert_eq!(keys[0], canonical(0));
+    assert_eq!(keys[1], canonical(1));
+    assert_eq!(store.latest_sequence(ACTOR_ID), 6);
 }

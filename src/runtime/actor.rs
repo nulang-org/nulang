@@ -311,6 +311,10 @@ pub struct Actor {
     pub workflow_replay_activation: Option<WorkflowActivationId>,
     /// Next deterministic custom-event ordinal within `workflow_replay_activation`.
     pub workflow_replay_event_ordinal: u32,
+    /// Lazy opt-in durable external-effect cursor. Kept separate from the
+    /// legacy custom-event ordinal; ordinary actors allocate no cursor.
+    pub(crate) workflow_effect_cursor:
+        Option<Box<crate::durable_effect_runtime::WorkflowEffectReplayCursor>>,
     /// Sentinel heap object used by the cycle detector to represent this
     /// actor as a holder of foreign references.
     cycle_sentinel: Option<*mut OrcaHeader>,
@@ -463,6 +467,7 @@ impl Actor {
             current_workflow_activation: None,
             workflow_replay_activation: None,
             workflow_replay_event_ordinal: 0,
+            workflow_effect_cursor: None,
             cycle_sentinel: None,
             suspended_execution: None,
             waiting_signal: None,
@@ -533,6 +538,7 @@ impl Actor {
         self.current_workflow_activation = None;
         self.workflow_replay_activation = None;
         self.workflow_replay_event_ordinal = 0;
+        self.workflow_effect_cursor = None;
         self.cycle_sentinel = None;
         self.suspended_execution = None;
         self.waiting_signal = None;

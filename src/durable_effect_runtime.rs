@@ -13,9 +13,9 @@ use crate::durable_effect::{
     DurableEffectRequestMismatch, DurableEffectSpec,
 };
 use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
-use crate::primitives::{DeliverySemantics, EffectBoundary};
+use crate::primitives::{ActorRole, DeliverySemantics, EffectBoundary};
 use crate::runtime::{
-    Actor, ActorState, DurableCommit, DurableTransition, PersistenceStore,
+    Actor, ActorState, DurableCommit, DurableTransition, PersistenceStore, WorkflowActivationId,
     DURABLE_TRANSITION_VERSION,
 };
 use crate::types::{NuError, NuResult, Span};
@@ -173,6 +173,42 @@ pub struct DurableVmAsyncInvocation<'a> {
     pub request: &'a [u8],
 }
 
+/// Execution-local cursor for the opt-in workflow adapter. The command
+/// sequence itself is durable; a fresh actor reconstructs occurrences by
+/// replaying the same pinned deterministic command from its safe boundary.
+/// This is not a persisted continuation or an independently persisted
+/// ordinal-to-site index.
+pub(crate) struct WorkflowEffectReplayCursor {
+    activation: WorkflowActivationId,
+    activation_epoch: u64,
+    next_occurrence: u32,
+    pending: Option<DurableEffectRecord>,
+}
+
+impl WorkflowEffectReplayCursor {
+    fn new(activation: WorkflowActivationId, activation_epoch: u64) -> Self {
+        Self {
+            activation,
+            activation_epoch,
+            next_occurrence: 0,
+            pending: None,
+        }
+    }
+}
+
+fn vm_effect_error(msg: impl Into<String>) -> NuError {
+    NuError::VMError {
+        msg: msg.into(),
+        span: Span::default(),
+    }
+}
+
+fn vm_text_receipt(receipt: Vec<u8>) -> NuResult<PerformAsyncResult> {
+    let text = String::from_utf8(receipt)
+        .map_err(|_| vm_effect_error("durable VM effect receipt is not valid UTF-8"))?;
+    Ok(PerformAsyncResult::Ready(Some(text)))
+}
+
 /// Coordinates one actor/entity/workflow's durable external effects.
 ///
 /// `activation_epoch` is supplied by the owning runtime/placement layer. A
@@ -259,6 +295,26 @@ impl<'a> DurableEffectCoordinator<'a> {
     where
         F: FnOnce(&str, &[u8]) -> io::Result<Vec<u8>>,
     {
+        let spec = self.authorized_compiled_spec(
+            actor,
+            authority,
+            module,
+            pc,
+            execution_key,
+            occurrence_index,
+        )?;
+        self.execute_authorized_spec(spec, request, dispatch)
+    }
+
+    fn authorized_compiled_spec(
+        &self,
+        actor: &Actor,
+        authority: &AuthorityGrant,
+        module: &CodeModule,
+        pc: usize,
+        execution_key: &str,
+        occurrence_index: u32,
+    ) -> Result<DurableEffectSpec, DurableAsyncDispatchError> {
         if actor.id != self.actor_id {
             return Err(DurableAsyncDispatchError::ActorMismatch {
                 expected: self.actor_id,
@@ -305,6 +361,18 @@ impl<'a> DurableEffectCoordinator<'a> {
             .require_authority(authority)
             .map_err(DurableAsyncDispatchError::Authorization)?;
 
+        Ok(spec)
+    }
+
+    fn execute_authorized_spec<F>(
+        &mut self,
+        spec: DurableEffectSpec,
+        request: &[u8],
+        dispatch: F,
+    ) -> Result<Vec<u8>, DurableAsyncDispatchError>
+    where
+        F: FnOnce(&str, &[u8]) -> io::Result<Vec<u8>>,
+    {
         match self.begin(spec, request)? {
             DurableEffectDispatchDecision::ReplayRecordedResult(receipt) => Ok(receipt),
             DurableEffectDispatchDecision::DispatchWithDeduplication { operation_id } => {
@@ -381,11 +449,127 @@ impl<'a> DurableEffectCoordinator<'a> {
                 msg: format!("durable VM effect rejected: {error}"),
                 span: Span::default(),
             })?;
-        let response = String::from_utf8(receipt).map_err(|_| NuError::VMError {
-            msg: "durable VM effect receipt is not valid UTF-8".into(),
-            span: Span::default(),
-        })?;
-        Ok(PerformAsyncResult::Ready(Some(response)))
+        vm_text_receipt(receipt)
+    }
+
+    /// Experimental workflow-only adapter; the host no longer supplies an
+    /// arbitrary execution key or occurrence. They come from the live actor's
+    /// current accepted command and its actor-owned cursor.
+    ///
+    /// The trusted host MUST have admitted (or recovered) the open command
+    /// atomically, verified and pinned its artifact, and replay from the safe
+    /// pre-command boundary on a fresh actor. A tail check is only a necessary
+    /// fence, not proof that a command is open or was atomically admitted.
+    /// Do not use this with the legacy compiled-workflow scheduler.
+    ///
+    /// Effects are numbered in the deterministic order in which this adapter
+    /// is called. The cursor survives in-process suspension; on a provider
+    /// error or invalid terminal text it remains on that occurrence. Live
+    /// retries cannot switch sites or requests. A fresh cursor reconstructs
+    /// occurrences through deterministic replay, not by counting journal rows.
+    /// Cross-site replay drift across restart, actor-turn atomicity and
+    /// persistent continuations still require additional integration.
+    pub fn execute_workflow_vm_async_text_with_deduplication<F>(
+        &mut self,
+        module: &CodeModule,
+        pc: usize,
+        invoked_operation: &str,
+        actor: &mut Actor,
+        authority: &AuthorityGrant,
+        request: &[u8],
+        dispatch: F,
+    ) -> NuResult<PerformAsyncResult>
+    where
+        F: FnOnce(&str, &[u8]) -> io::Result<Vec<u8>>,
+    {
+        if !actor.persistent || !matches!(actor.role(), Ok(ActorRole::Workflow)) {
+            return Err(vm_effect_error(
+                "durable workflow effect requires a persistent workflow",
+            ));
+        }
+        let activation = actor
+            .current_workflow_activation
+            .filter(|activation| {
+                activation.actor_id == actor.id && activation.command_sequence != 0
+            })
+            .ok_or_else(|| {
+                vm_effect_error("durable workflow effect requires the current accepted command")
+            })?;
+
+        // Treat a newer command as a new execution, but never allow a live
+        // cursor to be rewound to an older command or moved to another owner.
+        let occurrence = match actor.workflow_effect_cursor.as_deref() {
+            Some(cursor)
+                if cursor.activation_epoch != actor.activation_epoch
+                    || cursor.activation.command_sequence > activation.command_sequence
+                    || cursor.activation.actor_id != activation.actor_id
+                    || (cursor.activation != activation && cursor.pending.is_some()) =>
+            {
+                return Err(vm_effect_error(
+                    "durable workflow effect cursor cannot be rewound, transferred, or abandoned while pending",
+                ))
+            }
+            Some(cursor) if cursor.activation == activation => cursor.next_occurrence,
+            _ => 0,
+        };
+        let next = occurrence
+            .checked_add(1)
+            .ok_or_else(|| vm_effect_error("durable workflow effect occurrence exhausted"))?;
+        let site = module
+            .effect_site_at(pc)
+            .ok_or_else(|| vm_effect_error("durable workflow effect missing compiler metadata"))?;
+        if site.effect_operation != invoked_operation {
+            return Err(vm_effect_error(
+                "durable workflow effect operation mismatch",
+            ));
+        }
+        // Actor ID is already part of the canonical effect ID. Epoch is an
+        // ownership fence, not an invocation identity component.
+        let execution_key = format!("workflow-command:v1:{}", activation.command_sequence);
+        let spec = self
+            .authorized_compiled_spec(actor, authority, module, pc, &execution_key, occurrence)
+            .map_err(|error| vm_effect_error(format!("durable VM effect rejected: {error}")))?;
+
+        self.store
+            .load_durable_tail_position(actor.id)
+            .map_err(|error| {
+                vm_effect_error(format!("durable workflow tail read failed: {error}"))
+            })?
+            .filter(|tail| {
+                tail.sequence >= activation.command_sequence
+                    && tail.activation_epoch == actor.activation_epoch
+            })
+            .ok_or_else(|| {
+                vm_effect_error("durable workflow effect requires a current atomic tail")
+            })?;
+        // Keep this check separate from the coordinator's commit fence:
+        // even completed replay requires an admitted live workflow owner.
+        let epoch = actor.activation_epoch;
+
+        let cursor = actor
+            .workflow_effect_cursor
+            .get_or_insert_with(|| Box::new(WorkflowEffectReplayCursor::new(activation, epoch)));
+        if cursor.activation != activation {
+            **cursor = WorkflowEffectReplayCursor::new(activation, epoch);
+        }
+        if let Some(pending) = &cursor.pending {
+            if pending.spec() != &spec || pending.validate_request(request).is_err() {
+                return Err(vm_effect_error(
+                    "durable workflow effect pending occurrence changed",
+                ));
+            }
+        } else {
+            cursor.pending = Some(DurableEffectRecord::prepare(spec.clone(), request));
+        }
+
+        let receipt = self
+            .execute_authorized_spec(spec, request, dispatch)
+            .map_err(|error| vm_effect_error(format!("durable VM effect rejected: {error}")))?;
+        let result = vm_text_receipt(receipt)?;
+        // Only a valid terminal result advances the cursor, including replay.
+        cursor.pending = None;
+        cursor.next_occurrence = next;
+        Ok(result)
     }
 
     /// Persist the terminal result for a previously prepared effect.
