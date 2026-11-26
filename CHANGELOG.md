@@ -11,10 +11,37 @@
 ### Checked static web builds — 2026-11-26
 - **Experimental:** web builds emit HTML only for eligible, checked GET renderers, leave request-bound and mutation routes in Deployment IR without artifacts, and reject explicit static placement violations. Registration and rendering run under an interpreter instruction allowlist.
 - Stage and replace generated output after validation, reject unsafe paths and asset collisions, and preserve prior output on ordinary build errors. Static publishing no longer snapshots the server-dependent Todo starter; its native HTTP rendering and vendored styles remain supported. No full transitive effect proof or crash-atomic publication is claimed.
+### Fail-closed SQLite history recovery and trusted streaming — 2026-11-26
+- **Keep untrusted `DB.query` results bounded** while visiting fixed internal actor snapshot, journal, workflow/domain event and durable-effect rows incrementally. Recovery no longer mistakes histories beyond the general 100,000-row/64 MiB adapter buffer budget for absent data.
+- Introduce checked persistence-history reads for actor/virtual-actor activation. SQLite query, decode or corruption failures now refuse recovery before publishing a partially restored actor; legacy reader APIs retain compatibility, with warnings for their fallback paths.
+- Regression tests cover over-budget streamed rows/bytes, 100,001 committed events and journal entries, invalid snapshots/events/workflow rows, and preserved user-query limits. Full profile, live Turso and release qualification remain separate.
+
+### Fail-closed legacy snapshots schema validation (draft) — 2026-11-22
+- **Reject pre-existing SQLite `snapshots` tables missing mandatory `actor_id`, `sequence`, or `state` columns before adding optional columns.** Previously, `CREATE TABLE IF NOT EXISTS` accepted an incomplete table and startup could succeed despite an unusable durable-state schema.
+- **Match SQLite column names case-insensitively during optional migrations**, preserving compatible older schemas with uppercased optional column identifiers. The change applies only to the audited SQLite integration candidate, remains draft, and requires exact-head regression and migration/recovery qualification before release.
+
+### Bounded local SQLite result materialization (draft) — 2026-11-20
+- **Fail closed when an eager local SQLite query would buffer more than 100,000 rows or an estimated 64 MiB of row/value storage.** Reject the query with a pagination hint rather than returning a truncated result or retaining an unbounded in-memory buffer. Text/blob byte lengths are checked before cloning each cell.
+- The limit affects only local SQLite in the security integration adapter; remote Turso/Hrana and downstream JSON serialization have separate memory behavior. Existing large-result callers must paginate. Exact-head testing and review are required before release.
+
+### Single patched SQLite engine with preserved remote HTTPS (draft) — 2026-11-19
+- **The local actor store and AI-local runtime now use the same bundled rusqlite 0.41.1 / libsqlite3-sys 0.39.1 SQLite provider**, while the existing libSQL Hrana client runs remote-only without linking libsql-ffi's separate SQLite 3.47 engine.
+- **A compatibility adapter preserves the existing LibsqlStore persistence API, including immediate transactions and remote HTTPS/Turso operations.** Cross-provider durability, full linked feature matrix, and authenticated disposable remote smoke tests are required before release.
+- **Removed historical RustSec audit ignore entries**, exposing the previously suppressed RUSTSEC-2026-0258 on the legacy Hyper 0.14/h2 0.3 remote-libSQL path; patched the independent h2 0.4 chain to 0.4.16. The legacy h2 dependency still needs secure remediation without disabling remote HTTPS. This draft is not approved for merge until the audit is clean, exact-head validation and independent security review are complete.
+
+### Follow-up Wasmtime security maintenance (draft) — 2026-11-19
+- **Raise the Wasmtime 48.x minimum to 48.0.9, resolving to 48.0.10**, with matching internal Wasmtime/Cranelift/Pulley crates. This addresses RUSTSEC-2026-0566 through RUSTSEC-2026-0573 without changing SQLite providers or remote libSQL transport.
+- **Current RustSec audit remains red:** the updated exact-head lockfile has one finding, RUSTSEC-2026-0459 (`libsqlite3-sys 0.30.1`). The previous November 12 zero-vulnerability audit result below is historical and is not the current release status. Never bypass or ignore the remaining advisory.
+- **SQLite remediation is a separate stop-ship:** an isolated bundled-`rusqlite` upgrade introduces duplicate native `sqlite3_*` symbols with `libsql-ffi`. Retain both authenticated HTTPS remote-libSQL functionality and local persistence while designing an independently tested single patched SQLite provider. This update alone is not merge clearance.
+### Patched WASM/TLS dependencies and HTTPS-only remote libSQL — 2026-11-12
+- **Patched the Wasmtime 48.x/Cranelift toolchain and affected cryptography, certificate-root, and compression dependencies**, removing the November RustSec advisories without disabling the audit gate.
+- **Remote libSQL uses a platform-native HTTPS connector rather than the affected legacy Rustls dependency chain.** HTTPS and libsql:// endpoints are supported; plaintext HTTP endpoints now fail closed. Native CA trust stores must be maintained by deployments.
+- **The security branch passed cargo audit, focused SQLite/transport regressions, full-feature checks, and four-platform release builds.** Live authenticated Turso connectivity remains an operational smoke-test requirement before promoting remote-libSQL workloads.
 
 ### Per-priority scheduler runnable backlog diagnostics — 2026-11-20
 - **Expose approximate queued High, Normal, and Low runnable task counts** in the existing scheduler metrics snapshot, including global injector and worker-local queues, without adding counters to scheduling hot paths.
 - **Regression tests cover mixed priority queues, dequeues, and metrics-counter reset.** Queue depths are sampled non-atomically for diagnostics only; they are not admission, fairness, or backpressure guarantees.
+
 
 ### NUL0 TCP partial-frame recovery across read timeouts — 2026-11-10
 - **Preserve bytes already consumed from NUL0 frame prefixes and payloads when socket reads return `WouldBlock`, `TimedOut`, or `Interrupted`.** Retry from the unconsumed offset rather than restarting `read_exact` with a fresh buffer, preventing frame misalignment and lost actor packets.
