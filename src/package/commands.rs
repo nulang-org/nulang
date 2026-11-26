@@ -1587,6 +1587,57 @@ fn build_web(
         })?;
         eprintln!("    {}", dest.display());
     }
+    if let Some(site_url) = &manifest.web.site_url {
+        let package_error = |msg: String| NuError::PackageError {
+            msg,
+            span: Span::default(),
+        };
+        // An active server route must not intercept the generated sitemap.
+        for route in &runtime_routes {
+            let method = route.route.method.as_str();
+            if matches!(method, "GET" | "HEAD")
+                && ir.routes.iter().any(|r| {
+                    r.method == method && r.path == route.route.path && r.placement == "server"
+                })
+                && crate::web::dispatch::match_route(route, "/sitemap.xml").is_some()
+            {
+                return Err(package_error(format!(
+                    "sitemap.xml conflicts with {method} {}",
+                    route.route.path
+                )));
+            }
+        }
+        let xml = super::sitemap::render(
+            site_url,
+            ir.routes
+                .iter()
+                .filter(|route| {
+                    route.method == "GET" && route.placement == "static" && route.artifact.is_some()
+                })
+                .map(|route| &route.path),
+        )
+        .map_err(package_error)?;
+        // Reserve the generated file before copying assets, including
+        // case-insensitive directory aliases from already rendered pages.
+        for entry in std::fs::read_dir(output_dir).map_err(|e| package_error(e.to_string()))? {
+            let entry = entry.map_err(|e| package_error(e.to_string()))?;
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("sitemap.xml")
+            {
+                return Err(package_error(
+                    "sitemap.xml conflicts with generated output".into(),
+                ));
+            }
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output_dir.join("sitemap.xml"))
+            .and_then(|mut file| std::io::Write::write_all(&mut file, xml.as_bytes()))
+            .map_err(|e| package_error(format!("cannot write sitemap.xml: {e}")))?;
+    }
     let ir_path = output_dir.join("nulang-app.ir.json");
     let ir_json = ir.to_json();
     std::fs::write(&ir_path, ir_json).map_err(|e| NuError::PackageError {
