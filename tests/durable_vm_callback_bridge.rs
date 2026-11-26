@@ -1,0 +1,716 @@
+#![cfg(feature = "sqlite")]
+//! Executable VM PerformAsync -> durable coordinator -> file-backed libSQL.
+//!
+//! The fixture installs a trusted host callback explicitly. It does NOT mean
+//! arbitrary actor-runtime callbacks are durable or that the bytecode artifact
+//! has been independently authenticated. Provider state is an in-process
+//! stand-in for a remote idempotency service. The subprocess case separately
+//! kills a real VM process after its provider ledger is durably written.
+
+use nulang::authority::{AuthorityGrant, AuthorityManifest};
+use nulang::bytecode::{CodeModule, Constant};
+use nulang::durable_effect::{DurableEffectId, DurableEffectSpec};
+use nulang::durable_effect_runtime::{DurableEffectCoordinator, DurableVmAsyncInvocation};
+use nulang::hir_lower;
+use nulang::lexer::Lexer;
+use nulang::mir_codegen;
+use nulang::mir_lower;
+use nulang::parser::Parser;
+use nulang::primitives::{DeliverySemantics, EffectBoundary};
+use nulang::runtime::heap::{ActorHeap, TypeTag as HeapTypeTag};
+use nulang::runtime::{Actor, LibsqlStore, OrcaGc, PersistenceStore};
+use nulang::typechecker::TypeChecker;
+use nulang::types::{NuError, NuResult, Span};
+use nulang::vm::{ActorVmCallbacks, PerformAsyncResult, Value, VM};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::fmt;
+use std::fs;
+use std::io::{self, Write};
+use std::path::PathBuf;
+use std::process::{Child, Command};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const ACTOR_ID: u64 = 42;
+const EXECUTION_KEY: &str = "checkout/order-42/turn-1";
+const REQUEST: &str = "order=42&cents=100";
+static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+const CRASH_TIMEOUT: Duration = Duration::from_secs(20);
+
+struct TestDb {
+    dir: PathBuf,
+    path: PathBuf,
+    owns_directory: bool,
+}
+
+impl TestDb {
+    fn new() -> Self {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nulang-vm-durable-bridge-{}-{nonce}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&dir).expect("isolated test directory");
+        let path = dir.join("effects.db");
+        Self {
+            dir,
+            path,
+            owns_directory: true,
+        }
+    }
+
+    fn from_existing(path: PathBuf) -> Self {
+        Self {
+            dir: path.parent().expect("parent directory").to_path_buf(),
+            path,
+            owns_directory: false,
+        }
+    }
+}
+
+impl Drop for TestDb {
+    fn drop(&mut self) {
+        if self.owns_directory {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+fn compile_module() -> CodeModule {
+    let source =
+        "actor Payments { behavior charge(order: String) { perform Inference.ask(order) } }";
+    let tokens = Lexer::new(source).lex().unwrap();
+    let ast = Parser::new(tokens).parse_module().unwrap();
+    let mut types = TypeChecker::new();
+    types.check_module(&ast).unwrap();
+    let hir = hir_lower::lower_module(&ast, &types.inferred_decl_types);
+    let mut mir = mir_lower::lower_module(&hir).unwrap();
+    let compiled = mir_codegen::compile_mir(&mut mir, "durable-vm-bridge").unwrap();
+    let bytes = compiled.to_nbc(None).unwrap();
+    let module = CodeModule::from_nbc(&bytes).unwrap().module;
+    assert_eq!(module.effect_sites.len(), 1);
+    assert_eq!(module.behaviors.len(), 1);
+    module
+}
+
+fn grant() -> AuthorityGrant {
+    AuthorityGrant::Other {
+        namespace: "Inference".into(),
+        operation: "ask".into(),
+        argument: None,
+    }
+}
+
+fn actor(authorized: bool, epoch: u64) -> Actor {
+    let mut actor = Actor::new(ACTOR_ID, "Payments", 16);
+    actor.persistent = true;
+    actor.activation_epoch = epoch;
+    let grants = if authorized { vec![grant()] } else { vec![] };
+    actor.install_authority_manifest(&AuthorityManifest::from_grants(grants));
+    actor
+}
+
+#[derive(Default)]
+struct Provider {
+    attempts: usize,
+    mutations: usize,
+    committed: BTreeMap<String, Vec<u8>>,
+    lose_first_response: bool,
+    /// Optional file-backed fake for subprocess crash tests.
+    disk_path: Option<PathBuf>,
+    /// Pause after the provider's durable commit until the parent kills us.
+    pause_after_commit: bool,
+    /// Test the adapter's text-only receipt contract.
+    invalid_utf8_response: bool,
+}
+
+struct Callback {
+    store: LibsqlStore,
+    actor: Actor,
+    provider: Rc<RefCell<Provider>>,
+    observed: Rc<RefCell<Vec<String>>>,
+    heap: ActorHeap,
+    gc: OrcaGc,
+}
+
+impl fmt::Debug for Callback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableVmFixtureCallback")
+            .field("actor_id", &self.actor.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Callback {
+    fn new(
+        db: &TestDb,
+        provider: Rc<RefCell<Provider>>,
+        observed: Rc<RefCell<Vec<String>>>,
+        authorized: bool,
+        epoch: u64,
+    ) -> Self {
+        let mut heap = ActorHeap::new(1024 * 1024);
+        heap.set_actor_id(ACTOR_ID);
+        Self {
+            store: LibsqlStore::new(&db.path).expect("open file-backed store"),
+            actor: actor(authorized, epoch),
+            provider,
+            observed,
+            heap,
+            gc: OrcaGc::new(ACTOR_ID),
+        }
+    }
+}
+
+impl ActorVmCallbacks for Callback {
+    fn current_actor_id(&self) -> Option<u64> {
+        Some(ACTOR_ID)
+    }
+
+    fn alloc(&mut self, size: usize, type_tag: HeapTypeTag) -> Option<*mut u8> {
+        self.heap.alloc(size, type_tag)
+    }
+
+    fn drop_ref(&mut self, ptr: *mut u8) {
+        unsafe { self.gc.drop_local_ref(&mut self.heap, ptr) };
+    }
+
+    fn retain_ref(&mut self, ptr: *mut u8) {
+        unsafe { self.gc.local_ref(&self.heap, ptr) };
+    }
+
+    fn array_len(&self, ptr: *mut u8) -> Option<usize> {
+        unsafe {
+            let header = &*ActorHeap::header_of(ptr);
+            if header.type_tag == HeapTypeTag::Array {
+                Some((header.size - ActorHeap::HEADER_SIZE) / std::mem::size_of::<Value>())
+            } else {
+                None
+            }
+        }
+    }
+
+    fn spawn_actor(
+        &mut self,
+        _module: &CodeModule,
+        _spawn_pc: usize,
+        _behavior_idx: usize,
+        _init: Vec<(String, Value)>,
+    ) -> Value {
+        Value::actor_ref(0)
+    }
+
+    fn send_message(&mut self, _target: Value, _behavior_id: u16, _args: &[Value]) {}
+
+    fn perform_async_at_site(
+        &mut self,
+        module: &CodeModule,
+        pc: usize,
+        effect_op: &str,
+        args: &[Value],
+    ) -> NuResult<PerformAsyncResult> {
+        // The trusted host defines a canonical byte-encoding of the provider
+        // request. Never derive a durable key from transient VM register bits.
+        let request = args
+            .first()
+            .and_then(Value::as_string_id)
+            .and_then(|id| module.constants.get(id as usize))
+            .and_then(|c| match c {
+                Constant::String(s) => Some(s.as_bytes()),
+                _ => None,
+            })
+            .ok_or_else(|| NuError::VMError {
+                msg: "invalid durable provider request".into(),
+                span: Span::default(),
+            })?;
+
+        let invocation = DurableVmAsyncInvocation {
+            actor: &self.actor,
+            authority: &grant(),
+            execution_key: EXECUTION_KEY,
+            occurrence_index: 0,
+            request,
+        };
+        let mut coordinator =
+            DurableEffectCoordinator::new(&mut self.store, ACTOR_ID, self.actor.activation_epoch);
+        let result = coordinator.execute_vm_async_text_with_deduplication(
+            module,
+            pc,
+            effect_op,
+            invocation,
+            |key, request| {
+                let mut provider = self.provider.borrow_mut();
+                provider.attempts += 1;
+                let response = if let Some(path) = provider.disk_path.clone() {
+                    // The subprocess fake models a provider-side idempotency
+                    // ledger independent of the Nulang effect journal.
+                    if path.try_exists()? {
+                        let saved = fs::read(&path)?;
+                        let split =
+                            saved
+                                .iter()
+                                .position(|byte| *byte == b'\n')
+                                .ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "invalid provider receipt record",
+                                    )
+                                })?;
+                        if &saved[..split] != key.as_bytes() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "provider idempotency key changed on retry",
+                            ));
+                        }
+                        saved[split + 1..].to_vec()
+                    } else {
+                        let response = [b"receipt:".as_slice(), request].concat();
+                        let mut file = fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&path)?;
+                        file.write_all(key.as_bytes())?;
+                        file.write_all(b"\n")?;
+                        file.write_all(&response)?;
+                        file.sync_all()?;
+                        provider.mutations += 1;
+                        if provider.pause_after_commit {
+                            // Publish the checkpoint only after the provider
+                            // ledger has been synced. The parent sends SIGKILL
+                            // while the VM is still inside external dispatch.
+                            drop(file);
+                            let pending = path.with_file_name("provider-ready.pending");
+                            let ready = path.with_file_name("provider-ready");
+                            let mut marker = fs::File::create(&pending)?;
+                            marker.write_all(b"provider-committed")?;
+                            marker.sync_all()?;
+                            drop(marker);
+                            fs::rename(pending, ready)?;
+                            loop {
+                                std::thread::park();
+                            }
+                        }
+                        response
+                    }
+                } else if let Some(saved) = provider.committed.get(key) {
+                    saved.clone()
+                } else {
+                    provider.mutations += 1;
+                    let response = if provider.invalid_utf8_response {
+                        vec![0xff]
+                    } else {
+                        [b"receipt:".as_slice(), request].concat()
+                    };
+                    provider.committed.insert(key.to_owned(), response.clone());
+                    response
+                };
+                if provider.lose_first_response {
+                    provider.lose_first_response = false;
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "provider reply lost",
+                    ));
+                }
+                Ok(response)
+            },
+        )?;
+        if let PerformAsyncResult::Ready(Some(content)) = &result {
+            self.observed.borrow_mut().push(content.clone());
+        }
+        Ok(result)
+    }
+}
+
+fn execute_vm(
+    db: &TestDb,
+    provider: Rc<RefCell<Provider>>,
+    observed: Rc<RefCell<Vec<String>>>,
+    authorized: bool,
+    epoch: u64,
+    request: &str,
+    remove_site: bool,
+) -> NuResult<()> {
+    let mut module = compile_module();
+    let behavior_pc = module.behaviors[0].code_offset;
+    let string_id = module.add_string_constant(request);
+    if remove_site {
+        module.effect_sites.clear();
+    }
+    let mut vm = VM::new_without_jit();
+    vm.load_module(module);
+    vm.set_actor_callbacks(Box::new(Callback::new(
+        db, provider, observed, authorized, epoch,
+    )));
+    vm.call_function(0, behavior_pc, &[Value::string(string_id as u32)])?;
+    Ok(())
+}
+
+#[test]
+fn real_vm_retries_prepared_effect_after_store_reopen_with_same_provider_key() {
+    let db = TestDb::new();
+    let provider = Rc::new(RefCell::new(Provider {
+        lose_first_response: true,
+        ..Provider::default()
+    }));
+    let observed = Rc::new(RefCell::new(Vec::new()));
+
+    assert!(execute_vm(
+        &db,
+        provider.clone(),
+        observed.clone(),
+        true,
+        1,
+        REQUEST,
+        false
+    )
+    .is_err());
+    assert_eq!(
+        LibsqlStore::new(&db.path)
+            .unwrap()
+            .latest_sequence(ACTOR_ID),
+        1
+    );
+    assert_eq!(provider.borrow().attempts, 1);
+    assert_eq!(provider.borrow().mutations, 1);
+
+    execute_vm(
+        &db,
+        provider.clone(),
+        observed.clone(),
+        true,
+        1,
+        REQUEST,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        LibsqlStore::new(&db.path)
+            .unwrap()
+            .latest_sequence(ACTOR_ID),
+        2
+    );
+    assert_eq!(provider.borrow().attempts, 2);
+    assert_eq!(provider.borrow().mutations, 1);
+    assert_eq!(
+        observed.borrow().as_slice(),
+        &["receipt:order=42&cents=100"]
+    );
+
+    // A completed receipt is returned without any external provider call,
+    // even after both VM and persistence store are recreated again.
+    execute_vm(
+        &db,
+        provider.clone(),
+        observed.clone(),
+        true,
+        1,
+        REQUEST,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        LibsqlStore::new(&db.path)
+            .unwrap()
+            .latest_sequence(ACTOR_ID),
+        2
+    );
+    assert_eq!(provider.borrow().attempts, 2);
+    assert_eq!(observed.borrow().len(), 2);
+}
+
+#[test]
+fn vm_replay_rejects_revoked_grant_request_drift_and_missing_site() {
+    let db = TestDb::new();
+    let provider = Rc::new(RefCell::new(Provider::default()));
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    execute_vm(
+        &db,
+        provider.clone(),
+        observed.clone(),
+        true,
+        1,
+        REQUEST,
+        false,
+    )
+    .unwrap();
+
+    assert!(execute_vm(
+        &db,
+        provider.clone(),
+        observed.clone(),
+        false,
+        1,
+        REQUEST,
+        false
+    )
+    .is_err());
+    assert!(execute_vm(
+        &db,
+        provider.clone(),
+        observed.clone(),
+        true,
+        1,
+        "tampered",
+        false
+    )
+    .is_err());
+    assert!(execute_vm(
+        &db,
+        provider.clone(),
+        observed.clone(),
+        true,
+        1,
+        REQUEST,
+        true
+    )
+    .is_err());
+    assert_eq!(provider.borrow().attempts, 1);
+    assert_eq!(
+        LibsqlStore::new(&db.path)
+            .unwrap()
+            .latest_sequence(ACTOR_ID),
+        2
+    );
+    assert_eq!(observed.borrow().len(), 1);
+}
+
+#[test]
+fn vm_prepared_retry_rejects_stale_activation_after_new_owner_claims() {
+    let db = TestDb::new();
+    let provider = Rc::new(RefCell::new(Provider {
+        lose_first_response: true,
+        ..Provider::default()
+    }));
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    assert!(execute_vm(
+        &db,
+        provider.clone(),
+        observed.clone(),
+        true,
+        1,
+        REQUEST,
+        false
+    )
+    .is_err());
+
+    {
+        let mut store = LibsqlStore::new(&db.path).unwrap();
+        let spec = DurableEffectSpec::new(
+            DurableEffectId::derive(ACTOR_ID, "new-owner-epoch-claim", 0, "Test.claim"),
+            "Test.claim",
+            EffectBoundary::External,
+            DeliverySemantics::AtLeastOnce,
+        );
+        let mut current = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 2);
+        current.begin(spec, b"claim").unwrap();
+    }
+    assert_eq!(
+        LibsqlStore::new(&db.path)
+            .unwrap()
+            .latest_sequence(ACTOR_ID),
+        2
+    );
+    assert!(execute_vm(
+        &db,
+        provider.clone(),
+        observed.clone(),
+        true,
+        1,
+        REQUEST,
+        false
+    )
+    .is_err());
+    assert_eq!(provider.borrow().attempts, 1);
+    assert_eq!(provider.borrow().mutations, 1);
+    assert!(observed.borrow().is_empty());
+    assert_eq!(
+        LibsqlStore::new(&db.path)
+            .unwrap()
+            .latest_sequence(ACTOR_ID),
+        2
+    );
+}
+
+#[test]
+fn vm_invalid_text_receipt_fails_closed_and_never_redispatches() {
+    let db = TestDb::new();
+    let provider = Rc::new(RefCell::new(Provider {
+        invalid_utf8_response: true,
+        ..Provider::default()
+    }));
+    let observed = Rc::new(RefCell::new(Vec::new()));
+
+    // The provider mutation and receipt are already durable by the time the
+    // text-only adapter detects an invalid UTF-8 result. Replay must keep
+    // failing closed and never call the provider again.
+    for _ in 0..2 {
+        let error = execute_vm(
+            &db,
+            provider.clone(),
+            observed.clone(),
+            true,
+            1,
+            REQUEST,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                NuError::VMError { msg, .. }
+                    if msg.lines().next() == Some("durable VM effect receipt is not valid UTF-8")
+            ),
+            "unexpected VM error: {error:?}"
+        );
+        assert_eq!(provider.borrow().attempts, 1);
+        assert_eq!(provider.borrow().mutations, 1);
+        assert!(observed.borrow().is_empty());
+        assert_eq!(
+            LibsqlStore::new(&db.path)
+                .unwrap()
+                .latest_sequence(ACTOR_ID),
+            2,
+            "terminal invalid receipt must remain durable across recovery"
+        );
+    }
+}
+
+/// Guarantee the test reaps its worker even if a checkpoint assertion panics.
+struct CrashWorker(Child);
+
+impl Drop for CrashWorker {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+#[test]
+fn process_kill_after_provider_commit_restarts_vm_with_one_external_mutation() {
+    let db = TestDb::new();
+    let receipt_path = db.dir.join("provider-receipt");
+    let ready_path = db.dir.join("provider-ready");
+    let mut child = CrashWorker(
+        Command::new(std::env::current_exe().expect("integration test binary"))
+            .arg("--exact")
+            .arg("durable_vm_crash_fixture_child")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env("NULANG_VM_BRIDGE_DB_PATH", &db.path)
+            .env("NULANG_VM_BRIDGE_PROVIDER_PATH", &receipt_path)
+            .spawn()
+            .expect("launch isolated VM subprocess"),
+    );
+    let deadline = Instant::now() + CRASH_TIMEOUT;
+    loop {
+        if ready_path.try_exists().expect("inspect crash checkpoint") {
+            assert_eq!(
+                fs::read(&ready_path).expect("read checkpoint"),
+                b"provider-committed"
+            );
+            break;
+        }
+        if let Some(status) = child.0.try_wait().expect("poll child") {
+            panic!("VM worker exited before provider commit: {status}");
+        }
+        assert!(Instant::now() < deadline, "VM crash worker timed out");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child
+        .0
+        .kill()
+        .expect("kill VM while provider dispatch is paused");
+    let status = child.0.wait().expect("reap terminated VM");
+    assert!(!status.success(), "child must not exit normally");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+    assert!(
+        receipt_path.is_file(),
+        "provider must durably commit before exit"
+    );
+    assert_eq!(
+        LibsqlStore::new(&db.path)
+            .unwrap()
+            .latest_sequence(ACTOR_ID),
+        1,
+        "prepared intent must precede provider commit and survive SIGKILL"
+    );
+
+    // The parent is a separate process from the killed child. Recover with a
+    // fresh VM, callback and database connection. The external
+    // provider's idempotency ledger survives independently on disk.
+    let provider = Rc::new(RefCell::new(Provider {
+        disk_path: Some(receipt_path),
+        ..Provider::default()
+    }));
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    execute_vm(
+        &db,
+        provider.clone(),
+        observed.clone(),
+        true,
+        1,
+        REQUEST,
+        false,
+    )
+    .unwrap();
+    assert_eq!(provider.borrow().attempts, 1);
+    assert_eq!(
+        provider.borrow().mutations,
+        0,
+        "the persisted provider result must be reused"
+    );
+    assert_eq!(
+        observed.borrow().as_slice(),
+        &["receipt:order=42&cents=100"]
+    );
+    assert_eq!(
+        LibsqlStore::new(&db.path)
+            .unwrap()
+            .latest_sequence(ACTOR_ID),
+        2
+    );
+
+    execute_vm(&db, provider.clone(), observed, true, 1, REQUEST, false).unwrap();
+    assert_eq!(
+        provider.borrow().attempts,
+        1,
+        "completed VM replay must not call provider"
+    );
+    assert_eq!(
+        LibsqlStore::new(&db.path)
+            .unwrap()
+            .latest_sequence(ACTOR_ID),
+        2
+    );
+}
+
+#[test]
+#[ignore = "subprocess crash fixture; invoked only by the parent test"]
+fn durable_vm_crash_fixture_child() {
+    let db = TestDb::from_existing(PathBuf::from(
+        std::env::var_os("NULANG_VM_BRIDGE_DB_PATH").expect("parent db path"),
+    ));
+    let provider_path = PathBuf::from(
+        std::env::var_os("NULANG_VM_BRIDGE_PROVIDER_PATH").expect("parent provider path"),
+    );
+    let provider = Rc::new(RefCell::new(Provider {
+        disk_path: Some(provider_path),
+        pause_after_commit: true,
+        ..Provider::default()
+    }));
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let result = execute_vm(&db, provider, observed, true, 1, REQUEST, false);
+    panic!("fixture must be killed while provider receipt is not yet acknowledged: {result:?}");
+}

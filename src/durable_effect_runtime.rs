@@ -18,6 +18,8 @@ use crate::runtime::{
     Actor, ActorState, DurableCommit, DurableTransition, PersistenceStore,
     DURABLE_TRANSITION_VERSION,
 };
+use crate::types::{NuError, NuResult, Span};
+use crate::vm::PerformAsyncResult;
 use std::fmt;
 use std::io;
 
@@ -152,6 +154,23 @@ impl From<DurableEffectRuntimeError> for DurableAsyncDispatchError {
     fn from(error: DurableEffectRuntimeError) -> Self {
         Self::Recovery(error)
     }
+}
+
+/// Context the trusted VM host must derive from the currently admitted actor
+/// turn before an external provider is called. This is not inferred from VM
+/// registers: those are ephemeral and include nonportable pointer values.
+///
+/// The host must check the artifact provenance separately and encode the
+/// provider's *actual* request bytes deterministically. It must reuse the same
+/// execution key and dynamic occurrence index after a crash. Authority must
+/// come from the live actor's manifest, not an untrusted request.
+#[derive(Clone, Copy)]
+pub struct DurableVmAsyncInvocation<'a> {
+    pub actor: &'a Actor,
+    pub authority: &'a AuthorityGrant,
+    pub execution_key: &'a str,
+    pub occurrence_index: u32,
+    pub request: &'a [u8],
 }
 
 /// Coordinates one actor/entity/workflow's durable external effects.
@@ -296,6 +315,77 @@ impl<'a> DurableEffectCoordinator<'a> {
             }
             _ => Err(DurableAsyncDispatchError::UnexpectedDecision),
         }
+    }
+
+    /// Opt-in bridge between a real VM `PerformAsync` callback and the
+    /// existing durable intent/provider/receipt state machine.
+    ///
+    /// The VM callback supplies the exact loaded `CodeModule`, opcode PC
+    /// and observed operation, while the trusted host supplies actor identity,
+    /// authority, replay-stable turn/occurrence and canonical provider request.
+    /// The operation is checked against compiler metadata before journaling.
+    ///
+    /// This adapter is deliberately limited to UTF-8 text responses and the
+    /// exact unparameterized authority supported by the coordinator. Other
+    /// result kinds need a versioned, lossless codec; silently turning invalid
+    /// bytes or a denied dispatch into nil would violate replay semantics.
+    /// On invalid UTF-8, Completed may already be durable but replay still
+    /// fails closed without invoking the provider again.
+    ///
+    /// The artifact MUST have been verified and pinned by the host prior to
+    /// this call. The default runtime callbacks do not enable this path.
+    pub fn execute_vm_async_text_with_deduplication<F>(
+        &mut self,
+        module: &CodeModule,
+        pc: usize,
+        invoked_operation: &str,
+        invocation: DurableVmAsyncInvocation<'_>,
+        dispatch: F,
+    ) -> NuResult<PerformAsyncResult>
+    where
+        F: FnOnce(&str, &[u8]) -> io::Result<Vec<u8>>,
+    {
+        // The observed VM opcode, compiler metadata and coordinator's
+        // compiled-effect verification must all agree before any transition.
+        let site = module.effect_site_at(pc).ok_or_else(|| NuError::VMError {
+            msg: format!("durable VM effect missing compiler metadata at pc {pc}"),
+            span: Span::default(),
+        })?;
+        if site.effect_operation != invoked_operation {
+            return Err(NuError::VMError {
+                msg: format!(
+                    "durable VM effect operation mismatch at pc {pc}: expected {}, got {}",
+                    site.effect_operation, invoked_operation
+                ),
+                span: Span::default(),
+            });
+        }
+        if !invocation.actor.persistent {
+            return Err(NuError::VMError {
+                msg: "durable VM effect requires a persistent actor".into(),
+                span: Span::default(),
+            });
+        }
+        let receipt = self
+            .execute_compiled_async_with_deduplication(
+                invocation.actor,
+                invocation.authority,
+                module,
+                pc,
+                invocation.execution_key,
+                invocation.occurrence_index,
+                invocation.request,
+                dispatch,
+            )
+            .map_err(|error| NuError::VMError {
+                msg: format!("durable VM effect rejected: {error}"),
+                span: Span::default(),
+            })?;
+        let response = String::from_utf8(receipt).map_err(|_| NuError::VMError {
+            msg: "durable VM effect receipt is not valid UTF-8".into(),
+            span: Span::default(),
+        })?;
+        Ok(PerformAsyncResult::Ready(Some(response)))
     }
 
     /// Persist the terminal result for a previously prepared effect.

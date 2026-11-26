@@ -27,5 +27,15 @@ class DurableReleaseGateTests(unittest.TestCase):
         self.assertIn("set -euo pipefail", gate)
 
 
+    def test_sqlite_vm_callback_is_an_explicit_release_gate(self):
+        gate = (ROOT / "scripts" / "test-durability-guarantees.sh").read_text()
+        required = (
+            "cargo test --locked --no-default-features --features sqlite "
+            "--test durable_vm_callback_bridge"
+        )
+        self.assertIn(required + "\n", gate)
+        self.assertIn("set -euo pipefail", gate)
+
+
 if __name__ == "__main__":
     unittest.main()
