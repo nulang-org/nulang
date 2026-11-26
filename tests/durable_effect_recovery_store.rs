@@ -1013,7 +1013,26 @@ fn sqlite_workflow_outbox_and_inbox_rollback_and_reopen() {
     assert_eq!(store.load_snapshot(42).unwrap().sequence, 0);
     assert!(store.read_workflow_events(42).is_empty());
     raw.execute_batch("DROP TRIGGER fail_close;").unwrap();
+    raw.execute_batch("CREATE TRIGGER fail_dispatch_index BEFORE INSERT ON durable_workflow_outbox BEGIN SELECT RAISE(ABORT, 'dispatch index fault'); END;").unwrap();
+    assert!(store.commit_transition(terminal.clone()).is_err());
+    assert!(store.load_durable_outbox_message(id).unwrap().is_none());
+    assert!(store.load_workflow_outbox_message(id).unwrap().is_none());
+    assert!(store
+        .pending_workflow_outbox(42, None, 1)
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.latest_sequence(42), 5);
+    assert_eq!(store.load_snapshot(42).unwrap().sequence, 0);
+    assert!(store.load_open_workflow_command(42).unwrap().is_some());
+    raw.execute_batch("DROP TRIGGER fail_dispatch_index;")
+        .unwrap();
+
     store.commit_transition(terminal).unwrap();
+    assert_eq!(
+        store.pending_workflow_outbox(42, None, 1).unwrap(),
+        vec![id]
+    );
+    assert!(store.load_workflow_outbox_message(id).unwrap().is_some());
     store
         .save_snapshot(ActorSnapshot {
             actor_id: 77,
@@ -1035,6 +1054,10 @@ fn sqlite_workflow_outbox_and_inbox_rollback_and_reopen() {
         store.load_workflow_inbox_admission(id).unwrap(),
         Some(WorkflowActivationId::new(77, 1))
     );
+    assert!(store
+        .pending_workflow_outbox(42, None, 1)
+        .unwrap()
+        .is_empty());
     assert!(store.load_open_workflow_command(77).unwrap().is_some());
     close_receiver(&mut store);
     drop(store);

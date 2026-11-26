@@ -278,6 +278,24 @@ This experimental path scans the post-command portion of effect history; there
 is no dedicated index or throughput claim yet. Backends without slot recovery
 return Unsupported.
 
+The existing SQLite VM fixture exercises the effect replay path with compiled
+workflow bytecode, a committed command sequence, lost provider reply,
+repeated dynamic execution of one site, and replay from a reopened store
+with a fresh actor. Distinct occurrences and new commands produce distinct
+keys, while replay of completed occurrences does not call the provider.
+The later-occurrence case also checks a newer ownership epoch, pending site
+drift, and reuse of the original logical key after replay of an earlier receipt.
+A reopened-store regression rejects site drift with an empty in-memory cursor
+both before and after completion and replays the original receipt without a
+provider call. Storage tests exercise immutable bindings, monotonic completion,
+idempotent exact-tail retry and rollback of conflicting writes in both MemoryStore
+and SQLite.
+The admission tests also distinguish a generic atomic tail from true workflow
+admission, deny a closed command from a fresh VM cursor after database reopen,
+and inject failures in both SQLite admission and closure writes to verify
+atomic rollback. These are trusted fixture results, not proof of production
+workflow recovery.
+
 ### Same-store workflow inbox/outbox (experimental storage contract)
 
 A successful tracked terminal transition may stage outbound actor messages.
@@ -300,12 +318,12 @@ closes. Exact-tail commit retries remain idempotent. The lookup
 an unfinished admitted activation rather than dispatch it again.
 
 SQLite adds the `durable_workflow_inbox` table; absence of the optional
-identity preserves existing transition digests. No transport, mailbox,
-acknowledgment, or automatic dispatch is enabled by this contract.
+identity preserves existing transition digests. The storage contract alone
+does not provide transport or automatic dispatch.
 It assumes a trusted host, a shared store, and stable actor identities
 without destructive clear/reuse or mixed-version writers. Cross-store
-delivery, outbox polling/acknowledgment and retention, remote libSQL
-qualification, mailbox staging, atomic intermediate events, timers,
+delivery, outbox retention and execution-completion acknowledgment, remote libSQL
+qualification, atomic intermediate events, timers,
 suspension and production cross-epoch recovery remain unqualified.
 The general compiled workflow scheduler still uses the legacy journal path
 and **must not** use this adapter until those paths are qualified.
@@ -319,7 +337,8 @@ messages remain private to the executing turn, with zero-based ordinals in
 call order. The buffer is bound to the live activation and epoch, sealed on
 handler return, and committed with the reconciled terminal snapshot. A rejected
 staging attempt poisons the turn even when its error is ignored. At most 1024
-messages may be staged per turn; non-finite floats are rejected.
+messages may be staged per turn; non-finite floats, integers or actor IDs
+outside the VM representation, and embedded-NUL strings are rejected.
 
 The terminal helper checks that each receiver is a live, same-shard,
 non-hibernated persistent workflow with an ordinary Rust behavior and an
@@ -329,25 +348,55 @@ activation and recover the original admitted command; no messages are
 published to mailboxes. A replay reconstructs the staging buffer. Native
 handler registration and stable destination behavior IDs remain host
 responsibilities. Ordinary send semantics and bytecode/AOT dispatch are
-unchanged. No automatic outbox delivery or inbox acknowledgment is enabled.
+unchanged. No automatic outbox delivery is enabled.
 
-The existing SQLite VM fixture exercises this opt-in path with compiled
-workflow bytecode, a committed command sequence, lost provider reply,
-repeated dynamic execution of one site, and replay from a reopened store
-with a fresh actor. Distinct occurrences and new commands produce distinct
-keys, while replay of completed occurrences does not call the provider.
-The later-occurrence case also checks a newer ownership epoch, pending site
-drift, and reuse of the original logical key after replay of an earlier receipt.
-A reopened-store regression rejects site drift with an empty in-memory cursor
-both before and after completion and replays the original receipt without a
-provider call. Storage tests exercise immutable bindings, monotonic completion,
-idempotent exact-tail retry and rollback of conflicting writes in both MemoryStore
-and SQLite.
-The admission tests also distinguish a generic atomic tail from true workflow
-admission, deny a closed command from a fresh VM cursor after database reopen,
-and inject failures in both SQLite admission and closure writes to verify
-atomic rollback. These are trusted fixture results, not proof of production
-workflow recovery.
+### Opt-in same-store outbox dispatcher (experimental)
+
+A host may call `Runtime::pending_workflow_outbox(sender, after, limit)`
+between scheduler turns to discover unadmitted tracked workflow messages.
+Pages contain at most 1024 identities in (sender sequence, ordinal) order.
+The cursor is exclusive; wrap to `None` on the next scan so a deferred
+destination does not block unrelated messages. The host supplies known
+sender IDs, controls polling cadence and must retry deferred work. A page
+is not a reservation. It does not guarantee dispatch order across calls.
+
+`Runtime::dispatch_workflow_outbox(id)` loads a committed tracked message,
+rechecks destination eligibility and requires a quiescent same-shard
+ordinary Rust workflow receiver with no open command or mailbox work.
+The receiver's command and inbox receipt commit atomically before volatile
+mailbox publication. Busy or unavailable receivers return `Deferred`
+without acknowledgment; `Admitted` and `AlreadyAdmitted` carry the original
+activation, not proof of terminal execution. A duplicate never queues a new
+command. The explicitly admitted command takes precedence over later
+system traffic; selective receive and synchronous asks cannot consume or
+overtake it. Payloads that cannot round-trip into the receiver's VM values
+are rejected before admission.
+
+After interruption between admission, publication and execution, recover
+the receiver from the store and register its native handlers with stable
+behavior IDs before scheduling. The original journal entry is recovered
+into the admitted mailbox slot, not readmitted. A recovered command with
+no registered handler is parked; a retry of its original outbox identity
+can wake it after registration. After an ambiguous commit error, look up
+the receipt and recover the receiver if needed. Do not send an ordinary
+message to compensate. Polling excludes admitted messages even if the
+receiver has not completed its handler.
+
+MemoryStore and local SQLite support the opt-in path. SQLite adds an
+atomic `durable_workflow_outbox` identity index populated only by tracked
+successful terminal commits. Generic/legacy outbox rows and pre-index
+SQLite rows are not auto-qualified or backfilled. The dispatcher never
+deletes receipts or messages. This is not automatic scheduling, durable
+FIFO across senders, cross-shard/cross-store messaging, or exactly-once
+external side effects. This release slice does not qualify native handler
+identity changes, ownership transfer, remote libSQL, destructive clear,
+retention, or mixed-version writers.
+
+Tests cover rollback of receiver admission, reopen at the admission/publication
+cut, loss after mailbox publication, and OS process termination after admission
+but before handler execution. The durability release gate runs the SQLite
+workflow library suite, including these tests.
+
 
 ## What is not yet a production-wide guarantee
 
