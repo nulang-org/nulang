@@ -420,25 +420,26 @@ impl<'a> DurableEffectCoordinator<'a> {
     where
         F: FnOnce(&str, &[u8]) -> io::Result<Vec<u8>>,
     {
-        self.require_claimed_activation()?;
+        self.require_open_workflow_command(binding.activation)?;
         let existing = self.load_bound_workflow_effect(binding, &spec, request)?;
         if let Some(record) = &existing {
             if let DurableEffectRecoveryAction::ReplayRecordedResult(receipt) =
                 record.effect().recovery_action()
             {
+                self.require_open_workflow_command(binding.activation)?;
                 return Ok(receipt.to_vec());
             }
         } else {
             let prepared = DurableEffectRecord::prepare(spec.clone(), request);
             self.commit_record(workflow_persistence_record(binding, prepared)?)?;
         }
-        self.require_claimed_activation()?;
+        self.require_open_workflow_command(binding.activation)?;
         let receipt = dispatch(&spec.id.idempotency_key(), request)
             .map_err(DurableAsyncDispatchError::Provider)?;
 
         // Re-read the independently keyed slot after provider execution:
         // never reconstruct a terminal record from an unverified old request.
-        self.require_claimed_activation()?;
+        self.require_open_workflow_command(binding.activation)?;
         let record = self
             .load_bound_workflow_effect(binding, &spec, request)?
             .ok_or(DurableEffectRuntimeError::MissingPreparedEffect { effect_id: spec.id })?;
@@ -527,8 +528,8 @@ impl<'a> DurableEffectCoordinator<'a> {
     ///
     /// The trusted host MUST have admitted (or recovered) the open command
     /// atomically, verified and pinned its artifact, and replay from the safe
-    /// pre-command boundary on a fresh actor. A tail check is only a necessary
-    /// fence, not proof that a command is open or was atomically admitted.
+    /// pre-command boundary on a fresh actor. The store checks explicit open
+    /// command admission and the current owner epoch, not just the tail.
     /// Do not use this with the legacy compiled-workflow scheduler.
     ///
     /// Effects are numbered in the deterministic order in which this adapter
@@ -605,17 +606,9 @@ impl<'a> DurableEffectCoordinator<'a> {
             .authorized_compiled_spec(actor, authority, module, pc, &execution_key, occurrence)
             .map_err(|error| vm_effect_error(format!("durable VM effect rejected: {error}")))?;
 
-        self.store
-            .load_durable_tail_position(actor.id)
+        self.require_open_workflow_command(activation)
             .map_err(|error| {
-                vm_effect_error(format!("durable workflow tail read failed: {error}"))
-            })?
-            .filter(|tail| {
-                tail.sequence >= activation.command_sequence
-                    && tail.activation_epoch == actor.activation_epoch
-            })
-            .ok_or_else(|| {
-                vm_effect_error("durable workflow effect requires a current atomic tail")
+                vm_effect_error(format!("durable workflow admission rejected: {error}"))
             })?;
         // Keep this check separate from the coordinator's commit fence:
         // even completed replay requires an admitted live workflow owner.
@@ -684,6 +677,24 @@ impl<'a> DurableEffectCoordinator<'a> {
         Ok(durable_result)
     }
 
+    fn require_open_workflow_command(
+        &self,
+        activation: WorkflowActivationId,
+    ) -> Result<(), DurableEffectRuntimeError> {
+        let open = self
+            .store
+            .load_open_workflow_command(self.actor_id)?
+            .ok_or_else(|| {
+                workflow_binding_error("durable workflow requires proven open atomic admission")
+            })?;
+        if open.activation != activation || open.tail.activation_epoch != self.activation_epoch {
+            return Err(workflow_binding_error(
+                "durable workflow command or owner epoch does not match open admission",
+            ));
+        }
+        Ok(())
+    }
+
     /// A prepared intent may predate an actor's current activation, but
     /// redispatch is allowed only after the owner's new epoch is durably
     /// claimed. This read fence does not replace provider-side deduplication
@@ -745,6 +756,7 @@ impl<'a> DurableEffectCoordinator<'a> {
             sequence,
             expected_previous_sequence: previous,
             command: None,
+            workflow_admission: false,
             snapshot: None,
             workflow_events: Vec::new(),
             domain_events: Vec::new(),

@@ -9,8 +9,8 @@ use crate::bytecode::Constant;
 use crate::primitives::ActorRole;
 use crate::runtime::actor::Actor;
 use crate::runtime::persistence::{
-    ActorSnapshot, DurableTransition, EventEntry, JournalEntry, PersistedValue,
-    WorkflowActivationId, WorkflowEvent, WorkflowReplayEventId, DURABLE_TRANSITION_VERSION,
+    ActorSnapshot, DurableTransition, EventEntry, PersistedValue, WorkflowActivationId,
+    WorkflowEvent, WorkflowReplayEventId, DURABLE_TRANSITION_VERSION,
 };
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
 use crate::vm::{Frame, Value, VM};
@@ -253,31 +253,16 @@ pub(crate) fn commit_workflow_command(
             )
         })?;
     let expected_previous_sequence = rt.persistence.latest_sequence(actor_id);
-    let sequence = expected_previous_sequence.checked_add(1).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "workflow command transition sequence overflow",
-        )
-    })?;
-    let activation = WorkflowActivationId::new(actor_id, sequence);
-
-    rt.persistence.commit_transition(DurableTransition {
-        version: DURABLE_TRANSITION_VERSION,
+    let transition = DurableTransition::workflow_command(
         actor_id,
         activation_epoch,
-        sequence,
         expected_previous_sequence,
-        command: Some(JournalEntry {
-            sequence,
-            behavior_id,
-            payload,
-        }),
-        snapshot: None,
-        workflow_events: vec![],
-        domain_events: vec![],
-        durable_effects: vec![],
-        outbox: vec![],
-    })?;
+        behavior_id,
+        payload,
+    )?;
+    let sequence = transition.sequence;
+    let activation = WorkflowActivationId::new(actor_id, sequence);
+    rt.persistence.commit_transition(transition)?;
 
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.sequence = sequence;
@@ -320,6 +305,7 @@ pub(crate) fn commit_step_completed(
         sequence,
         expected_previous_sequence,
         command: None,
+        workflow_admission: false,
         snapshot: Some(snapshot.clone()),
         workflow_events: vec![WorkflowEvent::StepCompleted {
             sequence,

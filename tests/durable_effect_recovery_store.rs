@@ -2,7 +2,7 @@ use nulang::durable_effect::{DurableEffectId, DurableEffectRecord, DurableEffect
 use nulang::durable_effect_persistence::{DurableEffectPersistenceRecord, WorkflowEffectBinding};
 use nulang::primitives::{DeliverySemantics, EffectBoundary};
 use nulang::runtime::{
-    ActorSnapshot, DurableTransition, JournalEntry, JsonFileStore, MemoryStore, PersistenceStore,
+    ActorSnapshot, DurableTransition, JsonFileStore, MemoryStore, PersistenceStore,
     WorkflowActivationId, DURABLE_TRANSITION_VERSION,
 };
 use nulang::semantic_identity::{effect_site_id, EffectSiteOwnerKind};
@@ -37,6 +37,7 @@ fn transition(
         sequence: previous + 1,
         expected_previous_sequence: previous,
         command: None,
+        workflow_admission: false,
         snapshot: None,
         workflow_events: vec![],
         domain_events: vec![],
@@ -91,6 +92,10 @@ fn unsupported_store_fails_closed_instead_of_reporting_missing_effect() {
             .load_workflow_effect_occurrence(WorkflowActivationId::new(42, 1), 0)
             .unwrap_err()
             .kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    assert_eq!(
+        store.load_open_workflow_command(42).unwrap_err().kind(),
         std::io::ErrorKind::Unsupported
     );
     let _ = std::fs::remove_dir_all(base);
@@ -164,23 +169,14 @@ fn bound_completed(
 
 fn admit(store: &mut dyn PersistenceStore) {
     store
-        .commit_transition(DurableTransition {
-            version: DURABLE_TRANSITION_VERSION,
+        .save_snapshot(ActorSnapshot {
             actor_id: 42,
             activation_epoch: 1,
-            sequence: 1,
-            expected_previous_sequence: 0,
-            command: Some(JournalEntry {
-                sequence: 1,
-                behavior_id: 0,
-                payload: vec![],
-            }),
-            snapshot: None,
-            workflow_events: vec![],
-            domain_events: vec![],
-            durable_effects: vec![],
-            outbox: vec![],
+            ..ActorSnapshot::default()
         })
+        .unwrap();
+    store
+        .commit_transition(DurableTransition::workflow_command(42, 1, 0, 0, vec![]).unwrap())
         .unwrap();
 }
 
@@ -226,7 +222,7 @@ fn assert_slot_contract(store: &mut dyn PersistenceStore) {
         ..ActorSnapshot::default()
     });
     assert!(store.commit_transition(conflict).is_err());
-    assert!(store.load_snapshot(42).is_none());
+    assert_eq!(store.load_snapshot(42).unwrap().sequence, 0);
     assert!(store
         .load_durable_effect(42, other.effect().spec().id)
         .unwrap()
@@ -283,7 +279,10 @@ fn sqlite_workflow_slot_commit_is_immutable_and_atomic() {
 }
 
 fn assert_unbound_history_rejected(store: &mut dyn PersistenceStore) {
-    admit(store);
+    let mut legacy = DurableTransition::workflow_command(42, 1, 0, 0, vec![]).unwrap();
+    legacy.workflow_admission = false;
+    store.commit_transition(legacy).unwrap();
+    assert!(store.load_open_workflow_command(42).unwrap().is_none());
     let old = transition(
         store,
         42,
@@ -355,4 +354,300 @@ fn workflow_binding_codec_keeps_v1_unchanged_and_validates_v2_identity() {
         )
         .is_err());
     }
+}
+
+fn assert_workflow_admission_contract(store: &mut dyn PersistenceStore) {
+    use nulang::runtime::{EventEntry, JournalEntry, PersistedValue, WorkflowEvent};
+    assert!(store.load_open_workflow_command(42).unwrap().is_none());
+    let admission =
+        DurableTransition::workflow_command(42, 1, 0, 7, vec![PersistedValue::Int(8)]).unwrap();
+    assert!(
+        store.commit_transition(admission.clone()).is_err(),
+        "no safe snapshot"
+    );
+    assert_eq!(store.latest_sequence(42), 0);
+    store
+        .save_snapshot(ActorSnapshot {
+            actor_id: 42,
+            activation_epoch: 1,
+            ..ActorSnapshot::default()
+        })
+        .unwrap();
+    let mut invalid = admission.clone();
+    invalid.snapshot = store.load_snapshot(42);
+    assert!(store.commit_transition(invalid).is_err());
+    let admitted = store.commit_transition(admission.clone()).unwrap();
+    assert_eq!(
+        store.commit_transition(admission.clone()).unwrap(),
+        admitted
+    );
+    let mut changed = admission.clone();
+    changed.command.as_mut().unwrap().payload = vec![PersistedValue::Int(9)];
+    assert!(store.commit_transition(changed).is_err());
+    let open = store.load_open_workflow_command(42).unwrap().unwrap();
+    assert_eq!(open.activation, WorkflowActivationId::new(42, 1));
+    assert_eq!(open.tail.sequence, 1);
+    assert_eq!(open.tail.activation_epoch, 1);
+    assert_eq!(
+        store.read_journal(42)[0].payload,
+        vec![PersistedValue::Int(8)]
+    );
+    assert!(store
+        .commit_transition(DurableTransition::workflow_command(42, 1, 1, 7, vec![]).unwrap())
+        .is_err());
+    assert!(store
+        .append_journal(
+            42,
+            JournalEntry {
+                sequence: 2,
+                behavior_id: 7,
+                payload: vec![]
+            }
+        )
+        .is_err());
+    assert!(store
+        .save_snapshot(ActorSnapshot {
+            actor_id: 42,
+            sequence: 0,
+            activation_epoch: 1,
+            ..ActorSnapshot::default()
+        })
+        .is_err());
+    assert!(store
+        .append_workflow_event(
+            42,
+            WorkflowEvent::StepCompleted {
+                sequence: 2,
+                activation: Some(open.activation),
+                step_name: "step".into()
+            }
+        )
+        .is_err());
+    assert!(store
+        .append_event(
+            42,
+            EventEntry {
+                sequence: 2,
+                field_name: "count".into(),
+                event_name: "change".into(),
+                args: vec![],
+                value: PersistedValue::Int(1)
+            }
+        )
+        .is_err());
+    let record = bound_prepared(slot(0, 1), b"request");
+    let unbound = DurableEffectPersistenceRecord::from_effect(record.effect().clone());
+    assert!(store
+        .commit_transition(transition(store, 42, 1, unbound))
+        .is_err());
+    assert!(
+        store
+            .commit_transition(transition(store, 42, 2, record.clone()))
+            .is_err(),
+        "effect cannot itself claim a newer epoch"
+    );
+    store
+        .commit_transition(transition(store, 42, 1, record.clone()))
+        .unwrap();
+
+    let expected = store.latest_sequence(42);
+    let mut terminal = DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id: 42,
+        activation_epoch: 1,
+        sequence: expected + 1,
+        expected_previous_sequence: expected,
+        command: None,
+        workflow_admission: false,
+        snapshot: Some(ActorSnapshot {
+            actor_id: 42,
+            activation_epoch: 1,
+            sequence: expected + 1,
+            ..ActorSnapshot::default()
+        }),
+        workflow_events: vec![WorkflowEvent::StepCompleted {
+            sequence: expected + 1,
+            activation: Some(open.activation),
+            step_name: "step".into(),
+        }],
+        domain_events: vec![],
+        durable_effects: vec![],
+        outbox: vec![],
+    };
+    assert!(
+        store.commit_transition(terminal.clone()).is_err(),
+        "cannot close while an effect is Prepared"
+    );
+    assert_eq!(store.load_snapshot(42).unwrap().sequence, 0);
+    assert_eq!(store.latest_sequence(42), expected);
+    store
+        .commit_transition(transition(
+            store,
+            42,
+            1,
+            bound_completed(&record, b"receipt"),
+        ))
+        .unwrap();
+    terminal.sequence += 1;
+    terminal.expected_previous_sequence += 1;
+    terminal.snapshot.as_mut().unwrap().sequence = terminal.sequence;
+    terminal.workflow_events = vec![WorkflowEvent::StepCompleted {
+        sequence: terminal.sequence,
+        activation: Some(open.activation),
+        step_name: "step".into(),
+    }];
+    let mut unqualified = terminal.clone();
+    unqualified.snapshot = None;
+    assert!(store.commit_transition(unqualified).is_err());
+    let closed = store.commit_transition(terminal.clone()).unwrap();
+    assert_eq!(store.commit_transition(terminal.clone()).unwrap(), closed);
+    assert!(store.load_open_workflow_command(42).unwrap().is_none());
+    assert!(store
+        .commit_transition(transition(
+            store,
+            42,
+            1,
+            bound_prepared(slot(1, 1), b"request")
+        ))
+        .is_err());
+    let next = DurableTransition::workflow_command(42, 1, closed.sequence, 8, vec![]).unwrap();
+    let sequence = next.sequence;
+    store.commit_transition(next).unwrap();
+    assert_eq!(
+        store
+            .load_open_workflow_command(42)
+            .unwrap()
+            .unwrap()
+            .activation
+            .command_sequence,
+        sequence
+    );
+}
+
+#[test]
+fn memory_atomic_admission_lifecycle() {
+    assert_workflow_admission_contract(&mut MemoryStore::new());
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_atomic_admission_lifecycle() {
+    assert_workflow_admission_contract(&mut nulang::runtime::LibsqlStore::in_memory().unwrap());
+}
+
+#[test]
+fn workflow_admission_digest_distinguishes_explicit_marker() {
+    let admission = DurableTransition::workflow_command(42, 1, 0, 0, vec![]).unwrap();
+    let mut generic = admission.clone();
+    generic.workflow_admission = false;
+    assert_ne!(admission.digest().unwrap(), generic.digest().unwrap());
+    // Exact canonical digest for the pre-marker v1 envelope. Not merely
+    // comparing two digests generated by the new implementation.
+    let old = r#"{"activation_epoch":1,"actor_id":42,"command":{"behavior_id":0,"payload":[],"sequence":1},"domain_events":[],"durable_effects":[],"expected_previous_sequence":0,"outbox":[],"sequence":1,"snapshot":null,"version":1,"workflow_events":[]}"#;
+    assert_eq!(
+        generic.digest().unwrap(),
+        *blake3::hash(old.as_bytes()).as_bytes()
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_admission_and_terminal_marker_rollback_and_reopen() {
+    use nulang::runtime::{LibsqlStore, WorkflowEvent};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let path = std::env::temp_dir().join(format!(
+        "nulang-workflow-admission-{}-{}.db",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut store = LibsqlStore::new(&path).unwrap();
+    store
+        .save_snapshot(ActorSnapshot {
+            actor_id: 42,
+            activation_epoch: 1,
+            ..ActorSnapshot::default()
+        })
+        .unwrap();
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    // Force a database error *after* journal and durable transition inserts.
+    raw.execute_batch("CREATE TRIGGER fail_admit BEFORE INSERT ON durable_workflow_admissions BEGIN SELECT RAISE(ABORT, 'admission fault'); END;").unwrap();
+    let admission = DurableTransition::workflow_command(42, 1, 0, 7, vec![]).unwrap();
+    assert!(store.commit_transition(admission.clone()).is_err());
+    assert!(store.read_journal(42).is_empty());
+    assert!(store.load_durable_tail_position(42).unwrap().is_none());
+    assert!(store.load_open_workflow_command(42).unwrap().is_none());
+    raw.execute_batch("DROP TRIGGER fail_admit;").unwrap();
+    store.commit_transition(admission).unwrap();
+    drop(store);
+    let mut store = LibsqlStore::new(&path).unwrap();
+    let activation = store
+        .load_open_workflow_command(42)
+        .unwrap()
+        .unwrap()
+        .activation;
+    assert_eq!(activation, WorkflowActivationId::new(42, 1));
+    let mut competing = LibsqlStore::new(&path).unwrap();
+    assert!(competing
+        .commit_transition(DurableTransition::workflow_command(42, 1, 1, 8, vec![]).unwrap())
+        .is_err());
+    assert!(competing
+        .save_snapshot(ActorSnapshot {
+            actor_id: 42,
+            sequence: 0,
+            activation_epoch: 1,
+            ..ActorSnapshot::default()
+        })
+        .is_err());
+    drop(competing);
+
+    let close = DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id: 42,
+        activation_epoch: 1,
+        sequence: 2,
+        expected_previous_sequence: 1,
+        command: None,
+        workflow_admission: false,
+        snapshot: Some(ActorSnapshot {
+            actor_id: 42,
+            activation_epoch: 1,
+            sequence: 2,
+            ..ActorSnapshot::default()
+        }),
+        workflow_events: vec![WorkflowEvent::StepCompleted {
+            sequence: 2,
+            activation: Some(activation),
+            step_name: "step".into(),
+        }],
+        domain_events: vec![],
+        durable_effects: vec![],
+        outbox: vec![],
+    };
+    raw.execute_batch("CREATE TRIGGER fail_close BEFORE UPDATE ON durable_workflow_admissions BEGIN SELECT RAISE(ABORT, 'closure fault'); END;").unwrap();
+    assert!(store.commit_transition(close.clone()).is_err());
+    assert_eq!(store.load_snapshot(42).unwrap().sequence, 0);
+    assert!(store.read_workflow_events(42).is_empty());
+    assert_eq!(
+        store
+            .load_open_workflow_command(42)
+            .unwrap()
+            .unwrap()
+            .tail
+            .sequence,
+        1
+    );
+    raw.execute_batch("DROP TRIGGER fail_close;").unwrap();
+    store.commit_transition(close).unwrap();
+    drop(store);
+    drop(raw);
+    let store = LibsqlStore::new(&path).unwrap();
+    assert!(store.load_open_workflow_command(42).unwrap().is_none());
+    assert_eq!(store.load_snapshot(42).unwrap().sequence, 2);
+    assert_eq!(store.read_journal(42).len(), 1);
+    assert_eq!(store.read_workflow_events(42).len(), 1);
+    drop(store);
+    std::fs::remove_file(path).unwrap();
 }

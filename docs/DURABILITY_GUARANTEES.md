@@ -222,14 +222,26 @@ from custom workflow-event replay. It advances only after a terminal text
 receipt is successfully returned, including receipt replay. A failed attempt
 keeps the current occurrence and pins the site/request while the actor lives.
 Retry with a different site or request, invalid/mismatched activation, an
-older command, or a transferred cursor fails closed. A current atomic tail
-with the same epoch is required even for receipt replay.
+older command, or a transferred cursor fails closed. Storage-proven open
+admission with the same owner epoch is required even for receipt replay.
 
-The trusted host must establish that the command actually was atomically
-accepted and remains open, use the same verified/pinned bytecode, and replay
-from its safe pre-command boundary. A tail alone does not prove admission
-or command openness. The ordinal is reconstructed by deterministic execution
-of the recovered command, not serialized as a continuation or inferred by
+`DurableTransition::workflow_command` constructs an explicit standalone command
+admission. MemoryStore and SQLite persist the command journal entry and current
+open-command metadata together with the fenced tail. They require a safe
+pre-command snapshot and reject overlapping admissions, stale owners, legacy
+writes while open, unbound effects, and closure while an effect is Prepared.
+The native synchronous workflow admission helper uses this contract; the
+opt-in compiled VM adapter queries the same metadata before dispatch and replay.
+A generic command or old atomic tail without the explicit marker is not proof
+of admission; it is not backfilled or reinterpreted. The new marker participates
+in the transition digest, and absent markers preserve existing v1 digests.
+SQLite's additive `durable_workflow_admissions` table records the latest
+admission and terminal sequence. Old code does not enforce this metadata;
+mixed-version writers, live upgrades and rollback are not qualified.
+
+The trusted host must still use the same verified/pinned bytecode and replay
+from the safe pre-command boundary. The ordinal is reconstructed by deterministic
+execution of the recovered command, not serialized as a continuation or inferred by
 counting journal records. The new version-2 workflow-effect envelope binds the
 activation and occurrence to the semantic site and canonical effect ID in the
 same atomic transition as Prepared; Completed retains that binding and request
@@ -245,10 +257,13 @@ upgrade and rollback are not qualified.
 
 This experimental path scans the post-command portion of effect history; there
 is no dedicated index or throughput claim yet. Backends without slot recovery
-return Unsupported. Terminal actor state/inbox integration, detecting omitted
-trailing effects, and open-command/admission verification remain future work.
-The compiled workflow scheduler still uses the legacy journal path and **must
-not** use this adapter until its atomic command lifecycle is qualified.
+return Unsupported. While an explicit terminal transition stores the snapshot
+and closes admission in one commit, it does not prove deterministic execution
+consumed all previously completed effects. Terminal cursor reconciliation,
+inbox/outbox integration, atomic intermediate events, timers and suspension,
+and production recovery with a new ownership epoch remain future work.
+The general compiled workflow scheduler still uses the legacy journal path
+and **must not** use this adapter until those paths are qualified.
 
 The existing SQLite VM fixture exercises this opt-in path with compiled
 workflow bytecode, a committed command sequence, lost provider reply,
@@ -262,7 +277,11 @@ both before and after completion and replays the original receipt without a
 provider call. Storage tests exercise immutable bindings, monotonic completion,
 idempotent exact-tail retry and rollback of conflicting writes in both MemoryStore
 and SQLite.
-These are trusted fixture results, not proof of production workflow recovery.
+The admission tests also distinguish a generic atomic tail from true workflow
+admission, deny a closed command from a fresh VM cursor after database reopen,
+and inject failures in both SQLite admission and closure writes to verify
+atomic rollback. These are trusted fixture results, not proof of production
+workflow recovery.
 
 ## What is not yet a production-wide guarantee
 
