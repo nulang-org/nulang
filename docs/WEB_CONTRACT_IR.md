@@ -92,7 +92,7 @@ Extraction is intentionally best effort so IDE/compiler tooling can inspect part
 web::validation::compile_validated_contracts_from_tree(...)
 ```
 
-It aggregates extraction and binding diagnostics, sorts/deduplicates them deterministically, and returns the original `ContractCompilation` only when the contract is valid. Package build/dev paths enter this boundary through `web::dispatch::compile_runtime_routes(...)`; downstream consumers should reuse the validated compilation rather than reparsing source independently.
+It aggregates extraction and binding diagnostics, sorts/deduplicates them deterministically, and returns the original `ContractCompilation` only when the contract is valid. Package build/dev paths enter this boundary through `web::dispatch::compile_runtime_routes(...)`; downstream consumers should reuse the validated compilation rather than reparsing source independently. The public `compile_runtime_routes_from_contracts(...)` entry point also rechecks validation diagnostics before runtime attachment so an unvalidated caller cannot bypass this boundary.
 
 The intended flow is:
 
@@ -106,6 +106,24 @@ source tree
        -> OpenAPI / client generation
        -> tests / tooling
 ```
+
+## Route registration conflicts
+
+The validated package contract rejects duplicate `(method, path)` registrations,
+including duplicate calls through public `route(...)` helpers. Best-effort
+extraction retains one representative route and emits a diagnostic naming both
+handlers; serving and artifact generation fail at the validation boundary.
+
+Validation also rejects paths with equivalent compiled runtime matching shapes
+for the same HTTP method, even when capture names or capture syntax differ
+(e.g. `/users/:id` and `/users/{user_id: Int}`). Percent-encoded literal
+aliases are normalized through the existing runtime path parser. Different
+methods remain independent, and a static path such as `/users/me` can
+coexist with a parameter path; matching precedence is unchanged.
+
+This deliberately does not claim a general overlapping-pattern analyzer or
+support for wildcard precedence. The validator reuses the runtime's route
+segment compiler instead of maintaining an independent URL-pattern grammar.
 
 ## Runtime binding and dispatch
 
@@ -189,12 +207,17 @@ handler-based operation IDs are preserved; when the same handler is reused by
 multiple routes, deterministic route-based suffixes keep operation IDs distinct
 for client generators regardless of route registration order.
 
-Validation rejects duplicate HTTP method/path operations after path-template
-normalization and rejects parameter-renamed templates with the same path shape
-(even across methods), rather than silently overwriting or ambiguously
-publishing an OpenAPI operation. This does not imply that typed JSON
-request/response bodies are complete: opaque/raw bodies continue to retain
-extensions rather than fabricated media types.
+The shared runtime validator rejects duplicate or indistinguishable same-method
+routes. OpenAPI publication additionally requires a single normalized path
+spelling for each compiled matching shape across HTTP methods. For example,
+`GET /users/{id: Int}` and `POST /users/:id` share one path item; using different
+capture names for those methods is valid for runtime dispatch but fails the
+OpenAPI build check rather than emitting ambiguous documentation. Both checks
+reuse the runtime segment parser. The document describes statically extracted
+contracts and may expose route, handler and effect metadata if `dist` is
+publicly served; review its exposure before deploying. Typed JSON request and
+response types are not yet complete: opaque/raw bodies retain extensions rather
+than fabricated media types.
 
 ## Binding example
 

@@ -2587,6 +2587,132 @@ fn connection_reader(
     );
 }
 
+/// A stalled partial frame must not hold a reader thread, connection, or
+/// 16-MiB payload buffer indefinitely. Healthy idle connections, before the
+/// first prefix byte, deliberately have no frame-assembly deadline.
+#[cfg(feature = "tcp")]
+#[derive(Clone, Copy)]
+struct FrameReadLimits {
+    /// Maximum gap between successful reads once any frame byte has arrived.
+    no_progress: Duration,
+    /// Fixed budget for a complete frame, including its prefix.
+    base_total: Duration,
+    /// Additional size-proportional allowance for a complete payload.
+    min_bytes_per_second: u64,
+}
+
+#[cfg(feature = "tcp")]
+impl Default for FrameReadLimits {
+    fn default() -> Self {
+        Self {
+            no_progress: Duration::from_secs(30),
+            base_total: Duration::from_secs(60),
+            min_bytes_per_second: 64 * 1024,
+        }
+    }
+}
+
+/// Time limits persist across prefix and payload reads for the same frame.
+/// Only a new *complete* frame gets a fresh budget. A malicious peer cannot
+/// reset the absolute deadline by trickling a byte every few seconds.
+#[cfg(feature = "tcp")]
+struct FrameReadProgress {
+    limits: FrameReadLimits,
+    first_byte_at: Option<Instant>,
+    last_byte_at: Option<Instant>,
+    total_budget: Duration,
+}
+
+#[cfg(feature = "tcp")]
+impl FrameReadProgress {
+    fn new(limits: FrameReadLimits) -> Self {
+        Self {
+            total_budget: limits.base_total,
+            limits,
+            first_byte_at: None,
+            last_byte_at: None,
+        }
+    }
+
+    fn with_payload_len(&mut self, bytes: u32) {
+        let rate = self.limits.min_bytes_per_second.max(1);
+        let nanos = u64::from(bytes)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(rate - 1)
+            / rate;
+        self.total_budget = self
+            .limits
+            .base_total
+            .saturating_add(Duration::from_nanos(nanos));
+    }
+
+    fn check_deadlines(&self, now: Instant) -> io::Result<()> {
+        let Some(start) = self.first_byte_at else {
+            return Ok(()); // a live idle connection is not an incomplete frame
+        };
+        let last = self.last_byte_at.unwrap_or(start);
+        if now.saturating_duration_since(start) >= self.total_budget
+            || now.saturating_duration_since(last) >= self.limits.no_progress
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "incomplete NUL0 frame exceeded progress or total assembly budget",
+            ));
+        }
+        Ok(())
+    }
+
+    fn on_progress(&mut self, now: Instant) -> io::Result<()> {
+        // Check before updating last-progress time: a slow successful read
+        // must not conceal a budget violation.
+        self.check_deadlines(now)?;
+        self.first_byte_at.get_or_insert(now);
+        self.last_byte_at = Some(now);
+        Ok(())
+    }
+}
+
+/// Consume the exact frame bytes, retaining partial prefix/payload offsets
+/// over recoverable socket errors while bounding *in-progress* frame lifetime.
+/// The same `FrameReadProgress` must be passed across prefix and body.
+#[cfg(feature = "tcp")]
+fn read_exact_across_timeouts<R: Read>(
+    stream: &mut R,
+    buf: &mut [u8],
+    shutdown_flag: &AtomicBool,
+    progress: &mut FrameReadProgress,
+) -> io::Result<()> {
+    let mut consumed = 0;
+    while consumed < buf.len() {
+        if shutdown_flag.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "transport shutting down",
+            ));
+        }
+        progress.check_deadlines(Instant::now())?;
+        match stream.read(&mut buf[consumed..]) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => {
+                progress.on_progress(Instant::now())?;
+                consumed += n;
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(ref e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                // The deadline is checked again on the next loop iteration.
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Read framed packets from `stream` until disconnect or shutdown, then
 /// remove the peer from the connection pool.
 ///
@@ -2607,35 +2733,38 @@ fn connection_read_loop(
             break;
         }
 
-        // Read 4-byte length prefix.
-        let len = loop {
-            let mut len_buf = [0u8; 4];
-            match stream.read_exact(&mut len_buf) {
-                Ok(()) => break u32::from_be_bytes(len_buf),
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    // TLS read timeout: release lock briefly so the
-                    // sender thread can acquire it.
-                    std::thread::sleep(Duration::from_millis(1));
-                    continue;
-                }
-                Err(_) => break 'read_loop, // Disconnect or timeout.
-            }
-        };
+        // Reassemble length even if a timeout interrupts the middle of
+        // the 4-byte prefix; never restart after consuming partial bytes.
+        let mut len_buf = [0u8; 4];
+        let mut frame_progress = FrameReadProgress::new(FrameReadLimits::default());
+        if read_exact_across_timeouts(
+            &mut stream,
+            &mut len_buf,
+            &shutdown_flag,
+            &mut frame_progress,
+        )
+        .is_err()
+        {
+            break 'read_loop;
+        }
+        let len = u32::from_be_bytes(len_buf);
         if len == 0 || len > MAX_PACKET_LEN {
             break 'read_loop; // Protocol error or DoS.
         }
 
-        // Read payload.
+        // The same absolute assembly clock spans the prefix and payload.
+        // Size allowance is capped by MAX_PACKET_LEN above.
+        frame_progress.with_payload_len(len);
         let mut payload = vec![0u8; len as usize];
-        loop {
-            match stream.read_exact(&mut payload) {
-                Ok(()) => break,
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(1));
-                    continue;
-                }
-                Err(_) => break 'read_loop,
-            }
+        if read_exact_across_timeouts(
+            &mut stream,
+            &mut payload,
+            &shutdown_flag,
+            &mut frame_progress,
+        )
+        .is_err()
+        {
+            break 'read_loop;
         }
 
         // Update last-activity timestamp.
@@ -2849,6 +2978,207 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     #[cfg(feature = "tcp")]
     use std::thread::sleep;
+
+    // Regress a real TCP failure mode: a short socket read timeout can
+    // interrupt a frame *after* some bytes were already consumed. Retrying
+    // read_exact with a fresh buffer drops those bytes, shifts the next
+    // NUL0 frame boundary, and can lose a post-partition actor message.
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_fragmented_nul0_frame_survives_timeout_between_bytes() {
+        struct Fragmented {
+            bytes: Vec<u8>,
+            offset: usize,
+            calls: usize,
+        }
+
+        impl Read for Fragmented {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                self.calls += 1;
+                match self.calls % 4 {
+                    2 => return Err(io::ErrorKind::WouldBlock.into()),
+                    3 => return Err(io::ErrorKind::TimedOut.into()),
+                    0 => return Err(io::ErrorKind::Interrupted.into()),
+                    _ => {}
+                }
+                if self.offset == self.bytes.len() {
+                    return Ok(0);
+                }
+                out[0] = self.bytes[self.offset];
+                self.offset += 1;
+                Ok(1)
+            }
+        }
+
+        let body = b"NUL0actor-payload";
+        let mut wire = (body.len() as u32).to_be_bytes().to_vec();
+        wire.extend_from_slice(body);
+        let mut source = Fragmented {
+            bytes: wire.clone(),
+            offset: 0,
+            calls: 0,
+        };
+        let stopped = AtomicBool::new(false);
+        let mut length = [0u8; 4];
+        let mut progress = FrameReadProgress::new(FrameReadLimits::default());
+        read_exact_across_timeouts(&mut source, &mut length, &stopped, &mut progress)
+            .expect("partial prefix must survive WouldBlock and TimedOut");
+        assert_eq!(u32::from_be_bytes(length), body.len() as u32);
+        let mut recovered = vec![0u8; body.len()];
+        progress.with_payload_len(body.len() as u32);
+        read_exact_across_timeouts(&mut source, &mut recovered, &stopped, &mut progress)
+            .expect("partial body must survive WouldBlock and TimedOut");
+        assert_eq!(recovered, body);
+        assert_eq!(source.offset, wire.len());
+    }
+
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_nul0_frame_read_aborts_cleanly_on_eof_or_shutdown() {
+        let stopped = AtomicBool::new(false);
+        let mut truncated = io::Cursor::new(vec![1u8, 2]);
+        let mut output = [0u8; 4];
+        let mut progress = FrameReadProgress::new(FrameReadLimits::default());
+        let error =
+            read_exact_across_timeouts(&mut truncated, &mut output, &stopped, &mut progress)
+                .expect_err("truncated frame must never be accepted");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+
+        let stopped = AtomicBool::new(true);
+        let mut input = io::Cursor::new([1u8, 2, 3, 4]);
+        let mut progress = FrameReadProgress::new(FrameReadLimits::default());
+        let error = read_exact_across_timeouts(&mut input, &mut output, &stopped, &mut progress)
+            .expect_err("shutdown must unblock a pending reader");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(input.position(), 0);
+    }
+
+    // A peer that sends one prefix byte and then stalls must not keep a
+    // reader thread alive indefinitely. The old helper returned a sentinel
+    // error rather than timing out after repeated recoverable socket errors.
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_incomplete_nul0_prefix_expires_after_progress_stalls() {
+        struct PrefixThenStall {
+            calls: usize,
+        }
+        impl Read for PrefixThenStall {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    out[0] = 0;
+                    return Ok(1);
+                }
+                if self.calls > 40 {
+                    return Err(io::ErrorKind::BrokenPipe.into());
+                }
+                std::thread::sleep(Duration::from_millis(2));
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+        }
+        let mut source = PrefixThenStall { calls: 0 };
+        let stopped = AtomicBool::new(false);
+        let mut prefix = [0u8; 4];
+        let limits = FrameReadLimits {
+            no_progress: Duration::from_millis(15),
+            base_total: Duration::from_secs(1),
+            min_bytes_per_second: 64 * 1024,
+        };
+        let mut progress = FrameReadProgress::new(limits);
+        let error = read_exact_across_timeouts(&mut source, &mut prefix, &stopped, &mut progress)
+            .expect_err("stalled partial prefix must be bounded");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_idle_nul0_reader_remains_connected_before_first_prefix_byte() {
+        struct IdleThenPrefix {
+            remaining_idle: usize,
+            sent: bool,
+        }
+        impl Read for IdleThenPrefix {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                if self.remaining_idle > 0 {
+                    self.remaining_idle -= 1;
+                    std::thread::sleep(Duration::from_millis(2));
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                if self.sent {
+                    return Ok(0);
+                }
+                out[..4].copy_from_slice(&[0, 0, 0, 4]);
+                self.sent = true;
+                Ok(4)
+            }
+        }
+        let mut source = IdleThenPrefix {
+            remaining_idle: 20,
+            sent: false,
+        };
+        let stopped = AtomicBool::new(false);
+        let mut prefix = [0u8; 4];
+        let limits = FrameReadLimits {
+            no_progress: Duration::from_millis(10),
+            base_total: Duration::from_millis(15),
+            min_bytes_per_second: 64 * 1024,
+        };
+        let mut progress = FrameReadProgress::new(limits);
+        read_exact_across_timeouts(&mut source, &mut prefix, &stopped, &mut progress)
+            .expect("idle connection before first byte must remain alive");
+        assert_eq!(prefix, [0, 0, 0, 4]);
+    }
+
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_nul0_assembly_total_deadline_survives_prefix_to_payload() {
+        let stopped = AtomicBool::new(false);
+        let mut progress = FrameReadProgress::new(FrameReadLimits {
+            no_progress: Duration::from_secs(1),
+            base_total: Duration::from_millis(15),
+            min_bytes_per_second: 1_000_000_000,
+        });
+        let mut prefix = [0u8; 4];
+        let mut header = io::Cursor::new([0, 0, 0, 4]);
+        read_exact_across_timeouts(&mut header, &mut prefix, &stopped, &mut progress)
+            .expect("valid prefix");
+        progress.with_payload_len(4);
+        std::thread::sleep(Duration::from_millis(30));
+        let mut body = [0u8; 4];
+        let mut payload = io::Cursor::new([1, 2, 3, 4]);
+        let error = read_exact_across_timeouts(&mut payload, &mut body, &stopped, &mut progress)
+            .expect_err("payload cannot reset absolute prefix deadline");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(payload.position(), 0, "timed-out body must not be consumed");
+    }
+
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_nul0_assembly_total_deadline_blocks_continuous_trickle() {
+        struct SlowTrickle {
+            sent: usize,
+        }
+        impl Read for SlowTrickle {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(9));
+                out[0] = self.sent as u8;
+                self.sent += 1;
+                Ok(1)
+            }
+        }
+        let mut source = SlowTrickle { sent: 0 };
+        let stopped = AtomicBool::new(false);
+        let mut output = [0u8; 4];
+        let mut progress = FrameReadProgress::new(FrameReadLimits {
+            no_progress: Duration::from_secs(1),
+            base_total: Duration::from_millis(16),
+            min_bytes_per_second: 64 * 1024,
+        });
+        let error = read_exact_across_timeouts(&mut source, &mut output, &stopped, &mut progress)
+            .expect_err("trickled bytes must not reset the total budget");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(source.sent < output.len(), "reject before complete prefix");
+    }
 
     // ------------------------------------------------------------------
     // 1. NodeId hashing

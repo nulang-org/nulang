@@ -6,12 +6,64 @@
 
 use crate::web::bindings::{compile_route_bindings, RouteBindingContract, RouteBindingSource};
 use crate::web::contracts::{ContractCompilation, RouteContract, RouteParamContract};
+use crate::web::runtime_bindings::route_match_shape;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 
 pub const OPENAPI_VERSION: &str = "3.1.0";
 
+/// Validate an OpenAPI publication without changing what the HTTP runtime can
+/// serve. The runtime validator owns same-method route admission. OpenAPI's
+/// path-item keys additionally require one template spelling per matching shape
+/// across methods; differently named captures cannot be separate path items.
+pub fn generate_checked_openapi(
+    contracts: &ContractCompilation,
+    title: &str,
+    version: &str,
+) -> Result<Value, Vec<String>> {
+    let diagnostics = crate::web::validation::validation_diagnostics(contracts);
+    if !diagnostics.is_empty() {
+        return Err(diagnostics);
+    }
+
+    let mut paths: Vec<_> = contracts
+        .routes
+        .iter()
+        .map(|route| (openapi_path(&route.path), route.path.as_str()))
+        .collect();
+    paths.sort();
+    let mut templates = HashMap::new();
+    let mut diagnostics = Vec::new();
+    for (path, source) in paths {
+        let shape = match route_match_shape(source) {
+            Ok(shape) => shape,
+            Err(error) => {
+                diagnostics.push(format!("invalid OpenAPI route '{source}': {error}"));
+                continue;
+            }
+        };
+        if let Some(first) = templates.get(&shape) {
+            if first != &path {
+                diagnostics.push(format!(
+                    "ambiguous OpenAPI path templates '{first}' and '{path}': use one path spelling across methods"
+                ));
+            }
+        } else {
+            templates.insert(shape, path);
+        }
+    }
+    diagnostics.sort();
+    diagnostics.dedup();
+    if diagnostics.is_empty() {
+        Ok(generate_openapi(contracts, title, version))
+    } else {
+        Err(diagnostics)
+    }
+}
+
 /// Generate an OpenAPI 3.1 document from a validated Web Contract compilation.
+/// For publication use [`generate_checked_openapi`], which also rejects
+/// ambiguous OpenAPI path-item identities.
 ///
 /// Response media types are intentionally not invented here. The current Web
 /// runtime still has HTML-oriented response behavior and the typed response
@@ -487,6 +539,63 @@ mod tests {
     fn raw_body_does_not_invent_an_openapi_media_type() {
         let body = binding(RouteBindingSource::Body, "body", "Payload");
         assert!(form_request_body(&[body]).is_none());
+    }
+
+    #[test]
+    fn checked_openapi_keeps_compatible_methods_in_one_path_item() {
+        let get = route();
+        let mut post = get.clone();
+        post.method = "POST".into();
+        post.path = "/users/:id".into();
+        let contracts = ContractCompilation {
+            routes: vec![get, post],
+            diagnostics: Vec::new(),
+        };
+        let document = generate_checked_openapi(&contracts, "Test", "1").unwrap();
+        let path = &document["paths"]["/users/{id}"];
+        assert!(path["get"].is_object());
+        assert!(path["post"].is_object());
+        assert_ne!(path["get"]["operationId"], path["post"]["operationId"]);
+    }
+
+    #[test]
+    fn checked_openapi_rejects_conflicting_cross_method_templates_without_changing_runtime() {
+        let get = route();
+        let mut post = get.clone();
+        post.method = "POST".into();
+        post.path = "/users/{user_id: UserId}".into();
+        post.params[0].name = "user_id".into();
+        post.handler_params[0].name = "user_id".into();
+        let mut contracts = ContractCompilation {
+            routes: vec![get, post],
+            diagnostics: Vec::new(),
+        };
+        assert!(crate::web::validation::validation_diagnostics(&contracts).is_empty());
+        let diagnostics = generate_checked_openapi(&contracts, "Test", "1").unwrap_err();
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("ambiguous OpenAPI path templates"));
+        contracts.routes.reverse();
+        assert_eq!(
+            generate_checked_openapi(&contracts, "Test", "1").unwrap_err(),
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn checked_openapi_reuses_runtime_collision_diagnostics() {
+        let first = route();
+        let mut second = first.clone();
+        second.path = "/users/:id".into();
+        let contracts = ContractCompilation {
+            routes: vec![first, second],
+            diagnostics: Vec::new(),
+        };
+        let expected = crate::web::validation::validation_diagnostics(&contracts);
+        assert_eq!(expected.len(), 1);
+        assert_eq!(
+            generate_checked_openapi(&contracts, "Test", "1").unwrap_err(),
+            expected
+        );
     }
 
     #[test]
