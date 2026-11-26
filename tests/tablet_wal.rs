@@ -267,3 +267,30 @@ fn wal_recovery_rejects_a_descriptor_older_than_durable_ownership() {
 
     let _ = fs::remove_file(path);
 }
+
+#[test]
+fn every_partial_second_frame_recovers_exactly_the_acknowledged_prefix() {
+    let path = temp_wal("all_partial_offsets");
+    let _ = fs::remove_file(&path);
+    let (prefix_len, full_len) = {
+        let mut wal = FileWal::open(&path).unwrap();
+        wal.append_write(&write(0, b"k1", b"first")).unwrap();
+        wal.append_write(&write(1, b"k2", b"second")).unwrap();
+        (
+            wal.record_end_offset(0).unwrap(),
+            wal.record_end_offset(1).unwrap(),
+        )
+    };
+    let full = fs::read(&path).unwrap();
+    assert!(full_len > prefix_len);
+    for cut in prefix_len..full_len {
+        fs::write(&path, &full[..cut as usize]).unwrap();
+        let recovered = FileWal::open(&path).unwrap_or_else(|e| panic!("cut={cut}: {e:?}"));
+        assert_eq!(recovered.last_sequence(), 1, "cut={cut}");
+        assert_eq!(recovered.records().len(), 1, "cut={cut}");
+        assert_eq!(fs::metadata(&path).unwrap().len(), prefix_len, "cut={cut}");
+    }
+    fs::write(&path, &full).unwrap();
+    assert_eq!(FileWal::open(&path).unwrap().last_sequence(), 2);
+    let _ = fs::remove_file(path);
+}

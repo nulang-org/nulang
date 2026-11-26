@@ -302,3 +302,21 @@ repro.
 - Full-shard completions executed 800 programs in ~32-72s (debug build); ~28k seed positions attempted, with per-shard aborts (Finding 6) and OOM kills truncating many shards.
 - Outcomes: 106 untriaged crashers persisted (Finding 3 for-loop class dominates; Findings 4/5 represented), 2690 known-overflow crashers under known-overflow/ (Finding 1). Zero compile failures of generated programs in completed shards.
 - Smoke: 50 seeds, 37 agreed (24 with AOT), 13 known-overflow, 0 untriaged divergences.
+
+
+## Storage differential and crash recovery tests
+
+The MVCC tablet test compares the real memory and WAL-backed implementations
+with an independent historical map model across generated mutations,
+checkpoint publication, WAL reclamation, and reopen operations.
+
+```sh
+cargo test --locked --no-default-features --test tablet_seeded_model --test tablet_wal --test nudb_crash_recovery
+TABLET_TEST_SEED=42 TABLET_TEST_COUNT=64 cargo test --locked --no-default-features --test tablet_seeded_model -- --nocapture
+```
+
+Set TABLET_TEST_COUNT=1 and TABLET_TEST_SEED to the reported decimal seed
+for single-seed reproduction. The WAL test enumerates partial record offsets;
+the subprocess tests kill the real writer after preparation or an acknowledged
+durability boundary. These are process-crash and truncated-file tests, not
+power-loss or device-cache durability qualification.

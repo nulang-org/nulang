@@ -87,6 +87,12 @@ fn run_until_ack_then_kill(wal_path: &Path, action: &str) -> String {
         ack.starts_with("ACK "),
         "fixture must acknowledge only after its durability boundary, got {ack:?}"
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(9), "expected SIGKILL: {status}");
+    }
+    #[cfg(not(unix))]
     assert!(!status.success(), "fixture unexpectedly exited gracefully");
     ack
 }
@@ -102,9 +108,10 @@ fn crash_fixture_child() {
     let ack_path = std::env::var_os("NULANG_NUDB_CRASH_CHILD_ACK")
         .expect("crash fixture ack path must be supplied by parent");
 
+    // Keep the real WAL handle alive until the parent kills this process.
+    let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
     let acknowledgement = match action.as_str() {
         "commit" => {
-            let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
             let sequence = tablet.current_sequence();
             let write = tablet
                 .prepare_write(
@@ -119,14 +126,24 @@ fn crash_fixture_child() {
             let committed = tablet.commit(write).unwrap();
             format!("ACK COMMIT {committed}")
         }
+        "prepare-only" => {
+            let sequence = tablet.current_sequence();
+            let prepared = tablet
+                .prepare_write(
+                    5,
+                    sequence,
+                    vec![TabletMutation::Delete { key: b"k".to_vec() }],
+                )
+                .unwrap();
+            std::hint::black_box(prepared);
+            format!("ACK PREPARE {sequence}")
+        }
         "publish-checkpoint" => {
-            let tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
             let sequence = tablet.current_sequence();
             tablet.publish_checkpoint().unwrap();
             format!("ACK CHECKPOINT {sequence}")
         }
         "checkpoint" => {
-            let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
             let sequence = tablet.current_sequence();
             tablet.checkpoint().unwrap();
             format!("ACK CHECKPOINT_RECLAIMED {sequence}")
@@ -146,6 +163,7 @@ fn crash_fixture_child() {
     fs::rename(&temp, &ack_path).unwrap();
 
     loop {
+        std::hint::black_box(&tablet);
         std::thread::park();
     }
 }
@@ -209,4 +227,25 @@ fn reclaimed_wal_survives_immediate_process_kill() {
     assert_eq!(tablet.current_sequence(), 3);
 
     cleanup(&wal_path);
+}
+
+#[test]
+fn prepared_but_uncommitted_delete_is_absent_after_process_kill() {
+    let path = temp_wal("prepare_only");
+    cleanup(&path);
+    {
+        let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
+        commit_put(&mut tablet, b"k", b"original");
+    }
+    assert_eq!(
+        run_until_ack_then_kill(&path, "prepare-only").trim(),
+        "ACK PREPARE 1"
+    );
+    let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
+    assert_eq!(tablet.current_sequence(), 1);
+    assert_eq!(tablet.read_latest(b"k"), Some(&b"original"[..]));
+    commit_put(&mut tablet, b"k", b"next");
+    assert_eq!(tablet.current_sequence(), 2);
+    drop(tablet);
+    cleanup(&path);
 }

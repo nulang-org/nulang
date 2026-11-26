@@ -59,6 +59,6 @@ steps:
       - cargo check --all-targets --no-default-features
       - cargo check --all-targets
       - cargo clippy --all-targets --no-default-features -- -D clippy::correctness
-      - cargo test --no-default-features
+      - TABLET_TEST_COUNT=64 cargo test --no-default-features
       - cargo test
       - git diff --check
