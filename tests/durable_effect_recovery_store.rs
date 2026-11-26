@@ -38,6 +38,7 @@ fn transition(
         expected_previous_sequence: previous,
         command: None,
         workflow_admission: false,
+        workflow_effects_consumed: None,
         snapshot: None,
         workflow_events: vec![],
         domain_events: vec![],
@@ -459,6 +460,7 @@ fn assert_workflow_admission_contract(store: &mut dyn PersistenceStore) {
         expected_previous_sequence: expected,
         command: None,
         workflow_admission: false,
+        workflow_effects_consumed: Some(1),
         snapshot: Some(ActorSnapshot {
             actor_id: 42,
             activation_epoch: 1,
@@ -611,6 +613,7 @@ fn sqlite_admission_and_terminal_marker_rollback_and_reopen() {
         expected_previous_sequence: 1,
         command: None,
         workflow_admission: false,
+        workflow_effects_consumed: Some(0),
         snapshot: Some(ActorSnapshot {
             actor_id: 42,
             activation_epoch: 1,
@@ -648,6 +651,131 @@ fn sqlite_admission_and_terminal_marker_rollback_and_reopen() {
     assert_eq!(store.load_snapshot(42).unwrap().sequence, 2);
     assert_eq!(store.read_journal(42).len(), 1);
     assert_eq!(store.read_workflow_events(42).len(), 1);
+    drop(store);
+    std::fs::remove_file(path).unwrap();
+}
+
+fn terminal_after_two_effects(store: &mut dyn PersistenceStore) -> DurableTransition {
+    use nulang::runtime::WorkflowEvent;
+    admit(store);
+    for occurrence in 0..2 {
+        let record = bound_prepared(slot(occurrence, 1), b"request");
+        store
+            .commit_transition(transition(store, 42, 1, record.clone()))
+            .unwrap();
+        store
+            .commit_transition(transition(
+                store,
+                42,
+                1,
+                bound_completed(&record, b"receipt"),
+            ))
+            .unwrap();
+    }
+    let activation = WorkflowActivationId::new(42, 1);
+    let sequence = store.latest_sequence(42) + 1;
+    DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id: 42,
+        activation_epoch: 1,
+        sequence,
+        expected_previous_sequence: sequence - 1,
+        command: None,
+        workflow_admission: false,
+        workflow_effects_consumed: Some(2),
+        snapshot: Some(ActorSnapshot {
+            actor_id: 42,
+            activation_epoch: 1,
+            sequence,
+            ..ActorSnapshot::default()
+        }),
+        workflow_events: vec![WorkflowEvent::StepCompleted {
+            sequence,
+            activation: Some(activation),
+            step_name: "step".into(),
+        }],
+        domain_events: vec![],
+        durable_effects: vec![],
+        outbox: vec![],
+    }
+}
+
+fn assert_terminal_cursor_contract(store: &mut dyn PersistenceStore) {
+    let terminal = terminal_after_two_effects(store);
+    let sequence = terminal.sequence;
+    let activation = WorkflowActivationId::new(42, 1);
+    for evidence in [None, Some(0), Some(1), Some(3)] {
+        let mut invalid = terminal.clone();
+        invalid.workflow_effects_consumed = evidence;
+        assert!(
+            store.commit_transition(invalid).is_err(),
+            "must reject missing, short or over-counted cursor evidence: {evidence:?}"
+        );
+        assert_eq!(store.load_snapshot(42).unwrap().sequence, 0);
+        assert_eq!(store.latest_sequence(42), sequence - 1);
+        assert_eq!(
+            store
+                .load_open_workflow_command(42)
+                .unwrap()
+                .unwrap()
+                .activation,
+            activation
+        );
+        assert!(store.read_workflow_events(42).is_empty());
+    }
+    let mut changed = terminal.clone();
+    changed.workflow_effects_consumed = Some(1);
+    assert_ne!(changed.digest().unwrap(), terminal.digest().unwrap());
+    let committed = store.commit_transition(terminal.clone()).unwrap();
+    assert_eq!(store.commit_transition(terminal).unwrap(), committed);
+    assert!(store.commit_transition(changed).is_err());
+    assert!(store.load_open_workflow_command(42).unwrap().is_none());
+    assert_eq!(store.load_snapshot(42).unwrap().sequence, sequence);
+}
+
+#[test]
+fn memory_terminal_cursor_reconciles_all_effect_occurrences() {
+    assert_terminal_cursor_contract(&mut MemoryStore::new());
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_terminal_cursor_reconciles_all_effect_occurrences() {
+    assert_terminal_cursor_contract(&mut nulang::runtime::LibsqlStore::in_memory().unwrap());
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_terminal_rejects_missing_earlier_intent_even_with_valid_last_receipt() {
+    use nulang::runtime::LibsqlStore;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let path = std::env::temp_dir().join(format!(
+        "nulang-workflow-terminal-corrupt-{}-{}.db",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut store = LibsqlStore::new(&path).unwrap();
+    let terminal = terminal_after_two_effects(&mut store);
+    // Simulate corruption of the experimental effect table: keep the last
+    // terminal receipt intact but remove the first occurrence's intent.
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        raw.execute(
+            "DELETE FROM durable_effect_records WHERE actor_id = 42 AND sequence = 2",
+            []
+        )
+        .unwrap(),
+        1
+    );
+    assert!(store.commit_transition(terminal).is_err());
+    assert_eq!(store.latest_sequence(42), 5);
+    assert_eq!(store.load_snapshot(42).unwrap().sequence, 0);
+    assert!(store.read_workflow_events(42).is_empty());
+    assert!(store.load_open_workflow_command(42).unwrap().is_some());
+    drop(raw);
     drop(store);
     std::fs::remove_file(path).unwrap();
 }

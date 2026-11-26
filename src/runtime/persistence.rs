@@ -403,6 +403,9 @@ pub struct DurableTransition {
     pub command: Option<JournalEntry>,
     /// Explicit standalone workflow admission; generic/legacy commands are not proof of admission.
     pub workflow_admission: bool,
+    /// Number of terminal effects actually consumed by the current execution.
+    /// Required for tracked workflow closure; None on generic/legacy transitions.
+    pub workflow_effects_consumed: Option<u32>,
     pub snapshot: Option<ActorSnapshot>,
     pub workflow_events: Vec<WorkflowEvent>,
     pub domain_events: Vec<EventEntry>,
@@ -525,9 +528,12 @@ fn validate_workflow_admission_transition(
             ));
         }
         if closes {
-            if transition.snapshot.is_none() || !transition.durable_effects.is_empty() {
+            if transition.snapshot.is_none()
+                || !transition.durable_effects.is_empty()
+                || transition.workflow_effects_consumed.is_none()
+            {
                 return Err(workflow_admission_error(
-                    "workflow terminal transition requires a snapshot and no staged effects",
+                    "workflow terminal transition requires a snapshot, consumed effect cursor and no staged effects",
                 ));
             }
             return Ok(Some(WorkflowAdmission {
@@ -546,6 +552,11 @@ fn validate_workflow_admission_transition(
             ));
         }
         return Ok(None);
+    }
+    if transition.workflow_effects_consumed.is_some() {
+        return Err(workflow_admission_error(
+            "workflow terminal cursor requires a proven open command",
+        ));
     }
     if bound {
         return Err(workflow_admission_error(
@@ -604,6 +615,7 @@ impl DurableTransition {
                 payload,
             }),
             workflow_admission: true,
+            workflow_effects_consumed: None,
             snapshot: None,
             workflow_events: vec![],
             domain_events: vec![],
@@ -653,6 +665,20 @@ impl DurableTransition {
             ));
         }
 
+        if self.workflow_effects_consumed.is_some()
+            && (self.workflow_admission
+                || self.command.is_some()
+                || self.snapshot.is_none()
+                || self.workflow_events.len() != 1
+                || self.workflow_events[0].activation_id().is_none()
+                || !self.durable_effects.is_empty()
+                || !self.domain_events.is_empty()
+                || !self.outbox.is_empty())
+        {
+            return Err(workflow_admission_error(
+                "workflow effect cursor evidence requires a standalone terminal transition",
+            ));
+        }
         if self.workflow_admission
             && (self.command.is_none()
                 || self.snapshot.is_some()
@@ -781,6 +807,8 @@ impl DurableTransition {
             command: &'a Option<JournalEntry>,
             #[serde(skip_serializing_if = "is_false")]
             workflow_admission: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            workflow_effects_consumed: Option<u32>,
             snapshot: &'a Option<ActorSnapshot>,
             workflow_events: &'a [WorkflowEvent],
             domain_events: &'a [EventEntry],
@@ -806,6 +834,7 @@ impl DurableTransition {
             expected_previous_sequence: self.expected_previous_sequence,
             command: &self.command,
             workflow_admission: self.workflow_admission,
+            workflow_effects_consumed: self.workflow_effects_consumed,
             snapshot: &self.snapshot,
             workflow_events: &self.workflow_events,
             domain_events: &self.domain_events,
@@ -943,6 +972,16 @@ impl WorkflowOccurrenceHistory {
         }
     }
 
+    fn reconcile_terminal(&self, consumed: u32) -> io::Result<()> {
+        let committed = self.next_unused_occurrence()?;
+        if committed != consumed {
+            return Err(workflow_admission_error(&format!(
+                "workflow terminal cursor consumed {consumed} effect occurrences but committed history contains {committed}"
+            )));
+        }
+        Ok(())
+    }
+
     fn finish(self) -> io::Result<Option<DurableEffectPersistenceRecord>> {
         if self.latest.is_none() && self.occurrence != self.next_unused_occurrence()? {
             return Err(io::Error::new(
@@ -955,11 +994,11 @@ impl WorkflowOccurrenceHistory {
 }
 
 #[cfg(feature = "sqlite")]
-async fn read_workflow_occurrence_rows(
+async fn read_workflow_occurrence_history(
     mut rows: libsql::Rows,
     activation: WorkflowActivationId,
     occurrence: u32,
-) -> io::Result<Option<DurableEffectPersistenceRecord>> {
+) -> io::Result<WorkflowOccurrenceHistory> {
     let mut history = WorkflowOccurrenceHistory::new(activation, occurrence);
     while let Some(row) = rows
         .next()
@@ -973,7 +1012,18 @@ async fn read_workflow_occurrence_rows(
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         history.observe(record)?;
     }
-    history.finish()
+    Ok(history)
+}
+
+#[cfg(feature = "sqlite")]
+async fn read_workflow_occurrence_rows(
+    rows: libsql::Rows,
+    activation: WorkflowActivationId,
+    occurrence: u32,
+) -> io::Result<Option<DurableEffectPersistenceRecord>> {
+    read_workflow_occurrence_history(rows, activation, occurrence)
+        .await?
+        .finish()
 }
 
 /// Persistence backend trait. Implementations may be in-memory or disk-backed.
@@ -1444,20 +1494,22 @@ impl PersistenceStore for MemoryStore {
                 .map(|snapshot| snapshot.sequence),
         )?;
         if let Some(closed) = admission.filter(|a| a.closed_sequence.is_some()) {
-            let last_effect = self
+            let activation =
+                WorkflowActivationId::new(transition.actor_id, closed.command_sequence);
+            let mut history = WorkflowOccurrenceHistory::new(activation, 0);
+            for prior in self
                 .committed_transitions(transition.actor_id)
                 .iter()
-                .rev()
                 .filter(|prior| prior.sequence > closed.command_sequence)
-                .flat_map(|prior| prior.durable_effects.iter().rev())
-                .next();
-            if last_effect.is_some_and(|record| {
-                !matches!(record.effect(), DurableEffectRecord::Completed { .. })
-            }) {
-                return Err(workflow_admission_error(
-                    "cannot close workflow command with a prepared effect",
-                ));
+            {
+                for record in &prior.durable_effects {
+                    history.observe(record.clone())?;
+                }
             }
+            let consumed = transition
+                .workflow_effects_consumed
+                .ok_or_else(|| workflow_admission_error("workflow terminal cursor is missing"))?;
+            history.reconcile_terminal(consumed)?;
         }
         for record in &transition.durable_effects {
             if let Some(binding) = record.workflow_binding() {
@@ -2746,20 +2798,18 @@ impl PersistenceStore for LibsqlStore {
             };
             if let Some(closed) = admission.filter(|a| a.closed_sequence.is_some()) {
                 let validation = async {
-                    let mut rows = tx.query(
+                    let command_sequence = i64::try_from(closed.command_sequence)
+                        .map_err(|_| workflow_admission_error("workflow command sequence out of SQLite range"))?;
+                    let rows = tx.query(
                         "SELECT record FROM durable_effect_records WHERE actor_id = ?1 AND sequence > ?2
-                         ORDER BY sequence DESC, ordinal DESC LIMIT 1",
-                        libsql::params![transition.actor_id as i64, closed.command_sequence as i64],
+                         ORDER BY sequence ASC, ordinal ASC",
+                        libsql::params![transition.actor_id as i64, command_sequence],
                     ).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-                    if let Some(row) = rows.next().await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))? {
-                        let json: String = row.get(0).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                        let record = DurableEffectPersistenceRecord::from_json(json.as_bytes())
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                        if !matches!(record.effect(), DurableEffectRecord::Completed { .. }) {
-                            return Err(workflow_admission_error("cannot close workflow command with a prepared effect"));
-                        }
-                    }
-                    Ok(())
+                    let activation = WorkflowActivationId::new(transition.actor_id, closed.command_sequence);
+                    let history = read_workflow_occurrence_history(rows, activation, 0).await?;
+                    let consumed = transition.workflow_effects_consumed.ok_or_else(||
+                        workflow_admission_error("workflow terminal cursor is missing"))?;
+                    history.reconcile_terminal(consumed)
                 }.await;
                 if let Err(error) = validation { let _ = tx.rollback().await; return Err(error); }
             }
@@ -4824,6 +4874,7 @@ mod durable_transition_tests {
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }),
             workflow_admission: false,
+            workflow_effects_consumed: None,
             snapshot: Some(ActorSnapshot {
                 activation_epoch: epoch,
                 ..snapshot(actor_id, sequence, &[("count", sequence as i64)])
@@ -5065,6 +5116,7 @@ mod libsql_atomic_transition_tests {
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }),
             workflow_admission: false,
+            workflow_effects_consumed: None,
             snapshot: Some(ActorSnapshot {
                 activation_epoch: epoch,
                 ..snapshot(actor_id, sequence, sequence as i64)

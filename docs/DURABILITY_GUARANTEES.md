@@ -255,15 +255,32 @@ readers do not support the v2 envelope; reverting after a v2 write requires a
 compatible recovery path, such as restoring a consistent pre-v2 backup. Live
 upgrade and rollback are not qualified.
 
+A tracked terminal transition must include the actor's consumed-effect count,
+including an explicit zero for a command without effects. The trusted host
+obtains this evidence from the live actor's cursor after successful execution,
+not by counting persisted receipts. Pending requests and invalid text receipts
+cannot supply terminal evidence. The count is bound to the fenced transition
+digest; omitting it preserves legacy transition encoding but is not sufficient
+to close a tracked admission.
+
+MemoryStore and SQLite reconcile that count against the complete contiguous
+post-command occurrence history within the same commit that writes the
+terminal event, snapshot and admission closure. Missing, pending, malformed
+or unmatched occurrences reject the entire transition. A replay that returns
+before consuming previously committed effects, even if its terminal event and
+snapshot otherwise look valid, cannot close the tracked admission. Exact-tail
+retries of an identical terminal transition remain idempotent. This is a
+storage consistency check on a trusted execution host's evidence, not a proof
+against a malicious host fabricating a count. It requires no additional
+schema migration; mixed-version writers remain unqualified.
+
 This experimental path scans the post-command portion of effect history; there
 is no dedicated index or throughput claim yet. Backends without slot recovery
-return Unsupported. While an explicit terminal transition stores the snapshot
-and closes admission in one commit, it does not prove deterministic execution
-consumed all previously completed effects. Terminal cursor reconciliation,
-inbox/outbox integration, atomic intermediate events, timers and suspension,
-and production recovery with a new ownership epoch remain future work.
-The general compiled workflow scheduler still uses the legacy journal path
-and **must not** use this adapter until those paths are qualified.
+return Unsupported. Inbox/outbox integration, atomic intermediate events,
+timers and suspension, and production recovery with a new ownership epoch
+remain future work. The general compiled workflow scheduler still uses the
+legacy journal path and **must not** use this adapter until those paths are
+qualified.
 
 The existing SQLite VM fixture exercises this opt-in path with compiled
 workflow bytecode, a committed command sequence, lost provider reply,

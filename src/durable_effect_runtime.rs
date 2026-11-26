@@ -196,6 +196,43 @@ impl WorkflowEffectReplayCursor {
     }
 }
 
+/// Return the terminal effect count of the current live workflow execution.
+///
+/// The host must call this after the pinned command returns successfully and
+/// pass it into the terminal DurableTransition. Never derive this number from
+/// stored records: a fresh replay cursor starts at zero. The store reconciles
+/// it against complete, contiguous committed history inside terminal commit.
+pub fn workflow_terminal_effect_count(actor: &Actor) -> io::Result<u32> {
+    let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
+    if !actor.persistent
+        || !matches!(actor.role(), Ok(ActorRole::Workflow))
+        || actor.state == ActorState::Terminated
+        || actor.activation_epoch == 0
+    {
+        return Err(invalid(
+            "terminal effect cursor requires a live persistent workflow",
+        ));
+    }
+    let activation = actor
+        .current_workflow_activation
+        .filter(|activation| activation.actor_id == actor.id && activation.command_sequence != 0)
+        .ok_or_else(|| invalid("terminal effect cursor requires the current accepted command"))?;
+    match actor.workflow_effect_cursor.as_deref() {
+        Some(cursor)
+            if cursor.activation_epoch != actor.activation_epoch
+                || cursor.activation.actor_id != activation.actor_id
+                || cursor.activation.command_sequence > activation.command_sequence
+                || cursor.pending.is_some() =>
+        {
+            Err(invalid(
+                "terminal effect cursor is stale, transferred or has an unresolved occurrence",
+            ))
+        }
+        Some(cursor) if cursor.activation == activation => Ok(cursor.next_occurrence),
+        _ => Ok(0),
+    }
+}
+
 fn vm_effect_error(msg: impl Into<String>) -> NuError {
     NuError::VMError {
         msg: msg.into(),
@@ -538,8 +575,9 @@ impl<'a> DurableEffectCoordinator<'a> {
     /// retries cannot switch sites or requests. A fresh cursor reconstructs
     /// occurrences through deterministic replay, not by counting journal rows.
     /// The durable slot binding rejects cross-site replay drift after restart.
-    /// Detecting omitted trailing effects, actor-turn atomicity and persistent
-    /// continuations still require additional integration.
+    /// A terminal transition must reconcile the live cursor via
+    /// workflow_terminal_effect_count. Actor-turn inbox/outbox atomicity and
+    /// persistent continuations still require additional integration.
     pub fn execute_workflow_vm_async_text_with_deduplication<F>(
         &mut self,
         module: &CodeModule,
@@ -757,6 +795,7 @@ impl<'a> DurableEffectCoordinator<'a> {
             expected_previous_sequence: previous,
             command: None,
             workflow_admission: false,
+            workflow_effects_consumed: None,
             snapshot: None,
             workflow_events: Vec::new(),
             domain_events: Vec::new(),

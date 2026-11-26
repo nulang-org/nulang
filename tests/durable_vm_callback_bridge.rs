@@ -10,7 +10,9 @@
 use nulang::authority::{AuthorityGrant, AuthorityManifest};
 use nulang::bytecode::{CodeModule, Constant};
 use nulang::durable_effect::{DurableEffectId, DurableEffectSpec};
-use nulang::durable_effect_runtime::{DurableEffectCoordinator, DurableVmAsyncInvocation};
+use nulang::durable_effect_runtime::{
+    workflow_terminal_effect_count, DurableEffectCoordinator, DurableVmAsyncInvocation,
+};
 use nulang::hir_lower;
 use nulang::lexer::Lexer;
 use nulang::mir_codegen;
@@ -140,6 +142,7 @@ struct Callback {
     actor: Actor,
     provider: Rc<RefCell<Provider>>,
     observed: Rc<RefCell<Vec<String>>>,
+    terminal_count: Option<Rc<RefCell<Option<u32>>>>,
     heap: ActorHeap,
     gc: OrcaGc,
 }
@@ -167,6 +170,7 @@ impl Callback {
             actor: actor(authorized, epoch),
             provider,
             observed,
+            terminal_count: None,
             heap,
             gc: OrcaGc::new(ACTOR_ID),
         }
@@ -336,7 +340,11 @@ impl ActorVmCallbacks for Callback {
                 },
                 dispatch,
             )
-        }?;
+        };
+        if let Some(count) = &self.terminal_count {
+            *count.borrow_mut() = workflow_terminal_effect_count(&self.actor).ok();
+        }
+        let result = result?;
         if let PerformAsyncResult::Ready(Some(content)) = &result {
             self.observed.borrow_mut().push(content.clone());
         }
@@ -640,7 +648,7 @@ fn workflow_fixture_vm(
     provider: Rc<RefCell<Provider>>,
     observed: Rc<RefCell<Vec<String>>>,
     activation: WorkflowActivationId,
-) -> (VM, usize) {
+) -> (VM, usize, Rc<RefCell<Option<u32>>>) {
     let module = workflow_module();
     let behavior_pc = module
         .behaviors
@@ -650,10 +658,47 @@ fn workflow_fixture_vm(
         .code_offset;
     let mut callback = Callback::new(db, provider, observed, true, 1);
     callback.actor = workflow_actor(activation);
+    let count = Rc::new(RefCell::new(Some(
+        workflow_terminal_effect_count(&callback.actor).unwrap(),
+    )));
+    callback.terminal_count = Some(count.clone());
     let mut vm = VM::new_without_jit();
     vm.load_module(module);
     vm.set_actor_callbacks(Box::new(callback));
-    (vm, behavior_pc)
+    (vm, behavior_pc, count)
+}
+
+fn workflow_terminal_transition(
+    store: &dyn PersistenceStore,
+    activation: WorkflowActivationId,
+    consumed: Option<u32>,
+) -> DurableTransition {
+    let expected_previous_sequence = store.latest_sequence(activation.actor_id);
+    let sequence = expected_previous_sequence + 1;
+    DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id: activation.actor_id,
+        activation_epoch: 1,
+        sequence,
+        expected_previous_sequence,
+        command: None,
+        workflow_admission: false,
+        workflow_effects_consumed: consumed,
+        snapshot: Some(ActorSnapshot {
+            actor_id: activation.actor_id,
+            sequence,
+            activation_epoch: 1,
+            ..ActorSnapshot::default()
+        }),
+        workflow_events: vec![WorkflowEvent::StepCompleted {
+            sequence,
+            activation: Some(activation),
+            step_name: "charge".into(),
+        }],
+        domain_events: vec![],
+        durable_effects: vec![],
+        outbox: vec![],
+    }
 }
 
 #[test]
@@ -666,9 +711,15 @@ fn workflow_vm_occurrences_reconstruct_after_reopen_and_retry() {
     }));
     let observed = Rc::new(RefCell::new(Vec::new()));
     {
-        let (mut vm, pc) = workflow_fixture_vm(&db, provider.clone(), observed.clone(), activation);
+        let (mut vm, pc, count) =
+            workflow_fixture_vm(&db, provider.clone(), observed.clone(), activation);
         // First occurrence has durable intent and an indeterminate response.
         assert!(vm.call_function(0, pc, &[]).is_err());
+        assert_eq!(
+            *count.borrow(),
+            None,
+            "an indeterminate VM result cannot produce terminal cursor evidence"
+        );
         assert_eq!(provider.borrow().committed.len(), 1);
         assert_eq!(
             LibsqlStore::new(&db.path)
@@ -679,8 +730,10 @@ fn workflow_vm_occurrences_reconstruct_after_reopen_and_retry() {
         // Same actor/VM retry consumes the first occurrence, not a new one.
         vm.call_function(0, pc, &[]).unwrap();
         assert_eq!(provider.borrow().mutations, 1);
+        assert_eq!(*count.borrow(), Some(1));
         // The same static site reached again within this activation is distinct.
         vm.call_function(0, pc, &[]).unwrap();
+        assert_eq!(*count.borrow(), Some(2));
         assert_eq!(provider.borrow().attempts, 3);
         assert_eq!(provider.borrow().mutations, 2);
         assert_eq!(provider.borrow().committed.len(), 2);
@@ -700,9 +753,27 @@ fn workflow_vm_occurrences_reconstruct_after_reopen_and_retry() {
     let recovered = WorkflowActivationId::new(ACTOR_ID, commands[0].sequence);
     assert_eq!(recovered, activation);
     drop(reopened);
-    let (mut vm, pc) = workflow_fixture_vm(&db, provider.clone(), observed.clone(), recovered);
+    let (mut vm, pc, count) =
+        workflow_fixture_vm(&db, provider.clone(), observed.clone(), recovered);
+    let mut store = LibsqlStore::new(&db.path).unwrap();
+    assert_eq!(*count.borrow(), Some(0));
+    let skipped_all = workflow_terminal_transition(&store, recovered, *count.borrow());
+    assert!(store.commit_transition(skipped_all).is_err());
     vm.call_function(0, pc, &[]).unwrap();
+    assert_eq!(*count.borrow(), Some(1));
+    let skipped_trailing = workflow_terminal_transition(&store, recovered, *count.borrow());
+    let error = store.commit_transition(skipped_trailing).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("consumed 1 effect occurrences but committed history contains 2"));
+    assert_eq!(store.latest_sequence(ACTOR_ID), 5);
+    assert_eq!(store.load_snapshot(ACTOR_ID).unwrap().sequence, 0);
+    assert!(store
+        .load_open_workflow_command(ACTOR_ID)
+        .unwrap()
+        .is_some());
     vm.call_function(0, pc, &[]).unwrap();
+    assert_eq!(*count.borrow(), Some(2));
     assert_eq!(provider.borrow().attempts, 3);
     assert_eq!(provider.borrow().mutations, 2);
     assert_eq!(observed.borrow().len(), 4);
@@ -712,6 +783,14 @@ fn workflow_vm_occurrences_reconstruct_after_reopen_and_retry() {
             .latest_sequence(ACTOR_ID),
         5
     );
+    let terminal = workflow_terminal_transition(&store, recovered, *count.borrow());
+    let committed = store.commit_transition(terminal.clone()).unwrap();
+    assert_eq!(store.commit_transition(terminal).unwrap(), committed);
+    assert!(store
+        .load_open_workflow_command(ACTOR_ID)
+        .unwrap()
+        .is_none());
+    assert_eq!(store.load_snapshot(ACTOR_ID).unwrap().sequence, 6);
 }
 
 #[test]
@@ -824,6 +903,7 @@ fn workflow_cursor_pins_pending_request_and_separates_new_commands() {
                 |_, _| panic!("request drift must not dispatch")
             )
             .is_err());
+        assert!(workflow_terminal_effect_count(&actor).is_err());
         // A matching retry preserves the key and completes the occurrence.
         coordinator
             .execute_workflow_vm_async_text_with_deduplication(
@@ -841,6 +921,7 @@ fn workflow_cursor_pins_pending_request_and_separates_new_commands() {
             .unwrap();
     }
     assert_eq!(keys[0], keys[1]);
+    assert_eq!(workflow_terminal_effect_count(&actor).unwrap(), 1);
     let terminal_seq = store.latest_sequence(ACTOR_ID) + 1;
     store
         .commit_transition(DurableTransition {
@@ -851,6 +932,7 @@ fn workflow_cursor_pins_pending_request_and_separates_new_commands() {
             expected_previous_sequence: terminal_seq - 1,
             command: None,
             workflow_admission: false,
+            workflow_effects_consumed: Some(workflow_terminal_effect_count(&actor).unwrap()),
             snapshot: Some(ActorSnapshot {
                 actor_id: ACTOR_ID,
                 sequence: terminal_seq,
@@ -869,6 +951,7 @@ fn workflow_cursor_pins_pending_request_and_separates_new_commands() {
         .unwrap();
     let next = admit_command(&mut store);
     actor.current_workflow_activation = Some(next);
+    assert_eq!(workflow_terminal_effect_count(&actor).unwrap(), 0);
     let mut coordinator = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
     coordinator
         .execute_workflow_vm_async_text_with_deduplication(
@@ -886,6 +969,7 @@ fn workflow_cursor_pins_pending_request_and_separates_new_commands() {
         .unwrap();
     assert_ne!(keys[1], keys[2]);
     actor.current_workflow_activation = Some(activation);
+    assert!(workflow_terminal_effect_count(&actor).is_err());
     assert!(coordinator
         .execute_workflow_vm_async_text_with_deduplication(
             &module,
@@ -1106,6 +1190,7 @@ fn workflow_later_occurrence_recovers_after_new_owner_claim() {
             expected_previous_sequence: 4,
             command: None,
             workflow_admission: false,
+            workflow_effects_consumed: None,
             snapshot: None,
             workflow_events: vec![],
             domain_events: vec![],
@@ -1387,6 +1472,7 @@ fn workflow_closed_admission_rejects_completed_receipt_on_fresh_actor() {
             expected_previous_sequence: sequence - 1,
             command: None,
             workflow_admission: false,
+            workflow_effects_consumed: Some(workflow_terminal_effect_count(&actor).unwrap()),
             snapshot: Some(ActorSnapshot {
                 actor_id: ACTOR_ID,
                 sequence,
@@ -1424,4 +1510,38 @@ fn workflow_closed_admission_rejects_completed_receipt_on_fresh_actor() {
         )
         .is_err());
     assert_eq!(store.latest_sequence(ACTOR_ID), sequence);
+}
+
+#[test]
+fn workflow_invalid_completed_text_cannot_produce_terminal_cursor() {
+    let db = TestDb::new();
+    let activation = admit_command(&mut LibsqlStore::new(&db.path).unwrap());
+    let provider = Rc::new(RefCell::new(Provider {
+        invalid_utf8_response: true,
+        ..Provider::default()
+    }));
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let (mut vm, pc, count) = workflow_fixture_vm(&db, provider.clone(), observed, activation);
+    assert!(vm.call_function(0, pc, &[]).is_err());
+    assert_eq!(*count.borrow(), None);
+    let mut store = LibsqlStore::new(&db.path).unwrap();
+    assert_eq!(
+        store.latest_sequence(ACTOR_ID),
+        3,
+        "the invalid terminal receipt was still durably committed"
+    );
+    assert!(store
+        .commit_transition(workflow_terminal_transition(
+            &store,
+            activation,
+            *count.borrow()
+        ))
+        .is_err());
+    assert!(store
+        .commit_transition(workflow_terminal_transition(&store, activation, Some(0)))
+        .is_err());
+    assert!(vm.call_function(0, pc, &[]).is_err());
+    assert_eq!(*count.borrow(), None);
+    assert_eq!(provider.borrow().attempts, 1);
+    assert_eq!(store.load_snapshot(ACTOR_ID).unwrap().sequence, 0);
 }
