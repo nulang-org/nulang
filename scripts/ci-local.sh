@@ -8,6 +8,7 @@ set -euo pipefail
 # Usage:
 #   bash scripts/ci-local.sh          # core compiler/runtime matrix
 #   bash scripts/ci-local.sh --full   # also release/docs/audit/Lean gates
+#   bash scripts/ci-local.sh --reliability # focused durability + DST checks
 #
 # Keep this script in lockstep with .github/workflows/ci.yml. The intent is
 # that humans and coding agents have one canonical definition of "green".
@@ -16,11 +17,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 FULL=0
+RELIABILITY=0
 case "${1:-}" in
   "") ;;
   --full) FULL=1 ;;
+  --reliability) RELIABILITY=1 ;;
   *)
-    echo "usage: $0 [--full]" >&2
+    echo "usage: $0 [--full|--reliability]" >&2
     exit 2
     ;;
 esac
@@ -31,6 +34,16 @@ run() {
   printf '\n==> %s\n' "$*"
   "$@"
 }
+
+# Lightweight, repeatable certification for crash/replay and actor faults.
+# Rust tests are real: only the dispatch-contract self-test mocks cargo.
+if [[ "$RELIABILITY" -eq 1 ]]; then
+  run bash scripts/tests/durability-guarantees-contract.test.sh
+  run bash scripts/test-durability-guarantees.sh
+  run env NULANG_DST_SEEDS=200 cargo test --locked --lib dst_
+  printf '\nReliability certification tests passed.\n'
+  exit 0
+fi
 
 # Fastest failures first.
 run cargo fmt --all -- --check

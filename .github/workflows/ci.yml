@@ -223,6 +223,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Validate durability suite dispatch contract
+        run: bash scripts/tests/durability-guarantees-contract.test.sh
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -247,6 +250,33 @@ jobs:
           output="$(cargo run --locked --no-default-features --features savina-bench --bin nulang-savina -- --benchmark ping_pong --format jsonl)"
           echo "$output"
           echo "$output" | grep -F '"benchmark":"ping_pong"'
+
+  # -----------------------------------------------------------------------
+  # Durability: exact-head recovery proof with feature-scoped SQLite tests.
+  # This deliberately runs real Rust tests, not the mocked command contract.
+  # -----------------------------------------------------------------------
+  durability-recovery:
+    name: Durability & Replay Certification
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+
+      - name: Cache Cargo for durability
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: durability-recovery
+
+      - name: Execute real minimal and SQLite crash/replay matrix
+        run: bash scripts/test-durability-guarantees.sh
+
+      - name: Execute deterministic actor fault seeds
+        run: env NULANG_DST_SEEDS=200 cargo test --locked --lib dst_
 
   # -----------------------------------------------------------------------
   # WASM backend
