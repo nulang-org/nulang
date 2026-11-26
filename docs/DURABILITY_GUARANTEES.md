@@ -520,8 +520,8 @@ A process crash after committing a reservation (including before handler
 execution) conservatively uses one slot. Initial ordinary live admission
 is not counted. Missing recipes and invalid history before the reservation
 do not consume attempts. The first reservation pins the configured limit
-for that command (subsequent configuration changes do not reset or enlarge
-it). A subsequent distinct admitted command gets its own budget. MemoryStore
+for that command (subsequent configuration changes cannot reset or enlarge
+it; only the explicit audited redrive operation below can grant additional slots). A subsequent distinct admitted command gets its own budget. MemoryStore
 retains reservations for its lifetime; local SQLite retains them after
 process loss. Reservation does not advance the durable command tail.
 
@@ -535,11 +535,46 @@ open activation, epoch, reserved attempts and pinned limit (or None if
 unreserved/closed); `is_exhausted()` means no further automatic replay.
 The final reserved execution may still be runnable; successful closure is
 permitted. This does not count successful execution or prove every reserved
-attempt reached the handler. Explicit trusted-host manual recovery remains
-a separate operation, not an automatic redrive API. There is no snapshot
-deletion, command cancellation, receipt replacement or automatic release
-from quarantine. Store-level metadata is not a security boundary against a
-trusted host editing its database.
+attempt reached the handler. Explicit trusted-host manual recovery remains a separate operation. There
+is no snapshot deletion, command cancellation, receipt replacement or
+automatic release from quarantine. Store-level metadata is not a security
+boundary against a trusted host editing its database.
+
+#### Quarantine inspection and controlled redrive
+
+Trusted hosts can enumerate exhausted open reservations in actor-ID order
+using the shard-local, keyset-paginated
+`Runtime::native_workflow_quarantine(after_actor_id, limit)` (limit at most
+1024). This is a live inspection, not a reservation or consistent snapshot;
+an exhausted final attempt may still be resident/runnable.
+
+`Runtime::redrive_quarantined_native_workflow(expected_status,
+additional_attempts, operator, reason)` accepts only an exact current
+exhausted reservation on the host's owning shard, with supervision enabled,
+an absent/nonresident actor and the same registered immutable recipe. The
+host must repair the underlying failure independently. The store checks
+the open admission, sequence, epoch and expected counters; it atomically
+appends an authorization and raises the limit by the explicit finite grant.
+The existing reserved count never decreases and the lifetime cap of 1024
+automatic attempts per activation still applies. Duplicate/stale grants,
+invalid operator/reason or a failed transaction cannot grant new slots.
+Redrive does not run a handler or bypass the scheduler cooldown; the next
+due scan independently reconstructs and reserves the original command.
+No new receipt, command identity, journal entry or checkpoint is created.
+
+`Runtime::native_workflow_recovery_audit(activation, epoch)` returns
+classified reserved-attempt failures and explicit redrive authorizations
+in attempt order, even after command closure. One failure and at most one
+grant can be recorded per attempt; the per-activation history is bounded
+by twice the lifetime cap. Audit deliberately records no raw exception or
+command payload. Redrive records the supplied operator label and reason
+(maximum 128/512 UTF-8 bytes, no control characters), not a verified human
+identity; the host must enforce access control and avoid secret material.
+Failure diagnostics are best-effort: a crash, ambiguous closure or storage
+outage can leave a reservation without a recorded failure. A missing
+diagnostic is not proof of successful execution. SQLite audit persists
+across reopen; destructive actor clear removes its audit. There is no
+automatic redrive or cross-owner claiming.
 
 There is no panic containment, automatic ownership
 acquisition, or cross-shard recovery. No durable external-effect guarantee
@@ -547,7 +582,8 @@ is added. Tests exercise MemoryStore and SQLite, exact recipe matching,
 bounded pages, real process termination after admission, integrated outbox
 restart, injected terminal commit failure/repair, pinned retry limits,
 reservation write faults and process termination after the final
-reservation but before handler execution.
+reservation but before handler execution, redrive fences, audit idempotence,
+atomic grant/audit rollback and recovery after a persisted grant.
 
 ## What is not yet a production-wide guarantee
 

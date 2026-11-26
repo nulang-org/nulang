@@ -10632,6 +10632,91 @@ fn workflow_native_retry_quarantine_survives_failure_restart_and_config_change()
             .activation,
         receipt
     );
+    let failed_audit = rt
+        .native_workflow_recovery_audit(receipt, quarantined.activation_epoch)
+        .unwrap();
+    assert_eq!(failed_audit.len(), 2);
+    for (index, record) in failed_audit.iter().enumerate() {
+        assert!(
+            matches!(record, NativeWorkflowRecoveryAuditEvent::AttemptFailed {
+            status, failure: NativeWorkflowRecoveryFailure::TerminalCommitFailed
+        } if status.attempts_reserved == index as u32+1 && status.activation == receipt)
+        );
+    }
+    assert_eq!(
+        rt.native_workflow_quarantine(None, 10).unwrap(),
+        vec![quarantined]
+    );
+    // Audit failure must not authorize any extra attempt.
+    raw.execute_batch("CREATE TRIGGER block_redrive_audit BEFORE INSERT ON durable_native_workflow_audit WHEN NEW.kind=1 BEGIN SELECT RAISE(ABORT, 'audit fault'); END;").unwrap();
+    assert!(rt
+        .redrive_quarantined_native_workflow(quarantined, 1, "operator", "terminal fault repaired")
+        .is_err());
+    assert_eq!(
+        rt.native_workflow_retry_status(bad).unwrap(),
+        Some(quarantined)
+    );
+    assert_eq!(
+        rt.native_workflow_recovery_audit(receipt, quarantined.activation_epoch)
+            .unwrap(),
+        failed_audit
+    );
+    raw.execute_batch("DROP TRIGGER block_redrive_audit; CREATE TRIGGER block_redrive_budget BEFORE UPDATE ON durable_native_workflow_retries WHEN NEW.max_attempts<>OLD.max_attempts BEGIN SELECT RAISE(ABORT,'budget fault'); END;").unwrap();
+    // A failed budget write must roll back the audit insertion as well.
+    assert!(rt
+        .redrive_quarantined_native_workflow(quarantined, 1, "operator", "terminal fault repaired")
+        .is_err());
+    assert_eq!(
+        rt.native_workflow_retry_status(bad).unwrap(),
+        Some(quarantined)
+    );
+    assert_eq!(
+        rt.native_workflow_recovery_audit(receipt, quarantined.activation_epoch)
+            .unwrap(),
+        failed_audit
+    );
+    raw.execute_batch("DROP TRIGGER block_redrive_budget")
+        .unwrap();
+    let granted = rt
+        .redrive_quarantined_native_workflow(quarantined, 1, "operator", "terminal fault repaired")
+        .unwrap();
+    assert_eq!(granted.attempts_reserved, 2);
+    assert_eq!(granted.max_attempts, 3);
+    assert!(!rt.actors.contains_key(&bad));
+    let mut expected_audit = failed_audit;
+    expected_audit.push(NativeWorkflowRecoveryAuditEvent::RedriveAuthorized {
+        status: quarantined,
+        new_max_attempts: 3,
+        operator: "operator".into(),
+        reason: "terminal fault repaired".into(),
+    });
+    drop(rt);
+    let mut rt = Runtime::new();
+    rt.install_virtual_clock();
+    rt.persistence = Box::new(LibsqlStore::new(&path).unwrap());
+    register_native_recovery_fixture(&mut rt, "v1");
+    rt.enable_native_workflow_recovery(NativeWorkflowRecoveryConfig::default())
+        .unwrap();
+    assert_eq!(rt.native_workflow_retry_status(bad).unwrap(), Some(granted));
+    assert_eq!(
+        rt.native_workflow_recovery_audit(receipt, quarantined.activation_epoch)
+            .unwrap(),
+        expected_audit
+    );
+    rt.run_scheduler();
+    assert_received(&rt, bad, 1, PersistedValue::String("first".into()));
+    assert_eq!(rt.persistence.read_journal(bad).len(), 1);
+    assert_eq!(
+        rt.dispatch_workflow_outbox(first).unwrap(),
+        WorkflowOutboxDispatch::AlreadyAdmitted(receipt)
+    );
+    assert!(rt.native_workflow_retry_status(bad).unwrap().is_none());
+    assert_eq!(
+        rt.native_workflow_recovery_audit(receipt, quarantined.activation_epoch)
+            .unwrap(),
+        expected_audit
+    );
+    assert!(rt.native_workflow_quarantine(None, 10).unwrap().is_empty());
     drop(rt);
     drop(raw);
     std::fs::remove_file(path).unwrap();
@@ -10783,4 +10868,242 @@ fn workflow_native_retry_process_kill_after_reservation() {
     drop(rt);
     std::fs::remove_file(path).unwrap();
     std::fs::remove_file(ready).unwrap();
+}
+
+fn assert_native_workflow_redrive(rt: &mut Runtime) {
+    rt.install_virtual_clock();
+    register_native_recovery_fixture(rt, "v1");
+    let (_, first_actor, _, first, next) = dispatch_fixture(rt);
+    let (_, second_actor, _, another, _) = dispatch_fixture(rt);
+    let mut exhausted = Vec::new();
+    for (id, message) in [(first_actor, first), (second_actor, another)] {
+        rt.bind_native_workflow_recovery(id, "receiver", "v1")
+            .unwrap();
+        assert!(matches!(
+            rt.dispatch_workflow_outbox(message).unwrap(),
+            WorkflowOutboxDispatch::Admitted(_)
+        ));
+        let open = rt
+            .persistence
+            .load_open_workflow_command(id)
+            .unwrap()
+            .unwrap();
+        exhausted.push(
+            rt.persistence
+                .reserve_native_workflow_recovery_attempt(open, 1)
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    exhausted.sort_by_key(|status| status.activation.actor_id);
+    let first_status = exhausted
+        .iter()
+        .find(|s| s.activation.actor_id == first_actor)
+        .copied()
+        .unwrap();
+    let second_status = exhausted
+        .iter()
+        .find(|s| s.activation.actor_id == second_actor)
+        .copied()
+        .unwrap();
+    assert_eq!(
+        rt.native_workflow_quarantine(None, 1).unwrap(),
+        exhausted[..1]
+    );
+    assert_eq!(
+        rt.native_workflow_quarantine(Some(exhausted[0].activation.actor_id), 1)
+            .unwrap(),
+        exhausted[1..]
+    );
+    assert!(rt
+        .native_workflow_quarantine(Some(exhausted[1].activation.actor_id), 1)
+        .unwrap()
+        .is_empty());
+    assert!(rt.native_workflow_quarantine(None, 0).is_err());
+    assert!(rt
+        .native_workflow_quarantine(None, MAX_WORKFLOW_OUTBOX_PAGE + 1)
+        .is_err());
+    assert!(rt
+        .persistence
+        .scan_native_workflow_quarantine(0, 0, None, 1)
+        .is_err());
+    for shard in 0..2 {
+        let expected = exhausted
+            .iter()
+            .filter(|s| s.activation.actor_id % 2 == shard as u64)
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rt.persistence
+                .scan_native_workflow_quarantine(shard, 2, None, 10)
+                .unwrap(),
+            expected
+        );
+        assert!(rt
+            .persistence
+            .scan_native_workflow_quarantine(shard, 2, Some(if shard == 0 { 1 } else { 2 }), 1)
+            .is_err());
+    }
+    assert!(rt
+        .redrive_quarantined_native_workflow(first_status, 1, "operator", "storage repaired")
+        .is_err()); // disabled
+    rt.enable_native_workflow_recovery(NativeWorkflowRecoveryConfig {
+        max_attempts: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(rt
+        .redrive_quarantined_native_workflow(first_status, 1, "operator", "storage repaired")
+        .is_err()); // resident
+    rt.remove_actor_reaping(first_actor);
+    rt.remove_actor_reaping(second_actor);
+    let mut stale = first_status;
+    stale.activation_epoch += 1;
+    assert!(rt
+        .redrive_quarantined_native_workflow(stale, 1, "operator", "storage repaired")
+        .is_err());
+    stale = first_status;
+    stale.activation.command_sequence += 1;
+    assert!(rt
+        .redrive_quarantined_native_workflow(stale, 1, "operator", "storage repaired")
+        .is_err());
+    assert!(rt
+        .redrive_quarantined_native_workflow(first_status, 0, "operator", "storage repaired")
+        .is_err());
+    assert!(rt
+        .redrive_quarantined_native_workflow(
+            first_status,
+            MAX_NATIVE_WORKFLOW_RECOVERY_ATTEMPTS,
+            "operator",
+            "storage repaired"
+        )
+        .is_err());
+    assert!(rt
+        .redrive_quarantined_native_workflow(first_status, 1, "", "storage repaired")
+        .is_err());
+    assert!(rt
+        .redrive_quarantined_native_workflow(first_status, 1, "operator", "\n")
+        .is_err());
+    assert!(rt
+        .redrive_quarantined_native_workflow(first_status, 1, "operator", &"x".repeat(513))
+        .is_err());
+    assert!(rt
+        .native_workflow_recovery_audit(first_status.activation, first_status.activation_epoch)
+        .unwrap()
+        .is_empty());
+    let failure = NativeWorkflowRecoveryAuditEvent::AttemptFailed {
+        status: first_status,
+        failure: NativeWorkflowRecoveryFailure::TerminalCommitFailed,
+    };
+    assert_eq!(
+        rt.persistence
+            .append_native_workflow_recovery_audit(failure.clone())
+            .unwrap(),
+        first_status
+    );
+    assert_eq!(
+        rt.persistence
+            .append_native_workflow_recovery_audit(failure.clone())
+            .unwrap(),
+        first_status
+    ); // idempotent
+    assert!(rt
+        .persistence
+        .append_native_workflow_recovery_audit(NativeWorkflowRecoveryAuditEvent::AttemptFailed {
+            status: first_status,
+            failure: NativeWorkflowRecoveryFailure::ReconstructionRejected,
+        })
+        .is_err());
+    // Saturated page has no runnable actor. Redrive must respect this cooldown.
+    assert_eq!(
+        rt.poll_native_workflow_recovery()
+            .unwrap()
+            .unwrap()
+            .examined,
+        0
+    );
+    let updated = rt
+        .redrive_quarantined_native_workflow(first_status, 1, "operator", "storage repaired")
+        .unwrap();
+    assert_eq!(updated.attempts_reserved, 1);
+    assert_eq!(updated.max_attempts, 2);
+    assert_eq!(updated.activation, first_status.activation);
+    assert_eq!(updated.activation_epoch, first_status.activation_epoch);
+    assert!(!updated.is_exhausted());
+    assert!(rt
+        .redrive_quarantined_native_workflow(first_status, 1, "operator", "duplicate request")
+        .is_err());
+    assert!(rt
+        .redrive_quarantined_native_workflow(updated, 1, "operator", "not exhausted")
+        .is_err());
+    assert!(rt
+        .persistence
+        .append_native_workflow_recovery_audit(failure.clone())
+        .is_err());
+    assert_eq!(
+        rt.native_workflow_quarantine(None, 10).unwrap(),
+        vec![second_status]
+    );
+    assert!(!rt.actors.contains_key(&first_actor));
+    assert!(rt.poll_native_workflow_recovery().unwrap().is_none()); // don't bypass cooldown
+    let audit = vec![
+        failure,
+        NativeWorkflowRecoveryAuditEvent::RedriveAuthorized {
+            status: first_status,
+            new_max_attempts: 2,
+            operator: "operator".into(),
+            reason: "storage repaired".into(),
+        },
+    ];
+    assert_eq!(
+        rt.native_workflow_recovery_audit(first_status.activation, first_status.activation_epoch)
+            .unwrap(),
+        audit
+    );
+    assert_eq!(
+        rt.dispatch_workflow_outbox(next).unwrap(),
+        WorkflowOutboxDispatch::Deferred
+    );
+    rt.advance_time(Duration::from_millis(100));
+    rt.run_scheduler();
+    assert_received(rt, first_actor, 1, PersistedValue::String("first".into()));
+    assert_eq!(rt.persistence.read_journal(first_actor).len(), 1);
+    assert_eq!(
+        rt.dispatch_workflow_outbox(first).unwrap(),
+        WorkflowOutboxDispatch::AlreadyAdmitted(first_status.activation)
+    );
+    assert!(rt
+        .native_workflow_retry_status(first_actor)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        rt.native_workflow_recovery_audit(first_status.activation, first_status.activation_epoch)
+            .unwrap(),
+        audit
+    );
+    assert_eq!(
+        rt.native_workflow_quarantine(None, 10).unwrap(),
+        vec![second_status]
+    );
+    assert!(matches!(
+        rt.dispatch_workflow_outbox(next).unwrap(),
+        WorkflowOutboxDispatch::Admitted(_)
+    ));
+    rt.remove_actor_reaping(first_actor);
+    assert!(rt
+        .redrive_quarantined_native_workflow(first_status, 1, "operator", "stale activation")
+        .is_err());
+}
+
+#[test]
+fn workflow_native_redrive_requires_exact_exhausted_nonresident_command_memory() {
+    assert_native_workflow_redrive(&mut Runtime::new());
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn workflow_native_redrive_requires_exact_exhausted_nonresident_command_sqlite() {
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(LibsqlStore::in_memory().unwrap());
+    assert_native_workflow_redrive(&mut rt);
 }

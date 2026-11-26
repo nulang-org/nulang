@@ -3,7 +3,9 @@
 
 use super::{
     persistence::NativeWorkflowRecoveryBinding, Actor, ActorBackend, ActorRunState, ActorSnapshot,
-    ActorState, PersistedValue, Runtime, StateModel, WorkflowEvent, MAX_WORKFLOW_OUTBOX_PAGE,
+    ActorState, NativeWorkflowRecoveryAuditEvent, NativeWorkflowRecoveryFailure,
+    NativeWorkflowRetryStatus, PersistedValue, Runtime, StateModel, WorkflowActivationId,
+    WorkflowEvent, MAX_WORKFLOW_OUTBOX_PAGE,
 };
 use crate::{primitives::ActorRole, vm::Value};
 use std::{
@@ -244,6 +246,106 @@ impl Runtime {
         self.persistence.load_native_workflow_retry_status(actor_id)
     }
 
+    /// Bounded live inspection of exhausted open reservations on this shard.
+    /// The last reserved attempt may still be runnable; redrive checks residency.
+    pub fn native_workflow_quarantine(
+        &self,
+        after: Option<u64>,
+        limit: usize,
+    ) -> io::Result<Vec<NativeWorkflowRetryStatus>> {
+        self.persistence.scan_native_workflow_quarantine(
+            self.shard_idx,
+            self.shard_count,
+            after,
+            limit,
+        )
+    }
+
+    /// Audit for an exact activation and ownership epoch, retained after closure.
+    pub fn native_workflow_recovery_audit(
+        &self,
+        activation: WorkflowActivationId,
+        activation_epoch: u64,
+    ) -> io::Result<Vec<NativeWorkflowRecoveryAuditEvent>> {
+        if activation.actor_id == 0
+            || activation.actor_id % u64::from(self.shard_count) != u64::from(self.shard_idx)
+        {
+            return Err(invalid("native recovery audit requires the owning shard"));
+        }
+        self.persistence
+            .load_native_workflow_recovery_audit(activation, activation_epoch)
+    }
+
+    /// Trusted host operation: authorize a finite additional budget for an
+    /// exact exhausted, nonresident command. This never executes the handler.
+    /// Do not reset counters, change recipe identity, or bypass scheduler cooldown.
+    pub fn redrive_quarantined_native_workflow(
+        &mut self,
+        expected: NativeWorkflowRetryStatus,
+        additional_attempts: u32,
+        operator: &str,
+        reason: &str,
+    ) -> io::Result<NativeWorkflowRetryStatus> {
+        let id = expected.activation.actor_id;
+        if self.current_actor.is_some()
+            || self.native_workflow_recovery.is_none()
+            || self.actors.contains_key(&id)
+            || self.recovery_modules.contains_key(&id)
+            || self.migrated_actors.contains_key(&id)
+            || self.actor_grain_id.contains_key(&id)
+            || !expected.is_exhausted()
+            || additional_attempts == 0
+            || id == 0
+            || id % u64::from(self.shard_count) != u64::from(self.shard_idx)
+        {
+            return Err(invalid(
+                "redrive requires an exhausted, nonresident workflow on the owning shard",
+            ));
+        }
+        let binding = self
+            .persistence
+            .load_native_workflow_recovery_binding(id)?
+            .ok_or_else(|| invalid("native workflow recovery binding missing"))?;
+        let recipe = self
+            .native_workflow_recovery_recipes
+            .get(&(binding.name, binding.revision))
+            .ok_or_else(|| invalid("native workflow recovery recipe not registered"))?;
+        if binding.activation_epoch != expected.activation_epoch
+            || !binding
+                .behaviors
+                .iter()
+                .eq(recipe.iter().map(|(name, _)| name))
+        {
+            return Err(invalid("native workflow recovery layout or epoch mismatch"));
+        }
+        let new_max_attempts = expected
+            .max_attempts
+            .checked_add(additional_attempts)
+            .ok_or_else(|| invalid("native workflow recovery budget overflow"))?;
+        self.persistence.append_native_workflow_recovery_audit(
+            NativeWorkflowRecoveryAuditEvent::RedriveAuthorized {
+                status: expected,
+                new_max_attempts,
+                operator: operator.to_owned(),
+                reason: reason.to_owned(),
+            },
+        )
+    }
+
+    fn record_native_recovery_failure(
+        &mut self,
+        status: NativeWorkflowRetryStatus,
+        failure: NativeWorkflowRecoveryFailure,
+    ) {
+        // Diagnostics are best-effort. A storage outage must not turn failure
+        // into success or undo the committed attempt reservation.
+        if let Err(error) = self.persistence.append_native_workflow_recovery_audit(
+            NativeWorkflowRecoveryAuditEvent::AttemptFailed { status, failure },
+        ) {
+            tracing::warn!(actor_id = status.activation.actor_id, %error, "native workflow failure diagnostic could not be persisted");
+        }
+    }
+
     pub fn disable_native_workflow_recovery(&mut self) {
         self.native_workflow_recovery = None;
     }
@@ -406,6 +508,10 @@ impl Runtime {
         // Verify persisted values before making executable native handlers visible.
         // The existing recovery path independently checks the admission and tail.
         let Some(_) = self.recover_actor(actor_id) else {
+            self.record_native_recovery_failure(
+                attempt,
+                NativeWorkflowRecoveryFailure::ReconstructionRejected,
+            );
             return Err(invalid("native workflow recovery rejected by runtime"));
         };
         let actor = self.actors.get_mut(&actor_id).expect("recovered actor");
@@ -432,6 +538,10 @@ impl Runtime {
                 });
         if !representable {
             self.remove_actor_reaping(actor_id);
+            self.record_native_recovery_failure(
+                attempt,
+                NativeWorkflowRecoveryFailure::ReconstructionRejected,
+            );
             return Err(invalid(
                 "native recovery could not faithfully reconstruct command or state",
             ));
@@ -466,6 +576,16 @@ impl Runtime {
             || self.native_workflow_recovery.is_none()
         {
             return false;
+        }
+        match self.native_workflow_retry_status(actor_id) {
+            Ok(Some(status)) => self.record_native_recovery_failure(
+                status,
+                NativeWorkflowRecoveryFailure::TerminalCommitFailed,
+            ),
+            Ok(None) => {} // No reserved replay, or an ambiguous commit actually closed.
+            Err(error) => {
+                tracing::warn!(actor_id, %error, "native workflow failure diagnostic status unavailable")
+            }
         }
         let now = self.now();
         self.native_workflow_recovery
