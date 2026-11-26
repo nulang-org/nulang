@@ -153,6 +153,48 @@ writers with uncheckpointed WAL, interrupted schema migration, production
 workloads, AI-local data, or authenticated Turso. The production promotion gate
 remains open.
 
+## Hard-killed writer and uncheckpointed WAL rehearsal
+
+On a POSIX host, rebuild **both** independent probes using the updated
+fixture above (both must support the `upgrade-crash` mode). Pin the old
+revision to `4cd30251c2d39ff8a8e437c1c479fa56d674363a` and the security
+integration revision to `1a42a30823e76746da237bc4be73ba00e4160ac2` for
+this rehearsal. Then run:
+
+```sh
+python3 scripts/verify_sqlite_hard_kill.py \
+    --legacy-probe "$root/target-legacy/debug/examples/sqlite_cross_binary_probe" \
+    --candidate-probe "$root/target-candidate/debug/examples/sqlite_cross_binary_probe"
+```
+
+This creates a private disposable fixture; the harness accepts only paths
+to the two compiled probes, never a database path. The writer commits and
+verifies updated actor state, journal entries and timer events, then
+acknowledges readiness while its store remains open. The harness waits for
+that acknowledgment and sends SIGKILL **only to the child it started**.
+It requires complete WAL frames and confirms the new state is absent from
+a deliberately incomplete main-file-only **negative control**, not a
+backup. It then recovers from complete stopped main-file and WAL copies,
+recreates the transient shared-memory index, verifies the actor state,
+journal and workflow events, reopens, and checks SQLite integrity. Both
+legacy and candidate writers are killed; the independently built old and
+new binary recover the old writer's WAL, and the new binary recovers its
+own. The old binary is tested against the original immutable backup for
+rollback, never against the candidate-upgraded database. Source and backup
+digests must remain unchanged.
+
+The November 26, 2026 rehearsal passed three independent runs using the
+pinned binaries. Each killed writer left five complete WAL frames, and
+the main-file-only negative control retained the old sequence before WAL
+recovery. The clean-reopen upgrade/rollback harness also still passed.
+
+**Qualification boundary:** This proves process-kill recovery of the
+acknowledged commits in these fixtures, not crash-safe copying of live
+files, recovery from power loss or storage failure, interrupted
+transactions or schema migration, production workloads, AI-local
+persistence, or authenticated Turso. Never use the main-file-only negative
+control as an operational backup procedure.
+
 ## Required remote Turso / libSQL qualification (still open)
 
 Use only an explicitly disposable test database and limited-scope test token;
