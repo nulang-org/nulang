@@ -3275,7 +3275,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let _guard = ChangeDir::new(&dir);
 
-        scaffold_package(&dir, "deploy-test", "default").expect("scaffold should succeed");
+        // A deploy authentication test must start with a valid web app.
+        // The CLI scaffold performs IO.print during entry-point execution,
+        // which the checked static route discovery correctly rejects.
+        scaffold_package(&dir, "deploy-test", "web").expect("web scaffold should succeed");
 
         let result = cmd_deploy(
             false,
