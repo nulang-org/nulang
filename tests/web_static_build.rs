@@ -623,3 +623,233 @@ app "site" {
     assert_eq!(site.read("dist/index.html"), b"ok");
     assert_eq!(site.ir().routes[0].placement, "static");
 }
+
+fn collections(site: &Site, entries: &str) {
+    let path = site.0.join("Nulang.toml");
+    let original = std::fs::read_to_string(&path).unwrap();
+    let prefix = original.split("[web.collections]").next().unwrap();
+    std::fs::write(path, format!("{prefix}\n[web.collections]\n{entries}\n")).unwrap();
+}
+
+const COLLECTION_APP: &str = r#"
+import stdlib::web::html
+import stdlib::web::types
+import articles
+
+fn article_keys() -> [String] {
+    var keys = [];
+    for item in articles() {
+        keys = perform Array.push(keys, item.slug)
+    }
+    keys
+}
+fn article(slug: String) -> Html {
+    var title = "not found";
+    for item in articles() {
+        if item.slug == slug then { title = item.title } else {}
+    }
+    text(title)
+}
+app "collection" {
+    route "GET" "/articles/{slug}" -> article
+}
+"#;
+
+#[test]
+fn native_typed_collection_drives_pages_and_removes_stale_artifacts() {
+    let site = Site::new();
+    site.source(COLLECTION_APP);
+    let data = site.0.join("src/articles.nula");
+    let write_items = |items: &str| {
+        std::fs::write(&data, format!(
+            "pub type Article = {{ slug: String, title: String }}\npub fn articles() -> [Article] {{ [{items}] }}\n"
+        )).unwrap();
+    };
+    write_items(r#"{slug: "z", title: "Last"}, {slug: "intro", title: "Introduction"}"#);
+    collections(&site, r#""/articles/{slug}" = "article_keys""#);
+    success(site.build());
+    assert_eq!(site.read("dist/articles/intro/index.html"), b"Introduction");
+    assert_eq!(site.read("dist/articles/z/index.html"), b"Last");
+    let ir = site.ir();
+    assert_eq!(ir.routes.len(), 2);
+    assert_eq!(ir.routes[0].path, "/articles/intro");
+    assert_eq!(ir.routes[1].path, "/articles/z");
+    assert!(ir.routes.iter().all(|r| r.placement == "static"
+        && r.route_template.as_deref() == Some("/articles/{slug}")
+        && r.bindings.is_empty()
+        && r.artifact.is_some()));
+    let old_ir = site.read("dist/nulang-app.ir.json");
+    write_items(r#"{slug: "intro", title: "Introduction"}, {slug: "z", title: "Last"}"#);
+    success(site.build());
+    assert_eq!(site.read("dist/nulang-app.ir.json"), old_ir);
+
+    // Use the same compiler-owned dispatch plan, not a separate SSG renderer.
+    let artifact = nulang::bytecode::CodeModule::from_nbc(&site.read(".nula/build.nbc")).unwrap();
+    let mut vm = nulang::vm::VM::new();
+    vm.load_module(artifact.module);
+    vm.run().unwrap();
+    let routes =
+        nulang::web::dispatch::compile_runtime_routes(vm.take_web_routes(), &site.0.join("src"))
+            .unwrap();
+    let params = nulang::web::dispatch::match_route(&routes[0], "/articles/intro").unwrap();
+    let rendered = nulang::web::dispatch::render_direct_route(&routes[0], &params)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rendered.as_bytes(),
+        site.read("dist/articles/intro/index.html")
+    );
+    write_items(r#"{slug: "intro", title: "Revised"}"#);
+    success(site.build());
+    assert_eq!(site.read("dist/articles/intro/index.html"), b"Revised");
+    assert!(!site.0.join("dist/articles/z").exists());
+}
+
+#[test]
+fn collection_tuple_keys_follow_url_order_not_handler_order() {
+    let site = Site::new();
+    site.source(r#"
+import stdlib::web::html
+import stdlib::web::types
+fn keys() -> [(String, Int, Bool, Float)] { [("a", 2, true, 1.5)] }
+fn item(amount: Float, page: Int, slug: String, flag: Bool) -> Html {
+    if flag then text(slug + ":" + perform Int.to_string(page) + ":" + perform Float.to_string(amount)) else text("off")
+}
+fn other(slug: String) -> Html { text(slug) }
+app "site" {
+    route "GET" "/items/{slug}/{page: Int}/{flag: Bool}/{amount: Float}" -> item
+    route "GET" "/other/{slug}" -> other
+    route "GET" "/runtime/{slug}" -> other
+}
+"#);
+    prerender(&site, r#""/other/{slug}" = ["/other/manual"]"#);
+    collections(
+        &site,
+        r#""/items/{slug}/{page: Int}/{flag: Bool}/{amount: Float}" = "keys""#,
+    );
+    success(site.build());
+    assert_eq!(site.read("dist/items/a/2/true/1.5/index.html"), b"a:2:1.5");
+    assert_eq!(site.read("dist/other/manual/index.html"), b"manual");
+    assert_eq!(site.ir().routes[2].placement, "server");
+}
+
+#[test]
+fn invalid_collections_fail_closed_and_preserve_last_good_site() {
+    let site = Site::new();
+    site.source(STATIC);
+    success(site.build());
+    let old = site.read("dist/index.html");
+    for (provider, diagnostic) in [
+        ("fn keys(x: String) -> [String] { [x] }", "zero arguments"),
+        ("fn keys() -> String { \"a\" }", "must return an array"),
+        ("fn keys() -> [String] { [] }", "empty collection"),
+        ("fn keys() -> [Int] { [1] }", "must be String"),
+        ("fn keys() -> [String] { [\"a\", \"A\"] }", "conflicts"),
+        (
+            "fn keys() -> [String] { [\"..\"] }",
+            "invalid static route path",
+        ),
+        (
+            "fn keys() -> [String] { [\"a/b\"] }",
+            "invalid static route path key",
+        ),
+        (
+            "fn keys() -> [String] { [\"\"] }",
+            "invalid static route path key",
+        ),
+        (
+            "fn keys() -> [(String, Int)] { [(\"a\", 1)] }",
+            "must be String",
+        ),
+        (
+            "fn differently_named() -> [String] { [\"a\"] }",
+            "compiled provider function",
+        ),
+        (
+            r#"fn leaf(flag: Bool) -> [String] {
+            if flag then [perform Web.cookie("session")] else ["a"]
+        }
+        fn keys() -> [String] { leaf(false) }"#,
+            "Web.cookie",
+        ),
+    ] {
+        site.source(&format!(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+{provider}
+fn article(slug: String) -> Html {{ text(slug) }}
+app "site" {{ route "GET" "/articles/{{slug}}" -> article }}
+"#
+        ));
+        collections(&site, r#""/articles/{slug}" = "keys""#);
+        let output = site.build();
+        assert!(!output.status.success(), "{provider}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(diagnostic), "{provider}: {stderr}");
+        assert_eq!(site.read("dist/index.html"), old);
+    }
+}
+
+#[test]
+fn collection_and_manual_enumeration_cannot_configure_same_route() {
+    let site = Site::new();
+    site.source(PARAMETERIZED);
+    prerender(
+        &site,
+        r#""/articles/{slug}/{page: Int}" = ["/articles/a/1"]"#,
+    );
+    collections(&site, r#""/articles/{slug}/{page: Int}" = "keys""#);
+    let output = site.build();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("configured in both"));
+    assert!(!site.0.join("dist").exists());
+}
+
+#[test]
+fn invalid_collection_configuration_and_tuple_shape_are_rejected() {
+    let site = Site::new();
+    for (keys, entries, placement, diagnostic) in [
+        (
+            "fn keys() -> [(String, Int, Bool)] { [(\"a\", 1, true)] }",
+            r#""/articles/{slug}/{page: Int}" = "keys""#,
+            "",
+            "expected a tuple of 2 path keys",
+        ),
+        (
+            "fn keys() -> [(Int, String)] { [(1, \"a\")] }",
+            r#""/articles/{slug}/{page: Int}" = "keys""#,
+            "",
+            "path key 'slug' must be String",
+        ),
+        (
+            "fn keys() -> [(String, Int)] { [(\"a\", 1)] }",
+            r#""/missing/{slug}" = "keys""#,
+            "",
+            "registered GET",
+        ),
+        (
+            "fn keys() -> [(String, Int)] { [(\"a\", 1)] }",
+            r#""/articles/{slug}/{page: Int}" = "keys""#,
+            "@placement(server)",
+            "conflicts with explicit placement",
+        ),
+    ] {
+        site.source(&format!(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+{keys}
+{placement}
+fn article(slug: String, page: Int) -> Html {{ text(slug) }}
+app "site" {{ route "GET" "/articles/{{slug}}/{{page: Int}}" -> article }}
+"#
+        ));
+        collections(&site, entries);
+        let output = site.build();
+        assert!(!output.status.success(), "{keys}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(diagnostic), "{keys}: {stderr}");
+        assert!(!site.0.join("dist").exists());
+    }
+}

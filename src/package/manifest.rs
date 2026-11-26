@@ -45,6 +45,7 @@ impl Default for WebSection {
             static_dir: default_static_dir(),
             output_dir: default_output_dir(),
             prerender: BTreeMap::new(),
+            collections: BTreeMap::new(),
         }
     }
 }
@@ -102,6 +103,9 @@ pub struct WebSection {
     /// Exact GET route patterns mapped to a finite list of concrete URL paths.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub prerender: BTreeMap<String, Vec<String>>,
+    /// Exact GET route patterns mapped to pure zero-argument route-key providers.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub collections: BTreeMap<String, String>,
 }
 
 fn default_web_port() -> u16 {
@@ -326,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn test_web_prerender_manifest_roundtrip() {
+    fn test_web_enumeration_manifest_roundtrip() {
         let manifest = Manifest::parse(
             r#"
 [package]
@@ -334,6 +338,8 @@ name = "docs"
 version = "0.1.0"
 [web.prerender]
 "/docs/{slug}" = ["/docs/intro", "/docs/install"]
+[web.collections]
+"/articles/{slug}" = "article_keys"
 "#,
         )
         .unwrap();
@@ -341,6 +347,7 @@ version = "0.1.0"
             manifest.web.prerender["/docs/{slug}"],
             ["/docs/intro", "/docs/install"]
         );
+        assert_eq!(manifest.web.collections["/articles/{slug}"], "article_keys");
         assert_eq!(
             Manifest::parse(&manifest.to_toml().unwrap()).unwrap(),
             manifest
@@ -350,6 +357,13 @@ version = "0.1.0"
                 .unwrap()
                 .web
                 .prerender
+                .is_empty()
+        );
+        assert!(
+            Manifest::parse("[package]\nname = \"docs\"\nversion = \"0.1.0\"")
+                .unwrap()
+                .web
+                .collections
                 .is_empty()
         );
     }
