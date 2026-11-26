@@ -12,7 +12,7 @@ use crate::types::{NuError, NuResult, Span};
 use crate::web::modules::{ModuleRegistry, ModuleSpec};
 
 use crate::bytecode::CodeModule;
-use crate::runtime::{render_route_handler, WebDevServer};
+use crate::runtime::WebDevServer;
 use crate::vm::VM;
 
 use crate::registry::RegistryClient;
@@ -634,7 +634,8 @@ fn template_files(name: &str) -> Vec<(&'static str, &'static str)> {
                 "src/main.nula",
                 r#"// Nulang Web app — a compiler-first full-stack Todo list.
 //
-// Run with: `nula dev` (development server) or `nula build --web` (SSG).
+// Run with: `nula dev` (development server). A web build emits the server
+// route contract and public assets, not a snapshot of request-time state.
 //
 // The server renders the initial HTML and handles form POSTs with an
 // ephemeral in-memory store. The generated `app.client.js` intercepts
@@ -1041,6 +1042,13 @@ fn locate_nulang_exe() -> NuResult<PathBuf> {
 
 /// Run the current `nulang` executable with `args`, inheriting stdio.
 fn nulang_exe(args: &[&str]) -> NuResult<()> {
+    nulang_exe_with_content(args, None)
+}
+
+fn nulang_exe_with_content(
+    args: &[&str],
+    content: Option<&super::web_content::ContentSnapshot>,
+) -> NuResult<()> {
     let exe = locate_nulang_exe()?;
     let mut cmd = Command::new(&exe);
     cmd.args(args);
@@ -1072,6 +1080,26 @@ fn nulang_exe(args: &[&str]) -> NuResult<()> {
             module_path.push(';');
         }
         module_path.push_str(&computed);
+    }
+    if let Some(content) = content {
+        // Do not silently shadow a dependency or caller-provided module.
+        if module_path
+            .split(';')
+            .filter_map(|entry| entry.split_once('='))
+            .any(|(name, _)| {
+                name.trim().trim_start_matches("@nulang/") == super::web_content::IMPORT
+            })
+        {
+            return Err(NuError::PackageError {
+                msg: "configured web content conflicts with @nulang/web_content module".into(),
+                span: Span::default(),
+            });
+        }
+        module_path = if module_path.is_empty() {
+            content.module_path().to_owned()
+        } else {
+            format!("{};{module_path}", content.module_path())
+        };
     }
     if !module_path.is_empty() {
         cmd.env("NULANG_MODULE_PATH", &module_path);
@@ -1417,6 +1445,28 @@ fn cmd_build_web() -> NuResult<()> {
         span: Span::default(),
     })?;
     let entry = prepare_package()?;
+    let content = prepare_web_content(&root, &manifest)?;
+    build_web(&root, &manifest, &entry, content.as_ref())
+}
+
+fn prepare_web_content(
+    root: &Path,
+    manifest: &Manifest,
+) -> NuResult<Option<super::web_content::ContentSnapshot>> {
+    super::web_content::ContentSnapshot::new(root, &manifest.web).map_err(|msg| {
+        NuError::PackageError {
+            msg: format!("invalid web content: {msg}"),
+            span: Span::default(),
+        }
+    })
+}
+
+fn build_web(
+    root: &Path,
+    manifest: &Manifest,
+    entry: &Path,
+    content: Option<&super::web_content::ContentSnapshot>,
+) -> NuResult<()> {
     let entry_str = entry.to_string_lossy().into_owned();
 
     let build_dir = root.join(".nula");
@@ -1427,25 +1477,30 @@ fn cmd_build_web() -> NuResult<()> {
     let nbc_path = build_dir.join("build.nbc");
     let nbc_path_str = nbc_path.to_string_lossy().into_owned();
 
-    let output_dir = root.join(&manifest.web.output_dir);
-    std::fs::create_dir_all(&output_dir).map_err(|e| NuError::PackageError {
-        msg: format!("cannot create {}: {}", output_dir.display(), e),
+    let static_dir = root.join(&manifest.web.static_dir);
+    let output = super::web_output::BuildOutput::new(root, &manifest.web.output_dir, &static_dir)
+        .map_err(|msg| NuError::PackageError {
+        msg,
         span: Span::default(),
     })?;
+    let output_dir = output.path();
 
     let client_js_path = output_dir.join("app.client.js");
     let client_js_path_str = client_js_path.to_string_lossy().into_owned();
 
     eprintln!("Building {} (web)...", manifest.package.name);
     eprintln!("  Compiling {}...", entry.display());
-    nulang_exe(&[
-        "--emit-nbc",
-        "--out",
-        &nbc_path_str,
-        "--rewrite-signals",
-        &client_js_path_str,
-        &entry_str,
-    ])?;
+    nulang_exe_with_content(
+        &[
+            "--emit-nbc",
+            "--out",
+            &nbc_path_str,
+            "--rewrite-signals",
+            &client_js_path_str,
+            &entry_str,
+        ],
+        content,
+    )?;
 
     let bytes = std::fs::read(&nbc_path).map_err(|e| NuError::PackageError {
         msg: format!("cannot read {}: {}", nbc_path.display(), e),
@@ -1456,13 +1511,12 @@ fn cmd_build_web() -> NuResult<()> {
         span: Span::default(),
     })?;
 
-    let mut vm = VM::new();
-    vm.load_module(artifact.module);
-    vm.run().map_err(|e| NuError::PackageError {
-        msg: format!("runtime error in {}: {}", entry.display(), e),
-        span: Span::default(),
+    let routes = crate::web::static_build::discover_routes(artifact.module).map_err(|msg| {
+        NuError::PackageError {
+            msg,
+            span: Span::default(),
+        }
     })?;
-    let routes = vm.take_web_routes();
     let src_root = root.join("src");
     // Validate once: runtime route plans and deployment IR must consume the
     // same compiler-owned contracts rather than re-extracting source.
@@ -1473,7 +1527,7 @@ fn cmd_build_web() -> NuResult<()> {
         msg: format!("invalid web route contract:\n{}", diagnostics.join("\n")),
         span: Span::default(),
     })?;
-    crate::web::dispatch::compile_runtime_routes_from_contracts(
+    let runtime_routes = crate::web::dispatch::compile_runtime_routes_from_contracts(
         routes.clone(),
         &validated_contracts,
     )
@@ -1482,16 +1536,45 @@ fn cmd_build_web() -> NuResult<()> {
         span: Span::default(),
     })?;
 
-    eprintln!("  Rendering {} route(s)...", routes.len());
-    for route in &routes {
-        let html = render_route_handler(&route.handler_module, route.handler_func_idx, None)
-            .ok_or_else(|| NuError::PackageError {
-                msg: format!("failed to render route {:?} {}", route.method, route.path),
-                span: Span::default(),
-            })?;
-        let html = crate::web::reactivity::inject_client_runtime_script(&html);
-        let out_file = route_path_to_output_file(&route.path);
-        let dest = output_dir.join(&out_file);
+    // Emit the signal graph and generate provisional deployment metadata.
+    let signals_path = output_dir.join("app.signals.json");
+    nulang_exe_with_content(
+        &[
+            "--emit-signals",
+            &signals_path.to_string_lossy(),
+            &entry_str,
+        ],
+        content,
+    )?;
+    let mut ir = crate::web::ir::generate_deployment_ir(
+        &routes,
+        Some(&signals_path),
+        &src_root,
+        &manifest.budgets,
+        &validated_contracts,
+    );
+
+    // Rendering and deployment metadata share the same route decisions.
+    // Known dynamic handlers are skipped; inferred static candidates may
+    // execute only the checked, deterministic rendering subset.
+    let pages = crate::web::static_build::render_pages(
+        &runtime_routes,
+        &validated_contracts,
+        &manifest.web.prerender,
+        &manifest.web.collections,
+        &mut ir,
+    )
+    .map_err(|msg| NuError::PackageError {
+        msg,
+        span: Span::default(),
+    })?;
+    eprintln!(
+        "  Rendering {} static page(s) of {} route(s)...",
+        pages.len(),
+        routes.len()
+    );
+    for (path, html) in pages {
+        let dest = output_dir.join(path);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| NuError::PackageError {
                 msg: format!("cannot create {}: {}", parent.display(), e),
@@ -1502,30 +1585,59 @@ fn cmd_build_web() -> NuResult<()> {
             msg: format!("cannot write {}: {}", dest.display(), e),
             span: Span::default(),
         })?;
-        eprintln!("    {} -> {}", route.path, dest.display());
+        eprintln!("    {}", dest.display());
     }
-
-    let static_dir = root.join(&manifest.web.static_dir);
-    if static_dir.is_dir() {
-        copy_dir_contents(&static_dir, &output_dir)?;
+    if let Some(site_url) = &manifest.web.site_url {
+        let package_error = |msg: String| NuError::PackageError {
+            msg,
+            span: Span::default(),
+        };
+        // An active server route must not intercept the generated sitemap.
+        for route in &runtime_routes {
+            let method = route.route.method.as_str();
+            if matches!(method, "GET" | "HEAD")
+                && ir.routes.iter().any(|r| {
+                    r.method == method && r.path == route.route.path && r.placement == "server"
+                })
+                && crate::web::dispatch::match_route(route, "/sitemap.xml").is_some()
+            {
+                return Err(package_error(format!(
+                    "sitemap.xml conflicts with {method} {}",
+                    route.route.path
+                )));
+            }
+        }
+        let xml = super::sitemap::render(
+            site_url,
+            ir.routes
+                .iter()
+                .filter(|route| {
+                    route.method == "GET" && route.placement == "static" && route.artifact.is_some()
+                })
+                .map(|route| &route.path),
+        )
+        .map_err(package_error)?;
+        // Reserve the generated file before copying assets, including
+        // case-insensitive directory aliases from already rendered pages.
+        for entry in std::fs::read_dir(output_dir).map_err(|e| package_error(e.to_string()))? {
+            let entry = entry.map_err(|e| package_error(e.to_string()))?;
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("sitemap.xml")
+            {
+                return Err(package_error(
+                    "sitemap.xml conflicts with generated output".into(),
+                ));
+            }
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output_dir.join("sitemap.xml"))
+            .and_then(|mut file| std::io::Write::write_all(&mut file, xml.as_bytes()))
+            .map_err(|e| package_error(format!("cannot write sitemap.xml: {e}")))?;
     }
-
-    // Emit compile-time signal graph if the entry uses `signal` declarations.
-    let signals_path = output_dir.join("app.signals.json");
-    nulang_exe(&[
-        "--emit-signals",
-        &signals_path.to_string_lossy(),
-        &entry_str,
-    ])?;
-
-    // Generate deployment IR consumed by adapters and Nulang Cloud.
-    let ir = crate::web::ir::generate_deployment_ir(
-        &routes,
-        Some(&signals_path),
-        &src_root,
-        &manifest.budgets,
-        &validated_contracts,
-    );
     let ir_path = output_dir.join("nulang-app.ir.json");
     let ir_json = ir.to_json();
     std::fs::write(&ir_path, ir_json).map_err(|e| NuError::PackageError {
@@ -1533,10 +1645,21 @@ fn cmd_build_web() -> NuResult<()> {
         span: Span::default(),
     })?;
     eprintln!("  Wrote {}", ir_path.display());
+    if static_dir.is_dir() {
+        copy_dir_contents(&static_dir, output_dir)?;
+    }
+    if let Some(content) = content {
+        content
+            .validate_links(&ir, &runtime_routes, output_dir)
+            .map_err(|msg| NuError::PackageError {
+                msg,
+                span: Span::default(),
+            })?;
+    }
 
     // Enforce performance budgets declared in Nulang.toml.
     if let Err(violations) = crate::web::budget::check_initial_js_budget(
-        &output_dir,
+        output_dir,
         manifest.budgets.initial_js_max_bytes(),
     ) {
         let mut lines = vec!["performance budget exceeded:".to_string()];
@@ -1552,45 +1675,66 @@ fn cmd_build_web() -> NuResult<()> {
         });
     }
 
-    println!("Web build succeeded: {}", output_dir.display());
+    output.publish().map_err(|msg| NuError::PackageError {
+        msg,
+        span: Span::default(),
+    })?;
+    println!(
+        "Web build succeeded: {}",
+        root.join(&manifest.web.output_dir).display()
+    );
     Ok(())
 }
 
-fn route_path_to_output_file(path: &str) -> PathBuf {
-    let trimmed = path.trim_start_matches('/');
-    if trimmed.is_empty() {
-        PathBuf::from("index.html")
-    } else {
-        PathBuf::from(trimmed).join("index.html")
-    }
-}
-
 fn copy_dir_contents(src: &Path, dst: &Path) -> NuResult<()> {
-    for entry in std::fs::read_dir(src)
-        .map_err(|e| NuError::PackageError {
-            msg: format!("cannot read {}: {}", src.display(), e),
+    fn package_error(error: impl std::fmt::Display) -> NuError {
+        NuError::PackageError {
+            msg: error.to_string(),
             span: Span::default(),
-        })?
-        .flatten()
-    {
+        }
+    }
+
+    let mut entries = std::fs::read_dir(src)
+        .map_err(package_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(package_error)?;
+    entries.sort_by_key(|entry| entry.file_name());
+    let mut siblings = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(dst).map_err(package_error)? {
+        let entry = entry.map_err(package_error)?;
+        let name = entry.file_name();
+        siblings.insert(
+            name.to_string_lossy().to_ascii_lowercase(),
+            (name, entry.file_type().map_err(package_error)?.is_dir()),
+        );
+    }
+    for entry in entries {
         let path = entry.path();
-        let dest = dst.join(path.file_name().unwrap_or(path.as_os_str()));
-        if path.is_dir() {
-            std::fs::create_dir_all(&dest).map_err(|e| NuError::PackageError {
-                msg: format!("cannot create {}: {}", dest.display(), e),
-                span: Span::default(),
-            })?;
-            copy_dir_contents(&path, &dest)?;
+        let name = entry.file_name();
+        let dest = dst.join(&name);
+        let kind = entry.file_type().map_err(package_error)?;
+        // Case-insensitive sibling conflicts are rejected on every platform.
+        let key = name.to_string_lossy().to_ascii_lowercase();
+        if let Some((existing_name, existing_dir)) = siblings.get(&key) {
+            if existing_name != &name || !kind.is_dir() || !existing_dir {
+                return Err(package_error(format!(
+                    "static asset conflicts with generated output: {}",
+                    dest.display()
+                )));
+            }
         } else {
-            std::fs::copy(&path, &dest).map_err(|e| NuError::PackageError {
-                msg: format!(
-                    "cannot copy {} to {}: {}",
-                    path.display(),
-                    dest.display(),
-                    e
-                ),
-                span: Span::default(),
-            })?;
+            siblings.insert(key, (name, kind.is_dir()));
+        }
+        if kind.is_dir() {
+            std::fs::create_dir_all(&dest).map_err(package_error)?;
+            copy_dir_contents(&path, &dest)?;
+        } else if kind.is_file() {
+            std::fs::copy(&path, &dest).map_err(package_error)?;
+        } else {
+            return Err(package_error(format!(
+                "static asset must be a regular file or directory: {}",
+                path.display()
+            )));
         }
     }
     Ok(())
@@ -1608,6 +1752,7 @@ fn cmd_dev(port_override: Option<u16>) -> NuResult<()> {
     let port = port_override.unwrap_or(manifest.web.port);
 
     let entry = prepare_package()?;
+    let content = prepare_web_content(&root, &manifest)?;
     let entry_str = entry.to_string_lossy().into_owned();
 
     let dev_dir = root.join(".nula");
@@ -1633,14 +1778,17 @@ fn cmd_dev(port_override: Option<u16>) -> NuResult<()> {
     let client_js_path = output_dir.join("app.client.js");
 
     eprintln!("Compiling {} for dev...", entry.display());
-    nulang_exe(&[
-        "--emit-nbc",
-        "--out",
-        &nbc_path_str,
-        "--rewrite-signals",
-        &client_js_path.to_string_lossy(),
-        &entry_str,
-    ])?;
+    nulang_exe_with_content(
+        &[
+            "--emit-nbc",
+            "--out",
+            &nbc_path_str,
+            "--rewrite-signals",
+            &client_js_path.to_string_lossy(),
+            &entry_str,
+        ],
+        content.as_ref(),
+    )?;
 
     let bytes = std::fs::read(&nbc_path).map_err(|e| NuError::PackageError {
         msg: format!("cannot read {}: {}", nbc_path.display(), e),
@@ -1667,14 +1815,18 @@ fn cmd_dev(port_override: Option<u16>) -> NuResult<()> {
             }
         })?;
 
-    nulang_exe(&[
-        "--emit-signals",
-        &signals_path.to_string_lossy(),
-        &entry_str,
-    ])?;
+    nulang_exe_with_content(
+        &[
+            "--emit-signals",
+            &signals_path.to_string_lossy(),
+            &entry_str,
+        ],
+        content.as_ref(),
+    )?;
 
     if runtime_routes.is_empty() {
-        cmd_build_web()?;
+        build_web(&root, &manifest, &entry, content.as_ref())?;
+        drop(content);
         let output_dir = root.join(&manifest.web.output_dir);
         let addr = format!("127.0.0.1:{}", port);
         let listener = std::net::TcpListener::bind(&addr).map_err(|e| NuError::PackageError {
@@ -1695,6 +1847,7 @@ fn cmd_dev(port_override: Option<u16>) -> NuResult<()> {
         }
         Ok(())
     } else {
+        drop(content);
         let server = WebDevServer::bind_runtime(
             port,
             Some(static_dir),
@@ -2283,7 +2436,9 @@ fn cmd_deploy(
     let version = manifest.package.version.clone();
 
     // Build the web output so dist/ contains the IR and static assets.
-    cmd_build_web()?;
+    let entry = prepare_package()?;
+    let content = prepare_web_content(&root, &manifest)?;
+    build_web(&root, &manifest, &entry, content.as_ref())?;
 
     let dist_dir = root.join(&manifest.web.output_dir);
 
@@ -2334,32 +2489,37 @@ fn cmd_deploy(
     })?;
 
     // Always build .nbc (native bytecode tier).
-    let entry = prepare_package()?;
     let entry_str = entry.to_string_lossy().into_owned();
     let nbc_path = nula_dist.join(format!("{}.nbc", name));
     let nbc_path_str = nbc_path.to_string_lossy().into_owned();
     let behavior_path = nula_dist.join(format!("{}.behavior.json", name));
     let behavior_path_str = behavior_path.to_string_lossy().into_owned();
     eprintln!("Compiling {} to .nbc + behavior manifest...", name);
-    nulang_exe(&[
-        "--emit-nbc",
-        "--out",
-        &nbc_path_str,
-        "--emit-behavior-manifest",
-        &behavior_path_str,
-        "--behavior-package-name",
-        &name,
-        "--behavior-package-version",
-        &version,
-        &entry_str,
-    ])?;
+    nulang_exe_with_content(
+        &[
+            "--emit-nbc",
+            "--out",
+            &nbc_path_str,
+            "--emit-behavior-manifest",
+            &behavior_path_str,
+            "--behavior-package-name",
+            &name,
+            "--behavior-package-version",
+            &version,
+            &entry_str,
+        ],
+        content.as_ref(),
+    )?;
 
     // Optionally build .wasm + .cwasm (WASM tier).
     if wasm {
         let wasm_path = nula_dist.join(format!("{}.wasm", name));
         let wasm_path_str = wasm_path.to_string_lossy().into_owned();
         eprintln!("Compiling {} to .wasm + .cwasm...", name);
-        nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
+        nulang_exe_with_content(
+            &["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str],
+            content.as_ref(),
+        )?;
     }
 
     // Bundle into .tar.gz: .nula/dist/ contents + dist/** + Nulang.toml + Nulang.lock.
@@ -3174,7 +3334,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let _guard = ChangeDir::new(&dir);
 
-        scaffold_package(&dir, "deploy-test", "default").expect("scaffold should succeed");
+        // A deploy authentication test must start with a valid web app.
+        // The CLI scaffold performs IO.print during entry-point execution,
+        // which the checked static route discovery correctly rejects.
+        scaffold_package(&dir, "deploy-test", "web").expect("web scaffold should succeed");
 
         let result = cmd_deploy(
             false,

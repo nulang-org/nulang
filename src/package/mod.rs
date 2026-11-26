@@ -17,3 +17,8 @@ pub mod lockfile;
 pub mod manifest;
 pub mod module_invalidation;
 pub mod resolver;
+
+mod markdown;
+mod sitemap;
+mod web_content;
+mod web_output;

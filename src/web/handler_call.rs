@@ -18,9 +18,27 @@ pub fn render_bound_handler(
     handler_param_count: usize,
     args: &[BoundRouteArgument],
 ) -> Result<String, String> {
-    validate_argument_bank(handler_param_count, args)?;
-
+    let (executable, entry_offset) =
+        prepare_bound_handler(module, func_idx, handler_param_count, args)?;
     let mut vm = VM::new();
+    vm.load_module(executable);
+    let result = vm
+        .run_from(0, entry_offset)
+        .map_err(|error| format!("route handler execution failed: {error}"))?;
+    Ok(vm.value_to_string(0, result))
+}
+
+/// Prepare the same call ABI for runtime dispatch and checked static rendering.
+pub(crate) fn prepare_bound_handler(
+    module: &CodeModule,
+    func_idx: usize,
+    handler_param_count: usize,
+    args: &[BoundRouteArgument],
+) -> Result<(CodeModule, usize), String> {
+    validate_argument_bank(handler_param_count, args)?;
+    if func_idx >= module.function_table.len() {
+        return Err(format!("invalid handler function index {func_idx}"));
+    }
     let mut executable = module.clone();
     let entry_offset = executable.instructions.len();
 
@@ -57,11 +75,7 @@ pub fn render_bound_handler(
     ));
     executable.emit(Instruction::new0(OpCode::Ret));
 
-    vm.load_module(executable);
-    let result = vm
-        .run_from(0, entry_offset)
-        .map_err(|error| format!("route handler execution failed: {error}"))?;
-    Ok(vm.value_to_string(0, result))
+    Ok((executable, entry_offset))
 }
 
 fn validate_argument_bank(

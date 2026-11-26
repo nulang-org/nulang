@@ -100,7 +100,7 @@ app "hello" {
 }
 ```
 
-An `app` block desugars into `perform Web.route(method, path, handler)` calls plus a `serve_static` fallback — `route "GET" "/path" -> handler` is exactly `perform Web.route("GET", "/path", handler)`. Handlers are `fn() -> Html` (for POST routes, the handler reads the request via the request-access operations below and still returns `Html`).
+An `app` block desugars into `perform Web.route(method, path, handler)` calls; the package host handles the configured static-directory fallback — `route "GET" "/path" -> handler` is exactly `perform Web.route("GET", "/path", handler)`. Handlers are `fn() -> Html` (for POST routes, the handler reads the request via the request-access operations below and still returns `Html`).
 
 ### Building HTML
 
@@ -220,15 +220,303 @@ curl http://127.0.0.1:8080/last             # "Last message: hi"
 
 ## Static HTML and Static Sites
 
-Handlers that only perform `Web`/`Render` operations are **statically renderable** — the compiler can run them at build time. `nula build --web` does exactly that:
+Static builds select eligible request-independent GET handlers, prove their
+compiled direct-call graphs against a restrictive rendering policy, then
+interpret them under the same policy:
 
 ```bash
 nulang nula build --web
 ```
 
-It runs the route registrations, renders every route to `dist/<path>/index.html`, copies `static_dir` into `dist/`, and emits a deployment IR file (`nulang-app.ir.json`). The result is plain HTML + JS you can host on any static file server. Dynamic operations (`Web.param`, form parsing, the kv store, `Realtime.broadcast`) work under `nula dev` but render at their pattern path in a static build — e.g. `/hello/:name` becomes a literal `dist/hello/:name/index.html`.
+The build writes ordinary HTML to `dist/<path>/index.html`, copies the
+configured `static_dir`, and emits `nulang-app.ir.json`. Only successful
+static pages have an artifact in the deployment IR. Server routes remain in
+the IR without an HTML artifact. POST, HEAD, explicit server placement,
+non-path request bindings, and request-dependent effects are not statically
+published. Parameterized GET routes require an explicit list of
+concrete URL paths; no literal `dist/hello/:name/index.html` is produced.
 
-For a pure static response without the `app` machinery, `Web.text`/`Web.raw` are enough on their own — any `fn() -> Html` can be rendered by the same pipeline.
+### Finite parameterized routes
+
+For a blog, documentation site, or product catalog, use the existing typed
+route and list its concrete pages in `Nulang.toml`:
+
+```nulang
+import stdlib::web::html
+import stdlib::web::types
+
+fn article(slug: String) -> Html { text(slug) }
+
+app "articles" {
+    route "GET" "/articles/{slug}" -> article
+}
+```
+
+```toml
+[web.prerender]
+"/articles/{slug}" = ["/articles/intro", "/articles/install"]
+```
+
+The key must exactly match one registered parameterized GET route. Every listed
+URL is matched and decoded with the same compiler-owned path binding plan
+used by HTTP dispatch. The handler must have a complete path-only binding
+plan with explicit scalar types (`String`, `Int`, `Bool`, or `Float`).
+Explicit server/client placement, ambient request state, unsupported types,
+invalid URLs, empty lists, duplicate pages, and overlapping GET routes are
+build errors, not silent fallbacks. URLs must use portable unescaped path
+segments as for literal static routes.
+
+The list opts the entire route into **finite static deployment**: the output
+contains one concrete static Deployment IR entry per URL (including its
+artifact and original `route_template`), with no wildcard server fallback.
+Unlisted URLs are not generated. The development server still dispatches the
+original typed route for any matching URL; this does not restrict dev routing.
+Other, unconfigured dynamic routes remain server routes. Reordering the list
+does not change the output, and removing a URL removes its previous artifact
+on the next successful build.
+
+### Typed content collections
+
+Instead of maintaining URL lists by hand, define content in ordinary typed
+Nulang data and project its route keys with a named zero-argument function.
+For example, put your content in `src/articles.nula`:
+
+```nulang
+pub type Article = { slug: String, title: String }
+
+pub fn articles() -> [Article] {
+    [
+        {slug: "intro", title: "Introduction"},
+        {slug: "install", title: "Installation"}
+    ]
+}
+```
+
+Use the same collection for enumeration and rendering in `src/main.nula`:
+
+```nulang
+import stdlib::web::html
+import stdlib::web::types
+// fragment: requires src/articles.nula from the preceding example
+import articles
+
+fn article_keys() -> [String] {
+    var keys = [];
+    for item in articles() {
+        keys = perform Array.push(keys, item.slug)
+    }
+    keys
+}
+
+fn article(slug: String) -> Html {
+    var title = "Not found";
+    for item in articles() {
+        if item.slug == slug then { title = item.title } else {}
+    }
+    text(title)
+}
+
+app "articles" {
+    route "GET" "/articles/{slug}" -> article
+}
+```
+
+```toml
+[web.collections]
+"/articles/{slug}" = "article_keys"
+```
+
+The provider name must identify one compiled zero-argument function. For
+a route with one path capture, return an array of values of that exact scalar
+type. For several captures, return an array of tuples in URL capture order,
+independent of handler parameter order. For example, a route
+`/articles/{slug}/{page: Int}` expects keys such as
+`[("intro", 1), ("install", 2)]`. The build checks the actual VM value
+shapes and scalar types before converting each key to a portable URL segment.
+
+Each provider is evaluated once per configured route before its pages are
+rendered. Both the provider and handler must pass the static effect proof and
+checked VM below. Empty collections, invalid keys, duplicate output paths
+and route conflicts fail the build without replacing the previous site.
+Use either a collection or `[web.prerender]` on a given route, not both.
+All other finite deployment rules above still apply.
+
+There is no separate content or rendering runtime: records, imports, and
+functions use the existing language. The manifest only names the route-key
+projection.
+
+### Local Markdown content bundles
+
+For file-authored content, register named directories in the package manifest:
+
+```toml
+[web.content]
+articles = "content/articles"
+
+[web.collections]
+"/articles/{slug}" = "article_keys"
+```
+
+Each lowercase `.md` file below a bundle directory is one entry. Nested
+directories (including `intro/index.md` page bundles) are supported.
+For example, `content/articles/intro/index.md`:
+
+```markdown
++++
+slug = "intro"
+title = "Introduction"
+summary = "Getting started"
+tags = ["docs", "start"]
+draft = false
++++
+
+# Welcome
+
+Markdown content goes here.
+```
+
+The `+++` lines delimit TOML front matter. Required strings are `slug`
+and `title`; `summary` defaults to an empty string, `tags` to an empty
+string array, and `draft` to false. Unknown fields, wrong types, missing
+delimiters, empty titles, duplicate (case-insensitive) or non-portable slugs,
+and duplicate/empty/untrimmed tags are build errors with source diagnostics.
+Drafts are validated but omitted from the compiled collection in both build
+and dev; changing the flag publishes the entry on the next build.
+
+Import the generated, typed data using the ordinary module import:
+
+```nulang
+import stdlib::web::html
+import stdlib::web::types
+// fragment: generated by the package web commands, not a standalone module
+import @nulang/web_content
+
+fn article_keys() -> [String] {
+    var keys = [];
+    for item in content_articles() {
+        keys = perform Array.push(keys, item.slug)
+    }
+    keys
+}
+
+fn article(slug: String) -> Html {
+    var page = text("Not found");
+    for item in content_articles() {
+        if item.slug == slug then { page = item.html } else {}
+    }
+    page
+}
+
+app "articles" {
+    route "GET" "/articles/{slug}" -> article
+}
+```
+
+The bundle name becomes `content_<name>() -> [WebContentEntry]`.
+Each entry has `slug`, `title`, `summary`, `body`, and `source`
+strings, plus `tags: [String]` and `html: Html`. `body` remains the original
+Markdown source; `html` is the rendered fragment. `source` is a slash-separated path
+relative to the package. Names use lowercase ASCII letters, digits and
+underscores, starting with a letter. Entries are sorted by source path;
+CRLF line endings are normalized to LF.
+
+The package tool snapshots content once per `nula build --web`,
+`nula dev`, or `nula deploy` invocation (including deploy's separate
+runtime artifact compilation). The import is available during these web
+commands; it is not a runtime file-reading effect or a global stdlib module.
+The temporary generated source is not a public artifact. Content edits
+require a new build or dev-server restart. Bundle directories must remain
+within the package and must not overlap each other, output, static assets,
+`.git` or `.nula`; symlinks are rejected. The loader is intended for a
+trusted local project, not a concurrently mutated hostile filesystem.
+
+Published entries are rendered as CommonMark fragments. Use `item.html`
+directly in a page or component, or `text(item.body)` to display Markdown
+source. Inline and block HTML in the source are escaped, not executed.
+Links and images are checked after Markdown parsing: unsafe URL schemes,
+protocol-relative URLs and ambiguous root-relative paths fail with source
+diagnostics. Local references and the existing web URL schemes (HTTP,
+HTTPS, mailto, tel) are supported. Do not pass untrusted Markdown to
+`Web.raw`.
+
+Build and deploy check root-relative links and images against the newly
+staged files, generated pages and retained server GET routes before
+publishing. A missing target fails the build without replacing the previous
+site. Query strings and fragments are ignored for target existence; external
+URLs are not fetched. Relative links and fragment identifiers are left
+unchanged because content fragments can be embedded in multiple routes.
+Dev renders the same safe fragments, but the full staged-site link check
+runs on build and deploy. Automatic asset copying, custom metadata schemas
+and globbing are deliberately not included. Use the existing static asset
+directory for public files.
+A configured route with no published keys follows the usual empty-collection
+error rule rather than silently publishing an empty route set.
+
+### XML sitemap
+
+Opt in to sitemap generation with an explicit public origin in the package manifest:
+
+```toml
+[web]
+site_url = "https://example.com"
+```
+
+A successful web build (including deploy) emits `sitemap.xml` from the final
+Deployment IR's concrete static GET routes with HTML artifacts. Dynamic routes,
+unlisted collection keys, and arbitrary public files are not included. The
+registered URL spelling is preserved and entries are sorted. No modification
+dates or priorities are invented. This is an origin-only setting (ASCII DNS or
+IPv4, HTTP(S), optional port and trailing slash); subpath deployments are not
+supported by this option. A configured sitemap with no static pages, an invalid
+origin, a reserved output collision, or an exceeded sitemap protocol limit
+fails the build without replacing the previous output. Removing the option
+removes the generated sitemap on the next successful build. If you need custom
+canonical URLs, exclusions or redirect handling, supply your own sitemap in
+the static directory instead.
+
+### Static effect proof
+
+Before running a page handler, the build checks every emitted instruction in its
+transitive compiled direct-call graph, including linked imports and both branches
+of a conditional. It permits HTML construction and selected deterministic local
+operations. It rejects external/request operations (including `Web.cookie` and
+`Web.param`), unproven indirect call targets, and invalid function/control-flow
+ranges. The result is independent of which concrete URLs you prerender; even
+an unselected branch containing a request effect disqualifies the route.
+
+An inferred static candidate that fails the proof remains on the server, with a
+diagnostic explaining why. An explicit `@placement(static)` or a finite static
+route configured through `[web.prerender]` or `[web.collections]` that fails the proof fails
+the build instead. The interpreter independently checks operations during
+rendering as defense in depth.
+
+Direct recursion is permitted when the entire direct-call graph passes the
+policy. Arbitrary higher-order calls may remain server-only even when pure:
+a missing proof is not evidence of an effect. The proof is over compiled
+instructions, not unoptimized source, and does not establish termination,
+bounded resource use, or safety for untrusted bytecode.
+
+Plain pages have no injected client script; HTML with signal/action markers
+still receives the existing progressive-enhancement runtime.
+
+The output directory must be a generated directory within the package,
+separate from source, assets, and build metadata. Successful builds replace
+the generated directory, removing stale HTML; a failed build preserves the
+previous output. Concurrent builds targeting the same directory are rejected.
+Publication uses two filesystem renames and is not crash-atomic; after a
+process kill, inspect the retained staging/backup directory and stale build
+lock before retrying. Generated pages and public assets may not overwrite one
+another. Route paths must map to portable, contained file paths. Non-generated
+output directories are rejected.
+
+Route registration still uses the checked interpreter, with the additional
+permission to register routes. Executed application-startup external or
+request-dependent effects are rejected during a web build; startup is not
+subject to the page-handler all-branches proof. This is not an untrusted-build
+sandbox. Dependency resolution still uses the existing package pipeline and
+may perform network operations.
+Static-only deployments can serve the output directly; mixed deployments
+require a separately configured runtime for server routes.
 
 ## Realtime Broadcast
 
@@ -250,7 +538,7 @@ The `examples/chat-web` package shows the full pattern: an SSE `<script>` in the
 Two paths, depending on what your app does:
 
 - **Dynamic server** (uses request data, forms, kv store, broadcast): run the native runtime — `nulang --with net server.nula` for `Http.serve`-style programs, or ship the package and run `nulang nula dev` (the dev server is currently the runtime host for `Web`-routed apps). Native runtime required.
-- **Static site** (render-only handlers): `nulang nula build --web` and deploy `dist/` to any static host.
+- **Static site** (eligible request-independent GET handlers): `nulang nula build --web` and deploy `dist/` to any static host.
 
 :::caution
 The WASM backends (`--backend wasm`, `wasm-run`, `wasm-aot`, and `nula build-wasm`) are **not** a deployment target for web servers: they support `IO.print`/`IO.read` only — no user-defined effect handlers, and no `Http`/`Web`/`Realtime` host. WASM output is for compute-only programs today; serve on the native runtime.

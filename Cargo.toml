@@ -115,6 +115,8 @@ serde_json = "1.0"
 
 # Manifest/lockfile parsing for the `nula` package manager
 toml = "1"
+# CommonMark rendering at package build time; no CLI or optional extensions.
+pulldown-cmark = { version = "0.13.6", default-features = false, features = ["html"] }
 # Fast hashing for compiler-internal maps (already a transitive dep via cranelift)
 rustc-hash = "2"
 # Rich source-snippet diagnostic rendering (src/diagnostic.rs)
