@@ -1646,3 +1646,154 @@ app "overlap" {{ {routes} }}
         assert_eq!(site.read("dist/index.html"), previous);
     }
 }
+
+const INDEXED_CONTENT_APP: &str = r#"
+import stdlib::web::html
+import stdlib::web::types
+import @nulang/web_content
+
+fn article_keys() -> [String] { keys_content_articles() }
+fn article(slug: String) -> Html {
+    match lookup_content_articles(slug) {
+        Some(item) => item.html,
+        _ => text("not found"),
+    }
+}
+app "indexed content" {
+    route "GET" "/articles/{slug}" -> article
+}
+"#;
+
+#[test]
+fn indexed_content_lookup_preserves_rendering_and_exact_keys() {
+    let site = content_site();
+    enable_content_index(&site, "[\"articles\"]");
+    for (file, slug, title, body) in [
+        ("z.md", "a", "First", "**First** #{1 + 1}"),
+        ("a.md", "a-b", "Second", "Second"),
+        ("b.md", "Z", "Third", "Third"),
+        ("c.md", "a_2", "Fourth", "Fourth"),
+    ] {
+        markdown_file(
+            &site,
+            &format!("content/articles/{file}"),
+            &format!("+++\nslug = \"{slug}\"\ntitle = \"{title}\"\n+++\n{body}\n"),
+        );
+    }
+    markdown_file(
+        &site,
+        "content/articles/draft.md",
+        "+++\nslug = \"secret\"\ntitle = \"Draft\"\ndraft = true\n+++\nDRAFT_LOOKUP_SENTINEL\n",
+    );
+    site.source(MARKDOWN_HTML_APP);
+    success(site.build());
+    let expected: Vec<_> = ["a", "a-b", "Z", "a_2"]
+        .iter()
+        .map(|slug| site.read(&format!("dist/articles/{slug}/index.html")))
+        .collect();
+    // The old fixture registers an additional preview route, so compare HTML,
+    // not its unrelated deployment metadata.
+    site.source(INDEXED_CONTENT_APP);
+    success(site.build());
+    for (slug, body) in ["a", "a-b", "Z", "a_2"].iter().zip(&expected) {
+        assert_eq!(
+            site.read(&format!("dist/articles/{slug}/index.html")),
+            *body
+        );
+    }
+    assert_eq!(site.ir().routes.len(), 4);
+    let bytes = site.read(".nula/build.nbc");
+    assert!(!bytes
+        .windows(b"DRAFT_LOOKUP_SENTINEL".len())
+        .any(|w| w == b"DRAFT_LOOKUP_SENTINEL"));
+    let artifact = nulang::bytecode::CodeModule::from_nbc(&bytes).unwrap();
+    let mut vm = nulang::vm::VM::new();
+    vm.load_module(artifact.module);
+    vm.run().unwrap();
+    let routes =
+        nulang::web::dispatch::compile_runtime_routes(vm.take_web_routes(), &site.0.join("src"))
+            .unwrap();
+    for (slug, body) in ["a", "a-b", "Z", "a_2"].iter().zip(&expected) {
+        let params =
+            nulang::web::dispatch::match_route(&routes[0], &format!("/articles/{slug}")).unwrap();
+        assert_eq!(
+            nulang::web::dispatch::render_direct_route(&routes[0], &params)
+                .unwrap()
+                .unwrap()
+                .as_bytes(),
+            body
+        );
+    }
+    for slug in ["missing", "secret", "A", "z", "a-bb", "a-"] {
+        let params =
+            nulang::web::dispatch::match_route(&routes[0], &format!("/articles/{slug}")).unwrap();
+        assert_eq!(
+            nulang::web::dispatch::render_direct_route(&routes[0], &params)
+                .unwrap()
+                .unwrap(),
+            "not found",
+            "{slug}"
+        );
+    }
+    std::fs::remove_file(site.0.join("content/articles/z.md")).unwrap();
+    success(site.build());
+    assert!(!site.0.join("dist/articles/a").exists());
+}
+
+#[test]
+fn indexed_content_lookup_crosses_group_boundaries() {
+    let site = content_site();
+    enable_content_index(&site, "[\"articles\"]");
+    site.source(INDEXED_CONTENT_APP);
+    for i in 0..65 {
+        let slug = format!("page-{i:03}");
+        markdown_file(
+            &site,
+            &format!("content/articles/{slug}.md"),
+            &format!("+++\nslug = \"{slug}\"\ntitle = \"{slug}\"\n+++\nUnique body {i}.\n"),
+        );
+    }
+    success(site.build());
+    assert_eq!(site.ir().routes.len(), 65);
+    for i in 0..65 {
+        let html = site.read(&format!("dist/articles/page-{i:03}/index.html"));
+        assert_eq!(
+            String::from_utf8(html).unwrap().trim(),
+            format!("<p>Unique body {i}.</p>")
+        );
+    }
+}
+
+fn enable_content_index(site: &Site, names: &str) {
+    let path = site.0.join("Nulang.toml");
+    let original = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        path,
+        original.replace("[web]\n", &format!("[web]\nindexed_content = {names}\n")),
+    )
+    .unwrap();
+}
+
+#[test]
+fn indexed_content_is_opt_in_and_rejects_unknown_bundles() {
+    let site = content_site();
+    markdown_file(
+        &site,
+        "content/articles/a.md",
+        "+++\nslug = \"a\"\ntitle = \"A\"\n+++\nBody\n",
+    );
+    site.source(MARKDOWN_HTML_APP);
+    success(site.build());
+    let prior = site.read("dist/articles/a/index.html");
+    site.source(INDEXED_CONTENT_APP);
+    assert!(
+        !site.build().status.success(),
+        "lookup must require explicit opt-in"
+    );
+    assert_eq!(site.read("dist/articles/a/index.html"), prior);
+    enable_content_index(&site, "[\"articles\", \"unknown\"]");
+    let result = site.build();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("unknown indexed content bundle"));
+    assert_eq!(site.read("dist/articles/a/index.html"), prior);
+}

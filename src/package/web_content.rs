@@ -42,6 +42,15 @@ pub(super) struct ContentSnapshot {
 
 impl ContentSnapshot {
     pub(super) fn new(root: &Path, web: &WebSection) -> Result<Option<Self>, String> {
+        let mut indexed = BTreeSet::new();
+        for name in &web.indexed_content {
+            if !web.content.contains_key(name) {
+                return Err(format!("unknown indexed content bundle '{name}'"));
+            }
+            if !indexed.insert(name.as_str()) {
+                return Err(format!("duplicate indexed content bundle '{name}'"));
+            }
+        }
         if web.content.is_empty() {
             return Ok(None);
         }
@@ -59,6 +68,23 @@ impl ContentSnapshot {
              import stdlib::web::types\n\
              pub type WebContentEntry = { slug: String, title: String, summary: String, tags: [String], body: String, html: Html, source: String }\n",
         );
+        if !indexed.is_empty() {
+            source.push_str("import stdlib::option\n");
+            source.push_str(
+                "fn web_content_slug_less(a: String, b: String) -> Bool {\n\
+             let al = perform String.length(a);\n\
+             let bl = perform String.length(b);\n\
+             var i = 0;\n\
+             while i < al && i < bl {\n\
+                 let ac = perform String.charAt(a, i);\n\
+                 let bc = perform String.charAt(b, i);\n\
+                 if ac != bc then { return ac < bc } else {};\n\
+                 i = i + 1\n\
+             };\n\
+             al < bl\n\
+             }\n",
+            );
+        }
         let mut bundle_roots = Vec::<PathBuf>::new();
         let mut root_links = Vec::new();
         for (name, directory) in &web.content {
@@ -118,7 +144,7 @@ impl ContentSnapshot {
                     ));
                 }
             }
-            writeln!(source, "pub fn content_{name}() -> [WebContentEntry] {{ [").unwrap();
+            let mut published = Vec::new();
             for entry in entries.iter().filter(|entry| !entry.meta.draft) {
                 let meta = &entry.meta;
                 let rendered = markdown::render(&entry.body, &entry.source)?;
@@ -129,9 +155,8 @@ impl ContentSnapshot {
                     .map(|tag| quote(tag))
                     .collect::<Vec<_>>()
                     .join(", ");
-                writeln!(
-                    source,
-                    "    {{slug: {}, title: {}, summary: {}, tags: [{}], body: {}, html: perform Web.raw({}), source: {}}},",
+                let record = format!(
+                    "{{slug: {}, title: {}, summary: {}, tags: [{}], body: {}, html: perform Web.raw({}), source: {}}}",
                     quote(&meta.slug),
                     quote(&meta.title),
                     quote(&meta.summary),
@@ -139,10 +164,15 @@ impl ContentSnapshot {
                     quote(&entry.body),
                     quote(&rendered.html),
                     quote(&entry.source)
-                )
-                .unwrap();
+                );
+                published.push((meta.slug.as_str(), record));
             }
-            source.push_str("] }\n");
+            generate_bundle(
+                &mut source,
+                name,
+                &published,
+                indexed.contains(name.as_str()),
+            );
         }
 
         let build_dir = root.join(".nula");
@@ -190,6 +220,70 @@ impl ContentSnapshot {
     ) -> Result<(), String> {
         markdown::validate_root_links(&self.root_links, ir, runtime_routes, output)
     }
+}
+
+// All generated slugs are portable ASCII. The comparator uses code points
+// rather than runtime string ordering, and exact equality at the leaf is
+// still required. Arbitrary request strings cannot alias a published slug.
+fn generate_bundle(source: &mut String, name: &str, entries: &[(&str, String)], indexed: bool) {
+    writeln!(source, "pub fn content_{name}() -> [WebContentEntry] {{ [").unwrap();
+    for (_, record) in entries {
+        writeln!(source, "    {record},").unwrap();
+    }
+    source.push_str("] }\n");
+    if !indexed {
+        return;
+    }
+    writeln!(source, "pub fn keys_content_{name}() -> [String] {{ [").unwrap();
+    for (slug, _) in entries {
+        writeln!(source, "    {},", quote(slug)).unwrap();
+    }
+    source.push_str("] }\n");
+
+    let mut sorted: Vec<_> = entries.iter().collect();
+    sorted.sort_by_key(|entry| entry.0);
+    let mut next = 0;
+    let expression = lookup_tree(source, name, &sorted, &mut next);
+    writeln!(
+        source,
+        "pub fn lookup_content_{name}(slug: String) -> Option[WebContentEntry] {{ {expression} }}"
+    )
+    .unwrap();
+}
+
+fn lookup_tree(
+    source: &mut String,
+    name: &str,
+    entries: &[&(&str, String)],
+    next: &mut usize,
+) -> String {
+    if entries.is_empty() {
+        return "None".into();
+    }
+    let middle = entries.len() / 2;
+    let (slug, record) = entries[middle];
+    let left = lookup_tree(source, name, &entries[..middle], next);
+    let right = lookup_tree(source, name, &entries[middle + 1..], next);
+    let pivot = quote(slug);
+    let expression = if entries.len() == 1 {
+        format!("if slug == {pivot} then {{ Some({record}) }} else {{ None }}")
+    } else {
+        format!("if slug == {pivot} then {{ Some({record}) }} else {{ if web_content_slug_less(slug, {pivot}) then {{ {left} }} else {{ {right} }} }}")
+    };
+    // Amortize compiler function bookkeeping across bounded subtrees.
+    // Large trees still have function boundaries to keep branch offsets small.
+    if entries.len() <= 16 {
+        return expression;
+    }
+    let id = *next;
+    *next += 1;
+    let function = format!("web_content_lookup_node_{name}_{id}");
+    writeln!(
+        source,
+        "fn {function}(slug: String) -> Option[WebContentEntry] {{ {expression} }}"
+    )
+    .unwrap();
+    format!("{function}(slug)")
 }
 
 impl Drop for ContentSnapshot {
