@@ -4344,6 +4344,188 @@ mod libsql_atomic_transition_tests {
         }
     }
 
+    // The live smoke is deliberately opt-in, has no production endpoint
+    // defaults, and rejects arbitrary hosts before making any connection.
+    fn disposable_turso_endpoint_allowed(endpoint: &str, opt_in: &str) -> bool {
+        if opt_in != "yes" {
+            return false;
+        }
+        let Ok(uri) = endpoint.parse::<hyper::Uri>() else {
+            return false;
+        };
+        let Some(host) = uri.host() else {
+            return false;
+        };
+        matches!(uri.scheme_str(), Some("https" | "libsql"))
+            && host.starts_with("nulang-smoke-")
+            && host.ends_with(".turso.io")
+            && uri.authority().is_some_and(|a| a.as_str() == host)
+            && (uri.path().is_empty() || uri.path() == "/")
+            && uri.query().is_none()
+    }
+
+    #[test]
+    fn disposable_turso_smoke_guard_fails_closed() {
+        for endpoint in [
+            "http://nulang-smoke-abc.turso.io",
+            "https://prod.turso.io",
+            "https://nulang-smoke-abc.turso.io.evil.example",
+            "https://nulang-smoke-abc.turso.io:443",
+            "https://nulang-smoke-abc.turso.io/path",
+            "https://nulang-smoke-abc.turso.io/?token=secret",
+            "https://nulang-smoke-abc.turso.io@evil.example",
+        ] {
+            assert!(!disposable_turso_endpoint_allowed(endpoint, "yes"));
+        }
+        assert!(!disposable_turso_endpoint_allowed(
+            "https://nulang-smoke-abc.turso.io",
+            ""
+        ));
+        assert!(disposable_turso_endpoint_allowed(
+            "https://nulang-smoke-abc.turso.io",
+            "yes"
+        ));
+        assert!(disposable_turso_endpoint_allowed(
+            "libsql://nulang-smoke-abc.turso.io",
+            "yes"
+        ));
+    }
+
+    // Run precisely the same transaction and durable persistence contract
+    // against the disposable local and live remote stores. Never print
+    // underlying remote errors, which may contain endpoint/token details.
+    fn exercise_disposable_smoke(store: &mut LibsqlStore) {
+        const ACTOR: u64 = 867_5309;
+        assert_eq!(store.latest_sequence(ACTOR), 0, "fresh database required");
+        {
+            let conn = store.conn();
+            store.rt.block_on(async {
+                conn.execute(
+                    "CREATE TABLE nulang_smoke_sql (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+                    (),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("fresh smoke table creation failed"));
+                let tx = conn
+                    .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                    .await
+                    .unwrap_or_else(|_| panic!("start insert transaction failed"));
+                tx.execute(
+                    "INSERT INTO nulang_smoke_sql (id, value) VALUES (?1, ?2)",
+                    libsql::params![1_i64, "first"],
+                )
+                .await
+                .unwrap_or_else(|_| panic!("parameterized insert failed"));
+                tx.execute(
+                    "UPDATE nulang_smoke_sql SET value = ?1 WHERE id = ?2",
+                    libsql::params!["committed", 1_i64],
+                )
+                .await
+                .unwrap_or_else(|_| panic!("parameterized update failed"));
+                tx.commit()
+                    .await
+                    .unwrap_or_else(|_| panic!("commit failed"));
+                let tx = conn
+                    .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                    .await
+                    .unwrap_or_else(|_| panic!("start rollback transaction failed"));
+                tx.execute(
+                    "UPDATE nulang_smoke_sql SET value = ?1 WHERE id = ?2",
+                    libsql::params!["rolled back", 1_i64],
+                )
+                .await
+                .unwrap_or_else(|_| panic!("rollback update failed"));
+                tx.rollback()
+                    .await
+                    .unwrap_or_else(|_| panic!("rollback failed"));
+            });
+        }
+
+        let value = transition(ACTOR, 2, 1);
+        let first = store
+            .commit_transition(value.clone())
+            .unwrap_or_else(|_| panic!("durable transition commit failed"));
+        let retry = store
+            .commit_transition(value)
+            .unwrap_or_else(|_| panic!("durable transition retry failed"));
+        assert_eq!(first, retry, "exact retry must be idempotent");
+        assert!(
+            store.commit_transition(transition(ACTOR, 1, 2)).is_err(),
+            "stale activation must not commit"
+        );
+        verify_disposable_smoke(store);
+    }
+
+    fn verify_disposable_smoke(store: &LibsqlStore) {
+        const ACTOR: u64 = 867_5309;
+        let rows = store
+            .query(
+                "SELECT value FROM nulang_smoke_sql WHERE id = ?1",
+                &[Value::int(1)],
+            )
+            .unwrap_or_else(|_| panic!("parameterized select failed"));
+        assert!(
+            rows == [r#"["committed"]"#],
+            "committed value must survive rollback/reopen"
+        );
+        assert_eq!(store.latest_sequence(ACTOR), 1);
+        assert_eq!(store.load_snapshot(ACTOR).map(|s| s.sequence), Some(1));
+        assert_eq!(store.read_journal(ACTOR).len(), 1);
+        assert_eq!(store.read_workflow_events(ACTOR).len(), 2);
+        assert_eq!(store.read_events(ACTOR).len(), 2);
+    }
+
+    #[test]
+    fn disposable_turso_smoke_contract_on_local_sqlite() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang-smoke-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("test.db");
+        {
+            let mut store = LibsqlStore::new(&path).unwrap();
+            exercise_disposable_smoke(&mut store);
+        }
+        {
+            let store = LibsqlStore::new(&path).unwrap();
+            verify_disposable_smoke(&store);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires explicitly authorized, fresh disposable Turso DB; never production"]
+    fn disposable_turso_smoke_live_https_roundtrip() {
+        let endpoint = std::env::var("NULANG_DISPOSABLE_TURSO_URL").unwrap_or_default();
+        let opt_in = std::env::var("NULANG_DISPOSABLE_TURSO_CONFIRM").unwrap_or_default();
+        assert!(
+            disposable_turso_endpoint_allowed(&endpoint, &opt_in),
+            "requires a fresh nulang-smoke-* Turso hostname and explicit yes confirmation"
+        );
+        let token = std::env::var("NULANG_DISPOSABLE_TURSO_TOKEN").unwrap_or_default();
+        assert!(
+            !token.trim().is_empty(),
+            "disposable database token required"
+        );
+
+        let mut store = LibsqlStore::new_remote(&endpoint, &token)
+            .unwrap_or_else(|_| panic!("authenticated disposable HTTPS connection failed"));
+        assert!(
+            LibsqlStore::new_remote(&endpoint, "nulang-invalid-smoke-token").is_err(),
+            "invalid token was admitted after a valid connection succeeded"
+        );
+        exercise_disposable_smoke(&mut store);
+        drop(store);
+        let reopened = LibsqlStore::new_remote(&endpoint, &token)
+            .unwrap_or_else(|_| panic!("authenticated remote reopen failed"));
+        verify_disposable_smoke(&reopened);
+    }
+
     #[test]
     fn local_actor_store_uses_patched_sqlite_engine() {
         let store = LibsqlStore::in_memory().expect("local actor database opens");

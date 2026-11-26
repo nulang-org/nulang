@@ -117,6 +117,33 @@ pipeline. Record the exact test commit and server endpoint class **without
 recording secrets**. HTTP/2-only endpoints are incompatible with this
 candidate unless independently proven otherwise.
 
+### Opt-in executable live smoke
+
+Provision a **new** disposable database named `nulang-smoke-<unique>` with a
+database-scoped, expiring write token. Never supply a shared or production
+database/token. The test refuses missing confirmation, arbitrary hostnames,
+plaintext, embedded credentials, ports, paths and query strings before
+network access. A successful run leaves smoke rows and schema in the disposable
+database; destroy only that explicitly provisioned database after recording the
+result. Supply the token via the environment without printing it or including
+it in command arguments or logs.
+
+Set `NULANG_DISPOSABLE_TURSO_URL` to the new database's HTTPS/libsql URL,
+`NULANG_DISPOSABLE_TURSO_TOKEN` to its test-only token, and
+`NULANG_DISPOSABLE_TURSO_CONFIRM=yes`. Then run:
+
+```sh
+cargo test --locked --no-default-features --features sqlite --lib \
+  disposable_turso_smoke_live_https_roundtrip -- --ignored --test-threads=1
+```
+
+The harness verifies valid authentication, rejection of an invalid token,
+parameterized SQL insert/update/select, explicit commit/rollback, durable
+transition idempotency and stale-epoch rejection, and reopen persistence.
+The local fixture exercises the same SQL/durability contract but **does not
+substitute for executing the live test**. This test does not establish
+cross-process remote restart or the complete TLS negative matrix.
+
 **Stop-ship:** Until old-store upgrade/reopen/rollback evidence and the
 authenticated disposable remote suite are recorded, this document is a
 runbook proposal—not a statement that production database migration is safe.
