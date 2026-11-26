@@ -1052,3 +1052,95 @@ fn sqlite_workflow_outbox_and_inbox_rollback_and_reopen() {
     drop(raw);
     std::fs::remove_file(path).unwrap();
 }
+
+// A separate process discards the admission commit acknowledgement before
+// any consumer execution. The sender's retry must not create a new command.
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_inbox_ack_loss_child() {
+    let Some(path) = std::env::var_os("NULANG_TEST_INBOX_ACK_LOSS_DB") else {
+        return;
+    };
+    let mut store = nulang::runtime::LibsqlStore::new(std::path::Path::new(&path)).unwrap();
+    let id = committed_message(&mut store);
+    assert_eq!(id.sequence, 6);
+    store.commit_transition(receiving_admission(id, 0)).unwrap();
+    // Discard the returned commit receipt and skip all Rust destructors.
+    std::process::exit(73);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_inbox_admission_ack_loss_survives_abrupt_process_exit() {
+    use nulang::runtime::{DurableOutboxId, LibsqlStore};
+    use std::{
+        fs,
+        path::PathBuf,
+        process::Command,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    struct TestDir(PathBuf);
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = TestDir(std::env::temp_dir().join(format!(
+        "nulang-inbox-ack-loss-{}-{nonce}",
+        std::process::id()
+    )));
+    fs::create_dir(&dir.0).unwrap();
+    let path = dir.0.join("inbox.db");
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "sqlite_inbox_ack_loss_child", "--nocapture"])
+        .env("NULANG_TEST_INBOX_ACK_LOSS_DB", &path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(73),
+        "child failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let id = DurableOutboxId {
+        sender_actor_id: 42,
+        sequence: 6,
+        ordinal: 0,
+    };
+    let activation = WorkflowActivationId::new(77, 1);
+    {
+        let mut store = LibsqlStore::new(&path).unwrap();
+        assert_eq!(
+            store.load_workflow_inbox_admission(id).unwrap(),
+            Some(activation)
+        );
+        assert!(store.load_open_workflow_command(77).unwrap().is_some());
+        let retry = store.commit_transition(receiving_admission(id, 0)).unwrap();
+        assert_eq!(retry.sequence, 1);
+        assert_eq!(store.read_journal(77).len(), 1);
+        close_receiver(&mut store);
+    }
+    {
+        let mut store = LibsqlStore::new(&path).unwrap();
+        assert_eq!(
+            store.load_workflow_inbox_admission(id).unwrap(),
+            Some(activation)
+        );
+        assert!(store.load_open_workflow_command(77).unwrap().is_none());
+        assert_eq!(
+            store
+                .commit_transition(receiving_admission(id, 2))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(store.read_journal(77).len(), 1);
+        assert_eq!(store.latest_sequence(77), 2);
+        assert!(store.load_durable_outbox_message(id).unwrap().is_some());
+    }
+}
