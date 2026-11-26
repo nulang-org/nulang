@@ -113,7 +113,7 @@ pub fn generate_resource(root: &Path, name: &str) -> NuResult<()> {
     let handlers = format!(
         r#"
 fn {plural}_index() -> Html {{
-    document(
+    document_lang("en",
         head([title("{name}")]),
         body([
             el("h1", [], [text("{name}")]),
@@ -123,7 +123,7 @@ fn {plural}_index() -> Html {{
 }}
 
 fn {plural}_new() -> Html {{
-    document(
+    document_lang("en",
         head([title("New {name}")]),
         body([
             el("h1", [], [text("New {name}")]),

@@ -701,7 +701,7 @@ fn home() -> Html {
             delete_todo(form_value("id"))
         } else {}
     } else {}
-    document(
+    document_lang("en",
         head([
             title("Nulang Todo"),
             el("link", [("rel", text("stylesheet")), ("href", text("style.css"))], [])
