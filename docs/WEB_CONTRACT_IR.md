@@ -107,6 +107,28 @@ source tree
        -> tests / tooling
 ```
 
+## Middleware metadata (current enforcement)
+
+The deployment IR `middleware` list describes the middleware actually
+installed on the built-in web HTTP response path: `security_headers` and
+`request_log`. These names come from the same runtime default stack used
+to serve requests. Merely importing `@nulang/auth` does **not** install
+an authentication guard; likewise, CSRF enforcement is **not** implemented
+and must not be advertised as active. An external deployment adapter must
+independently implement/verify any configured security controls before
+claiming they are enforced. The current SSE fast path does not use the
+ordinary HTTP response middleware pipeline.
+
+This is a deliberately limited safety baseline, **not** the intended
+Reitit-style per-route policy compiler. Do not interpret the default
+metadata as a guarantee that session-authenticated state-changing
+routes are CSRF-protected.
+
+Route validation additionally rejects indistinguishable method/path
+registrations, including parameterized paths that differ only in capture
+names or source-level parameter types. A route must not win merely
+because it appears first in a compiled package.
+
 ## Runtime binding and dispatch
 
 Runtime registration remains method/path/module/function. Compiler metadata is attached as a sidecar so the low-level `Web.route` host effect does not need source-level type information.

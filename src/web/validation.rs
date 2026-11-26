@@ -8,7 +8,8 @@
 use crate::web::bindings::compile_route_bindings;
 use crate::web::contracts::ContractCompilation;
 use crate::web::package_contracts::compile_contracts_from_tree;
-use std::collections::HashSet;
+use crate::web::runtime_bindings::{compile_route_segments, RuntimeRouteSegment};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Compile and validate every statically extractable route contract in a
@@ -60,8 +61,37 @@ pub fn validate_compilation(
 /// IDE messages, or hard build errors without coupling that policy to IR JSON.
 pub fn validation_diagnostics(compilation: &ContractCompilation) -> Vec<String> {
     let mut diagnostics = compilation.diagnostics.clone();
+    // Identical route shapes are indistinguishable to HTTP dispatch, even when
+    // capture names or source-level types differ. Never let source-order or
+    // silent contract deduplication decide which handler wins.
+    let mut shapes: HashMap<(String, Vec<RuntimeRouteSegment>), &str> = HashMap::new();
     for route in &compilation.routes {
         diagnostics.extend(compile_route_bindings(route).diagnostics);
+        match compile_route_segments(&route.path) {
+            Ok(segments) => {
+                let normalized = segments
+                    .into_iter()
+                    .map(|segment| match segment {
+                        RuntimeRouteSegment::PathParam(_) => {
+                            RuntimeRouteSegment::PathParam(String::new())
+                        }
+                        literal => literal,
+                    })
+                    .collect();
+                let key = (route.method.to_ascii_uppercase(), normalized);
+                if let Some(first_path) = shapes.get(&key) {
+                    diagnostics.push(format!(
+                        "ambiguous route {} {} conflicts with {} {} (indistinguishable paths)",
+                        route.method, route.path, route.method, first_path
+                    ));
+                } else {
+                    shapes.insert(key, route.path.as_str());
+                }
+            }
+            Err(error) => {
+                diagnostics.push(format!("route {} {}: {error}", route.method, route.path))
+            }
+        }
     }
 
     let mut seen = HashSet::new();
@@ -91,6 +121,53 @@ mod tests {
             reference_capability: None,
             placement: Some("server".to_string()),
         }
+    }
+
+    #[test]
+    fn duplicate_method_and_path_are_rejected() {
+        let duplicate = contract("/users/:id", Vec::new());
+        let compilation = ContractCompilation {
+            routes: vec![duplicate.clone(), duplicate],
+            diagnostics: Vec::new(),
+        };
+        let err = validate_compilation(compilation).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|diagnostic| diagnostic.contains("ambiguous route")),
+            "expected duplicate-route diagnostic, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn equivalent_parameter_paths_are_rejected_regardless_of_capture_names() {
+        let compilation = ContractCompilation {
+            routes: vec![
+                contract("/users/:id", Vec::new()),
+                contract("/users/:username", Vec::new()),
+            ],
+            diagnostics: Vec::new(),
+        };
+        let err = validate_compilation(compilation).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|diagnostic| diagnostic.contains("ambiguous route")),
+            "expected ambiguous-pattern diagnostic, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn different_methods_and_distinct_literals_do_not_conflict() {
+        let mut post = contract("/users/:id", Vec::new());
+        post.method = "POST".to_string();
+        let compilation = ContractCompilation {
+            routes: vec![
+                contract("/users/:id", Vec::new()),
+                post,
+                contract("/users/new", Vec::new()),
+            ],
+            diagnostics: Vec::new(),
+        };
+        assert!(validate_compilation(compilation).is_ok());
     }
 
     #[test]

@@ -13,7 +13,7 @@ use crate::web::contracts::{ContractCompilation, RouteContract};
 use std::collections::HashMap;
 
 /// One precompiled route-pattern segment.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RuntimeRouteSegment {
     Literal(String),
     PathParam(String),
@@ -179,7 +179,7 @@ fn match_segments(
     Some(params)
 }
 
-fn compile_route_segments(path: &str) -> Result<Vec<RuntimeRouteSegment>, String> {
+pub(crate) fn compile_route_segments(path: &str) -> Result<Vec<RuntimeRouteSegment>, String> {
     compile_segments(path, true)
 }
 

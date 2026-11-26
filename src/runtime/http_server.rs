@@ -717,8 +717,21 @@ pub fn realtime_subscribe(room: &str) -> (Vec<String>, Receiver<String>) {
 pub enum Middleware {
     SecurityHeaders,
     RequestLog,
-    #[allow(dead_code)]
-    Csrf,
+}
+
+/// The only middlewares actually installed by the built-in web HTTP server.
+/// Deployment metadata must never advertise protections not present here.
+const DEFAULT_WEB_MIDDLEWARE: [Middleware; 2] =
+    [Middleware::SecurityHeaders, Middleware::RequestLog];
+
+pub(crate) fn default_web_middleware_names() -> Vec<String> {
+    DEFAULT_WEB_MIDDLEWARE
+        .iter()
+        .map(|middleware| match middleware {
+            Middleware::SecurityHeaders => "security_headers".to_string(),
+            Middleware::RequestLog => "request_log".to_string(),
+        })
+        .collect()
 }
 
 impl Middleware {
@@ -745,9 +758,6 @@ impl Middleware {
                     request.path,
                     response.status
                 );
-            }
-            Middleware::Csrf => {
-                // Phase 2: generate CSRF token cookie and validate on POST.
             }
         }
     }
@@ -1090,8 +1100,7 @@ impl WebDevServer {
         for cookie in take_response_cookies() {
             response.headers.push(("Set-Cookie".into(), cookie));
         }
-        let middlewares = [Middleware::SecurityHeaders, Middleware::RequestLog];
-        for m in &middlewares {
+        for m in &DEFAULT_WEB_MIDDLEWARE {
             m.apply(&request, &mut response);
         }
         HttpServerState::write_response(&mut stream, &response);
