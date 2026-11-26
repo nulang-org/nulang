@@ -1584,3 +1584,65 @@ app "mixed-aliases" {{ {routes} }}
         assert_eq!(site.read("dist/index.html"), previous);
     }
 }
+
+#[test]
+fn test_markdown_interpolation_is_literal_in_metadata_and_html() {
+    let site = content_site();
+    markdown_file(
+        &site,
+        "content/articles/a.md",
+        r#"+++
+slug = "a"
+title = 'Title #{1 + 1}'
+summary = 'Summary #{2 + 2}'
+tags = ['#{3 + 3}']
++++
+# Literal #{1 + 1}
+
+#{perform String.from_char(60)}script#{perform String.from_char(62)}alert(1)#{perform String.from_char(60)}/script#{perform String.from_char(62)}
+
+Unclosed #{
+"#,
+    );
+    site.source(MARKDOWN_HTML_APP);
+    success(site.build());
+    let html = String::from_utf8(site.read("dist/articles/a/index.html")).unwrap();
+    assert!(html.contains("Literal #{1 + 1}"), "{html}");
+    assert!(
+        html.contains("#{perform String.from_char(60)}script"),
+        "{html}"
+    );
+    assert!(html.contains("Unclosed #{"), "{html}");
+    assert!(!html.contains("<script>"), "{html}");
+    site.source(MARKDOWN_APP);
+    success(site.build());
+    let body = String::from_utf8(site.read("dist/articles/a/index.html")).unwrap();
+    assert!(body.contains("Title #{1 + 1}|Summary #{2 + 2}|"), "{body}");
+    assert!(body.contains("Literal #{1 + 1}"), "{body}");
+}
+
+#[test]
+fn test_literal_static_page_rejects_parameterized_get_overlap() {
+    let site = Site::new();
+    site.source(STATIC);
+    success(site.build());
+    let previous = site.read("dist/index.html");
+    for routes in [
+        "route \"GET\" \"/{slug}\" -> dynamic\nroute \"GET\" \"/about\" -> page",
+        "route \"GET\" \"/about\" -> page\nroute \"GET\" \"/{slug}\" -> dynamic",
+    ] {
+        site.source(&format!(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+fn page() -> Html {{ text("about") }}
+fn dynamic(slug: String) -> Html {{ text(slug) }}
+app "overlap" {{ {routes} }}
+"#
+        ));
+        let result = site.build();
+        assert!(!result.status.success(), "{routes}");
+        assert!(String::from_utf8_lossy(&result.stderr).contains("conflicts"));
+        assert_eq!(site.read("dist/index.html"), previous);
+    }
+}

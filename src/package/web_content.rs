@@ -316,9 +316,36 @@ fn read_entry(path: &Path, source: String) -> Result<Entry, String> {
     Ok(Entry { meta, body, source })
 }
 
-/// Serialize strings for the Nulang lexer (not JSON). No metadata value or
-/// Markdown body can inject executable Nulang source through a string literal.
+/// Serialize a data string as an expression, never as interpolation syntax.
+/// The parser recognizes interpolation *after* decoding literal escapes.
+/// Split immediately before each opening brace in a marker, so no individual
+/// decoded token contains that marker. Concatenate only already-parsed data.
 fn quote(s: &str) -> String {
+    if !s.contains("#{") {
+        return quote_literal(s);
+    }
+    let mut parts = Vec::new();
+    let mut start = 0;
+    for (offset, _) in s.match_indices("#{") {
+        let boundary = offset + 1;
+        parts.push(quote_literal(&s[start..boundary]));
+        start = boundary;
+    }
+    parts.push(quote_literal(&s[start..]));
+    // Balanced expression depth avoids a linear-depth syntax tree for
+    // documents containing many interpolation-like sequences.
+    fn join(parts: &[String]) -> String {
+        if parts.len() == 1 {
+            return parts[0].clone();
+        }
+        let middle = parts.len() / 2;
+        format!("({} + {})", join(&parts[..middle]), join(&parts[middle..]))
+    }
+    join(&parts)
+}
+
+fn quote_literal(s: &str) -> String {
+    debug_assert!(!s.contains("#{"));
     let mut quoted = String::from("\"");
     for c in s.chars() {
         match c {

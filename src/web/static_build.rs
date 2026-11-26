@@ -210,6 +210,17 @@ pub(crate) fn render_pages(
                     {
                         return Err(format!("{label} conflicts with GET {other} at '{path}'"));
                     }
+                    let canonical = metadata.path.trim_end_matches('/');
+                    let slash_alias = format!("{canonical}/");
+                    if let Some((_, other)) = routes.iter().enumerate().find(|(i, other)| {
+                        *i != index
+                            && other.route.method.as_str() == "GET"
+                            && [metadata.path.as_str(), canonical, slash_alias.as_str()]
+                                .iter()
+                                .any(|url| match_route(other, url).is_some())
+                    }) {
+                        return Err(format!("{label} conflicts with GET {}", other.route.path));
+                    }
                     reserve_path(&mut paths, &path, &label)?;
                     metadata.artifact = Some(path.clone());
                     pages.insert(
