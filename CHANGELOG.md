@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Bounded mailbox supervisor-credit isolation — 2026-11-26
+- **System messages bypass normal/bulk capacity without consuming those credits**, while total logical depth includes all lanes and selective-receive staging.
+- Regression coverage exercises concurrent admission under supervisor floods, credit release on pop/commit, retries, and pooled reset. System messages and dead-letter notifications remain unbounded; cross-shard destination admission still needs explicit acknowledgments.
+
 ### Opt-in actor mailbox capacity for hosted runtimes — 2026-11-26
 - **Allow hosts to configure per-actor normal/bulk mailbox capacity across all runtime shards**, including single-shard mode, with explicit backpressure at capacity.
 - Existing constructors remain unbounded by default. System messages and dead-letter mailboxes bypass the limit; this is not a process-wide memory bound.
