@@ -1410,3 +1410,119 @@ fn root_links_validate_against_new_not_previous_artifacts() {
     assert_eq!(site.read("dist/articles/a/index.html"), old);
     assert!(site.0.join("dist/articles/b/index.html").exists());
 }
+
+#[test]
+fn sitemap_uses_only_concrete_static_routes_in_sorted_order() {
+    let site = Site::new();
+    let manifest = site.0.join("Nulang.toml");
+    let mut config = std::fs::read_to_string(&manifest).unwrap();
+    config.push_str("site_url = \"https://example.com/\"\n[web.prerender]\n\"/posts/{slug}\" = [\"/posts/z\", \"/posts/a\"]\n");
+    std::fs::write(&manifest, config).unwrap();
+    site.source(
+        r#"
+import stdlib::web::html
+import stdlib::web::types
+fn home() -> Html { text("home") }
+fn post(slug: String) -> Html { text(slug) }
+@placement(server)
+fn account() -> Html { text("private") }
+app "sitemap" {
+    route "GET" "/posts/{slug}" -> post
+    route "GET" "/" -> home
+    route "GET" "/account" -> account
+}
+"#,
+    );
+    success(site.build());
+    let expected = concat!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+        "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n",
+        "  <url><loc>https://example.com/</loc></url>\n",
+        "  <url><loc>https://example.com/posts/a</loc></url>\n",
+        "  <url><loc>https://example.com/posts/z</loc></url>\n",
+        "</urlset>\n"
+    );
+    assert_eq!(site.read("dist/sitemap.xml"), expected.as_bytes());
+    success(site.build());
+    assert_eq!(site.read("dist/sitemap.xml"), expected.as_bytes());
+}
+
+#[test]
+fn sitemap_collision_and_invalid_origin_preserve_previous_site() {
+    let site = Site::new();
+    site.source(STATIC);
+    let manifest = site.0.join("Nulang.toml");
+    let original = std::fs::read_to_string(&manifest).unwrap();
+    let valid = format!("{original}site_url = \"https://example.com\"\n");
+    std::fs::write(&manifest, &valid).unwrap();
+    success(site.build());
+    let previous = site.read("dist/sitemap.xml");
+    for invalid in [
+        "https://user@example.com",
+        "https://example.com/path",
+        "https://example.com?x",
+        "javascript:alert(1)",
+    ] {
+        std::fs::write(&manifest, format!("{original}site_url = {invalid:?}\n")).unwrap();
+        assert!(!site.build().status.success(), "{invalid}");
+        assert_eq!(site.read("dist/sitemap.xml"), previous);
+    }
+    std::fs::write(&manifest, &valid).unwrap();
+    std::fs::write(site.0.join("public/SITEMAP.XML"), "collision").unwrap();
+    assert!(!site.build().status.success());
+    assert_eq!(site.read("dist/sitemap.xml"), previous);
+    std::fs::remove_file(site.0.join("public/SITEMAP.XML")).unwrap();
+    std::fs::write(&manifest, original).unwrap();
+    success(site.build());
+    assert!(!site.0.join("dist/sitemap.xml").exists());
+}
+
+#[test]
+fn sitemap_rejects_a_claimed_url_and_an_empty_static_site() {
+    let site = Site::new();
+    let manifest = site.0.join("Nulang.toml");
+    let mut config = std::fs::read_to_string(&manifest).unwrap();
+    config.push_str("site_url = \"https://example.com\"\n");
+    std::fs::write(&manifest, config).unwrap();
+    site.source(STATIC);
+    success(site.build());
+    let previous = site.read("dist/sitemap.xml");
+    for source in [
+        r#"
+import stdlib::web::html
+import stdlib::web::types
+@placement(server)
+fn account() -> Html { text("server") }
+app "site" { route "GET" "/" -> account }
+"#,
+        r#"
+import stdlib::web::html
+import stdlib::web::types
+fn home() -> Html { text("home") }
+@placement(server)
+fn intercept() -> Html { text("server") }
+app "site" {
+    route "GET" "/" -> home
+    route "GET" "/sitemap.xml" -> intercept
+}
+"#,
+        r#"
+import stdlib::web::html
+import stdlib::web::types
+fn home() -> Html { text("home") }
+app "site" {
+    route "GET" "/" -> home
+    route "GET" "/SITEMAP.XML" -> home
+}
+"#,
+    ] {
+        site.source(source);
+        let output = site.build();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("sitemap")
+                || String::from_utf8_lossy(&output.stderr).contains("web.site_url")
+        );
+        assert_eq!(site.read("dist/sitemap.xml"), previous);
+    }
+}

@@ -47,6 +47,7 @@ impl Default for WebSection {
             prerender: BTreeMap::new(),
             collections: BTreeMap::new(),
             content: BTreeMap::new(),
+            site_url: None,
         }
     }
 }
@@ -110,6 +111,9 @@ pub struct WebSection {
     /// Named Markdown content bundles, relative to the package root.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub content: BTreeMap<String, String>,
+    /// Optional public HTTP(S) origin for generating sitemap.xml.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_url: Option<String>,
 }
 
 fn default_web_port() -> u16 {
