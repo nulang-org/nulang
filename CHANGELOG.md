@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Scheduler-local System message priority — 2026-11-26
+- **Scheduler-local System signals now share the concurrent System priority FIFO**: ordinary receive, selective receive and mailbox snapshots agree on lane order, even when application credits are exhausted. Normal/Bulk delivery retains its existing scheduler-local path.
+- Regression coverage verifies mixed-producer FIFO, staged guard rejection and commit, snapshots, and bounded application-credit isolation. Cross-shard transport acceptance still does not acknowledge destination-mailbox admission.
+
 ### Bounded mailbox supervisor-credit isolation — 2026-11-26
 - **System messages bypass normal/bulk capacity without consuming those credits**, while total logical depth includes all lanes and selective-receive staging.
 - Regression coverage exercises concurrent admission under supervisor floods, credit release on pop/commit, retries, and pooled reset. System messages and dead-letter notifications remain unbounded; cross-shard destination admission still needs explicit acknowledgments.

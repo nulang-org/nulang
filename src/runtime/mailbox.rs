@@ -5,8 +5,8 @@
 //! traffic bypasses those credits and is still counted in total depth.
 //!
 //! Concurrent producers use the lock-free `SegQueue`s through `push(&self)`.
-//! Scheduler-local traffic uses a plain `VecDeque` through methods requiring
-//! `&mut self`; local System messages still share its FIFO on ordinary pop.
+//! Scheduler-local Normal/Bulk traffic uses a plain `VecDeque` through methods
+//! requiring `&mut self`. All System messages share the same priority lane.
 //! Separate bounded credits and a total logical count make reservation
 //! race-safe; unbounded mailboxes retain the single-counter fast path.
 
@@ -267,8 +267,8 @@ impl ReceiveIndexes {
 pub struct Mailbox {
     system_queue: SegQueue<Message>,
     normal_queue: SegQueue<Message>,
-    /// Same-thread local queue. Only scheduler-owned `&mut self` methods
-    /// access it; concurrent producers never touch it.
+    /// Same-thread Normal/Bulk queue. Only scheduler-owned `&mut self`
+    /// methods access it; concurrent producers never touch it.
     local_queue: VecDeque<Message>,
     capacity: usize,
     /// Total logical messages, including supervisor/system traffic.
@@ -394,10 +394,13 @@ impl Mailbox {
         Ok(())
     }
 
-    /// Push a message from the scheduler thread.
+    /// Push a message from the scheduler thread. System messages share the
+    /// concurrent priority lane so ordinary and selective receive agree.
     pub fn push_local(&mut self, msg: Message) -> Result<(), Message> {
-        let system = msg.priority == MessagePriority::System;
-        if !self.reserve_slot(system) {
+        if msg.priority == MessagePriority::System {
+            return self.push(msg);
+        }
+        if !self.reserve_slot(false) {
             return Err(msg);
         }
         self.local_queue.push_back(msg);
@@ -452,17 +455,13 @@ impl Mailbox {
             .as_mut()
             .expect("selective receive indexes must be initialized");
 
-        // Scheduler-local system messages join the system lane; other local
-        // traffic stays in its own lane so its FIFO position is stable.
-        while let Some(msg) = self.local_queue.pop_front() {
-            if msg.priority == MessagePriority::System {
-                Self::stage_message(&mut self.system_skip_buffer, &mut indexes.system, msg);
-            } else {
-                Self::stage_message(&mut self.local_skip_buffer, &mut indexes.local, msg);
-            }
-        }
+        // Both producer paths enqueue System messages in the same lane,
+        // preserving their enqueue order through staging and ordinary pop.
         while let Some(msg) = self.system_queue.pop() {
             Self::stage_message(&mut self.system_skip_buffer, &mut indexes.system, msg);
+        }
+        while let Some(msg) = self.local_queue.pop_front() {
+            Self::stage_message(&mut self.local_skip_buffer, &mut indexes.local, msg);
         }
         while let Some(msg) = self.normal_queue.pop() {
             Self::stage_message(&mut self.skip_buffer, &mut indexes.normal, msg);
@@ -1029,6 +1028,71 @@ mod bounded_admission_conformance_tests {
         assert_eq!(mb.pop().unwrap().behavior_id, 2);
         mb.push(msg(4, MessagePriority::Normal))
             .expect("normal credit returns only after consuming normal message");
+    }
+
+    #[test]
+    fn test_local_system_priority_bypasses_full_application_lane() {
+        let mut mb = Mailbox::new(2);
+        mb.push_local(msg(1, MessagePriority::Normal)).unwrap();
+        mb.push_local(msg(2, MessagePriority::Bulk)).unwrap();
+        mb.push_local(msg(3, MessagePriority::System)).unwrap();
+        mb.push_local(msg(4, MessagePriority::System)).unwrap();
+        assert!(mb.push_local(msg(5, MessagePriority::Normal)).is_err());
+        assert_eq!(mb.len(), 4);
+
+        assert_eq!(mb.pop().unwrap().behavior_id, 3);
+        assert_eq!(mb.pop().unwrap().behavior_id, 4);
+        assert!(mb.push(msg(5, MessagePriority::Normal)).is_err());
+        assert_eq!(mb.pop().unwrap().behavior_id, 1);
+        mb.push(msg(5, MessagePriority::Normal)).unwrap();
+        assert_eq!(mb.pop().unwrap().behavior_id, 2);
+        assert_eq!(mb.pop().unwrap().behavior_id, 5);
+        assert!(mb.is_empty());
+    }
+
+    #[test]
+    fn test_local_system_priority_matches_snapshot_and_pop_fifo() {
+        let mut mb = Mailbox::new(4);
+        mb.push(msg(1, MessagePriority::System)).unwrap();
+        mb.push_local(msg(2, MessagePriority::System)).unwrap();
+        mb.push(msg(3, MessagePriority::System)).unwrap();
+        mb.push_local(msg(4, MessagePriority::Normal)).unwrap();
+        mb.push(msg(5, MessagePriority::Bulk)).unwrap();
+        let expected = vec![1, 2, 3, 4, 5];
+        let snapshot: Vec<_> = mb.drain().iter().map(|m| m.behavior_id).collect();
+        assert_eq!(snapshot, expected);
+        assert_eq!(mb.len(), 5, "snapshot must not consume messages");
+        let actual: Vec<_> = std::iter::from_fn(|| mb.pop())
+            .map(|m| m.behavior_id)
+            .collect();
+        assert_eq!(actual, expected);
+        assert!(mb.is_empty());
+    }
+
+    #[test]
+    fn test_local_system_priority_preserves_staged_fifo_and_commit_credits() {
+        let mut mb = Mailbox::new(1);
+        mb.push_local(msg(4, MessagePriority::Normal)).unwrap();
+        mb.push(msg(1, MessagePriority::System)).unwrap();
+        assert!(mb.receive_match(&[99]).is_none(), "stage both lanes");
+        mb.push(msg(2, MessagePriority::System)).unwrap();
+        mb.push_local(msg(3, MessagePriority::System)).unwrap();
+
+        let (_, first) = mb.receive_match(&[4, 3, 2, 1]).unwrap();
+        assert_eq!(first[0].as_int(), Some(1));
+        let (_, second) = mb.receive_match(&[4, 3, 2, 1]).unwrap();
+        assert_eq!(second[0].as_int(), Some(2), "older system signal wins");
+        assert_eq!(mb.len(), 4, "guard rejection is not consumption");
+        assert_eq!(mb.commit_receive_match().unwrap()[0].as_int(), Some(2));
+        assert!(mb.push_local(msg(5, MessagePriority::Bulk)).is_err());
+
+        mb.flush_skip_buffer();
+        assert_eq!(mb.pop().unwrap().behavior_id, 1);
+        assert_eq!(mb.pop().unwrap().behavior_id, 3);
+        assert_eq!(mb.pop().unwrap().behavior_id, 4);
+        mb.push_local(msg(5, MessagePriority::Bulk)).unwrap();
+        assert_eq!(mb.pop().unwrap().behavior_id, 5);
+        assert!(mb.is_empty());
     }
 
     #[test]
