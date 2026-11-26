@@ -81,20 +81,19 @@ pub(crate) fn render_pages(
         }
     }
 
-    let mut literal_gets = BTreeMap::new();
-    for metadata in &ir.routes {
+    // Index potential aliases, but do not reject routes that never emit HTML.
+    // A static artifact must not shadow another literal GET, including a
+    // server route, on portable case-insensitive or trailing-slash hosts.
+    let mut literal_gets = BTreeMap::<String, Vec<(usize, String)>>::new();
+    for (index, metadata) in ir.routes.iter().enumerate() {
         if metadata.method != "GET" {
             continue;
         }
         if let Ok(path) = artifact_path(&metadata.path) {
-            if let Some(previous) =
-                literal_gets.insert(path.to_ascii_lowercase(), metadata.path.clone())
-            {
-                return Err(format!(
-                    "GET {} conflicts with GET {previous} at '{path}'",
-                    metadata.path
-                ));
-            }
+            literal_gets
+                .entry(path.to_ascii_lowercase())
+                .or_default()
+                .push((index, metadata.path.clone()));
         }
     }
     let mut pages = BTreeMap::new();
@@ -135,7 +134,10 @@ pub(crate) fn render_pages(
                 // A concrete page must not shadow another GET handler, even
                 // if the runtime registration order would choose this one.
                 // Also reject portable filename aliases of literal routes.
-                if let Some(other) = literal_gets.get(&path.to_ascii_lowercase()) {
+                if let Some((_, other)) = literal_gets
+                    .get(&path.to_ascii_lowercase())
+                    .and_then(|aliases| aliases.first())
+                {
                     return Err(format!(
                         "{label}: prerender '{url}' conflicts with GET {other}"
                     ));
@@ -197,6 +199,17 @@ pub(crate) fn render_pages(
             match html {
                 Rendered::Html(html) => {
                     let path = artifact_path(&metadata.path)?;
+                    if let Some((_, other)) =
+                        literal_gets
+                            .get(&path.to_ascii_lowercase())
+                            .and_then(|aliases| {
+                                aliases
+                                    .iter()
+                                    .find(|(other_index, _)| *other_index != index)
+                            })
+                    {
+                        return Err(format!("{label} conflicts with GET {other} at '{path}'"));
+                    }
                     reserve_path(&mut paths, &path, &label)?;
                     metadata.artifact = Some(path.clone());
                     pages.insert(
