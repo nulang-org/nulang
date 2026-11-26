@@ -424,6 +424,94 @@ pub struct NativeWorkflowRecoveryPage {
     pub watermark: Option<u64>,
 }
 
+/// Hard cap for a persisted automatic replay budget.
+pub const MAX_NATIVE_WORKFLOW_RECOVERY_ATTEMPTS: u32 = 1024;
+
+/// Reservations are charged before restoration/execution. An exhausted
+/// *open* activation is ineligible for automatic recovery; its receipt,
+/// command journal and last safe checkpoint remain intact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeWorkflowRetryStatus {
+    pub activation: WorkflowActivationId,
+    pub activation_epoch: u64,
+    pub attempts_reserved: u32,
+    pub max_attempts: u32,
+}
+
+impl NativeWorkflowRetryStatus {
+    pub fn is_exhausted(self) -> bool {
+        self.attempts_reserved >= self.max_attempts
+    }
+}
+
+fn validate_native_retry_request(open: OpenWorkflowCommand, max_attempts: u32) -> io::Result<()> {
+    if max_attempts == 0
+        || max_attempts > MAX_NATIVE_WORKFLOW_RECOVERY_ATTEMPTS
+        || open.activation.actor_id == 0
+        || open.activation.actor_id > i64::MAX as u64
+        || open.activation.command_sequence == 0
+        || open.activation.command_sequence > i64::MAX as u64
+        || open.tail.activation_epoch == 0
+        || open.tail.activation_epoch > i64::MAX as u64
+        || open.tail.sequence != open.activation.command_sequence
+    {
+        return Err(native_retry_conflict());
+    }
+    Ok(())
+}
+
+fn native_retry_conflict() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "native recovery retry budget or admission fence mismatch",
+    )
+}
+
+fn next_native_retry(
+    previous: Option<NativeWorkflowRetryStatus>,
+    open: OpenWorkflowCommand,
+    max_attempts: u32,
+) -> io::Result<Option<NativeWorkflowRetryStatus>> {
+    validate_native_retry_request(open, max_attempts)?;
+    let mut next = NativeWorkflowRetryStatus {
+        activation: open.activation,
+        activation_epoch: open.tail.activation_epoch,
+        attempts_reserved: 0,
+        max_attempts,
+    };
+    if let Some(previous) = previous {
+        if previous.activation.actor_id != open.activation.actor_id
+            || previous.activation_epoch != open.tail.activation_epoch
+            || previous.activation.command_sequence > open.activation.command_sequence
+            || previous.attempts_reserved == 0
+            || previous.attempts_reserved > previous.max_attempts
+            || previous.max_attempts > MAX_NATIVE_WORKFLOW_RECOVERY_ATTEMPTS
+        {
+            return Err(native_retry_conflict());
+        }
+        if previous.activation == open.activation {
+            next = previous; // First reservation pins the budget for this activation.
+        }
+    }
+    if next.is_exhausted() {
+        return Ok(None);
+    }
+    next.attempts_reserved += 1;
+    Ok(Some(next))
+}
+
+fn current_native_retry(
+    open: Option<OpenWorkflowCommand>,
+    previous: Option<NativeWorkflowRetryStatus>,
+) -> io::Result<Option<NativeWorkflowRetryStatus>> {
+    let (Some(open), Some(previous)) = (open, previous) else {
+        return Ok(None);
+    };
+    // Reuse validation without consuming a reservation.
+    next_native_retry(Some(previous), open, previous.max_attempts)?;
+    Ok((previous.activation == open.activation).then_some(previous))
+}
+
 fn validate_native_recovery_scan(
     shard: u16,
     shards: u16,
@@ -1298,7 +1386,34 @@ pub trait PersistenceStore: Send + Sync {
         ))
     }
 
-    /// Scan immutable bindings with open admissions, not idle snapshots.
+    /// Reserve one automatic recovery attempt before replaying a proven
+    /// ordinary same-epoch open command. None means the budget is exhausted.
+    /// The first reservation pins the limit; a later host configuration cannot
+    /// reset it. No state, journal entry, receipt or command tail is modified.
+    fn reserve_native_workflow_recovery_attempt(
+        &mut self,
+        _open: OpenWorkflowCommand,
+        _max_attempts: u32,
+    ) -> io::Result<Option<NativeWorkflowRetryStatus>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native workflow retry budget not supported",
+        ))
+    }
+
+    /// Read the reservation status for the current open activation, if any.
+    fn load_native_workflow_retry_status(
+        &self,
+        _actor_id: u64,
+    ) -> io::Result<Option<NativeWorkflowRetryStatus>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native workflow retry budget not supported",
+        ))
+    }
+
+    /// Scan immutable bindings with open admissions and remaining retry budget.
+    /// Watermark includes exhausted open IDs to preserve allocator fencing.
     fn scan_open_native_workflow_recovery(
         &self,
         _shard: u16,
@@ -1546,6 +1661,7 @@ pub struct MemoryStore {
     committed_transitions: HashMap<u64, Vec<DurableTransition>>,
     workflow_admissions: HashMap<u64, WorkflowAdmission>,
     native_recovery_bindings: BTreeMap<u64, NativeWorkflowRecoveryBinding>,
+    native_recovery_retries: HashMap<u64, NativeWorkflowRetryStatus>,
 }
 
 impl MemoryStore {
@@ -1730,6 +1846,42 @@ impl PersistenceStore for MemoryStore {
         Ok(self.native_recovery_bindings.get(&actor_id).cloned())
     }
 
+    fn reserve_native_workflow_recovery_attempt(
+        &mut self,
+        open: OpenWorkflowCommand,
+        max_attempts: u32,
+    ) -> io::Result<Option<NativeWorkflowRetryStatus>> {
+        validate_native_retry_request(open, max_attempts)?;
+        let id = open.activation.actor_id;
+        if self
+            .native_recovery_bindings
+            .get(&id)
+            .is_none_or(|b| b.activation_epoch != open.tail.activation_epoch)
+            || self.load_open_workflow_command(id)? != Some(open)
+        {
+            return Err(native_retry_conflict());
+        }
+        let next = next_native_retry(
+            self.native_recovery_retries.get(&id).copied(),
+            open,
+            max_attempts,
+        )?;
+        if let Some(next) = next {
+            self.native_recovery_retries.insert(id, next);
+        }
+        Ok(next)
+    }
+
+    fn load_native_workflow_retry_status(
+        &self,
+        actor_id: u64,
+    ) -> io::Result<Option<NativeWorkflowRetryStatus>> {
+        current_native_retry(
+            self.load_open_workflow_command(actor_id)?,
+            self.native_recovery_retries.get(&actor_id).copied(),
+        )
+    }
+
     fn scan_open_native_workflow_recovery(
         &self,
         shard: u16,
@@ -1739,7 +1891,7 @@ impl PersistenceStore for MemoryStore {
         limit: usize,
     ) -> io::Result<NativeWorkflowRecoveryPage> {
         validate_native_recovery_scan(shard, shards, after, through, limit)?;
-        let eligible = |id: u64| {
+        let open = |id: u64| {
             id % u64::from(shards) == u64::from(shard)
                 && self
                     .workflow_admissions
@@ -1751,13 +1903,21 @@ impl PersistenceStore for MemoryStore {
                 .keys()
                 .rev()
                 .copied()
-                .find(|id| eligible(*id))
+                .find(|id| open(*id))
         });
         let actors = self
             .native_recovery_bindings
             .keys()
             .copied()
-            .filter(|id| *id > after.unwrap_or(0) && *id <= watermark.unwrap_or(0) && eligible(*id))
+            .filter(|id| *id > after.unwrap_or(0) && *id <= watermark.unwrap_or(0) && open(*id))
+            .filter(|id| {
+                !self.native_recovery_retries.get(id).is_some_and(|retry| {
+                    retry.is_exhausted()
+                        && self.workflow_admissions.get(id).is_some_and(|a| {
+                            a.command_sequence == retry.activation.command_sequence
+                        })
+                })
+            })
             .take(limit)
             .collect();
         Ok(NativeWorkflowRecoveryPage { actors, watermark })
@@ -2186,6 +2346,7 @@ impl PersistenceStore for MemoryStore {
         self.committed_transitions.remove(&actor_id);
         self.workflow_admissions.remove(&actor_id);
         self.native_recovery_bindings.remove(&actor_id);
+        self.native_recovery_retries.remove(&actor_id);
         Ok(())
     }
 }
@@ -2785,6 +2946,16 @@ impl LibsqlStore {
                 (),
             ).await.map_err(io::Error::other)?;
             conn.execute(
+                "CREATE TABLE IF NOT EXISTS durable_native_workflow_retries (
+                    actor_id INTEGER PRIMARY KEY,
+                    command_sequence INTEGER NOT NULL CHECK(command_sequence > 0),
+                    activation_epoch INTEGER NOT NULL CHECK(activation_epoch > 0),
+                    attempts_reserved INTEGER NOT NULL CHECK(attempts_reserved >= 1 AND attempts_reserved <= max_attempts),
+                    max_attempts INTEGER NOT NULL CHECK(max_attempts BETWEEN 1 AND 1024)
+                )",
+                (),
+            ).await.map_err(io::Error::other)?;
+            conn.execute(
                 "CREATE TABLE IF NOT EXISTS durable_workflow_events (
                     actor_id INTEGER NOT NULL,
                     sequence INTEGER NOT NULL,
@@ -3085,6 +3256,25 @@ async fn decode_outbox_scan_row(rows: &mut libsql::Rows) -> io::Result<Option<Du
 }
 
 #[cfg(feature = "sqlite")]
+async fn decode_native_retry(
+    mut rows: libsql::Rows,
+    actor_id: u64,
+) -> io::Result<Option<NativeWorkflowRetryStatus>> {
+    let Some(row) = rows.next().await.map_err(io::Error::other)? else {
+        return Ok(None);
+    };
+    let number = |idx| -> io::Result<u64> {
+        u64::try_from(row.get::<i64>(idx).map_err(io::Error::other)?).map_err(io::Error::other)
+    };
+    Ok(Some(NativeWorkflowRetryStatus {
+        activation: WorkflowActivationId::new(actor_id, number(0)?),
+        activation_epoch: number(1)?,
+        attempts_reserved: u32::try_from(number(2)?).map_err(io::Error::other)?,
+        max_attempts: u32::try_from(number(3)?).map_err(io::Error::other)?,
+    }))
+}
+
+#[cfg(feature = "sqlite")]
 impl PersistenceStore for LibsqlStore {
     fn load_durable_outbox_message(
         &self,
@@ -3336,6 +3526,86 @@ impl PersistenceStore for LibsqlStore {
         })
     }
 
+    fn reserve_native_workflow_recovery_attempt(
+        &mut self,
+        open: OpenWorkflowCommand,
+        max_attempts: u32,
+    ) -> io::Result<Option<NativeWorkflowRetryStatus>> {
+        validate_native_retry_request(open, max_attempts)?;
+        let id = open.activation.actor_id;
+        if self
+            .load_native_workflow_recovery_binding(id)?
+            .is_none_or(|b| b.activation_epoch != open.tail.activation_epoch)
+            || self.load_open_workflow_command(id)? != Some(open)
+        {
+            return Err(native_retry_conflict());
+        }
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let tx = conn.transaction_with_behavior(libsql::TransactionBehavior::Immediate).await.map_err(io::Error::other)?;
+            // Recheck the command fence inside the write transaction. An
+            // earlier read alone is not authorization to reserve a replay.
+            let mut fence = tx.query(
+                "SELECT a.actor_id FROM durable_workflow_admissions a
+                 JOIN durable_tails t USING(actor_id)
+                 JOIN durable_native_workflow_recovery b USING(actor_id)
+                 WHERE a.actor_id=?1 AND a.command_sequence=?2 AND a.closed_sequence IS NULL
+                 AND t.sequence=?2 AND t.activation_epoch=?3",
+                libsql::params![id as i64, open.activation.command_sequence as i64, open.tail.activation_epoch as i64],
+            ).await.map_err(io::Error::other)?;
+            if fence.next().await.map_err(io::Error::other)?.is_none() { return Err(native_retry_conflict()); }
+            let previous = decode_native_retry(tx.query(
+                "SELECT command_sequence, activation_epoch, attempts_reserved, max_attempts
+                 FROM durable_native_workflow_retries WHERE actor_id=?1",
+                libsql::params![id as i64],
+            ).await.map_err(io::Error::other)?, id).await?;
+            let next = next_native_retry(previous, open, max_attempts)?;
+            if let Some(next) = next {
+                let changed = tx.execute(
+                    "INSERT INTO durable_native_workflow_retries
+                     (actor_id,command_sequence,activation_epoch,attempts_reserved,max_attempts)
+                     VALUES (?1,?2,?3,?4,?5)
+                     ON CONFLICT(actor_id) DO UPDATE SET command_sequence=excluded.command_sequence,
+                     activation_epoch=excluded.activation_epoch, attempts_reserved=excluded.attempts_reserved,
+                     max_attempts=excluded.max_attempts",
+                    libsql::params![id as i64, next.activation.command_sequence as i64, next.activation_epoch as i64,
+                        i64::from(next.attempts_reserved), i64::from(next.max_attempts)],
+                ).await.map_err(io::Error::other)?;
+                if changed != 1 { return Err(native_retry_conflict()); }
+            }
+            tx.commit().await.map_err(io::Error::other)?;
+            Ok(next)
+        })
+    }
+
+    fn load_native_workflow_retry_status(
+        &self,
+        actor_id: u64,
+    ) -> io::Result<Option<NativeWorkflowRetryStatus>> {
+        let open = self.load_open_workflow_command(actor_id)?;
+        let conn = self.conn();
+        if !matches!(&*conn, libsql::Connection::Local(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "native recovery requires local SQLite",
+            ));
+        }
+        self.rt.block_on(async {
+            let previous = decode_native_retry(
+                conn.query(
+                    "SELECT command_sequence, activation_epoch, attempts_reserved, max_attempts
+                 FROM durable_native_workflow_retries WHERE actor_id=?1",
+                    libsql::params![i64::try_from(actor_id).map_err(io::Error::other)?],
+                )
+                .await
+                .map_err(io::Error::other)?,
+                actor_id,
+            )
+            .await?;
+            current_native_retry(open, previous)
+        })
+    }
+
     fn scan_open_native_workflow_recovery(
         &self,
         shard: u16,
@@ -3359,10 +3629,13 @@ impl PersistenceStore for LibsqlStore {
             let watermark = match through {
                 Some(id) => Some(id),
                 None => {
-                    let mut rows = conn.query(
-                        &format!("{BASE} ORDER BY b.actor_id DESC LIMIT 1"),
-                        libsql::params![i64::from(shards), i64::from(shard)],
-                    ).await.map_err(io::Error::other)?;
+                    let mut rows = conn
+                        .query(
+                            &format!("{BASE} ORDER BY b.actor_id DESC LIMIT 1"),
+                            libsql::params![i64::from(shards), i64::from(shard)],
+                        )
+                        .await
+                        .map_err(io::Error::other)?;
                     match rows.next().await.map_err(io::Error::other)? {
                         Some(row) => Some(row.get::<i64>(0).map_err(io::Error::other)? as u64),
                         None => None,
@@ -3371,10 +3644,25 @@ impl PersistenceStore for LibsqlStore {
             };
             let mut actors = Vec::new();
             if let Some(watermark) = watermark {
-                let mut rows = conn.query(
-                    &format!("{BASE} AND b.actor_id > ?3 AND b.actor_id <= ?4 ORDER BY b.actor_id LIMIT ?5"),
-                    libsql::params![i64::from(shards), i64::from(shard), after.unwrap_or(0) as i64, watermark as i64, limit as i64],
-                ).await.map_err(io::Error::other)?;
+                let mut rows = conn
+                    .query(
+                        &format!(
+                            "{BASE} AND b.actor_id > ?3 AND b.actor_id <= ?4
+                        AND NOT EXISTS (SELECT 1 FROM durable_native_workflow_retries r
+                            WHERE r.actor_id=b.actor_id AND r.command_sequence=a.command_sequence
+                            AND r.attempts_reserved>=r.max_attempts)
+                        ORDER BY b.actor_id LIMIT ?5"
+                        ),
+                        libsql::params![
+                            i64::from(shards),
+                            i64::from(shard),
+                            after.unwrap_or(0) as i64,
+                            watermark as i64,
+                            limit as i64
+                        ],
+                    )
+                    .await
+                    .map_err(io::Error::other)?;
                 while let Some(row) = rows.next().await.map_err(io::Error::other)? {
                     actors.push(row.get::<i64>(0).map_err(io::Error::other)? as u64);
                 }
@@ -4374,6 +4662,7 @@ impl PersistenceStore for LibsqlStore {
                 "durable_workflow_outbox",
                 "durable_workflow_admissions",
                 "durable_native_workflow_recovery",
+                "durable_native_workflow_retries",
                 "durable_workflow_inbox",
                 "durable_transitions",
                 "durable_tails",
