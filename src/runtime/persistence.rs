@@ -450,6 +450,7 @@ impl NativeWorkflowRetryStatus {
 pub enum NativeWorkflowRecoveryFailure {
     ReconstructionRejected,
     TerminalCommitFailed,
+    HandlerPanicked,
 }
 
 /// Durable, activation-local audit. A grant and its budget change commit
