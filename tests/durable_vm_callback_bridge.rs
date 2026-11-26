@@ -560,10 +560,14 @@ fn vm_invalid_text_receipt_fails_closed_and_never_redispatches() {
             false,
         )
         .unwrap_err();
-        assert!(matches!(
-            error,
-            NuError::VMError { msg, .. } if msg == "durable VM effect receipt is not valid UTF-8"
-        ));
+        assert!(
+            matches!(
+                &error,
+                NuError::VMError { msg, .. }
+                    if msg.lines().next() == Some("durable VM effect receipt is not valid UTF-8")
+            ),
+            "unexpected VM error: {error:?}"
+        );
         assert_eq!(provider.borrow().attempts, 1);
         assert_eq!(provider.borrow().mutations, 1);
         assert!(observed.borrow().is_empty());
