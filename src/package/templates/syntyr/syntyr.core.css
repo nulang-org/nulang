@@ -1,0 +1,287 @@
+/* Syntyr token contract. Host application CSS can override layered defaults. */
+@layer syn.tokens, syn.base, syn.components, syn.semantic, syn.recipes, syn.geometry, syn.effects;
+
+@layer syn.tokens {
+  :where(.syn-root) {
+    color-scheme: dark;
+    --syn-font: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --syn-mono: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+    --syn-space-1: .375rem;
+    --syn-space-2: .75rem;
+    --syn-space-3: 1.125rem;
+    --syn-space-4: 1.75rem;
+    --syn-space-5: 2.5rem;
+    --syn-cut: .9rem;
+    --syn-radius: .25rem;
+    --syn-line: 1.55;
+    --syn-control-height: 2.75rem;
+    --syn-ease: cubic-bezier(.2, .8, .2, 1);
+    --syn-duration-fast: 150ms;
+  }
+  :where(.syn-root), :where(.syn-root[data-syn-theme="grid"], .syn-root [data-syn-theme="grid"]) {
+    color-scheme: dark;
+    --syn-bg: #080f19;
+    --syn-surface: #111f2c;
+    --syn-surface-hi: #172a3b;
+    --syn-text: #edf9ff;
+    --syn-muted: #adbfca;
+    --syn-accent: #76e7f7;
+    --syn-accent-2: #f7b06c;
+    --syn-on-accent: #07121a;
+    --syn-frame: #345569;
+    --syn-frame-strong: #5086a0;
+    --syn-danger: #ffaaa4;
+    --syn-success: #8ce6bb;
+    --syn-warning: #ffd08b;
+    --syn-accent-soft: rgb(118 231 247 / 11%);
+  }
+  :where(.syn-root[data-syn-theme="noir"], .syn-root [data-syn-theme="noir"]) {
+    color-scheme: dark;
+    --syn-bg: #0e0e12;
+    --syn-surface: #1c1b20;
+    --syn-surface-hi: #2a2628;
+    --syn-text: #f8eee5;
+    --syn-muted: #c3b5aa;
+    --syn-accent: #f1b574;
+    --syn-accent-2: #9acfd5;
+    --syn-on-accent: #1c100b;
+    --syn-frame: #625048;
+    --syn-frame-strong: #9a7557;
+    --syn-danger: #ffc1ac;
+    --syn-success: #a5e4bc;
+    --syn-warning: #fbd18c;
+    --syn-accent-soft: rgb(241 181 116 / 10%);
+  }
+  /* Professional, contrast-oriented light palette for SaaS and business sites. */
+  :where(.syn-root[data-syn-theme="studio"], .syn-root [data-syn-theme="studio"]) {
+    color-scheme: light;
+    --syn-bg: #f5f7fb;
+    --syn-surface: #ffffff;
+    --syn-surface-hi: #eaf0f8;
+    --syn-text: #15233a;
+    --syn-muted: #4b5d76;
+    --syn-accent: #2458c6;
+    --syn-accent-2: #176b80;
+    --syn-on-accent: #ffffff;
+    --syn-frame: #b8c6d8;
+    --syn-frame-strong: #6685b2;
+    --syn-danger: #ad2637;
+    --syn-success: #17694b;
+    --syn-warning: #92500a;
+    --syn-accent-soft: rgb(36 88 198 / 9%);
+  }
+}
+@layer syn.base {
+  :where(.syn-root), :where(.syn-root) *, :where(.syn-root) *::before, :where(.syn-root) *::after { box-sizing: border-box; }
+  .syn-root {
+    margin: 0;
+    font: 400 1rem/var(--syn-line) var(--syn-font);
+    color: var(--syn-text);
+    background: var(--syn-bg);
+    -webkit-font-smoothing: antialiased;
+  }
+  .syn-root.syn-page { min-height: 100svh; }
+  .syn-root :where(h1,h2,h3,h4,p) { margin-block-start: 0; }
+  .syn-root :where(h1,h2,h3,h4) { line-height: 1.12; letter-spacing: -.025em; overflow-wrap: anywhere; }
+  .syn-root :where(button,input,select,textarea) { font: inherit; }
+  .syn-root :where(a) { color: var(--syn-accent); text-underline-offset: .2em; }
+  .syn-root :where(:focus-visible) { outline: 3px solid var(--syn-accent); outline-offset: 3px; }
+  .syn-root :where(:disabled, [aria-disabled="true"]) { cursor: not-allowed; opacity: .55; }
+  .syn-root :where(::selection) { color: var(--syn-on-accent); background: var(--syn-accent); }
+  @media (prefers-reduced-motion: reduce) {
+    .syn-root *, .syn-root *::before, .syn-root *::after {
+      scroll-behavior: auto !important;
+      transition-duration: 0s !important;
+      animation-duration: 0s !important;
+    }
+  }
+  @media (forced-colors: active) {
+    .syn-root :where(:focus-visible) { outline-color: Highlight; }
+  }
+}
+@layer syn.components {
+  .syn-shell { width: min(100% - 2rem, 72rem); margin-inline: auto; }
+  .syn-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1rem; padding-block: 2rem; }
+  .syn-nav { display: flex; align-items: center; flex-wrap: wrap; gap: 1rem; }
+  .syn-nav a { color: var(--syn-muted); text-decoration: none; font: 600 .76rem var(--syn-mono); }
+  .syn-nav a:hover, .syn-nav a[aria-current] { color: var(--syn-accent); }
+  .syn-stage {
+    --syn-stage-pad: clamp(1.25rem, 4vw, 3rem);
+    background: radial-gradient(ellipse at 85% 5%, var(--syn-accent-soft), transparent 50%), var(--syn-bg);
+    color: var(--syn-text);
+    border: 1px solid var(--syn-frame);
+    padding: var(--syn-stage-pad);
+    margin-block: 1.5rem;
+    position: relative;
+    isolation: isolate;
+  }
+  .syn-stage::before { content: ""; position: absolute; top: 0; left: 0; width: 4rem; height: 2px; background: var(--syn-accent); }
+  .syn-stage-header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 1rem; margin-block-end: 1.75rem; }
+  .syn-grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(min(100%, 17rem), 1fr)); }
+  .syn-layout { display: grid; gap: 1.25rem; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); align-items: start; }
+  .syn-stack { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--syn-space-3); }
+  .syn-inline { display: flex; align-items: center; flex-wrap: wrap; gap: var(--syn-space-2); }
+  .syn-panel {
+    position: relative; padding: clamp(1rem, 2.8vw, 1.75rem); overflow-wrap: anywhere;
+    color: var(--syn-text); border: 1px solid var(--syn-frame);
+    background: linear-gradient(160deg, var(--syn-accent-soft), transparent 40%), var(--syn-surface);
+    min-width: 0;
+  }
+  .syn-panel--cut::after {
+    content: ""; pointer-events: none; position: absolute; right: -1px; bottom: -1px;
+    width: var(--syn-cut); height: var(--syn-cut); background: var(--syn-bg);
+    clip-path: polygon(100% 0, 0 100%, 100% 100%);
+  }
+  @media (max-width: 45rem) { .syn-layout { grid-template-columns: minmax(0, 1fr); } }
+  @media (forced-colors: active) { .syn-stage, .syn-panel { border-color: CanvasText; } }
+}
+@layer syn.components {
+  .syn-logo { font: 700 .95rem/1 var(--syn-mono); letter-spacing: .22em; text-decoration: none; color: var(--syn-text); }
+  .syn-eyebrow { font: 700 .69rem/1.4 var(--syn-mono); letter-spacing: .15em; text-transform: uppercase; color: var(--syn-accent); }
+  .syn-title { font-size: clamp(2rem, 5.5vw, 4rem); margin-block: 1rem; max-width: 14ch; }
+  .syn-heading { font-size: clamp(1.15rem, 2.4vw, 1.55rem); margin-block: .5rem 1rem; }
+  .syn-lede { max-width: 56ch; color: var(--syn-muted); }
+  .syn-muted { color: var(--syn-muted); }
+  .syn-mono { font-family: var(--syn-mono); font-variant-numeric: tabular-nums; }
+  .syn-caption { overflow-wrap: anywhere; color: var(--syn-muted); font: 500 .72rem/1.5 var(--syn-mono); letter-spacing: .04em; }
+  .syn-metric { margin: .5rem 0 0; font: 650 clamp(2.2rem, 5vw, 3.3rem)/1.1 var(--syn-mono); letter-spacing: -.06em; }
+  .syn-rule { border: 0; border-top: 1px solid var(--syn-frame); margin-block: 1.25rem; }
+  .syn-badge { display: inline-flex; width: fit-content; max-width: 100%; overflow-wrap: anywhere; align-items: center; gap: .45rem; padding: .34rem .6rem; border: 1px solid var(--syn-frame); background: var(--syn-accent-soft); color: var(--syn-accent); font: 650 .68rem/1.25 var(--syn-mono); letter-spacing: .04em; }
+  .syn-badge::before { content: ""; width: .35rem; height: .35rem; border-radius: 50%; background: currentColor; }
+  .syn-alert { padding: .8rem 1rem; border-inline-start: 3px solid var(--syn-accent); background: var(--syn-surface); color: var(--syn-text); }
+  .syn-alert--danger { border-inline-start-color: var(--syn-danger); }
+  .syn-code { font: .85em/1.5 var(--syn-mono); overflow-wrap: anywhere; background: var(--syn-surface-hi); padding: .12em .35em; }
+  @media (forced-colors: active) { .syn-badge, .syn-alert { border-color: CanvasText; } }
+}
+@layer syn.components {
+  .syn-actions { display: flex; flex-wrap: wrap; gap: .65rem; margin-block-start: 1.5rem; }
+  .syn-button {
+    display: inline-flex; align-items: center; justify-content: center; gap: .5rem;
+    min-height: var(--syn-control-height); padding: .65rem 1rem;
+    min-width: 0; max-width: 100%; text-align: center; overflow-wrap: anywhere;
+    border: 1px solid var(--syn-frame); border-radius: var(--syn-radius);
+    background: var(--syn-surface-hi); color: var(--syn-text);
+    text-decoration: none; font: 650 .81rem/1.2 var(--syn-mono);
+    cursor: pointer; transition: background-color var(--syn-duration-fast) var(--syn-ease), border-color var(--syn-duration-fast) var(--syn-ease), color var(--syn-duration-fast) var(--syn-ease);
+  }
+  .syn-button:not(:disabled):not([aria-disabled="true"]):hover { border-color: var(--syn-accent); background: var(--syn-accent-soft); }
+  .syn-button--primary { background: var(--syn-accent); border-color: var(--syn-accent); color: var(--syn-on-accent); }
+  .syn-button--primary:not(:disabled):not([aria-disabled="true"]):hover { background: color-mix(in srgb, var(--syn-accent), white 10%); color: var(--syn-on-accent); }
+  .syn-button--outline { background: transparent; border-color: var(--syn-accent); color: var(--syn-accent); }
+  .syn-button--outline:not(:disabled):not([aria-disabled="true"]):hover { background: var(--syn-accent-soft); }
+  .syn-button--danger { color: var(--syn-danger); border-color: var(--syn-danger); background: transparent; }
+  .syn-button--danger:not(:disabled):not([aria-disabled="true"]):hover { background: color-mix(in srgb, var(--syn-danger), transparent 88%); }
+  .syn-button--small { min-height: 2.25rem; padding: .4rem .65rem; font-size: .72rem; }
+  .syn-button--ghost { background: transparent; border-color: transparent; }
+  .syn-button--ghost:not(:disabled):not([aria-disabled="true"]):hover { background: var(--syn-accent-soft); border-color: var(--syn-frame); }
+  /* State variants use native ARIA for meaning and optional data attributes for app styling. */
+  .syn-button:where([aria-pressed="true"], [data-syn-state="active"]) {
+    border-color: var(--syn-accent);
+    background: var(--syn-accent-soft);
+    color: var(--syn-accent);
+  }
+  .syn-button[aria-busy="true"] { cursor: progress; }
+  /* Native disabled blocks activation. ARIA-disabled is informational only;
+     the host application must block its event handlers. Keep focus available. */
+  .syn-button:is(:disabled, [aria-disabled="true"]) { cursor: not-allowed; }
+  @media (forced-colors: active) {
+    .syn-button { border-color: ButtonText; }
+    .syn-button--primary { background: Highlight; color: HighlightText; border-color: Highlight; }
+    .syn-button--danger, .syn-button--outline { border-color: ButtonText; color: ButtonText; }
+  }
+}
+@layer syn.components {
+  .syn-form { display: grid; gap: 1rem; }
+  .syn-label { display: grid; gap: .35rem; font: 600 .75rem/1.35 var(--syn-mono); }
+  .syn-input, .syn-select, .syn-textarea {
+    width: 100%; min-height: var(--syn-control-height); padding: .7rem .8rem;
+    border: 1px solid var(--syn-frame); background: var(--syn-bg);
+    border-radius: var(--syn-radius); color: var(--syn-text);
+  }
+  .syn-input::placeholder, .syn-textarea::placeholder { color: var(--syn-muted); opacity: 1; }
+  .syn-input:focus, .syn-select:focus, .syn-textarea:focus { border-color: var(--syn-accent); }
+  .syn-input:where(:user-invalid, [aria-invalid="true"]),
+  .syn-select:where(:user-invalid, [aria-invalid="true"]),
+  .syn-textarea:where(:user-invalid, [aria-invalid="true"]) { border-color: var(--syn-danger); }
+  .syn-help { color: var(--syn-muted); font-size: .8rem; }
+  .syn-error { color: var(--syn-danger); font-size: .8rem; }
+  .syn-textarea { min-height: 6rem; resize: vertical; }
+  .syn-input[type="checkbox"], .syn-input[type="radio"] { width: 1.1rem; min-height: auto; height: 1.1rem; padding: 0; accent-color: var(--syn-accent); vertical-align: middle; }
+  .syn-check { display: inline-flex; align-items: center; gap: .55rem; color: var(--syn-text); cursor: pointer; }
+  .syn-fieldset { border: 1px solid var(--syn-frame); padding: 1rem; min-width: 0; }
+  .syn-fieldset legend { padding-inline: .45rem; font: 600 .78rem var(--syn-mono); }
+  @media (forced-colors: active) {
+    .syn-input, .syn-select, .syn-textarea, .syn-fieldset { border-color: CanvasText; }
+  }
+}
+@layer syn.components {
+  .syn-popover, .syn-dialog {
+    width: min(calc(100vw - 2rem), 26rem); padding: 1.5rem;
+    border: 1px solid var(--syn-accent); border-radius: var(--syn-radius);
+    background: var(--syn-surface); color: var(--syn-text);
+    box-shadow: 0 20px 70px rgb(0 0 0 / 45%);
+  }
+  .syn-popover { margin: .75rem; inset: auto 1rem 1rem auto; }
+  .syn-dialog { margin: auto; }
+  .syn-dialog::backdrop { background: rgb(0 0 0 / 70%); }
+  .syn-details { padding: 1rem 0; border-block-start: 1px solid var(--syn-frame); }
+  .syn-details summary { cursor: pointer; color: var(--syn-text); font-weight: 650; }
+  .syn-details[open] summary { color: var(--syn-accent); }
+  .syn-details p { color: var(--syn-muted); margin: .6rem 0 0; }
+  @media (forced-colors: active) { .syn-popover, .syn-dialog, .syn-details { border-color: CanvasText; } }
+}
+@layer syn.components {
+  .syn-meter { width: 100%; height: .45rem; overflow: hidden; border: none; border-radius: 0; accent-color: var(--syn-accent); }
+  .syn-meter::-webkit-progress-bar { background: var(--syn-bg); }
+  .syn-meter::-webkit-progress-value { background: var(--syn-accent); }
+  .syn-meter::-moz-progress-bar { background: var(--syn-accent); }
+  .syn-table-wrap { overflow-x: auto; }
+  .syn-table { width: 100%; border-collapse: collapse; text-align: left; font: .75rem/1.65 var(--syn-mono); }
+  .syn-table th, .syn-table td { padding: .7rem .6rem; border-block-end: 1px solid var(--syn-frame); white-space: nowrap; }
+  .syn-table th { color: var(--syn-muted); font-weight: 550; }
+  /* No implicit last-column accent: table columns may contain any kind of data. */
+  .syn-table .syn-table-emphasis { color: var(--syn-accent); font-weight: 650; }
+  .syn-table .syn-cell--numeric { text-align: right; font-variant-numeric: tabular-nums; }
+  .syn-status { display: inline-flex; gap: .4em; align-items: center; color: var(--syn-text); font: 650 .75rem/1.5 var(--syn-mono); }
+  .syn-status::before { content: ""; flex: none; width: .45em; height: .45em; border-radius: 50%; background: currentColor; }
+  .syn-status--success { color: var(--syn-success); }
+  .syn-status--warning { color: var(--syn-warning); }
+  .syn-status--danger { color: var(--syn-danger); }
+  @media (forced-colors: active) {
+    .syn-status::before { border: 1px solid currentColor; }
+  }
+}
+/* Portable app/marketing compositions, inspired by patterns rather than code from UI kits.
+   A named container prevents viewport-dependent components. All styles stay opt-in. */
+@layer syn.components {
+  .syn-region { container-name: syn-region; container-type: inline-size; min-width: 0; }
+  .syn-split { display: grid; gap: var(--syn-space-3); min-width: 0; }
+  .syn-stats { display: grid; gap: var(--syn-space-2); grid-template-columns: minmax(0, 1fr); }
+  .syn-stat { padding: var(--syn-space-3); border: 1px solid var(--syn-frame); background: var(--syn-surface); min-width: 0; }
+  .syn-stat-label { color: var(--syn-muted); font: 650 .73rem/1.4 var(--syn-mono); letter-spacing: .05em; }
+  .syn-stat-value { margin: .5rem 0 0; color: var(--syn-text); font: 650 clamp(1.7rem, 4vw, 2.4rem)/1.1 var(--syn-mono); font-variant-numeric: tabular-nums; }
+  .syn-toolbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: var(--syn-space-2); }
+  .syn-empty { display: grid; justify-items: center; align-content: center; text-align: center; gap: var(--syn-space-2); min-height: 12rem; padding: var(--syn-space-4); border: 1px dashed var(--syn-frame); background: var(--syn-surface); }
+  .syn-empty > :where(h2, h3, p) { margin-block: 0; }
+  .syn-pricing { display: grid; gap: var(--syn-space-2); grid-template-columns: minmax(0, 1fr); }
+  .syn-price-card { display: flex; flex-direction: column; gap: var(--syn-space-3); min-width: 0; border: 1px solid var(--syn-frame); padding: var(--syn-space-4); background: var(--syn-surface); }
+  .syn-price-card[data-syn-featured] { border-color: var(--syn-accent); background: linear-gradient(155deg, var(--syn-accent-soft), transparent 55%), var(--syn-surface); }
+  .syn-price-card > .syn-button { margin-block-start: auto; }
+  .syn-price-value { margin: 0; color: var(--syn-text); font: 650 clamp(2rem, 5vw, 3rem)/1.1 var(--syn-mono); font-variant-numeric: tabular-nums; }
+  .syn-price-value small { color: var(--syn-muted); font: 400 .9rem var(--syn-font); }
+  .syn-feature-list { display: grid; gap: .6rem; padding-inline-start: 1.2rem; margin: 0 0 var(--syn-space-3); color: var(--syn-muted); }
+  .syn-feature-list li::marker { color: var(--syn-accent); }
+  @container syn-region (min-width: 31rem) {
+    .syn-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  @container syn-region (min-width: 43rem) {
+    .syn-split { grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); }
+    .syn-pricing { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  }
+  @container syn-region (min-width: 55rem) {
+    .syn-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  }
+  @media (forced-colors: active) {
+    .syn-stat, .syn-empty, .syn-price-card, .syn-price-card[data-syn-featured] { border-color: CanvasText; }
+  }
+}

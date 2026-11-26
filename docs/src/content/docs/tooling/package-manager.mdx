@@ -63,7 +63,13 @@ nulang nula new my-app --template lib
 | `full` | `README.md`, `src/lib.nula`, `src/main.nula`, `tests/`, `examples/` |
 | `distributed` | supervised worker actors with message passing |
 | `ai-agent` | actor with LLM-backed conversation memory |
-| `web` | Nulang Web app with `[web]` manifest section and static assets |
+| `web` | Nulang Web app with `[web]` manifest section and static assets; optional `--style syntyr` |
+
+To scaffold the experimental Syntyr-styled Web starter, run
+`nulang nula new my-app --template web --style syntyr`. The preset
+includes pinned CSS and its MIT notice, and needs no frontend build tool or
+CDN. Other templates and the unstyled default remain independent of Syntyr.
+See the [integration and provenance guide](https://github.com/nulang-org/nulang/blob/main/docs/web/SYNTYR.md).
 
 ## The `Nulang.toml` manifest
 
