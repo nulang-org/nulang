@@ -1,7 +1,40 @@
 # Nulang Changelog
-### Static-only Web artifact generation — 2026-10-15
-- **`nula build --web` prerenders only routes that validated Deployment IR classifies as static.** Server-placed routes (including POST mutations) remain in deployment metadata but are not executed or emitted as public HTML during static generation.
-- **A mixed-route build regression validates placement and emitted artifacts**, preserving the compiler-owned validated contract as the shared authority for runtime and deployment.
+
+### Static-only Web artifact generation — 2026-11-26
+- **`nula build --web` prerenders only routes with an artifact in validated Deployment IR.** Server-placed routes remain in deployment metadata and OpenAPI without invoking their handlers or publishing their responses as static HTML.
+- Use the same IR artifact filename in the renderer rather than duplicating route-to-output mapping. Mixed static, POST and captured-path GET routes have regression coverage.
+
+### Web compiler route-conflict validation integration — 2026-11-26
+- **Fail closed on duplicate package route registrations and ambiguous compiled path shapes.** Reuse the authoritative Web Contract compilation/validation boundary and runtime segment parser, without introducing a parallel router.
+- Regression coverage includes duplicate direct/helper routes, capture-shape collisions, cross-module package validation, public runtime attachment, and real TCP HTTP coverage. Different methods and distinct static routes remain supported.
+- This is compile-time admission hardening, not HTTP authorization, deployment certification, or a complete overlapping-pattern policy.
+
+### Per-priority scheduler runnable backlog diagnostics — 2026-11-20
+- **Expose approximate queued High, Normal, and Low runnable task counts** in the existing scheduler metrics snapshot, including global injector and worker-local queues, without adding counters to scheduling hot paths.
+- **Regression tests cover mixed priority queues, dequeues, and metrics-counter reset.** Queue depths are sampled non-atomically for diagnostics only; they are not admission, fairness, or backpressure guarantees.
+
+### NUL0 TCP partial-frame recovery across read timeouts — 2026-11-10
+- **Preserve bytes already consumed from NUL0 frame prefixes and payloads when socket reads return `WouldBlock`, `TimedOut`, or `Interrupted`.** Retry from the unconsumed offset rather than restarting `read_exact` with a fresh buffer, preventing frame misalignment and lost actor packets.
+- **Cover fragmented reads, shutdown and premature EOF with deterministic regressions.** Existing maximum-frame-size limits and transport failure semantics are retained. The intermittent five-node post-heal delivery problem still requires separate qualification; this change does not establish that it is fully resolved.
+- **2026-11-20 bounded-frame follow-up:** Once the first prefix byte arrives, enforce a 30-second no-progress timeout and a 60-second base total assembly budget plus payload-size allowance at 64 KiB/s, shared across prefix and payload. A healthy idle connection before the first byte is not expired by the frame deadline. New regressions exercise stalls, trickle traffic, and cross-segment deadline continuity; the five-node recovery issue remains separately gated.
+
+### Optional Syntyr styling preset for Web scaffolds — 2026-11-15
+- **The existing `nula new --template web` now supports opt-in `--style syntyr`.** Generated apps include pinned, self-hosted Syntyr 0.3.0-alpha.4 core and semantic styles, MIT attribution, scoped Studio styling, a responsive Todo UI, and no mandatory npm/CDN/JavaScript dependency. The default web template remains unstyled.
+- **Generated Todo forms support standard no-JavaScript POST submissions.** Hidden action fields distinguish add, toggle and delete operations; web starter type annotations incompatible with route-contract parsing have been removed. The original preset branch verified both styled and unstyled builds locally.
+- **Pin the stylesheet hashes and carry the license into static builds.** Add executable CLI scaffold/build coverage for both variants without a Cargo executable on PATH. The standalone CLI locates itself before attempting Cargo metadata, avoiding an unnecessary Rust toolchain dependency.
+
+### Native float division/modulo nil parity — 2026-10-19
+- **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
+- **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
+
+### Fabric on-demand mailbox scoring — 2026-10-18
+- **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
+- **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
+
+### Bounded Nulang Web development-server connections — 2026-10-16
+- **The experimental Web development listener caps active connections at 64**, including SSE, and returns `503` with `Retry-After: 1` when full.
+- **Worker capacity is returned by a scoped RAII lease** after normal completion, panic, or thread-spawn failure. One shared `Arc` route table replaces per-connection clones of compiled route modules.
+- **Existing deterministic capacity and concurrent-admission regressions are preserved** from draft #1774; current-main static containment and bounded HTTP framing remain intact. Exact-head CI and real TCP saturation validation are required before promotion.
 
 ### Web static-root containment — 2026-10-15
 - **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.

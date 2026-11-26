@@ -5,10 +5,12 @@
 //! handler ABI slots. Build/compiler entry points should consume this module so
 //! they have one authoritative diagnostic list instead of reimplementing policy.
 
+use crate::runtime::HttpMethod;
 use crate::web::bindings::compile_route_bindings;
 use crate::web::contracts::ContractCompilation;
 use crate::web::package_contracts::compile_contracts_from_tree;
-use std::collections::HashSet;
+use crate::web::runtime_bindings::route_match_shape;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Compile and validate every statically extractable route contract in a
@@ -62,6 +64,35 @@ pub fn validation_diagnostics(compilation: &ContractCompilation) -> Vec<String> 
     let mut diagnostics = compilation.diagnostics.clone();
     for route in &compilation.routes {
         diagnostics.extend(compile_route_bindings(route).diagnostics);
+    }
+
+    // The runtime matches path segments, not parameter names. A later route
+    // with the same method and literal/parameter shape is unreachable, while
+    // OpenAPI would silently overwrite one operation. Reject that disagreement
+    // at the shared compiler-owned validation boundary before serving/building.
+    let mut route_shapes: HashMap<(&str, Vec<Option<String>>), &str> = HashMap::new();
+    for route in &compilation.routes {
+        // The VM's registration path accepts only methods parsed by HttpMethod.
+        // Reject unsupported static registrations here rather than documenting
+        // routes that the runtime silently discards.
+        let Some(method) = HttpMethod::from_str(&route.method) else {
+            diagnostics.push(format!(
+                "unsupported HTTP method '{}' for route '{}'",
+                route.method, route.path
+            ));
+            continue;
+        };
+        let method = method.as_str();
+        // Malformed paths already have extractor diagnostics; do not invent a
+        // second, differently worded validation policy here.
+        if let Ok(shape) = route_match_shape(&route.path) {
+            if let Some(previous) = route_shapes.insert((method, shape), &route.path) {
+                diagnostics.push(format!(
+                    "ambiguous route {method}: '{previous}' and '{}' match the same request paths",
+                    route.path
+                ));
+            }
+        }
     }
 
     let mut seen = HashSet::new();
@@ -150,6 +181,111 @@ mod tests {
             validation_diagnostics(&compilation),
             vec!["a diagnostic".to_string(), "z diagnostic".to_string()]
         );
+    }
+
+    fn collision_route(method: &str, path: &str, capture: Option<&str>) -> RouteContract {
+        let params = capture
+            .map(|name| {
+                vec![RouteParamContract {
+                    name: name.to_string(),
+                    ty: Some("Int".to_string()),
+                }]
+            })
+            .unwrap_or_default();
+        let handler_params = capture
+            .map(|name| {
+                vec![HandlerParamContract {
+                    name: name.to_string(),
+                    ty: Some("Int".to_string()),
+                    capability: None,
+                    request: None,
+                }]
+            })
+            .unwrap_or_default();
+        RouteContract {
+            method: method.to_string(),
+            path: path.to_string(),
+            handler: Some("show".to_string()),
+            params,
+            handler_params,
+            response_type: Some("String".to_string()),
+            error_type: None,
+            effects: Vec::new(),
+            reference_capability: None,
+            placement: Some("server".to_string()),
+        }
+    }
+
+    #[test]
+    fn rejects_ambiguous_routes_with_differently_named_path_captures() {
+        let compilation = ContractCompilation {
+            routes: vec![
+                collision_route("GET", "/users/{id: Int}", Some("id")),
+                collision_route("GET", "/users/:user_id", Some("user_id")),
+            ],
+            diagnostics: Vec::new(),
+        };
+
+        let diagnostics = validate_compilation(compilation).unwrap_err();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(
+            diagnostics[0].contains("ambiguous route GET"),
+            "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics[0].contains("/users/{id: Int}"),
+            "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics[0].contains("/users/:user_id"),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_same_route_with_percent_encoded_literal_aliases() {
+        let compilation = ContractCompilation {
+            routes: vec![
+                collision_route("GET", "/users/me", None),
+                collision_route("GET", "/users/%6De", None),
+            ],
+            diagnostics: Vec::new(),
+        };
+
+        let diagnostics = validation_diagnostics(&compilation);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(
+            diagnostics[0].contains("ambiguous route GET"),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn permits_every_supported_http_method() {
+        let compilation = ContractCompilation {
+            routes: ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
+                .into_iter()
+                .map(|method| collision_route(method, "/resource", None))
+                .collect(),
+            diagnostics: Vec::new(),
+        };
+
+        assert!(validation_diagnostics(&compilation).is_empty());
+    }
+
+    #[test]
+    fn permits_distinct_methods_and_distinct_static_routes() {
+        let compilation = ContractCompilation {
+            routes: vec![
+                collision_route("GET", "/users/{id: Int}", Some("id")),
+                collision_route("POST", "/users/{user_id: Int}", Some("user_id")),
+                collision_route("GET", "/users/me", None),
+                collision_route("GET", "/teams/{id: Int}", Some("id")),
+            ],
+            diagnostics: Vec::new(),
+        };
+
+        assert!(validation_diagnostics(&compilation).is_empty());
     }
 
     #[test]

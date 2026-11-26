@@ -51,18 +51,28 @@ pub fn run(args: &[String]) -> NuResult<()> {
     match args.first().map(String::as_str) {
         Some("new") => {
             let mut template: Option<&str> = None;
+            let mut style: Option<&str> = None;
             let mut path_arg: Option<&str> = None;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
-                    "--template" => {
+                    "--template" | "--style" => {
+                        let flag = args[i].as_str();
                         i += 1;
-                        if i < args.len() {
+                        if i >= args.len() || args[i].starts_with("--") {
+                            return Err(NuError::PackageError {
+                                msg: format!("{} requires a value", flag),
+                                span: Span::default(),
+                            });
+                        }
+                        if flag == "--template" {
                             template = Some(args[i].as_str());
+                        } else {
+                            style = Some(args[i].as_str());
                         }
                     }
                     other => {
-                        if path_arg.is_some() {
+                        if path_arg.is_some() || other.starts_with("--") {
                             return Err(NuError::PackageError {
                                 msg: format!("unexpected argument '{}' for nula new", other),
                                 span: Span::default(),
@@ -73,7 +83,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
                 }
                 i += 1;
             }
-            cmd_new(path_arg, template)
+            cmd_new_styled(path_arg, template, style)
         }
         Some("init") => cmd_init(),
         Some("build") => {
@@ -284,9 +294,9 @@ fn print_usage() {
     println!("Usage: nulang nula <COMMAND>");
     println!();
     println!("Commands:");
-    println!("  new   <path> [--template <name>]");
+    println!("  new   <path> [--template <name>] [--style syntyr]");
     println!("                Scaffold a new package directory");
-    println!("                Templates: default, cli, lib, full");
+    println!("                Templates: default, cli, lib, full, distributed, ai-agent, web");
     println!("  init          Scaffold a new package in the current directory");
     println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
     println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
@@ -361,8 +371,17 @@ fn run_auth_enable(_args: &[String]) -> NuResult<()> {
     Ok(())
 }
 
-/// `nula new <name> [--template <name>]`: scaffold a package directory.
+/// `nula new <name> [--template <name>] [--style syntyr]`: scaffold a package.
+#[cfg(test)]
 fn cmd_new(path_arg: Option<&str>, template: Option<&str>) -> NuResult<()> {
+    cmd_new_styled(path_arg, template, None)
+}
+
+fn cmd_new_styled(
+    path_arg: Option<&str>,
+    template: Option<&str>,
+    style: Option<&str>,
+) -> NuResult<()> {
     let path_str = path_arg.ok_or_else(|| NuError::PackageError {
         msg: "nula new requires a package name or path".to_string(),
         span: Span::default(),
@@ -402,7 +421,20 @@ fn cmd_new(path_arg: Option<&str>, template: Option<&str>) -> NuResult<()> {
             span: Span::default(),
         });
     }
-    scaffold_package(&dir, name, tmpl)?;
+    let style = style.unwrap_or("none");
+    if !["none", "syntyr"].contains(&style) {
+        return Err(NuError::PackageError {
+            msg: format!("unknown style '{}' (available: none, syntyr)", style),
+            span: Span::default(),
+        });
+    }
+    if style == "syntyr" && tmpl != "web" {
+        return Err(NuError::PackageError {
+            msg: "--style syntyr requires --template web".to_string(),
+            span: Span::default(),
+        });
+    }
+    scaffold_package_styled(&dir, name, tmpl, style)?;
     println!("Created package '{}' at '{}'", name, dir.display());
     Ok(())
 }
@@ -455,6 +487,11 @@ fn validate_package_name(name: &str) -> NuResult<()> {
 
 /// Write the `Nulang.toml` + template source files for a new package.
 fn scaffold_package(dir: &Path, name: &str, template: &str) -> NuResult<()> {
+    scaffold_package_styled(dir, name, template, "none")
+}
+
+/// Syntyr is an opt-in, vendored CSS preset; no network access or npm needed.
+fn scaffold_package_styled(dir: &Path, name: &str, template: &str, style: &str) -> NuResult<()> {
     std::fs::create_dir_all(dir).map_err(|e| NuError::PackageError {
         msg: format!("cannot create {}: {}", dir.display(), e),
         span: Span::default(),
@@ -489,7 +526,35 @@ fn scaffold_package(dir: &Path, name: &str, template: &str) -> NuResult<()> {
         })?;
     }
 
-    for (rel_path, content) in template_files(template) {
+    let files = if template == "web" && style == "syntyr" {
+        vec![
+            ("src/main.nula", include_str!("templates/syntyr/main.nula")),
+            (
+                "public/style.css",
+                include_str!("templates/syntyr/style.css"),
+            ),
+            (
+                "public/syntyr.core.css",
+                include_str!("templates/syntyr/syntyr.core.css"),
+            ),
+            (
+                "public/syntyr.semantic.css",
+                include_str!("templates/syntyr/syntyr.semantic.css"),
+            ),
+            (
+                "SYNTYR-LICENSE",
+                include_str!("templates/syntyr/SYNTYR-LICENSE"),
+            ),
+            (
+                "public/SYNTYR-LICENSE.txt",
+                include_str!("templates/syntyr/SYNTYR-LICENSE"),
+            ),
+            ("README.md", include_str!("templates/syntyr/README.md")),
+        ]
+    } else {
+        template_files(template)
+    };
+    for (rel_path, content) in files {
         let dest = dir.join(rel_path);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| NuError::PackageError {
@@ -581,7 +646,7 @@ import stdlib::web::types
 import stdlib::web::host
 import stdlib::json
 
-fn get_todos() -> [JsonValue] {
+fn get_todos() {
     let raw = kv_get("todos")
     if raw == "" then { [] }
     else {
@@ -648,7 +713,7 @@ fn delete_todo(id_str) {
     set_todos(updated)
 }
 
-fn render_todos() -> Html {
+fn render_todos() {
     let todos = get_todos()
     var rows = []
     for todo in todos {
@@ -673,7 +738,7 @@ fn render_todos() -> Html {
     el("ul", [("class", text("todos"))], rows)
 }
 
-fn home() -> Html {
+fn home() {
     if request_method() == "POST" then {
         let action = form_value("__nulang_action")
         if action == "add_todo" then {
@@ -888,8 +953,17 @@ fn try_find_existing_nulang_binary() -> Option<PathBuf> {
         }
     }
 
-    // 2. Binary next to the current test harness: target/<profile>/nulang.
+    // 2. A running standalone CLI is its own compiler. Do this before
+    // probing Cargo or neighboring build profiles: installed releases may
+    // have no Rust toolchain, and a different binary could be a stale version.
     let current_exe = std::env::current_exe().ok();
+    if let Some(p) = current_exe.as_ref() {
+        if p.file_stem() == Some(std::ffi::OsStr::new("nulang")) && p.is_file() {
+            return Some(p.clone());
+        }
+    }
+
+    // 3. Binary next to the current test harness: target/<profile>/nulang.
     if let Some(p) = current_exe.as_ref().and_then(|p| {
         p.parent()
             .and_then(|deps| deps.parent())
@@ -899,7 +973,7 @@ fn try_find_existing_nulang_binary() -> Option<PathBuf> {
         return Some(p);
     }
 
-    // 3. Coverage runs / custom target dirs: ask cargo metadata for the
+    // 4. Coverage runs / custom target dirs: ask cargo metadata for the
     // workspace target directory and look in debug/release profiles.
     let out = std::process::Command::new("cargo")
         .args(["metadata", "--format-version", "1", "--no-deps"])
@@ -915,13 +989,6 @@ fn try_find_existing_nulang_binary() -> Option<PathBuf> {
         let candidate = std::path::Path::new(td).join(profile).join("nulang");
         if candidate.is_file() {
             return Some(candidate);
-        }
-    }
-
-    // 4. If the current process is itself the `nulang` CLI, use it.
-    if let Some(p) = current_exe {
-        if p.file_stem() == Some(std::ffi::OsStr::new("nulang")) && p.is_file() {
-            return Some(p);
         }
     }
 
@@ -1415,8 +1482,22 @@ fn cmd_build_web() -> NuResult<()> {
         span: Span::default(),
     })?;
 
-    // Emit compile-time signal graph if the entry uses `signal` declarations.
-    let signals_path = output_dir.join("app.signals.json");
+    // OpenAPI has additional path-item identity constraints. Check those
+    // before rendering and publishing the generated artifacts, without imposing
+    // documentation-specific restrictions on the HTTP dispatcher.
+    let openapi = crate::web::openapi::generate_checked_openapi(
+        &validated_contracts,
+        &manifest.package.name,
+        &manifest.package.version,
+    )
+    .map_err(|diagnostics| NuError::PackageError {
+        msg: format!("invalid OpenAPI contract:\n{}", diagnostics.join("\n")),
+        span: Span::default(),
+    })?;
+
+    // Stage the graph for deployment IR before rendering; publish it after
+    // copying static assets, as before, so a user asset cannot replace it.
+    let signals_path = build_dir.join("build.signals.json");
     nulang_exe(&[
         "--emit-signals",
         &signals_path.to_string_lossy(),
@@ -1434,23 +1515,23 @@ fn cmd_build_web() -> NuResult<()> {
     let static_count = ir
         .routes
         .iter()
-        .filter(|route| route.placement == "static")
+        .filter(|route| route.artifact.is_some())
         .count();
     eprintln!("  Rendering {} static route(s)...", static_count);
-    // IR routes are generated in the same order as the registered routes.
-    // Server-only handlers must never run during static artifact generation.
+    // Deployment IR preserves the registered route order. Use its artifact
+    // decision and filename directly: server routes must not run during
+    // static generation, and a second path mapping can drift from the IR.
     for (route, ir_route) in routes.iter().zip(&ir.routes) {
-        if ir_route.placement != "static" {
+        let Some(out_file) = &ir_route.artifact else {
             continue;
-        }
+        };
         let html = render_route_handler(&route.handler_module, route.handler_func_idx, None)
             .ok_or_else(|| NuError::PackageError {
                 msg: format!("failed to render route {:?} {}", route.method, route.path),
                 span: Span::default(),
             })?;
         let html = crate::web::reactivity::inject_client_runtime_script(&html);
-        let out_file = route_path_to_output_file(&route.path);
-        let dest = output_dir.join(&out_file);
+        let dest = output_dir.join(out_file);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| NuError::PackageError {
                 msg: format!("cannot create {}: {}", parent.display(), e),
@@ -1469,6 +1550,12 @@ fn cmd_build_web() -> NuResult<()> {
         copy_dir_contents(&static_dir, &output_dir)?;
     }
 
+    let output_signals_path = output_dir.join("app.signals.json");
+    std::fs::copy(&signals_path, &output_signals_path).map_err(|e| NuError::PackageError {
+        msg: format!("cannot publish {}: {e}", output_signals_path.display()),
+        span: Span::default(),
+    })?;
+
     let ir_path = output_dir.join("nulang-app.ir.json");
     let ir_json = ir.to_json();
     std::fs::write(&ir_path, ir_json).map_err(|e| NuError::PackageError {
@@ -1476,6 +1563,19 @@ fn cmd_build_web() -> NuResult<()> {
         span: Span::default(),
     })?;
     eprintln!("  Wrote {}", ir_path.display());
+
+    // Publish API documentation generated from the same checked contracts.
+    let openapi_json =
+        serde_json::to_vec_pretty(&openapi).map_err(|error| NuError::PackageError {
+            msg: format!("cannot serialize OpenAPI document: {error}"),
+            span: Span::default(),
+        })?;
+    let openapi_file = output_dir.join("openapi.json");
+    std::fs::write(&openapi_file, openapi_json).map_err(|error| NuError::PackageError {
+        msg: format!("cannot write {}: {error}", openapi_file.display()),
+        span: Span::default(),
+    })?;
+    eprintln!("  Wrote {}", openapi_file.display());
 
     // Enforce performance budgets declared in Nulang.toml.
     if let Err(violations) = crate::web::budget::check_initial_js_budget(
@@ -1497,15 +1597,6 @@ fn cmd_build_web() -> NuResult<()> {
 
     println!("Web build succeeded: {}", output_dir.display());
     Ok(())
-}
-
-fn route_path_to_output_file(path: &str) -> PathBuf {
-    let trimmed = path.trim_start_matches('/');
-    if trimmed.is_empty() {
-        PathBuf::from("index.html")
-    } else {
-        PathBuf::from(trimmed).join("index.html")
-    }
 }
 
 fn copy_dir_contents(src: &Path, dst: &Path) -> NuResult<()> {
@@ -2731,6 +2822,104 @@ mod tests {
     }
 
     #[test]
+    fn test_web_syntyr_style_scaffolds_self_hosted_assets() {
+        let dir =
+            std::env::temp_dir().join(format!("nulang_syntyr_web_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let args = vec![
+            "new".to_string(),
+            dir.to_str().unwrap().to_string(),
+            "--template".to_string(),
+            "web".to_string(),
+            "--style".to_string(),
+            "syntyr".to_string(),
+        ];
+        run(&args).expect("Syntyr must be a supported opt-in web style");
+        let source = std::fs::read_to_string(dir.join("src/main.nula")).unwrap();
+        let core = std::fs::read_to_string(dir.join("public/syntyr.core.css")).unwrap();
+        let semantic = std::fs::read_to_string(dir.join("public/syntyr.semantic.css")).unwrap();
+        let css = std::fs::read_to_string(dir.join("public/style.css")).unwrap();
+        assert!(
+            source.contains("el(\"html\", [(\"lang\", text(\"en\"))], ["),
+            "Syntyr starter needs an explicit document language for assistive technology"
+        );
+        assert!(source.contains("syn-root syn-semantic"));
+        assert!(source.contains("data-syn-theme"));
+        assert!(source.contains("syntyr.core.css"));
+        assert!(source.contains("syntyr.semantic.css"));
+        assert!(source.contains("route \"POST\" \"/\" -> home"));
+        assert_eq!(
+            source
+                .matches("(\"name\", text(\"__nulang_action\"))")
+                .count(),
+            3,
+            "native forms need action fields even when client JavaScript is disabled"
+        );
+        assert!(core.contains(".syn-root"));
+        assert!(semantic.contains(".syn-semantic"));
+        assert!(css.contains(".todos"));
+        assert!(dir.join("SYNTYR-LICENSE").is_file());
+        assert!(dir.join("README.md").is_file());
+        assert!(dir.join("Nulang.toml").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_new_syntyr_style_rejects_non_web_template_and_unknown_style() {
+        for (template, style) in [("cli", "syntyr"), ("web", "unknown")] {
+            let dir = std::env::temp_dir().join(format!(
+                "nulang_syntyr_invalid_{}_{}_{}",
+                template,
+                style,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let args = vec![
+                "new".to_string(),
+                dir.to_str().unwrap().to_string(),
+                "--template".to_string(),
+                template.to_string(),
+                "--style".to_string(),
+                style.to_string(),
+            ];
+            assert!(run(&args).is_err());
+            assert!(!dir.exists(), "invalid styling must not create a package");
+        }
+    }
+
+    #[test]
+    fn test_new_style_flag_requires_a_value() {
+        let args = vec![
+            "new".to_string(),
+            "example".to_string(),
+            "--template".to_string(),
+            "web".to_string(),
+            "--style".to_string(),
+        ];
+        let err = run(&args).expect_err("missing --style value must be rejected");
+        assert!(err.to_string().contains("--style requires a value"));
+    }
+
+    #[test]
+    fn test_new_web_without_style_remains_unstyled() {
+        let dir =
+            std::env::temp_dir().join(format!("nulang_web_default_style_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let args = vec![
+            "new".to_string(),
+            dir.to_str().unwrap().to_string(),
+            "--template".to_string(),
+            "web".to_string(),
+        ];
+        run(&args).expect("unstyled web scaffold remains supported");
+        assert!(!dir.join("public/syntyr.core.css").exists());
+        assert!(!std::fs::read_to_string(dir.join("src/main.nula"))
+            .unwrap()
+            .contains("syn-root"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_cmd_new_rejects_unknown_template() {
         let dir = std::env::temp_dir().join(format!("nulang_unk_tmpl_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3081,15 +3270,14 @@ mod tests {
         scaffold_package(&dir, "mixed-routes", "web").expect("web scaffold should succeed");
         std::fs::write(
             dir.join("src/main.nula"),
-            r#"import stdlib::web::html
-import stdlib::web::types
-
-fn home() -> Html { text("Static homepage") }
-fn submit() -> Html { text("Server response") }
+            r#"fn home() -> String { "Static homepage" }
+fn submit() -> String { "Server response" }
+fn detail(id: Int) -> Int { id }
 
 app "mixed-routes" {
     route "GET" "/" -> home
     route "POST" "/submit" -> submit
+    route "GET" "/items/{id: Int}" -> detail
 }
 "#,
         )
@@ -3099,22 +3287,27 @@ app "mixed-routes" {
         cmd_build_web().expect("mixed static/server Web build should succeed");
 
         assert!(dir.join("dist/index.html").is_file());
-        assert!(
-            !dir.join("dist/submit/index.html").exists(),
-            "POST server routes must not be prerendered as public static pages"
-        );
+        assert!(!dir.join("dist/submit/index.html").exists());
+        assert!(!dir.join("dist/items").exists());
 
-        let ir: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(dir.join("dist/nulang-app.ir.json")).unwrap(),
-        )
-        .unwrap();
+        let ir: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("dist/nulang-app.ir.json")).unwrap())
+                .unwrap();
         let routes = ir["routes"].as_array().unwrap();
-        let server = routes
-            .iter()
-            .find(|route| route["method"] == "POST" && route["path"] == "/submit")
-            .expect("server route metadata must still be emitted");
-        assert_eq!(server["placement"], "server");
-        assert!(server["artifact"].is_null());
+        assert_eq!(routes.len(), 3);
+        let home = routes.iter().find(|route| route["path"] == "/").unwrap();
+        assert_eq!(home["artifact"], "index.html");
+        for path in ["/submit", "/items/{id: Int}"] {
+            let server = routes.iter().find(|route| route["path"] == path).unwrap();
+            assert_eq!(server["placement"], "server");
+            assert!(server["artifact"].is_null());
+        }
+
+        let openapi: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("dist/openapi.json")).unwrap()).unwrap();
+        assert!(openapi["paths"]["/"]["get"].is_object());
+        assert!(openapi["paths"]["/submit"]["post"].is_object());
+        assert!(openapi["paths"]["/items/{id}"]["get"].is_object());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3152,8 +3345,39 @@ app "counter" {
         )
         .unwrap();
 
+        // Generated signal metadata must retain precedence over copied assets.
+        std::fs::create_dir_all(dir.join("public")).unwrap();
+        std::fs::write(dir.join("public/app.signals.json"), r#"{"stale":true}"#).unwrap();
+
         let _guard = ChangeDir::new(&dir);
         cmd_build_web().expect("web build should succeed");
+
+        // The generated API contract and deployment IR must describe the same
+        // validated routes; OpenAPI is a build artifact, not a separate parser.
+        let openapi: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join("dist/openapi.json"))
+                .expect("OpenAPI document should be emitted with the web build"),
+        )
+        .expect("OpenAPI document must be valid JSON");
+        assert_eq!(openapi["openapi"], "3.1.0");
+        assert_eq!(openapi["info"]["title"], "signal-app");
+        assert!(openapi["paths"]["/"]["get"].is_object());
+        let ir: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("dist/nulang-app.ir.json")).unwrap())
+                .unwrap();
+        let signals: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("dist/app.signals.json")).unwrap())
+                .unwrap();
+        assert_eq!(signals, ir["signals"]);
+        assert!(signals.get("stale").is_none());
+        let routes = ir["routes"].as_array().unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0]["method"], "GET");
+        assert_eq!(routes[0]["path"], "/");
+        assert_eq!(
+            openapi["paths"]["/"]["get"]["operationId"],
+            routes[0]["handler"]
+        );
 
         let html =
             std::fs::read_to_string(dir.join("dist/index.html")).expect("index.html should exist");

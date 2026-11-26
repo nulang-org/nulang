@@ -179,8 +179,22 @@ fn match_segments(
     Some(params)
 }
 
-fn compile_route_segments(path: &str) -> Result<Vec<RuntimeRouteSegment>, String> {
+pub(crate) fn compile_route_segments(path: &str) -> Result<Vec<RuntimeRouteSegment>, String> {
     compile_segments(path, true)
+}
+
+/// A canonical matching shape: decoded literals are preserved and captures
+/// are represented by `None` regardless of source spelling or name.
+pub(crate) fn route_match_shape(path: &str) -> Result<Vec<Option<String>>, String> {
+    compile_route_segments(path).map(|segments| {
+        segments
+            .into_iter()
+            .map(|segment| match segment {
+                RuntimeRouteSegment::Literal(value) => Some(value),
+                RuntimeRouteSegment::PathParam(_) => None,
+            })
+            .collect()
+    })
 }
 
 fn compile_legacy_route_segments(path: &str) -> Result<Vec<RuntimeRouteSegment>, String> {
