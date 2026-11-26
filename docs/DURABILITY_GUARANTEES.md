@@ -372,8 +372,9 @@ system traffic; selective receive and synchronous asks cannot consume or
 overtake it. Payloads that cannot round-trip into the receiver's VM values
 are rejected before admission.
 
-After interruption between admission, publication and execution, recover
-the receiver from the store and register its native handlers with stable
+After interruption between admission, publication and execution, unless the
+receiver was explicitly bound to the native recovery supervisor described
+below, recover the receiver from the store and register its native handlers with stable
 behavior IDs before scheduling. The original journal entry is recovered
 into the admitted mailbox slot, not readmitted. A recovered command with
 no registered handler is parked; a retry of its original outbox identity
@@ -445,12 +446,75 @@ obtain one page's admission counts and observe cooldown. Individual failures
 are logged and counted; unadmitted messages stay pending. Divergent snapshots
 or an ambiguous commit still require inspection and receiver recovery. Pending messages
 are distinct from already-admitted commands: after interruption, the
-latter are replayed by explicit receiver recovery/handler registration,
-not sent a second time by the pump. There is no automatic actor recreation,
-behavior registration, multi-owner claiming, dead-letter policy, or
+latter are replayed by explicit receiver recovery/handler registration or
+the separately enabled native recovery supervisor, not sent a second time
+by the pump. The outbox pump itself does not recreate actors or register
+handlers. There is no multi-owner claiming, dead-letter policy, or
 cross-shard delivery. The release gate exercises both backends, SQLite
 reopen without a live sender, a bounded idle sweep, time-based retry,
 failure isolation, and deterministic scheduling.
+
+### Opt-in native recovery supervisor (experimental)
+
+The host may bind a newly created ordinary Rust workflow to an immutable
+recipe before the first command. A recipe is a trusted name, revision and
+ordered sequence of native handlers (excluding reserved timer behavior 0).
+For example, with a registered `receive` native behavior:
+
+```rust
+runtime.register_native_workflow_recovery_recipe(
+    "receiver", "v1", vec![("receive".into(), receive_handler)]
+)?;
+runtime.bind_native_workflow_recovery(receiver_id, "receiver", "v1")?;
+runtime.enable_native_workflow_recovery(NativeWorkflowRecoveryConfig::default())?;
+```
+
+On restart, register the same recipe before enabling recovery; actor IDs
+need not be enumerated by the host for open, bound commands. MemoryStore
+retains bindings in memory; local SQLite persists them across process
+restarts. SQLite discovery joins the
+binding with open admission metadata and returns a bounded shard-local page
+of actor IDs. The supervisor validates the binding (including ownership
+epoch), current safe snapshot, original admission, command journal,
+behavior ID, and supported workflow history; it reconstructs through
+`recover_actor` and installs the ordered native handlers before scheduling.
+The original receipt and journal entry remain unchanged. Missing recipes
+are deferred; inconsistent layouts or unsupported history fail closed.
+The revision is a trusted host contract, not a cryptographic hash of Rust
+code. Changing a handler or its behavior layout requires a different
+revision and a separately qualified new workflow identity.
+
+The supervisor is disabled by default. It attempts one page per scheduler
+iteration (default 64, maximum 1024), with a bounded four-page idle sweep
+and a retry interval (default 100 ms, range 1 ms–300 s). The scheduler's
+logical clock controls cooldown; it does not sleep solely for recovery.
+Embedded hosts must drive subsequent scheduler turns; deterministic hosts
+must advance their clock. `poll_native_workflow_recovery()` reports the
+number examined, restored, deferred and failed, not successful handler
+completion. On terminal commit failure for a locally bound actor with
+supervision enabled, volatile state is discarded and a later due sweep
+can retry the same still-open admission; unrelated actors remain runnable.
+A terminal commit that actually closed despite an ambiguous error is not
+re-executed; explicit host recovery of that closed actor may be needed.
+
+Scope: single existing store owner, unchanged shard/epoch, ordinary
+synchronous native handlers and supported durable primitive/string state
+(handlers must not depend on state-model metadata for absent fields),
+no external non-idempotent side effects, timers/signals, transient state,
+event sourcing, CRDT, authority, compilation/AOT, migration, grain or
+supervision-tree reconstruction. The host must keep bound handler layouts
+and semantics immutable, use stable actor identities, and enable recovery
+before spawning new actors on restart; the runtime reserves the discovered
+open bound IDs but does not provide a global durable actor-ID allocator.
+Resident actors (including ones manually recovered without handlers),
+unbound legacy actors, idle/closed actors, and post-effect intermediate
+history are not automatically reconstructed. A permanently failing command
+can remain open and be retried across sweeps. There is no persistent retry
+budget, poison-command quarantine, panic containment, automatic ownership
+acquisition, or cross-shard recovery. No durable external-effect guarantee
+is added. Tests exercise MemoryStore and SQLite, exact recipe matching,
+bounded pages, real process termination after admission, integrated outbox
+restart, and injected terminal commit failure/repair.
 
 ## What is not yet a production-wide guarantee
 
