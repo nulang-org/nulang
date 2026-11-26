@@ -55,8 +55,8 @@ Route metadata includes the existing method/path/placement/artifact fields plus:
 
 Bindings are ordered by handler slot rather than URL segment order. The runtime therefore stages arguments directly into the call ABI without inferring argument order from route text.
 
-For `[web.prerender]` in the package manifest, a parameterized GET route
-is replaced in deployment IR by a finite set of concrete static routes,
+For `[web.prerender]` or `[web.collections]` in the package manifest, a
+parameterized GET route is replaced in deployment IR by a finite set of concrete static routes,
 one per successfully rendered URL. The original pattern is preserved in
 `route_template`; its path/handler parameter and request binding metadata is
 not copied onto the concrete routes because those inputs have already been
@@ -64,6 +64,13 @@ consumed at build time. There is no implicit runtime fallback for unlisted
 URLs. Existing v1 consumers see ordinary static routes and artifacts, not
 a new placement kind. The dev server and source-level contracts remain
 unchanged.
+
+A collection names a compiled zero-argument Nulang function that returns a
+nonempty array of route keys. One capture uses scalar rows; multiple captures
+use tuple rows in URL order, with each value matching its compiler path binding
+type. The provider is proved and evaluated before rendering; its concrete URL
+list enters the same validation, sorting, binding, and artifact pipeline as
+manual enumeration. No record schema or provider metadata is added to the IR.
 
 Static placement is validated before artifact emission against the linked
 compiler-produced bytecode, independently of the declared effect row. Every

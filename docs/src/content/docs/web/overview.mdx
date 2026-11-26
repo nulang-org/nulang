@@ -275,6 +275,76 @@ Other, unconfigured dynamic routes remain server routes. Reordering the list
 does not change the output, and removing a URL removes its previous artifact
 on the next successful build.
 
+### Typed content collections
+
+Instead of maintaining URL lists by hand, define content in ordinary typed
+Nulang data and project its route keys with a named zero-argument function.
+For example, put your content in `src/articles.nula`:
+
+```nulang
+pub type Article = { slug: String, title: String }
+
+pub fn articles() -> [Article] {
+    [
+        {slug: "intro", title: "Introduction"},
+        {slug: "install", title: "Installation"}
+    ]
+}
+```
+
+Use the same collection for enumeration and rendering in `src/main.nula`:
+
+```nulang
+import stdlib::web::html
+import stdlib::web::types
+import articles
+
+fn article_keys() -> [String] {
+    var keys = [];
+    for item in articles() {
+        keys = perform Array.push(keys, item.slug)
+    }
+    keys
+}
+
+fn article(slug: String) -> Html {
+    var title = "Not found";
+    for item in articles() {
+        if item.slug == slug then { title = item.title } else {}
+    }
+    text(title)
+}
+
+app "articles" {
+    route "GET" "/articles/{slug}" -> article
+}
+```
+
+```toml
+[web.collections]
+"/articles/{slug}" = "article_keys"
+```
+
+The provider name must identify one compiled zero-argument function. For
+a route with one path capture, return an array of values of that exact scalar
+type. For several captures, return an array of tuples in URL capture order,
+independent of handler parameter order. For example, a route
+`/articles/{slug}/{page: Int}` expects keys such as
+`[("intro", 1), ("install", 2)]`. The build checks the actual VM value
+shapes and scalar types before converting each key to a portable URL segment.
+
+Each provider is evaluated once per configured route before its pages are
+rendered. Both the provider and handler must pass the static effect proof and
+checked VM below. Empty collections, invalid keys, duplicate output paths
+and route conflicts fail the build without replacing the previous site.
+Use either a collection or `[web.prerender]` on a given route, not both.
+All other finite deployment rules above still apply.
+
+There is no separate content or rendering runtime: records, imports, and
+functions use the existing language. The manifest only names the route-key
+projection. Markdown/front matter ingestion and filesystem globbing are not
+part of this first collection interface.
+
 ### Static effect proof
 
 Before running a page handler, the build checks every emitted instruction in its
@@ -286,9 +356,10 @@ ranges. The result is independent of which concrete URLs you prerender; even
 an unselected branch containing a request effect disqualifies the route.
 
 An inferred static candidate that fails the proof remains on the server, with a
-diagnostic explaining why. An explicit `@placement(static)` or configured
-`[web.prerender]` route that fails the proof fails the build instead. The
-interpreter independently checks operations during rendering as defense in depth.
+diagnostic explaining why. An explicit `@placement(static)` or a finite static
+route configured through `[web.prerender]` or `[web.collections]` that fails the proof fails
+the build instead. The interpreter independently checks operations during
+rendering as defense in depth.
 
 Direct recursion is permitted when the entire direct-call graph passes the
 policy. Arbitrary higher-order calls may remain server-only even when pure:

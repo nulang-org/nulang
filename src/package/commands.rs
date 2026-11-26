@@ -1506,6 +1506,7 @@ fn cmd_build_web() -> NuResult<()> {
         &runtime_routes,
         &validated_contracts,
         &manifest.web.prerender,
+        &manifest.web.collections,
         &mut ir,
     )
     .map_err(|msg| NuError::PackageError {

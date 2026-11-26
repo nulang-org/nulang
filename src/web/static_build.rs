@@ -5,14 +5,16 @@
 use crate::bytecode::{CodeModule, Constant, OpCode};
 use crate::runtime::WebRoute;
 use crate::types::{NuError, Span};
-use crate::vm::VM;
+use crate::vm::{Value, VM};
 use crate::web::bindings::RouteBindingSource;
 use crate::web::contracts::ContractCompilation;
 use crate::web::dispatch::{has_complete_request_binding_plan, match_route};
 use crate::web::handler_call::prepare_bound_handler;
 use crate::web::ir::{DeploymentIr, IrRoute};
 use crate::web::request_bindings::{bind_request_arguments, RequestBindingValues};
-use crate::web::runtime_bindings::{BoundRouteArgument, RuntimeWebRoute};
+use crate::web::runtime_bindings::{
+    BoundRouteArgument, RuntimeRoutePlan, RuntimeRouteSegment, RuntimeWebRoute,
+};
 use crate::web::static_proof::{check_instruction, prove_handler};
 use std::collections::{BTreeMap, HashMap};
 
@@ -41,12 +43,18 @@ pub(crate) fn render_pages(
     routes: &[RuntimeWebRoute],
     contracts: &ContractCompilation,
     enumeration: &BTreeMap<String, Vec<String>>,
+    collections: &BTreeMap<String, String>,
     ir: &mut DeploymentIr,
 ) -> Result<BTreeMap<String, String>, String> {
     if routes.len() != ir.routes.len() {
         return Err("static build route/IR length mismatch".into());
     }
-    for (pattern, urls) in enumeration {
+    for pattern in enumeration.keys().chain(collections.keys()) {
+        if enumeration.contains_key(pattern) && collections.contains_key(pattern) {
+            return Err(format!(
+                "prerender '{pattern}' is configured in both [web.prerender] and [web.collections]"
+            ));
+        }
         if routes
             .iter()
             .filter(|r| r.route.method.as_str() == "GET" && r.route.path == *pattern)
@@ -68,7 +76,7 @@ pub(crate) fn render_pages(
                 "prerender '{pattern}' must identify exactly one compiler route contract"
             ));
         }
-        if urls.is_empty() {
+        if enumeration.get(pattern).is_some_and(Vec::is_empty) {
             return Err(format!("prerender '{pattern}' has an empty URL list"));
         }
     }
@@ -105,9 +113,9 @@ pub(crate) fn render_pages(
             .and_then(|contract| contract.placement.as_deref());
         let explicitly_static = placement == Some("static");
 
-        if let Some(urls) = enumeration
-            .get(&metadata.path)
-            .filter(|_| metadata.method == "GET")
+        if metadata.method == "GET"
+            && (enumeration.contains_key(&metadata.path)
+                || collections.contains_key(&metadata.path))
         {
             if placement.is_some_and(|p| p != "static") {
                 return Err(format!(
@@ -117,7 +125,10 @@ pub(crate) fn render_pages(
             if let Err(reason) = prove_candidate(&metadata, &route.route, true) {
                 return Err(format!("{label}: cannot prerender: {reason}"));
             }
-            let mut urls = urls.clone();
+            let mut urls = match collections.get(&metadata.path) {
+                Some(provider) => collection_urls(route, provider)?,
+                None => enumeration[&metadata.path].clone(),
+            };
             urls.sort();
             for url in urls {
                 let path = artifact_path(&url)?;
@@ -211,11 +222,10 @@ pub(crate) fn render_pages(
     Ok(pages)
 }
 
-fn prerender_arguments(
-    route: &RuntimeWebRoute,
-    url: &str,
-) -> Result<Vec<BoundRouteArgument>, String> {
-    let label = format!("GET {} -> {url}", route.route.path);
+fn prerender_plan<'a>(
+    route: &'a RuntimeWebRoute,
+    label: &str,
+) -> Result<&'a RuntimeRoutePlan, String> {
     let plan = route
         .plan
         .as_ref()
@@ -241,6 +251,15 @@ fn prerender_arguments(
             "{label}: prerender requires explicitly typed String, Int, Bool or Float path bindings"
         ));
     }
+    Ok(plan)
+}
+
+fn prerender_arguments(
+    route: &RuntimeWebRoute,
+    url: &str,
+) -> Result<Vec<BoundRouteArgument>, String> {
+    let label = format!("GET {} -> {url}", route.route.path);
+    let plan = prerender_plan(route, &label)?;
     let path = match_route(route, url)
         .ok_or_else(|| format!("{label}: URL does not match route pattern"))?;
     if path.values().any(String::is_empty) {
@@ -257,6 +276,117 @@ fn prerender_arguments(
     };
     bind_request_arguments(&plan.bindings, plan.handler_param_count, &values)
         .map_err(|error| format!("{label}: {error}"))
+}
+
+/// Evaluate one native Nulang route-key projection in the same checked VM
+/// as the renderer. Arrays contain scalars for a one-capture route, or tuples
+/// in URL capture order for a multi-capture route. No record field IDs or
+/// source type serialization are needed.
+fn collection_urls(route: &RuntimeWebRoute, provider: &str) -> Result<Vec<String>, String> {
+    let label = format!("GET {} collection '{provider}'", route.route.path);
+    let plan = prerender_plan(route, &label)?;
+    let module = &route.route.handler_module;
+    let mut functions = module.debug_functions.iter().filter(|f| f.name == provider);
+    let function = functions
+        .next()
+        .filter(|_| functions.next().is_none())
+        .ok_or_else(|| format!("{label}: expected exactly one compiled provider function"))?;
+    if !function.params.is_empty() {
+        return Err(format!("{label}: provider must accept zero arguments"));
+    }
+    let mut indices = module
+        .function_table
+        .iter()
+        .enumerate()
+        .filter(|(_, offset)| **offset == function.code_offset);
+    let (index, _) = indices
+        .next()
+        .filter(|_| indices.next().is_none())
+        .ok_or_else(|| format!("{label}: provider is not a unique callable function"))?;
+    prove_handler(module, index)
+        .map_err(|reason| format!("{label}: cannot enumerate: {reason}"))?;
+    let (module, entry) = prepare_bound_handler(module, index, 0, &[])
+        .map_err(|reason| format!("{label}: {reason}"))?;
+    let mut vm = VM::new_without_jit();
+    vm.load_module(module);
+    let value = vm
+        .run_from_checked(0, entry, |module, instr| {
+            check_instruction(module, instr)
+                .map_err(|reason| NuError::runtime_error(reason, Span::default()))
+        })
+        .map_err(|error| format!("{label}: collection evaluation failed: {error}"))?;
+    let rows = vm
+        .array_elements(value)
+        .ok_or_else(|| format!("{label}: provider must return an array of route keys"))?;
+    if rows.is_empty() {
+        return Err(format!("{label}: provider returned an empty collection"));
+    }
+    let capture_count = plan
+        .segments
+        .iter()
+        .filter(|segment| matches!(segment, RuntimeRouteSegment::PathParam(_)))
+        .count();
+    let mut urls = Vec::with_capacity(rows.len());
+    for (index, row) in rows.into_iter().enumerate() {
+        let row_label = format!("{label} row {}", index + 1);
+        let keys = if capture_count == 1 {
+            vec![row]
+        } else {
+            vm.tuple_elements(row)
+                .filter(|keys| keys.len() == capture_count)
+                .ok_or_else(|| {
+                    format!("{row_label}: expected a tuple of {capture_count} path keys")
+                })?
+        };
+        let mut keys = keys.into_iter();
+        let mut url = String::new();
+        for segment in &plan.segments {
+            url.push('/');
+            match segment {
+                RuntimeRouteSegment::Literal(literal) => {
+                    if literal.contains('/') {
+                        return Err(format!("{label}: invalid static route literal"));
+                    }
+                    url.push_str(literal);
+                }
+                RuntimeRouteSegment::PathParam(name) => {
+                    let ty = plan
+                        .bindings
+                        .iter()
+                        .find(|binding| binding.source_name == *name)
+                        .and_then(|binding| binding.ty.as_deref())
+                        .ok_or_else(|| format!("{label}: unresolved path binding '{name}'"))?;
+                    let key = keys
+                        .next()
+                        .ok_or_else(|| format!("{row_label}: missing key '{name}'"))?;
+                    let key = collection_key(&vm, key, ty)
+                        .ok_or_else(|| format!("{row_label}: path key '{name}' must be {ty}"))?;
+                    if key.is_empty() || key.contains('/') {
+                        return Err(format!(
+                            "{row_label}: invalid static route path key '{name}'"
+                        ));
+                    }
+                    url.push_str(&key);
+                }
+            }
+        }
+        artifact_path(&url).map_err(|error| format!("{row_label}: {error}"))?;
+        urls.push(url);
+    }
+    Ok(urls)
+}
+
+fn collection_key(vm: &VM, value: Value, ty: &str) -> Option<String> {
+    match ty {
+        "String" => vm.string_operand(0, value),
+        "Int" => value.as_int().map(|v| v.to_string()),
+        "Bool" => value.as_bool().map(|v| v.to_string()),
+        "Float" => value
+            .as_float()
+            .filter(|v| v.is_finite())
+            .map(|v| v.to_string()),
+        _ => None,
+    }
 }
 
 fn reserve_path(
