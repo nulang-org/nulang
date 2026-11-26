@@ -23,7 +23,12 @@ fn seeded_mvcc_matches_model_across_checkpoint_and_reopen() {
         .ok()
         .map(|s| s.parse::<u64>().expect("decimal seed"))
         .unwrap_or(42);
-    for offset in 0..16 {
+    let count = std::env::var("TABLET_TEST_COUNT")
+        .ok()
+        .map(|s| s.parse::<u64>().expect("decimal seed count"))
+        .unwrap_or(16);
+    assert!(count > 0, "seed count must be positive");
+    for offset in 0..count {
         let seed = base.wrapping_add(offset);
         let mut rng = seed;
         let dir = Scratch(
