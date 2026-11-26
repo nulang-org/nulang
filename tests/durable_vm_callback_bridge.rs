@@ -19,7 +19,7 @@ use nulang::parser::Parser;
 use nulang::primitives::{DeliverySemantics, EffectBoundary};
 use nulang::runtime::heap::{ActorHeap, TypeTag as HeapTypeTag};
 use nulang::runtime::{
-    Actor, ActorSnapshot, DurableTransition, JournalEntry, LibsqlStore, OrcaGc, PersistenceStore,
+    Actor, ActorSnapshot, DurableTransition, LibsqlStore, OrcaGc, PersistenceStore,
     WorkflowActivationId, WorkflowEvent, DURABLE_TRANSITION_VERSION,
 };
 use nulang::typechecker::TypeChecker;
@@ -602,25 +602,19 @@ fn vm_invalid_text_receipt_fails_closed_and_never_redispatches() {
 
 fn admit_command(store: &mut LibsqlStore) -> WorkflowActivationId {
     let previous = store.latest_sequence(ACTOR_ID);
-    let sequence = previous + 1;
+    if previous == 0 {
+        store
+            .save_snapshot(ActorSnapshot {
+                actor_id: ACTOR_ID,
+                activation_epoch: 1,
+                ..ActorSnapshot::default()
+            })
+            .unwrap();
+    }
     let committed = store
-        .commit_transition(DurableTransition {
-            version: DURABLE_TRANSITION_VERSION,
-            actor_id: ACTOR_ID,
-            activation_epoch: 1,
-            sequence,
-            expected_previous_sequence: previous,
-            command: Some(JournalEntry {
-                sequence,
-                behavior_id: 0,
-                payload: vec![],
-            }),
-            snapshot: None,
-            workflow_events: vec![],
-            domain_events: vec![],
-            durable_effects: vec![],
-            outbox: vec![],
-        })
+        .commit_transition(
+            DurableTransition::workflow_command(ACTOR_ID, 1, previous, 0, vec![]).unwrap(),
+        )
         .unwrap();
     WorkflowActivationId::new(committed.actor_id, committed.sequence)
 }
@@ -856,6 +850,7 @@ fn workflow_cursor_pins_pending_request_and_separates_new_commands() {
             sequence: terminal_seq,
             expected_previous_sequence: terminal_seq - 1,
             command: None,
+            workflow_admission: false,
             snapshot: Some(ActorSnapshot {
                 actor_id: ACTOR_ID,
                 sequence: terminal_seq,
@@ -1110,6 +1105,7 @@ fn workflow_later_occurrence_recovers_after_new_owner_claim() {
             sequence: 5,
             expected_previous_sequence: 4,
             command: None,
+            workflow_admission: false,
             snapshot: None,
             workflow_events: vec![],
             domain_events: vec![],
@@ -1320,4 +1316,112 @@ fn workflow_restart_rejects_changed_site_before_provider_and_replays_original_sl
         .unwrap();
     assert!(matches!(result, PerformAsyncResult::Ready(Some(ref value)) if value == "receipt"));
     assert_eq!(store.latest_sequence(ACTOR_ID), 3);
+}
+
+#[test]
+fn workflow_adapter_requires_proven_open_admission_after_restart() {
+    let db = TestDb::new();
+    let module = workflow_module();
+    let pc = module.effect_sites[0].pc;
+    let mut store = LibsqlStore::new(&db.path).unwrap();
+    store
+        .save_snapshot(ActorSnapshot {
+            actor_id: ACTOR_ID,
+            activation_epoch: 1,
+            ..ActorSnapshot::default()
+        })
+        .unwrap();
+    let mut generic = DurableTransition::workflow_command(ACTOR_ID, 1, 0, 0, vec![]).unwrap();
+    generic.workflow_admission = false;
+    store.commit_transition(generic).unwrap();
+    // A generic command and valid current tail are NOT an admission proof.
+    drop(store);
+    let mut store = LibsqlStore::new(&db.path).unwrap();
+    let mut actor = workflow_actor(WorkflowActivationId::new(ACTOR_ID, 1));
+    assert!(store
+        .load_open_workflow_command(ACTOR_ID)
+        .unwrap()
+        .is_none());
+    let mut coordinator = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
+    assert!(coordinator
+        .execute_workflow_vm_async_text_with_deduplication(
+            &module,
+            pc,
+            "Inference.ask",
+            &mut actor,
+            &grant(),
+            REQUEST.as_bytes(),
+            |_, _| panic!("unproven command must not dispatch")
+        )
+        .is_err());
+    assert_eq!(store.latest_sequence(ACTOR_ID), 1);
+}
+
+#[test]
+fn workflow_closed_admission_rejects_completed_receipt_on_fresh_actor() {
+    let db = TestDb::new();
+    let module = workflow_module();
+    let pc = module.effect_sites[0].pc;
+    let mut store = LibsqlStore::new(&db.path).unwrap();
+    let activation = admit_command(&mut store);
+    let mut actor = workflow_actor(activation);
+    let mut coordinator = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
+    coordinator
+        .execute_workflow_vm_async_text_with_deduplication(
+            &module,
+            pc,
+            "Inference.ask",
+            &mut actor,
+            &grant(),
+            REQUEST.as_bytes(),
+            |_, _| Ok(b"receipt".to_vec()),
+        )
+        .unwrap();
+    let sequence = store.latest_sequence(ACTOR_ID) + 1;
+    store
+        .commit_transition(DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id: ACTOR_ID,
+            activation_epoch: 1,
+            sequence,
+            expected_previous_sequence: sequence - 1,
+            command: None,
+            workflow_admission: false,
+            snapshot: Some(ActorSnapshot {
+                actor_id: ACTOR_ID,
+                sequence,
+                activation_epoch: 1,
+                ..ActorSnapshot::default()
+            }),
+            workflow_events: vec![WorkflowEvent::StepCompleted {
+                sequence,
+                activation: Some(activation),
+                step_name: "charge".into(),
+            }],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![],
+        })
+        .unwrap();
+    drop(store);
+    let mut store = LibsqlStore::new(&db.path).unwrap();
+    assert!(store
+        .load_open_workflow_command(ACTOR_ID)
+        .unwrap()
+        .is_none());
+    // No stale in-memory cursor to do the rejection for us.
+    let mut actor = workflow_actor(activation);
+    let mut coordinator = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
+    assert!(coordinator
+        .execute_workflow_vm_async_text_with_deduplication(
+            &module,
+            pc,
+            "Inference.ask",
+            &mut actor,
+            &grant(),
+            REQUEST.as_bytes(),
+            |_, _| panic!("closed command must not dispatch")
+        )
+        .is_err());
+    assert_eq!(store.latest_sequence(ACTOR_ID), sequence);
 }

@@ -4374,6 +4374,15 @@ fn test_recovery_replays_unfinished_atomic_native_workflow_activation() {
         "accepted command must extend the pre-command safe snapshot"
     );
 
+    assert_eq!(
+        rt.persistence
+            .load_open_workflow_command(actor_id)
+            .unwrap()
+            .unwrap()
+            .activation,
+        activation,
+        "native admission must persist explicit proof before executing user code"
+    );
     // Crash after atomic command admission but before handler entry.
     rt.actors.remove(&actor_id);
     assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
@@ -4427,6 +4436,13 @@ fn test_recovery_replays_unfinished_atomic_native_workflow_activation() {
         rt.persistence.read_journal(actor_id).len(),
         1,
         "replay must execute the accepted command without admitting a duplicate"
+    );
+    assert!(
+        rt.persistence
+            .load_open_workflow_command(actor_id)
+            .unwrap()
+            .is_none(),
+        "native terminal snapshot must close the durable admission"
     );
 }
 

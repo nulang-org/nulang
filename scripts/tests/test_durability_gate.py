@@ -46,5 +46,17 @@ class DurableReleaseGateTests(unittest.TestCase):
         self.assertIn("set -euo pipefail", gate)
 
 
+    def test_workflow_command_admission_and_recovery_are_explicit_release_gates(self):
+        gate = (ROOT / "scripts" / "test-durability-guarantees.sh").read_text()
+        self.assertIn(
+            "cargo test --locked --no-default-features --features sqlite --test workflow_effect_tail_recovery\n",
+            gate,
+        )
+        self.assertIn(
+            "cargo test --locked --no-default-features --lib test_recovery_replays_unfinished_atomic_native_workflow_activation\n",
+            gate,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

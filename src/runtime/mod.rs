@@ -5545,6 +5545,18 @@ impl Runtime {
         // history is accepted solely for replay-identified intermediate records
         // belonging to that same activation; every other mixed-history shape
         // fails closed.
+        let proven_open_command = if is_workflow {
+            match self.persistence.load_open_workflow_command(actor_id) {
+                Ok(open) => open,
+                Err(error) if error.kind() == std::io::ErrorKind::Unsupported => None,
+                Err(error) => {
+                    warn!("nulang-recover: refusing workflow actor {} after open admission read failed: {}", actor_id, error);
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
         let pending_atomic_workflow_replay = if is_workflow {
             match self.persistence.load_durable_tail_position(actor_id) {
                 Ok(Some(tail)) if tail.sequence > snapshot.sequence => {
@@ -5654,6 +5666,16 @@ impl Runtime {
         } else {
             None
         };
+
+        if let Some(open) = proven_open_command {
+            if pending_atomic_workflow_replay.as_ref().map(|(id, _)| *id) != Some(open.activation) {
+                warn!(
+                    "nulang-recover: refusing inconsistent open workflow admission for actor {}",
+                    actor_id
+                );
+                return None;
+            }
+        }
 
         let journal_to_replay: Vec<JournalEntry> = if is_workflow {
             Vec::new()

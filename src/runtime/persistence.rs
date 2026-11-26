@@ -401,6 +401,8 @@ pub struct DurableTransition {
     pub sequence: u64,
     pub expected_previous_sequence: u64,
     pub command: Option<JournalEntry>,
+    /// Explicit standalone workflow admission; generic/legacy commands are not proof of admission.
+    pub workflow_admission: bool,
     pub snapshot: Option<ActorSnapshot>,
     pub workflow_events: Vec<WorkflowEvent>,
     pub domain_events: Vec<EventEntry>,
@@ -418,13 +420,150 @@ pub struct DurableTail {
 
 /// Minimal committed-tail metadata needed to classify crash recovery.
 ///
-/// Recovery intentionally does not need the transition digest; it only needs
-/// the fencing epoch and exact committed sequence to distinguish atomic
-/// command admission from legacy journal history.
+/// Recovery uses the fencing epoch and exact committed sequence to classify
+/// history. This position alone is not evidence that a workflow command was
+/// admitted or remains open; use load_open_workflow_command for that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DurableTailPosition {
     pub activation_epoch: u64,
     pub sequence: u64,
+}
+
+/// A storage-proven, currently open workflow command and its ownership fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenWorkflowCommand {
+    pub activation: WorkflowActivationId,
+    pub tail: DurableTailPosition,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WorkflowAdmission {
+    command_sequence: u64,
+    closed_sequence: Option<u64>,
+}
+
+fn workflow_admission_error(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn validate_open_boundary(
+    command_sequence: u64,
+    snapshot_sequence: Option<u64>,
+    latest_command: u64,
+    legacy_events: u64,
+    tail: DurableTailPosition,
+) -> io::Result<()> {
+    if command_sequence == 0
+        || snapshot_sequence != command_sequence.checked_sub(1)
+        || latest_command != command_sequence
+        || legacy_events >= command_sequence
+        || tail.sequence < command_sequence
+        || tail.activation_epoch == 0
+    {
+        return Err(workflow_admission_error(
+            "open workflow command history is not at a safe atomic boundary",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_open_workflow_owner(
+    transition: &DurableTransition,
+    open: Option<OpenWorkflowCommand>,
+) -> io::Result<()> {
+    if let Some(open) = open {
+        if transition.activation_epoch != open.tail.activation_epoch
+            && (transition.command.is_some()
+                || transition.snapshot.is_some()
+                || !transition.workflow_events.is_empty()
+                || !transition.domain_events.is_empty()
+                || !transition.durable_effects.is_empty()
+                || !transition.outbox.is_empty())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "workflow owner epoch must be claimed before command writes",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Return the next admission state for an explicitly tracked command.
+/// Existing generic transactions retain their prior contract.
+fn validate_workflow_admission_transition(
+    transition: &DurableTransition,
+    last: Option<WorkflowAdmission>,
+    snapshot_sequence: Option<u64>,
+) -> io::Result<Option<WorkflowAdmission>> {
+    let open = last.filter(|admission| admission.closed_sequence.is_none());
+    if transition.workflow_admission {
+        if open.is_some() || snapshot_sequence != Some(transition.expected_previous_sequence) {
+            return Err(workflow_admission_error(
+                "workflow admission requires a safe snapshot and no open command",
+            ));
+        }
+        return Ok(Some(WorkflowAdmission {
+            command_sequence: transition.sequence,
+            closed_sequence: None,
+        }));
+    }
+    let bound = transition
+        .durable_effects
+        .iter()
+        .any(|record| record.workflow_binding().is_some());
+    if let Some(open) = open {
+        let activation = WorkflowActivationId::new(transition.actor_id, open.command_sequence);
+        let closes = transition.workflow_events.len() == 1
+            && transition.workflow_events[0].activation_id() == Some(activation);
+        if transition.command.is_some()
+            || !transition.domain_events.is_empty()
+            || !transition.outbox.is_empty()
+        {
+            return Err(workflow_admission_error(
+                "unqualified transition while workflow command is open",
+            ));
+        }
+        if closes {
+            if transition.snapshot.is_none() || !transition.durable_effects.is_empty() {
+                return Err(workflow_admission_error(
+                    "workflow terminal transition requires a snapshot and no staged effects",
+                ));
+            }
+            return Ok(Some(WorkflowAdmission {
+                command_sequence: open.command_sequence,
+                closed_sequence: Some(transition.sequence),
+            }));
+        }
+        if transition.snapshot.is_some()
+            || !transition.workflow_events.is_empty()
+            || transition.durable_effects.iter().any(|record| {
+                record.workflow_binding().map(|binding| binding.activation) != Some(activation)
+            })
+        {
+            return Err(workflow_admission_error(
+                "unqualified snapshot, event or effect while workflow command is open",
+            ));
+        }
+        return Ok(None);
+    }
+    if bound {
+        return Err(workflow_admission_error(
+            "workflow effect requires a proven open command",
+        ));
+    }
+    if let Some(closed) = last {
+        if transition.workflow_events.iter().any(|event| {
+            event
+                .activation_id()
+                .is_some_and(|activation| activation.command_sequence <= closed.command_sequence)
+        }) {
+            return Err(workflow_admission_error(
+                "workflow command is already terminal",
+            ));
+        }
+    }
+    Ok(None)
 }
 
 /// Result of a successfully committed durable transition.
@@ -437,6 +576,42 @@ pub struct DurableCommit {
 }
 
 impl DurableTransition {
+    /// Construct the single fenced transition that admits a workflow command
+    /// from its already-persisted safe snapshot. The store validates that
+    /// boundary and the absence of another open command inside the commit.
+    pub fn workflow_command(
+        actor_id: u64,
+        activation_epoch: u64,
+        expected_previous_sequence: u64,
+        behavior_id: u16,
+        payload: Vec<PersistedValue>,
+    ) -> io::Result<Self> {
+        let sequence = expected_previous_sequence.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workflow command sequence overflow",
+            )
+        })?;
+        Ok(Self {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id,
+            activation_epoch,
+            sequence,
+            expected_previous_sequence,
+            command: Some(JournalEntry {
+                sequence,
+                behavior_id,
+                payload,
+            }),
+            workflow_admission: true,
+            snapshot: None,
+            workflow_events: vec![],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![],
+        })
+    }
+
     fn validate_structure(&self) -> io::Result<()> {
         if self.version != DURABLE_TRANSITION_VERSION {
             return Err(io::Error::new(
@@ -478,6 +653,18 @@ impl DurableTransition {
             ));
         }
 
+        if self.workflow_admission
+            && (self.command.is_none()
+                || self.snapshot.is_some()
+                || !self.workflow_events.is_empty()
+                || !self.domain_events.is_empty()
+                || !self.durable_effects.is_empty()
+                || !self.outbox.is_empty())
+        {
+            return Err(workflow_admission_error(
+                "workflow admission must be a standalone command transition",
+            ));
+        }
         if let Some(command) = &self.command {
             if command.sequence != self.sequence {
                 return Err(io::Error::new(
@@ -581,6 +768,9 @@ impl DurableTransition {
     pub fn digest(&self) -> io::Result<[u8; 32]> {
         self.validate_structure()?;
 
+        fn is_false(value: &bool) -> bool {
+            !*value
+        }
         #[derive(serde::Serialize)]
         struct DigestEnvelope<'a> {
             version: u16,
@@ -589,6 +779,8 @@ impl DurableTransition {
             sequence: u64,
             expected_previous_sequence: u64,
             command: &'a Option<JournalEntry>,
+            #[serde(skip_serializing_if = "is_false")]
+            workflow_admission: bool,
             snapshot: &'a Option<ActorSnapshot>,
             workflow_events: &'a [WorkflowEvent],
             domain_events: &'a [EventEntry],
@@ -613,6 +805,7 @@ impl DurableTransition {
             sequence: self.sequence,
             expected_previous_sequence: self.expected_previous_sequence,
             command: &self.command,
+            workflow_admission: self.workflow_admission,
             snapshot: &self.snapshot,
             workflow_events: &self.workflow_events,
             domain_events: &self.domain_events,
@@ -811,6 +1004,18 @@ pub trait PersistenceStore: Send + Sync {
         ))
     }
 
+    /// Load storage-proven open command identity and the current fence, not
+    /// inferred from a journal entry or atomic tail alone.
+    fn load_open_workflow_command(
+        &self,
+        _actor_id: u64,
+    ) -> io::Result<Option<OpenWorkflowCommand>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic workflow admission recovery is not supported",
+        ))
+    }
+
     /// Load the newest durable record for one logical external effect.
     ///
     /// Backends that cannot recover durable-effect records MUST fail closed
@@ -1004,6 +1209,7 @@ pub struct MemoryStore {
     events: HashMap<u64, Vec<EventEntry>>,
     durable_tails: HashMap<u64, DurableTail>,
     committed_transitions: HashMap<u64, Vec<DurableTransition>>,
+    workflow_admissions: HashMap<u64, WorkflowAdmission>,
 }
 
 impl MemoryStore {
@@ -1024,6 +1230,66 @@ impl MemoryStore {
 }
 
 impl PersistenceStore for MemoryStore {
+    fn load_open_workflow_command(&self, actor_id: u64) -> io::Result<Option<OpenWorkflowCommand>> {
+        let Some(admission) = self
+            .workflow_admissions
+            .get(&actor_id)
+            .filter(|a| a.closed_sequence.is_none())
+        else {
+            return Ok(None);
+        };
+        let tail = self
+            .load_durable_tail_position(actor_id)?
+            .ok_or_else(|| workflow_admission_error("open workflow command lacks atomic tail"))?;
+        let command_sequence = admission.command_sequence;
+        let journal = self
+            .journals
+            .get(&actor_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if journal
+            .iter()
+            .filter(|entry| entry.sequence == command_sequence)
+            .count()
+            != 1
+        {
+            return Err(workflow_admission_error(
+                "open workflow command lacks a unique journal entry",
+            ));
+        }
+        let latest_command = journal
+            .iter()
+            .map(|entry| entry.sequence)
+            .max()
+            .unwrap_or(0);
+        let legacy_events = self
+            .workflow_events
+            .get(&actor_id)
+            .into_iter()
+            .flatten()
+            .map(WorkflowEvent::sequence)
+            .chain(
+                self.events
+                    .get(&actor_id)
+                    .into_iter()
+                    .flatten()
+                    .map(|entry| entry.sequence),
+            )
+            .max()
+            .unwrap_or(0);
+        validate_open_boundary(
+            command_sequence,
+            self.snapshots.get(&actor_id).map(|s| s.sequence),
+            latest_command,
+            legacy_events,
+            tail,
+        )?;
+        Ok(Some(OpenWorkflowCommand {
+            activation: WorkflowActivationId::new(actor_id, command_sequence),
+            tail,
+        }))
+    }
+
     fn load_durable_tail_position(&self, actor_id: u64) -> io::Result<Option<DurableTailPosition>> {
         Ok(self
             .durable_tails
@@ -1144,6 +1410,55 @@ impl PersistenceStore for MemoryStore {
             }
         }
 
+        validate_open_workflow_owner(
+            &transition,
+            self.load_open_workflow_command(transition.actor_id)?,
+        )?;
+        let admission = validate_workflow_admission_transition(
+            &transition,
+            self.workflow_admissions.get(&transition.actor_id).copied(),
+            self.snapshots
+                .get(&transition.actor_id)
+                .filter(|snapshot| {
+                    !transition.workflow_admission
+                        || (snapshot.activation_epoch <= transition.activation_epoch
+                            && self
+                                .journals
+                                .get(&transition.actor_id)
+                                .into_iter()
+                                .flatten()
+                                .all(|entry| entry.sequence <= snapshot.sequence)
+                            && self
+                                .workflow_events
+                                .get(&transition.actor_id)
+                                .into_iter()
+                                .flatten()
+                                .all(|event| event.sequence() <= snapshot.sequence)
+                            && self
+                                .events
+                                .get(&transition.actor_id)
+                                .into_iter()
+                                .flatten()
+                                .all(|event| event.sequence <= snapshot.sequence))
+                })
+                .map(|snapshot| snapshot.sequence),
+        )?;
+        if let Some(closed) = admission.filter(|a| a.closed_sequence.is_some()) {
+            let last_effect = self
+                .committed_transitions(transition.actor_id)
+                .iter()
+                .rev()
+                .filter(|prior| prior.sequence > closed.command_sequence)
+                .flat_map(|prior| prior.durable_effects.iter().rev())
+                .next();
+            if last_effect.is_some_and(|record| {
+                !matches!(record.effect(), DurableEffectRecord::Completed { .. })
+            }) {
+                return Err(workflow_admission_error(
+                    "cannot close workflow command with a prepared effect",
+                ));
+            }
+        }
         for record in &transition.durable_effects {
             if let Some(binding) = record.workflow_binding() {
                 let previous =
@@ -1180,6 +1495,10 @@ impl PersistenceStore for MemoryStore {
             digest,
         };
         self.durable_tails.insert(transition.actor_id, tail);
+        if let Some(admission) = admission {
+            self.workflow_admissions
+                .insert(transition.actor_id, admission);
+        }
         self.committed_transitions
             .entry(transition.actor_id)
             .or_default()
@@ -1194,6 +1513,15 @@ impl PersistenceStore for MemoryStore {
     }
 
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
+        if self
+            .workflow_admissions
+            .get(&snapshot.actor_id)
+            .is_some_and(|admission| admission.closed_sequence.is_none())
+        {
+            return Err(workflow_admission_error(
+                "legacy write forbidden while workflow command is open",
+            ));
+        }
         self.snapshots.insert(snapshot.actor_id, snapshot);
         Ok(())
     }
@@ -1203,6 +1531,15 @@ impl PersistenceStore for MemoryStore {
     }
 
     fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> io::Result<()> {
+        if self
+            .workflow_admissions
+            .get(&actor_id)
+            .is_some_and(|admission| admission.closed_sequence.is_none())
+        {
+            return Err(workflow_admission_error(
+                "legacy write forbidden while workflow command is open",
+            ));
+        }
         self.journals.entry(actor_id).or_default().push(entry);
         Ok(())
     }
@@ -1212,6 +1549,15 @@ impl PersistenceStore for MemoryStore {
     }
 
     fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()> {
+        if self
+            .workflow_admissions
+            .get(&actor_id)
+            .is_some_and(|admission| admission.closed_sequence.is_none())
+        {
+            return Err(workflow_admission_error(
+                "legacy write forbidden while workflow command is open",
+            ));
+        }
         self.workflow_events
             .entry(actor_id)
             .or_default()
@@ -1227,6 +1573,15 @@ impl PersistenceStore for MemoryStore {
     }
 
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
+        if self
+            .workflow_admissions
+            .get(&actor_id)
+            .is_some_and(|admission| admission.closed_sequence.is_none())
+        {
+            return Err(workflow_admission_error(
+                "legacy write forbidden while workflow command is open",
+            ));
+        }
         self.events.entry(actor_id).or_default().push(entry);
         Ok(())
     }
@@ -1275,6 +1630,7 @@ impl PersistenceStore for MemoryStore {
         self.events.remove(&actor_id);
         self.durable_tails.remove(&actor_id);
         self.committed_transitions.remove(&actor_id);
+        self.workflow_admissions.remove(&actor_id);
         Ok(())
     }
 }
@@ -1857,6 +2213,16 @@ impl LibsqlStore {
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             conn.execute(
+                "CREATE TABLE IF NOT EXISTS durable_workflow_admissions (
+                    actor_id INTEGER PRIMARY KEY,
+                    command_sequence INTEGER NOT NULL,
+                    closed_sequence INTEGER
+                )",
+                (),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            conn.execute(
                 "CREATE TABLE IF NOT EXISTS durable_workflow_events (
                     actor_id INTEGER NOT NULL,
                     sequence INTEGER NOT NULL,
@@ -1971,7 +2337,111 @@ impl LibsqlStore {
 }
 
 #[cfg(feature = "sqlite")]
+fn validate_legacy_write(changed: u64) -> io::Result<()> {
+    if changed != 1 {
+        return Err(workflow_admission_error(
+            "legacy write forbidden while workflow command is open",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sqlite")]
+const WORKFLOW_ADMISSION_QUERY: &str =
+    "SELECT a.command_sequence, a.closed_sequence, t.sequence, t.activation_epoch,
+            (SELECT sequence FROM snapshots WHERE actor_id = ?1),
+            COALESCE((SELECT MAX(sequence) FROM journal WHERE actor_id = ?1), 0),
+            MAX(COALESCE((SELECT MAX(sequence) FROM workflow_events WHERE actor_id = ?1), 0),
+                COALESCE((SELECT MAX(sequence) FROM events WHERE actor_id = ?1), 0)),
+            (SELECT activation_epoch FROM snapshots WHERE actor_id = ?1)
+         FROM (SELECT ?1 AS actor_id) x
+         LEFT JOIN durable_workflow_admissions a ON a.actor_id = x.actor_id
+         LEFT JOIN durable_tails t ON t.actor_id = x.actor_id";
+
+#[cfg(feature = "sqlite")]
+async fn read_workflow_admission(
+    mut rows: libsql::Rows,
+    actor_id: u64,
+    admission_epoch: Option<u64>,
+) -> io::Result<(
+    Option<WorkflowAdmission>,
+    Option<u64>,
+    Option<OpenWorkflowCommand>,
+)> {
+    let row = rows
+        .next()
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+        .ok_or_else(|| workflow_admission_error("missing workflow admission metadata"))?;
+    let number = |column| -> io::Result<Option<u64>> {
+        let value: Option<i64> = row
+            .get(column)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        value
+            .map(|value| {
+                u64::try_from(value)
+                    .map_err(|_| workflow_admission_error("negative workflow admission metadata"))
+            })
+            .transpose()
+    };
+    let snapshot_sequence = number(4)?;
+    let latest_command = number(5)?.unwrap_or(0);
+    let legacy_events = number(6)?.unwrap_or(0);
+    let snapshot_epoch = number(7)?;
+    let safe_snapshot = snapshot_sequence.filter(|sequence| {
+        latest_command <= *sequence
+            && legacy_events <= *sequence
+            && admission_epoch.map_or(true, |epoch| {
+                snapshot_epoch.is_some_and(|stored| stored <= epoch)
+            })
+    });
+    let Some(command_sequence) = number(0)? else {
+        return Ok((None, safe_snapshot, None));
+    };
+    let admission = WorkflowAdmission {
+        command_sequence,
+        closed_sequence: number(1)?,
+    };
+    if admission.closed_sequence.is_some() {
+        return Ok((Some(admission), safe_snapshot, None));
+    }
+    let tail = DurableTailPosition {
+        sequence: number(2)?
+            .ok_or_else(|| workflow_admission_error("open workflow command lacks atomic tail"))?,
+        activation_epoch: number(3)?.ok_or_else(|| {
+            workflow_admission_error("open workflow command lacks ownership epoch")
+        })?,
+    };
+    validate_open_boundary(
+        command_sequence,
+        snapshot_sequence,
+        latest_command,
+        legacy_events,
+        tail,
+    )?;
+    Ok((
+        Some(admission),
+        snapshot_sequence,
+        Some(OpenWorkflowCommand {
+            activation: WorkflowActivationId::new(actor_id, command_sequence),
+            tail,
+        }),
+    ))
+}
+
+#[cfg(feature = "sqlite")]
 impl PersistenceStore for LibsqlStore {
+    fn load_open_workflow_command(&self, actor_id: u64) -> io::Result<Option<OpenWorkflowCommand>> {
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let rows = conn
+                .query(WORKFLOW_ADMISSION_QUERY, libsql::params![actor_id as i64])
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            Ok(read_workflow_admission(rows, actor_id, None).await?.2)
+        })
+    }
+
     fn load_durable_tail_position(&self, actor_id: u64) -> io::Result<Option<DurableTailPosition>> {
         let conn = self.conn();
         self.rt.block_on(async {
@@ -2257,6 +2727,43 @@ impl PersistenceStore for LibsqlStore {
                 }
             }
 
+            let admission_metadata = async {
+                let rows = tx.query(WORKFLOW_ADMISSION_QUERY, libsql::params![transition.actor_id as i64])
+                    .await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                read_workflow_admission(rows, transition.actor_id, transition.workflow_admission.then_some(transition.activation_epoch)).await
+            }.await;
+            let (last_admission, safe_snapshot, open) = match admission_metadata {
+                Ok(metadata) => metadata,
+                Err(error) => { let _ = tx.rollback().await; return Err(error); }
+            };
+            if let Err(error) = validate_open_workflow_owner(&transition, open) {
+                let _ = tx.rollback().await;
+                return Err(error);
+            }
+            let admission = match validate_workflow_admission_transition(&transition, last_admission, safe_snapshot) {
+                Ok(admission) => admission,
+                Err(error) => { let _ = tx.rollback().await; return Err(error); }
+            };
+            if let Some(closed) = admission.filter(|a| a.closed_sequence.is_some()) {
+                let validation = async {
+                    let mut rows = tx.query(
+                        "SELECT record FROM durable_effect_records WHERE actor_id = ?1 AND sequence > ?2
+                         ORDER BY sequence DESC, ordinal DESC LIMIT 1",
+                        libsql::params![transition.actor_id as i64, closed.command_sequence as i64],
+                    ).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    if let Some(row) = rows.next().await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))? {
+                        let json: String = row.get(0).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                        let record = DurableEffectPersistenceRecord::from_json(json.as_bytes())
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        if !matches!(record.effect(), DurableEffectRecord::Completed { .. }) {
+                            return Err(workflow_admission_error("cannot close workflow command with a prepared effect"));
+                        }
+                    }
+                    Ok(())
+                }.await;
+                if let Err(error) = validation { let _ = tx.rollback().await; return Err(error); }
+            }
+
             // Validate the immutable slot inside the same immediate write
             // transaction as Prepared/Completed and the fenced tail update.
             // A stale pre-dispatch lookup cannot race a conflicting binding
@@ -2409,6 +2916,16 @@ impl PersistenceStore for LibsqlStore {
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
+            if let Some(admission) = admission {
+                tx.execute(
+                    "INSERT INTO durable_workflow_admissions (actor_id, command_sequence, closed_sequence)
+                     VALUES (?1, ?2, ?3) ON CONFLICT(actor_id) DO UPDATE SET
+                     command_sequence=excluded.command_sequence, closed_sequence=excluded.closed_sequence",
+                    libsql::params![transition.actor_id as i64, admission.command_sequence as i64,
+                        admission.closed_sequence.map(|sequence| sequence as i64)],
+                ).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            }
+
             if let Some((old_epoch, old_sequence, old_digest)) = current_tail {
                 let changed = tx
                     .execute(
@@ -2478,10 +2995,11 @@ impl PersistenceStore for LibsqlStore {
         let conn = self.conn();
         self.rt.block_on(async {
             conn.execute(
-                "INSERT INTO snapshots (actor_id, sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "INSERT INTO snapshots (actor_id, sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+                 WHERE NOT EXISTS (SELECT 1 FROM durable_workflow_admissions WHERE actor_id=?1 AND closed_sequence IS NULL)
                  ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, activation_epoch=excluded.activation_epoch, state=excluded.state, waiting_signal=excluded.waiting_signal, crdt_snapshot=excluded.crdt_snapshot, crdt_field_map=excluded.crdt_field_map, schema_name=excluded.schema_name, authority_tokens=excluded.authority_tokens",
                 libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, snapshot.activation_epoch as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str(), crdt_field_map_json.as_str(), snapshot.schema_name.as_deref(), authority_json.as_str()],
-            ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+            ).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string())).and_then(validate_legacy_write)
         })
     }
 
@@ -2546,9 +3064,9 @@ impl PersistenceStore for LibsqlStore {
         let conn = self.conn();
         self.rt.block_on(async {
             conn.execute(
-                "INSERT INTO journal (actor_id, sequence, behavior_id, payload) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO journal (actor_id, sequence, behavior_id, payload) SELECT ?1, ?2, ?3, ?4 WHERE NOT EXISTS (SELECT 1 FROM durable_workflow_admissions WHERE actor_id=?1 AND closed_sequence IS NULL)",
                 libsql::params![actor_id as i64, entry.sequence as i64, entry.behavior_id as i64, payload_json],
-            ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+            ).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string())).and_then(validate_legacy_write)
         })
     }
 
@@ -2607,12 +3125,12 @@ impl PersistenceStore for LibsqlStore {
         let conn = self.conn();
         self.rt.block_on(async {
             conn.execute(
-                "INSERT INTO workflow_events (actor_id, sequence, event) VALUES (?1, ?2, ?3)",
+                "INSERT INTO workflow_events (actor_id, sequence, event) SELECT ?1, ?2, ?3 WHERE NOT EXISTS (SELECT 1 FROM durable_workflow_admissions WHERE actor_id=?1 AND closed_sequence IS NULL)",
                 libsql::params![actor_id as i64, event.sequence() as i64, event_json],
             )
             .await
-            .map(|_| ())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+            .and_then(validate_legacy_write)
         })
     }
 
@@ -2682,9 +3200,9 @@ impl PersistenceStore for LibsqlStore {
             let value_json = serde_json::to_string(&entry.value)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             conn.execute(
-                "INSERT INTO events (actor_id, sequence, field_name, event_name, args, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO events (actor_id, sequence, field_name, event_name, args, value) SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE NOT EXISTS (SELECT 1 FROM durable_workflow_admissions WHERE actor_id=?1 AND closed_sequence IS NULL)",
                 libsql::params![actor_id as i64, entry.sequence as i64, entry.field_name, entry.event_name, args_json, value_json],
-            ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+            ).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string())).and_then(validate_legacy_write)
         })
     }
 
@@ -2859,6 +3377,7 @@ impl PersistenceStore for LibsqlStore {
                 "durable_domain_events",
                 "durable_effect_records",
                 "durable_outbox",
+                "durable_workflow_admissions",
                 "durable_transitions",
                 "durable_tails",
             ] {
@@ -4304,6 +4823,7 @@ mod durable_transition_tests {
                 behavior_id: 7,
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }),
+            workflow_admission: false,
             snapshot: Some(ActorSnapshot {
                 activation_epoch: epoch,
                 ..snapshot(actor_id, sequence, &[("count", sequence as i64)])
@@ -4544,6 +5064,7 @@ mod libsql_atomic_transition_tests {
                 behavior_id: 3,
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }),
+            workflow_admission: false,
             snapshot: Some(ActorSnapshot {
                 activation_epoch: epoch,
                 ..snapshot(actor_id, sequence, sequence as i64)
