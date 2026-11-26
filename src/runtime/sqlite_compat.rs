@@ -67,6 +67,51 @@ impl Connection {
         }
     }
 
+    /// Visit rows from a trusted, fixed persistence query without accumulating
+    /// an intermediate result buffer. Never expose this unmetered path to
+    /// arbitrary DB.query SQL; those queries must retain their row/byte limits.
+    pub(crate) async fn query_each<P, F>(&self, sql: &str, params: P, mut visitor: F) -> Result<()>
+    where
+        P: IntoParams,
+        F: FnMut(Row) -> Result<()>,
+    {
+        self.query_each_until(sql, params, |row| {
+            visitor(row)?;
+            Ok(true)
+        })
+        .await
+    }
+
+    /// As query_each, but the visitor may stop early after it finds a record.
+    /// This preserves latest-first durable effect lookup efficiency.
+    pub(crate) async fn query_each_until<P, F>(
+        &self,
+        sql: &str,
+        params: P,
+        mut visitor: F,
+    ) -> Result<()>
+    where
+        P: IntoParams,
+        F: FnMut(Row) -> Result<bool>,
+    {
+        let params = params.into_params().map_err(|e| e.to_string())?;
+        match self {
+            Self::Local(conn) => local_visit(conn, sql, params, &mut visitor),
+            Self::Remote(conn) => {
+                let mut rows = conn.query(sql, params).await.map_err(|e| e.to_string())?;
+                while let Some(row) = rows.next().await.map_err(|e| e.to_string())? {
+                    let cells = (0..row.column_count())
+                        .map(|i| row.get_value(i).map_err(|e| e.to_string()))
+                        .collect::<Result<Vec<_>>>()?;
+                    if !visitor(Row { cells })? {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
     pub async fn transaction_with_behavior(
         &self,
         behavior: TransactionBehavior,
@@ -207,6 +252,62 @@ fn local_query(conn: &rusqlite::Connection, sql: &str, params: Params) -> Result
         }
     }
     Ok(collected)
+}
+
+fn local_visit<F>(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: Params,
+    visitor: &mut F,
+) -> Result<()>
+where
+    F: FnMut(Row) -> Result<bool>,
+{
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    match params {
+        Params::None => visit_rows(&mut stmt, (), visitor),
+        Params::Positional(values) => {
+            let values: Vec<_> = values.into_iter().map(to_local).collect();
+            visit_rows(
+                &mut stmt,
+                rusqlite::params_from_iter(values.iter()),
+                visitor,
+            )
+        }
+        Params::Named(values) => {
+            let entries: Vec<_> = values
+                .into_iter()
+                .map(|(name, value)| (name, to_local(value)))
+                .collect();
+            let bindings: Vec<(&str, &dyn rusqlite::ToSql)> = entries
+                .iter()
+                .map(|(name, value)| (name.as_str(), value as &dyn rusqlite::ToSql))
+                .collect();
+            visit_rows(&mut stmt, bindings.as_slice(), visitor)
+        }
+    }
+}
+
+fn visit_rows<P: rusqlite::Params, F: FnMut(Row) -> Result<bool>>(
+    stmt: &mut rusqlite::Statement<'_>,
+    params: P,
+    visitor: &mut F,
+) -> Result<()> {
+    let width = stmt.column_count();
+    let mut rows = stmt.query(params).map_err(|e| e.to_string())?;
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let cells = (0..width)
+            .map(|i| {
+                row.get::<_, rusqlite::types::Value>(i)
+                    .map(from_local)
+                    .map_err(|e| e.to_string())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !visitor(Row { cells })? {
+            break;
+        }
+    }
+    Ok(())
 }
 
 // The compatibility adapter buffers local rows before returning them.
@@ -360,6 +461,74 @@ impl Row {
 #[cfg(test)]
 mod local_query_budget_tests {
     use super::*;
+
+    #[test]
+    fn test_trusted_recovery_visitor_streams_beyond_untrusted_row_budget() {
+        let conn = Connection::Local(rusqlite::Connection::open_in_memory().unwrap());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut count = 0usize;
+        runtime.block_on(async {
+            conn.query_each(
+                "WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<100001) SELECT v FROM n",
+                (),
+                |row| {
+                    count += 1;
+                    assert_eq!(row.get::<i64>(0)?, count as i64);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap()
+        });
+        assert_eq!(count, 100_001);
+        assert!(runtime.block_on(conn.query(
+            "WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<100001) SELECT v FROM n",
+            (),
+        )).is_err(), "untrusted queries must still retain the row budget");
+    }
+
+    #[test]
+    fn test_trusted_visitor_does_not_accumulate_over_64mb() {
+        let conn = Connection::Local(rusqlite::Connection::open_in_memory().unwrap());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut bytes_seen = 0usize;
+        runtime
+            .block_on(conn.query_each(
+                "WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<70000)
+             SELECT hex(zeroblob(512)) FROM n",
+                (),
+                |row| {
+                    let content: String = row.get(0)?;
+                    bytes_seen += content.len();
+                    Ok(())
+                },
+            ))
+            .unwrap();
+        assert!(bytes_seen > MAX_LOCAL_QUERY_BUFFERED_BYTES);
+        assert_eq!(bytes_seen, 70_000 * 1024);
+    }
+
+    #[test]
+    fn test_trusted_recovery_visitor_propagates_decode_error() {
+        let conn = Connection::Local(rusqlite::Connection::open_in_memory().unwrap());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = runtime
+            .block_on(conn.query_each("SELECT 'not an integer'", (), |row| {
+                let _: i64 = row.get(0)?;
+                Ok(())
+            }))
+            .expect_err("a recovery decode error is not an empty history");
+        assert!(err.contains("expected SQLite integer"), "{err}");
+    }
 
     #[test]
     fn rejects_unbounded_local_result_before_materializing_every_row() {
