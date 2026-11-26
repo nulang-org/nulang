@@ -6,11 +6,64 @@
 
 use crate::web::bindings::{compile_route_bindings, RouteBindingContract, RouteBindingSource};
 use crate::web::contracts::{ContractCompilation, RouteContract, RouteParamContract};
+use crate::web::runtime_bindings::route_match_shape;
 use serde_json::{json, Map, Value};
+use std::collections::{HashMap, HashSet};
 
 pub const OPENAPI_VERSION: &str = "3.1.0";
 
+/// Validate an OpenAPI publication without changing what the HTTP runtime can
+/// serve. The runtime validator owns same-method route admission. OpenAPI's
+/// path-item keys additionally require one template spelling per matching shape
+/// across methods; differently named captures cannot be separate path items.
+pub fn generate_checked_openapi(
+    contracts: &ContractCompilation,
+    title: &str,
+    version: &str,
+) -> Result<Value, Vec<String>> {
+    let diagnostics = crate::web::validation::validation_diagnostics(contracts);
+    if !diagnostics.is_empty() {
+        return Err(diagnostics);
+    }
+
+    let mut paths: Vec<_> = contracts
+        .routes
+        .iter()
+        .map(|route| (openapi_path(&route.path), route.path.as_str()))
+        .collect();
+    paths.sort();
+    let mut templates = HashMap::new();
+    let mut diagnostics = Vec::new();
+    for (path, source) in paths {
+        let shape = match route_match_shape(source) {
+            Ok(shape) => shape,
+            Err(error) => {
+                diagnostics.push(format!("invalid OpenAPI route '{source}': {error}"));
+                continue;
+            }
+        };
+        if let Some(first) = templates.get(&shape) {
+            if first != &path {
+                diagnostics.push(format!(
+                    "ambiguous OpenAPI path templates '{first}' and '{path}': use one path spelling across methods"
+                ));
+            }
+        } else {
+            templates.insert(shape, path);
+        }
+    }
+    diagnostics.sort();
+    diagnostics.dedup();
+    if diagnostics.is_empty() {
+        Ok(generate_openapi(contracts, title, version))
+    } else {
+        Err(diagnostics)
+    }
+}
+
 /// Generate an OpenAPI 3.1 document from a validated Web Contract compilation.
+/// For publication use [`generate_checked_openapi`], which also rejects
+/// ambiguous OpenAPI path-item identities.
 ///
 /// Response media types are intentionally not invented here. The current Web
 /// runtime still has HTML-oriented response behavior and the typed response
@@ -18,11 +71,12 @@ pub const OPENAPI_VERSION: &str = "3.1.0";
 /// the Nulang response/error type as extensions until that contract is explicit.
 pub fn generate_openapi(contracts: &ContractCompilation, title: &str, version: &str) -> Value {
     let mut paths = Map::new();
+    let operation_ids = unique_operation_ids(&contracts.routes);
 
-    for route in &contracts.routes {
+    for (route, operation_id) in contracts.routes.iter().zip(operation_ids.iter()) {
         let path = openapi_path(&route.path);
         let method = route.method.to_ascii_lowercase();
-        let operation = operation_for(route);
+        let operation = operation_for(route, operation_id);
 
         let entry = paths
             .entry(path)
@@ -43,7 +97,91 @@ pub fn generate_openapi(contracts: &ContractCompilation, title: &str, version: &
     })
 }
 
-fn operation_for(route: &RouteContract) -> Value {
+/// A single handler can serve multiple paths or methods. OpenAPI operation IDs
+/// are unique per operation, not per handler, and generated SDK names must not
+/// depend on source registration order.
+fn unique_operation_ids(routes: &[RouteContract]) -> Vec<String> {
+    let preferred: Vec<String> = routes.iter().map(preferred_operation_id).collect();
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for name in &preferred {
+        *counts.entry(name.as_str()).or_default() += 1;
+    }
+
+    let mut ids = vec![String::new(); routes.len()];
+    let mut used = HashSet::new();
+
+    // Preserve existing names for the common, non-conflicting case.
+    // Reserve them before generating suffixed names so a collision never
+    // renames an otherwise unique operation.
+    for (index, name) in preferred.iter().enumerate() {
+        if counts[name.as_str()] == 1 {
+            used.insert(name.clone());
+            ids[index] = name.clone();
+        }
+    }
+
+    let mut conflicting: Vec<usize> = (0..routes.len())
+        .filter(|&index| counts[preferred[index].as_str()] > 1)
+        .collect();
+    conflicting.sort_by_key(|&index| {
+        (
+            openapi_path(&routes[index].path),
+            routes[index].method.to_ascii_lowercase(),
+            routes[index].path.clone(),
+        )
+    });
+
+    for index in conflicting {
+        let route = &routes[index];
+        let path = openapi_path(&route.path);
+        let stem = format!(
+            "{}__{}_{}",
+            preferred[index],
+            route.method.to_ascii_lowercase(),
+            operation_path_slug(&path)
+        );
+        let mut candidate = stem.clone();
+        let mut number = 2;
+        while used.contains(&candidate) {
+            candidate = format!("{stem}_{number}");
+            number += 1;
+        }
+        used.insert(candidate.clone());
+        ids[index] = candidate;
+    }
+    ids
+}
+
+fn preferred_operation_id(route: &RouteContract) -> String {
+    route.handler.clone().unwrap_or_else(|| {
+        let suffix = route
+            .path
+            .trim_matches('/')
+            .replace(|c: char| matches!(c, '/' | ':' | '{' | '}' | ' '), "_");
+        format!("{}_{}", route.method.to_ascii_lowercase(), suffix)
+            .trim_end_matches('_')
+            .to_string()
+    })
+}
+
+fn operation_path_slug(path: &str) -> String {
+    let mut slug = String::new();
+    for character in path.chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character.to_ascii_lowercase());
+        } else if !slug.ends_with('_') {
+            slug.push('_');
+        }
+    }
+    let slug = slug.trim_matches('_');
+    if slug.is_empty() {
+        "root".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
+fn operation_for(route: &RouteContract, operation_id: &str) -> Value {
     // Path parameters continue to come directly from the route contract so
     // legacy routes that still use ambient `Web.param` remain accurately
     // described. Additional request parameters come from compiler binding IR.
@@ -55,16 +193,6 @@ fn operation_for(route: &RouteContract) -> Value {
             .iter()
             .filter_map(binding_parameter),
     );
-
-    let operation_id = route.handler.clone().unwrap_or_else(|| {
-        let suffix = route
-            .path
-            .trim_matches('/')
-            .replace(|c: char| matches!(c, '/' | ':' | '{' | '}' | ' '), "_");
-        format!("{}_{}", route.method.to_ascii_lowercase(), suffix)
-            .trim_end_matches('_')
-            .to_string()
-    });
 
     let mut success = Map::new();
     success.insert(
@@ -91,7 +219,10 @@ fn operation_for(route: &RouteContract) -> Value {
     }
 
     let mut operation = Map::new();
-    operation.insert("operationId".to_string(), Value::String(operation_id));
+    operation.insert(
+        "operationId".to_string(),
+        Value::String(operation_id.to_string()),
+    );
     if !parameters.is_empty() {
         operation.insert("parameters".to_string(), Value::Array(parameters));
     }
@@ -408,6 +539,120 @@ mod tests {
     fn raw_body_does_not_invent_an_openapi_media_type() {
         let body = binding(RouteBindingSource::Body, "body", "Payload");
         assert!(form_request_body(&[body]).is_none());
+    }
+
+    #[test]
+    fn checked_openapi_keeps_compatible_methods_in_one_path_item() {
+        let get = route();
+        let mut post = get.clone();
+        post.method = "POST".into();
+        post.path = "/users/:id".into();
+        let contracts = ContractCompilation {
+            routes: vec![get, post],
+            diagnostics: Vec::new(),
+        };
+        let document = generate_checked_openapi(&contracts, "Test", "1").unwrap();
+        let path = &document["paths"]["/users/{id}"];
+        assert!(path["get"].is_object());
+        assert!(path["post"].is_object());
+        assert_ne!(path["get"]["operationId"], path["post"]["operationId"]);
+    }
+
+    #[test]
+    fn checked_openapi_rejects_conflicting_cross_method_templates_without_changing_runtime() {
+        let get = route();
+        let mut post = get.clone();
+        post.method = "POST".into();
+        post.path = "/users/{user_id: UserId}".into();
+        post.params[0].name = "user_id".into();
+        post.handler_params[0].name = "user_id".into();
+        let mut contracts = ContractCompilation {
+            routes: vec![get, post],
+            diagnostics: Vec::new(),
+        };
+        assert!(crate::web::validation::validation_diagnostics(&contracts).is_empty());
+        let diagnostics = generate_checked_openapi(&contracts, "Test", "1").unwrap_err();
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("ambiguous OpenAPI path templates"));
+        contracts.routes.reverse();
+        assert_eq!(
+            generate_checked_openapi(&contracts, "Test", "1").unwrap_err(),
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn checked_openapi_reuses_runtime_collision_diagnostics() {
+        let first = route();
+        let mut second = first.clone();
+        second.path = "/users/:id".into();
+        let contracts = ContractCompilation {
+            routes: vec![first, second],
+            diagnostics: Vec::new(),
+        };
+        let expected = crate::web::validation::validation_diagnostics(&contracts);
+        assert_eq!(expected.len(), 1);
+        assert_eq!(
+            generate_checked_openapi(&contracts, "Test", "1").unwrap_err(),
+            expected
+        );
+    }
+
+    #[test]
+    fn reused_handlers_have_distinct_order_independent_operation_ids() {
+        let mut first = route();
+        first.handler = Some("shared_handler".into());
+        let mut second = route();
+        second.handler = Some("shared_handler".into());
+        second.path = "/accounts/{id: UserId}".into();
+
+        let forward = generate_openapi(
+            &ContractCompilation {
+                routes: vec![first.clone(), second.clone()],
+                diagnostics: Vec::new(),
+            },
+            "Test",
+            "1",
+        );
+        let reversed = generate_openapi(
+            &ContractCompilation {
+                routes: vec![second, first],
+                diagnostics: Vec::new(),
+            },
+            "Test",
+            "1",
+        );
+        let first_id = forward["paths"]["/users/{id}"]["get"]["operationId"]
+            .as_str()
+            .unwrap();
+        let second_id = forward["paths"]["/accounts/{id}"]["get"]["operationId"]
+            .as_str()
+            .unwrap();
+
+        assert_ne!(
+            first_id, second_id,
+            "OpenAPI operationId values must be unique"
+        );
+        assert_eq!(
+            forward, reversed,
+            "contract order must not rename SDK operations"
+        );
+    }
+
+    #[test]
+    fn leaves_a_unique_explicit_handler_operation_id_unchanged() {
+        let document = generate_openapi(
+            &ContractCompilation {
+                routes: vec![route()],
+                diagnostics: Vec::new(),
+            },
+            "Test",
+            "1",
+        );
+        assert_eq!(
+            document["paths"]["/users/{id}"]["get"]["operationId"],
+            "show_user"
+        );
     }
 
     #[test]

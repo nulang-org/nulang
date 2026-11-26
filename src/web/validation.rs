@@ -5,10 +5,11 @@
 //! handler ABI slots. Build/compiler entry points should consume this module so
 //! they have one authoritative diagnostic list instead of reimplementing policy.
 
+use crate::runtime::HttpMethod;
 use crate::web::bindings::compile_route_bindings;
 use crate::web::contracts::ContractCompilation;
 use crate::web::package_contracts::compile_contracts_from_tree;
-use crate::web::runtime_bindings::{compile_route_segments, RuntimeRouteSegment};
+use crate::web::runtime_bindings::route_match_shape;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -69,20 +70,23 @@ pub fn validation_diagnostics(compilation: &ContractCompilation) -> Vec<String> 
     // with the same method and literal/parameter shape is unreachable, while
     // OpenAPI would silently overwrite one operation. Reject that disagreement
     // at the shared compiler-owned validation boundary before serving/building.
-    let mut route_shapes: HashMap<(String, Vec<Option<String>>), &str> = HashMap::new();
+    let mut route_shapes: HashMap<(&str, Vec<Option<String>>), &str> = HashMap::new();
     for route in &compilation.routes {
+        // The VM's registration path accepts only methods parsed by HttpMethod.
+        // Reject unsupported static registrations here rather than documenting
+        // routes that the runtime silently discards.
+        let Some(method) = HttpMethod::from_str(&route.method) else {
+            diagnostics.push(format!(
+                "unsupported HTTP method '{}' for route '{}'",
+                route.method, route.path
+            ));
+            continue;
+        };
+        let method = method.as_str();
         // Malformed paths already have extractor diagnostics; do not invent a
         // second, differently worded validation policy here.
-        if let Ok(segments) = compile_route_segments(&route.path) {
-            let shape = segments
-                .into_iter()
-                .map(|segment| match segment {
-                    RuntimeRouteSegment::Literal(value) => Some(value),
-                    RuntimeRouteSegment::PathParam(_) => None,
-                })
-                .collect();
-            let method = route.method.to_ascii_uppercase();
-            if let Some(previous) = route_shapes.insert((method.clone(), shape), &route.path) {
+        if let Ok(shape) = route_match_shape(&route.path) {
+            if let Some(previous) = route_shapes.insert((method, shape), &route.path) {
                 diagnostics.push(format!(
                     "ambiguous route {method}: '{previous}' and '{}' match the same request paths",
                     route.path
@@ -254,6 +258,19 @@ mod tests {
             diagnostics[0].contains("ambiguous route GET"),
             "{diagnostics:?}"
         );
+    }
+
+    #[test]
+    fn permits_every_supported_http_method() {
+        let compilation = ContractCompilation {
+            routes: ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
+                .into_iter()
+                .map(|method| collision_route(method, "/resource", None))
+                .collect(),
+            diagnostics: Vec::new(),
+        };
+
+        assert!(validation_diagnostics(&compilation).is_empty());
     }
 
     #[test]
