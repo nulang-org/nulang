@@ -202,6 +202,14 @@ jobs:
       - name: Smoke test (eval)
         run: ./target/release/nulang --eval 'perform IO.print("hello")'
 
+      - name: Verify durable job demo harness
+        run: python3 -m unittest discover -s examples/durable_job -p 'test_*.py'
+
+      - name: Crash and restart the native durable job demo
+        run: |
+          ./target/release/nulang --check examples/durable_job/job.nula
+          python3 examples/durable_job/run_demo.py --nulang-bin ./target/release/nulang
+
       - name: Scaffold test package
         run: ./target/release/nulang nula new test-pkg
 

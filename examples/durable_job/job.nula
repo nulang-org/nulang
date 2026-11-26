@@ -1,0 +1,48 @@
+// Durable job checkpoint demo: run with the reference bytecode VM.
+// The first process prepares a checkpoint, then blocks on stdin while the
+// Python harness SIGKILLs it. Fresh processes select the recovery path from
+// persisted actor state; the actor-backed VM does not yet handle Env.get,
+// System.arg, or FS.read.
+persistent actor DemoJob {
+    state durable stage: Int = 0
+    state durable completions: Int = 0
+
+    behavior prepare() {
+        if self.stage == 0 then {
+            self.stage = 1
+        } else { unit }
+    }
+
+    behavior complete() {
+        if self.stage == 1 then {
+            self.stage = 2
+            self.completions = self.completions + 1
+        } else { unit }
+    }
+
+    behavior get_stage() { self.stage }
+    behavior get_completions() { self.completions }
+}
+
+fn main() {
+    // Spawn order is deliberately identical across process restarts.
+    let job = spawn DemoJob {}
+    let stage = ask job get_stage()
+    let completions = ask job get_completions()
+    if stage == 0 then {
+        ask job prepare()
+        let after_stage = ask job get_stage()
+        let after_completions = ask job get_completions()
+        perform IO.print("PREPARED=" + perform Int.to_string(after_stage) + ":" + perform Int.to_string(after_completions))
+        // An open stdin pipe blocks until the harness sends SIGKILL.
+        // The checkpoint and read-back have already completed.
+        perform IO.read()
+    } else {
+        perform IO.print("RECOVERED=" + perform Int.to_string(stage) + ":" + perform Int.to_string(completions))
+        ask job complete()
+        let after_stage = ask job get_stage()
+        let after_completions = ask job get_completions()
+        perform IO.print("COMPLETED=" + perform Int.to_string(after_stage) + ":" + perform Int.to_string(after_completions))
+    }
+    0
+}
