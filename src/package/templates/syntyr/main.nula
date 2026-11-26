@@ -1,6 +1,7 @@
 // Nulang Web app — a compiler-first full-stack Todo list.
 //
-// Run with: `nula dev` (development server) or `nula build --web` (SSG).
+// Run with: `nula dev` (development server). A web build emits the server
+// route contract and public assets, not a snapshot of request-time state.
 //
 // The server renders the initial HTML and handles form POSTs with an
 // ephemeral in-memory store. The generated `app.client.js` intercepts

@@ -1,4 +1,9 @@
 # Nulang Changelog
+
+### Checked static web builds — 2026-11-26
+- **Experimental:** web builds emit HTML only for eligible, checked GET renderers, leave request-bound and mutation routes in Deployment IR without artifacts, and reject explicit static placement violations. Registration and rendering run under an interpreter instruction allowlist.
+- Stage and replace generated output after validation, reject unsafe paths and asset collisions, and preserve prior output on ordinary build errors. Static publishing no longer snapshots the server-dependent Todo starter; its native HTTP rendering and vendored styles remain supported. No full transitive effect proof or crash-atomic publication is claimed.
+
 ### Per-priority scheduler runnable backlog diagnostics — 2026-11-20
 - **Expose approximate queued High, Normal, and Low runnable task counts** in the existing scheduler metrics snapshot, including global injector and worker-local queues, without adding counters to scheduling hot paths.
 - **Regression tests cover mixed priority queues, dequeues, and metrics-counter reset.** Queue depths are sampled non-atomically for diagnostics only; they are not admission, fairness, or backpressure guarantees.
