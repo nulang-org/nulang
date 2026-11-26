@@ -259,7 +259,8 @@ impl Runtime {
     ///
     /// A retry returns the original receipt; it never creates another command.
     /// After process loss, recover the receiver and register its native
-    /// handlers before scheduling; an open admission replays from the journal.
+    /// handlers before scheduling (or opt into native workflow recovery);
+    /// an open admission replays from the journal.
     /// An error after an uncertain commit requires checking the receipt and
     /// recovering the receiver, not sending an ordinary message.
     pub fn dispatch_workflow_outbox(

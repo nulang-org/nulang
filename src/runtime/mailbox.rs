@@ -406,6 +406,10 @@ impl Mailbox {
         self.admitted_workflow = Some(Box::new(msg));
     }
 
+    pub(crate) fn admitted_workflow_message(&self) -> Option<&Message> {
+        self.admitted_workflow.as_deref()
+    }
+
     pub(crate) fn admitted_workflow_behavior(&self) -> Option<u16> {
         self.admitted_workflow.as_ref().map(|msg| msg.behavior_id)
     }

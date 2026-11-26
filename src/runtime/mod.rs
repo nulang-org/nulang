@@ -84,9 +84,13 @@ mod timer;
 mod trace;
 mod workflow;
 mod workflow_outbox;
+mod workflow_recovery;
 pub use trace::TraceContext;
 pub use workflow_outbox::{
     WorkflowOutboxDispatch, WorkflowOutboxPumpConfig, WorkflowOutboxPumpReport,
+};
+pub use workflow_recovery::{
+    NativeWorkflowHandler, NativeWorkflowRecoveryConfig, NativeWorkflowRecoveryReport,
 };
 
 #[cfg(test)]
@@ -459,6 +463,9 @@ pub struct Runtime {
     // Persistence engine (v0.7)
     pub persistence: Box<dyn PersistenceStore>,
     workflow_outbox_pump: Option<Box<workflow_outbox::WorkflowOutboxPump>>,
+    native_workflow_recovery: Option<Box<workflow_recovery::NativeWorkflowRecovery>>,
+    native_workflow_recovery_recipes: HashMap<(String, String), Vec<NativeWorkflowHandler>>,
+    native_workflow_recovery_bound: std::collections::HashSet<u64>,
     // Immutable shared object store for large `val` buffers.
     pub object_store: ObjectStore,
     // Virtual actor (grain) type registry and resident mapping.
@@ -694,6 +701,9 @@ impl Runtime {
             pending_fetched_messages: HashMap::new(),
             persistence: Box::new(MemoryStore::new()),
             workflow_outbox_pump: None,
+            native_workflow_recovery: None,
+            native_workflow_recovery_recipes: HashMap::new(),
+            native_workflow_recovery_bound: std::collections::HashSet::new(),
             object_store: ObjectStore::new(),
             grain_registry: GrainRegistry::new(),
             grain_residents: HashMap::new(),
@@ -3196,6 +3206,7 @@ impl Runtime {
         let mut idle_outbox_pages = 0;
         loop {
             self.drain_cross_shard_messages();
+            let more_recovery = self.tick_native_workflow_recovery();
             let more_outbox = self.tick_workflow_outbox_pump();
             let actor_id = match self.claim_next_ready_actor() {
                 Some(actor_id) => actor_id,
@@ -3203,7 +3214,7 @@ impl Runtime {
                     // A blocked first page must not hide a ready receiver on
                     // a later page. Bound work while idle so a permanently
                     // blocked backlog never keeps the synchronous API alive.
-                    if more_outbox
+                    if (more_outbox || more_recovery)
                         && idle_outbox_pages + 1 < workflow_outbox::OUTBOX_IDLE_PAGE_BUDGET
                     {
                         idle_outbox_pages += 1;
@@ -3408,6 +3419,7 @@ impl Runtime {
             self.drain_cross_shard_messages();
             // Tick timers first (respects virtual clock via self.now())
             self.tick_timers();
+            let more_recovery = self.tick_native_workflow_recovery();
             let more_outbox = self.tick_workflow_outbox_pump();
             match self.pick_ready_actor_deterministic(rng) {
                 Some(actor_id) => {
@@ -3427,7 +3439,7 @@ impl Runtime {
                     }
                 }
                 None => {
-                    if more_outbox
+                    if (more_outbox || more_recovery)
                         && idle_outbox_pages + 1 < workflow_outbox::OUTBOX_IDLE_PAGE_BUDGET
                     {
                         idle_outbox_pages += 1;
@@ -4410,12 +4422,14 @@ impl Runtime {
                             %error,
                             "nulang-workflow: terminal durable transition failed; discarding activation"
                         );
-                        self.actors.remove(&actor_id);
-                        if self.recover_actor(actor_id).is_none() {
-                            tracing::error!(
-                                actor_id,
-                                "nulang-workflow: actor recovery failed after terminal durable transition failure"
-                            );
+                        if !self.defer_native_workflow_terminal_failure(actor_id) {
+                            self.actors.remove(&actor_id);
+                            if self.recover_actor(actor_id).is_none() {
+                                tracing::error!(
+                                    actor_id,
+                                    "nulang-workflow: actor recovery failed after terminal durable transition failure"
+                                );
+                            }
                         }
                         self.current_actor = None;
                         return;

@@ -9672,6 +9672,9 @@ fn workflow_dispatch_process_kill_after_admission() {
     let mut rt = Runtime::new();
     rt.persistence = Box::new(LibsqlStore::new(&path).unwrap());
     let (sender, receiver, _, first, second) = dispatch_fixture(&mut rt);
+    register_native_recovery_fixture(&mut rt, "v1");
+    rt.bind_native_workflow_recovery(receiver, "receiver", "v1")
+        .unwrap();
     drop(rt);
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
@@ -9720,12 +9723,10 @@ fn workflow_dispatch_process_kill_after_admission() {
         rt.dispatch_workflow_outbox(first).unwrap(),
         WorkflowOutboxDispatch::AlreadyAdmitted(receipt)
     );
-    assert_eq!(rt.recover_actor(receiver), Some(receiver));
-    rt.actors
-        .get_mut(&receiver)
-        .unwrap()
-        .register_behavior("receive", receive_workflow_outbox);
-    run_ready_actor_turn(&mut rt, receiver);
+    register_native_recovery_fixture(&mut rt, "v1");
+    rt.enable_native_workflow_recovery(NativeWorkflowRecoveryConfig::default())
+        .unwrap();
+    rt.run_scheduler();
     assert_received(&rt, receiver, 1, PersistedValue::String("first".into()));
     assert_eq!(rt.persistence.read_journal(receiver).len(), 1);
     assert!(rt
@@ -10010,6 +10011,9 @@ fn workflow_outbox_pump_restart_discovers_unadmitted_without_sender_residency() 
     let mut rt = Runtime::new();
     rt.persistence = Box::new(LibsqlStore::new(&path).unwrap());
     let (sender, receiver, _, first, second) = dispatch_fixture(&mut rt);
+    register_native_recovery_fixture(&mut rt, "v1");
+    rt.bind_native_workflow_recovery(receiver, "receiver", "v1")
+        .unwrap();
     assert!(matches!(
         rt.dispatch_workflow_outbox(first).unwrap(),
         WorkflowOutboxDispatch::Admitted(_)
@@ -10018,11 +10022,9 @@ fn workflow_outbox_pump_restart_discovers_unadmitted_without_sender_residency() 
     let mut rt = Runtime::new();
     rt.install_virtual_clock();
     rt.persistence = Box::new(LibsqlStore::new(&path).unwrap());
-    assert_eq!(rt.recover_actor(receiver), Some(receiver));
-    rt.actors
-        .get_mut(&receiver)
-        .unwrap()
-        .register_behavior("receive", receive_workflow_outbox);
+    register_native_recovery_fixture(&mut rt, "v1");
+    rt.enable_native_workflow_recovery(NativeWorkflowRecoveryConfig::default())
+        .unwrap();
     assert!(!rt.actors.contains_key(&sender));
     rt.enable_workflow_outbox_pump(outbox_pump_config(64))
         .unwrap();
@@ -10121,6 +10123,13 @@ fn workflow_outbox_pump_unsupported_store_fails_closed() {
         std::io::ErrorKind::Unsupported
     );
     assert!(rt.poll_workflow_outbox().unwrap().is_none());
+    assert_eq!(
+        rt.enable_native_workflow_recovery(NativeWorkflowRecoveryConfig::default())
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    assert!(rt.poll_native_workflow_recovery().unwrap().is_none());
     drop(rt);
     std::fs::remove_dir(directory).unwrap();
 }
@@ -10167,5 +10176,237 @@ fn workflow_outbox_pump_scan_error_preserves_cursor_and_backs_off() {
     );
     drop(raw);
     drop(rt);
+    std::fs::remove_file(path).unwrap();
+}
+
+fn register_native_recovery_fixture(rt: &mut Runtime, revision: &str) {
+    rt.register_native_workflow_recovery_recipe(
+        "receiver",
+        revision,
+        vec![("receive".into(), receive_workflow_outbox)],
+    )
+    .unwrap();
+}
+
+#[test]
+fn workflow_supervised_recovery_memory_requires_exact_recipe_and_keeps_admission() {
+    let mut rt = Runtime::new();
+    rt.install_virtual_clock();
+    let (_, receiver, _, first, _) = dispatch_fixture(&mut rt);
+    register_native_recovery_fixture(&mut rt, "v1");
+    register_native_recovery_fixture(&mut rt, "v2");
+    rt.bind_native_workflow_recovery(receiver, "receiver", "v1")
+        .unwrap();
+    assert!(rt
+        .bind_native_workflow_recovery(receiver, "receiver", "v2")
+        .is_err());
+    let receipt = match rt.dispatch_workflow_outbox(first).unwrap() {
+        WorkflowOutboxDispatch::Admitted(receipt) => receipt,
+        result => panic!("expected admission, got {result:?}"),
+    };
+    rt.remove_actor_reaping(receiver);
+    rt.native_workflow_recovery_recipes.clear();
+    register_native_recovery_fixture(&mut rt, "v2");
+    rt.enable_native_workflow_recovery(NativeWorkflowRecoveryConfig::default())
+        .unwrap();
+    let report = rt.poll_native_workflow_recovery().unwrap().unwrap();
+    assert_eq!(report.examined, 1);
+    assert_eq!(report.deferred, 1);
+    assert!(!rt.actors.contains_key(&receiver));
+    rt.register_native_workflow_recovery_recipe(
+        "receiver",
+        "v1",
+        vec![("different".into(), receive_workflow_outbox)],
+    )
+    .unwrap();
+    assert!(rt.poll_native_workflow_recovery().unwrap().is_none());
+    rt.advance_time(Duration::from_millis(100));
+    let report = rt.poll_native_workflow_recovery().unwrap().unwrap();
+    assert_eq!(report.failed, 1);
+    assert!(!rt.actors.contains_key(&receiver));
+    // Fresh host catalog with the correct immutable revision.
+    rt.native_workflow_recovery_recipes.clear();
+    register_native_recovery_fixture(&mut rt, "v1");
+    rt.advance_time(Duration::from_millis(100));
+    rt.run_scheduler_deterministic(19, 100);
+    assert_received(&rt, receiver, 1, PersistedValue::String("first".into()));
+    assert_eq!(
+        rt.persistence.load_workflow_inbox_admission(first).unwrap(),
+        Some(receipt)
+    );
+    assert_eq!(rt.persistence.read_journal(receiver).len(), 1);
+    assert!(rt
+        .persistence
+        .load_open_workflow_command(receiver)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn workflow_supervised_recovery_scan_is_bounded_and_excludes_unbound_closed_actors() {
+    let mut rt = Runtime::new();
+    register_native_recovery_fixture(&mut rt, "v1");
+    let (_, a, _, first, _) = dispatch_fixture(&mut rt);
+    let (_, b, _, second, _) = dispatch_fixture(&mut rt);
+    let (_, unbound, _, third, _) = dispatch_fixture(&mut rt);
+    for id in [a, b] {
+        rt.bind_native_workflow_recovery(id, "receiver", "v1")
+            .unwrap();
+    }
+    for message in [first, second, third] {
+        assert!(matches!(
+            rt.dispatch_workflow_outbox(message).unwrap(),
+            WorkflowOutboxDispatch::Admitted(_)
+        ));
+    }
+    let min = a.min(b);
+    let max = a.max(b);
+    let page = rt
+        .persistence
+        .scan_open_native_workflow_recovery(0, 1, None, None, 1)
+        .unwrap();
+    assert_eq!(page.actors, vec![min]);
+    assert_eq!(page.watermark, Some(max));
+    let next = rt
+        .persistence
+        .scan_open_native_workflow_recovery(0, 1, Some(min), page.watermark, 1)
+        .unwrap();
+    assert_eq!(next.actors, vec![max]);
+    for shard in 0..2 {
+        let page = rt
+            .persistence
+            .scan_open_native_workflow_recovery(shard, 2, None, None, 10)
+            .unwrap();
+        assert_eq!(
+            page.actors,
+            [min, max]
+                .into_iter()
+                .filter(|id| id % 2 == u64::from(shard))
+                .collect::<Vec<_>>()
+        );
+    }
+    assert!(rt
+        .persistence
+        .scan_open_native_workflow_recovery(0, 1, None, None, 0)
+        .is_err());
+    assert!(rt
+        .persistence
+        .scan_open_native_workflow_recovery(0, 0, None, None, 1)
+        .is_err());
+    run_ready_actor_turn(&mut rt, a);
+    let page = rt
+        .persistence
+        .scan_open_native_workflow_recovery(0, 1, None, None, 10)
+        .unwrap();
+    assert_eq!(page.actors, vec![b]);
+    assert!(rt
+        .persistence
+        .load_open_workflow_command(unbound)
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn workflow_supervised_recovery_rejects_changed_layout_and_late_binding() {
+    let mut rt = Runtime::new();
+    register_native_recovery_fixture(&mut rt, "v1");
+    let (_, receiver, _, first, _) = dispatch_fixture(&mut rt);
+    rt.register_native_workflow_recovery_recipe(
+        "receiver",
+        "wrong",
+        vec![("wrong".into(), receive_workflow_outbox)],
+    )
+    .unwrap();
+    assert!(rt
+        .bind_native_workflow_recovery(receiver, "receiver", "wrong")
+        .is_err());
+    rt.dispatch_workflow_outbox(first).unwrap();
+    assert!(rt
+        .bind_native_workflow_recovery(receiver, "receiver", "v1")
+        .is_err());
+    run_ready_actor_turn(&mut rt, receiver);
+    assert!(rt
+        .bind_native_workflow_recovery(receiver, "receiver", "v1")
+        .is_err());
+    assert!(rt
+        .persistence
+        .load_native_workflow_recovery_binding(receiver)
+        .unwrap()
+        .is_none());
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn workflow_supervised_recovery_terminal_failure_is_rate_limited_and_isolated() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "nulang-workflow-supervised-{}-{nonce}.db",
+        std::process::id()
+    ));
+    let mut rt = Runtime::new();
+    rt.install_virtual_clock();
+    rt.persistence = Box::new(LibsqlStore::new(&path).unwrap());
+    register_native_recovery_fixture(&mut rt, "v1");
+    let (_, bad, _, first, _) = dispatch_fixture(&mut rt);
+    let (_, good, _, other, _) = dispatch_fixture(&mut rt);
+    for id in [bad, good] {
+        rt.bind_native_workflow_recovery(id, "receiver", "v1")
+            .unwrap();
+    }
+    for msg in [first, other] {
+        assert!(matches!(
+            rt.dispatch_workflow_outbox(msg).unwrap(),
+            WorkflowOutboxDispatch::Admitted(_)
+        ));
+    }
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute_batch(&format!("CREATE TRIGGER fail_supervised_close BEFORE UPDATE ON durable_workflow_admissions WHEN NEW.actor_id={bad} AND NEW.closed_sequence IS NOT NULL BEGIN SELECT RAISE(ABORT, 'terminal fault'); END;")).unwrap();
+    drop(rt);
+    let mut rt = Runtime::new();
+    rt.install_virtual_clock();
+    rt.persistence = Box::new(LibsqlStore::new(&path).unwrap());
+    register_native_recovery_fixture(&mut rt, "v1");
+    rt.enable_native_workflow_recovery(NativeWorkflowRecoveryConfig {
+        page_size: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    rt.run_scheduler();
+    assert!(rt
+        .persistence
+        .load_open_workflow_command(bad)
+        .unwrap()
+        .is_some());
+    assert!(!rt.actors.contains_key(&bad));
+    assert!(rt.persistence.load_snapshot(bad).unwrap().state.is_empty());
+    assert!(rt.poll_native_workflow_recovery().unwrap().is_none());
+    rt.advance_time(Duration::from_millis(100));
+    rt.run_scheduler();
+    assert_received(&rt, good, 1, PersistedValue::String("first".into()));
+    assert!(rt
+        .persistence
+        .load_open_workflow_command(good)
+        .unwrap()
+        .is_none());
+    rt.advance_time(Duration::from_millis(100));
+    rt.run_scheduler();
+    assert!(!rt.actors.contains_key(&bad));
+    assert_eq!(rt.persistence.read_journal(bad).len(), 1);
+    raw.execute_batch("DROP TRIGGER fail_supervised_close")
+        .unwrap();
+    rt.advance_time(Duration::from_millis(100));
+    rt.run_scheduler();
+    assert_received(&rt, bad, 1, PersistedValue::String("first".into()));
+    assert!(rt
+        .persistence
+        .load_open_workflow_command(bad)
+        .unwrap()
+        .is_none());
+    assert_eq!(rt.persistence.read_journal(bad).len(), 1);
+    drop(rt);
+    drop(raw);
     std::fs::remove_file(path).unwrap();
 }

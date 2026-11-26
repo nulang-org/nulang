@@ -4,7 +4,7 @@
 //! snapshot of durable actor state and an append-only journal of messages.
 //! On recovery the runtime loads the latest snapshot and replays the journal.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -407,6 +407,52 @@ pub struct DurableOutboxId {
 pub struct WorkflowOutboxScanPage {
     pub identities: Vec<DurableOutboxId>,
     pub watermark: Option<DurableOutboxId>,
+}
+
+/// Trusted-host identity for a native workflow's immutable behavior layout.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NativeWorkflowRecoveryBinding {
+    pub name: String,
+    pub revision: String,
+    pub behaviors: Vec<String>,
+    pub activation_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeWorkflowRecoveryPage {
+    pub actors: Vec<u64>,
+    pub watermark: Option<u64>,
+}
+
+fn validate_native_recovery_scan(
+    shard: u16,
+    shards: u16,
+    after: Option<u64>,
+    through: Option<u64>,
+    limit: usize,
+) -> io::Result<()> {
+    validate_outbox_page(None, limit)?;
+    let valid =
+        |id: u64| id > 0 && id <= i64::MAX as u64 && id % u64::from(shards) == u64::from(shard);
+    if shards == 0
+        || shard >= shards
+        || after.is_some_and(|id| !valid(id))
+        || through.is_some_and(|id| !valid(id))
+        || after.is_some_and(|id| through.is_none_or(|w| id > w))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid native recovery scan",
+        ));
+    }
+    Ok(())
+}
+
+fn native_binding_conflict() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "native recovery binding conflicts or actor is not at an initial safe boundary",
+    )
 }
 
 fn outbox_scan_key(id: DurableOutboxId) -> (u64, u64, u32) {
@@ -1230,6 +1276,43 @@ pub trait PersistenceStore: Send + Sync {
         ))
     }
 
+    /// Bind a host-defined native layout before any command has been admitted.
+    fn save_native_workflow_recovery_binding(
+        &mut self,
+        _actor_id: u64,
+        _binding: &NativeWorkflowRecoveryBinding,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native workflow recovery not supported",
+        ))
+    }
+
+    fn load_native_workflow_recovery_binding(
+        &self,
+        _actor_id: u64,
+    ) -> io::Result<Option<NativeWorkflowRecoveryBinding>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native workflow recovery not supported",
+        ))
+    }
+
+    /// Scan immutable bindings with open admissions, not idle snapshots.
+    fn scan_open_native_workflow_recovery(
+        &self,
+        _shard: u16,
+        _shards: u16,
+        _after: Option<u64>,
+        _through: Option<u64>,
+        _limit: usize,
+    ) -> io::Result<NativeWorkflowRecoveryPage> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native workflow recovery not supported",
+        ))
+    }
+
     /// Return the original accepted command for this message, even after closure.
     fn load_workflow_inbox_admission(
         &self,
@@ -1462,6 +1545,7 @@ pub struct MemoryStore {
     durable_tails: HashMap<u64, DurableTail>,
     committed_transitions: HashMap<u64, Vec<DurableTransition>>,
     workflow_admissions: HashMap<u64, WorkflowAdmission>,
+    native_recovery_bindings: BTreeMap<u64, NativeWorkflowRecoveryBinding>,
 }
 
 impl MemoryStore {
@@ -1609,6 +1693,74 @@ impl PersistenceStore for MemoryStore {
             identities: page.into_iter().map(decode).collect(),
             watermark: watermark.map(decode),
         })
+    }
+
+    fn save_native_workflow_recovery_binding(
+        &mut self,
+        actor_id: u64,
+        binding: &NativeWorkflowRecoveryBinding,
+    ) -> io::Result<()> {
+        if let Some(existing) = self.native_recovery_bindings.get(&actor_id) {
+            return if existing == binding {
+                Ok(())
+            } else {
+                Err(native_binding_conflict())
+            };
+        }
+        if actor_id == 0
+            || actor_id > i64::MAX as u64
+            || self.workflow_admissions.contains_key(&actor_id)
+            || self
+                .snapshots
+                .get(&actor_id)
+                .is_none_or(|s| s.activation_epoch != binding.activation_epoch)
+            || self.journals.get(&actor_id).is_some_and(|j| !j.is_empty())
+        {
+            return Err(native_binding_conflict());
+        }
+        self.native_recovery_bindings
+            .insert(actor_id, binding.clone());
+        Ok(())
+    }
+
+    fn load_native_workflow_recovery_binding(
+        &self,
+        actor_id: u64,
+    ) -> io::Result<Option<NativeWorkflowRecoveryBinding>> {
+        Ok(self.native_recovery_bindings.get(&actor_id).cloned())
+    }
+
+    fn scan_open_native_workflow_recovery(
+        &self,
+        shard: u16,
+        shards: u16,
+        after: Option<u64>,
+        through: Option<u64>,
+        limit: usize,
+    ) -> io::Result<NativeWorkflowRecoveryPage> {
+        validate_native_recovery_scan(shard, shards, after, through, limit)?;
+        let eligible = |id: u64| {
+            id % u64::from(shards) == u64::from(shard)
+                && self
+                    .workflow_admissions
+                    .get(&id)
+                    .is_some_and(|a| a.closed_sequence.is_none())
+        };
+        let watermark = through.or_else(|| {
+            self.native_recovery_bindings
+                .keys()
+                .rev()
+                .copied()
+                .find(|id| eligible(*id))
+        });
+        let actors = self
+            .native_recovery_bindings
+            .keys()
+            .copied()
+            .filter(|id| *id > after.unwrap_or(0) && *id <= watermark.unwrap_or(0) && eligible(*id))
+            .take(limit)
+            .collect();
+        Ok(NativeWorkflowRecoveryPage { actors, watermark })
     }
 
     fn load_workflow_inbox_admission(
@@ -2033,6 +2185,7 @@ impl PersistenceStore for MemoryStore {
         self.durable_tails.remove(&actor_id);
         self.committed_transitions.remove(&actor_id);
         self.workflow_admissions.remove(&actor_id);
+        self.native_recovery_bindings.remove(&actor_id);
         Ok(())
     }
 }
@@ -2625,6 +2778,13 @@ impl LibsqlStore {
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             conn.execute(
+                "CREATE TABLE IF NOT EXISTS durable_native_workflow_recovery (
+                    actor_id INTEGER PRIMARY KEY,
+                    binding TEXT NOT NULL
+                )",
+                (),
+            ).await.map_err(io::Error::other)?;
+            conn.execute(
                 "CREATE TABLE IF NOT EXISTS durable_workflow_events (
                     actor_id INTEGER NOT NULL,
                     sequence INTEGER NOT NULL,
@@ -3101,6 +3261,125 @@ impl PersistenceStore for LibsqlStore {
                 identities,
                 watermark: Some(watermark),
             })
+        })
+    }
+
+    fn save_native_workflow_recovery_binding(
+        &mut self,
+        actor_id: u64,
+        binding: &NativeWorkflowRecoveryBinding,
+    ) -> io::Result<()> {
+        if actor_id == 0 || actor_id > i64::MAX as u64 {
+            return Err(native_binding_conflict());
+        }
+        let serialized = serde_json::to_string(binding).map_err(io::Error::other)?;
+        {
+            let conn = self.conn();
+            if !matches!(&*conn, libsql::Connection::Local(_)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "native recovery requires local SQLite",
+                ));
+            }
+            self.rt.block_on(async {
+                conn.execute(
+                    "INSERT INTO durable_native_workflow_recovery (actor_id, binding)
+                    SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM snapshots WHERE actor_id=?1 AND activation_epoch=?3)
+                    AND NOT EXISTS (SELECT 1 FROM durable_workflow_admissions WHERE actor_id=?1)
+                    AND NOT EXISTS (SELECT 1 FROM journal WHERE actor_id=?1)
+                    ON CONFLICT(actor_id) DO NOTHING",
+                    libsql::params![actor_id as i64, serialized, i64::try_from(binding.activation_epoch).map_err(io::Error::other)?],
+                )
+                .await
+                .map_err(io::Error::other)?;
+                Ok::<_, io::Error>(())
+            })?;
+        }
+        if self
+            .load_native_workflow_recovery_binding(actor_id)?
+            .as_ref()
+            != Some(binding)
+        {
+            return Err(native_binding_conflict());
+        }
+        Ok(())
+    }
+
+    fn load_native_workflow_recovery_binding(
+        &self,
+        actor_id: u64,
+    ) -> io::Result<Option<NativeWorkflowRecoveryBinding>> {
+        let conn = self.conn();
+        if !matches!(&*conn, libsql::Connection::Local(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "native recovery requires local SQLite",
+            ));
+        }
+        self.rt.block_on(async {
+            let mut rows = conn
+                .query(
+                    "SELECT binding FROM durable_native_workflow_recovery WHERE actor_id=?1",
+                    libsql::params![i64::try_from(actor_id).map_err(io::Error::other)?],
+                )
+                .await
+                .map_err(io::Error::other)?;
+            match rows.next().await.map_err(io::Error::other)? {
+                Some(row) => {
+                    let binding: String = row.get(0).map_err(io::Error::other)?;
+                    Ok(Some(
+                        serde_json::from_str(&binding).map_err(io::Error::other)?,
+                    ))
+                }
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn scan_open_native_workflow_recovery(
+        &self,
+        shard: u16,
+        shards: u16,
+        after: Option<u64>,
+        through: Option<u64>,
+        limit: usize,
+    ) -> io::Result<NativeWorkflowRecoveryPage> {
+        validate_native_recovery_scan(shard, shards, after, through, limit)?;
+        let conn = self.conn();
+        if !matches!(&*conn, libsql::Connection::Local(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "native recovery requires local SQLite",
+            ));
+        }
+        self.rt.block_on(async {
+            const BASE: &str = "SELECT b.actor_id FROM durable_native_workflow_recovery b
+                JOIN durable_workflow_admissions a USING(actor_id)
+                WHERE b.actor_id > 0 AND b.actor_id % ?1 = ?2 AND a.closed_sequence IS NULL";
+            let watermark = match through {
+                Some(id) => Some(id),
+                None => {
+                    let mut rows = conn.query(
+                        &format!("{BASE} ORDER BY b.actor_id DESC LIMIT 1"),
+                        libsql::params![i64::from(shards), i64::from(shard)],
+                    ).await.map_err(io::Error::other)?;
+                    match rows.next().await.map_err(io::Error::other)? {
+                        Some(row) => Some(row.get::<i64>(0).map_err(io::Error::other)? as u64),
+                        None => None,
+                    }
+                }
+            };
+            let mut actors = Vec::new();
+            if let Some(watermark) = watermark {
+                let mut rows = conn.query(
+                    &format!("{BASE} AND b.actor_id > ?3 AND b.actor_id <= ?4 ORDER BY b.actor_id LIMIT ?5"),
+                    libsql::params![i64::from(shards), i64::from(shard), after.unwrap_or(0) as i64, watermark as i64, limit as i64],
+                ).await.map_err(io::Error::other)?;
+                while let Some(row) = rows.next().await.map_err(io::Error::other)? {
+                    actors.push(row.get::<i64>(0).map_err(io::Error::other)? as u64);
+                }
+            }
+            Ok(NativeWorkflowRecoveryPage { actors, watermark })
         })
     }
 
@@ -4094,6 +4373,7 @@ impl PersistenceStore for LibsqlStore {
                 "durable_outbox",
                 "durable_workflow_outbox",
                 "durable_workflow_admissions",
+                "durable_native_workflow_recovery",
                 "durable_workflow_inbox",
                 "durable_transitions",
                 "durable_tails",
