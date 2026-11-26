@@ -85,7 +85,9 @@ mod trace;
 mod workflow;
 mod workflow_outbox;
 pub use trace::TraceContext;
-pub use workflow_outbox::WorkflowOutboxDispatch;
+pub use workflow_outbox::{
+    WorkflowOutboxDispatch, WorkflowOutboxPumpConfig, WorkflowOutboxPumpReport,
+};
 
 #[cfg(test)]
 mod cluster_dst;
@@ -456,6 +458,7 @@ pub struct Runtime {
 
     // Persistence engine (v0.7)
     pub persistence: Box<dyn PersistenceStore>,
+    workflow_outbox_pump: Option<Box<workflow_outbox::WorkflowOutboxPump>>,
     // Immutable shared object store for large `val` buffers.
     pub object_store: ObjectStore,
     // Virtual actor (grain) type registry and resident mapping.
@@ -690,6 +693,7 @@ impl Runtime {
             process_groups: ProcessGroups::new(),
             pending_fetched_messages: HashMap::new(),
             persistence: Box::new(MemoryStore::new()),
+            workflow_outbox_pump: None,
             object_store: ObjectStore::new(),
             grain_registry: GrainRegistry::new(),
             grain_residents: HashMap::new(),
@@ -3189,11 +3193,22 @@ impl Runtime {
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn run_scheduler(&mut self) {
         let mut ticks: u64 = 0;
+        let mut idle_outbox_pages = 0;
         loop {
             self.drain_cross_shard_messages();
+            let more_outbox = self.tick_workflow_outbox_pump();
             let actor_id = match self.claim_next_ready_actor() {
                 Some(actor_id) => actor_id,
                 None => {
+                    // A blocked first page must not hide a ready receiver on
+                    // a later page. Bound work while idle so a permanently
+                    // blocked backlog never keeps the synchronous API alive.
+                    if more_outbox
+                        && idle_outbox_pages + 1 < workflow_outbox::OUTBOX_IDLE_PAGE_BUDGET
+                    {
+                        idle_outbox_pages += 1;
+                        continue;
+                    }
                     if self.llm_inflight_count() == 0 && self.timer_wheel.is_empty() {
                         if let Some(ref mut cb) = self.idle_callback {
                             cb();
@@ -3222,6 +3237,7 @@ impl Runtime {
                 }
             };
 
+            idle_outbox_pages = 0;
             let reductions_before = self
                 .actors
                 .get(&actor_id)
@@ -3381,6 +3397,7 @@ impl Runtime {
         max_steps: u64,
     ) -> DeterministicRunResult {
         let mut steps: u64 = 0;
+        let mut idle_outbox_pages = 0;
         loop {
             if steps >= max_steps {
                 return DeterministicRunResult::StepLimitExceeded { steps };
@@ -3391,8 +3408,10 @@ impl Runtime {
             self.drain_cross_shard_messages();
             // Tick timers first (respects virtual clock via self.now())
             self.tick_timers();
+            let more_outbox = self.tick_workflow_outbox_pump();
             match self.pick_ready_actor_deterministic(rng) {
                 Some(actor_id) => {
+                    idle_outbox_pages = 0;
                     self.step_actor(actor_id);
                     steps += 1;
                     if steps % GC_PUMP_INTERVAL == 0 {
@@ -3408,6 +3427,12 @@ impl Runtime {
                     }
                 }
                 None => {
+                    if more_outbox
+                        && idle_outbox_pages + 1 < workflow_outbox::OUTBOX_IDLE_PAGE_BUDGET
+                    {
+                        idle_outbox_pages += 1;
+                        continue;
+                    }
                     // No actor is ready. With a virtual clock installed and
                     // timers pending, advance the clock to the next
                     // deadline and re-tick — the fired timer re-enqueues

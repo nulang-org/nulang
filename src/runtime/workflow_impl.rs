@@ -349,6 +349,7 @@ pub(crate) fn commit_step_completed(
         }
     }
 
+    let has_staged_messages = !outbox.is_empty();
     rt.persistence.commit_transition(DurableTransition {
         version: DURABLE_TRANSITION_VERSION,
         actor_id,
@@ -370,6 +371,9 @@ pub(crate) fn commit_step_completed(
         outbox,
     })?;
 
+    if has_staged_messages {
+        rt.note_workflow_outbox_staged();
+    }
     rt.maybe_shadow_replicate(actor_id, &snapshot);
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.sequence = sequence;
