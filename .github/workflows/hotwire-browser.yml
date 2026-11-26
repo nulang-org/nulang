@@ -1,0 +1,49 @@
+name: Hotwire browser acceptance
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/hotwire-browser.yml'
+      - 'examples/web_hotwire_browser_test_server.rs'
+      - 'scripts/tests/web_hotwire_browser_e2e.cjs'
+      - 'scripts/tests/hotwire-browser/**'
+      - 'src/runtime/http_server.rs'
+      - 'src/runtime/callbacks.rs'
+      - 'src/web/turbo.rs'
+      - 'src/stdlib/web/turbo.nula'
+      - 'src/stdlib/web/frames.nula'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hotwire-browser-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  browser-e2e:
+    name: Guarded WebDevServer + official Turbo CRUD
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.95.0'
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Install isolated pinned Hotwire browser dependencies
+        run: npm ci --prefix scripts/tests/hotwire-browser --ignore-scripts --no-audit --no-fund
+
+      - name: Install Chromium and OS browser dependencies
+        run: scripts/tests/hotwire-browser/node_modules/.bin/playwright install --with-deps chromium
+
+      - name: Build actual guarded Nulang server fixture
+        run: cargo build --locked --no-default-features --example web_hotwire_browser_test_server
+
+      - name: Browser CRUD, origin admission, escaping and fallback
+        run: node scripts/tests/web_hotwire_browser_e2e.cjs

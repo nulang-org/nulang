@@ -1,28 +1,34 @@
-//! HTTP/1.1 server built on std::net::TcpListener with httparse.
+//! Experimental HTTP/1.1 server built on std::net::TcpListener with httparse.
 //!
-//! Phase 1: each request dispatches to a standalone VM on the listener thread.
+//! Accepted connections run on bounded worker threads; handler dispatch uses
+//! a standalone VM per request. Connections close after one HTTP request.
 //! Handlers are non-capturing `fn(String) -> String` — no closures with env.
-//! Status is always 200; Content-Type is always text/plain.
+//! This transport does not yet support persistent HTTP connections or HTTP/2.
+
+use rand_core::{OsRng, RngCore};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::bytecode::CodeModule;
 use crate::value_layout::PAYLOAD_MASK;
 use crate::vm::{resolve_value_string, Value, CLOSURE_ENV_FLAG, VM};
+use crate::web::csrf::validate_mutation_origin;
 use crate::web::dispatch::{render_direct_request, DirectRequestRenderError};
-use crate::web::http_problem::request_decode_problem_response;
+use crate::web::form_guard::{FormGuardError, GuardedFormRoute};
+use crate::web::http_problem::{form_validation_problem_response, request_decode_problem_response};
 use crate::web::http_request::HttpRequestBindingInputs;
 use crate::web::reactivity::inject_client_runtime_script;
 use crate::web::request_bindings::percent_decode_form;
 use crate::web::runtime_bindings::RuntimeWebRoute;
+use crate::web::tenant_auth::{TenantAuthGuard, VerifiedTenant};
 
 /// HTTP method — must match the Nulang-level variant type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +116,99 @@ impl HttpReadError {
 const MAX_HTTP_HEADERS_SIZE: usize = 16 * 1024;
 const MAX_HTTP_BODY_SIZE: usize = 1_048_576;
 
+/// Convert absolute-form targets to origin-form and retain the URI authority.
+fn normalize_http_request_target(
+    raw: &str,
+    method: HttpMethod,
+) -> Result<(String, Option<String>), HttpReadError> {
+    if raw.contains('#') || raw.bytes().any(|byte| byte <= 0x20 || byte == 0x7f) {
+        return Err(HttpReadError::BadRequest);
+    }
+    if raw.starts_with('/') {
+        return Ok((raw.to_string(), None));
+    }
+    if raw == "*" && method == HttpMethod::Options {
+        return Ok((raw.to_string(), None));
+    }
+    let remainder = if raw
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+    {
+        &raw[7..]
+    } else if raw
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        &raw[8..]
+    } else {
+        return Err(HttpReadError::BadRequest);
+    };
+    let authority_end = remainder
+        .find(|ch: char| ch == '/' || ch == '?')
+        .unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    if !valid_http_authority(authority) {
+        return Err(HttpReadError::BadRequest);
+    }
+    let suffix = &remainder[authority_end..];
+    let path = if suffix.is_empty() {
+        "/".to_string()
+    } else if suffix.starts_with('?') {
+        format!("/{suffix}")
+    } else {
+        suffix.to_string()
+    };
+    Ok((path, Some(authority.to_string())))
+}
+
+/// Validate request authorities conservatively before routing. A blank Host
+/// for a URI without authority is permitted separately at the call site.
+fn valid_http_authority(value: &str) -> bool {
+    if value.is_empty()
+        || value.bytes().any(|byte| {
+            byte <= 0x20 || byte >= 0x7f || matches!(byte, b',' | b'/' | b'\\' | b'@' | b'#' | b'?')
+        })
+    {
+        return false;
+    }
+    if let Some(rest) = value.strip_prefix('[') {
+        let Some((host, suffix)) = rest.split_once(']') else {
+            return false;
+        };
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        return suffix.is_empty()
+            || suffix
+                .strip_prefix(':')
+                .is_some_and(|port| port.bytes().all(|byte| byte.is_ascii_digit()));
+    }
+    let (host, port) = value.split_once(':').unwrap_or((value, ""));
+    !host.is_empty()
+        && !host.contains(':')
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && host.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'-' | b'.'
+                        | b'_'
+                        | b'~'
+                        | b'%'
+                        | b'!'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b'='
+                        | b';'
+                )
+        })
+}
+
 /// Reads exactly one HTTP/1.x request. Both HTTP listeners use this same
 /// bounded framing boundary, rather than assuming one read contains a request.
 ///
@@ -166,12 +265,18 @@ fn read_http_request<R: Read>(reader: &mut R) -> Result<Option<HttpRequest>, Htt
         return Err(HttpReadError::BadRequest);
     }
 
+    let version = parsed.version.ok_or(HttpReadError::BadRequest)?;
+    if version != 0 && version != 1 {
+        return Err(HttpReadError::BadRequest);
+    }
+
     let method = parsed
         .method
         .and_then(HttpMethod::from_str)
         .ok_or(HttpReadError::NotImplemented)?;
-    let path = parsed.path.ok_or(HttpReadError::BadRequest)?.to_string();
-    let headers: Vec<(String, String)> = parsed
+    let raw_target = parsed.path.ok_or(HttpReadError::BadRequest)?;
+    let (path, absolute_authority) = normalize_http_request_target(raw_target, method)?;
+    let mut headers: Vec<(String, String)> = parsed
         .headers
         .iter()
         .map(|header| {
@@ -185,8 +290,20 @@ fn read_http_request<R: Read>(reader: &mut R) -> Result<Option<HttpRequest>, Htt
     let mut content_length = None;
     let mut has_transfer_encoding = false;
     let mut has_expectation = false;
+    let mut has_host = false;
     for (name, value) in &headers {
-        if name.eq_ignore_ascii_case("content-length") {
+        if name.eq_ignore_ascii_case("host") {
+            // Duplicate or ambiguous authority can cause front-end/backend
+            // routing disagreement, even when both Host values are equal.
+            if has_host {
+                return Err(HttpReadError::BadRequest);
+            }
+            has_host = true;
+            let host = value.trim();
+            if !host.is_empty() && !valid_http_authority(host) {
+                return Err(HttpReadError::BadRequest);
+            }
+        } else if name.eq_ignore_ascii_case("content-length") {
             // Reject even identical duplicates: this is a one-request server,
             // and accepting ambiguous lengths enables request desynchronization.
             let value = value.trim();
@@ -213,6 +330,22 @@ fn read_http_request<R: Read>(reader: &mut R) -> Result<Option<HttpRequest>, Htt
     }
     if has_transfer_encoding {
         return Err(HttpReadError::NotImplemented);
+    }
+    // RFC 9112 requires exactly one Host field line for HTTP/1.1.
+    // HTTP/1.0 remains supported for legacy clients without Host.
+    if version == 1 && !has_host {
+        return Err(HttpReadError::BadRequest);
+    }
+    if let Some(authority) = absolute_authority {
+        // RFC 9112: an absolute request-target overrides a conflicting Host.
+        if let Some((_, host)) = headers
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+        {
+            *host = authority;
+        } else {
+            headers.push(("Host".into(), authority));
+        }
     }
 
     let content_length = content_length.unwrap_or(0);
@@ -263,6 +396,8 @@ pub struct HttpServerState {
     pub handler_func_idx: usize,
     /// True while the server is running; set to false to signal shutdown.
     shutdown_flag: Arc<AtomicBool>,
+    /// Bounded worker admission and handles for orderly connection shutdown.
+    connection_slots: Arc<ConnectionSlots>,
     /// Listener thread handle.
     listener_thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -280,14 +415,30 @@ impl std::fmt::Debug for HttpServerState {
 
 impl Drop for HttpServerState {
     fn drop(&mut self) {
-        self.shutdown_flag.store(true, Ordering::Relaxed);
+        self.shutdown_flag.store(true, Ordering::Release);
         if let Some(handle) = self.listener_thread.take() {
             let _ = handle.join();
+        }
+        // Let ordinary requests finish before interrupting stalled socket
+        // reads. Non-cooperative application code is not forcibly killed.
+        if !self
+            .connection_slots
+            .wait_for_drain(Duration::from_millis(500))
+        {
+            self.connection_slots.interrupt_active();
+            if !self
+                .connection_slots
+                .wait_for_drain(Duration::from_millis(1500))
+            {
+                eprintln!("standalone HTTP server shutdown: workers exceeded drain deadline");
+            }
         }
     }
 }
 
 impl HttpServerState {
+    const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+
     pub fn bind(
         port: u16,
         handler_module: CodeModule,
@@ -297,12 +448,20 @@ impl HttpServerState {
         let actual_port = listener.local_addr()?.port();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
+        let connection_slots = Arc::new(ConnectionSlots::new(Self::MAX_CONCURRENT_CONNECTIONS));
+        let slots_for_listener = Arc::clone(&connection_slots);
         let module_clone = handler_module.clone();
 
         let handle = std::thread::Builder::new()
             .name("nulang-http-listener".into())
             .spawn(move || {
-                Self::listener_loop(listener, module_clone, handler_func_idx, shutdown_clone);
+                Self::listener_loop(
+                    listener,
+                    module_clone,
+                    handler_func_idx,
+                    shutdown_clone,
+                    slots_for_listener,
+                );
             })?;
 
         Ok(HttpServerState {
@@ -310,6 +469,7 @@ impl HttpServerState {
             handler_module,
             handler_func_idx,
             shutdown_flag: shutdown,
+            connection_slots,
             listener_thread: Some(handle),
         })
     }
@@ -319,16 +479,49 @@ impl HttpServerState {
         handler_module: CodeModule,
         handler_func_idx: usize,
         shutdown: Arc<AtomicBool>,
+        slots: Arc<ConnectionSlots>,
     ) {
         listener.set_nonblocking(true).ok();
+        let handler_module = Arc::new(handler_module);
         loop {
             if shutdown.load(Ordering::Relaxed) {
                 break;
             }
             match listener.accept() {
-                Ok((stream, _)) => {
+                Ok((mut stream, _)) => {
+                    let lease = match slots.try_acquire_socket(&stream) {
+                        Ok(Some(lease)) => lease,
+                        Ok(None) => {
+                            let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+                            Self::write_response(
+                                &mut stream,
+                                &HttpResponse {
+                                    status: 503,
+                                    headers: vec![
+                                        ("Content-Type".into(), "text/plain".into()),
+                                        ("Retry-After".into(), "1".into()),
+                                    ],
+                                    body: b"Server at connection capacity".to_vec(),
+                                },
+                            );
+                            continue;
+                        }
+                        Err(error) => {
+                            eprintln!("failed to track HTTP connection for shutdown: {error}");
+                            continue;
+                        }
+                    };
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-                    Self::handle_connection(stream, &handler_module, handler_func_idx);
+                    let module = Arc::clone(&handler_module);
+                    if let Err(error) = std::thread::Builder::new()
+                        .name("nulang-http-connection".into())
+                        .spawn(move || {
+                            let _lease = lease;
+                            Self::handle_connection(stream, &module, handler_func_idx);
+                        })
+                    {
+                        eprintln!("failed to spawn HTTP connection worker: {error}");
+                    }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(10));
@@ -356,6 +549,21 @@ impl HttpServerState {
     }
 
     fn write_response(stream: &mut TcpStream, response: &HttpResponse) {
+        // The HTTP writer owns framing. A caller-supplied CRLF or framing
+        // header must not split the response or override Content-Length.
+        // Reuse the same fail-closed response behavior as draft #1927.
+        if response
+            .headers
+            .iter()
+            .any(|(name, value)| !safe_response_header(name, value))
+        {
+            let fallback = HttpResponse {
+                status: 500,
+                headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+                body: b"Internal server error".to_vec(),
+            };
+            return Self::write_response(stream, &fallback);
+        }
         let status_text = match response.status {
             200 => "OK",
             201 => "Created",
@@ -519,7 +727,9 @@ pub struct RequestContext {
 
 thread_local! {
     static CURRENT_REQUEST: RefCell<Option<RequestContext>> = const { RefCell::new(None) };
+    static VERIFIED_TENANT: RefCell<Option<VerifiedTenant>> = const { RefCell::new(None) };
     static RESPONSE_COOKIES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static RESPONSE_MEDIA_TYPE: RefCell<Option<&'static str>> = const { RefCell::new(None) };
 }
 
 /// Set the request context for the current thread, run `f`, then clear it.
@@ -529,20 +739,123 @@ where
 {
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = Some(ctx));
     RESPONSE_COOKIES.with(|c| c.borrow_mut().clear());
+    RESPONSE_MEDIA_TYPE.with(|c| *c.borrow_mut() = None);
     let result = f();
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = None);
     result
 }
 
-/// Add a `Set-Cookie` header for the current response.
+/// Access only the tenant identity resolved from a server-side opaque session.
+pub fn current_verified_tenant_id() -> Option<String> {
+    VERIFIED_TENANT.with(|ctx| ctx.borrow().as_ref().map(|id| id.tenant_id().to_owned()))
+}
+
+fn with_verified_tenant<F, R>(identity: Option<VerifiedTenant>, operation: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    struct Restore(Option<VerifiedTenant>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            VERIFIED_TENANT.with(|ctx| *ctx.borrow_mut() = self.0.take());
+        }
+    }
+    let previous = VERIFIED_TENANT.with(|ctx| ctx.replace(identity));
+    let _restore = Restore(previous);
+    operation()
+}
+
+/// Select the Turbo Stream media type only inside a live Web request.
+pub fn mark_turbo_stream_response() {
+    CURRENT_REQUEST.with(|ctx| {
+        if ctx.borrow().is_some() {
+            RESPONSE_MEDIA_TYPE
+                .with(|media| *media.borrow_mut() = Some(crate::web::turbo::TURBO_STREAM_MIME));
+        }
+    });
+}
+
+fn take_response_media_type() -> Option<&'static str> {
+    RESPONSE_MEDIA_TYPE.with(|media| media.borrow_mut().take())
+}
+
+/// Generate a cryptographically random, 256-bit opaque session secret.
+///
+/// This host operation is intentionally nondeterministic and must never be
+/// replayed as a fresh authentication decision in a durable workflow.
+/// Failed OS entropy acquisition is a hard failure, not a counter fallback.
+pub fn secure_session_token() -> Option<String> {
+    let mut bytes = [0u8; 32];
+    let mut rng = OsRng;
+    rng.try_fill_bytes(&mut bytes).ok()?;
+    Some(hex::encode(bytes))
+}
+
+/// RFC 6265 cookie names must be nonempty HTTP tokens. Never allow
+/// attacker-controlled characters to create new header fields or attributes.
+fn valid_cookie_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+/// Reject invalid response metadata and caller-owned HTTP framing.
+fn safe_response_header(name: &str, value: &str) -> bool {
+    valid_cookie_name(name)
+        && !name.eq_ignore_ascii_case("content-length")
+        && !name.eq_ignore_ascii_case("transfer-encoding")
+        && value
+            .bytes()
+            .all(|byte| byte == b'\t' || (byte >= 0x20 && byte != 0x7f))
+}
+
+/// Preserve all unquoted RFC 6265 cookie octets, but reject separators,
+/// controls, whitespace, and backslash rather than escaping them into a
+/// response header. Callers can encode arbitrary values using base64url.
+fn valid_cookie_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| matches!(byte, 0x21 | 0x23..=0x2B | 0x2D..=0x3A | 0x3C..=0x5B | 0x5D..=0x7E))
+}
+
+/// Add a secure, HTTP-only `Set-Cookie` header for the current response.
+/// Invalid names or values are not emitted. This demo API is not a
+/// production session/identity boundary.
 pub fn set_cookie(name: &str, value: &str) {
-    let cookie = format!("{}={}; Path=/; HttpOnly; SameSite=Lax", name, value);
+    if !valid_cookie_name(name) || !valid_cookie_value(value) {
+        return;
+    }
+    let cookie = format!("{}={}; Path=/; HttpOnly; Secure; SameSite=Lax", name, value);
     RESPONSE_COOKIES.with(|c| c.borrow_mut().push(cookie));
 }
 
 /// Add a `Set-Cookie` header that clears the named cookie.
 pub fn clear_cookie(name: &str) {
-    let cookie = format!("{}=; Path=/; Max-Age=0; SameSite=Lax", name);
+    if !valid_cookie_name(name) {
+        return;
+    }
+    let cookie = format!(
+        "{}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax",
+        name
+    );
     RESPONSE_COOKIES.with(|c| c.borrow_mut().push(cookie));
 }
 
@@ -717,8 +1030,6 @@ pub fn realtime_subscribe(room: &str) -> (Vec<String>, Receiver<String>) {
 pub enum Middleware {
     SecurityHeaders,
     RequestLog,
-    #[allow(dead_code)]
-    Csrf,
 }
 
 impl Middleware {
@@ -745,9 +1056,6 @@ impl Middleware {
                     request.path,
                     response.status
                 );
-            }
-            Middleware::Csrf => {
-                // Phase 2: generate CSRF token cookie and validate on POST.
             }
         }
     }
@@ -805,6 +1113,11 @@ pub fn render_route_handler(
     module.emit(Instruction::new0(OpCode::Ret));
     vm.load_module(module);
     let mut run = || match vm.run_from(0, entry_offset) {
+        // An invalid HTML host operation returns a VM nil. It is not a valid
+        // rendered response and must not become a successful "nil" document.
+        // Check the actual tagged Value, not its string representation:
+        // returning the legitimate String "nil" still means HTTP 200.
+        Ok(result) if result.is_nil() => None,
         Ok(result) => Some(vm.value_to_string(0, result)),
         Err(_) => None,
     };
@@ -813,6 +1126,31 @@ pub fn render_route_handler(
     } else {
         run()
     }
+}
+
+/// Experimental Web rejects ambiguous or cross-origin browser mutations before
+/// handler dispatch. This does not replace authentication or authorization.
+fn unsafe_origin_response(
+    request: &HttpRequest,
+    local_addr: Option<std::net::SocketAddr>,
+    public_origin: Option<&str>,
+) -> Option<HttpResponse> {
+    let failure = validate_mutation_origin(
+        request.method.as_str(),
+        &request.headers,
+        local_addr,
+        public_origin,
+    )
+    .err()?;
+    eprintln!("Nulang Web denied request admission: {failure:?}");
+    Some(HttpResponse {
+        status: 403,
+        headers: vec![
+            ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+            ("Cache-Control".into(), "no-store".into()),
+        ],
+        body: b"Forbidden: invalid request authority or origin".to_vec(),
+    })
 }
 
 fn invalid_ui_action_response(captured: &HttpRequestBindingInputs) -> Option<HttpResponse> {
@@ -829,9 +1167,13 @@ fn invalid_ui_action_response(captured: &HttpRequestBindingInputs) -> Option<Htt
 /// Limits concurrently active development-server connections, including
 /// long-lived SSE streams. Lease release is automatic on worker exit or panic.
 /// This is capacity control, not an isolation boundary for untrusted code.
+#[derive(Debug)]
 struct ConnectionSlots {
     active: AtomicUsize,
     limit: usize,
+    next_socket_id: AtomicUsize,
+    active_sockets: Mutex<HashMap<usize, TcpStream>>,
+    drained: Condvar,
 }
 
 impl ConnectionSlots {
@@ -839,6 +1181,9 @@ impl ConnectionSlots {
         Self {
             active: AtomicUsize::new(0),
             limit,
+            next_socket_id: AtomicUsize::new(0),
+            active_sockets: Mutex::new(HashMap::new()),
+            drained: Condvar::new(),
         }
     }
 
@@ -857,21 +1202,219 @@ impl ConnectionSlots {
                 Ok(_) => {
                     return Some(ConnectionLease {
                         slots: Arc::clone(self),
+                        socket_id: None,
                     });
                 }
                 Err(observed) => current = observed,
             }
         }
     }
+
+    /// Retain a shutdown handle for each admitted connection. A cloned socket
+    /// can interrupt a worker blocked on an incomplete request or SSE write.
+    fn try_acquire_socket(
+        self: &Arc<Self>,
+        stream: &TcpStream,
+    ) -> std::io::Result<Option<ConnectionLease>> {
+        let Some(mut lease) = self.try_acquire() else {
+            return Ok(None);
+        };
+        let shutdown_handle = stream.try_clone()?;
+        let id = self.next_socket_id.fetch_add(1, Ordering::Relaxed);
+        self.active_sockets
+            .lock()
+            .unwrap()
+            .insert(id, shutdown_handle);
+        lease.socket_id = Some(id);
+        Ok(Some(lease))
+    }
+
+    fn interrupt_active(&self) {
+        let sockets = self.active_sockets.lock().unwrap();
+        for stream in sockets.values() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+
+    /// Once the accept loop has stopped, no new leases can be created. Wait
+    /// only for a bounded interval: non-cooperative user code may still run.
+    fn wait_for_drain(&self, timeout: Duration) -> bool {
+        let sockets = self.active_sockets.lock().unwrap();
+        let (_sockets, _) = self
+            .drained
+            .wait_timeout_while(sockets, timeout, |_| {
+                self.active.load(Ordering::Acquire) != 0
+            })
+            .unwrap();
+        self.active.load(Ordering::Acquire) == 0
+    }
 }
 
 struct ConnectionLease {
     slots: Arc<ConnectionSlots>,
+    socket_id: Option<usize>,
 }
 
 impl Drop for ConnectionLease {
     fn drop(&mut self) {
+        // Coordinate the transition to zero with the same mutex used by the
+        // drain waiter so it cannot miss a worker-exit notification.
+        let mut sockets = self.slots.active_sockets.lock().unwrap();
+        if let Some(id) = self.socket_id.take() {
+            sockets.remove(&id);
+        }
         self.slots.active.fetch_sub(1, Ordering::AcqRel);
+        self.slots.drained.notify_all();
+    }
+}
+
+/// Host-level HTTP limits, validated before a Web listener binds.
+///
+/// Defaults preserve the existing development server behavior. This is a
+/// runtime-host configuration surface, not a new language or Web DSL feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebServerOptions {
+    /// Maximum simultaneous connections, including long-lived SSE streams.
+    pub max_concurrent_connections: usize,
+    /// Maximum time to wait for data on an individual connection.
+    pub read_timeout: Duration,
+    /// Maximum time to block writing a response to a slow client.
+    pub write_timeout: Duration,
+}
+
+impl Default for WebServerOptions {
+    fn default() -> Self {
+        Self {
+            max_concurrent_connections: WebDevServer::MAX_CONCURRENT_CONNECTIONS,
+            read_timeout: Duration::from_secs(30),
+            write_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+impl WebServerOptions {
+    /// Reject unsafe or unsupported limits before opening a listening socket.
+    pub fn validate(&self) -> std::io::Result<()> {
+        if !(1..=512).contains(&self.max_concurrent_connections) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "max_concurrent_connections must be between 1 and 512",
+            ));
+        }
+        for (name, timeout) in [
+            ("read_timeout", self.read_timeout),
+            ("write_timeout", self.write_timeout),
+        ] {
+            if !(Duration::from_millis(1)..=Duration::from_secs(300)).contains(&timeout) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{name} must be between 1ms and 300s"),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Authorize unsafe HTTP requests carrying a first-party development session.
+///
+/// An anonymous request is left to its route's authentication policy. For a
+/// request with a `nulang_session` cookie, enforce a per-session synchronizer
+/// token stored server-side by `@nulang/auth`. Only one submitted token source
+/// is allowed. This does not replace same-origin admission or authorization.
+fn session_csrf_allowed(request: &HttpRequest, captured: &HttpRequestBindingInputs) -> bool {
+    if matches!(
+        request.method,
+        HttpMethod::Get | HttpMethod::Head | HttpMethod::Options
+    ) {
+        return true;
+    }
+
+    let mut session: Option<&str> = None;
+    for (_, raw) in request
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+    {
+        for cookie in raw.split(';') {
+            let cookie = cookie.trim();
+            let (name, value) = cookie.split_once('=').unwrap_or((cookie, ""));
+            if name.trim() == "nulang_session" {
+                if session.replace(value.trim()).is_some() {
+                    return false; // Duplicate session cookies are ambiguous.
+                }
+            }
+        }
+    }
+    let Some(session) = session else {
+        return true; // Authentication is an independent route boundary.
+    };
+    if session.len() != 64 || !session.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+
+    let expected = kv_get(&format!("nulang_auth:csrf:{session}"));
+    let Some(expected) = expected.filter(|value| value.len() == 64) else {
+        return false;
+    };
+
+    let headers: Vec<&str> = request
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("x-csrf-token"))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    if headers.len() > 1 {
+        return false;
+    }
+
+    // A form token must appear exactly once in the raw body. Decoding the
+    // map alone would silently overwrite duplicate _csrf fields.
+    let form_media = request
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .collect::<Vec<_>>();
+    let mut forms = Vec::new();
+    if form_media.len() == 1
+        && form_media[0].1.split(';').next().is_some_and(|value| {
+            value
+                .trim()
+                .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        })
+    {
+        for part in String::from_utf8_lossy(&request.body).split('&') {
+            let (raw_name, raw_value) = part.split_once('=').unwrap_or((part, ""));
+            if percent_decode_form(raw_name) == "_csrf" {
+                forms.push(percent_decode_form(raw_value));
+            }
+        }
+    }
+
+    let submitted = match (headers.as_slice(), forms.as_slice()) {
+        ([header], []) => *header,
+        ([], [form]) => form.as_str(),
+        _ => return false,
+    };
+    if submitted.len() != 64 || !submitted.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+
+    // The token is random and server-owned; comparison must avoid a
+    // character-by-character early return.
+    use subtle::ConstantTimeEq;
+    let _ = captured; // Input parsing is shared with the typed route binder.
+    bool::from(submitted.as_bytes().ct_eq(expected.as_bytes()))
+}
+
+fn configured_web_public_origin() -> std::io::Result<Option<String>> {
+    match std::env::var("NULANG_WEB_PUBLIC_ORIGIN") {
+        Ok(origin) => Ok(Some(origin)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid NULANG_WEB_PUBLIC_ORIGIN: {error}"),
+        )),
     }
 }
 
@@ -881,14 +1424,30 @@ impl Drop for ConnectionLease {
 pub struct WebDevServer {
     pub port: u16,
     shutdown_flag: Arc<AtomicBool>,
+    connection_slots: Arc<ConnectionSlots>,
     listener_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for WebDevServer {
     fn drop(&mut self) {
-        self.shutdown_flag.store(true, Ordering::Relaxed);
+        self.shutdown_flag.store(true, Ordering::Release);
         if let Some(handle) = self.listener_thread.take() {
             let _ = handle.join();
+        }
+        // Give in-flight requests a short opportunity to complete before
+        // interrupting idle reads and long-lived streams. The overall drain
+        // deadline remains bounded if user code does not cooperate.
+        if !self
+            .connection_slots
+            .wait_for_drain(Duration::from_millis(500))
+        {
+            self.connection_slots.interrupt_active();
+            if !self
+                .connection_slots
+                .wait_for_drain(Duration::from_millis(1500))
+            {
+                eprintln!("web dev server shutdown: connection workers exceeded drain deadline");
+            }
         }
     }
 }
@@ -921,11 +1480,213 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
     ) -> std::io::Result<Self> {
+        Self::bind_runtime_with_options(
+            port,
+            static_dir,
+            output_dir,
+            routes,
+            WebServerOptions::default(),
+        )
+    }
+
+    /// Validate host limits and configured origin through the shared admission path.
+    pub fn bind_runtime_with_options(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        options: WebServerOptions,
+    ) -> std::io::Result<Self> {
+        Self::bind_runtime_guarded_configured(
+            port,
+            static_dir,
+            output_dir,
+            routes,
+            Vec::new(),
+            configured_web_public_origin()?,
+            None,
+            options,
+        )
+    }
+
+    /// Opt-in, independently verified session admission on explicitly guarded routes.
+    pub fn bind_with_tenant_guard(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<WebRoute>,
+        tenant_guard: TenantAuthGuard,
+    ) -> std::io::Result<Self> {
+        let routes = routes
+            .into_iter()
+            .map(|route| RuntimeWebRoute { route, plan: None })
+            .collect();
+        Self::bind_runtime_with_tenant_guard(
+            port,
+            static_dir,
+            output_dir,
+            routes,
+            Vec::new(),
+            tenant_guard,
+        )
+    }
+
+    /// Composes tenant session admission with compiler-validated guarded forms.
+    pub fn bind_runtime_with_tenant_guard(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        guarded_forms: Vec<GuardedFormRoute>,
+        tenant_guard: TenantAuthGuard,
+    ) -> std::io::Result<Self> {
+        Self::bind_runtime_with_tenant_guard_and_options(
+            port,
+            static_dir,
+            output_dir,
+            routes,
+            guarded_forms,
+            tenant_guard,
+            WebServerOptions::default(),
+        )
+    }
+
+    /// Apply host limits and tenant/form admission through the same startup gate.
+    pub fn bind_runtime_with_tenant_guard_and_options(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        guarded_forms: Vec<GuardedFormRoute>,
+        tenant_guard: TenantAuthGuard,
+        options: WebServerOptions,
+    ) -> std::io::Result<Self> {
+        Self::bind_runtime_guarded_configured(
+            port,
+            static_dir,
+            output_dir,
+            routes,
+            guarded_forms,
+            configured_web_public_origin()?,
+            Some(tenant_guard),
+            options,
+        )
+    }
+
+    /// Attach compiler-validated form guards before opening a listening socket.
+    /// Public-origin configuration is validated before accepting connections.
+    pub fn bind_runtime_with_form_guards(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        guarded_forms: Vec<GuardedFormRoute>,
+    ) -> std::io::Result<Self> {
+        let public_origin = configured_web_public_origin()?;
+        Self::bind_runtime_guarded_configured(
+            port,
+            static_dir,
+            output_dir,
+            routes,
+            guarded_forms,
+            public_origin,
+            None,
+            WebServerOptions::default(),
+        )
+    }
+
+    // Keep the explicit-configuration entry point for the existing startup
+    // regression tests without bypassing the common guarded admission path.
+    #[cfg(test)]
+    fn bind_runtime_configured(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        public_origin: Option<String>,
+        options: WebServerOptions,
+    ) -> std::io::Result<Self> {
+        Self::bind_runtime_guarded_configured(
+            port,
+            static_dir,
+            output_dir,
+            routes,
+            Vec::new(),
+            public_origin,
+            None,
+            options,
+        )
+    }
+
+    fn bind_runtime_guarded_configured(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        guarded_forms: Vec<GuardedFormRoute>,
+        public_origin: Option<String>,
+        tenant_guard: Option<TenantAuthGuard>,
+        options: WebServerOptions,
+    ) -> std::io::Result<Self> {
+        options.validate()?;
+        if let Some(origin) = public_origin.as_deref() {
+            crate::web::csrf::validate_public_origin(origin).map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid NULANG_WEB_PUBLIC_ORIGIN: {error:?}"),
+                )
+            })?;
+        }
+
+        let mut form_guards = HashMap::new();
+        for guard in guarded_forms {
+            let mut matches = routes.iter().filter(|route| {
+                route.route.method.as_str() == guard.form.method
+                    && route.route.path == guard.form.path
+            });
+            let route = matches.next().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "form guard references an unknown runtime route",
+                )
+            })?;
+            if matches.next().is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "guarded form route has duplicate runtime registrations",
+                ));
+            }
+            guard.check_route(route).map_err(|message| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+            })?;
+            let key = (guard.form.method.clone(), guard.form.path.clone());
+            if form_guards.insert(key, guard).is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "multiple guards target the same form route",
+                ));
+            }
+        }
+
+        if let Some(guard) = &tenant_guard {
+            guard
+                .validate_routes(&routes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+            let form_keys = form_guards.keys().cloned().collect();
+            guard
+                .validate_mutation_routes(&form_keys)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        }
         let listener = TcpListener::bind(("0.0.0.0", port))?;
         let actual_port = listener.local_addr()?.port();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
+        let connection_slots = Arc::new(ConnectionSlots::new(options.max_concurrent_connections));
+        let slots_for_listener = Arc::clone(&connection_slots);
         let routes_clone = routes;
+        let form_guards = Arc::new(form_guards);
+        let guards_clone = Arc::clone(&form_guards);
+        let tenant_guard = tenant_guard.map(Arc::new);
         let static_dir_clone = static_dir.clone();
         let output_dir_clone = output_dir.clone();
 
@@ -937,13 +1698,19 @@ impl WebDevServer {
                     static_dir_clone,
                     output_dir_clone,
                     routes_clone,
+                    public_origin,
+                    guards_clone,
+                    tenant_guard,
                     shutdown_clone,
+                    slots_for_listener,
+                    options,
                 );
             })?;
 
         Ok(WebDevServer {
             port: actual_port,
             shutdown_flag: shutdown,
+            connection_slots,
             listener_thread: Some(handle),
         })
     }
@@ -953,10 +1720,14 @@ impl WebDevServer {
         static_dir: Option<PathBuf>,
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
+        public_origin: Option<String>,
+        form_guards: Arc<HashMap<(String, String), GuardedFormRoute>>,
+        tenant_guard: Option<Arc<TenantAuthGuard>>,
         shutdown: Arc<AtomicBool>,
+        slots: Arc<ConnectionSlots>,
+        options: WebServerOptions,
     ) {
         listener.set_nonblocking(true).ok();
-        let slots = Arc::new(ConnectionSlots::new(Self::MAX_CONCURRENT_CONNECTIONS));
         // Route tables contain compiled modules; share them rather than
         // cloning the full vector for every incoming connection.
         let routes = Arc::new(routes);
@@ -966,25 +1737,42 @@ impl WebDevServer {
             }
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let Some(lease) = slots.try_acquire() else {
-                        let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
-                        HttpServerState::write_response(
-                            &mut stream,
-                            &HttpResponse {
-                                status: 503,
-                                headers: vec![
-                                    ("Content-Type".into(), "text/plain".into()),
-                                    ("Retry-After".into(), "1".into()),
-                                ],
-                                body: b"Server at connection capacity".to_vec(),
-                            },
-                        );
-                        continue;
+                    let lease = match slots.try_acquire_socket(&stream) {
+                        Ok(Some(lease)) => lease,
+                        Ok(None) => {
+                            let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+                            HttpServerState::write_response(
+                                &mut stream,
+                                &HttpResponse {
+                                    status: 503,
+                                    headers: vec![
+                                        ("Content-Type".into(), "text/plain".into()),
+                                        ("Retry-After".into(), "1".into()),
+                                    ],
+                                    body: b"Server at connection capacity".to_vec(),
+                                },
+                            );
+                            continue;
+                        }
+                        Err(error) => {
+                            eprintln!("failed to track web connection for shutdown: {error}");
+                            continue;
+                        }
                     };
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+                    // Bound I/O before dispatch; an error drops the tracked lease.
+                    if stream.set_read_timeout(Some(options.read_timeout)).is_err()
+                        || stream
+                            .set_write_timeout(Some(options.write_timeout))
+                            .is_err()
+                    {
+                        continue;
+                    }
                     let static_dir = static_dir.clone();
                     let output_dir = output_dir.clone();
                     let routes = Arc::clone(&routes);
+                    let public_origin = public_origin.clone();
+                    let form_guards = Arc::clone(&form_guards);
+                    let tenant_guard = tenant_guard.clone();
                     let shutdown = Arc::clone(&shutdown);
                     // A failed spawn drops the closure and lease, returning capacity.
                     if let Err(error) = std::thread::Builder::new()
@@ -992,7 +1780,14 @@ impl WebDevServer {
                         .spawn(move || {
                             let _lease = lease;
                             Self::handle_connection(
-                                stream, static_dir, output_dir, routes, shutdown,
+                                stream,
+                                static_dir,
+                                output_dir,
+                                routes,
+                                public_origin,
+                                form_guards,
+                                tenant_guard,
+                                shutdown,
                             );
                         })
                     {
@@ -1012,6 +1807,9 @@ impl WebDevServer {
         static_dir: Option<PathBuf>,
         output_dir: Option<PathBuf>,
         routes: Arc<Vec<RuntimeWebRoute>>,
+        public_origin: Option<String>,
+        form_guards: Arc<HashMap<(String, String), GuardedFormRoute>>,
+        tenant_guard: Option<Arc<TenantAuthGuard>>,
         shutdown: Arc<AtomicBool>,
     ) {
         let request = match read_http_request(&mut stream) {
@@ -1022,8 +1820,35 @@ impl WebDevServer {
                 return;
             }
         };
+        // Both provenance and session synchronizer checks are request-admission
+        // boundaries. Reject before dispatching typed or legacy handlers.
+        if let Some(forbidden) =
+            unsafe_origin_response(&request, stream.local_addr().ok(), public_origin.as_deref())
+        {
+            HttpServerState::write_response(&mut stream, &forbidden);
+            return;
+        }
+        let captured =
+            HttpRequestBindingInputs::capture(&request.path, &request.headers, &request.body);
+        if !session_csrf_allowed(&request, &captured) {
+            HttpServerState::write_response(
+                &mut stream,
+                &HttpResponse {
+                    status: 403,
+                    headers: vec![
+                        ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+                        ("Cache-Control".into(), "no-store".into()),
+                        ("X-Content-Type-Options".into(), "nosniff".into()),
+                    ],
+                    body: b"Invalid CSRF token".to_vec(),
+                },
+            );
+            return;
+        }
+
         let path = request.path.clone();
 
+        let mut protected_response = false;
         let mut response = if path.starts_with(Self::SSE_PATH_PREFIX) {
             let room = &path[Self::SSE_PATH_PREFIX.len()..];
             Self::serve_sse(room, &mut stream, shutdown.clone());
@@ -1035,32 +1860,129 @@ impl WebDevServer {
                 crate::web::dispatch::match_route(r, &request.path).map(|params| (r, params))
             })
         {
-            let captured =
-                HttpRequestBindingInputs::capture(&request.path, &request.headers, &request.body);
-            if let Some(response) = invalid_ui_action_response(&captured) {
+            // Only a registered guarded route can acquire a tenant identity.
+            // A raw tenant header, query value or cookie payload is never trusted.
+            let guard = tenant_guard
+                .as_deref()
+                .filter(|guard| guard.protects(route.route.method, &route.route.path));
+            protected_response = guard.is_some();
+            let authenticated = guard.map(|guard| guard.resolve(&request.headers));
+            if matches!(authenticated, Some(None)) {
+                HttpResponse {
+                    status: 401,
+                    headers: vec![
+                        ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+                        ("Cache-Control".into(), "no-store".into()),
+                        ("WWW-Authenticate".into(), "Session".into()),
+                    ],
+                    body: b"Authentication required".to_vec(),
+                }
+            } else if guard
+                .zip(authenticated.as_ref().and_then(|id| id.as_ref()))
+                .is_some_and(|(guard, principal)| {
+                    !guard.permits(principal, route.route.method, &route.route.path, &params)
+                })
+            {
+                HttpResponse {
+                    status: 403,
+                    headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+                    body: b"Forbidden".to_vec(),
+                }
+            } else if let Some(response) = invalid_ui_action_response(&captured) {
                 response
+            } else if let Some(error) = form_guards
+                .get(&(
+                    route.route.method.as_str().to_string(),
+                    route.route.path.clone(),
+                ))
+                .and_then(|guard| {
+                    guard
+                        .preflight(request.method.as_str(), &request.headers, &captured)
+                        .err()
+                })
+            {
+                match error {
+                    FormGuardError::Forbidden => HttpResponse {
+                        status: 403,
+                        headers: vec![
+                            ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+                            ("Cache-Control".into(), "no-store".into()),
+                        ],
+                        body: b"Forbidden".to_vec(),
+                    },
+                    FormGuardError::Validation(errors) => {
+                        let problem = form_validation_problem_response(&errors);
+                        let mut headers = problem.headers;
+                        headers.push(("Cache-Control".into(), "no-store".into()));
+                        HttpResponse {
+                            status: problem.status,
+                            headers,
+                            body: problem.body,
+                        }
+                    }
+                }
             } else {
                 let values = captured.values(&params, &request.headers);
                 let ctx = RequestContext {
                     request: request.clone(),
                     params: params.clone(),
                 };
-                let rendered =
-                    with_request_context(ctx, || match render_direct_request(route, &values) {
-                        Ok(Some(rendered)) => Ok(Some(rendered)),
-                        Ok(None) => Ok(render_route_handler(
-                            &route.route.handler_module,
-                            route.route.handler_func_idx,
-                            None,
-                        )),
-                        Err(error) => Err(error),
-                    });
+                let guard_key = (
+                    route.route.method.as_str().to_string(),
+                    route.route.path.clone(),
+                );
+                // Typed and legacy handlers share one request scope. Without it,
+                // typed form VM calls cannot mark Turbo Stream response metadata.
+                let verified_tenant = authenticated.flatten();
+                let rendered = with_request_context(ctx, || {
+                    with_verified_tenant(verified_tenant, || {
+                        if let Some(guard) =
+                            form_guards.get(&guard_key).filter(|guard| guard.is_typed())
+                        {
+                            guard
+                                .render_typed(route, &captured)
+                                .map(Some)
+                                .map_err(DirectRequestRenderError::Execution)
+                        } else {
+                            match render_direct_request(route, &values) {
+                                Ok(Some(rendered)) => Ok(Some(rendered)),
+                                Ok(None) => Ok(render_route_handler(
+                                    &route.route.handler_module,
+                                    route.route.handler_func_idx,
+                                    None,
+                                )),
+                                Err(error) => Err(error),
+                            }
+                        }
+                    })
+                });
+                // Turbo responses must retain their own MIME and avoid
+                // normal client-runtime injection.
+                let response_media_type = take_response_media_type();
                 match rendered {
-                    Ok(Some(html)) => HttpResponse {
-                        status: 200,
-                        headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())],
-                        body: inject_client_runtime_script(&html).into_bytes(),
-                    },
+                    Ok(Some(html)) => {
+                        let is_turbo =
+                            response_media_type == Some(crate::web::turbo::TURBO_STREAM_MIME);
+                        HttpResponse {
+                            status: 200,
+                            headers: vec![(
+                                "Content-Type".into(),
+                                if is_turbo {
+                                    format!(
+                                        "{}; charset=utf-8",
+                                        crate::web::turbo::TURBO_STREAM_MIME
+                                    )
+                                } else {
+                                    "text/html; charset=utf-8".into()
+                                },
+                            )],
+                            body: if is_turbo {
+                                html.into_bytes()
+                            } else {
+                                inject_client_runtime_script(&html).into_bytes()
+                            },
+                        }
+                    }
                     Ok(None) => HttpResponse {
                         status: 500,
                         headers: vec![("Content-Type".into(), "text/plain".into())],
@@ -1087,6 +2009,14 @@ impl WebDevServer {
         } else {
             Self::serve_static(static_dir.as_deref(), output_dir.as_deref(), &request.path)
         };
+        if protected_response {
+            response
+                .headers
+                .retain(|(name, _)| !name.eq_ignore_ascii_case("Cache-Control"));
+            response
+                .headers
+                .push(("Cache-Control".into(), "no-store".into()));
+        }
         for cookie in take_response_cookies() {
             response.headers.push(("Set-Cookie".into(), cookie));
         }
@@ -1206,6 +2136,473 @@ fn guess_content_type(path: &Path) -> &'static str {
 mod tests {
     use super::*;
 
+    fn response_wire_for_test(response: HttpResponse) -> String {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            HttpServerState::write_response(&mut socket, &response);
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut raw = String::new();
+        client.read_to_string(&mut raw).unwrap();
+        server.join().unwrap();
+        raw
+    }
+
+    #[test]
+    fn response_writer_rejects_untrusted_headers_and_framing() {
+        for (name, value) in [
+            ("X-Test\r\nX-Injected", "safe"),
+            ("X-Test", "safe\r\nX-Injected: yes"),
+            ("X-Test", "safe\0trailing"),
+            ("Content-Length", "1"),
+            ("Transfer-Encoding", "chunked"),
+        ] {
+            let response = response_wire_for_test(HttpResponse {
+                status: 200,
+                headers: vec![(name.into(), value.into())],
+                body: b"trusted".to_vec(),
+            });
+            assert!(
+                response.starts_with("HTTP/1.1 500 Internal Server Error"),
+                "{response}"
+            );
+            assert!(!response.contains("X-Injected"), "{response}");
+            assert!(!response.contains("trusted"), "{response}");
+            assert_eq!(response.matches("Content-Length:").count(), 1, "{response}");
+        }
+    }
+
+    #[test]
+    fn configured_public_origin_is_validated_before_listener_startup() {
+        for invalid in [
+            "http://app.example.com",
+            "https://app.example.com/path",
+            "https://app.example.com:wrong",
+            "https://app.example.com:",
+            "https://app.example.com:00000",
+            "https://[::1]:bad",
+            "https://",
+        ] {
+            let result = WebDevServer::bind_runtime_configured(
+                0,
+                None,
+                None,
+                vec![],
+                Some(invalid.to_string()),
+                WebServerOptions {
+                    max_concurrent_connections: 2,
+                    ..WebServerOptions::default()
+                },
+            );
+            assert!(
+                result.is_err(),
+                "invalid origin {invalid:?} must fail startup"
+            );
+        }
+
+        for origin in [
+            "https://app.example.com",
+            "https://app.example.com:8443",
+            "https://[::1]:8443",
+        ] {
+            let valid = WebDevServer::bind_runtime_configured(
+                0,
+                None,
+                None,
+                vec![],
+                Some(origin.to_string()),
+                WebServerOptions {
+                    max_concurrent_connections: 2,
+                    ..WebServerOptions::default()
+                },
+            );
+            assert!(valid.is_ok(), "valid HTTPS origin {origin:?} should bind");
+        }
+    }
+
+    #[test]
+    fn configured_public_origin_is_pinned_for_real_http_requests() {
+        let server = WebDevServer::bind_runtime_configured(
+            0,
+            None,
+            None,
+            vec![],
+            Some("https://app.example.com".to_string()),
+            WebServerOptions {
+                max_concurrent_connections: 2,
+                ..WebServerOptions::default()
+            },
+        )
+        .expect("valid proxy origin should allow startup");
+
+        let send = |host: &str, origin: &str| {
+            let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request = format!(
+                "POST /missing HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(request.as_bytes()).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        };
+
+        assert!(
+            send("app.example.com", "https://app.example.com")
+                .starts_with("HTTP/1.1 404 Not Found"),
+            "correctly scoped request should reach routing"
+        );
+        assert!(
+            send("app.example.com", "https://attacker.example")
+                .starts_with("HTTP/1.1 403 Forbidden"),
+            "foreign Origin must fail closed"
+        );
+        assert!(
+            send("attacker.example", "https://app.example.com")
+                .starts_with("HTTP/1.1 403 Forbidden"),
+            "foreign Host must fail closed"
+        );
+    }
+
+    #[test]
+    fn unauthenticated_cross_origin_post_cannot_reach_web_routing() {
+        let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let request = format!(
+            "POST /unsafe HTTP/1.1\r\nHost: localhost:{}\r\nOrigin: https://attacker.example\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            server.port
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden"),
+            "cross-origin unsafe request was not rejected: {response}"
+        );
+    }
+
+    #[test]
+    fn secure_session_token_is_unpredictable_and_256_bits() {
+        let a = secure_session_token().expect("OS entropy must be available");
+        let b = secure_session_token().expect("OS entropy must be available");
+        assert_eq!(a.len(), 64); // 32 random bytes in lowercase hex
+        assert!(a.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn web_dev_server_fences_cross_origin_mutations_before_dispatch() {
+        fn send(port: u16, raw: &str) -> String {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream.write_all(raw.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        }
+
+        let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
+        let host = format!("localhost:{}", server.port);
+        // A cross-origin script can DNS-rebind attacker.example to localhost.
+        // Read-only routes must reject that Host before any page or SSE dispatch.
+        let rebound_read = format!(
+            "GET / HTTP/1.1\r\nHost: attacker.example:{}\r\n\r\n",
+            server.port
+        );
+        assert!(
+            send(server.port, &rebound_read).starts_with("HTTP/1.1 403 Forbidden"),
+            "read routes must reject DNS-rebound hosts"
+        );
+
+        let trusted_read = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        assert!(
+            send(server.port, &trusted_read).starts_with("HTTP/1.1 404 Not Found"),
+            "valid read requests must reach normal routing"
+        );
+
+        let rebound_sse = format!(
+            "GET /__nulang/sse/room HTTP/1.1\r\nHost: attacker.example:{}\r\n\r\n",
+            server.port
+        );
+        assert!(
+            send(server.port, &rebound_sse).starts_with("HTTP/1.1 403 Forbidden"),
+            "SSE must reject an untrusted Host before subscribing"
+        );
+
+        let missing_host = "GET / HTTP/1.1\r\nConnection: close\r\n\r\n";
+        assert!(
+            send(server.port, missing_host).starts_with("HTTP/1.1 400 Bad Request"),
+            "HTTP/1.1 framing must reject missing Host before Web admission"
+        );
+
+        let foreign = format!(
+            "POST /mutation HTTP/1.1\r\nHost: {host}\r\nOrigin: https://attacker.example\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(send(server.port, &foreign).starts_with("HTTP/1.1 403 Forbidden"));
+
+        let missing =
+            format!("POST /mutation HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\n\r\n");
+        assert!(send(server.port, &missing).starts_with("HTTP/1.1 403 Forbidden"));
+
+        let trusted = format!(
+            "POST /mutation HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(
+            send(server.port, &trusted).starts_with("HTTP/1.1 404 Not Found"),
+            "same-origin requests must reach normal routing"
+        );
+
+        let duplicate = format!(
+            "POST /mutation HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nOrigin: https://attacker.example\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(send(server.port, &duplicate).starts_with("HTTP/1.1 403 Forbidden"));
+
+        let unknown = format!("TRACE / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        assert!(send(server.port, &unknown).starts_with("HTTP/1.1 501 Not Implemented"));
+    }
+
+    #[test]
+    fn web_dev_server_requires_origin_and_csrf_together_over_tcp() {
+        use std::io::{Read, Write};
+        use std::net::{Shutdown, TcpStream};
+
+        let session = secure_session_token().unwrap();
+        let csrf = secure_session_token().unwrap();
+        let key = format!("nulang_auth:csrf:{session}");
+        kv_set(&key, &csrf);
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                kv_delete(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(key);
+        let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
+        let host = format!("localhost:{}", server.port);
+        let send = |origin: Option<&str>, csrf_header: Option<&str>, cookie: bool| {
+            let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = format!("POST /mutate HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\nConnection: close\r\n");
+            if let Some(origin) = origin {
+                request.push_str(&format!("Origin: {origin}\r\n"));
+            }
+            if let Some(token) = csrf_header {
+                request.push_str(&format!("X-CSRF-Token: {token}\r\n"));
+            }
+            if cookie {
+                request.push_str(&format!("Cookie: nulang_session={session}\r\n"));
+            }
+            request.push_str("\r\n");
+            stream.write_all(request.as_bytes()).unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        };
+        let trusted = format!("http://{host}");
+        assert!(send(Some(&trusted), Some(&csrf), true).starts_with("HTTP/1.1 404 Not Found"));
+        assert!(send(Some(&trusted), None, true).starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(send(Some("https://attacker.example"), Some(&csrf), true)
+            .starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(send(None, Some(&csrf), true).starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(send(Some("https://attacker.example"), None, false)
+            .starts_with("HTTP/1.1 403 Forbidden"));
+    }
+
+    #[test]
+    fn session_mutations_need_a_valid_bound_csrf_token() {
+        let session = secure_session_token().unwrap();
+        let csrf = secure_session_token().unwrap();
+        let key = format!("nulang_auth:csrf:{session}");
+        kv_set(&key, &csrf);
+
+        let request =
+            |method: HttpMethod, headers: Vec<(String, String)>, body: &str| HttpRequest {
+                method,
+                path: "/logout".into(),
+                headers,
+                body: body.as_bytes().to_vec(),
+            };
+        let cookie = ("Cookie".into(), format!("nulang_session={session}"));
+        let form_type = (
+            "Content-Type".into(),
+            "application/x-www-form-urlencoded".into(),
+        );
+
+        let missing = request(HttpMethod::Post, vec![cookie.clone()], "");
+        let captured =
+            HttpRequestBindingInputs::capture(&missing.path, &missing.headers, &missing.body);
+        assert!(!session_csrf_allowed(&missing, &captured));
+
+        let valid_form = request(
+            HttpMethod::Post,
+            vec![cookie.clone(), form_type.clone()],
+            &format!("_csrf={csrf}"),
+        );
+        let captured = HttpRequestBindingInputs::capture(
+            &valid_form.path,
+            &valid_form.headers,
+            &valid_form.body,
+        );
+        assert!(session_csrf_allowed(&valid_form, &captured));
+
+        let header = request(
+            HttpMethod::Post,
+            vec![cookie.clone(), ("X-CSRF-Token".into(), csrf.clone())],
+            "",
+        );
+        let captured =
+            HttpRequestBindingInputs::capture(&header.path, &header.headers, &header.body);
+        assert!(session_csrf_allowed(&header, &captured));
+
+        let duplicate = request(
+            HttpMethod::Post,
+            vec![cookie.clone(), form_type],
+            &format!("_csrf={csrf}&_csrf=forged"),
+        );
+        let captured =
+            HttpRequestBindingInputs::capture(&duplicate.path, &duplicate.headers, &duplicate.body);
+        assert!(!session_csrf_allowed(&duplicate, &captured));
+
+        let forged = request(
+            HttpMethod::Post,
+            vec![cookie.clone(), ("X-CSRF-Token".into(), "forged".into())],
+            "",
+        );
+        let captured =
+            HttpRequestBindingInputs::capture(&forged.path, &forged.headers, &forged.body);
+        assert!(!session_csrf_allowed(&forged, &captured));
+
+        let read = request(HttpMethod::Get, vec![cookie.clone()], "");
+        let captured = HttpRequestBindingInputs::capture(&read.path, &read.headers, &read.body);
+        assert!(session_csrf_allowed(&read, &captured));
+
+        let anonymous = request(HttpMethod::Post, vec![], "");
+        let captured =
+            HttpRequestBindingInputs::capture(&anonymous.path, &anonymous.headers, &anonymous.body);
+        assert!(session_csrf_allowed(&anonymous, &captured));
+
+        kv_delete(&key);
+        let captured =
+            HttpRequestBindingInputs::capture(&header.path, &header.headers, &header.body);
+        assert!(!session_csrf_allowed(&header, &captured));
+    }
+
+    #[test]
+    fn web_dev_server_rejects_missing_session_csrf_over_real_tcp() {
+        use std::io::{Read, Write};
+        use std::net::{Shutdown, TcpStream};
+
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                kv_delete(&self.0);
+            }
+        }
+
+        let session = secure_session_token().unwrap();
+        let csrf = secure_session_token().unwrap();
+        let key = format!("nulang_auth:csrf:{session}");
+        kv_set(&key, &csrf);
+        let _cleanup = Cleanup(key);
+        // Even without a registered route, the admission boundary runs before
+        // dispatch. A valid token reaches the normal 404 fallback instead.
+        let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
+
+        let send = |csrf_header: Option<&str>| {
+            let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = format!(
+                "POST /mutate HTTP/1.1\r\nHost: localhost:{}\r\nOrigin: http://localhost:{}\r\nCookie: nulang_session={}\r\nContent-Length: 0\r\nConnection: close\r\n",
+                server.port, server.port, session
+            );
+            if let Some(value) = csrf_header {
+                request.push_str(&format!("X-CSRF-Token: {value}\r\n"));
+            }
+            request.push_str("\r\n");
+            stream.write_all(request.as_bytes()).unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        };
+
+        assert!(send(None).starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(send(Some("forged")).starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(send(Some(&csrf)).starts_with("HTTP/1.1 404 Not Found"));
+    }
+
+    #[test]
+    fn session_cookies_are_secure_http_only_and_expire_on_clear() {
+        let ctx = RequestContext {
+            request: HttpRequest {
+                method: HttpMethod::Get,
+                path: "/".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+        with_request_context(ctx, || {
+            set_cookie("nulang_session", "random-token");
+            clear_cookie("nulang_session");
+            let cookies = take_response_cookies();
+            assert_eq!(cookies.len(), 2);
+            assert!(cookies.iter().all(|cookie| cookie.contains("; Secure")));
+            assert!(cookies.iter().all(|cookie| cookie.contains("; HttpOnly")));
+            assert!(cookies[0].contains("; SameSite=Lax"));
+            assert!(cookies[1].contains("; Max-Age=0"));
+        });
+    }
+
+    #[test]
+    fn session_cookie_helpers_reject_header_and_attribute_injection() {
+        let ctx = RequestContext {
+            request: HttpRequest {
+                method: HttpMethod::Get,
+                path: "/".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+        with_request_context(ctx, || {
+            set_cookie("good_token", "abc.def_123-xyz");
+            set_cookie("bad\r\nX-Injected", "token");
+            set_cookie("bad; Domain=attacker.test", "token");
+            set_cookie("session", "safe\r\nSet-Cookie: admin=1");
+            set_cookie("session", "safe; SameSite=None");
+            clear_cookie("bad\r\nSet-Cookie: admin=1");
+            clear_cookie("good_token");
+            let cookies = take_response_cookies();
+            assert_eq!(
+                cookies.len(),
+                2,
+                "malformed cookie names and values must not be emitted"
+            );
+            assert!(cookies[0].starts_with("good_token=abc.def_123-xyz;"));
+            assert!(cookies[1].starts_with("good_token=;"));
+        });
+    }
+
     // A deterministic reader forces TCP-like fragmentation without sleeps.
     struct FixedChunkReader<'a> {
         remaining: &'a [u8],
@@ -1278,6 +2675,147 @@ mod tests {
     }
 
     #[test]
+    fn http_ingress_rejects_duplicate_or_missing_host_before_dispatch() {
+        for raw in [
+            &b"GET / HTTP/1.1\r\n\r\n"[..],
+            &b"POST /unsafe HTTP/1.1\r\nHost: localhost\r\nhost: attacker.test\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"GET / HTTP/1.1\r\nHost: local,evil.test\r\n\r\n"[..],
+        ] {
+            assert_eq!(
+                read_http_request(&mut chunks(raw, 2)).unwrap_err(),
+                HttpReadError::BadRequest,
+                "invalid Host must be rejected at ingress"
+            );
+        }
+    }
+
+    #[test]
+    fn http_ingress_normalizes_absolute_target_and_rejects_fragments() {
+        let raw =
+            b"GET https://localhost:8080/users?limit=7 HTTP/1.1\r\nHost: attacker.test\r\n\r\n";
+        let request = read_http_request(&mut chunks(raw, 3)).unwrap().unwrap();
+        assert_eq!(request.path, "/users?limit=7");
+        assert_eq!(
+            request
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+                .map(|(_, value)| value.as_str()),
+            Some("localhost:8080")
+        );
+        let fragment = b"GET /users#danger HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        assert_eq!(
+            read_http_request(&mut chunks(fragment, 2)).unwrap_err(),
+            HttpReadError::BadRequest
+        );
+    }
+
+    #[test]
+    fn http_request_requires_single_host_for_http_11() {
+        for raw in [
+            &b"GET /resource HTTP/1.1\r\n\r\n"[..],
+            &b"GET /resource HTTP/1.1\r\nHost: first.example\r\nhost: second.example\r\n\r\n"[..],
+            &b"GET /resource HTTP/1.1\r\nHost: first.example, second.example\r\n\r\n"[..],
+            &b"GET /resource HTTP/1.1\r\nHost: bad host\r\n\r\n"[..],
+            &b"GET /resource HTTP/1.1\r\nHost: \xff\r\n\r\n"[..],
+        ] {
+            assert_eq!(
+                read_http_request(&mut chunks(raw, 3)).unwrap_err(),
+                HttpReadError::BadRequest,
+                "invalid or ambiguous HTTP/1.1 Host must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn http_request_accepts_single_host_and_legacy_http_10() {
+        let http11 = read_http_request(&mut chunks(
+            b"GET /resource?limit=1 HTTP/1.1\r\nHost: api.example:8080\r\n\r\n",
+            2,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(http11.path, "/resource?limit=1");
+
+        // HTTP/1.0 did not require Host; keep compatibility with legacy clients.
+        let http10 = read_http_request(&mut chunks(b"GET /legacy HTTP/1.0\r\n\r\n", 2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(http10.path, "/legacy");
+    }
+
+    #[test]
+    fn http_request_rejects_invalid_versions_and_fragments() {
+        for raw in [
+            &b"GET / HTTP/2.0\r\nHost: localhost\r\n\r\n"[..],
+            &b"GET /resource#fragment HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+            &b"GET http://example.test/a#fragment HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+        ] {
+            assert_eq!(
+                read_http_request(&mut chunks(raw, 4)).unwrap_err(),
+                HttpReadError::BadRequest,
+                "invalid request lines must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn http_request_preserves_absolute_form_and_empty_host_for_routing() {
+        // RFC 9112: an origin host accepts absolute-form, routes its path,
+        // and uses request-target authority instead of a conflicting Host.
+        let absolute = read_http_request(&mut chunks(
+            b"GET http://example.test/resource?x=1 HTTP/1.1\r\nHost: mismatch.test\r\n\r\n",
+            4,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(absolute.path, "/resource?x=1");
+        let effective_host = absolute
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("host"))
+            .map(|(_, value)| value.as_str());
+        assert_eq!(effective_host, Some("example.test"));
+
+        // A URI with no explicit path still routes to '/'.
+        let no_path = read_http_request(&mut chunks(
+            b"GET HTTP://example.test?x=1 HTTP/1.1\r\nHost: ignored.test\r\n\r\n",
+            4,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(no_path.path, "/?x=1");
+        let effective_host = no_path
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("host"))
+            .map(|(_, value)| value.as_str());
+        assert_eq!(effective_host, Some("example.test"));
+
+        // Empty Host is permitted when the target has no URI authority.
+        let empty_host =
+            read_http_request(&mut chunks(b"GET /resource HTTP/1.1\r\nHost: \r\n\r\n", 4))
+                .unwrap()
+                .unwrap();
+        assert_eq!(empty_host.path, "/resource");
+    }
+
+    #[test]
+    fn http_request_rejects_ambiguous_absolute_form_authorities() {
+        for raw in [
+            &b"GET http:///missing HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+            &b"GET http://user@host.example/private HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+            &b"GET http://bad\\host.example/private HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+            &b"GET unknown://host.example/private HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+        ] {
+            assert_eq!(
+                read_http_request(&mut chunks(raw, 4)).unwrap_err(),
+                HttpReadError::BadRequest,
+            );
+        }
+    }
+
+    #[test]
     fn http_request_reassembles_fragmented_headers_and_exact_body() {
         let raw = b"POST /submit HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
         let request = read_http_request(&mut chunks(raw, 3)).unwrap().unwrap();
@@ -1328,7 +2866,7 @@ mod tests {
 
     #[test]
     fn http_request_rejects_oversized_payload_from_declared_length() {
-        let raw = b"POST / HTTP/1.1\r\nContent-Length: 1048577\r\n\r\n";
+        let raw = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1048577\r\n\r\n";
         assert_eq!(
             read_http_request(&mut chunks(raw, 32)).unwrap_err(),
             HttpReadError::PayloadTooLarge
@@ -1356,9 +2894,109 @@ mod tests {
 
     #[test]
     fn http_request_does_not_consume_pipelined_bytes_as_body() {
-        let raw = b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nokGET / HTTP/1.1\r\n\r\n";
+        let raw =
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\nokGET / HTTP/1.1\r\n\r\n";
         let request = read_http_request(&mut chunks(raw, 128)).unwrap().unwrap();
         assert_eq!(request.body, b"ok");
+    }
+
+    #[test]
+    fn test_web_connection_slots_interrupt_sockets_and_wait_for_drain() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        let slots = Arc::new(ConnectionSlots::new(1));
+        let lease = slots
+            .try_acquire_socket(&accepted)
+            .unwrap()
+            .expect("one active socket");
+        assert!(slots.try_acquire_socket(&accepted).unwrap().is_none());
+
+        slots.interrupt_active();
+        let mut data = [0_u8; 1];
+        let read = peer.read(&mut data);
+        assert!(
+            matches!(read, Ok(0))
+                || matches!(read, Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset),
+            "registered sockets must be interrupted, got {read:?}"
+        );
+        assert!(!slots.wait_for_drain(Duration::from_millis(1)));
+        drop(lease);
+        assert!(slots.wait_for_drain(Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn web_host_options_reject_invalid_capacity_before_binding() {
+        let options = WebServerOptions {
+            max_concurrent_connections: 0,
+            ..WebServerOptions::default()
+        };
+        let error =
+            WebDevServer::bind_runtime_with_options(0, None, None, vec![], options).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn web_host_options_reject_zero_and_excessive_timeouts() {
+        let defaults = WebServerOptions::default();
+        assert!(defaults.validate().is_ok());
+
+        assert!(WebServerOptions {
+            read_timeout: Duration::ZERO,
+            ..defaults
+        }
+        .validate()
+        .is_err());
+        assert!(WebServerOptions {
+            write_timeout: Duration::from_secs(301),
+            ..defaults
+        }
+        .validate()
+        .is_err());
+        assert!(WebServerOptions {
+            max_concurrent_connections: 513,
+            ..defaults
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn web_host_options_enforce_custom_connection_capacity_over_http() {
+        let options = WebServerOptions {
+            max_concurrent_connections: 1,
+            ..WebServerOptions::default()
+        };
+        let server =
+            WebDevServer::bind_runtime_with_options(0, None, None, vec![], options).unwrap();
+        let mut first = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        first
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        first
+            .write_all(b"GET /__nulang/sse/lease HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut buffer = [0; 128];
+        let read = first.read(&mut buffer).unwrap();
+        assert!(
+            String::from_utf8_lossy(&buffer[..read]).starts_with("HTTP/1.1 200"),
+            "the SSE worker must own the capacity lease"
+        );
+
+        let mut second = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        second
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        second
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let read = second.read(&mut buffer).unwrap();
+        assert!(
+            String::from_utf8_lossy(&buffer[..read]).starts_with("HTTP/1.1 503"),
+            "custom capacity must reject excess requests"
+        );
+        drop(server);
     }
 
     #[test]
@@ -1483,6 +3121,42 @@ mod tests {
         assert!(String::from_utf8(response.body)
             .unwrap()
             .contains("Invalid UI action envelope"));
+    }
+
+    #[test]
+    fn turbo_mime_is_only_selected_inside_the_current_request() {
+        fn context() -> RequestContext {
+            RequestContext {
+                request: HttpRequest {
+                    method: HttpMethod::Post,
+                    path: "/todos".to_string(),
+                    headers: vec![],
+                    body: vec![],
+                },
+                params: HashMap::new(),
+            }
+        }
+
+        mark_turbo_stream_response();
+        assert_eq!(take_response_media_type(), None);
+
+        with_request_context(context(), || {
+            mark_turbo_stream_response();
+            assert_eq!(
+                take_response_media_type(),
+                Some(crate::web::turbo::TURBO_STREAM_MIME)
+            );
+            mark_turbo_stream_response();
+        });
+        assert_eq!(
+            take_response_media_type(),
+            Some(crate::web::turbo::TURBO_STREAM_MIME)
+        );
+
+        with_request_context(context(), || {
+            assert_eq!(take_response_media_type(), None);
+        });
+        assert_eq!(take_response_media_type(), None);
     }
 
     #[test]

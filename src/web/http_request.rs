@@ -5,7 +5,7 @@
 //! coupling the decoder to the runtime server implementation.
 
 use crate::web::request_bindings::{
-    parse_cookie_header, parse_urlencoded, split_request_target, RequestBindingValues,
+    parse_cookie_header, parse_urlencoded_multi, split_request_target_multi, RequestBindingValues,
 };
 use nulang_ui_protocol::{decode_host_message, ActionPlacement, HostToRuntimeMessage};
 use std::collections::HashMap;
@@ -42,10 +42,10 @@ impl std::fmt::Display for UiActionEnvelopeError {
 /// Owned HTTP request data derived once per matched route.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HttpRequestBindingInputs {
-    pub query: HashMap<String, String>,
+    pub query: HashMap<String, Vec<String>>,
     pub cookies: HashMap<String, String>,
     pub body: Option<String>,
-    pub form: HashMap<String, String>,
+    pub form: HashMap<String, Vec<String>>,
     /// Validated renderer-neutral UI/action message carried alongside a
     /// compatibility form submission. Invalid or unsupported envelopes are
     /// ignored rather than becoming runtime authority.
@@ -62,7 +62,7 @@ impl HttpRequestBindingInputs {
     /// must not be reinterpreted as form data merely because a handler declares
     /// a form binding.
     pub fn capture(target: &str, headers: &[(String, String)], body: &[u8]) -> Self {
-        let (_, query) = split_request_target(target);
+        let (_, query) = split_request_target_multi(target);
 
         let mut cookies = HashMap::new();
         for (_, value) in headers
@@ -74,7 +74,7 @@ impl HttpRequestBindingInputs {
 
         let body_text = (!body.is_empty()).then(|| String::from_utf8_lossy(body).into_owned());
         let form = if is_urlencoded_form(headers) {
-            parse_urlencoded(body)
+            parse_urlencoded_multi(body)
         } else {
             HashMap::new()
         };
@@ -109,11 +109,22 @@ impl HttpRequestBindingInputs {
 }
 
 fn capture_ui_action_message(
-    form: &HashMap<String, String>,
+    form: &HashMap<String, Vec<String>>,
 ) -> (Option<HostToRuntimeMessage>, Option<UiActionEnvelopeError>) {
     let Some(encoded) = form.get("__nulang_ui_message") else {
         return (None, None);
     };
+    // Never let a duplicate action envelope or identity pick a last-wins
+    // value. This protects the renderer-neutral action authority boundary.
+    let [encoded] = encoded.as_slice() else {
+        return (None, Some(UiActionEnvelopeError::Malformed));
+    };
+    if form
+        .get("__nulang_action")
+        .is_some_and(|values| values.len() != 1)
+    {
+        return (None, Some(UiActionEnvelopeError::Malformed));
+    }
 
     let Ok(message) = decode_host_message(encoded) else {
         return (None, Some(UiActionEnvelopeError::Malformed));
@@ -127,7 +138,10 @@ fn capture_ui_action_message(
         return (None, Some(UiActionEnvelopeError::ClientPlacement));
     }
 
-    if let Some(legacy_action) = form.get("__nulang_action") {
+    if let Some(legacy_action) = form
+        .get("__nulang_action")
+        .and_then(|values| values.first())
+    {
         if legacy_action != request.action_id.as_str() {
             return (
                 None,
@@ -175,10 +189,13 @@ mod tests {
             b"title=hello+world",
         );
 
-        assert_eq!(captured.query.get("limit").map(String::as_str), Some("25"));
         assert_eq!(
-            captured.query.get("term").map(String::as_str),
-            Some("hello world")
+            captured.query.get("limit").map(Vec::as_slice),
+            Some(&["25".to_string()][..])
+        );
+        assert_eq!(
+            captured.query.get("term").map(Vec::as_slice),
+            Some(&["hello world".to_string()][..])
         );
         assert_eq!(
             captured.cookies.get("theme").map(String::as_str),
@@ -186,8 +203,8 @@ mod tests {
         );
         assert_eq!(captured.body.as_deref(), Some("title=hello+world"));
         assert_eq!(
-            captured.form.get("title").map(String::as_str),
-            Some("hello world")
+            captured.form.get("title").map(Vec::as_slice),
+            Some(&["hello world".to_string()][..])
         );
     }
 
@@ -201,8 +218,8 @@ mod tests {
         );
 
         assert_eq!(
-            captured.query.get("active").map(String::as_str),
-            Some("true")
+            captured.query.get("active").map(Vec::as_slice),
+            Some(&["true".to_string()][..])
         );
         assert!(captured.form.is_empty());
         assert!(captured.body.is_some());
@@ -322,6 +339,47 @@ mod tests {
         assert_eq!(
             captured.ui_message_error,
             Some(UiActionEnvelopeError::ClientPlacement)
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_ui_action_envelope_without_selecting_an_identity() {
+        let message = nulang_ui_protocol::HostToRuntimeMessage::invoke_action(
+            nulang_ui_protocol::ActionRequest {
+                document_id: "app".into(),
+                revision: nulang_ui_protocol::Revision(1),
+                action_id: "save".into(),
+                placement: nulang_ui_protocol::ActionPlacement::Server,
+                correlation_id: "corr-1".into(),
+                idempotency_key: "idem-1".into(),
+                payload: nulang_ui_protocol::WireValue::Null,
+            },
+        );
+        let encoded =
+            percent_encode_form_value(&nulang_ui_protocol::encode_host_message(&message).unwrap());
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        // A last-wins parser would accept either of these ambiguous requests.
+        let duplicate_envelope =
+            format!("__nulang_ui_message={encoded}&__nulang_ui_message={encoded}");
+        let captured =
+            HttpRequestBindingInputs::capture("/", &headers, duplicate_envelope.as_bytes());
+        assert_eq!(captured.ui_message, None);
+        assert_eq!(
+            captured.ui_message_error,
+            Some(UiActionEnvelopeError::Malformed)
+        );
+
+        let duplicate_identity =
+            format!("__nulang_action=save&__nulang_action=save&__nulang_ui_message={encoded}");
+        let captured =
+            HttpRequestBindingInputs::capture("/", &headers, duplicate_identity.as_bytes());
+        assert_eq!(captured.ui_message, None);
+        assert_eq!(
+            captured.ui_message_error,
+            Some(UiActionEnvelopeError::Malformed)
         );
     }
 
