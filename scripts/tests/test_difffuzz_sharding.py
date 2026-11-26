@@ -79,6 +79,39 @@ if [[ -n "${FUZZ_SLEEP:-}" ]]; then sleep "$FUZZ_SLEEP"; fi
         self.assertEqual(result.returncode, 2)
         self.assertEqual(self.invocations(), [])
 
+    def test_exact_batch_multiple_does_not_schedule_empty_tail(self):
+        result = self.run_fuzz("--seeds", "1600")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.invocations(), ["0,800,", "800,800,"])
+
+    def test_zero_requested_seeds_does_not_invoke_fuzzer(self):
+        result = self.run_fuzz("--seeds", "0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.invocations(), [])
+        self.assertIn("scheduled 0 of 0 seeds", result.stderr)
+
+    def test_zero_time_budget_does_not_invoke_fuzzer(self):
+        result = self.run_fuzz("--seeds", "800", "--time", "0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.invocations(), [])
+        self.assertIn("scheduled 0 of 800 seeds", result.stderr)
+
+    def test_decimal_arguments_with_leading_zeros_are_not_octal(self):
+        result = self.run_fuzz("--seeds", "0009", "--seed-base", "0008", "--batch-size", "0004")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.invocations(), ["8,4,", "12,4,", "16,1,"])
+
+    def test_hex_seed_wraps_inside_batch_boundary(self):
+        result = self.run_fuzz("--seeds", "5", "--seed-base", "0xffffffffffffffff", "--batch-size", "2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.invocations(), ["18446744073709551615,2,", "1,2,", "3,1,"])
+
+    def test_first_batch_failure_never_schedules_second_batch(self):
+        result = self.run_fuzz("--seeds", "801", FAIL_AT_BASE="0")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(self.invocations(), ["0,800,"])
+        self.assertNotIn("complete;", result.stderr)
+
     def test_release_build_invokes_release_binary(self):
         release = self.root / "target" / "release"
         release.mkdir()
