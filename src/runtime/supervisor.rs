@@ -323,7 +323,7 @@ impl Supervisor {
         };
         let new_id = fresh_actor_id();
         let child_name = format!("{}_child_{}", self.name, spec.id);
-        let mut new_actor = Actor::new(new_id, child_name, 0);
+        let mut new_actor = Actor::new(new_id, child_name, runtime.default_mailbox_capacity);
 
         // Hydrate durable state from the persistence store if a snapshot
         // exists for the old actor.  On first spawn there is no snapshot,

@@ -8710,3 +8710,119 @@ fn confirmed_node_removal_forgets_crdt_receiver_knowledge() {
         "a peer that rejoins after confirmed removal must receive full state"
     );
 }
+
+// Hosted runtimes can opt into a finite normal-message budget without
+// changing the standalone/runtime compatibility default.
+#[test]
+fn hosted_mailbox_capacity_is_opt_in_and_backpressures_normal_messages() {
+    let mut legacy = Runtime::new();
+    let legacy_id = legacy.spawn_actor(Box::new(Vec::new));
+    assert_eq!(legacy.actors[&legacy_id].mailbox.capacity(), 0);
+
+    let mut hosted = Runtime::with_default_mailbox_capacity(1);
+    let id = hosted.spawn_actor(Box::new(Vec::new));
+    let actor = hosted.actors.get_mut(&id).unwrap();
+    assert_eq!(actor.mailbox.capacity(), 1);
+    let message = Message {
+        behavior_id: 0,
+        payload: MessagePayload::from_slice(&[]),
+        sender: 1,
+        priority: MessagePriority::Normal,
+        trace_id: None,
+    };
+    assert!(actor.mailbox.push(message.clone()).is_ok());
+    assert!(actor.mailbox.push(message.clone()).is_err());
+    assert_eq!(actor.mailbox.len(), 1);
+
+    // Supervision/control messages retain their pre-existing bypass contract.
+    let system_message = Message {
+        priority: MessagePriority::System,
+        ..message
+    };
+    assert!(actor.mailbox.push(system_message).is_ok());
+}
+
+#[test]
+fn hosted_mailbox_capacity_survives_actor_pool_reuse_and_persistent_recovery() {
+    let mut rt = Runtime::with_default_mailbox_capacity(3);
+    let pooled_id = rt.spawn_actor(Box::new(Vec::new));
+    rt.actor_pool.push(rt.actors.remove(&pooled_id).unwrap());
+    let recycled_id = rt.spawn_actor(Box::new(Vec::new));
+    assert_eq!(rt.actors[&recycled_id].mailbox.capacity(), 3);
+
+    let durable_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
+    assert_eq!(rt.actors[&durable_id].mailbox.capacity(), 3);
+    rt.checkpoint_actor(durable_id);
+    rt.actors.remove(&durable_id);
+    assert_eq!(rt.recover_actor(durable_id), Some(durable_id));
+    assert_eq!(rt.actors[&durable_id].mailbox.capacity(), 3);
+
+    let supervisor_id = rt.create_supervisor("hosted-supervisor", RestartStrategy::OneForOne);
+    assert_eq!(rt.actors[&supervisor_id].mailbox.capacity(), 3);
+}
+
+#[test]
+fn hosted_mailbox_capacity_applies_to_every_shard_and_single_shard_fast_path() {
+    for count in [1, 4] {
+        let mut legacy = Runtime::new_sharded(count);
+        assert_eq!(legacy.len(), count);
+        for shard in &mut legacy {
+            let id = shard.spawn_actor(Box::new(Vec::new));
+            assert_eq!(shard.actors[&id].mailbox.capacity(), 0);
+        }
+
+        let mut hosted = Runtime::new_sharded_with_default_mailbox_capacity(count, 2);
+        assert_eq!(hosted.len(), count);
+        for shard in &mut hosted {
+            let id = shard.spawn_actor(Box::new(Vec::new));
+            let actor = shard.actors.get_mut(&id).unwrap();
+            assert_eq!(actor.mailbox.capacity(), 2);
+            let message = Message {
+                behavior_id: 0,
+                payload: MessagePayload::from_slice(&[]),
+                sender: 1,
+                priority: MessagePriority::Normal,
+                trace_id: None,
+            };
+            assert!(actor.mailbox.push(message.clone()).is_ok());
+            assert!(actor.mailbox.push(message.clone()).is_ok());
+            assert!(actor.mailbox.push(message.clone()).is_err());
+            assert!(actor
+                .mailbox
+                .push(Message {
+                    priority: MessagePriority::System,
+                    ..message
+                })
+                .is_ok());
+        }
+    }
+}
+
+#[test]
+fn hosted_mailbox_capacity_cross_shard_ack_is_channel_only() {
+    let mut shards = Runtime::new_sharded_with_default_mailbox_capacity(2, 1);
+    let mut target = shards[1].spawn_actor(Box::new(Vec::new));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(Vec::new));
+    }
+    assert_eq!(shards[1].actors[&target].mailbox.capacity(), 1);
+
+    // Both sends enter the channel before the receiver drains it. Acceptance
+    // here is not a reservation of a destination mailbox slot.
+    for payload in [1, 2] {
+        assert_eq!(
+            shards[0].send_cross_shard_message(target, 0, vec![Value::int(payload)], None, None),
+            MessageAdmission::Accepted
+        );
+    }
+    assert_eq!(shards[1].actors[&target].mailbox.len(), 0);
+    assert_eq!(shards[1].dlq_depth(), 0);
+
+    shards[1].drain_cross_shard_messages();
+    assert_eq!(shards[1].actors[&target].mailbox.len(), 1);
+    assert_eq!(
+        shards[1].dlq_depth(),
+        1,
+        "the second accepted transport envelope becomes a dead-letter notification"
+    );
+}

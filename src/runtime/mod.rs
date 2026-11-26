@@ -353,6 +353,8 @@ pub(crate) enum MessageAdmission {
 }
 
 pub struct Runtime {
+    /// Capacity of ordinary actor mailboxes spawned or recovered here; zero retains legacy unbounded behavior.
+    pub(crate) default_mailbox_capacity: usize,
     pub actors: HashMap<u64, Actor>,
     pub supervisors: HashMap<u64, Supervisor>,
     pub scheduler: Scheduler,
@@ -640,8 +642,20 @@ impl crate::backends::ForeignInterop for NoOpForeignInterop {
 }
 
 impl Runtime {
+    /// Construct a runtime with an opt-in cap on normal/bulk messages per actor.
+    ///
+    /// Zero is the historical unbounded default. System messages bypass the cap
+    /// to preserve supervisor progress. The internal dead-letter mailbox is
+    /// exempt, so this is NOT a complete process-wide memory limit.
+    pub fn with_default_mailbox_capacity(capacity: usize) -> Self {
+        let mut runtime = Self::new();
+        runtime.default_mailbox_capacity = capacity;
+        runtime
+    }
+
     pub fn new() -> Self {
         Runtime {
+            default_mailbox_capacity: 0,
             actors: HashMap::new(),
             supervisors: HashMap::new(),
             scheduler: Scheduler::new(4),
@@ -785,9 +799,26 @@ impl Runtime {
     /// Cross-shard messages carry only value types (no heap pointers), keeping
     /// ORCA reference counting local to each shard.
     pub fn new_sharded(num_shards: usize) -> Vec<Runtime> {
+        Self::new_sharded_with_default_mailbox_capacity(num_shards, 0)
+    }
+
+    /// Create sharded runtimes with the same opt-in per-actor mailbox capacity
+    /// on every shard. Zero preserves the unbounded legacy default.
+    /// System messages and internal dead-letter mailboxes remain exempt.
+    ///
+    /// Cross-shard sends acknowledge admission to the transport channel, not
+    /// the destination actor's mailbox. If that mailbox is full when the
+    /// destination drains the channel, a dead-letter notification is generated;
+    /// there is no synchronous destination-capacity backpressure or replay of
+    /// the rejected payload. Hosted callers needing that guarantee must use
+    /// an explicit acknowledgment protocol.
+    pub fn new_sharded_with_default_mailbox_capacity(
+        num_shards: usize,
+        capacity: usize,
+    ) -> Vec<Runtime> {
         assert!(num_shards > 0, "num_shards must be >= 1");
         if num_shards == 1 {
-            return vec![Runtime::new()];
+            return vec![Runtime::with_default_mailbox_capacity(capacity)];
         }
 
         // Create a sync_channel per shard (bounded, 1024 messages deep).
@@ -802,13 +833,15 @@ impl Runtime {
         let object_store = ObjectStore::new();
         let mut shards = Vec::with_capacity(num_shards);
         for (i, (_tx, rx)) in channels.into_iter().enumerate() {
-            shards.push(Runtime::new_shard(
+            let mut shard = Runtime::new_shard(
                 i as u16,
                 num_shards as u16,
                 senders.clone(),
                 rx,
                 object_store.clone(),
-            ));
+            );
+            shard.default_mailbox_capacity = capacity;
+            shards.push(shard);
         }
         shards
     }
@@ -5702,7 +5735,7 @@ impl Runtime {
             recovery_schema_name
                 .clone()
                 .unwrap_or_else(|| format!("actor_{}", actor_id)),
-            0,
+            self.default_mailbox_capacity,
         );
         actor.persistent = true;
         actor.is_workflow = is_workflow;
@@ -6023,6 +6056,7 @@ impl Runtime {
         snapshot: &ActorSnapshot,
         expected_schema_name: Option<&str>,
         runtime_name: Option<String>,
+        mailbox_capacity: usize,
     ) -> Result<Actor, String> {
         if snapshot.activation_epoch == 0 {
             return Err(format!(
@@ -6040,7 +6074,7 @@ impl Runtime {
             let mut actor = Actor::new(
                 actor_id,
                 runtime_name.unwrap_or_else(|| format!("actor_{}", actor_id)),
-                0,
+                mailbox_capacity,
             );
             actor.persistent = true;
             actor.sequence = snapshot.sequence;
@@ -6099,7 +6133,7 @@ impl Runtime {
         let mut actor = Actor::new(
             actor_id,
             runtime_name.unwrap_or_else(|| meta.name.clone()),
-            0,
+            mailbox_capacity,
         );
         actor.persistent = true;
         actor.is_workflow = meta.is_workflow;
@@ -6189,6 +6223,7 @@ impl Runtime {
                 snap,
                 Some(&grain_id.grain_type),
                 Some(grain_id.actor_name()),
+                self.default_mailbox_capacity,
             )
             .map_err(|err| NuError::RuntimeError {
                 msg: format!(
@@ -6199,7 +6234,11 @@ impl Runtime {
                 span: Span::new(0, 0),
             })?
         } else {
-            let mut actor = Actor::new(stable_actor_id, grain_id.actor_name(), 0);
+            let mut actor = Actor::new(
+                stable_actor_id,
+                grain_id.actor_name(),
+                self.default_mailbox_capacity,
+            );
             actor.persistent = true;
             actor.bytecode_module = Some(Box::new(grain_type.module.clone()));
             actor.bytecode_offsets = grain_type.bytecode_offsets.clone();
@@ -6337,17 +6376,23 @@ impl Runtime {
         };
         let is_workflow = schema_meta.as_ref().is_some_and(|meta| meta.is_workflow);
 
-        let actor =
-            match Self::restore_actor_from_snapshot(actor_id, &module, &snapshot, None, None) {
-                Ok(actor) => actor,
-                Err(err) => {
-                    warn!(
-                        "nulang-migrate: invalid durable snapshot for actor {}: {}",
-                        actor_id, err
-                    );
-                    return false;
-                }
-            };
+        let actor = match Self::restore_actor_from_snapshot(
+            actor_id,
+            &module,
+            &snapshot,
+            None,
+            None,
+            self.default_mailbox_capacity,
+        ) {
+            Ok(actor) => actor,
+            Err(err) => {
+                warn!(
+                    "nulang-migrate: invalid durable snapshot for actor {}: {}",
+                    actor_id, err
+                );
+                return false;
+            }
+        };
 
         // The target must own a durable local copy before the actor becomes
         // runnable. Without this, a crash immediately after migration/failover
@@ -7046,7 +7091,7 @@ impl Runtime {
 
     pub fn create_supervisor(&mut self, name: &str, strategy: RestartStrategy) -> u64 {
         let id = fresh_actor_id();
-        let mut actor = Actor::new(id, name.to_string(), 0);
+        let mut actor = Actor::new(id, name.to_string(), self.default_mailbox_capacity);
         actor.state = ActorState::Running;
         self.actors.insert(id, actor);
         let supervisor = Supervisor::new(id, name, strategy);
