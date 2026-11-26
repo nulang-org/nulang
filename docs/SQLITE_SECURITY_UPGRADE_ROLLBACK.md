@@ -106,6 +106,53 @@ uncheckpointed WAL, crash-consistent copying of live files, or a production
 rollback. Those requirements remain stop-ship until independently rehearsed.
 No production data or credentials are used by this test.
 
+## Independent old/new binary rehearsal
+
+The pinned-binary fixture under `scripts/tests/fixtures/sqlite_cross_binary_probe.rs`
+is intentionally not a normal Cargo example: use the same fixture source to
+build the two different versions in disposable detached worktrees. The Python
+harness creates all database files itself in a private temporary directory and
+never accepts a database path. Do not invoke the Rust probe against real data.
+
+From this repository, pin the exact pre-upgrade and candidate commits; use the
+same Rust toolchain for both. For the November 26, 2026 rehearsal, the old
+commit was `4cd30251c2d39ff8a8e437c1c479fa56d674363a` and the candidate was
+`e0c5cf1203a27d5aeedc64f4a47bbf649b0a405d`. Replace them only deliberately
+for a new release rehearsal.
+
+```sh
+repo=$(pwd)
+root=$(mktemp -d)
+old=4cd30251c2d39ff8a8e437c1c479fa56d674363a
+new=e0c5cf1203a27d5aeedc64f4a47bbf649b0a405d
+git worktree add --detach "$root/legacy" "$old"
+git worktree add --detach "$root/candidate" "$new"
+for version in legacy candidate; do
+    cp "$repo/scripts/tests/fixtures/sqlite_cross_binary_probe.rs" \
+        "$root/$version/examples/sqlite_cross_binary_probe.rs"
+    (cd "$root/$version" && CARGO_TARGET_DIR="$root/target-$version" \
+        cargo build --locked --no-default-features --features sqlite,tcp \
+        --example sqlite_cross_binary_probe)
+done
+python3 scripts/verify_sqlite_cross_binary.py \
+    --legacy-probe "$root/target-legacy/debug/examples/sqlite_cross_binary_probe" \
+    --candidate-probe "$root/target-candidate/debug/examples/sqlite_cross_binary_probe"
+```
+
+The harness rejects identical binaries, records their SHA-256s, and checks
+SQLite integrity after each stage. It verifies legacy write/reopen, upgrades
+a separate copy using the candidate, writes and reopens candidate state, then
+runs the **actual legacy binary** on a fresh copy of the immutable pre-upgrade
+backup. It checks typed actor state, activation epoch, sequence, journal
+payload, and timer workflow events, including that candidate writes do not
+appear in the restored copy. The backup digest must remain unchanged.
+
+This rehearsal passed for the pinned commits above. It complements rather
+than replaces the legacy-schema regression and does not cover hard-killed
+writers with uncheckpointed WAL, interrupted schema migration, production
+workloads, AI-local data, or authenticated Turso. The production promotion gate
+remains open.
+
 ## Required remote Turso / libSQL qualification (still open)
 
 Use only an explicitly disposable test database and limited-scope test token;
