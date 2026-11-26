@@ -149,6 +149,32 @@ execute the VM's live `PerformAsync` callback, kill a process, verify provider
 side-effect deduplication, or prove atomic actor-turn completion. Those require
 separate integration and crash tests.
 
+## OS-process crash acceptance on file-backed SQLite
+
+`tests/durable_effect_process_kill.rs` uses the same Rust trusted-host coordinator
+and a file-backed provider test double that deduplicates the logical operation
+ID. A parent waits for an atomically published checkpoint marker, forcibly kills
+the actual child process, and starts a fresh process against the same database.
+On Unix it verifies the process exited due to SIGKILL. Recovery subprocesses
+have bounded timeouts and are reaped on assertion failures.
+
+The test covers three acknowledged checkpoints: after intent commit, after
+provider mutation but before terminal receipt, and after terminal receipt but
+before resumption. It also covers an epoch-2 ownership claim following a crash,
+rejecting stale epoch-1 retry and receipt commit. Every scenario then does one
+more independent restart, checking unchanged journal sequence, stable idempotency
+keys, one provider mutation and no redispatch after a terminal receipt.
+
+Run the focused test with:
+
+```bash
+cargo test --locked --no-default-features --features sqlite --test durable_effect_process_kill
+```
+
+This is not a power-loss or mid-SQLite-commit test. The provider is a cooperative
+local test double; the fixture does not qualify arbitrary providers, concurrent
+live owners, the normal VM callback, or atomic actor-turn completion.
+
 ## What is not yet a production-wide guarantee
 
 Passing this gate does **not** prove that every `perform`, workflow activity,
@@ -180,9 +206,11 @@ Run:
 bash scripts/test-durability-guarantees.sh
 ```
 
-The gate is deterministic and performs no public network calls, sleeps, or
-wall-clock assertions. It covers semantic-site artifact propagation, storage
-recovery, crash-window behavior, and the lower-level durable-effect contracts.
+The gate performs no public network calls. It covers semantic-site artifact
+propagation, storage recovery, deterministic crash-window behavior and real
+OS-process termination/recovery on SQLite. Process waits are bounded by the
+fixture timeout; logical correctness is asserted from the durable journal and
+provider ledger, not elapsed wall-clock time.
 
 ## Competitive benchmark contract
 

@@ -1,4 +1,4 @@
-"""Keep the source-compiled, disk-backed recovery regression in the durability gate."""
+"""Keep disk-backed and OS-process recovery regressions in the durability gate."""
 
 from pathlib import Path
 import unittest
@@ -13,6 +13,15 @@ class DurableReleaseGateTests(unittest.TestCase):
         required = (
             "cargo test --locked --no-default-features --features sqlite "
             "--test durable_compiled_store_restart"
+        )
+        self.assertIn(required + "\n", gate)
+        self.assertIn("set -euo pipefail", gate)
+
+    def test_sqlite_process_kill_is_an_explicit_release_gate(self):
+        gate = (ROOT / "scripts" / "test-durability-guarantees.sh").read_text()
+        required = (
+            "cargo test --locked --no-default-features --features sqlite "
+            "--test durable_effect_process_kill"
         )
         self.assertIn(required + "\n", gate)
         self.assertIn("set -euo pipefail", gate)
