@@ -334,6 +334,114 @@ mod tests {
     }
 
     #[test]
+    fn test_nbc_rejects_every_truncated_prefix() {
+        let module = sample_module();
+        let bytes = module.to_nbc(None).unwrap();
+        let instr_end = NBC_HEADER_LEN + module.instructions.len() * 4;
+        let meta_start = instr_end + 4;
+        let meta_len = (bytes.len() - meta_start) as u32;
+        for end in 0..bytes.len() {
+            let expected = if end < NBC_HEADER_LEN {
+                FormatError::Truncated {
+                    need: NBC_HEADER_LEN,
+                    have: end,
+                }
+            } else if end < instr_end {
+                FormatError::Truncated {
+                    need: instr_end,
+                    have: end,
+                }
+            } else if end < meta_start {
+                FormatError::Truncated {
+                    need: meta_start,
+                    have: end,
+                }
+            } else {
+                FormatError::LengthMismatch {
+                    declared: meta_len,
+                    actual: end - meta_start,
+                }
+            };
+            assert_eq!(
+                CodeModule::from_nbc(&bytes[..end]).unwrap_err(),
+                expected,
+                "prefix length {end}"
+            );
+        }
+        assert_eq!(CodeModule::from_nbc(&bytes).unwrap().module, module);
+    }
+
+    #[test]
+    fn test_nbc_rejects_invalid_metadata_json_with_complete_length() {
+        let module = sample_module();
+        let mut bytes = module.to_nbc(None).unwrap();
+        let meta_start = NBC_HEADER_LEN + module.instructions.len() * 4 + 4;
+        bytes[meta_start] = 0xff;
+        assert!(matches!(
+            CodeModule::from_nbc(&bytes),
+            Err(FormatError::BodyDecode(_))
+        ));
+    }
+
+    #[test]
+    fn test_nbc_rejects_empty_metadata_body() {
+        let module = sample_module();
+        let mut bytes = module.to_nbc(None).unwrap();
+        let meta_len_off = NBC_HEADER_LEN + module.instructions.len() * 4;
+        bytes[meta_len_off..meta_len_off + 4].copy_from_slice(&0u32.to_be_bytes());
+        bytes.truncate(meta_len_off + 4);
+        assert!(matches!(
+            CodeModule::from_nbc(&bytes),
+            Err(FormatError::BodyDecode(_))
+        ));
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn test_nbc_rejects_maximum_declared_lengths_without_payload() {
+        let module = sample_module();
+        let mut bytes = module.to_nbc(None).unwrap();
+        let meta_len_off = NBC_HEADER_LEN + module.instructions.len() * 4;
+        bytes[meta_len_off..meta_len_off + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(
+            CodeModule::from_nbc(&bytes).unwrap_err(),
+            FormatError::LengthMismatch {
+                declared: u32::MAX,
+                actual: bytes.len() - meta_len_off - 4,
+            }
+        );
+        bytes[44..48].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(
+            CodeModule::from_nbc(&bytes).unwrap_err(),
+            FormatError::Truncated {
+                need: NBC_HEADER_LEN + u32::MAX as usize * 4,
+                have: bytes.len(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_nbc_decoder_rejects_effect_metadata_pointing_to_non_effect_instruction() {
+        let mut module = sample_module();
+        module
+            .instructions
+            .insert(0, Instruction::new0(OpCode::PerformAsync));
+        module.effect_sites.push(EffectSiteMetadata {
+            pc: 0,
+            id: [1; 32],
+            effect_operation: "Inference.ask".into(),
+        });
+        let mut bytes = module.to_nbc(None).unwrap();
+        assert_eq!(CodeModule::from_nbc(&bytes).unwrap().module, module);
+        // Corrupt only the binary instruction stream, leaving valid JSON and lengths.
+        bytes[NBC_HEADER_LEN..NBC_HEADER_LEN + 4]
+            .copy_from_slice(&Instruction::new0(OpCode::Halt).encode().to_be_bytes());
+        assert!(
+            matches!(CodeModule::from_nbc(&bytes), Err(FormatError::BodyDecode(message)) if message.contains("non-effect opcode"))
+        );
+    }
+
+    #[test]
     fn test_nbc_rejects_bad_magic() {
         let mut bytes = sample_module().to_nbc(None).unwrap();
         bytes[0] = b'X';
