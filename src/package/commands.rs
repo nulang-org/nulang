@@ -1475,7 +1475,7 @@ fn cmd_build_web() -> NuResult<()> {
         msg: format!("invalid web route contract:\n{}", diagnostics.join("\n")),
         span: Span::default(),
     })?;
-    crate::web::dispatch::compile_runtime_routes_from_contracts(
+    let runtime_routes = crate::web::dispatch::compile_runtime_routes_from_contracts(
         routes.clone(),
         &validated_contracts,
     )
@@ -1502,11 +1502,16 @@ fn cmd_build_web() -> NuResult<()> {
     // Rendering and deployment metadata share the same route decisions.
     // Known dynamic handlers are skipped; inferred static candidates may
     // execute only the checked, deterministic rendering subset.
-    let pages = crate::web::static_build::render_pages(&routes, &validated_contracts, &mut ir)
-        .map_err(|msg| NuError::PackageError {
-            msg,
-            span: Span::default(),
-        })?;
+    let pages = crate::web::static_build::render_pages(
+        &runtime_routes,
+        &validated_contracts,
+        &manifest.web.prerender,
+        &mut ir,
+    )
+    .map_err(|msg| NuError::PackageError {
+        msg,
+        span: Span::default(),
+    })?;
     eprintln!(
         "  Rendering {} static page(s) of {} route(s)...",
         pages.len(),

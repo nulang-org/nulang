@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Finite parameterized static web routes — 2026-11-26
+- **Experimental:** `[web.prerender]` maps exact parameterized GET route patterns to finite concrete URL lists. Build-time rendering shares the HTTP request decoder and handler-call ABI; concrete Deployment IR v1 entries retain the original pattern and require no runtime parameter binding.
+- Reject invalid or overlapping URL lists, unsupported request inputs, contradictory placement, and executed non-render effects. Sort enumeration deterministically and preserve the prior generated site on failures. Dev dispatch is unchanged; finite deployments do not imply a server fallback.
+
 ### Checked static web builds — 2026-11-26
 - **Experimental:** web builds emit HTML only for eligible, checked GET renderers, leave request-bound and mutation routes in Deployment IR without artifacts, and reject explicit static placement violations. Registration and rendering run under an interpreter instruction allowlist.
 - Stage and replace generated output after validation, reject unsafe paths and asset collisions, and preserve prior output on ordinary build errors. Static publishing no longer snapshots the server-dependent Todo starter; its native HTTP rendering and vendored styles remain supported. No full transitive effect proof or crash-atomic publication is claimed.

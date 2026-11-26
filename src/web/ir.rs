@@ -22,6 +22,9 @@ pub struct IrRoute {
     pub path: String,
     pub placement: String,
     pub artifact: Option<String>,
+    /// Original route contract for an explicitly enumerated concrete page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_template: Option<String>,
     /// Source-level handler name when the route target can be resolved
     /// statically. Older IR consumers may ignore this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -122,6 +125,7 @@ pub fn generate_deployment_ir(
             path: route.path.clone(),
             placement,
             artifact: None,
+            route_template: None,
             handler: contract.and_then(|c| c.handler.clone()),
             params: contract.map(|c| c.params.clone()).unwrap_or_default(),
             handler_params: contract
