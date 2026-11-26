@@ -175,6 +175,39 @@ This is not a power-loss or mid-SQLite-commit test. The provider is a cooperativ
 local test double; the fixture does not qualify arbitrary providers, concurrent
 live owners, the normal VM callback, or atomic actor-turn completion.
 
+## Opt-in VM asynchronous effect bridge (experimental)
+
+The VM exposes a backwards-compatible asynchronous callback with the exact
+`PerformAsync` instruction location and owning code module.
+`DurableEffectCoordinator::execute_vm_async_text_with_deduplication` is an
+explicit trusted-host adapter to the existing authorized compiled-effect
+coordinator. The caller must provide a trusted live actor, verified artifact,
+correct grant and provider, canonical request bytes, and a replay-stable
+execution key and occurrence. The adapter validates the compiled effect site
+and authority before journaling or dispatch. It supports text receipts only:
+invalid UTF-8 fails closed, including after reopening a completed journal,
+without redispatching the provider.
+
+`tests/durable_vm_callback_bridge.rs` executes actual VM bytecode against
+file-backed SQLite. A subprocess pauses after atomically publishing a
+checkpoint following a provider ledger write and fsync, before acknowledging
+the receipt; its parent kills and reaps it (SIGKILL on Unix). A fresh VM and
+store in the surviving parent recover using the same provider idempotency key,
+and completed replay does not contact the provider. The fixture also exercises
+authority, request drift, and terminal invalid text receipt recovery.
+
+```bash
+cargo test --locked --no-default-features --features sqlite --test durable_vm_callback_bridge
+```
+
+This is an opt-in trusted test adapter, not the default actor runtime.
+`RuntimeVmCallbacks` and `BytecodeRuntimeCallbacks` remain unchanged.
+The test does not establish artifact provenance, persistence of execution
+keys and occurrences across arbitrary actor-turn replay, resource-scoped
+authority, atomic actor-turn/inbox completion, real provider cooperation or
+multi-owner safety. Default runtime integration remains gated on these
+requirements.
+
 ## What is not yet a production-wide guarantee
 
 Passing this gate does **not** prove that every `perform`, workflow activity,
@@ -208,7 +241,7 @@ bash scripts/test-durability-guarantees.sh
 
 The gate performs no public network calls. It covers semantic-site artifact
 propagation, storage recovery, deterministic crash-window behavior and real
-OS-process termination/recovery on SQLite. Process waits are bounded by the
+OS-process termination/recovery on SQLite, including the opt-in VM callback. Process waits are bounded by the
 fixture timeout; logical correctness is asserted from the durable journal and
 provider ledger, not elapsed wall-clock time.
 
