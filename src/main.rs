@@ -741,6 +741,7 @@ fn main() {
                 .unwrap_or_else(|| "out.nbc".to_string());
             if let Err(e) = compile_source_to_nbc(
                 &code,
+                None,
                 &out,
                 opts.rewrite_signals.as_deref(),
                 &opts.with_capabilities,
@@ -925,6 +926,7 @@ fn main() {
             });
             if let Err(e) = compile_source_to_nbc(
                 &source,
+                Some(path),
                 &out,
                 opts.rewrite_signals.as_deref(),
                 &opts.with_capabilities,
@@ -2440,6 +2442,7 @@ fn compile_with_new_pipeline(
 /// (supply-chain integrity). Does not execute the module.
 fn compile_source_to_nbc(
     source: &str,
+    file_path: Option<&str>,
     out_path: &str,
     rewrite_signals: Option<&str>,
     with_capabilities: &[String],
@@ -2449,7 +2452,7 @@ fn compile_source_to_nbc(
     behavior_package_version: Option<&str>,
 ) -> NuResult<()> {
     let (mut ast, type_checker) =
-        run_frontend(source, None, false, with_capabilities, deny_warnings)?;
+        run_frontend(source, file_path, false, with_capabilities, deny_warnings)?;
 
     // Optional web-framework pass: rewrite HTML for signals/actions and emit the
     // generic client-side micro-runtime. This runs after effect checking so

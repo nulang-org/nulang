@@ -50,7 +50,7 @@ Route metadata includes the existing method/path/placement/artifact fields plus:
 - `bindings`: deterministic request-source-to-handler-slot bindings for `path`, `query`, `header`, `cookie`, `body`, and `form`. Each binding records `source_name`, `handler_param`, `handler_index`, and resolved source-level type.
 - `response_type`: declared handler return type.
 - `error_type`: declared typed-error type.
-- `effects`: declared handler effect row.
+- `effects`: declared handler effect row (not a transitive proof).
 - `reference_capability`: the existing Pony-style handler capability (`iso`, `ref`, `val`, etc.).
 
 Bindings are ordered by handler slot rather than URL segment order. The runtime therefore stages arguments directly into the call ABI without inferring argument order from route text.
@@ -64,6 +64,16 @@ consumed at build time. There is no implicit runtime fallback for unlisted
 URLs. Existing v1 consumers see ordinary static routes and artifacts, not
 a new placement kind. The dev server and source-level contracts remain
 unchanged.
+
+Static placement is validated before artifact emission against the linked
+compiler-produced bytecode, independently of the declared effect row. Every
+instruction in the handler's transitive direct-call graph must meet the
+rendering allowlist, and unverifiable indirect calls or control-flow boundaries
+disqualify static placement. An inferred candidate becomes server-only;
+explicit `@placement(static)` or finite prerender fails the build. The existing
+checked interpreter remains active. No IR or NBC format change is required;
+this is an operation-level pre-render proof, not a language-wide effect
+inference, termination, or untrusted-code safety guarantee.
 
 The package-level `capabilities` field remains unchanged for compatibility. It is not the same concept as an authorization/resource capability.
 

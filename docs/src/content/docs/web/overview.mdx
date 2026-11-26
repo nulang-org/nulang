@@ -220,8 +220,9 @@ curl http://127.0.0.1:8080/last             # "Last message: hi"
 
 ## Static HTML and Static Sites
 
-Static builds select eligible request-independent GET handlers, then interpret
-them under a restrictive build-time rendering policy:
+Static builds select eligible request-independent GET handlers, prove their
+compiled direct-call graphs against a restrictive rendering policy, then
+interpret them under the same policy:
 
 ```bash
 nulang nula build --web
@@ -274,10 +275,27 @@ Other, unconfigured dynamic routes remain server routes. Reordering the list
 does not change the output, and removing a URL removes its previous artifact
 on the next successful build.
 
-The renderer checks instructions as they execute, including calls to helpers,
-and permits HTML construction and selected deterministic local operations. An
-inferred route that reaches a disallowed operation stays on the server; an
-explicit `@placement(static)` route that cannot be rendered fails the build.
+### Static effect proof
+
+Before running a page handler, the build checks every emitted instruction in its
+transitive compiled direct-call graph, including linked imports and both branches
+of a conditional. It permits HTML construction and selected deterministic local
+operations. It rejects external/request operations (including `Web.cookie` and
+`Web.param`), unproven indirect call targets, and invalid function/control-flow
+ranges. The result is independent of which concrete URLs you prerender; even
+an unselected branch containing a request effect disqualifies the route.
+
+An inferred static candidate that fails the proof remains on the server, with a
+diagnostic explaining why. An explicit `@placement(static)` or configured
+`[web.prerender]` route that fails the proof fails the build instead. The
+interpreter independently checks operations during rendering as defense in depth.
+
+Direct recursion is permitted when the entire direct-call graph passes the
+policy. Arbitrary higher-order calls may remain server-only even when pure:
+a missing proof is not evidence of an effect. The proof is over compiled
+instructions, not unoptimized source, and does not establish termination,
+bounded resource use, or safety for untrusted bytecode.
+
 Plain pages have no injected client script; HTML with signal/action markers
 still receives the existing progressive-enhancement runtime.
 
@@ -291,12 +309,12 @@ lock before retrying. Generated pages and public assets may not overwrite one
 another. Route paths must map to portable, contained file paths. Non-generated
 output directories are rejected.
 
-The same instruction policy is used for route registration, with the additional
-permission to register routes. Application startup with external or
-request-dependent effects is rejected during a web build. This is a conservative
-**build execution policy**, not a complete static proof of all branches or an
-untrusted-build sandbox. Dependency resolution still uses the existing package
-pipeline and may perform network operations.
+Route registration still uses the checked interpreter, with the additional
+permission to register routes. Executed application-startup external or
+request-dependent effects are rejected during a web build; startup is not
+subject to the page-handler all-branches proof. This is not an untrusted-build
+sandbox. Dependency resolution still uses the existing package pipeline and
+may perform network operations.
 Static-only deployments can serve the output directly; mixed deployments
 require a separately configured runtime for server routes.
 
