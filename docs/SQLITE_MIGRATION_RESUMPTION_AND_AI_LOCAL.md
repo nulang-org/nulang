@@ -24,8 +24,9 @@ DDL and DML, forces dirty pages into the WAL, signals readiness, and is
 killed with SIGKILL. The actual production store is the first opener after
 the kill; it must recover the last committed state, finish the migration,
 persist a new snapshot, and reopen with integrity intact and no leaked
-uncommitted table. The ignored subprocess entrypoint is invoked by the
-parent test only. This tests an interrupted SQLite transaction, not a
+uncommitted table. The subprocess entrypoint is an ordinary test that
+returns before touching any database unless the parent provides its private
+fixture directory. This tests an interrupted SQLite transaction, not a
 failure injected at every production migration instruction or power loss.
 
 ## AI-local: independent legacy and candidate binaries

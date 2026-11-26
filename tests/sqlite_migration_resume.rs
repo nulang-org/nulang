@@ -224,10 +224,9 @@ const CHILD_DIR_ENV: &str = "NULANG_TEST_INTERRUPTED_DDL_FIXTURE_DIR";
 const CHILD_READY: &str = "NULANG_SQLITE_UNCOMMITTED_DDL_READY";
 
 /// Subprocess fixture only. The parent owns the directory and supplies its
-/// path; running ignored tests directly cannot create or open any database.
+/// path; an ordinary test run without the parent environment opens no database.
 #[cfg(unix)]
 #[test]
-#[ignore = "internal disposable subprocess fixture"]
 fn uncommitted_ddl_child() {
     use std::io::Write;
 
@@ -355,12 +354,7 @@ fn hard_kill_uncommitted_ddl_rolls_back_before_migration_resumes() {
 
     let mut child = KillChild(
         Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "uncommitted_ddl_child",
-                "--ignored",
-                "--nocapture",
-            ])
+            .args(["--exact", "uncommitted_ddl_child", "--nocapture"])
             .env(CHILD_DIR_ENV, &dir.0)
             .stdout(Stdio::piped())
             .spawn()
