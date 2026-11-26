@@ -508,3 +508,118 @@ app "site" {
     assert_eq!(ir.routes[2].placement, "server");
     assert!(ir.routes[2].artifact.is_none() && ir.routes[2].route_template.is_none());
 }
+
+#[test]
+fn cold_request_effect_through_helper_prevents_static_publication() {
+    let site = Site::new();
+    site.source(
+        r#"
+import stdlib::web::html
+import stdlib::web::types
+fn leaf(flag: Bool) -> Html {
+    if flag then text(perform Web.cookie("session")) else text("preview")
+}
+fn middle(flag: Bool) -> Html { leaf(flag) }
+fn home() -> Html { middle(false) }
+fn pure() -> Html { text("independent") }
+app "site" {
+    route "GET" "/" -> home
+    route "GET" "/pure" -> pure
+}
+"#,
+    );
+    let output = site.build();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!site.0.join("dist/index.html").exists());
+    let ir = site.ir();
+    assert_eq!(ir.routes[0].placement, "server");
+    assert!(ir.routes[0].artifact.is_none());
+    assert_eq!(site.read("dist/pure/index.html"), b"independent");
+}
+
+#[test]
+fn finite_prerender_rejects_effect_on_unlisted_branch_and_preserves_site() {
+    let site = Site::new();
+    site.source(STATIC);
+    success(site.build());
+    let old = site.read("dist/index.html");
+    site.source(
+        r#"
+import stdlib::web::html
+import stdlib::web::types
+fn leaf(slug: String) -> Html {
+    if slug == "private" then text(perform Web.cookie("session")) else text(slug)
+}
+fn article(slug: String) -> Html { leaf(slug) }
+app "site" {
+    route "GET" "/articles/{slug}" -> article
+}
+"#,
+    );
+    prerender(&site, r#""/articles/{slug}" = ["/articles/public"]"#);
+    let output = site.build();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("disallows Web.cookie"), "{stderr}");
+    assert_eq!(site.read("dist/index.html"), old);
+    assert!(!site.0.join("dist/articles").exists());
+}
+
+#[test]
+fn imported_callee_effects_are_proved_on_linked_bytecode_only_for_called_functions() {
+    let site = Site::new();
+    std::fs::write(
+        site.0.join("src/details.nula"),
+        r#"
+fn private_detail(flag: Bool) -> String {
+    if flag then perform Web.cookie("session") else "preview"
+}
+fn public_detail() -> String { "public" }
+"#,
+    )
+    .unwrap();
+    site.source(
+        r#"
+import stdlib::web::html
+import stdlib::web::types
+import details
+fn private_page() -> Html { text(private_detail(false)) }
+fn public_page() -> Html { text(public_detail()) }
+app "site" {
+    route "GET" "/private" -> private_page
+    route "GET" "/public" -> public_page
+}
+"#,
+    );
+    success(site.build());
+    assert!(!site.0.join("dist/private/index.html").exists());
+    assert_eq!(site.read("dist/public/index.html"), b"public");
+    let ir = site.ir();
+    assert_eq!(ir.routes[0].placement, "server");
+    assert_eq!(ir.routes[1].placement, "static");
+}
+
+#[test]
+fn direct_recursive_renderer_is_not_disqualified_merely_for_recursion() {
+    let site = Site::new();
+    site.source(
+        r#"
+import stdlib::web::html
+import stdlib::web::types
+fn countdown(n: Int) -> String {
+    if n == 0 then "ok" else countdown(n - 1)
+}
+fn home() -> Html { text(countdown(3)) }
+app "site" {
+    route "GET" "/" -> home
+}
+"#,
+    );
+    success(site.build());
+    assert_eq!(site.read("dist/index.html"), b"ok");
+    assert_eq!(site.ir().routes[0].placement, "static");
+}

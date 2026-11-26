@@ -2,7 +2,7 @@
 //! deployment contract but never produce an HTML artifact merely because
 //! their URL has no path parameters.
 
-use crate::bytecode::{CodeModule, Constant, Instruction, OpCode};
+use crate::bytecode::{CodeModule, Constant, OpCode};
 use crate::runtime::WebRoute;
 use crate::types::{NuError, Span};
 use crate::vm::VM;
@@ -13,6 +13,7 @@ use crate::web::handler_call::prepare_bound_handler;
 use crate::web::ir::{DeploymentIr, IrRoute};
 use crate::web::request_bindings::{bind_request_arguments, RequestBindingValues};
 use crate::web::runtime_bindings::{BoundRouteArgument, RuntimeWebRoute};
+use crate::web::static_proof::{check_instruction, prove_handler};
 use std::collections::{BTreeMap, HashMap};
 
 /// Discover registered routes without executing request, I/O, or mutation
@@ -113,7 +114,7 @@ pub(crate) fn render_pages(
                     "{label}: prerender conflicts with explicit placement"
                 ));
             }
-            if let Some(reason) = ineligible(&metadata, &route.route, true) {
+            if let Err(reason) = prove_candidate(&metadata, &route.route, true) {
                 return Err(format!("{label}: cannot prerender: {reason}"));
             }
             let mut urls = urls.clone();
@@ -178,9 +179,9 @@ pub(crate) fn render_pages(
         }
 
         if metadata.placement == "static" {
-            let html = match ineligible(&metadata, &route.route, false) {
-                Some(reason) => Rendered::Denied(reason.into()),
-                None => render(&route.route, 0, &[])?,
+            let html = match prove_candidate(&metadata, &route.route, false) {
+                Err(reason) => Rendered::Denied(reason),
+                Ok(()) => render(&route.route, 0, &[])?,
             };
             match html {
                 Rendered::Html(html) => {
@@ -198,6 +199,7 @@ pub(crate) fn render_pages(
                             "{label}: cannot render @placement(static): {reason}"
                         ));
                     }
+                    eprintln!("  {label}: retaining server placement: {reason}");
                     metadata.placement = "server".into();
                     metadata.artifact = None;
                 }
@@ -291,6 +293,14 @@ fn reserve_path(
     }
     paths.insert(key, label.into());
     Ok(())
+}
+
+// One proof per route pattern, independent of concrete prerender arguments.
+fn prove_candidate(route: &IrRoute, executable: &WebRoute, enumerated: bool) -> Result<(), String> {
+    if let Some(reason) = ineligible(route, executable, enumerated) {
+        return Err(reason.into());
+    }
+    prove_handler(&executable.handler_module, executable.handler_func_idx)
 }
 
 fn ineligible(route: &IrRoute, executable: &WebRoute, enumerated: bool) -> Option<&'static str> {
@@ -428,71 +438,6 @@ fn render(route: &WebRoute, arity: usize, args: &[BoundRouteArgument]) -> Result
     Ok(Rendered::Html(html))
 }
 
-// Fail closed for unfamiliar operations. The actual interpreted instruction
-// stream is checked across function/closure calls, not merely the handler's
-// declared effect row. This is a build policy, not an untrusted-code sandbox.
-fn check_instruction(module: &CodeModule, instr: &Instruction) -> Result<(), String> {
-    use OpCode::*;
-    match instr.opcode {
-        Nop | Halt | Panic | Const0 | Const1 | Const2 | ConstM1 | ConstU | ConstL | Load
-        | Store | Move | Pop | Dup | Swap | IAdd | ISub | IMul | IDiv | IMod | INeg | IInc
-        | IDec | IPow | Xor | Shl | Shr | BitAnd | BitOr | FAdd | FSub | FMul | FDiv | FNeg
-        | FMod | IToF | FToI | FToS | FPow | ICmpEq | ICmpLt | ICmpGt | ICmpLe | ICmpGe
-        | FCmpEq | FCmpLt | FCmpGt | SCmpEq | Not | And | Or | Jmp | JmpT | JmpF | Switch
-        | Call | TailCall | Ret | RetVal | Closure | CapLoad | CapStore | ClosureCall | Alloc
-        | FieldL | FieldS | ArrAlloc | ArrLoad | ArrStore | ArrLen | TupleMk | TupleL | RecMk
-        | RecL | RecS | IsTag | Unpack | RecCopy | Copy | Drop | SConcat | MetaType | MetaCap
-        | SpillLoad | SpillStore => Ok(()),
-        Perform => {
-            let operation = module.constants.get(instr.imm16() as usize);
-            match operation {
-                Some(Constant::String(name)) if allowed_effect(name) => Ok(()),
-                Some(Constant::String(name)) => {
-                    Err(format!("build-time rendering disallows {name}"))
-                }
-                _ => Err("build-time rendering encountered an invalid effect operand".into()),
-            }
-        }
-        other => Err(format!("build-time rendering disallows opcode {other:?}")),
-    }
-}
-
-fn allowed_effect(name: &str) -> bool {
-    matches!(
-        name,
-        "Web.html"
-            | "Web.text"
-            | "Web.raw"
-            | "Array.length"
-            | "Array.push"
-            | "Array.new"
-            | "Array.set"
-            | "Array.slice"
-            | "Int.to_string"
-            | "Int.to_float"
-            | "Int.to_hex"
-            | "Int.to_binary"
-            | "Float.to_int"
-            | "Float.to_string"
-            | "Float.sin"
-            | "Float.cos"
-            | "Float.sqrt"
-            | "Float.tan"
-            | "Float.log"
-            | "Float.exp"
-            | "Float.log2"
-            | "Float.log10"
-            | "Float.pow"
-            | "String.to_int"
-            | "String.to_float"
-            | "String.length"
-            | "String.charAt"
-            | "String.from_char"
-            | "String.concat"
-            | "String.substring"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,39 +458,6 @@ mod tests {
             "/CON",
         ] {
             assert!(artifact_path(path).is_err(), "{path}");
-        }
-    }
-
-    #[test]
-    fn effect_policy_denies_ambient_and_external_operations() {
-        for name in [
-            "Web.cookie",
-            "Web.method",
-            "Web.kv_get",
-            "Web.kv_set",
-            "Web.serve_static",
-            "FS.read",
-            "IO.print",
-            "Http.get",
-            "Time.now",
-            "Rand.int",
-        ] {
-            let mut module = CodeModule::new("test");
-            module.constants.push(Constant::String(name.into()));
-            assert!(
-                check_instruction(&module, &Instruction::new3(OpCode::Perform, 0, 0, 0)).is_err(),
-                "{name}"
-            );
-        }
-        for opcode in [
-            OpCode::FFICall,
-            OpCode::Spawn,
-            OpCode::SRead,
-            OpCode::PerformAsync,
-        ] {
-            assert!(
-                check_instruction(&CodeModule::new("test"), &Instruction::new0(opcode)).is_err()
-            );
         }
     }
 }

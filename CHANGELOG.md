@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Transitive static web effect proof — 2026-11-26
+- **Experimental:** before rendering, validate every emitted instruction in the linked handler's transitive direct-call graph against the existing rendering allowlist. Cold branches, imported helpers, and recursive direct-call cycles are analyzed; unresolved indirect calls and invalid control-flow ranges fail closed. Inferred candidates remain server routes; explicit static/prerender failures preserve the prior output.
+- Preserve the source file path during NBC emission so sibling imports use the same resolution context as the signal-analysis and run paths. No new dependency, IR field, or frozen bytecode format change. Retain the interpreter guard; this does not prove termination or sandbox untrusted programs.
+
 ### Finite parameterized static web routes — 2026-11-26
 - **Experimental:** `[web.prerender]` maps exact parameterized GET route patterns to finite concrete URL lists. Build-time rendering shares the HTTP request decoder and handler-call ABI; concrete Deployment IR v1 entries retain the original pattern and require no runtime parameter binding.
 - Reject invalid or overlapping URL lists, unsupported request inputs, contradictory placement, and executed non-render effects. Sort enumeration deterministically and preserve the prior generated site on failures. Dev dispatch is unchanged; finite deployments do not imply a server fallback.
