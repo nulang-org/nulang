@@ -900,6 +900,13 @@ fn main() {
                     checker.set_resource_grants(&opts.with_capabilities);
                     let _ = checker.check_module(&ast.decls);
                     let graph = nulang::web::reactivity::analyze_module(&ast, Some(&checker));
+                    if !graph.errors.is_empty() {
+                        eprintln!(
+                            "Invalid web interaction contract:\n{}",
+                            graph.errors.join("\n")
+                        );
+                        std::process::exit(1);
+                    }
                     if let Err(e) = std::fs::write(out, graph.to_json()) {
                         eprintln!("Error: Cannot write signal graph '{}': {}", out, e);
                         std::process::exit(1);
@@ -2459,6 +2466,16 @@ fn compile_source_to_nbc(
         effect_checker.check_module(&ast.decls)?;
         for msg in &effect_checker.diagnostics {
             eprintln!("{}", msg);
+        }
+        let graph = nulang::web::reactivity::analyze_module(&ast, Some(&effect_checker));
+        if !graph.errors.is_empty() {
+            return Err(nulang::types::NuError::PackageError {
+                msg: format!(
+                    "invalid web interaction contract:\n{}",
+                    graph.errors.join("\n")
+                ),
+                span: Span::default(),
+            });
         }
         nulang::web::reactivity::rewrite_module(&mut ast, Some(&effect_checker));
         let client_js = nulang::web::reactivity::generate_client_runtime();
