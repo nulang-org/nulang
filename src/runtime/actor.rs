@@ -794,9 +794,11 @@ impl Actor {
             || staging.epoch != self.activation_epoch
             || destination_actor_id == 0
             || staging.messages.len() >= 1024
-            || payload
-                .iter()
-                .any(|v| matches!(v, PersistedValue::Float(f) if !f.is_finite()))
+            || payload.iter().any(|v| match v {
+                PersistedValue::String(s) => s.contains('\0'),
+                PersistedValue::Float(f) => !f.is_finite(),
+                other => PersistedValue::from_value(&other.to_value()) != *other,
+            })
         {
             staging.poisoned = true;
             return Err(invalid("invalid or exhausted workflow outbox staging"));

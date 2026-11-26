@@ -9,8 +9,8 @@ use crate::bytecode::Constant;
 use crate::primitives::ActorRole;
 use crate::runtime::actor::Actor;
 use crate::runtime::persistence::{
-    ActorSnapshot, DurableTransition, EventEntry, PersistedValue, WorkflowActivationId,
-    WorkflowEvent, WorkflowReplayEventId, DURABLE_TRANSITION_VERSION,
+    ActorSnapshot, DurableOutboxId, DurableTransition, EventEntry, PersistedValue,
+    WorkflowActivationId, WorkflowEvent, WorkflowReplayEventId, DURABLE_TRANSITION_VERSION,
 };
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
 use crate::vm::{Frame, Value, VM};
@@ -241,6 +241,16 @@ pub(crate) fn commit_workflow_command(
     behavior_id: u16,
     payload: Vec<PersistedValue>,
 ) -> std::io::Result<WorkflowActivationId> {
+    commit_workflow_command_with_inbox(rt, actor_id, behavior_id, payload, None)
+}
+
+pub(crate) fn commit_workflow_command_with_inbox(
+    rt: &mut Runtime,
+    actor_id: u64,
+    behavior_id: u16,
+    payload: Vec<PersistedValue>,
+    inbox: Option<DurableOutboxId>,
+) -> std::io::Result<WorkflowActivationId> {
     let activation_epoch = rt
         .actors
         .get(&actor_id)
@@ -253,13 +263,14 @@ pub(crate) fn commit_workflow_command(
             )
         })?;
     let expected_previous_sequence = rt.persistence.latest_sequence(actor_id);
-    let transition = DurableTransition::workflow_command(
+    let mut transition = DurableTransition::workflow_command(
         actor_id,
         activation_epoch,
         expected_previous_sequence,
         behavior_id,
         payload,
     )?;
+    transition.workflow_inbox = inbox;
     let sequence = transition.sequence;
     let activation = WorkflowActivationId::new(actor_id, sequence);
     rt.persistence.commit_transition(transition)?;
@@ -328,26 +339,8 @@ pub(crate) fn commit_step_completed(
         .staged_workflow_messages()?
         .to_vec();
     for message in &outbox {
-        let destination = message.destination_actor_id;
-        let behavior = message.behavior_id as usize;
-        let valid_target = rt.actors.get(&destination).is_some_and(|actor| {
-            actor.persistent
-                && actor.state != crate::runtime::ActorState::Terminated
-                && matches!(actor.role(), Ok(ActorRole::Workflow))
-                && !actor.is_hibernated()
-        }) && rt.has_native_handler(destination, behavior)
-            && !rt.is_internal_behavior(destination, behavior)
-            && !rt.migrated_actors.contains_key(&destination)
-            && !rt.actor_grain_id.contains_key(&destination)
-            && destination % rt.shard_count as u64 == rt.shard_idx as u64
-            && rt.persistence.load_snapshot(destination).is_some();
-        #[cfg(feature = "native-codegen")]
-        let valid_target = valid_target
-            && rt
-                .actors
-                .get(&destination)
-                .and_then(|actor| actor.aot_targets.get(behavior))
-                .is_none_or(|target| target.is_none());
+        let valid_target =
+            rt.is_workflow_outbox_destination(message.destination_actor_id, message.behavior_id);
         if workflow_effects_consumed.is_none() || !valid_target {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

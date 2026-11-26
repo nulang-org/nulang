@@ -400,6 +400,25 @@ pub struct DurableOutboxId {
     pub ordinal: u32,
 }
 
+/// Maximum number of pending message identities returned in a dispatcher page.
+pub const MAX_WORKFLOW_OUTBOX_PAGE: usize = 1024;
+
+fn validate_outbox_page(after: Option<(u64, u32)>, limit: usize) -> io::Result<(i64, i64)> {
+    if limit == 0 || limit > MAX_WORKFLOW_OUTBOX_PAGE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid workflow outbox page limit",
+        ));
+    }
+    match after {
+        Some((sequence, ordinal)) => Ok((
+            i64::try_from(sequence).map_err(io::Error::other)?,
+            i64::from(ordinal),
+        )),
+        None => Ok((0, -1)),
+    }
+}
+
 /// One logical durable actor/workflow/entity transition.
 #[derive(Debug, Clone)]
 pub struct DurableTransition {
@@ -1124,6 +1143,33 @@ pub trait PersistenceStore: Send + Sync {
         ))
     }
 
+    /// Look up only messages produced by tracked successful workflow closure.
+    /// Generic/legacy outbox messages are deliberately excluded.
+    fn load_workflow_outbox_message(
+        &self,
+        _id: DurableOutboxId,
+    ) -> io::Result<Option<DurableOutboxMessage>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "workflow outbox dispatch is not supported",
+        ))
+    }
+
+    /// Return a bounded, ordered page for one sender, excluding admitted messages.
+    /// The exclusive cursor is (sender sequence, ordinal); wrap to None to revisit
+    /// deferred messages. A page is not a reservation or acknowledgment.
+    fn pending_workflow_outbox(
+        &self,
+        _sender: u64,
+        _after: Option<(u64, u32)>,
+        _limit: usize,
+    ) -> io::Result<Vec<DurableOutboxId>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "workflow outbox polling is not supported",
+        ))
+    }
+
     /// Return the original accepted command for this message, even after closure.
     fn load_workflow_inbox_admission(
         &self,
@@ -1391,6 +1437,60 @@ impl PersistenceStore for MemoryStore {
                     .find(|message| message.ordinal == id.ordinal)
             })
             .cloned())
+    }
+
+    fn load_workflow_outbox_message(
+        &self,
+        id: DurableOutboxId,
+    ) -> io::Result<Option<DurableOutboxMessage>> {
+        Ok(self
+            .committed_transitions(id.sender_actor_id)
+            .iter()
+            .find(|transition| {
+                transition.sequence == id.sequence && transition.workflow_effects_consumed.is_some()
+            })
+            .and_then(|transition| {
+                transition
+                    .outbox
+                    .iter()
+                    .find(|message| message.ordinal == id.ordinal)
+            })
+            .cloned())
+    }
+
+    fn pending_workflow_outbox(
+        &self,
+        sender: u64,
+        after: Option<(u64, u32)>,
+        limit: usize,
+    ) -> io::Result<Vec<DurableOutboxId>> {
+        validate_outbox_page(after, limit)?;
+        let mut pending = Vec::new();
+        for transition in self
+            .committed_transitions(sender)
+            .iter()
+            .filter(|t| t.workflow_effects_consumed.is_some())
+        {
+            let mut ordinals: Vec<_> = transition.outbox.iter().map(|m| m.ordinal).collect();
+            ordinals.sort_unstable();
+            for ordinal in ordinals {
+                let id = DurableOutboxId {
+                    sender_actor_id: sender,
+                    sequence: transition.sequence,
+                    ordinal,
+                };
+                if after.is_some_and(|cursor| (id.sequence, id.ordinal) <= cursor)
+                    || self.load_workflow_inbox_admission(id)?.is_some()
+                {
+                    continue;
+                }
+                pending.push(id);
+                if pending.len() == limit {
+                    return Ok(pending);
+                }
+            }
+        }
+        Ok(pending)
     }
 
     fn load_workflow_inbox_admission(
@@ -2457,6 +2557,17 @@ impl LibsqlStore {
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             conn.execute(
+                "CREATE TABLE IF NOT EXISTS durable_workflow_outbox (
+                    actor_id INTEGER NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    PRIMARY KEY (actor_id, sequence, ordinal)
+                )",
+                (),
+            )
+            .await
+            .map_err(io::Error::other)?;
+            conn.execute(
                 "CREATE TABLE IF NOT EXISTS durable_workflow_inbox (
                     actor_id INTEGER NOT NULL,
                     command_sequence INTEGER NOT NULL,
@@ -2687,6 +2798,80 @@ impl PersistenceStore for LibsqlStore {
                 .await
                 .map_err(io::Error::other)?;
             decode_durable_outbox(rows, id).await
+        })
+    }
+
+    fn load_workflow_outbox_message(
+        &self,
+        id: DurableOutboxId,
+    ) -> io::Result<Option<DurableOutboxMessage>> {
+        let sequence = i64::try_from(id.sequence).map_err(io::Error::other)?;
+        let conn = self.conn();
+        if !matches!(&*conn, libsql::Connection::Local(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "workflow outbox dispatch requires local SQLite",
+            ));
+        }
+        self.rt.block_on(async {
+            let rows = conn
+                .query(
+                    "SELECT o.destination_actor_id, o.behavior_id, o.payload
+                 FROM durable_workflow_outbox w
+                 JOIN durable_outbox o USING (actor_id, sequence, ordinal)
+                 JOIN durable_transitions t USING (actor_id, sequence)
+                 WHERE w.actor_id=?1 AND w.sequence=?2 AND w.ordinal=?3",
+                    libsql::params![id.sender_actor_id as i64, sequence, id.ordinal as i64],
+                )
+                .await
+                .map_err(io::Error::other)?;
+            decode_durable_outbox(rows, id).await
+        })
+    }
+
+    fn pending_workflow_outbox(
+        &self,
+        sender: u64,
+        after: Option<(u64, u32)>,
+        limit: usize,
+    ) -> io::Result<Vec<DurableOutboxId>> {
+        let (sequence, ordinal) = validate_outbox_page(after, limit)?;
+        let conn = self.conn();
+        if !matches!(&*conn, libsql::Connection::Local(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "workflow outbox dispatch requires local SQLite",
+            ));
+        }
+        self.rt.block_on(async {
+            let mut rows = conn
+                .query(
+                    "SELECT w.sequence, w.ordinal FROM durable_workflow_outbox w
+                 JOIN durable_outbox o USING (actor_id, sequence, ordinal)
+                 JOIN durable_transitions t USING (actor_id, sequence)
+                 LEFT JOIN durable_workflow_inbox i ON i.sender_actor_id=w.actor_id
+                   AND i.sender_sequence=w.sequence AND i.ordinal=w.ordinal
+                 WHERE w.actor_id=?1 AND (w.sequence, w.ordinal) > (?2, ?3)
+                   AND i.sender_actor_id IS NULL
+                 ORDER BY w.sequence, w.ordinal LIMIT ?4",
+                    libsql::params![sender as i64, sequence, ordinal, limit as i64],
+                )
+                .await
+                .map_err(io::Error::other)?;
+            let mut pending = Vec::new();
+            while let Some(row) = rows.next().await.map_err(io::Error::other)? {
+                let sequence: i64 = row.get(0).map_err(io::Error::other)?;
+                let ordinal: i64 = row.get(1).map_err(io::Error::other)?;
+                if sequence <= 0 {
+                    return Err(workflow_admission_error("invalid workflow outbox sequence"));
+                }
+                pending.push(DurableOutboxId {
+                    sender_actor_id: sender,
+                    sequence: sequence as u64,
+                    ordinal: u32::try_from(ordinal).map_err(io::Error::other)?,
+                });
+            }
+            Ok(pending)
         })
     }
 
@@ -3194,6 +3379,12 @@ impl PersistenceStore for LibsqlStore {
                 )
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                if transition.workflow_effects_consumed.is_some() {
+                    tx.execute(
+                        "INSERT INTO durable_workflow_outbox (actor_id, sequence, ordinal) VALUES (?1, ?2, ?3)",
+                        libsql::params![transition.actor_id as i64, transition.sequence as i64, message.ordinal as i64],
+                    ).await.map_err(io::Error::other)?;
+                }
             }
 
             tx.execute(
@@ -3672,6 +3863,7 @@ impl PersistenceStore for LibsqlStore {
                 "durable_domain_events",
                 "durable_effect_records",
                 "durable_outbox",
+                "durable_workflow_outbox",
                 "durable_workflow_admissions",
                 "durable_workflow_inbox",
                 "durable_transitions",

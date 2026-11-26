@@ -57,6 +57,13 @@ class DurableReleaseGateTests(unittest.TestCase):
             gate,
         )
 
+    def test_sqlite_workflow_dispatch_and_process_interruption_are_release_gates(self):
+        gate = (ROOT / "scripts" / "test-durability-guarantees.sh").read_text()
+        self.assertIn(
+            "cargo test --locked --no-default-features --features sqlite --lib workflow\n",
+            gate,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

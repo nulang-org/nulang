@@ -83,7 +83,9 @@ pub(crate) use spawn::spawn_from_module_with_authority;
 mod timer;
 mod trace;
 mod workflow;
+mod workflow_outbox;
 pub use trace::TraceContext;
+pub use workflow_outbox::WorkflowOutboxDispatch;
 
 #[cfg(test)]
 mod cluster_dst;
@@ -2030,6 +2032,16 @@ impl Runtime {
         behavior_id: u16,
         args: &[Value],
     ) -> crate::types::NuResult<Value> {
+        if self
+            .actors
+            .get(&actor_id)
+            .is_some_and(|actor| actor.mailbox.admitted_workflow_behavior().is_some())
+        {
+            return Err(NuError::VMError {
+                msg: "cannot synchronously ask an actor with an admitted workflow command".into(),
+                span: Span::default(),
+            });
+        }
         let behavior_idx = behavior_id as usize;
         if !self.actor_has_behavior_id(actor_id, behavior_id) {
             return Err(NuError::VMError {
@@ -3119,6 +3131,15 @@ impl Runtime {
     /// Close one actor turn and enqueue it exactly once when runnable mailbox
     /// work remains.
     pub(crate) fn finish_actor_turn(&mut self, actor_id: u64) {
+        // A failed terminal commit can replace this actor with a recovered
+        // instance and enqueue its original command during step_actor.
+        // The old turn must not consume the new instance's ready token.
+        if self.actors.get(&actor_id).is_some_and(|actor| {
+            actor.run_state == ActorRunState::Queued
+                && actor.mailbox.admitted_workflow_behavior().is_some()
+        }) {
+            return;
+        }
         let should_requeue = self
             .actors
             .get(&actor_id)
@@ -3143,7 +3164,7 @@ impl Runtime {
             }
         }
 
-        if should_requeue {
+        if should_requeue && self.admitted_workflow_handler_ready(actor_id) {
             self.enqueue_actor(actor_id);
         }
     }
@@ -3224,7 +3245,7 @@ impl Runtime {
                             && actor.suspended_execution.is_none()
                     })
                     .unwrap_or(false);
-                if !should_continue {
+                if !should_continue || !self.admitted_workflow_handler_ready(actor_id) {
                     break;
                 }
 
@@ -3297,7 +3318,7 @@ impl Runtime {
         let mut ready: Vec<u64> = self
             .actors
             .iter()
-            .filter(|(_, a)| !a.mailbox.is_empty())
+            .filter(|(id, a)| !a.mailbox.is_empty() && self.admitted_workflow_handler_ready(**id))
             .map(|(id, _)| *id)
             .collect();
         if ready.is_empty() {
@@ -3872,6 +3893,11 @@ impl Runtime {
             if jit_yield {
                 self.resume_suspended_jit_yield(actor_id);
             }
+        }
+
+        if !self.admitted_workflow_handler_ready(actor_id) {
+            self.current_actor = None;
+            return;
         }
 
         let msg_opt = {
@@ -5866,23 +5892,13 @@ impl Runtime {
                 .collect();
             actor.current_workflow_activation = Some(*activation);
             actor.sequence = entry.sequence;
-            if actor
-                .mailbox
-                .push_local(Message {
-                    behavior_id: entry.behavior_id,
-                    payload: MessagePayload::from_vec(payload),
-                    sender: 0,
-                    priority: MessagePriority::Normal,
-                    trace_id: None,
-                })
-                .is_err()
-            {
-                warn!(
-                    "nulang-recover: refusing workflow actor {}: recovered atomic command could not enter empty mailbox",
-                    actor_id
-                );
-                return None;
-            }
+            actor.mailbox.push_admitted_workflow(Message {
+                behavior_id: entry.behavior_id,
+                payload: MessagePayload::from_vec(payload),
+                sender: 0,
+                priority: MessagePriority::Normal,
+                trace_id: None,
+            });
         }
         if let Some(schema_name) = recovery_schema_name {
             self.recovery_schema_names.insert(actor_id, schema_name);
