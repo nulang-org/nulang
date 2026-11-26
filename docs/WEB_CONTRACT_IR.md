@@ -86,6 +86,13 @@ Contract extraction parses the package source tree and builds package-level anal
 
 Bare helper recognition is scoped to modules importing `stdlib::web*`. A Web import in one file cannot reinterpret an unrelated user-defined `route()` call in another file as framework metadata.
 
+Exact repeated registrations of the same method, path, and handler contract
+remain idempotent for compatibility. If two registrations use the same literal
+method/path but resolve to different handler contracts, package extraction now
+produces a deterministic diagnostic instead of silently dropping one. This
+check does not yet classify different path spellings that match the same set
+of URLs (for example, `/users/:id` and `/users/{user}`).
+
 Extraction is intentionally best effort so IDE/compiler tooling can inspect partial metadata. Artifact-producing and serving entry points use the stronger boundary:
 
 ```text
