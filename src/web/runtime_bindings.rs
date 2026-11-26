@@ -179,7 +179,7 @@ fn match_segments(
     Some(params)
 }
 
-fn compile_route_segments(path: &str) -> Result<Vec<RuntimeRouteSegment>, String> {
+pub(crate) fn compile_route_segments(path: &str) -> Result<Vec<RuntimeRouteSegment>, String> {
     compile_segments(path, true)
 }
 

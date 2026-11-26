@@ -1,4 +1,10 @@
 # Nulang Changelog
+
+### Web compiler route-conflict validation integration — 2026-11-26
+- **Fail closed on duplicate package route registrations and ambiguous compiled path shapes.** Reuse the authoritative Web Contract compilation/validation boundary and runtime segment parser, without introducing a parallel router.
+- Regression coverage includes duplicate direct/helper routes, capture-shape collisions, cross-module package validation, public runtime attachment, and real TCP HTTP coverage. Different methods and distinct static routes remain supported.
+- This is compile-time admission hardening, not HTTP authorization, deployment certification, or a complete overlapping-pattern policy.
+
 ### Per-priority scheduler runnable backlog diagnostics — 2026-11-20
 - **Expose approximate queued High, Normal, and Low runnable task counts** in the existing scheduler metrics snapshot, including global injector and worker-local queues, without adding counters to scheduling hot paths.
 - **Regression tests cover mixed priority queues, dequeues, and metrics-counter reset.** Queue depths are sampled non-atomically for diagnostics only; they are not admission, fairness, or backpressure guarantees.

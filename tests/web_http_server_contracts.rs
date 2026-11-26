@@ -4,9 +4,13 @@ use nulang::parser::Parser;
 use nulang::runtime::{HttpMethod, WebDevServer, WebRoute};
 use nulang::typechecker::TypeChecker;
 use nulang::web::contracts::compile_module_contracts;
+use nulang::web::dispatch::{compile_runtime_routes, compile_runtime_routes_from_contracts};
+use nulang::web::openapi::generate_openapi;
 use nulang::web::runtime_bindings::{compile_runtime_route_plan, RuntimeWebRoute};
+use nulang::web::validation::compile_validated_contracts_from_tree;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
+use std::path::PathBuf;
 use std::time::Duration;
 
 fn compile_handler(source: &str, handler_name: &str) -> (CodeModule, usize) {
@@ -164,4 +168,97 @@ fn legacy_route_still_falls_back_over_real_http() {
 
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
     assert!(response_body(&response).starts_with("legacy"), "{response}");
+}
+
+fn isolated_web_contract_test_dir(name: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "nulang-web-http-contract-{name}-{}-{id}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&path).expect("create isolated source directory");
+    path
+}
+
+#[test]
+fn unvalidated_ambiguous_contracts_must_not_attach_to_http_runtime() {
+    let source = r#"
+fn show_id(id: Int) -> Int { id }
+fn show_user(user_id: Int) -> Int { user_id }
+fn web_main() {
+    perform Web.route("GET", "/items/{id: Int}", show_id)
+    perform Web.route("GET", "/items/:user_id", show_user)
+}
+"#;
+    let tokens = Lexer::new(source).lex().expect("lex conflicting contracts");
+    let module = Parser::new(tokens)
+        .parse_module()
+        .expect("parse conflicting contracts");
+    let contracts = compile_module_contracts(&module);
+    assert!(
+        contracts.diagnostics.is_empty(),
+        "{:?}",
+        contracts.diagnostics
+    );
+    assert_eq!(contracts.routes.len(), 2);
+
+    let error = compile_runtime_routes_from_contracts(vec![typed_query_route().route], &contracts)
+        .expect_err("runtime attachment must revalidate untrusted contract input");
+    assert!(
+        error
+            .iter()
+            .any(|diagnostic| diagnostic.contains("ambiguous route GET")),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn package_route_preflight_rejects_duplicates_before_http_bind_and_allows_valid_route() {
+    let dir = isolated_web_contract_test_dir("duplicates");
+    let source_file = dir.join("main.nula");
+    let handler = r#"
+fn endpoint(limit: Int from query) -> Int { limit }
+fn web_main() {
+    perform Web.route("GET", "/users", endpoint)
+"#;
+    std::fs::write(
+        &source_file,
+        format!("{handler}    perform Web.route(\"GET\", \"/users\", endpoint)\n}}\n"),
+    )
+    .expect("write conflicting package");
+
+    // A real compiled VM handler must not be accepted for an ambiguous package.
+    let error = compile_runtime_routes(vec![typed_query_route().route], &dir)
+        .expect_err("duplicate package registration must block HTTP attachment");
+    assert!(
+        error
+            .iter()
+            .any(|diagnostic| diagnostic.contains("duplicate web route GET /users")),
+        "{error:?}"
+    );
+    assert!(
+        compile_validated_contracts_from_tree(&dir).is_err(),
+        "invalid package must not be exported to OpenAPI or deployment IR"
+    );
+
+    std::fs::write(&source_file, format!("{handler}}}\n")).expect("write valid package");
+    let contracts = compile_validated_contracts_from_tree(&dir).expect("validate route");
+    let openapi = generate_openapi(&contracts, "Test API", "1.0");
+    assert_eq!(openapi["paths"]["/users"]["get"]["operationId"], "endpoint");
+
+    let routes = compile_runtime_routes(vec![typed_query_route().route], &dir)
+        .expect("valid route must attach");
+    assert_eq!(routes.len(), 1);
+    let server = WebDevServer::bind_runtime(0, None, None, routes).expect("start listener");
+    let response = send_raw_request(
+        server.port,
+        "GET /users?limit=25 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(response_body(&response).starts_with("25"), "{response}");
+
+    drop(server);
+    std::fs::remove_dir_all(&dir).expect("remove isolated source directory");
 }
