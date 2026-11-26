@@ -853,3 +853,410 @@ app "site" {{ route "GET" "/articles/{{slug}}/{{page: Int}}" -> article }}
         assert!(!site.0.join("dist").exists());
     }
 }
+
+const MARKDOWN_APP: &str = r#"
+import stdlib::web::html
+import stdlib::web::types
+import @nulang/web_content
+
+fn article_keys() -> [String] {
+    var keys = [];
+    for item in content_articles() {
+        keys = perform Array.push(keys, item.slug)
+    }
+    keys
+}
+fn article(slug: String) -> Html {
+    var page = "not found";
+    for item in content_articles() {
+        if item.slug == slug then {
+            page = item.title + "|" + item.summary + "|" + item.body + "|" + item.source
+        } else {}
+    }
+    text(page)
+}
+app "content site" {
+    route "GET" "/articles/{slug}" -> article
+}
+"#;
+
+fn markdown_config(site: &Site, content: &str) {
+    let manifest = site.0.join("Nulang.toml");
+    let original = std::fs::read_to_string(&manifest).unwrap();
+    let prefix = original.split("[web.content]").next().unwrap();
+    std::fs::write(manifest, format!("{prefix}\n[web.content]\n{content}\n")).unwrap();
+}
+
+fn markdown_file(site: &Site, path: &str, contents: &str) {
+    let path = site.0.join(path);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, contents).unwrap();
+}
+
+fn content_site() -> Site {
+    let site = Site::new();
+    site.source(MARKDOWN_APP);
+    collections(&site, r#""/articles/{slug}" = "article_keys""#);
+    markdown_config(&site, r#"articles = "content/articles""#);
+    site
+}
+
+#[test]
+fn markdown_bundles_are_typed_deterministic_and_draft_free() {
+    let site = content_site();
+    markdown_file(
+        &site,
+        "content/articles/z.md",
+        "+++\nslug = \"last\"\ntitle = \"Last\"\n+++\nLast body\n",
+    );
+    markdown_file(&site, "content/articles/intro/index.md", "+++\r\nslug = \"intro\"\r\ntitle = 'Introdução \"quoted\"'\r\nsummary = \"Summary\"\r\ntags = [\"docs\", \"start\"]\r\n+++\r\n# Heading\r\n<script>unsafe</script>\r\n\\ literal\r\n");
+    markdown_file(
+        &site,
+        "content/articles/draft.md",
+        "+++\nslug = \"hidden\"\ntitle = \"Not published\"\ndraft = true\n+++\nDRAFT_SENTINEL\n",
+    );
+    markdown_file(
+        &site,
+        "content/articles/intro/attachment.txt",
+        "not a Markdown entry",
+    );
+    success(site.build());
+    let intro = String::from_utf8(site.read("dist/articles/intro/index.html")).unwrap();
+    assert!(intro.contains("Introdução"), "{intro}");
+    assert!(intro.contains("Summary|# Heading\n"), "{intro}");
+    assert!(
+        intro.contains("&lt;script&gt;unsafe&lt;/script&gt;"),
+        "{intro}"
+    );
+    assert!(
+        intro.contains("\\ literal\n|content/articles/intro/index.md"),
+        "{intro}"
+    );
+    assert!(!site.0.join("dist/articles/hidden").exists());
+    let nbc = site.read(".nula/build.nbc");
+    assert!(!nbc
+        .windows(b"DRAFT_SENTINEL".len())
+        .any(|w| w == b"DRAFT_SENTINEL"));
+    assert_eq!(site.ir().routes.len(), 2);
+    let ir = site.read("dist/nulang-app.ir.json");
+    success(site.build());
+    assert_eq!(site.read("dist/nulang-app.ir.json"), ir);
+    assert_eq!(
+        site.read("dist/articles/intro/index.html"),
+        intro.as_bytes()
+    );
+
+    // Dispatch the exact same compiled renderer from the validated snapshot.
+    let artifact = nulang::bytecode::CodeModule::from_nbc(&site.read(".nula/build.nbc")).unwrap();
+    let mut vm = nulang::vm::VM::new();
+    vm.load_module(artifact.module);
+    vm.run().unwrap();
+    let routes =
+        nulang::web::dispatch::compile_runtime_routes(vm.take_web_routes(), &site.0.join("src"))
+            .unwrap();
+    let params = nulang::web::dispatch::match_route(&routes[0], "/articles/intro").unwrap();
+    assert_eq!(
+        nulang::web::dispatch::render_direct_route(&routes[0], &params)
+            .unwrap()
+            .unwrap(),
+        intro,
+    );
+    std::fs::remove_file(site.0.join("content/articles/z.md")).unwrap();
+    success(site.build());
+    assert!(!site.0.join("dist/articles/last").exists());
+    assert_eq!(site.ir().routes.len(), 1);
+    assert_eq!(
+        std::fs::read_dir(site.0.join(".nula"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("web-content-"))
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn invalid_markdown_metadata_preserves_last_good_site() {
+    let site = content_site();
+    markdown_file(
+        &site,
+        "content/articles/a.md",
+        "+++\nslug = \"a\"\ntitle = \"A\"\n+++\nStable\n",
+    );
+    success(site.build());
+    let old = site.read("dist/articles/a/index.html");
+    let bad = "content/articles/b.md";
+    for (document, diagnostic) in [
+        ("# missing metadata", "expected TOML front matter"),
+        ("+++\nslug = \"b\"\ntitle = \"B\"\n", "missing closing"),
+        ("+++\nslug = \"b\"\n+++\n", "invalid front matter"),
+        (
+            "+++\nslug = \"b\"\ntitle = 42\n+++\n",
+            "invalid front matter",
+        ),
+        (
+            "+++\nslug = \"b\"\ntitle = \"B\"\ntypo = true\n+++\n",
+            "invalid front matter",
+        ),
+        (
+            "+++\nslug = \"b\"\ntitle = \" \"\n+++\n",
+            "title must not be empty",
+        ),
+        (
+            "+++\nslug = \"b\"\ntitle = \"B\"\ntags = [\"a\", \"a\"]\n+++\n",
+            "tags must be",
+        ),
+        (
+            "+++\nslug = \"../b\"\ntitle = \"B\"\n+++\n",
+            "portable nonempty",
+        ),
+        (
+            "+++\nslug = \"A\"\ntitle = \"B\"\ndraft = true\n+++\n",
+            "duplicate content slug",
+        ),
+        (
+            "+++\nslug = \"b\"\ntitle = \"B\"\n+++\n\0",
+            "must not contain NUL",
+        ),
+    ] {
+        markdown_file(&site, bad, document);
+        let output = site.build();
+        assert!(!output.status.success(), "{document}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(diagnostic) && stderr.contains("content/articles/b.md"),
+            "{diagnostic}: {stderr}"
+        );
+        assert_eq!(site.read("dist/articles/a/index.html"), old);
+    }
+}
+
+#[test]
+fn content_directories_cannot_overlap_output_or_assets_or_escape_root() {
+    let site = content_site();
+    for (config, diagnostic) in [
+        (
+            r#"articles = "../outside""#,
+            "relative path inside the package",
+        ),
+        (r#"articles = "dist/articles""#, "overlaps protected path"),
+        (r#"articles = "public/articles""#, "overlaps protected path"),
+        (r#"articles = ".nula/articles""#, "overlaps protected path"),
+        (
+            r#""bad-name" = "content/articles""#,
+            "invalid web content bundle name",
+        ),
+    ] {
+        markdown_config(&site, config);
+        let output = site.build();
+        assert!(!output.status.success(), "{config}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(diagnostic), "{diagnostic}: {stderr}");
+        assert!(!site.0.join("dist").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn content_symlinks_are_rejected_without_following_them() {
+    use std::os::unix::fs::symlink;
+    let site = content_site();
+    markdown_file(
+        &site,
+        "outside.md",
+        "+++\nslug = \"secret\"\ntitle = \"Secret\"\n+++\nPrivate\n",
+    );
+    std::fs::create_dir_all(site.0.join("content/articles")).unwrap();
+    symlink(
+        site.0.join("outside.md"),
+        site.0.join("content/articles/link.md"),
+    )
+    .unwrap();
+    let output = site.build();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("only real files and directories"));
+    assert!(!site.0.join("dist").exists());
+}
+
+#[test]
+fn content_artifacts_are_byte_identical_across_clean_packages() {
+    fn snapshot(path: &Path, root: &Path, out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                snapshot(&path, root, out);
+            } else {
+                out.insert(
+                    path.strip_prefix(root).unwrap().into(),
+                    std::fs::read(&path).unwrap(),
+                );
+            }
+        }
+    }
+    let a = content_site();
+    let b = content_site();
+    let intro = "+++\nslug = \"intro\"\ntitle = \"Intro\"\n+++\n# Heading\n";
+    let last = "+++\nslug = \"last\"\ntitle = \"Last\"\n+++\nLast\n";
+    for (path, doc) in [
+        ("content/articles/a/index.md", intro),
+        ("content/articles/z.md", last),
+    ] {
+        markdown_file(&a, path, doc);
+    }
+    for (path, doc) in [
+        ("content/articles/z.md", last),
+        ("content/articles/a/index.md", intro),
+    ] {
+        markdown_file(&b, path, doc);
+    }
+    success(a.build());
+    success(b.build());
+    let mut first = std::collections::BTreeMap::new();
+    let mut second = std::collections::BTreeMap::new();
+    snapshot(&a.0.join("dist"), &a.0.join("dist"), &mut first);
+    snapshot(&b.0.join("dist"), &b.0.join("dist"), &mut second);
+    assert_eq!(first, second);
+}
+
+#[cfg(unix)]
+#[test]
+fn content_output_alias_is_rejected() {
+    use std::os::unix::fs::symlink;
+    let site = content_site();
+    markdown_file(
+        &site,
+        "content/articles/a.md",
+        "+++\nslug = \"a\"\ntitle = \"A\"\n+++\n",
+    );
+    let original = site.read("content/articles/a.md");
+    symlink(site.0.join("content/articles"), site.0.join("dist")).unwrap();
+    let output = site.build();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("web content/output path must be a real directory"));
+    assert_eq!(site.read("content/articles/a.md"), original);
+}
+
+#[cfg(feature = "ureq")]
+#[test]
+fn content_deploy_dryrun_reuses_snapshot_for_runtime_artifact() {
+    let site = content_site();
+    markdown_file(
+        &site,
+        "content/articles/a.md",
+        "+++\nslug = \"a\"\ntitle = \"A\"\n+++\nCompiled body\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_nulang"))
+        .current_dir(&site.0)
+        .env(
+            "NULANG_STDLIB",
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/stdlib"),
+        )
+        .env_remove("CARGO_BIN_EXE_nulang")
+        .env("PATH", "")
+        .args(["nula", "deploy", "--dry-run", "--adapter", "static"])
+        .output()
+        .unwrap();
+    success(output);
+    let artifact =
+        nulang::bytecode::CodeModule::from_nbc(&site.read(".nula/dist/static-fixture.nbc"))
+            .unwrap();
+    let mut vm = nulang::vm::VM::new();
+    vm.load_module(artifact.module);
+    vm.run().unwrap();
+    let routes =
+        nulang::web::dispatch::compile_runtime_routes(vm.take_web_routes(), &site.0.join("src"))
+            .unwrap();
+    let params = nulang::web::dispatch::match_route(&routes[0], "/articles/a").unwrap();
+    let body = nulang::web::dispatch::render_direct_route(&routes[0], &params)
+        .unwrap()
+        .unwrap();
+    assert_eq!(body.as_bytes(), site.read("dist/articles/a/index.html"));
+}
+
+#[test]
+fn dev_server_uses_content_snapshot_and_does_not_publish_drafts() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{Shutdown, TcpStream};
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let site = content_site();
+    markdown_file(
+        &site,
+        "content/articles/a.md",
+        "+++\nslug = \"a\"\ntitle = \"Published\"\n+++\nBody\n",
+    );
+    markdown_file(
+        &site,
+        "content/articles/draft.md",
+        "+++\nslug = \"draft\"\ntitle = \"Private\"\ndraft = true\n+++\nPrivate body\n",
+    );
+    success(site.build());
+    let expected = site.read("dist/articles/a/index.html");
+    let stderr = std::fs::File::create(site.0.join("dev.stderr")).unwrap();
+    let mut child = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_nulang"))
+            .current_dir(&site.0)
+            .env(
+                "NULANG_STDLIB",
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("src/stdlib"),
+            )
+            .env_remove("CARGO_BIN_EXE_nulang")
+            .env("PATH", "")
+            .args(["nula", "dev", "--port", "0"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = child.0.stdout.take().unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(address) = line.strip_prefix("Dev server listening on http://") {
+                let _ = send.send(address.trim_end_matches('/').to_owned());
+                break;
+            }
+        }
+    });
+    let address = receive
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap_or_else(|err| {
+            panic!(
+                "dev startup: {err}: {}",
+                String::from_utf8_lossy(&site.read("dev.stderr"))
+            )
+        });
+    reader.join().unwrap();
+    let get = |path: &str| {
+        let mut stream = TcpStream::connect(&address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        stream.shutdown(Shutdown::Write).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response.split_once("\r\n\r\n").unwrap().1.to_owned()
+    };
+    assert_eq!(get("/articles/a").as_bytes(), expected);
+    assert_eq!(get("/articles/draft"), "not found");
+    // The dev runtime no longer needs a snapshot source on disk.
+    assert!(!std::fs::read_dir(site.0.join(".nula"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|e| e.file_name().to_string_lossy().starts_with("web-content-")));
+}

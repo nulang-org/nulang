@@ -486,7 +486,7 @@ fn ineligible(route: &IrRoute, executable: &WebRoute, enumerated: bool) -> Optio
 // A deliberately narrow, portable filesystem mapping. Percent-encoded paths,
 // traversal, Windows separators/drive prefixes, and empty segments must not
 // become filenames. A single trailing slash is normalized.
-fn artifact_path(path: &str) -> Result<String, String> {
+pub(crate) fn artifact_path(path: &str) -> Result<String, String> {
     let relative = path
         .strip_prefix('/')
         .ok_or_else(|| format!("invalid static route path '{path}'"))?;

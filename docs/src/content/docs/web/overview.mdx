@@ -342,8 +342,98 @@ All other finite deployment rules above still apply.
 
 There is no separate content or rendering runtime: records, imports, and
 functions use the existing language. The manifest only names the route-key
-projection. Markdown/front matter ingestion and filesystem globbing are not
-part of this first collection interface.
+projection.
+
+### Local Markdown content bundles
+
+For file-authored content, register named directories in the package manifest:
+
+```toml
+[web.content]
+articles = "content/articles"
+
+[web.collections]
+"/articles/{slug}" = "article_keys"
+```
+
+Each lowercase `.md` file below a bundle directory is one entry. Nested
+directories (including `intro/index.md` page bundles) are supported.
+For example, `content/articles/intro/index.md`:
+
+```markdown
++++
+slug = "intro"
+title = "Introduction"
+summary = "Getting started"
+tags = ["docs", "start"]
+draft = false
++++
+
+# Welcome
+
+Markdown content goes here.
+```
+
+The `+++` lines delimit TOML front matter. Required strings are `slug`
+and `title`; `summary` defaults to an empty string, `tags` to an empty
+string array, and `draft` to false. Unknown fields, wrong types, missing
+delimiters, empty titles, duplicate (case-insensitive) or non-portable slugs,
+and duplicate/empty/untrimmed tags are build errors with source diagnostics.
+Drafts are validated but omitted from the compiled collection in both build
+and dev; changing the flag publishes the entry on the next build.
+
+Import the generated, typed data using the ordinary module import:
+
+```nulang
+import stdlib::web::html
+import stdlib::web::types
+import @nulang/web_content
+
+fn article_keys() -> [String] {
+    var keys = [];
+    for item in content_articles() {
+        keys = perform Array.push(keys, item.slug)
+    }
+    keys
+}
+
+fn article(slug: String) -> Html {
+    var body = "Not found";
+    for item in content_articles() {
+        if item.slug == slug then { body = item.body } else {}
+    }
+    text(body)
+}
+
+app "articles" {
+    route "GET" "/articles/{slug}" -> article
+}
+```
+
+The bundle name becomes `content_<name>() -> [WebContentEntry]`.
+Each entry has `slug`, `title`, `summary`, `body`, and `source`
+strings, plus `tags: [String]`. `source` is a slash-separated path
+relative to the package. Names use lowercase ASCII letters, digits and
+underscores, starting with a letter. Entries are sorted by source path;
+CRLF line endings are normalized to LF.
+
+The package tool snapshots content once per `nula build --web`,
+`nula dev`, or `nula deploy` invocation (including deploy's separate
+runtime artifact compilation). The import is available during these web
+commands; it is not a runtime file-reading effect or a global stdlib module.
+The temporary generated source is not a public artifact. Content edits
+require a new build or dev-server restart. Bundle directories must remain
+within the package and must not overlap each other, output, static assets,
+`.git` or `.nula`; symlinks are rejected. The loader is intended for a
+trusted local project, not a concurrently mutated hostile filesystem.
+
+This initial interface ingests **Markdown source**, not rendered Markdown
+HTML. `text(body)` safely escapes the source; do not pass untrusted Markdown
+to `Web.raw`. Full Markdown-to-HTML parsing, cross-document link validation,
+automatic asset copying, custom metadata schemas and globbing are deliberately
+not included. Use the existing static asset directory for public files.
+A configured route with no published keys follows the usual empty-collection
+error rule rather than silently publishing an empty route set.
 
 ### Static effect proof
 
