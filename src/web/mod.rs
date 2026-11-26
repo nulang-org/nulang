@@ -1,3 +1,4 @@
+pub(crate) mod accessibility;
 pub mod action_dispatch;
 pub mod adapters;
 pub mod bindings;
