@@ -60,3 +60,22 @@ upgrades or whose vulnerable APIs are not used by the current implementation.
 Those suppressions are accepted risks, not a claim that the dependency graph is
 advisory-free. Release decisions should review that file and the relevant
 reachable feature paths.
+
+## Restricted WebAssembly execution (opt-in)
+
+Use `WasmRuntime::new_sandboxed(wasm_bytes, WasmSandboxLimits::default())`
+or `nulang --backend wasm-sandbox-run` (with the `wasm-backend` feature)
+to run a **restricted, pure-computation** WASM guest. The profile:
+
+- meters Wasmtime instructions with a finite fuel budget (default 10 million);
+- limits linear memory to 256 64-KiB pages (16 MiB);
+- traps on native FFI, host IO/logging, and effect-dispatch calls;
+- refuses zero fuel or invalid memory budgets.
+
+The existing `WasmRuntime::new`, `--backend wasm-run`, and native
+precompiled paths are **trusted execution**, not sandbox entry points.
+Restricted execution does not bound compile-time CPU/RAM, the work performed
+inside every host helper, or process-level threats. Deploy untrusted code
+behind an additional OS/container isolation boundary with an external
+timeout and memory/cgroup budget. The component runtime and actor pool
+have separate host boundaries and are NOT secured by this constructor.

@@ -45,9 +45,51 @@ pub fn default_wasm_config() -> Config {
     config
 }
 
+/// Resource budget for executing **untrusted** WASM. Unlike `new`, the
+/// sandboxed constructor blocks native FFI, host IO, and effect dispatch.
+#[derive(Debug, Clone, Copy)]
+pub struct WasmSandboxLimits {
+    /// Total Wasmtime instruction fuel for instantiation and execution.
+    pub fuel: u64,
+    /// Maximum linear memory size in 64-KiB WebAssembly pages.
+    pub max_memory_pages: u32,
+}
+
+impl Default for WasmSandboxLimits {
+    fn default() -> Self {
+        Self {
+            fuel: 10_000_000,
+            max_memory_pages: 256, // 16 MiB
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SandboxDenied(&'static str);
+
+impl std::fmt::Display for SandboxDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "wasm sandbox denied {}", self.0)
+    }
+}
+impl std::error::Error for SandboxDenied {}
+
+fn require_trusted_host(
+    caller: &Caller<'_, HostState>,
+    operation: &'static str,
+) -> Result<(), Error> {
+    if caller.data().sandboxed {
+        Err(Error::new(SandboxDenied(operation)))
+    } else {
+        Ok(())
+    }
+}
+
 // ── Host state ───────────────────────────────────────────────────────
 
 struct HostState {
+    sandboxed: bool,
+    limits: StoreLimits,
     /// Next allocation offset in WASM linear memory (bump allocator).
     alloc_offset: u32,
     /// Reference to the linear memory, stored for access from host functions.
@@ -70,6 +112,8 @@ struct HostState {
 impl Default for HostState {
     fn default() -> Self {
         HostState {
+            sandboxed: false,
+            limits: StoreLimits::default(),
             alloc_offset: 0,
             memory: None,
             input: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -99,18 +143,55 @@ pub struct WasmRuntime {
 }
 
 impl WasmRuntime {
-    /// Compile WASM bytecode and instantiate with host imports.
+    /// Trusted WASM execution with unrestricted host imports. Not suitable for
+    /// adversarial guest modules; use `new_sandboxed` for untrusted code.
     pub fn new(wasm_bytes: &[u8], config: Option<Config>) -> NuResult<Self> {
-        let config = config.unwrap_or_else(default_wasm_config);
-        let engine = Engine::new(&config).map_err(map_wasmtime_err)?;
+        Self::new_internal(wasm_bytes, config.unwrap_or_else(default_wasm_config), None)
+    }
 
-        let res = Module::new(&engine, wasm_bytes);
-        if let Err(_) = &res {
-            std::fs::write("/tmp/failed_module.wasm", wasm_bytes).unwrap();
+    /// Execute untrusted WASM with bounded fuel/memory and without host IO,
+    /// native FFI, or effect-dispatch authority. Only pure computational host
+    /// helpers and bounded guest-memory allocation remain available.
+    ///
+    /// This does NOT bound compilation time or every host-helper CPU cost.
+    /// Use OS-level process isolation and external timeouts for hostile tenants.
+    pub fn new_sandboxed(wasm_bytes: &[u8], limits: WasmSandboxLimits) -> NuResult<Self> {
+        if limits.fuel == 0 || limits.max_memory_pages == 0 || limits.max_memory_pages > 65_536 {
+            return Err(NuError::runtime_error(
+                "wasm sandbox requires positive fuel and 1..=65536 memory pages".into(),
+                Span::default(),
+            ));
         }
-        let module = res.map_err(map_wasmtime_err)?;
+        let mut config = default_wasm_config();
+        config.consume_fuel(true);
+        Self::new_internal(wasm_bytes, config, Some(limits))
+    }
 
-        let mut store = Store::new(&engine, HostState::default());
+    fn new_internal(
+        wasm_bytes: &[u8],
+        config: Config,
+        sandbox: Option<WasmSandboxLimits>,
+    ) -> NuResult<Self> {
+        let engine = Engine::new(&config).map_err(map_wasmtime_err)?;
+        // Malformed untrusted modules are ordinary errors: never write them to
+        // a predictable /tmp path or panic while trying to dump their bytes.
+        let module = Module::new(&engine, wasm_bytes).map_err(map_wasmtime_err)?;
+
+        let mut host = HostState::default();
+        if let Some(limits) = sandbox {
+            host.sandboxed = true;
+            host.limits = StoreLimitsBuilder::new()
+                .memory_size(limits.max_memory_pages as usize * 65_536)
+                .instances(1)
+                .memories(1)
+                .tables(1)
+                .build();
+        }
+        let mut store = Store::new(&engine, host);
+        if let Some(limits) = sandbox {
+            store.limiter(|host| &mut host.limits);
+            store.set_fuel(limits.fuel).map_err(map_wasmtime_err)?;
+        }
 
         // Build a Linker and define all host imports.
         let mut linker: Linker<HostState> = Linker::new(&engine);
@@ -186,7 +267,7 @@ impl WasmRuntime {
             .map_err(map_wasmtime_err)?;
 
         // Provide memory: 1-page (64KB) linear memory.
-        let mem_type = MemoryType::new(1, None);
+        let mem_type = MemoryType::new(1, sandbox.map(|limits| limits.max_memory_pages));
         let memory = Memory::new(&mut store, mem_type).map_err(map_wasmtime_err)?;
         store.data_mut().memory = Some(memory.clone());
         linker
@@ -243,7 +324,9 @@ impl WasmRuntime {
             // in a trap whose Display only shows a backtrace. Downcast to
             // the original message and surface it as a RuntimeError so the
             // WASM backend agrees with the interpreter/JIT/AOT.
-            if let Some(msg) = e.downcast_ref::<String>() {
+            if let Some(denied) = e.downcast_ref::<SandboxDenied>() {
+                NuError::runtime_error(denied.to_string(), Span::default())
+            } else if let Some(msg) = e.downcast_ref::<String>() {
                 NuError::runtime_error(msg.clone(), Span::default())
             } else {
                 map_wasmtime_err(e)
@@ -288,6 +371,7 @@ impl WasmRuntime {
 /// "empty string"; before this fallback the slice `data[off..off]` made
 /// every `IO.print` a silent no-op on the WASM backend.
 fn host_print(mut caller: Caller<'_, HostState>, offset: i32, len: i32) -> Result<i64, Error> {
+    require_trusted_host(&caller, "io_print")?;
     let mem = get_memory(&mut caller)?;
     let data = mem.data(&caller);
     let off = offset as usize;
@@ -313,6 +397,7 @@ fn host_print(mut caller: Caller<'_, HostState>, offset: i32, len: i32) -> Resul
 
 /// `env.io_read() -> i64`
 fn host_read(mut caller: Caller<'_, HostState>) -> Result<i64, Error> {
+    require_trusted_host(&caller, "io_read")?;
     // Read one line (mirrors the interpreter's IO.read), copy it into a
     // freshly bump-allocated WASM-memory buffer, and return it as a tagged
     // string. Nil on read error. Prefers the test input buffer over stdin.
@@ -361,6 +446,7 @@ fn host_read(mut caller: Caller<'_, HostState>) -> Result<i64, Error> {
 
 /// `env.log(offset: i32, len: i32) -> i64`
 fn host_log(mut caller: Caller<'_, HostState>, offset: i32, len: i32) -> Result<i64, Error> {
+    require_trusted_host(&caller, "log")?;
     let mem = get_memory(&mut caller)?;
     let data = mem.data(&caller);
     let off = offset as usize;
@@ -374,7 +460,13 @@ fn host_log(mut caller: Caller<'_, HostState>, offset: i32, len: i32) -> Result<
 ///
 /// Simple bump allocator in WASM linear memory. Single-threaded.
 fn host_alloc(mut caller: Caller<'_, HostState>, size: i32) -> Result<i32, Error> {
-    let size = (size as u32 + 7) & !7u32; // align to 8
+    // Guest sizes are untrusted. Casting a negative i32 to u32 and adding
+    // seven previously overflowed (panicking in debug builds).
+    let size = u32::try_from(size).map_err(|_| Error::msg("negative wasm allocation size"))?;
+    let size = size
+        .checked_add(7)
+        .ok_or_else(|| Error::msg("wasm allocation size overflow"))?
+        & !7u32; // align to 8
     let offset = caller.data().alloc_offset;
     let required = offset
         .checked_add(size)
@@ -382,8 +474,8 @@ fn host_alloc(mut caller: Caller<'_, HostState>, size: i32) -> Result<i32, Error
     let mem = get_memory(&mut caller)?;
     let current_size = mem.data_size(&caller) as u32;
     if required > current_size {
-        let pages_needed = ((required - current_size) + 65535) / 65536;
-        mem.grow(&mut caller, pages_needed as u64)
+        let pages_needed = (u64::from(required - current_size) + 65535) / 65536;
+        mem.grow(&mut caller, pages_needed)
             .map_err(|e| Error::msg(format!("memory grow: {}", e)))?;
     }
     caller.data_mut().alloc_offset = required;
@@ -646,6 +738,7 @@ fn host_ffi_call_impl(
     sig: i64,
     args: &[i64],
 ) -> Result<i64, Error> {
+    require_trusted_host(caller, "native ffi")?;
     let lib_s = read_wasm_string(&mut caller, lib);
     let sym_s = read_wasm_string(&mut caller, sym);
     let sig = sig as u64;
@@ -806,14 +899,21 @@ fn host_pow(_caller: Caller<'_, HostState>, a: i64, b: i64) -> Result<i64, Error
 /// returns its length — matching the length-return contract the pool's
 /// `host_dispatch` implements (the wasmtime-actor-pool bridges the real
 /// dispatch to `EffectRuntimePool`). Returns 0 when no result is injected.
-fn host_dispatch(mut caller: Caller<'_, HostState>, a: i32, b: i32, c: i32, d: i32) -> i64 {
+fn host_dispatch(
+    mut caller: Caller<'_, HostState>,
+    a: i32,
+    b: i32,
+    c: i32,
+    d: i32,
+) -> Result<i64, Error> {
+    require_trusted_host(&caller, "effect dispatch")?;
     // Record the (tag, payload) pair for test verification of the
     // compiler's marshaling. Scoped to release the memory borrow before the
     // result write-back below takes `&mut caller`.
     {
         let mem = match get_memory(&mut caller) {
             Ok(m) => m,
-            Err(_) => return 0,
+            Err(_) => return Ok(0),
         };
         let data = mem.data(&caller);
         let read = |off: i32, len: i32| -> Vec<u8> {
@@ -832,23 +932,23 @@ fn host_dispatch(mut caller: Caller<'_, HostState>, a: i32, b: i32, c: i32, d: i
         guard.clone()
     };
     let Some(result) = result else {
-        return 0;
+        return Ok(0);
     };
     if result.is_empty() {
-        return 0;
+        return Ok(0);
     }
     let base = crate::mir_wasm::RING_BUFFER_BASE as usize;
     let write_len = result.len().min(0x1000); // ring buffer is 4 KiB
     let mem = match get_memory(&mut caller) {
         Ok(m) => m,
-        Err(_) => return 0,
+        Err(_) => return Ok(0),
     };
     let data = mem.data_mut(&mut caller);
     if base + write_len > data.len() {
-        return 0;
+        return Ok(0);
     }
     data[base..base + write_len].copy_from_slice(&result[..write_len]);
-    write_len as i64
+    Ok(write_len as i64)
 }
 
 /// Decode one tagged Nulang value (as produced by the WASM backend) into a
@@ -898,10 +998,11 @@ fn host_dispatch_args(
     tag_len: i32,
     argv_ptr: i32,
     argc: i32,
-) -> i64 {
+) -> Result<i64, Error> {
+    require_trusted_host(&caller, "effect dispatch")?;
     const MAX_DISPATCH_ARGS: i32 = 16;
     if argc < 0 || argc > MAX_DISPATCH_ARGS {
-        return 0;
+        return Ok(0);
     }
     // Read the tag + argv words, decode into a positional JSON array, and
     // record for tests. Scoped to release the memory borrow before the result
@@ -909,7 +1010,7 @@ fn host_dispatch_args(
     {
         let mem = match get_memory(&mut caller) {
             Ok(m) => m,
-            Err(_) => return 0,
+            Err(_) => return Ok(0),
         };
         let data = mem.data(&caller);
         let read = |off: i32, len: i32| -> Vec<u8> {
@@ -938,23 +1039,23 @@ fn host_dispatch_args(
         guard.clone()
     };
     let Some(result) = result else {
-        return 0;
+        return Ok(0);
     };
     if result.is_empty() {
-        return 0;
+        return Ok(0);
     }
     let base = crate::mir_wasm::RING_BUFFER_BASE as usize;
     let write_len = result.len().min(0x1000); // ring buffer is 4 KiB
     let mem = match get_memory(&mut caller) {
         Ok(m) => m,
-        Err(_) => return 0,
+        Err(_) => return Ok(0),
     };
     let data = mem.data_mut(&mut caller);
     if base + write_len > data.len() {
-        return 0;
+        return Ok(0);
     }
     data[base..base + write_len].copy_from_slice(&result[..write_len]);
-    write_len as i64
+    Ok(write_len as i64)
 }
 
 /// Helper: retrieve linear memory from the HostState.
@@ -1173,5 +1274,186 @@ mod tests {
             Some("hello from input\n"),
             "io_read must read from the input source"
         );
+    }
+
+    #[test]
+    fn sandboxed_wasm_runs_pure_computation() {
+        let wasm = format!(
+            "(module (func (export \"nulang_init\") (result i64) i64.const {}))",
+            value_layout::tag_int(7)
+        );
+        let mut rt = WasmRuntime::new_sandboxed(
+            wasm.as_bytes(),
+            WasmSandboxLimits {
+                fuel: 10_000,
+                max_memory_pages: 2,
+            },
+        )
+        .expect("pure wasm must instantiate");
+        assert_eq!(rt.run().unwrap().as_int(), Some(7));
+    }
+
+    #[test]
+    fn sandboxed_wasm_stops_infinite_loop_with_fuel() {
+        let wasm = br#"(module
+            (func (export "nulang_init") (result i64)
+                (loop $forever br $forever)
+                i64.const 0)
+        )"#;
+        let mut rt = WasmRuntime::new_sandboxed(
+            wasm,
+            WasmSandboxLimits {
+                fuel: 1_000,
+                max_memory_pages: 2,
+            },
+        )
+        .expect("loop must compile");
+        assert!(rt.run().is_err(), "infinite loop must exhaust its budget");
+    }
+
+    #[test]
+    fn sandboxed_wasm_rejects_native_ffi() {
+        let wasm = br#"(module
+            (import "env" "ffi_call_0" (func $ffi (param i64 i64 i64) (result i64)))
+            (func (export "nulang_init") (result i64)
+                i64.const 0 i64.const 0 i64.const 0 call $ffi)
+        )"#;
+        let mut rt = WasmRuntime::new_sandboxed(wasm, WasmSandboxLimits::default()).unwrap();
+        let err = rt.run().unwrap_err().to_string();
+        assert!(err.contains("sandbox") && err.contains("ffi"), "{err}");
+    }
+
+    #[test]
+    fn sandboxed_wasm_rejects_host_io() {
+        let wasm = br#"(module
+            (import "env" "io_read" (func $read (result i64)))
+            (func (export "nulang_init") (result i64) call $read)
+        )"#;
+        let mut rt = WasmRuntime::new_sandboxed(wasm, WasmSandboxLimits::default()).unwrap();
+        let err = rt.run().unwrap_err().to_string();
+        assert!(err.contains("sandbox") && err.contains("io"), "{err}");
+    }
+
+    #[test]
+    fn sandboxed_wasm_denies_all_host_output_and_effect_dispatch() {
+        for (import_name, signature, args, denied_operation) in [
+            ("io_print", "i32 i32", "i32.const 0 i32.const 0", "io_print"),
+            ("log", "i32 i32", "i32.const 0 i32.const 0", "log"),
+            (
+                "nulang_dispatch",
+                "i32 i32 i32 i32",
+                "i32.const 0 i32.const 0 i32.const 0 i32.const 0",
+                "effect dispatch",
+            ),
+            (
+                "nulang_dispatch_args",
+                "i32 i32 i32 i32",
+                "i32.const 0 i32.const 0 i32.const 0 i32.const 0",
+                "effect dispatch",
+            ),
+        ] {
+            let wasm = format!(
+                r#"(module
+                    (import "env" "{import_name}" (func $host (param {signature}) (result i64)))
+                    (func (export "nulang_init") (result i64)
+                        {args} call $host)
+                )"#
+            );
+            let mut runtime =
+                WasmRuntime::new_sandboxed(wasm.as_bytes(), WasmSandboxLimits::default())
+                    .expect("sandboxed module should link");
+            let error = runtime.run().unwrap_err().to_string();
+            assert!(
+                error.contains("sandbox") && error.contains(denied_operation),
+                "{import_name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandboxed_wasm_rejects_imported_memory_above_budget() {
+        let wasm = br#"(module
+            (import "env" "memory" (memory 3))
+            (func (export "nulang_init") (result i64) i64.const 0)
+        )"#;
+        assert!(WasmRuntime::new_sandboxed(
+            wasm,
+            WasmSandboxLimits {
+                fuel: 100_000,
+                max_memory_pages: 2
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn sandboxed_wasm_limits_memory_growth() {
+        let wasm = format!(
+            r#"(module
+            (import "env" "memory" (memory 1))
+            (func (export "nulang_init") (result i64)
+                i32.const 2
+                memory.grow
+                i32.const -1
+                i32.eq
+                if (result i64)
+                    i64.const {}
+                else
+                    i64.const {}
+                end)
+        )"#,
+            value_layout::tag_int(7),
+            value_layout::tag_int(8)
+        );
+        let mut rt = WasmRuntime::new_sandboxed(
+            wasm.as_bytes(),
+            WasmSandboxLimits {
+                fuel: 100_000,
+                max_memory_pages: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            rt.run().unwrap().as_int(),
+            Some(7),
+            "guest must not grow past limit"
+        );
+    }
+
+    #[test]
+    fn sandboxed_wasm_rejects_negative_guest_allocation_without_panicking() {
+        let wasm = br#"(module
+            (import "env" "nulang_alloc" (func $alloc (param i32) (result i32)))
+            (func (export "nulang_init") (result i64)
+                i32.const -1
+                call $alloc
+                i64.extend_i32_u)
+        )"#;
+        let mut runtime = WasmRuntime::new_sandboxed(wasm, WasmSandboxLimits::default()).unwrap();
+        assert!(
+            runtime.run().is_err(),
+            "invalid guest allocations must trap"
+        );
+    }
+
+    #[test]
+    fn sandboxed_wasm_rejects_invalid_resource_limits() {
+        let wasm = br#"(module (func (export "nulang_init") (result i64) i64.const 0))"#;
+        assert!(WasmRuntime::new_sandboxed(
+            wasm,
+            WasmSandboxLimits {
+                fuel: 0,
+                max_memory_pages: 1
+            }
+        )
+        .is_err());
+        assert!(WasmRuntime::new_sandboxed(
+            wasm,
+            WasmSandboxLimits {
+                fuel: 1,
+                max_memory_pages: 0
+            }
+        )
+        .is_err());
     }
 }
