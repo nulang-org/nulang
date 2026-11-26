@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Per-priority scheduler runnable backlog diagnostics — 2026-11-20
+- **Expose approximate queued High, Normal, and Low runnable task counts** in the existing scheduler metrics snapshot, including global injector and worker-local queues, without adding counters to scheduling hot paths.
+- **Regression tests cover mixed priority queues, dequeues, and metrics-counter reset.** Queue depths are sampled non-atomically for diagnostics only; they are not admission, fairness, or backpressure guarantees.
+
 ### NUL0 TCP partial-frame recovery across read timeouts — 2026-11-10
 - **Preserve bytes already consumed from NUL0 frame prefixes and payloads when socket reads return `WouldBlock`, `TimedOut`, or `Interrupted`.** Retry from the unconsumed offset rather than restarting `read_exact` with a fresh buffer, preventing frame misalignment and lost actor packets.
 - **Cover fragmented reads, shutdown and premature EOF with deterministic regressions.** Existing maximum-frame-size limits and transport failure semantics are retained. The intermittent five-node post-heal delivery problem still requires separate qualification; this change does not establish that it is fully resolved.
