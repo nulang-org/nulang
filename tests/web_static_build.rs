@@ -1526,3 +1526,61 @@ app "site" {
         assert_eq!(site.read("dist/sitemap.xml"), previous);
     }
 }
+
+#[test]
+fn test_server_route_aliases_do_not_require_static_artifacts() {
+    let site = Site::new();
+    site.source(
+        r#"
+import stdlib::web::html
+import stdlib::web::types
+@placement(server)
+fn server() -> Html { text("server") }
+fn inferred() -> Html { text(perform Web.cookie("session")) }
+app "server-aliases" {
+    route "GET" "/docs" -> server
+    route "GET" "/docs/" -> server
+    route "GET" "/Account" -> inferred
+    route "GET" "/account" -> inferred
+}
+"#,
+    );
+    success(site.build());
+    let ir = site.ir();
+    assert_eq!(ir.routes.len(), 4);
+    assert!(ir
+        .routes
+        .iter()
+        .all(|r| r.placement == "server" && r.artifact.is_none()));
+    assert!(!site.0.join("dist/docs").exists());
+    assert!(!site.0.join("dist/account").exists());
+    assert!(!site.0.join("dist/Account").exists());
+}
+
+#[test]
+fn test_static_page_cannot_shadow_literal_server_alias_in_either_order() {
+    let site = Site::new();
+    site.source(STATIC);
+    success(site.build());
+    let previous = site.read("dist/index.html");
+    for routes in [
+        "route \"GET\" \"/docs\" -> page\nroute \"GET\" \"/docs/\" -> server",
+        "route \"GET\" \"/docs/\" -> server\nroute \"GET\" \"/docs\" -> page",
+        "route \"GET\" \"/Account\" -> page\nroute \"GET\" \"/account\" -> server",
+    ] {
+        site.source(&format!(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+fn page() -> Html {{ text("page") }}
+@placement(server)
+fn server() -> Html {{ text("server") }}
+app "mixed-aliases" {{ {routes} }}
+"#
+        ));
+        let output = site.build();
+        assert!(!output.status.success(), "{routes}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("conflicts"));
+        assert_eq!(site.read("dist/index.html"), previous);
+    }
+}
