@@ -1,0 +1,51 @@
+name: Web tenant RLS negative tests
+
+on:
+  pull_request:
+    paths:
+      - 'src/web/tenant_auth.rs'
+      - 'src/package/model_generator.rs'
+      - 'src/runtime/http_server.rs'
+      - 'tests/web_verified_tenant_http.rs'
+      - 'tests/web_tenant_postgres_rls.rs'
+      - 'tests/fixtures/web_tenant_rls.sql'
+      - '.github/workflows/web-tenant-rls.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tenant-rls:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_PASSWORD: local_test_admin_only
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+      - name: Provision isolated non-BYPASSRLS role and disposable database
+        env:
+          PGPASSWORD: local_test_admin_only
+        run: |
+          psql -h localhost -U postgres -v ON_ERROR_STOP=1 \
+            -c "CREATE ROLE nulang_rls_ci WITH LOGIN PASSWORD 'local_test_role_only' NOSUPERUSER NOBYPASSRLS;"
+          psql -h localhost -U postgres -v ON_ERROR_STOP=1 \
+            -c "CREATE DATABASE nulang_rls_ci OWNER nulang_rls_ci;"
+      - name: PostgreSQL cross-tenant read/write negative tests
+        env:
+          NU_TEST_POSTGRES_REQUIRED: '1'
+          NU_TEST_POSTGRES_URL: 'host=localhost port=5432 user=nulang_rls_ci password=local_test_role_only dbname=nulang_rls_ci'
+          CARGO_INCREMENTAL: '0'
+        run: cargo test --locked --no-default-features --features postgres --test web_tenant_postgres_rls -- --nocapture

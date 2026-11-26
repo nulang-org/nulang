@@ -1,0 +1,61 @@
+// Read-only admin presentation primitives.
+// Import: `import stdlib::web::admin`
+//
+// This module only formats data already authorized by the application.
+// It never loads records, resolves tenant scope, authorizes HTTP requests,
+// creates write endpoints, or authorizes actions.
+
+import stdlib::web::html
+import stdlib::web::types
+
+/// Render an accessible read-only table from application-provided strings.
+/// Reject malformed rows before emitting any row data.
+pub fn readonly_table(headers: [String], rows: [[String]]) -> Html {
+    for cells in rows {
+        if perform Array.length(cells) != perform Array.length(headers) then {
+            return el("p", [("role", text("alert"))], [text("Invalid table data")])
+        } else {}
+    };
+
+    var headings = [];
+    for heading in headers {
+        headings = perform Array.push(
+            headings,
+            el("th", [("scope", text("col"))], [text(heading)])
+        )
+    };
+
+    var body_rows = [];
+    for cells in rows {
+        var cell_nodes = [];
+        for cell in cells {
+            cell_nodes = perform Array.push(cell_nodes, el("td", [], [text(cell)]))
+        };
+        body_rows = perform Array.push(body_rows, el("tr", [], cell_nodes))
+    };
+    el("table", [], [
+        el("thead", [], [el("tr", [], headings)]),
+        el("tbody", [], body_rows)
+    ])
+}
+
+/// Render a read-only definition list. Both arrays must have equal length.
+pub fn readonly_detail(labels: [String], values: [String]) -> Html {
+    if perform Array.length(labels) != perform Array.length(values) then {
+        return el("p", [("role", text("alert"))], [text("Invalid detail data")])
+    } else {};
+
+    var fields = [];
+    var index = 0;
+    for label in labels {
+        fields = perform Array.push(fields, el("dt", [], [text(label)]));
+        fields = perform Array.push(fields, el("dd", [], [text(values[index])]));
+        index = index + 1
+    };
+    el("dl", [], fields)
+}
+
+/// Safe fallback for applications that reject record-level authorization.
+pub fn denied_view() -> Html {
+    el("p", [("role", text("alert"))], [text("Access denied")])
+}

@@ -1,0 +1,6 @@
+import stdlib::web::turbo
+
+fn main() {
+    let stream = append("todos", perform Web.text("Tea & toast"))
+    perform IO.print(stream)
+}

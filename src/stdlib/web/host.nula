@@ -2,6 +2,8 @@
 // Import: `import stdlib::web`
 //
 // The `Web` effect is the runtime host for the compiler-first web framework.
+// String-valued request accessors and kv_get return an empty String when
+// a value is absent; they never return Nil for a String return type.
 // Wrapper functions also declare the placement effects (`Request`, `Render`,
 // `Respond`) so the compiler can infer placements.
 
@@ -36,6 +38,13 @@ pub fn raw(s: String) -> Html ! {Web, Render} {
     perform Web.raw(s)
 }
 
+/// Render a Turbo Stream action for a DOM id. The content must be an Html
+/// value constructed through safe HTML helpers, not unescaped user input.
+/// On a Web request, this selects the Turbo Stream response MIME type.
+pub fn turbo_stream(action: String, target: String, content: Html) -> Html ! {Web, Render, Respond} {
+    perform Web.turbo_stream(action, target, content)
+}
+
 /// Produce a redirect response to the given URL.
 pub fn redirect(url: String) -> Html ! {Web, Respond} {
     perform Web.redirect(url)
@@ -59,6 +68,13 @@ pub fn param(name: String) -> String ! {Web, Request} {
 /// Get a request header from the current HTTP request.
 pub fn header(name: String) -> String ! {Web, Request} {
     perform Web.header(name)
+}
+
+/// Obtain the tenant ID exclusively from an opt-in trusted session resolver.
+/// Empty outside a protected, successfully authenticated route.
+/// This does not grant database or resource permissions by itself.
+pub fn verified_tenant_id() -> String ! {Web, Request} {
+    perform Web.verified_tenant_id()
 }
 
 /// Get a cookie value from the current HTTP request by name.
@@ -99,6 +115,11 @@ pub fn kv_delete(key: String) -> Unit ! {Web, Request} {
 /// Return all key/value pairs in the ephemeral in-memory web store.
 pub fn kv_all() -> [(String, String)] ! {Web, Request} {
     perform Web.kv_all()
+}
+
+/// Generate a cryptographically random 256-bit session secret.
+pub fn secure_token() -> String ! {Web, Request} {
+    perform Web.secure_token()
 }
 
 /// Set a response cookie.
