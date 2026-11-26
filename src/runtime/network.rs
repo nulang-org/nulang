@@ -1592,6 +1592,10 @@ fn read_varint(bytes: &[u8], offset: usize) -> Option<(u64, usize)> {
     loop {
         let byte = *bytes.get(offset + consumed)?;
         consumed += 1;
+        // Only one payload bit fits in the tenth byte of a u64 varint.
+        if consumed == 10 && byte > 1 {
+            return None;
+        }
         result |= ((byte & 0x7F) as u64) << ((consumed - 1) * 7);
         if byte & 0x80 == 0 {
             return Some((result, consumed));
@@ -4295,6 +4299,199 @@ mod tests {
     // ------------------------------------------------------------------
     // 12. Corrupt / garbage bytes are rejected
     // ------------------------------------------------------------------
+    #[test]
+    fn test_packet_required_fields_reject_every_truncated_prefix() {
+        let watcher = RemoteLink {
+            node_id: NodeId(7),
+            actor_id: 11,
+        };
+        let target = RemoteLink {
+            node_id: NodeId(9),
+            actor_id: 13,
+        };
+        let packets = [
+            Packet::Heartbeat {
+                node_id: NodeId(4),
+                timestamp: u64::MAX,
+            },
+            Packet::Ack {
+                packet_seq: u64::MAX,
+            },
+            Packet::SpawnRequest {
+                request_id: 1,
+                behavior_name: "counter".into(),
+                content_hash: Some([3; 32]),
+                initial_state: vec![("count".into(), Value::int(17))],
+                bytecode: Some(vec![1, 2, 3]),
+            },
+            Packet::SpawnResponse {
+                request_id: 1,
+                actor_id: 5,
+                success: true,
+            },
+            Packet::FetchBehaviorRequest {
+                content_hash: [4; 32],
+            },
+            Packet::FetchBehaviorResponse {
+                content_hash: [4; 32],
+                behavior_name: "counter".into(),
+                nbc_bytes: Some(vec![1, 2, 3]),
+            },
+            Packet::Link {
+                watcher: watcher.clone(),
+                target: target.clone(),
+            },
+            Packet::Monitor {
+                watcher,
+                target: target.clone(),
+            },
+            Packet::Down {
+                target,
+                reason: "stopped".into(),
+            },
+            Packet::MigrateActor {
+                actor_id: 8,
+                nbc_bytes: vec![1, 2],
+                snapshot_json: vec![3, 4],
+            },
+            Packet::NodeGoodbye {
+                node_id: NodeId(6),
+                durable: vec![(8, 1), (9, 2)],
+            },
+            Packet::ShadowReplicate {
+                actor_id: 8,
+                nbc_bytes: vec![1, 2],
+                snapshot_json: vec![3, 4],
+                epoch: 2,
+            },
+            Packet::CrdtSync {
+                ops: Arc::new(vec![CrdtOp {
+                    crdt_id: CrdtId(1),
+                    crdt_type: CrdtType::GCounter,
+                    payload: vec![1, 2, 3],
+                }]),
+            },
+            Packet::CrdtDeltaSync {
+                ops: Arc::new(vec![CrdtDeltaOp {
+                    op: CrdtOp {
+                        crdt_id: CrdtId(1),
+                        crdt_type: CrdtType::GCounter,
+                        payload: vec![1, 2, 3],
+                    },
+                    is_delta: true,
+                }]),
+            },
+        ];
+        for packet in packets {
+            let bytes = packet.to_bytes(u64::MAX);
+            for end in 0..bytes.len() {
+                assert!(
+                    Packet::from_bytes(&bytes[..end]).is_none(),
+                    "accepted truncated packet type {} at {end}/{}",
+                    bytes[4],
+                    bytes.len()
+                );
+            }
+            assert_eq!(Packet::from_bytes(&bytes), Some((u64::MAX, packet)));
+        }
+    }
+
+    // Several length-prefixed packet readers still require a separate
+    // checked-offset audit on 32-bit targets. This test pins native behavior.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn test_packet_rejects_oversized_declared_counts_and_lengths() {
+        let cases = [
+            (
+                Packet::Down {
+                    target: RemoteLink {
+                        node_id: NodeId(1),
+                        actor_id: 2,
+                    },
+                    reason: "stop".into(),
+                },
+                16,
+            ),
+            (
+                Packet::NodeGoodbye {
+                    node_id: NodeId(1),
+                    durable: vec![(2, 3)],
+                },
+                8,
+            ),
+            (
+                Packet::CrdtSync {
+                    ops: Arc::new(vec![]),
+                },
+                0,
+            ),
+            (
+                Packet::CrdtDeltaSync {
+                    ops: Arc::new(vec![]),
+                },
+                0,
+            ),
+            (
+                Packet::MigrateActor {
+                    actor_id: 1,
+                    nbc_bytes: vec![1, 2],
+                    snapshot_json: vec![3],
+                },
+                8,
+            ),
+            (
+                Packet::ShadowReplicate {
+                    actor_id: 1,
+                    nbc_bytes: vec![1, 2],
+                    snapshot_json: vec![3],
+                    epoch: 4,
+                },
+                8,
+            ),
+        ];
+        for (packet, offset) in cases {
+            let mut bytes = packet.to_bytes(1);
+            let start = PACKET_HEADER_LEN + offset;
+            bytes[start..start + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+            assert!(
+                Packet::from_bytes(&bytes).is_none(),
+                "accepted oversized field for packet type {}",
+                bytes[4]
+            );
+        }
+    }
+
+    #[test]
+    fn test_packet_rejects_invalid_utf8_and_unknown_value_tag() {
+        let mut bytes = Packet::Down {
+            target: RemoteLink {
+                node_id: NodeId(1),
+                actor_id: 2,
+            },
+            reason: "x".into(),
+        }
+        .to_bytes(1);
+        *bytes.last_mut().unwrap() = 0xff;
+        assert!(Packet::from_bytes(&bytes).is_none());
+        assert!(read_value(&[0xff], 0).is_none());
+    }
+
+    #[test]
+    fn test_varint_rejects_overflow_in_tenth_byte() {
+        for terminal in 2..=127u8 {
+            let mut bytes = [0xff; 10];
+            bytes[9] = terminal;
+            assert!(
+                read_varint(&bytes, 0).is_none(),
+                "accepted overflowing terminal byte {terminal:#x}"
+            );
+        }
+        let mut max = [0xff; 10];
+        max[9] = 1;
+        assert_eq!(read_varint(&max, 0), Some((u64::MAX, 10)));
+        assert!(read_varint(&[0x80; 10], 0).is_none());
+    }
+
     #[test]
     fn test_packet_from_bytes_rejects_garbage() {
         assert!(Packet::from_bytes(b"").is_none());
