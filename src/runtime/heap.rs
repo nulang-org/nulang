@@ -1895,9 +1895,11 @@ fn test_heap_pool_reuse_across_heaps() {
         let heaps: Vec<_> = (0..4).map(|_| materialize()).collect();
         let bases: Vec<_> = heaps.iter().map(|heap| heap.base).collect();
         drop(heaps); // Return real blocks through the normal Drop path.
+        HEAP_POOL.with(|pool| assert_eq!(pool.borrow().len(), 4));
 
         // Keep replacements alive as well: each pooled block may be reused once.
         let replacements: Vec<_> = (0..4).map(|_| materialize()).collect();
+        HEAP_POOL.with(|pool| assert!(pool.borrow().is_empty()));
         for heap in &replacements {
             assert!(bases.contains(&heap.base), "expected a recycled block");
         }
