@@ -9456,6 +9456,12 @@ fn assert_generic_outbox_not_dispatched(rt: &mut Runtime) {
         .pending_workflow_outbox(sender, None, 1)
         .unwrap()
         .is_empty());
+    let scan = rt
+        .persistence
+        .scan_pending_workflow_outbox(0, 1, None, None, 1)
+        .unwrap();
+    assert!(scan.identities.is_empty());
+    assert!(scan.watermark.is_none());
     assert_eq!(
         rt.dispatch_workflow_outbox(id).unwrap_err().kind(),
         std::io::ErrorKind::NotFound
@@ -9730,4 +9736,436 @@ fn workflow_dispatch_process_kill_after_admission() {
     drop(rt);
     std::fs::remove_file(path).unwrap();
     std::fs::remove_file(ready).unwrap();
+}
+
+fn outbox_pump_config(page_size: usize) -> WorkflowOutboxPumpConfig {
+    WorkflowOutboxPumpConfig {
+        page_size,
+        retry_interval: Duration::from_millis(100),
+    }
+}
+
+fn assert_shard_outbox_scan(rt: &mut Runtime) {
+    let (sender, _, behavior, first, second) = dispatch_fixture(rt);
+    let (other_sender, _, _, other_first, other_second) = dispatch_fixture(rt);
+    let mut expected = vec![first, second, other_first, other_second];
+    expected.sort_unstable_by_key(|id| (id.sequence, id.sender_actor_id, id.ordinal));
+    let page = rt
+        .persistence
+        .scan_pending_workflow_outbox(0, 1, None, None, 1)
+        .unwrap();
+    assert_eq!(page.identities, expected[..1]);
+    assert_eq!(page.watermark, expected.last().copied());
+    // A hot sender can append new work while a sweep is in progress.
+    rt.send_message(sender, "send", &[Value::int(behavior as i64)]);
+    run_ready_actor_turn(rt, sender);
+    let tail = rt
+        .persistence
+        .scan_pending_workflow_outbox(0, 1, page.identities.last().copied(), page.watermark, 10)
+        .unwrap();
+    assert_eq!(tail.identities, expected[1..]);
+    assert_eq!(tail.watermark, page.watermark);
+    let all = rt
+        .persistence
+        .scan_pending_workflow_outbox(0, 1, None, None, 10)
+        .unwrap();
+    assert_eq!(all.identities.len(), 6);
+    assert!(all.watermark.unwrap().sequence > page.watermark.unwrap().sequence);
+    for shard in 0..2 {
+        let page = rt
+            .persistence
+            .scan_pending_workflow_outbox(shard, 2, None, None, 10)
+            .unwrap();
+        assert_eq!(
+            page.identities,
+            all.identities
+                .iter()
+                .copied()
+                .filter(|id| id.sender_actor_id % 2 == u64::from(shard))
+                .collect::<Vec<_>>()
+        );
+        if sender % 2 != u64::from(shard) {
+            assert!(rt
+                .persistence
+                .scan_pending_workflow_outbox(shard, 2, Some(first), Some(first), 1)
+                .is_err());
+        }
+    }
+    assert!(rt
+        .persistence
+        .scan_pending_workflow_outbox(0, 0, None, None, 1)
+        .is_err());
+    assert!(rt
+        .persistence
+        .scan_pending_workflow_outbox(1, 1, None, None, 1)
+        .is_err());
+    assert!(rt
+        .persistence
+        .scan_pending_workflow_outbox(0, 1, Some(first), None, 1)
+        .is_err());
+    assert!(rt
+        .persistence
+        .scan_pending_workflow_outbox(0, 1, None, None, 0)
+        .is_err());
+    assert!(rt
+        .persistence
+        .scan_pending_workflow_outbox(0, 1, None, None, MAX_WORKFLOW_OUTBOX_PAGE + 1)
+        .is_err());
+    assert_ne!(sender, other_sender);
+}
+
+#[test]
+fn workflow_outbox_pump_memory_scan_watermark_shards_and_bounds() {
+    assert_shard_outbox_scan(&mut Runtime::new());
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn workflow_outbox_pump_sqlite_scan_watermark_shards_and_bounds() {
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(LibsqlStore::in_memory().unwrap());
+    assert_shard_outbox_scan(&mut rt);
+}
+
+fn assert_outbox_pump_fairness(rt: &mut Runtime) {
+    rt.install_virtual_clock();
+    let (sender, receiver, _, first, second) = dispatch_fixture(rt);
+    let (other_sender, other_receiver, _, other_first, other_second) = dispatch_fixture(rt);
+    rt.remove_actor_reaping(receiver);
+    rt.remove_actor_reaping(sender); // sender need not be resident for discovery
+    assert!(rt.poll_workflow_outbox().unwrap().is_none());
+    assert!(rt
+        .enable_workflow_outbox_pump(outbox_pump_config(0))
+        .is_err());
+    assert!(rt
+        .enable_workflow_outbox_pump(WorkflowOutboxPumpConfig {
+            page_size: 1,
+            retry_interval: Duration::ZERO
+        })
+        .is_err());
+    rt.enable_workflow_outbox_pump(outbox_pump_config(1))
+        .unwrap();
+    for _ in 0..2 {
+        let report = rt.poll_workflow_outbox().unwrap().unwrap();
+        assert_eq!(report.examined, 1);
+        assert_eq!(report.deferred, 1);
+        assert!(!report.sweep_complete);
+    }
+    let report = rt.poll_workflow_outbox().unwrap().unwrap();
+    assert_eq!(report.admitted, 1);
+    assert!(rt
+        .persistence
+        .load_workflow_inbox_admission(other_first)
+        .unwrap()
+        .is_some());
+    let report = rt.poll_workflow_outbox().unwrap().unwrap();
+    assert_eq!(report.deferred, 1); // recipient already has the first command
+    assert!(report.sweep_complete);
+    assert!(rt.poll_workflow_outbox().unwrap().is_none());
+    rt.run_scheduler();
+    assert_received(
+        rt,
+        other_receiver,
+        1,
+        PersistedValue::String("first".into()),
+    );
+    assert_eq!(
+        rt.pending_workflow_outbox(sender, None, 10).unwrap(),
+        vec![first, second]
+    );
+    assert_eq!(
+        rt.pending_workflow_outbox(other_sender, None, 10).unwrap(),
+        vec![other_second]
+    );
+    rt.advance_time(Duration::from_millis(99));
+    rt.note_workflow_outbox_staged(); // hot sender cannot bypass retry cooldown
+    assert!(rt.poll_workflow_outbox().unwrap().is_none());
+    rt.advance_time(Duration::from_millis(1));
+    assert_eq!(rt.recover_actor(receiver), Some(receiver));
+    rt.actors
+        .get_mut(&receiver)
+        .unwrap()
+        .register_behavior("receive", receive_workflow_outbox);
+    rt.run_scheduler();
+    assert_received(rt, receiver, 2, PersistedValue::Int(9));
+    assert_received(rt, other_receiver, 2, PersistedValue::Int(9));
+    assert!(rt
+        .pending_workflow_outbox(sender, None, 10)
+        .unwrap()
+        .is_empty());
+    assert!(rt
+        .pending_workflow_outbox(other_sender, None, 10)
+        .unwrap()
+        .is_empty());
+    assert_eq!(rt.persistence.read_journal(receiver).len(), 2);
+    assert_eq!(rt.persistence.read_journal(other_receiver).len(), 2);
+    rt.disable_workflow_outbox_pump();
+    assert!(rt.poll_workflow_outbox().unwrap().is_none());
+}
+
+#[test]
+fn workflow_outbox_pump_memory_fairness_and_retry_cooldown() {
+    assert_outbox_pump_fairness(&mut Runtime::new());
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn workflow_outbox_pump_sqlite_fairness_and_retry_cooldown() {
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(LibsqlStore::in_memory().unwrap());
+    assert_outbox_pump_fairness(&mut rt);
+}
+
+#[test]
+fn workflow_outbox_pump_idle_budget_preserves_cursor_and_quiesces() {
+    let mut rt = Runtime::new();
+    rt.install_virtual_clock();
+    for _ in 0..3 {
+        let (sender, receiver, _, _, _) = dispatch_fixture(&mut rt);
+        rt.remove_actor_reaping(sender);
+        rt.remove_actor_reaping(receiver);
+    }
+    rt.enable_workflow_outbox_pump(outbox_pump_config(1))
+        .unwrap();
+    rt.run_scheduler(); // four deferred pages, not an unbounded spin
+    let report = rt.poll_workflow_outbox().unwrap().unwrap();
+    assert_eq!(report.deferred, 1);
+    assert!(!report.sweep_complete);
+    let report = rt.poll_workflow_outbox().unwrap().unwrap();
+    assert_eq!(report.deferred, 1);
+    assert!(report.sweep_complete);
+    assert!(rt.poll_workflow_outbox().unwrap().is_none());
+}
+
+#[test]
+fn workflow_outbox_pump_new_terminal_commit_wakes_idle_scan() {
+    let mut rt = Runtime::new();
+    rt.install_virtual_clock();
+    let (sender, receiver, behavior) = workflow_staging_fixture(&mut rt);
+    rt.actors.get_mut(&receiver).unwrap().behavior_table[behavior as usize].handler_fn =
+        receive_workflow_outbox;
+    rt.actors
+        .get_mut(&sender)
+        .unwrap()
+        .register_behavior("send", stage_test_messages);
+    rt.enable_workflow_outbox_pump(outbox_pump_config(64))
+        .unwrap();
+    rt.run_scheduler(); // empty scan enters idle cooldown
+    assert!(rt.poll_workflow_outbox().unwrap().is_none());
+    rt.send_message(sender, "send", &[Value::int(behavior as i64)]);
+    rt.run_scheduler();
+    assert_received(&rt, receiver, 1, PersistedValue::String("first".into()));
+    assert_eq!(
+        rt.pending_workflow_outbox(sender, None, 10).unwrap().len(),
+        1
+    );
+    rt.advance_time(Duration::from_millis(100));
+    rt.run_scheduler();
+    assert_received(&rt, receiver, 2, PersistedValue::Int(9));
+    assert!(rt
+        .pending_workflow_outbox(sender, None, 10)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn workflow_outbox_pump_deterministic_scheduler_uses_virtual_cooldown() {
+    let mut rt = Runtime::new();
+    rt.install_virtual_clock();
+    let (sender, receiver, _, _, _) = dispatch_fixture(&mut rt);
+    rt.enable_workflow_outbox_pump(outbox_pump_config(64))
+        .unwrap();
+    assert_eq!(
+        rt.run_scheduler_deterministic(42, 10),
+        DeterministicRunResult::Quiescent { steps: 1 }
+    );
+    assert_received(&rt, receiver, 1, PersistedValue::String("first".into()));
+    assert_eq!(
+        rt.run_scheduler_deterministic(42, 10),
+        DeterministicRunResult::Quiescent { steps: 0 }
+    );
+    rt.advance_time(Duration::from_millis(100));
+    assert_eq!(
+        rt.run_scheduler_deterministic(42, 10),
+        DeterministicRunResult::Quiescent { steps: 1 }
+    );
+    assert_received(&rt, receiver, 2, PersistedValue::Int(9));
+    assert!(rt
+        .pending_workflow_outbox(sender, None, 10)
+        .unwrap()
+        .is_empty());
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn workflow_outbox_pump_restart_discovers_unadmitted_without_sender_residency() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "nulang-outbox-pump-{}-{nonce}.db",
+        std::process::id()
+    ));
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(LibsqlStore::new(&path).unwrap());
+    let (sender, receiver, _, first, second) = dispatch_fixture(&mut rt);
+    assert!(matches!(
+        rt.dispatch_workflow_outbox(first).unwrap(),
+        WorkflowOutboxDispatch::Admitted(_)
+    ));
+    drop(rt);
+    let mut rt = Runtime::new();
+    rt.install_virtual_clock();
+    rt.persistence = Box::new(LibsqlStore::new(&path).unwrap());
+    assert_eq!(rt.recover_actor(receiver), Some(receiver));
+    rt.actors
+        .get_mut(&receiver)
+        .unwrap()
+        .register_behavior("receive", receive_workflow_outbox);
+    assert!(!rt.actors.contains_key(&sender));
+    rt.enable_workflow_outbox_pump(outbox_pump_config(64))
+        .unwrap();
+    rt.run_scheduler(); // replay first, second deferred until receipt closure
+    assert_received(&rt, receiver, 1, PersistedValue::String("first".into()));
+    assert_eq!(
+        rt.pending_workflow_outbox(sender, None, 10).unwrap(),
+        vec![second]
+    );
+    assert_eq!(rt.persistence.read_journal(receiver).len(), 1);
+    rt.advance_time(Duration::from_millis(100));
+    rt.run_scheduler();
+    assert_received(&rt, receiver, 2, PersistedValue::Int(9));
+    assert_eq!(rt.persistence.read_journal(receiver).len(), 2);
+    assert!(rt
+        .pending_workflow_outbox(sender, None, 10)
+        .unwrap()
+        .is_empty());
+    drop(rt);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn workflow_outbox_pump_failed_admission_does_not_starve_other_receivers() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "nulang-outbox-failure-{}-{nonce}.db",
+        std::process::id()
+    ));
+    let mut rt = Runtime::new();
+    rt.install_virtual_clock();
+    rt.persistence = Box::new(LibsqlStore::new(&path).unwrap());
+    let (sender, receiver, _, first, _) = dispatch_fixture(&mut rt);
+    let (_, other_receiver, _, _, _) = dispatch_fixture(&mut rt);
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute_batch(&format!("CREATE TRIGGER fail_pump BEFORE INSERT ON durable_workflow_inbox WHEN NEW.actor_id={receiver} BEGIN SELECT RAISE(ABORT, 'admission fault'); END;")).unwrap();
+    rt.enable_workflow_outbox_pump(outbox_pump_config(64))
+        .unwrap();
+    let report = rt.poll_workflow_outbox().unwrap().unwrap();
+    assert_eq!(report.examined, 4);
+    assert_eq!(report.failed, 2);
+    assert_eq!(report.admitted, 1);
+    assert_eq!(report.deferred, 1);
+    assert!(report.sweep_complete);
+    assert!(rt
+        .persistence
+        .load_workflow_inbox_admission(first)
+        .unwrap()
+        .is_none());
+    assert!(rt.actors[&receiver].mailbox.is_empty());
+    rt.run_scheduler();
+    assert_received(
+        &rt,
+        other_receiver,
+        1,
+        PersistedValue::String("first".into()),
+    );
+    raw.execute_batch("DROP TRIGGER fail_pump;").unwrap();
+    assert!(rt.poll_workflow_outbox().unwrap().is_none());
+    rt.advance_time(Duration::from_millis(100));
+    rt.run_scheduler();
+    assert_received(&rt, receiver, 1, PersistedValue::String("first".into()));
+    assert_received(&rt, other_receiver, 2, PersistedValue::Int(9));
+    rt.advance_time(Duration::from_millis(100));
+    rt.run_scheduler();
+    assert_received(&rt, receiver, 2, PersistedValue::Int(9));
+    assert!(rt
+        .pending_workflow_outbox(sender, None, 10)
+        .unwrap()
+        .is_empty());
+    drop(raw);
+    drop(rt);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn workflow_outbox_pump_unsupported_store_fails_closed() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "nulang-unsupported-outbox-{}-{nonce}",
+        std::process::id()
+    ));
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(JsonFileStore::new(&directory).unwrap());
+    assert_eq!(
+        rt.enable_workflow_outbox_pump(outbox_pump_config(1))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    assert!(rt.poll_workflow_outbox().unwrap().is_none());
+    drop(rt);
+    std::fs::remove_dir(directory).unwrap();
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn workflow_outbox_pump_scan_error_preserves_cursor_and_backs_off() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "nulang-outbox-scan-error-{}-{nonce}.db",
+        std::process::id()
+    ));
+    let mut rt = Runtime::new();
+    rt.install_virtual_clock();
+    rt.persistence = Box::new(LibsqlStore::new(&path).unwrap());
+    let (sender, receiver, _, _, _) = dispatch_fixture(&mut rt);
+    rt.remove_actor_reaping(receiver);
+    rt.enable_workflow_outbox_pump(outbox_pump_config(1))
+        .unwrap();
+    let first = rt.poll_workflow_outbox().unwrap().unwrap();
+    assert_eq!(first.deferred, 1);
+    assert!(!first.sweep_complete);
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    // Test-only fault: hide the scan table without deleting its rows.
+    raw.execute_batch("ALTER TABLE durable_workflow_outbox RENAME TO test_hidden_workflow_outbox;")
+        .unwrap();
+    assert!(rt.poll_workflow_outbox().is_err());
+    raw.execute_batch("ALTER TABLE test_hidden_workflow_outbox RENAME TO durable_workflow_outbox;")
+        .unwrap();
+    assert!(rt.poll_workflow_outbox().unwrap().is_none());
+    rt.advance_time(Duration::from_millis(100));
+    let second = rt.poll_workflow_outbox().unwrap().unwrap();
+    assert_eq!(second.deferred, 1);
+    assert!(
+        second.sweep_complete,
+        "a scan fault must not reset the page cursor"
+    );
+    assert_eq!(
+        rt.pending_workflow_outbox(sender, None, 10).unwrap().len(),
+        2
+    );
+    drop(raw);
+    drop(rt);
+    std::fs::remove_file(path).unwrap();
 }

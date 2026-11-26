@@ -348,7 +348,7 @@ activation and recover the original admitted command; no messages are
 published to mailboxes. A replay reconstructs the staging buffer. Native
 handler registration and stable destination behavior IDs remain host
 responsibilities. Ordinary send semantics and bytecode/AOT dispatch are
-unchanged. No automatic outbox delivery is enabled.
+unchanged. Automatic delivery remains disabled by default.
 
 ### Opt-in same-store outbox dispatcher (experimental)
 
@@ -356,8 +356,8 @@ A host may call `Runtime::pending_workflow_outbox(sender, after, limit)`
 between scheduler turns to discover unadmitted tracked workflow messages.
 Pages contain at most 1024 identities in (sender sequence, ordinal) order.
 The cursor is exclusive; wrap to `None` on the next scan so a deferred
-destination does not block unrelated messages. The host supplies known
-sender IDs, controls polling cadence and must retry deferred work. A page
+destination does not block unrelated messages. This manual API requires known
+sender IDs and host-managed polling cadence. A page
 is not a reservation. It does not guarantee dispatch order across calls.
 
 `Runtime::dispatch_workflow_outbox(id)` loads a committed tracked message,
@@ -386,8 +386,8 @@ MemoryStore and local SQLite support the opt-in path. SQLite adds an
 atomic `durable_workflow_outbox` identity index populated only by tracked
 successful terminal commits. Generic/legacy outbox rows and pre-index
 SQLite rows are not auto-qualified or backfilled. The dispatcher never
-deletes receipts or messages. This is not automatic scheduling, durable
-FIFO across senders, cross-shard/cross-store messaging, or exactly-once
+deletes receipts or messages. This is not durable FIFO across senders,
+cross-shard/cross-store messaging, or exactly-once
 external side effects. This release slice does not qualify native handler
 identity changes, ownership transfer, remote libSQL, destructive clear,
 retention, or mixed-version writers.
@@ -397,6 +397,60 @@ cut, loss after mailbox publication, and OS process termination after admission
 but before handler execution. The durability release gate runs the SQLite
 workflow library suite, including these tests.
 
+
+### Opt-in automatic outbox pump (experimental)
+
+A host may enable the cooperative scheduler pump after choosing a supported
+persistence store and restoring/registering the ordinary Rust workflow actors:
+
+```rust
+runtime.enable_workflow_outbox_pump(WorkflowOutboxPumpConfig::default())?;
+runtime.run_scheduler();
+```
+
+The default configuration attempts at most 64 admissions per page, applies
+a 100 ms cooldown after finished sweeps, and uses the runtime's logical clock.
+Page sizes 1 through 1024 and intervals 1 ms through 300 s are accepted.
+The pump is disabled by default and can be disabled at any time without
+changing durable records. Enabling probes support and fails for unsupported
+stores; re-enable when replacing the store.
+
+Both MemoryStore and local SQLite discover pending tracked messages directly
+from committed storage on the owning shard, including nonresident senders.
+No sender list or volatile cursor must survive a restart. A scan uses the
+exclusive key (sender transition sequence, sender actor ID, ordinal), an
+upper watermark captured at its start, and bounded pages. The SQLite scan
+index is additive; only already dispatch-qualified tracked records are
+eligible. The watermark bounds the key range: newly committed later keys
+wait for the next sweep, while earlier arrivals can be discovered on a later
+page or sweep. This is not a snapshot reservation or a FIFO guarantee.
+MemoryStore scans its in-memory history; SQLite still incurs index scans
+over admitted history. Neither has a proven throughput or latency bound.
+
+The real and deterministic schedulers attempt one due page between actor
+turns, advance past deferred or failed individual deliveries, and retry
+those items on the next sweep after the cooldown. A newly staged terminal
+outbox wakes an idle successful sweep, but not a cooldown after a deferred
+or failed admission. A scan error preserves the cursor and backs off.
+When otherwise quiescent, a single synchronous scheduler call scans at
+most four pages without claiming a ready actor and returns rather than
+spinning or waiting for permanently unavailable recipients. The cursor
+continues at the next call. Long-lived node loops invoke the scheduler
+repeatedly; embedded hosts must continue driving it while work is pending,
+including after cooldown. The deterministic scheduler does not advance its
+virtual clock solely for outbox retries; test hosts explicitly advance it.
+
+The host can also call `Runtime::poll_workflow_outbox()` between turns to
+obtain one page's admission counts and observe cooldown. Individual failures
+are logged and counted; unadmitted messages stay pending. Divergent snapshots
+or an ambiguous commit still require inspection and receiver recovery. Pending messages
+are distinct from already-admitted commands: after interruption, the
+latter are replayed by explicit receiver recovery/handler registration,
+not sent a second time by the pump. There is no automatic actor recreation,
+behavior registration, multi-owner claiming, dead-letter policy, or
+cross-shard delivery. The release gate exercises both backends, SQLite
+reopen without a live sender, a bounded idle sweep, time-based retry,
+failure isolation, and deterministic scheduling.
 
 ## What is not yet a production-wide guarantee
 

@@ -400,6 +400,48 @@ pub struct DurableOutboxId {
     pub ordinal: u32,
 }
 
+/// Shard-local scan page. Ordering is (sequence, sender_actor_id, ordinal).
+/// The watermark is the greatest pending key observed at the start of a
+/// sweep. Preserve it across pages; later keys wait for the next sweep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowOutboxScanPage {
+    pub identities: Vec<DurableOutboxId>,
+    pub watermark: Option<DurableOutboxId>,
+}
+
+fn outbox_scan_key(id: DurableOutboxId) -> (u64, u64, u32) {
+    (id.sequence, id.sender_actor_id, id.ordinal)
+}
+
+fn validate_outbox_scan(
+    shard: u16,
+    shards: u16,
+    after: Option<DurableOutboxId>,
+    through: Option<DurableOutboxId>,
+    limit: usize,
+) -> io::Result<()> {
+    validate_outbox_page(None, limit)?;
+    let valid = |id: DurableOutboxId| {
+        id.sender_actor_id > 0
+            && id.sender_actor_id <= i64::MAX as u64
+            && id.sequence > 0
+            && id.sequence <= i64::MAX as u64
+            && id.sender_actor_id % u64::from(shards) == u64::from(shard)
+    };
+    if shards == 0
+        || shard >= shards
+        || after.is_some_and(|id| !valid(id))
+        || through.is_some_and(|id| !valid(id))
+        || after.is_some_and(|id| through.is_none_or(|w| outbox_scan_key(id) > outbox_scan_key(w)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid workflow outbox scan cursor or shard",
+        ));
+    }
+    Ok(())
+}
+
 /// Maximum number of pending message identities returned in a dispatcher page.
 pub const MAX_WORKFLOW_OUTBOX_PAGE: usize = 1024;
 
@@ -1170,6 +1212,24 @@ pub trait PersistenceStore: Send + Sync {
         ))
     }
 
+    /// Discover pending tracked messages across all senders on one shard.
+    /// On the first page pass no cursor/watermark. On subsequent pages use
+    /// the last returned identity and original watermark. No reservation is
+    /// made and already admitted messages are excluded.
+    fn scan_pending_workflow_outbox(
+        &self,
+        _shard: u16,
+        _shards: u16,
+        _after: Option<DurableOutboxId>,
+        _through: Option<DurableOutboxId>,
+        _limit: usize,
+    ) -> io::Result<WorkflowOutboxScanPage> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "shard workflow outbox scanning is not supported",
+        ))
+    }
+
     /// Return the original accepted command for this message, even after closure.
     fn load_workflow_inbox_admission(
         &self,
@@ -1491,6 +1551,64 @@ impl PersistenceStore for MemoryStore {
             }
         }
         Ok(pending)
+    }
+
+    fn scan_pending_workflow_outbox(
+        &self,
+        shard: u16,
+        shards: u16,
+        after: Option<DurableOutboxId>,
+        through: Option<DurableOutboxId>,
+        limit: usize,
+    ) -> io::Result<WorkflowOutboxScanPage> {
+        validate_outbox_scan(shard, shards, after, through, limit)?;
+        // The ephemeral backend has no persistent index. Keep only the
+        // smallest page keys in memory rather than collecting all messages.
+        let mut page = std::collections::BTreeSet::new();
+        let mut watermark = through.map(outbox_scan_key);
+        for (&sender, transitions) in &self.committed_transitions {
+            if sender == 0
+                || sender > i64::MAX as u64
+                || sender % u64::from(shards) != u64::from(shard)
+            {
+                continue;
+            }
+            for transition in transitions
+                .iter()
+                .filter(|t| t.workflow_effects_consumed.is_some())
+            {
+                for message in &transition.outbox {
+                    let id = DurableOutboxId {
+                        sender_actor_id: sender,
+                        sequence: transition.sequence,
+                        ordinal: message.ordinal,
+                    };
+                    let key = outbox_scan_key(id);
+                    if after.is_some_and(|a| key <= outbox_scan_key(a))
+                        || through.is_some_and(|w| key > outbox_scan_key(w))
+                        || self.load_workflow_inbox_admission(id)?.is_some()
+                    {
+                        continue;
+                    }
+                    if through.is_none() {
+                        watermark = Some(watermark.map_or(key, |previous| previous.max(key)));
+                    }
+                    page.insert(key);
+                    if page.len() > limit {
+                        page.pop_last();
+                    }
+                }
+            }
+        }
+        let decode = |(sequence, sender_actor_id, ordinal)| DurableOutboxId {
+            sequence,
+            sender_actor_id,
+            ordinal,
+        };
+        Ok(WorkflowOutboxScanPage {
+            identities: page.into_iter().map(decode).collect(),
+            watermark: watermark.map(decode),
+        })
     }
 
     fn load_workflow_inbox_admission(
@@ -2568,6 +2686,13 @@ impl LibsqlStore {
             .await
             .map_err(io::Error::other)?;
             conn.execute(
+                "CREATE INDEX IF NOT EXISTS durable_workflow_outbox_scan
+                 ON durable_workflow_outbox (sequence, actor_id, ordinal)",
+                (),
+            )
+            .await
+            .map_err(io::Error::other)?;
+            conn.execute(
                 "CREATE TABLE IF NOT EXISTS durable_workflow_inbox (
                     actor_id INTEGER NOT NULL,
                     command_sequence INTEGER NOT NULL,
@@ -2782,6 +2907,24 @@ const DURABLE_INBOX_QUERY: &str = "SELECT actor_id, command_sequence FROM durabl
     WHERE sender_actor_id=?1 AND sender_sequence=?2 AND ordinal=?3";
 
 #[cfg(feature = "sqlite")]
+async fn decode_outbox_scan_row(rows: &mut libsql::Rows) -> io::Result<Option<DurableOutboxId>> {
+    let Some(row) = rows.next().await.map_err(io::Error::other)? else {
+        return Ok(None);
+    };
+    let sequence: i64 = row.get(0).map_err(io::Error::other)?;
+    let sender: i64 = row.get(1).map_err(io::Error::other)?;
+    let ordinal: i64 = row.get(2).map_err(io::Error::other)?;
+    if sequence <= 0 || sender <= 0 {
+        return Err(workflow_admission_error("invalid shard outbox scan key"));
+    }
+    Ok(Some(DurableOutboxId {
+        sender_actor_id: sender as u64,
+        sequence: sequence as u64,
+        ordinal: u32::try_from(ordinal).map_err(io::Error::other)?,
+    }))
+}
+
+#[cfg(feature = "sqlite")]
 impl PersistenceStore for LibsqlStore {
     fn load_durable_outbox_message(
         &self,
@@ -2872,6 +3015,92 @@ impl PersistenceStore for LibsqlStore {
                 });
             }
             Ok(pending)
+        })
+    }
+
+    fn scan_pending_workflow_outbox(
+        &self,
+        shard: u16,
+        shards: u16,
+        after: Option<DurableOutboxId>,
+        through: Option<DurableOutboxId>,
+        limit: usize,
+    ) -> io::Result<WorkflowOutboxScanPage> {
+        validate_outbox_scan(shard, shards, after, through, limit)?;
+        let conn = self.conn();
+        if !matches!(&*conn, libsql::Connection::Local(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "workflow outbox scan requires local SQLite",
+            ));
+        }
+        self.rt.block_on(async {
+            const BASE: &str = "SELECT w.sequence, w.actor_id, w.ordinal
+                FROM durable_workflow_outbox w
+                JOIN durable_outbox o USING (actor_id, sequence, ordinal)
+                JOIN durable_transitions t USING (actor_id, sequence)
+                LEFT JOIN durable_workflow_inbox i ON i.sender_actor_id=w.actor_id
+                 AND i.sender_sequence=w.sequence AND i.ordinal=w.ordinal
+                WHERE w.actor_id > 0 AND w.actor_id % ?1 = ?2 AND i.sender_actor_id IS NULL";
+            let watermark = match through {
+                Some(id) => Some(id),
+                None => {
+                    let sql = format!(
+                        "{BASE} ORDER BY w.sequence DESC, w.actor_id DESC, w.ordinal DESC LIMIT 1"
+                    );
+                    let mut rows = conn
+                        .query(&sql, libsql::params![i64::from(shards), i64::from(shard)])
+                        .await
+                        .map_err(io::Error::other)?;
+                    decode_outbox_scan_row(&mut rows).await?
+                }
+            };
+            let Some(watermark) = watermark else {
+                return Ok(WorkflowOutboxScanPage {
+                    identities: vec![],
+                    watermark: None,
+                });
+            };
+            let (aseq, asender, aordinal) = after
+                .map(|id| {
+                    (
+                        id.sequence as i64,
+                        id.sender_actor_id as i64,
+                        id.ordinal as i64,
+                    )
+                })
+                .unwrap_or((0, 0, -1));
+            let sql = format!(
+                "{BASE}
+                AND (w.sequence, w.actor_id, w.ordinal) > (?3, ?4, ?5)
+                AND (w.sequence, w.actor_id, w.ordinal) <= (?6, ?7, ?8)
+                ORDER BY w.sequence, w.actor_id, w.ordinal LIMIT ?9"
+            );
+            let mut rows = conn
+                .query(
+                    &sql,
+                    libsql::params![
+                        i64::from(shards),
+                        i64::from(shard),
+                        aseq,
+                        asender,
+                        aordinal,
+                        watermark.sequence as i64,
+                        watermark.sender_actor_id as i64,
+                        watermark.ordinal as i64,
+                        limit as i64
+                    ],
+                )
+                .await
+                .map_err(io::Error::other)?;
+            let mut identities = Vec::new();
+            while let Some(id) = decode_outbox_scan_row(&mut rows).await? {
+                identities.push(id);
+            }
+            Ok(WorkflowOutboxScanPage {
+                identities,
+                watermark: Some(watermark),
+            })
         })
     }
 
