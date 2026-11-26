@@ -3,6 +3,7 @@
 ### Opt-in actor mailbox capacity for hosted runtimes — 2026-11-26
 - **Allow hosts to configure per-actor normal/bulk mailbox capacity across all runtime shards**, including single-shard mode, with explicit backpressure at capacity.
 - Existing constructors remain unbounded by default. System messages and dead-letter mailboxes bypass the limit; this is not a process-wide memory bound.
+- A cross-shard transport admission is not destination-mailbox admission. A full destination produces a dead-letter notification, not synchronous sender backpressure or replay of the rejected payload.
 
 ### Per-priority scheduler runnable backlog diagnostics — 2026-11-20
 - **Expose approximate queued High, Normal, and Low runnable task counts** in the existing scheduler metrics snapshot, including global injector and worker-local queues, without adding counters to scheduling hot paths.

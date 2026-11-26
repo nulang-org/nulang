@@ -8797,3 +8797,32 @@ fn hosted_mailbox_capacity_applies_to_every_shard_and_single_shard_fast_path() {
         }
     }
 }
+
+#[test]
+fn hosted_mailbox_capacity_cross_shard_ack_is_channel_only() {
+    let mut shards = Runtime::new_sharded_with_default_mailbox_capacity(2, 1);
+    let mut target = shards[1].spawn_actor(Box::new(Vec::new));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(Vec::new));
+    }
+    assert_eq!(shards[1].actors[&target].mailbox.capacity(), 1);
+
+    // Both sends enter the channel before the receiver drains it. Acceptance
+    // here is not a reservation of a destination mailbox slot.
+    for payload in [1, 2] {
+        assert_eq!(
+            shards[0].send_cross_shard_message(target, 0, vec![Value::int(payload)], None, None),
+            MessageAdmission::Accepted
+        );
+    }
+    assert_eq!(shards[1].actors[&target].mailbox.len(), 0);
+    assert_eq!(shards[1].dlq_depth(), 0);
+
+    shards[1].drain_cross_shard_messages();
+    assert_eq!(shards[1].actors[&target].mailbox.len(), 1);
+    assert_eq!(
+        shards[1].dlq_depth(),
+        1,
+        "the second accepted transport envelope becomes a dead-letter notification"
+    );
+}

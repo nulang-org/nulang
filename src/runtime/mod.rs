@@ -805,6 +805,13 @@ impl Runtime {
     /// Create sharded runtimes with the same opt-in per-actor mailbox capacity
     /// on every shard. Zero preserves the unbounded legacy default.
     /// System messages and internal dead-letter mailboxes remain exempt.
+    ///
+    /// Cross-shard sends acknowledge admission to the transport channel, not
+    /// the destination actor's mailbox. If that mailbox is full when the
+    /// destination drains the channel, a dead-letter notification is generated;
+    /// there is no synchronous destination-capacity backpressure or replay of
+    /// the rejected payload. Hosted callers needing that guarantee must use
+    /// an explicit acknowledgment protocol.
     pub fn new_sharded_with_default_mailbox_capacity(
         num_shards: usize,
         capacity: usize,
