@@ -1,4 +1,9 @@
 # Nulang Changelog
+### NUL0 TCP partial-frame recovery across read timeouts — 2026-11-10
+- **Preserve bytes already consumed from NUL0 frame prefixes and payloads when socket reads return `WouldBlock`, `TimedOut`, or `Interrupted`.** Retry from the unconsumed offset rather than restarting `read_exact` with a fresh buffer, preventing frame misalignment and lost actor packets.
+- **Cover fragmented reads, shutdown and premature EOF with deterministic regressions.** Existing maximum-frame-size limits and transport failure semantics are retained. The intermittent five-node post-heal delivery problem still requires separate qualification; this change does not establish that it is fully resolved.
+- **2026-11-20 bounded-frame follow-up:** Once the first prefix byte arrives, enforce a 30-second no-progress timeout and a 60-second base total assembly budget plus payload-size allowance at 64 KiB/s, shared across prefix and payload. A healthy idle connection before the first byte is not expired by the frame deadline. New regressions exercise stalls, trickle traffic, and cross-segment deadline continuity; the five-node recovery issue remains separately gated.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
