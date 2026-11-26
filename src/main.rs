@@ -1265,6 +1265,37 @@ fn emit_stdlib_docs(dir: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Require an explicit, local-only plaintext opt-in; never infer plaintext
+/// from missing TLS files. The caller must still validate and load each file.
+#[cfg(feature = "tcp")]
+fn validate_node_security_mode(
+    plaintext: bool,
+    has_cert: bool,
+    has_key: bool,
+    has_ca: bool,
+    bind_addr: std::net::SocketAddr,
+    seed_addr: Option<std::net::SocketAddr>,
+) -> Result<(), &'static str> {
+    if plaintext {
+        if has_cert || has_key || has_ca {
+            return Err("--plaintext cannot be combined with TLS options");
+        }
+        if !bind_addr.ip().is_loopback() {
+            return Err("--plaintext is only permitted on loopback addresses");
+        }
+        if seed_addr.is_some_and(|seed| !seed.ip().is_loopback()) {
+            return Err("--plaintext cannot connect to a non-loopback seed address");
+        }
+        return Ok(());
+    }
+    if !(has_cert && has_key && has_ca) {
+        return Err(
+            "node requires --tls-cert, --tls-key and --tls-ca (or explicit loopback --plaintext)",
+        );
+    }
+    Ok(())
+}
+
 /// Run a distributed Nulang node: parse arguments, create a Runtime,
 /// enable distribution, join a seed cluster if requested, and run forever.
 #[cfg(feature = "tcp")]
@@ -1344,7 +1375,7 @@ fn run_node_cmd(args: &[String]) -> NuResult<()> {
                 println!("  --tls-cert <PATH>     Server certificate (PEM)");
                 println!("  --tls-key <PATH>      Server private key (PEM)");
                 println!("  --tls-ca <PATH>       CA certificate for mutual TLS");
-                println!("  --plaintext           Disable TLS (insecure, dev only)");
+                println!("  --plaintext           Disable TLS (loopback-only development)");
                 println!("  -h, --help            Show this help message");
                 return Ok(());
             }
@@ -1362,34 +1393,53 @@ fn run_node_cmd(args: &[String]) -> NuResult<()> {
             span: Span::default(),
         })?;
 
+    let seed_socket = seed_addr
+        .as_deref()
+        .map(|seed| {
+            seed.parse::<std::net::SocketAddr>()
+                .map_err(|e| NuError::RuntimeError {
+                    msg: format!("invalid seed address: {e}"),
+                    span: Span::default(),
+                })
+        })
+        .transpose()?;
+
+    validate_node_security_mode(
+        plaintext,
+        tls_cert.is_some(),
+        tls_key.is_some(),
+        tls_ca.is_some(),
+        bind_addr,
+        seed_socket,
+    )
+    .map_err(|msg| NuError::RuntimeError {
+        msg: msg.to_string(),
+        span: Span::default(),
+    })?;
+
     let tls_config = if plaintext {
         nulang::runtime::TlsConfig::PlaintextInsecure
     } else {
-        let cert = tls_cert
-            .as_ref()
-            .map(|p| std::fs::read_to_string(p).ok())
-            .flatten()
-            .unwrap_or_default();
-        let key = tls_key
-            .as_ref()
-            .map(|p| std::fs::read_to_string(p).ok())
-            .flatten()
-            .unwrap_or_default();
-        let ca = tls_ca
-            .as_ref()
-            .map(|p| std::fs::read_to_string(p).ok())
-            .flatten()
-            .unwrap_or_default();
-        if cert.is_empty() && key.is_empty() && ca.is_empty() {
-            eprintln!("Warning: no TLS certificates provided; using plaintext transport");
-            nulang::runtime::TlsConfig::PlaintextInsecure
-        } else {
-            nulang::runtime::TlsConfig::MutualTls {
-                ca_cert_pem: ca.into_bytes(),
-                server_cert_pem: cert.into_bytes(),
-                server_key_pem: key.into_bytes(),
-                server_name: None,
-            }
+        let load = |path: &str| {
+            std::fs::read(path).map_err(|e| NuError::RuntimeError {
+                msg: format!("unable to read TLS file '{path}': {e}"),
+                span: Span::default(),
+            })
+        };
+        let cert = load(tls_cert.as_deref().expect("validated TLS certificate path"))?;
+        let key = load(tls_key.as_deref().expect("validated TLS private key path"))?;
+        let ca = load(tls_ca.as_deref().expect("validated TLS CA path"))?;
+        if cert.is_empty() || key.is_empty() || ca.is_empty() {
+            return Err(NuError::RuntimeError {
+                msg: "TLS certificate, private key and CA must all be nonempty".to_string(),
+                span: Span::default(),
+            });
+        }
+        nulang::runtime::TlsConfig::MutualTls {
+            ca_cert_pem: ca,
+            server_cert_pem: cert,
+            server_key_pem: key,
+            server_name: None,
         }
     };
 
@@ -1410,12 +1460,7 @@ fn run_node_cmd(args: &[String]) -> NuResult<()> {
         });
     }
 
-    if let Some(seed) = seed_addr {
-        let seed_socket: std::net::SocketAddr =
-            seed.parse().map_err(|e| NuError::RuntimeError {
-                msg: format!("invalid seed address: {e}"),
-                span: Span::default(),
-            })?;
+    if let Some(seed_socket) = seed_socket {
         runtime.join_cluster(seed_socket);
     }
 
@@ -2900,6 +2945,48 @@ mod tests {
         );
         drop(rt);
         let _ = std::fs::remove_dir_all(store_dir);
+    }
+
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_node_rejects_missing_or_partial_tls_material() {
+        let loopback = "127.0.0.1:9000".parse().unwrap();
+        assert!(validate_node_security_mode(false, false, false, false, loopback, None).is_err());
+        assert!(validate_node_security_mode(false, true, true, false, loopback, None).is_err());
+        assert!(validate_node_security_mode(false, true, true, true, loopback, None).is_ok());
+    }
+
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_node_plaintext_requires_explicit_loopback_only_opt_in() {
+        let loopback = "127.0.0.1:9000".parse().unwrap();
+        let wildcard = "0.0.0.0:9000".parse().unwrap();
+        assert!(validate_node_security_mode(true, false, false, false, loopback, None).is_ok());
+        assert!(validate_node_security_mode(true, false, false, false, wildcard, None).is_err());
+        assert!(validate_node_security_mode(true, true, true, true, loopback, None).is_err());
+    }
+
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_node_plaintext_cannot_join_off_host_seed() {
+        let loopback = "127.0.0.1:9000".parse().unwrap();
+        let local_seed = "127.0.0.1:9001".parse().unwrap();
+        let remote_seed = "203.0.113.10:9001".parse().unwrap();
+        assert!(
+            validate_node_security_mode(true, false, false, false, loopback, Some(local_seed))
+                .is_ok(),
+            "explicit plaintext may join a loopback seed"
+        );
+        assert!(
+            validate_node_security_mode(true, false, false, false, loopback, Some(remote_seed))
+                .is_err(),
+            "loopback bind must not allow plaintext egress to a remote seed"
+        );
+        assert!(
+            validate_node_security_mode(false, true, true, true, loopback, Some(remote_seed))
+                .is_ok(),
+            "mTLS may join a remote seed"
+        );
     }
 
     #[test]
