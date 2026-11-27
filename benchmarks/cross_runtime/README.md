@@ -21,7 +21,7 @@ primitive:
 Run all installed runtimes on the same host:
 
 ```bash
-python3 scripts/cross_runtime_bench.py --runs 5 --warmup 1 \
+python3 scripts/cross_runtime_bench.py --runs 8 --warmup 1 \
   --cpu-mode single \
   --output /tmp/nulang-cross-runtime.json
 ```
@@ -91,3 +91,7 @@ In particular:
 For actor-framework comparisons (for example Pony, Ractor/Actix/Kameo,
 Proto.Actor, or Pekko/Akka), add separate pinned fixtures instead of silently
 changing these standard-runtime baselines.
+
+### Counterbalanced execution
+
+The default is eight measured rounds (one warm-up). Measured rounds rotate runtime order and reverse every second round; for four runtimes each occupies each position twice. Warm-up scheduling is independent. Schema 2 reports include measured_execution_orders. Shorter runs remain diagnostic and may not be fully balanced. Evidence validation applies to every warm-up and measured invocation.
