@@ -508,6 +508,28 @@ impl MemoryTablet {
     pub(crate) fn has_receipts(&self) -> bool {
         !self.receipts.is_empty()
     }
+    /// A version at exactly this sequence, including explicit tombstones.
+    pub(crate) fn exact_version_at(&self, key: &[u8], sequence: u64) -> Option<Option<&[u8]>> {
+        let versions = self.rows.get(key)?;
+        let index = versions
+            .binary_search_by_key(&sequence, |version| version.sequence)
+            .ok()?;
+        Some(versions[index].value.as_deref())
+    }
+
+    /// The retained anchor visible at the durable floor, with its original sequence.
+    pub(crate) fn floor_anchor(&self, key: &[u8], floor: u64) -> Option<(u64, Option<&[u8]>)> {
+        let version = visible_version_at(self.rows.get(key)?, floor)?;
+        Some((version.sequence, version.value.as_deref()))
+    }
+
+    pub(crate) fn version_count_after(&self, sequence: u64) -> usize {
+        self.rows
+            .values()
+            .map(|versions| versions.len() - versions.partition_point(|v| v.sequence <= sequence))
+            .sum()
+    }
+
     pub(crate) fn receipt_count_after(&self, sequence: u64) -> usize {
         self.receipts
             .values()
