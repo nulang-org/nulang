@@ -43,6 +43,8 @@ struct Version {
 #[derive(Debug)]
 pub struct IndexedSst {
     file: File,
+    checksum: [u8; 32],
+    file_bytes: u64,
     generation: u64,
     min_sequence: u64,
     max_sequence: u64,
@@ -205,6 +207,8 @@ impl IndexedSst {
         }
         Ok(Self {
             file: scanner.reader.into_inner(),
+            checksum,
+            file_bytes: metadata.len(),
             generation,
             min_sequence,
             max_sequence,
@@ -212,6 +216,18 @@ impl IndexedSst {
             key_bytes,
             rows,
         })
+    }
+
+    /// Identity of the verified immutable table, excluding its checksum trailer.
+    pub fn checksum(&self) -> [u8; 32] {
+        self.checksum
+    }
+    pub fn file_bytes(&self) -> u64 {
+        self.file_bytes
+    }
+    #[cfg(unix)]
+    pub(crate) fn sync_file(&self) -> io::Result<()> {
+        self.file.sync_all()
     }
 
     pub fn generation(&self) -> u64 {
