@@ -709,16 +709,16 @@ impl MirCodegen {
                     .ok_or_else(|| {
                         compile_err("internal: jump to unknown MIR block", Span::default())
                     })?;
-            let diff = target_offset as i64 - patch.instr_idx as i64;
+            let diff = checked_jump_offset(target_offset, patch.instr_idx, &func.name)?;
             let instr = &mut self.module.instructions[patch.instr_idx];
             match patch.kind {
                 JumpKind::Jmp => {
-                    instr.op1 = ((diff as i16 >> 8) & 0xFF) as u8;
-                    instr.op2 = (diff as i16 & 0xFF) as u8;
+                    instr.op1 = ((diff >> 8) & 0xFF) as u8;
+                    instr.op2 = (diff & 0xFF) as u8;
                 }
                 JumpKind::JmpF => {
-                    instr.op2 = ((diff as i16 >> 8) & 0xFF) as u8;
-                    instr.op3 = (diff as i16 & 0xFF) as u8;
+                    instr.op2 = ((diff >> 8) & 0xFF) as u8;
+                    instr.op3 = (diff & 0xFF) as u8;
                 }
             }
         }
@@ -1401,11 +1401,11 @@ impl MirCodegen {
             mir::Terminator::Jump(target) => {
                 let idx = self.module.instructions.len();
                 if let Some(&offset) = block_offsets.get(target) {
-                    let diff = offset as i64 - idx as i64;
+                    let diff = checked_jump_offset(offset, idx, func_name)?;
                     self.emit(Instruction::new2(
                         OpCode::Jmp,
-                        ((diff as i16 >> 8) & 0xFF) as u8,
-                        (diff as i16 & 0xFF) as u8,
+                        ((diff >> 8) & 0xFF) as u8,
+                        (diff & 0xFF) as u8,
                     ));
                 } else {
                     self.emit(Instruction::new2(OpCode::Jmp, 0, 0));
@@ -1422,12 +1422,12 @@ impl MirCodegen {
                 // JmpF to else_ when the condition is false.
                 let jmpf_idx = self.module.instructions.len();
                 if let Some(&else_offset) = block_offsets.get(else_) {
-                    let diff = else_offset as i64 - jmpf_idx as i64;
+                    let diff = checked_jump_offset(else_offset, jmpf_idx, func_name)?;
                     self.emit(Instruction::new3(
                         OpCode::JmpF,
                         cond_reg,
-                        ((diff as i16 >> 8) & 0xFF) as u8,
-                        (diff as i16 & 0xFF) as u8,
+                        ((diff >> 8) & 0xFF) as u8,
+                        (diff & 0xFF) as u8,
                     ));
                 } else {
                     self.emit(Instruction::new3(OpCode::JmpF, cond_reg, 0, 0));
@@ -1441,11 +1441,11 @@ impl MirCodegen {
                 // Unconditional jump to then_.
                 let jmp_idx = self.module.instructions.len();
                 if let Some(&then_offset) = block_offsets.get(then_) {
-                    let diff = then_offset as i64 - jmp_idx as i64;
+                    let diff = checked_jump_offset(then_offset, jmp_idx, func_name)?;
                     self.emit(Instruction::new2(
                         OpCode::Jmp,
-                        ((diff as i16 >> 8) & 0xFF) as u8,
-                        (diff as i16 & 0xFF) as u8,
+                        ((diff >> 8) & 0xFF) as u8,
+                        (diff & 0xFF) as u8,
                     ));
                 } else {
                     self.emit(Instruction::new2(OpCode::Jmp, 0, 0));
@@ -2260,6 +2260,18 @@ fn rvalue_reads(rv: &mir::RValue, out: &mut HashSet<mir::LocalId>) {
     }
 }
 
+fn checked_jump_offset(target: usize, source: usize, function: &str) -> NuResult<i16> {
+    let diff = target as i128 - source as i128;
+    i16::try_from(diff).map_err(|_| {
+        compile_err(
+            format!(
+                "function '{function}': jump offset {diff} exceeds signed 16-bit bytecode range"
+            ),
+            Span::default(),
+        )
+    })
+}
+
 pub fn compile_mir(mir: &mut mir::Module, module_name: impl Into<String>) -> NuResult<CodeModule> {
     let mut codegen = MirCodegen::new(module_name);
     codegen.compile_module(mir)?;
@@ -3061,6 +3073,112 @@ mod tests {
         // assignment mutates it in place.
         let value = run_mir_source("let x = &10 in { x = 3; *x }").unwrap();
         assert_eq!(value.as_int(), Some(3));
+    }
+
+    #[test]
+    fn test_mir_codegen_rejects_out_of_range_forward_and_backward_jumps() {
+        for (padding, forward, valid) in [
+            (32765, true, true),
+            (32766, true, false),
+            (32767, false, true),
+            (32768, false, true),
+            (32769, false, false),
+        ] {
+            let mut builder = mir::FunctionBuilder::new("jump_boundary", Some(Type::int()));
+            let value = builder.add_temp(Type::int());
+            let end = builder.create_block();
+            if forward {
+                let tail = builder.create_block();
+                builder.terminate(mir::Terminator::Jump(tail));
+                builder.switch_to(end);
+                for _ in 0..padding {
+                    builder.assign(value, mir::RValue::Const(Constant::Int(1)));
+                }
+                builder.terminate(mir::Terminator::Return(Some(value)));
+                builder.switch_to(tail);
+                builder.terminate(mir::Terminator::Return(None));
+            } else {
+                for _ in 0..padding {
+                    builder.assign(value, mir::RValue::Const(Constant::Int(1)));
+                }
+                builder.terminate(mir::Terminator::Jump(mir::BlockId(0)));
+                builder.switch_to(end);
+                builder.terminate(mir::Terminator::Return(None));
+            }
+            // Direct codegen prevents optimization from removing padding.
+            let mut codegen = MirCodegen::new("jump_boundary");
+            let result = codegen.compile_function(&builder.build(), &[]);
+            if valid {
+                assert!(
+                    result.is_ok(),
+                    "valid offset: padding={padding}, forward={forward}: {result:?}"
+                );
+                let jump = codegen
+                    .module
+                    .instructions
+                    .iter()
+                    .find(|ins| ins.opcode == OpCode::Jmp)
+                    .unwrap();
+                assert_eq!(
+                    jump.simm16() as i32,
+                    if forward { padding + 2 } else { -padding }
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(NuError::VMError { ref msg, .. }) if msg.contains("jump offset")),
+                    "invalid offset must fail: padding={padding}, forward={forward}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_mir_codegen_checked_conditional_offsets() {
+        // Check both immediate branch destinations separately, including
+        // the negative boundary and its first unrepresentable neighbour.
+        for (source, then_offset, else_offset, valid) in [
+            (32768, 1, 0, true),
+            (32769, 2, 0, false),
+            (32768, 0, 0, false),
+            (0, 32768, 32767, true),
+            (0, 32768, 32768, false),
+            (0, 32769, 32767, false),
+        ] {
+            let mut cg = MirCodegen::new("conditional_boundary");
+            cg.module
+                .instructions
+                .resize(source, Instruction::new0(OpCode::Halt));
+            let then_ = mir::BlockId(1);
+            let else_ = mir::BlockId(2);
+            let offsets = FxHashMap::from_iter([(then_, then_offset), (else_, else_offset)]);
+            let mut patches = Vec::new();
+            let result = cg.compile_terminator(
+                &mir::Terminator::Branch {
+                    cond: mir::LocalId(0),
+                    then_,
+                    else_,
+                },
+                "conditional_boundary",
+                &offsets,
+                &mut patches,
+            );
+            if valid {
+                assert!(result.is_ok(), "{result:?}");
+                assert_eq!(
+                    cg.module.instructions[source].offset16() as i64,
+                    else_offset as i64 - source as i64
+                );
+                assert_eq!(
+                    cg.module.instructions[source + 1].simm16() as i64,
+                    then_offset as i64 - source as i64 - 1
+                );
+                assert!(patches.is_empty());
+            } else {
+                assert!(
+                    matches!(result, Err(NuError::VMError { ref msg, .. }) if msg.contains("jump offset"))
+                );
+            }
+        }
     }
 
     #[test]
