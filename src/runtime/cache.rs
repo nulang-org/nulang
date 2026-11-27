@@ -856,6 +856,11 @@ impl CacheStore {
             CacheValue::Integer(value) => value,
             CacheValue::Bytes(bytes) => {
                 let raw = bytes.as_slice(&self.arena);
+                // RESP integer values must use canonical decimal syntax: no
+                // leading plus, leading zeros, or negative zero.
+                if raw != b"0" && !matches!(raw, [b'1'..=b'9', ..] | [b'-', b'1'..=b'9', ..]) {
+                    return Err(CacheIncrementError::NotInteger);
+                }
                 let text = std::str::from_utf8(raw).map_err(|_| CacheIncrementError::NotInteger)?;
                 text.parse::<i64>()
                     .map_err(|_| CacheIncrementError::NotInteger)?

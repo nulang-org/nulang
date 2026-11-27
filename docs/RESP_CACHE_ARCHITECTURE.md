@@ -241,3 +241,24 @@ cross-shard queues are separate. Conservative reply bounds may reject a
 response that would fit if encoded exactly; the policy is close-on-pressure
 rather than waiting or evicting another connection. Fairness, idle-capacity
 reclamation and full-system memory qualification remain future work.
+## Reference-server verification
+
+The explicit same-slot RESP2 differential example starts a fresh local Redis or Valkey
+process on a private Unix socket (TCP and persistence disabled), compares raw
+replies against the shard-local command executor, and cleans up the process.
+Run each installed reference implementation explicitly:
+
+```sh
+NULANG_RESP_ORACLE=redis-server cargo run --no-default-features --example resp_cache_oracle
+NULANG_RESP_ORACLE=valkey-server cargo run --no-default-features --example resp_cache_oracle
+```
+
+The suite covers the supported ten commands, binary payloads, duplicate keys,
+canonical integers and overflow, TTL rounding, and deterministic seeded
+mutation sequences. The seed and step are included in mismatch diagnostics.
+A dependency-free regression test runs even without an external server.
+Cross-slot rejection remains a separate Nulang cluster-contract test, since
+standalone reference servers permit cross-slot commands. This is a kernel
+compatibility gate, not a claim of complete Redis command, network, persistence,
+or cluster compatibility. Verify executable versions independently; some
+distributions install Valkey under both binary names.

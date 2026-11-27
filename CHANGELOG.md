@@ -1,4 +1,7 @@
 # Nulang Changelog
+### RESP cache reference-server parity — 2026-11-27
+- **Match canonical integer validation, overflow responses and nearest-second TTL rounding** for the supported RESP subset. Always-on regressions and an explicit reference-server example avoid ignored tests.
+
 ### Shared RESP reactor buffer admission — 2026-11-27
 - **Reserve retained connection vector capacity before growth**, with a shared optional cross-reactor byte budget and RAII release. Preflight conservative reply size before execution and avoid a synchronous response scratch copy. Close on budget exhaustion; this is not a full-process RSS cap.
 
