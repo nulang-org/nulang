@@ -307,3 +307,66 @@ The orthogonal model is considered established when:
 Phase 1 is additive and changes no executable semantics or stable format.
 
 Future phases that alter source-visible behavior, entity defaults, or serialized metadata require their own compatibility gates and migration tests.
+
+## Infrastructure execution boundaries (NuDB and Fabric)
+
+The orthogonal model applies to native infrastructure kernels as well as the
+language. It does not require NuDB or Fabric to execute their inner loops in
+the VM or to create an actor per key, record, request, or subscriber.
+
+| Work | Execution boundary |
+| --- | --- |
+| MVCC lookup, validation, RESP parsing, cache operations, topic matching | Direct owner-local functions |
+| Independent read-only query preparation, compression, checksum batches | Bounded scoped tasks where independence is established |
+| Tablet ownership, consumer groups, stream placement, membership | Isolated owner state machine; actor hosting when useful |
+| WAL/log append, fsync, network readiness | Dedicated bounded I/O execution |
+| Recovery, retention, compaction and expiration | Budgeted maintenance work |
+
+Direct calls may not bypass an actor's mailbox/turn isolation or a tablet's
+exclusive ownership. Cross-shard admission must preserve ordering and account
+for both bytes and item count. Immutable buffers may cross shards with explicit
+lifetime accounting; never share actor heap pointers. Task cancellation does
+not undo an accepted durable write. Unknown commit outcomes require recovery
+or idempotent retry, not a fabricated failure or successful acknowledgment.
+Durability stays orthogonal: retain WAL-before-MVCC visibility and stream
+quorum-before-committed-consumer visibility, as applicable.
+
+### Qualification before changing scheduling
+
+1. Establish native kernel baselines and separate actor/mailbox and remote
+   transport benchmarks. Do not compare an in-memory commit to a durable one.
+2. Consolidate existing NuDB recovery/fencing candidates and Fabric routing,
+   stream seek and TTL work before adding another executor or storage format.
+3. Measure exact-base paired runs on a quiet host; report payload size,
+   history depth, concurrency, durability mode, CPU/RSS and tail latency.
+4. Test bounded admission, cancellation, stale epochs, owner loss and crashes
+   across each handoff before enabling any asynchronous commit or delivery path.
+5. Keep runtime, cache and storage APIs usable independently. Extract shared
+   mechanisms only when their contracts agree and measurements justify them.
+
+The native NuDB Criterion group (nudb/snapshot_point_read and
+nudb/memory_prepare_commit) measures local work without mailbox or disk
+overhead. Existing cache and actor groups serve as separate baselines. This
+qualification slice neither implements parallel language par nor changes
+production storage or actor scheduling semantics.
+
+### Opt-in local durability baseline
+
+Set NULANG_BENCH_STORAGE_DIR to an existing directory on the filesystem being
+measured. Run the nudb/durable_prepare_commit, fabric/durable_local_append and
+fabric/local_replay Criterion groups separately; no storage fixture is created
+by the default benchmark run. The operator must verify the directory is on
+the intended persistent filesystem, not tmpfs or a memory-backed mount.
+
+The first two groups measure one acknowledged local write at 64 and 4096
+payload bytes; neither implies replicated/quorum durability. Fresh bounded
+fixtures exclude file/stream creation and cleanup from measured time.
+Fabric replay measures a 16-record batch at the head and tail of a warm
+128-record multi-segment log. Record storage device and filesystem details,
+and distinguish these microbenchmarks from end-to-end latency distributions.
+
+For a functional smoke (not a latency/throughput measurement), run
+`python3 scripts/infrastructure_bench_smoke.py --storage-root /path/to/existing/dir`.
+The wrapper verifies all 13 expected Criterion case IDs complete successfully
+and rejects leftover fixtures. The existing PR Build & Test job runs it before
+merge; the main-only performance regression gate remains unchanged.
