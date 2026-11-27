@@ -182,3 +182,25 @@ must be measured separately from steady-state command execution.
 6. Expand RESP compatibility and add Nulang-native leases, locks, semaphores,
    fencing tokens, queues, and stored functions where they fit the product
    boundary.
+
+## Reference-server verification
+
+The same-slot RESP2 differential suite starts a fresh local Redis or Valkey
+process on a private Unix socket (TCP and persistence disabled), compares raw
+replies against the shard-local command executor, and cleans up the process.
+Run each installed reference implementation explicitly:
+
+```sh
+NULANG_RESP_ORACLE=redis-server cargo test --test resp_cache_differential -- --include-ignored
+NULANG_RESP_ORACLE=valkey-server cargo test --test resp_cache_differential -- --include-ignored
+```
+
+The suite covers the supported ten commands, binary payloads, duplicate keys,
+canonical integers and overflow, TTL rounding, and deterministic seeded
+mutation sequences. The seed and step are included in mismatch diagnostics.
+A dependency-free regression test runs even without an external server.
+Cross-slot rejection remains a separate Nulang cluster-contract test, since
+standalone reference servers permit cross-slot commands. This is a kernel
+compatibility gate, not a claim of complete Redis command, network, persistence,
+or cluster compatibility. Verify executable versions independently; some
+distributions install Valkey under both binary names.
