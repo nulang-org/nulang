@@ -248,3 +248,84 @@ fn sse_request_write_half_close_preserves_response_stream() {
         assert_eq!(blank, "\n");
     }
 }
+
+#[test]
+fn overloaded_listener_returns_complete_503_to_fragmented_request() {
+    use std::io::Read;
+    let server = WebDevServer::bind_runtime_with_options(
+        0,
+        None,
+        None,
+        vec![],
+        WebServerOptions {
+            max_concurrent_connections: 1,
+            ..WebServerOptions::default()
+        },
+    )
+    .unwrap();
+    let (status, _occupied) = subscribe(&server, "wire-fragment-overload");
+    assert_eq!(status, "HTTP/1.1 200 OK\r\n");
+    for _ in 0..4 {
+        let mut peer = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        peer.set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        peer.write_all(b"GET / HTTP/1.1\r\n").unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        peer.write_all(b"Host: localhost\r\n\r\n")
+            .expect("overload response must allow request completion");
+        peer.shutdown(Shutdown::Write).unwrap();
+        let mut response = String::new();
+        peer.read_to_string(&mut response)
+            .expect("complete overload response without reset");
+        assert!(response.starts_with("HTTP/1.1 503 "), "{response:?}");
+        assert!(response.contains("Retry-After: 1\r\n"), "{response:?}");
+        assert!(
+            response.ends_with("Server at connection capacity"),
+            "{response:?}"
+        );
+    }
+}
+
+#[test]
+fn idle_overload_peers_do_not_serialize_rejection_responses() {
+    use std::io::Read;
+    let server = WebDevServer::bind_runtime_with_options(
+        0,
+        None,
+        None,
+        vec![],
+        WebServerOptions {
+            max_concurrent_connections: 1,
+            ..WebServerOptions::default()
+        },
+    )
+    .unwrap();
+    let (status, occupied) = subscribe(&server, "wire-concurrent-overload");
+    assert_eq!(status, "HTTP/1.1 200 OK\r\n");
+    // Keep the rejected write sides open until all responses arrive. The
+    // listener must not spend a full drain timeout on each connection.
+    let started = Instant::now();
+    let mut peers = Vec::new();
+    for _ in 0..8 {
+        let peer = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        peers.push(peer);
+    }
+    for peer in &mut peers {
+        let mut response = String::new();
+        peer.read_to_string(&mut response)
+            .expect("rejection should finish its write side");
+        assert!(response.starts_with("HTTP/1.1 503 "), "{response:?}");
+        assert!(
+            response.ends_with("Server at connection capacity"),
+            "{response:?}"
+        );
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "rejections were serialized"
+    );
+    drop(peers);
+    drop(occupied);
+}

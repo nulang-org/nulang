@@ -635,24 +635,14 @@ impl HttpServerState {
         slots: Arc<ConnectionSlots>,
     ) {
         let handler_module = Arc::new(handler_module);
+        let rejections = OverloadRejections::new();
         loop {
             match listener.accept(&shutdown) {
-                Ok(Some(mut stream)) => {
+                Ok(Some(stream)) => {
                     let lease = match slots.try_acquire_socket(&stream) {
                         Ok(Some(lease)) => lease,
                         Ok(None) => {
-                            let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
-                            Self::write_response(
-                                &mut stream,
-                                &HttpResponse {
-                                    status: 503,
-                                    headers: vec![
-                                        ("Content-Type".into(), "text/plain".into()),
-                                        ("Retry-After".into(), "1".into()),
-                                    ],
-                                    body: b"Server at connection capacity".to_vec(),
-                                },
-                            );
+                            rejections.reject(stream);
                             continue;
                         }
                         Err(error) => {
@@ -1938,13 +1928,96 @@ impl Drop for ConnectionLease {
     }
 }
 
+/// Separate, small budget for rejecting overloaded connections. No user
+/// handler or request parser runs here. If the rejection budget is also full,
+/// close immediately rather than queue sockets or block the accept loop.
+struct OverloadRejections {
+    slots: Arc<ConnectionSlots>,
+}
+
+impl OverloadRejections {
+    const MAX_CONNECTIONS: usize = 8;
+    const WRITE_TIMEOUT: Duration = Duration::from_millis(200);
+    const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+    const MAX_DRAIN_BYTES: usize = 64 * 1024;
+
+    fn new() -> Self {
+        Self {
+            slots: Arc::new(ConnectionSlots::new(Self::MAX_CONNECTIONS)),
+        }
+    }
+
+    fn reject(&self, mut stream: TcpStream) {
+        let Ok(Some(lease)) = self.slots.try_acquire_socket(&stream) else {
+            return;
+        };
+        // Failed thread creation drops the closure, socket and lease.
+        let _ = std::thread::Builder::new()
+            .name("nulang-http-overload".into())
+            .spawn(move || {
+                let _lease = lease;
+                Self::respond(&mut stream);
+            });
+    }
+
+    fn respond(stream: &mut TcpStream) {
+        if stream.set_write_timeout(Some(Self::WRITE_TIMEOUT)).is_err() {
+            return;
+        }
+        HttpServerState::write_response(
+            stream,
+            &HttpResponse {
+                status: 503,
+                headers: vec![
+                    ("Content-Type".into(), "text/plain".into()),
+                    ("Retry-After".into(), "1".into()),
+                ],
+                body: b"Server at connection capacity".to_vec(),
+            },
+        );
+        // A close with unread input can reset the connection and discard
+        // the response. Half-close the write side so the peer sees EOF, then
+        // discard input under a single elapsed deadline and byte budget.
+        // Do not parse, allocate a body, or wait indefinitely for a peer FIN.
+        if stream.shutdown(Shutdown::Write).is_err() {
+            return;
+        }
+        let mut reader = RequestDeadlineReader {
+            stream,
+            deadline: Instant::now() + Self::DRAIN_TIMEOUT,
+        };
+        let mut remaining = Self::MAX_DRAIN_BYTES;
+        let mut buffer = [0u8; 4096];
+        while remaining > 0 {
+            let len = remaining.min(buffer.len());
+            match reader.read(&mut buffer[..len]) {
+                Ok(0) => break,
+                Ok(n) => remaining -= n,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+impl Drop for OverloadRejections {
+    fn drop(&mut self) {
+        // The accept loop owns this pool. No new leases are possible now;
+        // interrupt rejected peers before joining the listener.
+        self.slots.interrupt_active();
+        let _ = self.slots.wait_for_drain(Self::DRAIN_TIMEOUT);
+    }
+}
+
 /// Host-level HTTP limits, validated before a Web listener binds.
 ///
 /// Defaults preserve the existing development server behavior. This is a
 /// runtime-host configuration surface, not a new language or Web DSL feature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WebServerOptions {
-    /// Maximum simultaneous connections, including long-lived SSE streams.
+    /// Maximum admitted connections, including long-lived SSE streams.
+    /// Up to eight separate overload-response connections may also exist;
+    /// they cannot dispatch application code and are drained under fixed limits.
     pub max_concurrent_connections: usize,
     /// Total time allowed to receive one HTTP request's headers and body.
     /// The budget does not reset when more bytes arrive.
@@ -2492,24 +2565,14 @@ impl WebDevServer {
         // Route tables contain compiled modules; share them rather than
         // cloning the full vector for every incoming connection.
         let routes = Arc::new(routes);
+        let rejections = OverloadRejections::new();
         loop {
             match listener.accept(&shutdown) {
-                Ok(Some(mut stream)) => {
+                Ok(Some(stream)) => {
                     let lease = match slots.try_acquire_socket(&stream) {
                         Ok(Some(lease)) => lease,
                         Ok(None) => {
-                            let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
-                            HttpServerState::write_response(
-                                &mut stream,
-                                &HttpResponse {
-                                    status: 503,
-                                    headers: vec![
-                                        ("Content-Type".into(), "text/plain".into()),
-                                        ("Retry-After".into(), "1".into()),
-                                    ],
-                                    body: b"Server at connection capacity".to_vec(),
-                                },
-                            );
+                            rejections.reject(stream);
                             continue;
                         }
                         Err(error) => {
@@ -4086,6 +4149,57 @@ mod tests {
             "custom capacity must reject excess requests"
         );
         drop(server);
+    }
+
+    #[test]
+    fn test_overload_rejection_budget_never_queues_excess_sockets() {
+        let rejections = OverloadRejections::new();
+        let held: Vec<_> = (0..OverloadRejections::MAX_CONNECTIONS)
+            .map(|_| rejections.slots.try_acquire().unwrap())
+            .collect();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        rejections.reject(socket);
+        let mut byte = [0u8; 1];
+        let result = peer.read(&mut byte);
+        assert!(
+            matches!(result, Ok(0))
+                || matches!(result, Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset),
+            "a full rejection budget must close rather than queue: {result:?}"
+        );
+        assert_eq!(
+            rejections.slots.active.load(Ordering::Acquire),
+            OverloadRejections::MAX_CONNECTIONS
+        );
+        drop(held);
+        assert!(rejections.slots.wait_for_drain(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn test_overload_rejection_drain_deadline_cannot_be_extended_by_trickle() {
+        let rejections = OverloadRejections::new();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        peer.set_write_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        rejections.reject(socket);
+        let mut response = String::new();
+        peer.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 503 "));
+        // A continuously trickling peer must not retain a rejection worker
+        // by repeatedly resetting the socket's per-read timeout.
+        let started = Instant::now();
+        while rejections.slots.active.load(Ordering::Acquire) != 0
+            && started.elapsed() < Duration::from_secs(2)
+        {
+            let _ = peer.write_all(b"x");
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        assert_eq!(rejections.slots.active.load(Ordering::Acquire), 0);
     }
 
     #[test]
