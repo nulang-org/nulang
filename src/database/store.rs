@@ -85,20 +85,35 @@ impl WalBackedTablet {
         wal_path: impl AsRef<Path>,
         manifest_dir: impl AsRef<Path>,
     ) -> std::io::Result<Self> {
-        use std::io;
-        let invalid = |reason: &'static str| io::Error::new(io::ErrorKind::InvalidData, reason);
-        // Both locks are nonblocking. Resolve the expected seal before opening
-        // the WAL so a mismatched bound header cannot trigger tail repair.
         let manifest = super::sst_manifest::ManifestStore::open(
             manifest_dir,
             descriptor.id().get(),
             descriptor.ownership_epoch(),
         )?;
+        Self::open_with_sealed_manifest(descriptor, wal_path.as_ref(), &manifest, false)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn open_with_sealed_manifest(
+        descriptor: TabletDescriptor,
+        wal_path: &Path,
+        manifest: &super::sst_manifest::ManifestStore,
+        require_bound: bool,
+    ) -> std::io::Result<Self> {
+        use std::io;
+        let invalid = |reason: &'static str| io::Error::new(io::ErrorKind::InvalidData, reason);
+        // Both locks are nonblocking. Resolve the expected seal before opening
+        // the WAL so a mismatched bound header cannot trigger tail repair.
         if manifest.current().recovery_descriptor() != Some(&descriptor) {
             return Err(invalid("sealed recovery descriptor mismatch"));
         }
-        let wal = FileWal::open_existing(wal_path.as_ref(), manifest.wal_binding()?)
-            .map_err(|error| io::Error::other(error.to_string()))?;
+        let binding = manifest.wal_binding()?;
+        let wal = if require_bound {
+            FileWal::open_existing_bound(wal_path, binding)
+        } else {
+            FileWal::open_existing(wal_path, binding)
+        }
+        .map_err(io::Error::other)?;
         let checkpoint_path = checkpoint::checkpoint_path_for_wal(wal.path());
         match std::fs::symlink_metadata(&checkpoint_path) {
             Ok(_) => return Err(invalid("existing checkpoint requires normal recovery")),
@@ -111,7 +126,7 @@ impl WalBackedTablet {
                     "nonzero seal floor is pending WAL4 cutover; reopen complete WAL normally",
                 ));
             }
-            super::wal_sst_shadow::verify_prefix(&wal, &descriptor, &manifest)?;
+            super::wal_sst_shadow::verify_prefix(&wal, &descriptor, manifest)?;
         }
         let mut tablet = manifest.restore_memory_tablet()?;
         wal.replay_after_checkpoint(&mut tablet)

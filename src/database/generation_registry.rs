@@ -394,6 +394,33 @@ impl GenerationRegistry {
         Owner::Wal(path.as_os_str().as_bytes().to_vec())
     }
 
+    /// Check a candidate before opening the WAL for recovery or tail repair.
+    pub(super) fn require_registered_wal(
+        &self,
+        path: &Path,
+        binding: SealBinding,
+    ) -> io::Result<()> {
+        let digest = self.digest(binding)?;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .canonicalize()?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| invalid("invalid WAL name"))?;
+        let canonical = parent.join(name);
+        let i = self
+            .state
+            .index(&Self::wal_owner(&canonical))
+            .map_err(|_| invalid("WAL not registered"))?;
+        let r = &self.state.references[i];
+        if r.active != digest && r.pending != Some(digest) {
+            return Err(invalid("candidate WAL binding not registered"));
+        }
+        Ok(())
+    }
+
     pub(super) fn register_wal(&mut self, path: &Path, binding: SealBinding) -> io::Result<()> {
         let digest = self.digest(binding)?;
         self.add(Self::wal_owner(path), digest)

@@ -1034,3 +1034,137 @@ fn registry_rejects_wrong_identity_duplicate_reference_and_corruption() {
     assert!(GenerationRegistry::open(&dir, 7, 3).is_err());
     assert!(GenerationRegistry::create(&dir, 7, 3).is_err());
 }
+
+#[test]
+fn managed_rotation_automatically_reconciles_and_quarantine_respects_references() {
+    use nulang::database::generation_registry::{
+        GenerationRegistry, GenerationStatus, ReferenceKind,
+    };
+    use nulang::database::managed_storage::ManagedTablet;
+    let f = Fixture::new();
+    let mut db = f.open();
+    let receipt = db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let old = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let reg_dir = f.0.join("registry");
+    fs::create_dir(&reg_dir).unwrap();
+    let registry = GenerationRegistry::create(&reg_dir, 7, 3).unwrap();
+    let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+    managed
+        .register_reference(ReferenceKind::Reader, [1; 16])
+        .unwrap();
+    managed
+        .commit_idempotent(id(2), vec![put(b"tail")])
+        .unwrap();
+    let next_dir = f.0.join("next");
+    fs::create_dir(&next_dir).unwrap();
+    let next = ManifestStore::create(&next_dir, 7, 3).unwrap();
+    managed.rotate(next, 1).unwrap();
+    let old_dir = f.0.join("sst");
+    let old = ManifestStore::open(&old_dir, 7, 3).unwrap();
+    assert_eq!(
+        managed.generation_status(&old).unwrap(),
+        GenerationStatus::Referenced
+    );
+    let backup = f.0.join("backup");
+    managed.backup([2; 16], &backup).unwrap();
+    let quarantine = f.0.join("quarantine");
+    assert!(managed.quarantine(old, &backup, &quarantine).is_err());
+    let old = ManifestStore::open(&old_dir, 7, 3).unwrap();
+    managed
+        .release_reference(ReferenceKind::Reader, [1; 16], &old)
+        .unwrap();
+    assert_eq!(
+        managed.generation_status(&old).unwrap(),
+        GenerationStatus::Unreferenced
+    );
+    managed.quarantine(old, &backup, &quarantine).unwrap();
+    assert!(!old_dir.exists());
+    assert_eq!(
+        managed
+            .commit_idempotent(id(1), vec![put(b"first")])
+            .unwrap(),
+        receipt
+    );
+    drop(managed);
+    let registry = GenerationRegistry::open(&reg_dir, 7, 3).unwrap();
+    let managed =
+        ManagedTablet::open(f.descriptor(), f.0.join("tablet.wal"), &next_dir, registry).unwrap();
+    assert_eq!(managed.current_sequence(), 2);
+    assert_eq!(managed.read_at(b"k", 2).unwrap(), Some(b"tail".as_slice()));
+}
+
+#[test]
+fn managed_open_requires_registered_wal_and_backup_reserves_reference() {
+    use nulang::database::generation_registry::{
+        GenerationRegistry, GenerationStatus, ReferenceKind,
+    };
+    use nulang::database::managed_storage::ManagedTablet;
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let old = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    drop(db);
+    drop(old);
+    let reg_dir = f.0.join("registry");
+    fs::create_dir(&reg_dir).unwrap();
+    let registry = GenerationRegistry::create(&reg_dir, 7, 3).unwrap();
+    assert!(ManagedTablet::open(
+        f.descriptor(),
+        f.0.join("tablet.wal"),
+        f.0.join("sst"),
+        registry
+    )
+    .is_err());
+    let db = recover(&f).unwrap();
+    let old = ManifestStore::open(f.0.join("sst"), 7, 3).unwrap();
+    let registry = GenerationRegistry::open(&reg_dir, 7, 3).unwrap();
+    let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+    let existing = f.0.join("existing");
+    fs::create_dir(&existing).unwrap();
+    assert!(managed.backup([3; 16], &existing).is_err());
+    managed
+        .commit_idempotent(id(2), vec![put(b"tail")])
+        .unwrap();
+    let next_dir = f.0.join("next");
+    fs::create_dir(&next_dir).unwrap();
+    managed
+        .rotate(ManifestStore::create(&next_dir, 7, 3).unwrap(), 0)
+        .unwrap();
+    let old = ManifestStore::open(f.0.join("sst"), 7, 3).unwrap();
+    assert_eq!(
+        managed.generation_status(&old).unwrap(),
+        GenerationStatus::Referenced
+    );
+    managed
+        .release_reference(ReferenceKind::Backup, [3; 16], &old)
+        .unwrap();
+    assert_eq!(
+        managed.generation_status(&old).unwrap(),
+        GenerationStatus::Unreferenced
+    );
+}
+
+#[test]
+fn unregistered_managed_open_leaves_torn_wal_unchanged() {
+    use nulang::database::{
+        generation_registry::GenerationRegistry, managed_storage::ManagedTablet,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let m = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&m).unwrap();
+    drop(db);
+    drop(m);
+    let wal = f.0.join("tablet.wal");
+    let mut torn = fs::read(&wal).unwrap();
+    torn.extend_from_slice(b"partial");
+    fs::write(&wal, &torn).unwrap();
+    let reg_dir = f.0.join("registry");
+    fs::create_dir(&reg_dir).unwrap();
+    let registry = GenerationRegistry::create(&reg_dir, 7, 3).unwrap();
+    assert!(ManagedTablet::open(f.descriptor(), &wal, f.0.join("sst"), registry).is_err());
+    assert_eq!(fs::read(&wal).unwrap(), torn);
+}
