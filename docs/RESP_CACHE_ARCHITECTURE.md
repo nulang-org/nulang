@@ -427,15 +427,15 @@ cargo build --release --locked --no-default-features --features cache-server --b
 ```
 
 Adjust the binary path if CARGO_TARGET_DIR overrides the default. The server
-requires a numeric loopback address and nonzero port. No authentication or
-TLS is implemented, so do not expose it through a proxy or tunnel to
-untrusted clients. Other local users may connect. Durable modes require an
+requires a numeric address and nonzero port. Plaintext binds are restricted
+to loopback; remote standalone binds require mutual TLS. Other local users
+may connect to a plaintext listener, so do not proxy plaintext to untrusted clients. Durable modes require an
 explicit journal path. READY is printed only after recovery and binding.
 The server exits nonzero on configuration, recovery, or reactor failure.
 Process-level tests kill the child without graceful shutdown and verify that
 memory mode loses its contents while both journal modes recover acknowledged
 writes after a process-only failure. This does not establish power-loss
-survival for buffered writes. Multi-shard configuration, authentication/TLS and production
+survival for buffered writes. Multi-shard configuration, per-client ACLs and production
 performance testing remain pending.
 
 
@@ -542,3 +542,45 @@ limitations.
 The shutdown drain additionally checks its deadline between socket writes,
 not only before each flush, so a continually reading peer cannot extend
 the flush loop indefinitely.
+
+
+## Mutual TLS authentication (standalone)
+
+Use all three PEM options to enable an encrypted listener that requires a
+client certificate signed by the configured private client CA:
+
+    nulang-fabric --bind 192.0.2.10:6380 --mode sync --journal /path/to/private/cache.wal --tls-ca /path/to/client-ca.pem --tls-cert /path/to/server-chain.pem --tls-key /path/to/server.key
+
+The example address is a documentation placeholder; use a real local
+interface. Without all three TLS options, standalone non-loopback binds
+are rejected. Missing/invalid certificate material fails before bind.
+The private key is read from a file, not a command-line secret value.
+Protect the PEM files and use a dedicated client CA. Clients must verify
+the server certificate and its hostname against their trusted server CA.
+The client CA may be different from the CA signing the server certificate.
+
+Rustls (existing dependency, explicit ring provider) authenticates the
+client during the handshake; there is no plaintext fallback, optional
+client certificate mode, early data, or session resumption. Each trusted
+client has full access to the supported RESP commands; password AUTH,
+per-user/key ACLs, certificate revocation checking and live reload are
+not implemented. Rotate credentials by replacing the files and restarting
+with the desired trust configuration. Configure a concrete advertised
+address when using cluster metadata.
+
+The mio reactor handles encrypted reads and writes nonblockingly and
+accounts for pending encrypted output when choosing writable readiness
+and draining shutdown replies. TLS mode has at most 256 connections (or
+the lower configured limit), a 10-second handshake deadline checked by
+the reactor, and a 64 KiB rustls send-buffer target. TLS state, handshake
+allocations and kernel buffers are additional to the RESP vector budget;
+this is not an RSS guarantee. Socket close does not guarantee delivery
+of pending replies or a TLS close-notify exchange.
+
+The loopback process test generates a private CA and certificates,
+rejects unauthenticated and untrusted clients and raw RESP plaintext,
+and verifies authenticated fragmented 128 KiB writes and pipelined reads.
+Full locked-workspace CI, exact security-baseline integration, WAN load
+and adversarial handshake/resource qualification remain required before
+production remote exposure. Embedded users must explicitly enable mutual
+TLS before polling; the existing low-level plaintext bind API is unchanged.

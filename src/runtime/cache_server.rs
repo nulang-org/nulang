@@ -250,6 +250,54 @@ impl CacheDispatchWake for Waker {
     }
 }
 
+/// Explicit client-certificate authentication using a private trust root.
+#[derive(Clone)]
+pub struct CacheMutualTls {
+    config: Arc<rustls::ServerConfig>,
+}
+
+impl CacheMutualTls {
+    pub fn from_pem(mut ca: &[u8], mut cert: &[u8], mut key: &[u8]) -> io::Result<Self> {
+        let mut roots = rustls::RootCertStore::empty();
+        for certificate in rustls_pemfile::certs(&mut ca) {
+            roots.add(certificate?).map_err(io::Error::other)?;
+        }
+        if roots.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty client CA",
+            ));
+        }
+        let certificates = rustls_pemfile::certs(&mut cert).collect::<Result<Vec<_>, _>>()?;
+        let key = rustls_pemfile::private_key(&mut key)?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "missing server private key")
+        })?;
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            provider.clone(),
+        )
+        .build()
+        .map_err(io::Error::other)?;
+        let mut config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(io::Error::other)?
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certificates, key)
+            .map_err(io::Error::other)?;
+        config.max_early_data_size = 0;
+        config.send_tls13_tickets = 0;
+        config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        Ok(Self {
+            config: Arc::new(config),
+        })
+    }
+}
+
+const TLS_BUFFER_LIMIT: usize = 64 * 1024;
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const TLS_CONNECTION_LIMIT: usize = 256;
+
 struct CacheConnection {
     stream: TcpStream,
     input: Vec<u8>,
@@ -258,6 +306,8 @@ struct CacheConnection {
     output_start: usize,
     lease: BufferLease,
     writable_interest: bool,
+    tls: Option<Box<rustls::ServerConnection>>,
+    accepted_at: Instant,
 }
 
 impl CacheConnection {
@@ -270,11 +320,46 @@ impl CacheConnection {
             output_start: 0,
             lease,
             writable_interest: false,
+            tls: None,
+            accepted_at: Instant::now(),
         }
     }
 
     fn pending_output(&self) -> usize {
         self.output.len().saturating_sub(self.output_start)
+    }
+
+    fn has_pending_wire(&self) -> bool {
+        self.pending_output() != 0 || self.tls.as_ref().is_some_and(|tls| tls.wants_write())
+    }
+
+    fn handshake_pending(&self) -> bool {
+        self.tls.as_ref().is_some_and(|tls| tls.is_handshaking())
+    }
+
+    // Drain plaintext before reading more encrypted records. The outer
+    // reactor retains its existing application-buffer admission policy.
+    fn read_plaintext(&mut self, scratch: &mut [u8]) -> io::Result<usize> {
+        let Some(tls) = &mut self.tls else {
+            return self.stream.read(scratch);
+        };
+        loop {
+            if tls.is_handshaking() && self.accepted_at.elapsed() >= TLS_HANDSHAKE_TIMEOUT {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            if !tls.is_handshaking() {
+                match tls.reader().read(scratch) {
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    result => return result,
+                }
+            }
+            // rustls bounds its internal record/handshake buffers.
+            let n = tls.read_tls(&mut self.stream)?;
+            if n == 0 {
+                return Ok(0);
+            }
+            tls.process_new_packets().map_err(io::Error::other)?;
+        }
     }
 
     fn compact_input(&mut self) {
@@ -405,6 +490,8 @@ pub struct CacheShardServer {
     shutdown: Arc<AtomicBool>,
     waker: Arc<Waker>,
     next_expiry_sweep: Instant,
+    mutual_tls: Option<CacheMutualTls>,
+    started: bool,
     #[cfg(unix)]
     automatic_checkpoint: Option<AutomaticCheckpoint>,
 }
@@ -554,9 +641,24 @@ impl CacheShardServer {
             shutdown,
             waker,
             next_expiry_sweep,
+            mutual_tls: None,
+            started: false,
             #[cfg(unix)]
             automatic_checkpoint: None,
         })
+    }
+
+    /// Configure mutual TLS before the first reactor iteration. No plaintext
+    /// fallback is permitted. Limit TLS connection count independently of
+    /// RESP vector budgets because rustls owns additional allocations.
+    pub fn enable_mutual_tls(&mut self, tls: CacheMutualTls) -> Result<(), CacheServerError> {
+        if self.started || self.mutual_tls.is_some() {
+            return Err(CacheServerError::InvalidConfig(
+                "TLS must be configured before polling",
+            ));
+        }
+        self.mutual_tls = Some(tls);
+        Ok(())
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -745,10 +847,10 @@ impl CacheShardServer {
             connection.input_start = 0;
             connection.lease.release_empty(&mut connection.input);
             if start.elapsed() < timeout
-                && connection.pending_output() != 0
+                && connection.has_pending_wire()
                 && Self::flush_connection_while(&mut connection, || start.elapsed() < timeout)
                     .is_ok()
-                && connection.pending_output() != 0
+                && connection.has_pending_wire()
                 && self
                     .poll
                     .registry()
@@ -784,7 +886,7 @@ impl CacheShardServer {
                                 start.elapsed() < timeout
                             })
                             .is_err()
-                                || connection.pending_output() == 0))
+                                || !connection.has_pending_wire()))
                     {
                         let mut connection = self
                             .connections
@@ -815,6 +917,7 @@ impl CacheShardServer {
     /// next expiration sweep deadline so TTL reclamation progresses while idle.
     pub fn poll_once(&mut self, timeout: Option<Duration>) -> Result<(), CacheServerError> {
         self.ensure_healthy()?;
+        self.started = true;
         if self.shutdown.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -823,6 +926,20 @@ impl CacheShardServer {
         let timeout = self.poll_timeout(timeout);
         self.poll.poll(&mut self.events, timeout)?;
 
+        // A slow unauthenticated handshake cannot retain a slot forever.
+        if self.mutual_tls.is_some() {
+            let expired: Vec<_> = self
+                .connections
+                .iter()
+                .filter(|(_, c)| {
+                    c.handshake_pending() && c.accepted_at.elapsed() >= TLS_HANDSHAKE_TIMEOUT
+                })
+                .map(|(token, _)| *token)
+                .collect();
+            for token in expired {
+                self.close_connection(token);
+            }
+        }
         self.ready.clear();
         for event in self.events.iter() {
             self.ready.push(ReadyEvent {
@@ -897,7 +1014,10 @@ impl CacheShardServer {
             };
             match listener.accept() {
                 Ok((mut stream, _peer)) => {
-                    if self.connections.len() >= self.config.max_connections {
+                    if self.connections.len() >= self.config.max_connections
+                        || (self.mutual_tls.is_some()
+                            && self.connections.len() >= TLS_CONNECTION_LIMIT)
+                    {
                         drop(stream);
                         continue;
                     }
@@ -907,10 +1027,14 @@ impl CacheShardServer {
                     self.poll
                         .registry()
                         .register(&mut stream, token, Interest::READABLE)?;
-                    self.connections.insert(
-                        token,
-                        CacheConnection::new(stream, self.buffer_budget.lease()),
-                    );
+                    let mut connection = CacheConnection::new(stream, self.buffer_budget.lease());
+                    if let Some(tls) = &self.mutual_tls {
+                        let mut session = rustls::ServerConnection::new(tls.config.clone())
+                            .map_err(io::Error::other)?;
+                        session.set_buffer_limit(Some(TLS_BUFFER_LIMIT));
+                        connection.tls = Some(Box::new(session));
+                    }
+                    self.connections.insert(token, connection);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) => return Err(CacheServerError::Io(error)),
@@ -984,7 +1108,7 @@ impl CacheShardServer {
             return Err(ConnectionAction::Close);
         }
 
-        if self.process_input(connection).is_err() {
+        if !connection.handshake_pending() && self.process_input(connection).is_err() {
             return Err(ConnectionAction::Close);
         }
 
@@ -992,7 +1116,7 @@ impl CacheShardServer {
             return Err(ConnectionAction::Close);
         }
 
-        if (writable || connection.pending_output() != 0)
+        if (writable || connection.has_pending_wire())
             && Self::flush_connection(connection).is_err()
         {
             return Err(ConnectionAction::Close);
@@ -1014,7 +1138,7 @@ impl CacheShardServer {
             if self.shutdown.load(Ordering::Acquire) {
                 return Ok(());
             }
-            match connection.stream.read(&mut scratch) {
+            match connection.read_plaintext(&mut scratch) {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
@@ -1154,6 +1278,35 @@ impl CacheShardServer {
         connection: &mut CacheConnection,
         mut can_write: impl FnMut() -> bool,
     ) -> io::Result<()> {
+        if let Some(tls) = &mut connection.tls {
+            loop {
+                if !can_write() {
+                    break;
+                }
+                if tls.wants_write() {
+                    match tls.write_tls(&mut connection.stream) {
+                        Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                        Ok(_) => continue,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => return Err(e),
+                    }
+                }
+                if tls.is_handshaking() || connection.output_start == connection.output.len() {
+                    break;
+                }
+                let end = (connection.output_start + 16 * 1024).min(connection.output.len());
+                match tls
+                    .writer()
+                    .write(&connection.output[connection.output_start..end])
+                {
+                    Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                    Ok(n) => connection.output_start += n,
+                    Err(e) => return Err(e),
+                }
+            }
+            connection.compact_output();
+            return Ok(());
+        }
         while connection.output_start < connection.output.len() && can_write() {
             match connection
                 .stream
@@ -1179,7 +1332,7 @@ impl CacheShardServer {
         token: Token,
         connection: &mut CacheConnection,
     ) -> Result<(), CacheServerError> {
-        let wants_writable = connection.pending_output() != 0;
+        let wants_writable = connection.has_pending_wire();
         if wants_writable == connection.writable_interest {
             return Ok(());
         }

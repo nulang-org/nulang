@@ -191,3 +191,145 @@ fn termination_signals_exit_successfully_and_release_journal() {
         request(address, GET, b"$5\r\nvalue\r\n");
     }
 }
+
+#[test]
+fn mutual_tls_requires_trusted_client_certificate() {
+    use rcgen::{
+        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+        KeyUsagePurpose,
+    };
+    use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
+    use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+    use std::sync::Arc;
+    let temp = Temp(std::env::temp_dir().join(format!(
+            "nulang-fabric-tls-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )));
+    std::fs::create_dir(&temp.0).unwrap();
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+    let ca_key = KeyPair::generate().unwrap();
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let issuer = Issuer::new(ca_params, ca_key);
+    let leaf = |usage| {
+        let mut params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+        params.extended_key_usages.push(usage);
+        let key = KeyPair::generate().unwrap();
+        (params.signed_by(&key, &issuer).unwrap(), key)
+    };
+    let (server_cert, server_key) = leaf(ExtendedKeyUsagePurpose::ServerAuth);
+    let (client_cert, client_key) = leaf(ExtendedKeyUsagePurpose::ClientAuth);
+    let ca_path = temp.0.join("ca.pem");
+    let cert_path = temp.0.join("server.pem");
+    let key_path = temp.0.join("server.key");
+    std::fs::write(&ca_path, ca.pem()).unwrap();
+    std::fs::write(&cert_path, server_cert.pem()).unwrap();
+    std::fs::write(&key_path, server_key.serialize_pem()).unwrap();
+    let addr = port();
+    let _server = Server::start(
+        addr,
+        &[
+            "--tls-ca",
+            ca_path.to_str().unwrap(),
+            "--tls-cert",
+            cert_path.to_str().unwrap(),
+            "--tls-key",
+            key_path.to_str().unwrap(),
+        ],
+    );
+    let mut roots = RootCertStore::empty();
+    roots.add(ca.der().clone()).unwrap();
+    let connect = |config: ClientConfig| {
+        let socket = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        StreamOwned::new(
+            ClientConnection::new(Arc::new(config), ServerName::try_from("localhost").unwrap())
+                .unwrap(),
+            socket,
+        )
+    };
+    let mut denied = connect(
+        ClientConfig::builder()
+            .with_root_certificates(roots.clone())
+            .with_no_client_auth(),
+    );
+    let attempt = denied
+        .write_all(SET)
+        .and_then(|_| denied.flush())
+        .and_then(|_| denied.read_exact(&mut [0; 5]));
+    assert!(
+        attempt.is_err(),
+        "unauthenticated client received a response"
+    );
+    // Plaintext must never fall through to RESP dispatch on a TLS listener.
+    let mut plain = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+    plain
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    plain.write_all(SET).unwrap();
+    let mut byte = [0];
+    match plain.read(&mut byte) {
+        Ok(0) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("unexpected plaintext response: {other:?}"),
+    }
+    let unknown = rcgen::generate_simple_self_signed(vec!["unknown".to_string()]).unwrap();
+    let mut untrusted = connect(
+        ClientConfig::builder()
+            .with_root_certificates(roots.clone())
+            .with_client_auth_cert(
+                vec![unknown.cert.der().clone()],
+                PrivatePkcs8KeyDer::from(unknown.signing_key.serialize_der()).into(),
+            )
+            .unwrap(),
+    );
+    assert!(untrusted
+        .write_all(SET)
+        .and_then(|_| untrusted.read_exact(&mut [0; 5]))
+        .is_err());
+    let mut allowed = connect(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(
+                vec![client_cert.der().clone()],
+                PrivatePkcs8KeyDer::from(client_key.serialize_der()).into(),
+            )
+            .unwrap(),
+    );
+    allowed.write_all(GET).unwrap();
+    let mut result = [0; 5];
+    allowed.read_exact(&mut result).unwrap();
+    assert_eq!(&result, b"$-1\r\n");
+    allowed.write_all(SET).unwrap();
+    allowed.read_exact(&mut result).unwrap();
+    assert_eq!(&result, b"+OK\r\n");
+    let value = vec![b'x'; 128 * 1024];
+    let mut set = format!("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n${}\r\n", value.len()).into_bytes();
+    set.extend_from_slice(&value);
+    set.extend_from_slice(b"\r\n");
+    // Fragment the request over multiple TLS records, then pipeline GETs.
+    for chunk in set.chunks(3000) {
+        allowed.write_all(chunk).unwrap();
+    }
+    allowed.write_all(&[GET, GET].concat()).unwrap();
+    let bulk = format!("${}\r\n", value.len()).into_bytes();
+    let mut expected = b"+OK\r\n".to_vec();
+    for _ in 0..2 {
+        expected.extend_from_slice(&bulk);
+        expected.extend_from_slice(&value);
+        expected.extend_from_slice(b"\r\n");
+    }
+    let mut actual = vec![0; expected.len()];
+    allowed.read_exact(&mut actual).unwrap();
+    assert_eq!(actual, expected);
+}
