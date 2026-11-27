@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Fabric shared TLS admission budget — 2026-11-27
+- **Charge a fixed 512 KiB modeled reservation per TLS session against the shared connection budget before session creation**, retain it through idle buffer reclamation and release it on every close. Expose per-shard reservation and shared budget limit; reject insufficient TLS configuration. Qualify cross-shard and concurrent admission without adding dependencies.
+
 ### Fabric cooperative reactor fairness — 2026-11-27
 - **Bound per-turn listener, connection and inbox work** with explicit deduplicated readiness continuations for edge-triggered I/O, retain preflighted pipeline ordering across command yields, and qualify competing clients, accept bursts and large/ encrypted replies. No dependency changes.
 

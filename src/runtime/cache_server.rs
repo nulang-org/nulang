@@ -45,7 +45,7 @@ const READ_QUANTUM: usize = 32;
 const WRITE_QUANTUM: usize = 32;
 const IO_CHUNK_BYTES: usize = 16 * 1024;
 
-/// Shared limit on retained connection input/output vector capacity.
+/// Shared admission budget for retained RESP vector capacity and TLS reservations.
 /// Clone this budget into multiple shard reactors to share one process allowance.
 #[derive(Debug, Clone)]
 pub struct CacheBufferBudget {
@@ -65,6 +65,12 @@ impl CacheBufferBudget {
             }),
         }
     }
+    /// Configured shared admission limit.
+    pub fn limit_bytes(&self) -> usize {
+        self.inner.limit
+    }
+
+    /// Total charged vector capacities plus fixed TLS admission reservations.
     pub fn used_bytes(&self) -> usize {
         self.inner.used.load(Ordering::Acquire)
     }
@@ -89,6 +95,14 @@ struct BufferLease {
     charged: usize,
 }
 impl BufferLease {
+    fn reserve_tls(&mut self) -> bool {
+        if !self.budget.acquire(TLS_RESERVATION_BYTES) {
+            return false;
+        }
+        self.charged += TLS_RESERVATION_BYTES;
+        true
+    }
+
     fn reserve(&mut self, buffer: &mut Vec<u8>, required: usize, max: usize) -> io::Result<()> {
         let denied = || {
             io::Error::new(
@@ -300,6 +314,9 @@ impl CacheMutualTls {
 }
 
 const TLS_BUFFER_LIMIT: usize = 64 * 1024;
+/// Conservative admission charge, not a measured or guaranteed RSS bound.
+/// Covers modeled record/handshake buffers, session state and headroom.
+pub const TLS_RESERVATION_BYTES: usize = 512 * 1024;
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const TLS_CONNECTION_LIMIT: usize = 256;
 
@@ -309,9 +326,9 @@ struct CacheConnection {
     input_start: usize,
     output: Vec<u8>,
     output_start: usize,
-    lease: BufferLease,
     writable_interest: bool,
     tls: Option<Box<rustls::ServerConnection>>,
+    lease: BufferLease,
     accepted_at: Instant,
     commands_remaining: usize,
 }
@@ -702,6 +719,11 @@ impl CacheShardServer {
                 "TLS must be configured before polling",
             ));
         }
+        if self.buffer_budget.inner.limit <= TLS_RESERVATION_BYTES {
+            return Err(CacheServerError::InvalidConfig(
+                "shared connection budget must exceed one TLS reservation",
+            ));
+        }
         self.mutual_tls = Some(tls);
         Ok(())
     }
@@ -718,6 +740,15 @@ impl CacheShardServer {
             shutdown: self.shutdown.clone(),
             waker: self.waker.clone(),
         }
+    }
+
+    /// Modeled TLS reservation held by this shard, excluding RESP vectors.
+    pub fn tls_reserved_bytes(&self) -> usize {
+        self.connections
+            .values()
+            .filter(|connection| connection.tls.is_some())
+            .count()
+            * TLS_RESERVATION_BYTES
     }
 
     pub fn connection_count(&self) -> usize {
@@ -1075,7 +1106,7 @@ impl CacheShardServer {
                 return Ok(());
             };
             match listener.accept() {
-                Ok((mut stream, _peer)) => {
+                Ok((stream, _peer)) => {
                     if self.connections.len() >= self.config.max_connections
                         || (self.mutual_tls.is_some()
                             && self.connections.len() >= TLS_CONNECTION_LIMIT)
@@ -1088,16 +1119,24 @@ impl CacheShardServer {
                         continue;
                     }
                     let token = self.allocate_connection_token();
-                    self.poll
-                        .registry()
-                        .register(&mut stream, token, Interest::READABLE)?;
                     let mut connection = CacheConnection::new(stream, self.buffer_budget.lease());
                     if let Some(tls) = &self.mutual_tls {
+                        // Charge before constructing Rustls state, even for a
+                        // peer that never sends a ClientHello. The same lease
+                        // holds RESP allocations and releases on every close.
+                        if !connection.lease.reserve_tls() {
+                            continue;
+                        }
                         let mut session = rustls::ServerConnection::new(tls.config.clone())
                             .map_err(io::Error::other)?;
                         session.set_buffer_limit(Some(TLS_BUFFER_LIMIT));
                         connection.tls = Some(Box::new(session));
                     }
+                    self.poll.registry().register(
+                        &mut connection.stream,
+                        token,
+                        Interest::READABLE,
+                    )?;
                     self.connections.insert(token, connection);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
@@ -2435,6 +2474,8 @@ mod tests {
             }
         }
         assert_eq!(server.connection_count(), 2);
+        assert_eq!(server.tls_reserved_bytes(), 2 * TLS_RESERVATION_BYTES);
+        assert_eq!(server.buffer_budget.used_bytes(), 2 * TLS_RESERVATION_BYTES);
         let mut excess = StdTcpStream::connect(addr).unwrap();
         excess
             .set_read_timeout(Some(Duration::from_secs(1)))
@@ -2448,6 +2489,8 @@ mod tests {
             other => panic!("excess TLS connection not closed: {other:?}"),
         }
         assert_eq!(server.connection_count(), 2);
+        assert_eq!(server.tls_reserved_bytes(), 2 * TLS_RESERVATION_BYTES);
+        assert_eq!(server.buffer_budget.used_bytes(), 2 * TLS_RESERVATION_BYTES);
         for connection in server.connections.values_mut() {
             connection.accepted_at = Instant::now() - TLS_HANDSHAKE_TIMEOUT;
         }
@@ -2455,6 +2498,7 @@ mod tests {
         assert_eq!(server.poll_timeout(None), Some(Duration::ZERO));
         server.poll_once(Some(Duration::ZERO)).unwrap();
         assert_eq!(server.connection_count(), 0);
+        assert_eq!(server.tls_reserved_bytes(), 0);
         assert_eq!(server.buffer_budget.used_bytes(), 0);
         let _replacement = StdTcpStream::connect(addr).unwrap();
         for _ in 0..8 {
@@ -2599,5 +2643,161 @@ mod tests {
         }
         reader.join().unwrap();
         assert_eq!(server.buffer_budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn tls_admission_reserves_shared_budget_before_handshake_and_releases_on_close() {
+        const RESERVE: usize = 512 * 1024;
+        let budget = CacheBufferBudget::new(RESERVE + 4096);
+        let mut first = build_server();
+        let mut second = build_server();
+        first.buffer_budget = budget.clone();
+        second.buffer_budget = budget.clone();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let tls = CacheMutualTls::from_pem(
+            cert.cert.pem().as_bytes(),
+            cert.cert.pem().as_bytes(),
+            cert.signing_key.serialize_pem().as_bytes(),
+        )
+        .unwrap();
+        first.enable_mutual_tls(tls.clone()).unwrap();
+        second.enable_mutual_tls(tls).unwrap();
+
+        let stalled = StdTcpStream::connect(first.local_addr().unwrap()).unwrap();
+        for _ in 0..8 {
+            first.poll_once(Some(Duration::from_millis(5))).unwrap();
+            if first.connection_count() == 1 {
+                break;
+            }
+        }
+        assert_eq!(first.connection_count(), 1);
+        assert_eq!(budget.used_bytes(), RESERVE);
+
+        let mut denied = StdTcpStream::connect(second.local_addr().unwrap()).unwrap();
+        denied
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        for _ in 0..8 {
+            second.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        assert_eq!(second.connection_count(), 0);
+        match denied.read(&mut [0; 1]) {
+            Ok(0) => {}
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+            other => panic!("budget-denied connection not closed: {other:?}"),
+        }
+        assert_eq!(budget.used_bytes(), RESERVE);
+
+        drop(stalled);
+        for _ in 0..8 {
+            first.poll_once(Some(Duration::from_millis(5))).unwrap();
+            if first.connection_count() == 0 {
+                break;
+            }
+        }
+        assert_eq!(budget.used_bytes(), 0);
+
+        let mut invalid = StdTcpStream::connect(second.local_addr().unwrap()).unwrap();
+        for _ in 0..8 {
+            second.poll_once(Some(Duration::from_millis(5))).unwrap();
+            if second.connection_count() == 1 {
+                break;
+            }
+        }
+        assert_eq!(budget.used_bytes(), RESERVE);
+        invalid.write_all(b"not tls at all").unwrap();
+        for _ in 0..8 {
+            second.poll_once(Some(Duration::from_millis(5))).unwrap();
+            if second.connection_count() == 0 {
+                break;
+            }
+        }
+        assert_eq!(second.connection_count(), 0);
+        assert_eq!(budget.used_bytes(), 0);
+
+        let _replacement = StdTcpStream::connect(second.local_addr().unwrap()).unwrap();
+        for _ in 0..8 {
+            second.poll_once(Some(Duration::from_millis(5))).unwrap();
+            if second.connection_count() == 1 {
+                break;
+            }
+        }
+        assert_eq!(budget.used_bytes(), RESERVE);
+        second.control().shutdown();
+        second.run_with_shutdown_timeout(Duration::ZERO).unwrap();
+        assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn idle_buffer_release_retains_tls_charge_until_session_drop() {
+        let budget = CacheBufferBudget::new(TLS_RESERVATION_BYTES + 4096);
+        let mut lease = budget.lease();
+        let mut input = Vec::new();
+        let mut output = Vec::new();
+        assert!(lease.reserve_tls());
+        lease.reserve(&mut input, 128, 256).unwrap();
+        lease.reserve(&mut output, 128, 256).unwrap();
+        assert_eq!(
+            budget.used_bytes(),
+            TLS_RESERVATION_BYTES + input.capacity() + output.capacity()
+        );
+        input.extend_from_slice(b"partial");
+        lease.release_empty(&mut input);
+        assert_ne!(input.capacity(), 0);
+        input.clear();
+        lease.release_empty(&mut input);
+        lease.release_empty(&mut output);
+        assert_eq!(budget.used_bytes(), TLS_RESERVATION_BYTES);
+        assert!(!budget.lease().reserve_tls());
+        drop(lease);
+        assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn shared_tls_reservations_are_atomic_under_concurrent_admission() {
+        use std::sync::Barrier;
+        let budget = CacheBufferBudget::new(3 * TLS_RESERVATION_BYTES);
+        let barrier = Arc::new(Barrier::new(9));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let budget = budget.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                let mut lease = budget.lease();
+                let admitted = lease.reserve_tls();
+                barrier.wait();
+                barrier.wait();
+                admitted
+            }));
+        }
+        barrier.wait();
+        assert_eq!(budget.used_bytes(), budget.limit_bytes());
+        barrier.wait();
+        let admitted = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|admitted| *admitted)
+            .count();
+        assert_eq!(admitted, 3);
+        assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn tls_configuration_rejects_budget_without_application_headroom() {
+        let mut server = build_server();
+        server.buffer_budget = CacheBufferBudget::new(TLS_RESERVATION_BYTES);
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let tls = CacheMutualTls::from_pem(
+            cert.cert.pem().as_bytes(),
+            cert.cert.pem().as_bytes(),
+            cert.signing_key.serialize_pem().as_bytes(),
+        )
+        .unwrap();
+        assert!(matches!(
+            server.enable_mutual_tls(tls),
+            Err(CacheServerError::InvalidConfig(_))
+        ));
+        assert_eq!(server.buffer_budget.used_bytes(), 0);
+        assert!(server.mutual_tls.is_none());
     }
 }
