@@ -307,3 +307,22 @@ The orthogonal model is considered established when:
 Phase 1 is additive and changes no executable semantics or stable format.
 
 Future phases that alter source-visible behavior, entity defaults, or serialized metadata require their own compatibility gates and migration tests.
+
+#### Infrastructure reference preparation slice
+
+The std-only reference executor and portable cancellation token from the
+shared-budget prototype are available to native infrastructure callers.
+A shared worker admission budget is fail-fast, releases permits after joins,
+and bounds cooperating scopes' OS threads. It is not an actor scheduler,
+a reusable worker pool, or a bound on the caller's input vector or heap.
+
+NuDB's scoped preparation integration tests give children computation-only
+inputs; no child owns a tablet or WAL. The caller joins the scope, prepares
+point-key writes against the original snapshot, and serially commits them
+through the existing fenced owner. Conflicts still reject at commit and
+cancelled preparation publishes nothing. Callers must bound input count and
+bytes separately; reads used to compute mutations must be declared in
+the read set or captured through tracked point transactions. This slice
+does not add an asynchronous write queue, optimistic group commit, or
+source-level parallel `par`. Do not enable such paths without explicit
+admission, cancellation and durability contracts.
