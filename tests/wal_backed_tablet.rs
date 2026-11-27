@@ -229,8 +229,8 @@ fn symlink_and_hardlink_wal_aliases_fail_closed() {
     use std::os::unix::fs::symlink;
 
     let path = temp_wal("aliased_wal");
-    let symlink_path = path.with_extension("symlink");
-    let hardlink_path = path.with_extension("hardlink");
+    let symlink_path = path.with_extension("symlink.wal");
+    let hardlink_path = path.with_extension("hardlink.wal");
     let _ = fs::remove_file(&path);
     let _ = fs::remove_file(&symlink_path);
     let _ = fs::remove_file(&hardlink_path);

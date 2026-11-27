@@ -247,6 +247,8 @@ pub struct FileWal {
 }
 
 impl FileWal {
+    /// Open a canonical lowercase .wal path in a trusted local directory.
+    /// Noncanonical legacy paths require verified offline migration.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WalError> {
         Self::open_with_mode(path.as_ref(), false, None)
     }
@@ -261,6 +263,11 @@ impl FileWal {
         require_existing: bool,
         binding: Option<SealBinding>,
     ) -> Result<Self, WalError> {
+        // WAL, checkpoint and lock/temp sidecars occupy disjoint namespaces.
+        // Both WAL3 and WAL4 admission must reject aliases before mutation.
+        if requested_path.extension() != Some(std::ffi::OsStr::new("wal")) {
+            return Err(WalError::InvalidWalExtension);
+        }
         let parent = requested_path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -1330,6 +1337,7 @@ pub enum WalError {
     SealBindingMismatch,
     WriterLocked,
     AliasedWalPath,
+    InvalidWalExtension,
     WalHeaderChecksumMismatch,
     InvalidFrameHeader {
         offset: u64,
@@ -1414,6 +1422,7 @@ impl fmt::Display for WalError {
             Self::Io { message, .. } => write!(f, "WAL I/O error: {message}"),
             Self::InvalidHeader => f.write_str("invalid NuDB WAL header"),
             Self::SealBindingMismatch => f.write_str("bound WAL requires matching sealed manifest; legacy reclamation is disabled"),
+            Self::InvalidWalExtension => f.write_str("NuDB WAL path must end in .wal; noncanonical legacy paths require offline migration"),
             Self::WriterLocked => f.write_str("NuDB WAL already has an exclusive writer"),
             Self::AliasedWalPath => {
                 f.write_str("NuDB WAL or lock path must not be a symlink or hardlink")
