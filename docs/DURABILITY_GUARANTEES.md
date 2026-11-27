@@ -149,6 +149,454 @@ execute the VM's live `PerformAsync` callback, kill a process, verify provider
 side-effect deduplication, or prove atomic actor-turn completion. Those require
 separate integration and crash tests.
 
+## OS-process crash acceptance on file-backed SQLite
+
+`tests/durable_effect_process_kill.rs` uses the same Rust trusted-host coordinator
+and a file-backed provider test double that deduplicates the logical operation
+ID. A parent waits for an atomically published checkpoint marker, forcibly kills
+the actual child process, and starts a fresh process against the same database.
+On Unix it verifies the process exited due to SIGKILL. Recovery subprocesses
+have bounded timeouts and are reaped on assertion failures.
+
+The test covers three acknowledged checkpoints: after intent commit, after
+provider mutation but before terminal receipt, and after terminal receipt but
+before resumption. It also covers an epoch-2 ownership claim following a crash,
+rejecting stale epoch-1 retry and receipt commit. Every scenario then does one
+more independent restart, checking unchanged journal sequence, stable idempotency
+keys, one provider mutation and no redispatch after a terminal receipt.
+
+Run the focused test with:
+
+```bash
+cargo test --locked --no-default-features --features sqlite --test durable_effect_process_kill
+```
+
+This is not a power-loss or mid-SQLite-commit test. The provider is a cooperative
+local test double; the fixture does not qualify arbitrary providers, concurrent
+live owners, the normal VM callback, or atomic actor-turn completion.
+
+## Opt-in VM asynchronous effect bridge (experimental)
+
+The VM exposes a backwards-compatible asynchronous callback with the exact
+`PerformAsync` instruction location and owning code module.
+`DurableEffectCoordinator::execute_vm_async_text_with_deduplication` is an
+explicit trusted-host adapter to the existing authorized compiled-effect
+coordinator. The caller must provide a trusted live actor, verified artifact,
+correct grant and provider, canonical request bytes, and a replay-stable
+execution key and occurrence. The adapter validates the compiled effect site
+and authority before journaling or dispatch. It supports text receipts only:
+invalid UTF-8 fails closed, including after reopening a completed journal,
+without redispatching the provider.
+
+`tests/durable_vm_callback_bridge.rs` executes actual VM bytecode against
+file-backed SQLite. A subprocess pauses after atomically publishing a
+checkpoint following a provider ledger write and fsync, before acknowledging
+the receipt; its parent kills and reaps it (SIGKILL on Unix). A fresh VM and
+store in the surviving parent recover using the same provider idempotency key,
+and completed replay does not contact the provider. The fixture also exercises
+authority, request drift, and terminal invalid text receipt recovery.
+
+```bash
+cargo test --locked --no-default-features --features sqlite --test durable_vm_callback_bridge
+```
+
+This is an opt-in trusted test adapter, not the default actor runtime.
+`RuntimeVmCallbacks` and `BytecodeRuntimeCallbacks` remain unchanged.
+The test does not establish artifact provenance, persistence of execution
+keys and occurrences across arbitrary actor-turn replay, resource-scoped
+authority, atomic actor-turn/inbox completion, real provider cooperation or
+multi-owner safety. Default runtime integration remains gated on these
+requirements.
+
+### Activation-scoped workflow occurrences (experimental)
+
+The opt-in `execute_workflow_vm_async_text_with_deduplication` adapter
+derives the execution key from the live actor's `WorkflowActivationId`:
+`workflow-command:v1:<accepted-command-sequence>`. The effect ID additionally
+includes the actor identity, compiler-owned semantic site, and a deterministic
+activation-local occurrence ordinal. The ownership epoch is a fence, not part
+of the logical effect ID.
+
+A lazily allocated actor-owned cursor tracks the next occurrence separately
+from custom workflow-event replay. It advances only after a terminal text
+receipt is successfully returned, including receipt replay. A failed attempt
+keeps the current occurrence and pins the site/request while the actor lives.
+Retry with a different site or request, invalid/mismatched activation, an
+older command, or a transferred cursor fails closed. Storage-proven open
+admission with the same owner epoch is required even for receipt replay.
+
+`DurableTransition::workflow_command` constructs an explicit standalone command
+admission. MemoryStore and SQLite persist the command journal entry and current
+open-command metadata together with the fenced tail. They require a safe
+pre-command snapshot and reject overlapping admissions, stale owners, legacy
+writes while open, unbound effects, and closure while an effect is Prepared.
+The native synchronous workflow admission helper uses this contract; the
+opt-in compiled VM adapter queries the same metadata before dispatch and replay.
+A generic command or old atomic tail without the explicit marker is not proof
+of admission; it is not backfilled or reinterpreted. The new marker participates
+in the transition digest, and absent markers preserve existing v1 digests.
+SQLite's additive `durable_workflow_admissions` table records the latest
+admission and terminal sequence. Old code does not enforce this metadata;
+mixed-version writers, live upgrades and rollback are not qualified.
+
+The trusted host must still use the same verified/pinned bytecode and replay
+from the safe pre-command boundary. The ordinal is reconstructed by deterministic
+execution of the recovered command, not serialized as a continuation or inferred by
+counting journal records. The new version-2 workflow-effect envelope binds the
+activation and occurrence to the semantic site and canonical effect ID in the
+same atomic transition as Prepared; Completed retains that binding and request
+digest. The MemoryStore and SQLite implementations find the slot without the
+caller guessing its site and check the binding and monotonic state inside the
+commit boundary. Gaps, duplicate new transitions, completion without an intent,
+and changed site/request/receipt fail closed. Generic v1 effect and compensation
+records retain their previous encoding. An unbound effect in the active command
+window is ambiguous and is refused rather than automatically migrated. Older
+readers do not support the v2 envelope; reverting after a v2 write requires a
+compatible recovery path, such as restoring a consistent pre-v2 backup. Live
+upgrade and rollback are not qualified.
+
+A tracked terminal transition must include the actor's consumed-effect count,
+including an explicit zero for a command without effects. The trusted host
+obtains this evidence from the live actor's cursor after successful execution,
+not by counting persisted receipts. Pending requests and invalid text receipts
+cannot supply terminal evidence. The count is bound to the fenced transition
+digest; omitting it preserves legacy transition encoding but is not sufficient
+to close a tracked admission.
+
+MemoryStore and SQLite reconcile that count against the complete contiguous
+post-command occurrence history within the same commit that writes the
+terminal event, snapshot and admission closure. Missing, pending, malformed
+or unmatched occurrences reject the entire transition. A replay that returns
+before consuming previously committed effects, even if its terminal event and
+snapshot otherwise look valid, cannot close the tracked admission. Exact-tail
+retries of an identical terminal transition remain idempotent. This is a
+storage consistency check on a trusted execution host's evidence, not a proof
+against a malicious host fabricating a count. It requires no additional
+schema migration; mixed-version writers remain unqualified.
+
+This experimental path scans the post-command portion of effect history; there
+is no dedicated index or throughput claim yet. Backends without slot recovery
+return Unsupported.
+
+The existing SQLite VM fixture exercises the effect replay path with compiled
+workflow bytecode, a committed command sequence, lost provider reply,
+repeated dynamic execution of one site, and replay from a reopened store
+with a fresh actor. Distinct occurrences and new commands produce distinct
+keys, while replay of completed occurrences does not call the provider.
+The later-occurrence case also checks a newer ownership epoch, pending site
+drift, and reuse of the original logical key after replay of an earlier receipt.
+A reopened-store regression rejects site drift with an empty in-memory cursor
+both before and after completion and replays the original receipt without a
+provider call. Storage tests exercise immutable bindings, monotonic completion,
+idempotent exact-tail retry and rollback of conflicting writes in both MemoryStore
+and SQLite.
+The admission tests also distinguish a generic atomic tail from true workflow
+admission, deny a closed command from a fresh VM cursor after database reopen,
+and inject failures in both SQLite admission and closure writes to verify
+atomic rollback. These are trusted fixture results, not proof of production
+workflow recovery.
+
+### Same-store workflow inbox/outbox (experimental storage contract)
+
+A successful tracked terminal transition may stage outbound actor messages.
+The snapshot, terminal event, cursor reconciliation, admission closure and
+outbox records commit together. A failed step or intermediate effect
+transition cannot stage messages. Duplicate ordinals and non-finite floating
+point payloads are rejected. Each message is identified by sender actor ID,
+committed transition sequence and ordinal; ownership epochs are not part of
+the logical message identity.
+
+A receiver sharing the same persistence store may set the optional
+`workflow_inbox` identity on its standalone workflow command admission.
+MemoryStore and SQLite verify that the source outbox record is committed and
+matches the receiver, behavior and serialized payload. Admission and the
+deduplication receipt commit atomically with the command journal and fenced
+tail. A duplicate cannot create a new command after the original admission
+closes. Exact-tail commit retries remain idempotent. The lookup
+`load_workflow_inbox_admission` returns the original accepted activation,
+**not** proof of execution or delivery completion. A receiver must recover
+an unfinished admitted activation rather than dispatch it again.
+
+SQLite adds the `durable_workflow_inbox` table; absence of the optional
+identity preserves existing transition digests. The storage contract alone
+does not provide transport or automatic dispatch.
+It assumes a trusted host, a shared store, and stable actor identities
+without destructive clear/reuse or mixed-version writers. Cross-store
+delivery, outbox retention and execution-completion acknowledgment, remote libSQL
+qualification, atomic intermediate events, timers,
+suspension and production cross-epoch recovery remain unqualified.
+The general compiled workflow scheduler still uses the legacy journal path
+and **must not** use this adapter until those paths are qualified.
+
+### Scheduled Rust workflow message staging (experimental)
+
+A scheduled, atomically admitted ordinary Rust workflow handler may call
+`Actor::stage_workflow_message` with a local destination, behavior ID and
+explicitly serialized `PersistedValue` payload. Staging is not a send:
+messages remain private to the executing turn, with zero-based ordinals in
+call order. The buffer is bound to the live activation and epoch, sealed on
+handler return, and committed with the reconciled terminal snapshot. A rejected
+staging attempt poisons the turn even when its error is ignored. At most 1024
+messages may be staged per turn; non-finite floats, integers or actor IDs
+outside the VM representation, and embedded-NUL strings are rejected.
+
+The terminal helper checks that each receiver is a live, same-shard,
+non-hibernated persistent workflow with an ordinary Rust behavior and an
+existing snapshot in the same store. Grain, migrated, internal and AOT
+destinations are excluded. Failed terminal commits discard the in-memory
+activation and recover the original admitted command; no messages are
+published to mailboxes. A replay reconstructs the staging buffer. Native
+handler registration and stable destination behavior IDs remain host
+responsibilities. Ordinary send semantics and bytecode/AOT dispatch are
+unchanged. Automatic delivery remains disabled by default.
+
+### Opt-in same-store outbox dispatcher (experimental)
+
+A host may call `Runtime::pending_workflow_outbox(sender, after, limit)`
+between scheduler turns to discover unadmitted tracked workflow messages.
+Pages contain at most 1024 identities in (sender sequence, ordinal) order.
+The cursor is exclusive; wrap to `None` on the next scan so a deferred
+destination does not block unrelated messages. This manual API requires known
+sender IDs and host-managed polling cadence. A page
+is not a reservation. It does not guarantee dispatch order across calls.
+
+`Runtime::dispatch_workflow_outbox(id)` loads a committed tracked message,
+rechecks destination eligibility and requires a quiescent same-shard
+ordinary Rust workflow receiver with no open command or mailbox work.
+The receiver's command and inbox receipt commit atomically before volatile
+mailbox publication. Busy or unavailable receivers return `Deferred`
+without acknowledgment; `Admitted` and `AlreadyAdmitted` carry the original
+activation, not proof of terminal execution. A duplicate never queues a new
+command. The explicitly admitted command takes precedence over later
+system traffic; selective receive and synchronous asks cannot consume or
+overtake it. Payloads that cannot round-trip into the receiver's VM values
+are rejected before admission.
+
+After interruption between admission, publication and execution, unless the
+receiver was explicitly bound to the native recovery supervisor described
+below, recover the receiver from the store and register its native handlers with stable
+behavior IDs before scheduling. The original journal entry is recovered
+into the admitted mailbox slot, not readmitted. A recovered command with
+no registered handler is parked; a retry of its original outbox identity
+can wake it after registration. After an ambiguous commit error, look up
+the receipt and recover the receiver if needed. Do not send an ordinary
+message to compensate. Polling excludes admitted messages even if the
+receiver has not completed its handler.
+
+MemoryStore and local SQLite support the opt-in path. SQLite adds an
+atomic `durable_workflow_outbox` identity index populated only by tracked
+successful terminal commits. Generic/legacy outbox rows and pre-index
+SQLite rows are not auto-qualified or backfilled. The dispatcher never
+deletes receipts or messages. This is not durable FIFO across senders,
+cross-shard/cross-store messaging, or exactly-once
+external side effects. This release slice does not qualify native handler
+identity changes, ownership transfer, remote libSQL, destructive clear,
+retention, or mixed-version writers.
+
+Tests cover rollback of receiver admission, reopen at the admission/publication
+cut, loss after mailbox publication, and OS process termination after admission
+but before handler execution. The durability release gate runs the SQLite
+workflow library suite, including these tests.
+
+
+### Opt-in automatic outbox pump (experimental)
+
+A host may enable the cooperative scheduler pump after choosing a supported
+persistence store and restoring/registering the ordinary Rust workflow actors:
+
+```rust
+runtime.enable_workflow_outbox_pump(WorkflowOutboxPumpConfig::default())?;
+runtime.run_scheduler();
+```
+
+The default configuration attempts at most 64 admissions per page, applies
+a 100 ms cooldown after finished sweeps, and uses the runtime's logical clock.
+Page sizes 1 through 1024 and intervals 1 ms through 300 s are accepted.
+The pump is disabled by default and can be disabled at any time without
+changing durable records. Enabling probes support and fails for unsupported
+stores; re-enable when replacing the store.
+
+Both MemoryStore and local SQLite discover pending tracked messages directly
+from committed storage on the owning shard, including nonresident senders.
+No sender list or volatile cursor must survive a restart. A scan uses the
+exclusive key (sender transition sequence, sender actor ID, ordinal), an
+upper watermark captured at its start, and bounded pages. The SQLite scan
+index is additive; only already dispatch-qualified tracked records are
+eligible. The watermark bounds the key range: newly committed later keys
+wait for the next sweep, while earlier arrivals can be discovered on a later
+page or sweep. This is not a snapshot reservation or a FIFO guarantee.
+MemoryStore scans its in-memory history; SQLite still incurs index scans
+over admitted history. Neither has a proven throughput or latency bound.
+
+The real and deterministic schedulers attempt one due page between actor
+turns, advance past deferred or failed individual deliveries, and retry
+those items on the next sweep after the cooldown. A newly staged terminal
+outbox wakes an idle successful sweep, but not a cooldown after a deferred
+or failed admission. A scan error preserves the cursor and backs off.
+When otherwise quiescent, a single synchronous scheduler call scans at
+most four pages without claiming a ready actor and returns rather than
+spinning or waiting for permanently unavailable recipients. The cursor
+continues at the next call. Long-lived node loops invoke the scheduler
+repeatedly; embedded hosts must continue driving it while work is pending,
+including after cooldown. The deterministic scheduler does not advance its
+virtual clock solely for outbox retries; test hosts explicitly advance it.
+
+The host can also call `Runtime::poll_workflow_outbox()` between turns to
+obtain one page's admission counts and observe cooldown. Individual failures
+are logged and counted; unadmitted messages stay pending. Divergent snapshots
+or an ambiguous commit still require inspection and receiver recovery. Pending messages
+are distinct from already-admitted commands: after interruption, the
+latter are replayed by explicit receiver recovery/handler registration or
+the separately enabled native recovery supervisor, not sent a second time
+by the pump. The outbox pump itself does not recreate actors or register
+handlers. There is no multi-owner claiming, dead-letter policy, or
+cross-shard delivery. The release gate exercises both backends, SQLite
+reopen without a live sender, a bounded idle sweep, time-based retry,
+failure isolation, and deterministic scheduling.
+
+### Opt-in native recovery supervisor (experimental)
+
+The host may bind a newly created ordinary Rust workflow to an immutable
+recipe before the first command. A recipe is a trusted name, revision and
+ordered sequence of native handlers (excluding reserved timer behavior 0).
+For example, with a registered `receive` native behavior:
+
+```rust
+runtime.register_native_workflow_recovery_recipe(
+    "receiver", "v1", vec![("receive".into(), receive_handler)]
+)?;
+runtime.bind_native_workflow_recovery(receiver_id, "receiver", "v1")?;
+runtime.enable_native_workflow_recovery(NativeWorkflowRecoveryConfig::default())?;
+```
+
+On restart, register the same recipe before enabling recovery; actor IDs
+need not be enumerated by the host for open, bound commands. MemoryStore
+retains bindings in memory; local SQLite persists them across process
+restarts. SQLite discovery joins the
+binding with open admission metadata and returns a bounded shard-local page
+of actor IDs. The supervisor validates the binding (including ownership
+epoch), current safe snapshot, original admission, command journal,
+behavior ID, and supported workflow history; it reconstructs through
+`recover_actor` and installs the ordered native handlers before scheduling.
+The original receipt and journal entry remain unchanged. Missing recipes
+are deferred; inconsistent layouts or unsupported history fail closed.
+The revision is a trusted host contract, not a cryptographic hash of Rust
+code. Changing a handler or its behavior layout requires a different
+revision and a separately qualified new workflow identity.
+
+The supervisor is disabled by default. It attempts one page per scheduler
+iteration (default 64, maximum 1024), with a bounded four-page idle sweep,
+a retry interval (default 100 ms, range 1 ms–300 s), and an automatic
+recovery attempt budget (default 3, range 1–1024) per open activation.
+The scheduler's logical clock controls cooldown; it does not sleep solely for recovery.
+Embedded hosts must drive subsequent scheduler turns; deterministic hosts
+must advance their clock. `poll_native_workflow_recovery()` reports the
+number examined, restored, deferred and failed, not successful handler
+completion. On terminal commit failure for a locally bound actor with
+supervision enabled, volatile state is discarded and a later due sweep
+can retry the same still-open admission; unrelated actors remain runnable.
+A terminal commit that actually closed despite an ambiguous error is not
+re-executed; explicit host recovery of that closed actor may be needed.
+
+Scope: single existing store owner, unchanged shard/epoch, ordinary
+synchronous native handlers and supported durable primitive/string state
+(handlers must not depend on state-model metadata for absent fields),
+no external non-idempotent side effects, timers/signals, transient state,
+event sourcing, CRDT, authority, compilation/AOT, migration, grain or
+supervision-tree reconstruction. The host must keep bound handler layouts
+and semantics immutable, use stable actor identities, and enable recovery
+before spawning new actors on restart; the runtime reserves the discovered
+open bound IDs but does not provide a global durable actor-ID allocator.
+Resident actors (including ones manually recovered without handlers),
+unbound legacy actors, idle/closed actors, and post-effect intermediate
+history are not automatically reconstructed.
+
+#### Durable retry budget and quarantine
+
+Before reconstructing a storage-proven open command, the supervisor
+reserves an automatic recovery attempt in the same store, fenced by actor
+ID, command sequence and epoch. A failed reservation prevents execution.
+A process crash after committing a reservation (including before handler
+execution) conservatively uses one slot. Initial ordinary live admission
+is not counted. Missing recipes and invalid history before the reservation
+do not consume attempts. The first reservation pins the configured limit
+for that command (subsequent configuration changes cannot reset or enlarge
+it; only the explicit audited redrive operation below can grant additional slots). A subsequent distinct admitted command gets its own budget. MemoryStore
+retains reservations for its lifetime; local SQLite retains them after
+process loss. Reservation does not advance the durable command tail.
+
+When the final reserved attempt leaves the command open, it is quarantined
+from further automatic recovery. The storage scan excludes exhausted
+commands but retains their IDs in its watermark, and the original inbox
+receipt, command journal, safe snapshot and open admission remain.
+No later command is admitted past the quarantined one. Hosts can inspect
+`Runtime::native_workflow_retry_status(actor_id)`: it reports the current
+open activation, epoch, reserved attempts and pinned limit (or None if
+unreserved/closed); `is_exhausted()` means no further automatic replay.
+The final reserved execution may still be runnable; successful closure is
+permitted. This does not count successful execution or prove every reserved
+attempt reached the handler. Explicit trusted-host manual recovery remains a separate operation. There
+is no snapshot deletion, command cancellation, receipt replacement or
+automatic release from quarantine. Store-level metadata is not a security
+boundary against a trusted host editing its database.
+
+#### Quarantine inspection and controlled redrive
+
+Trusted hosts can enumerate exhausted open reservations in actor-ID order
+using the shard-local, keyset-paginated
+`Runtime::native_workflow_quarantine(after_actor_id, limit)` (limit at most
+1024). This is a live inspection, not a reservation or consistent snapshot;
+an exhausted final attempt may still be resident/runnable.
+
+`Runtime::redrive_quarantined_native_workflow(expected_status,
+additional_attempts, operator, reason)` accepts only an exact current
+exhausted reservation on the host's owning shard, with supervision enabled,
+an absent/nonresident actor and the same registered immutable recipe. The
+host must repair the underlying failure independently. The store checks
+the open admission, sequence, epoch and expected counters; it atomically
+appends an authorization and raises the limit by the explicit finite grant.
+The existing reserved count never decreases and the lifetime cap of 1024
+automatic attempts per activation still applies. Duplicate/stale grants,
+invalid operator/reason or a failed transaction cannot grant new slots.
+Redrive does not run a handler or bypass the scheduler cooldown; the next
+due scan independently reconstructs and reserves the original command.
+No new receipt, command identity, journal entry or checkpoint is created.
+
+`Runtime::native_workflow_recovery_audit(activation, epoch)` returns
+classified reserved-attempt failures and explicit redrive authorizations
+in attempt order, even after command closure. One failure and at most one
+grant can be recorded per attempt; the per-activation history is bounded
+by twice the lifetime cap. Audit deliberately records no raw exception or
+command payload. Redrive records the supplied operator label and reason
+(maximum 128/512 UTF-8 bytes, no control characters), not a verified human
+identity; the host must enforce access control and avoid secret material.
+Failure diagnostics are best-effort: a crash, ambiguous closure or storage
+outage can leave a reservation without a recorded failure. A missing
+diagnostic is not proof of successful execution. SQLite audit persists
+across reopen; destructive actor clear removes its audit. There is no
+automatic redrive or cross-owner claiming.
+
+#### Native handler panic containment
+
+With supervision enabled, an ordinary Rust handler in a bound atomic
+workflow turn is isolated if it unwinds. The runtime discards the actor
+and uncommitted staging, leaves the original admission and safe snapshot,
+and applies the existing recovery cooldown and reserved retry budget.
+A reserved replay that panics records the classified HandlerPanicked
+diagnostic on a best-effort basis; the initial live turn is not counted.
+The standard panic hook still runs. This does not catch aborts,
+panic=abort builds, double panics during unwinding, runtime/storage
+panics or arbitrary native/compiled handlers. Trusted host handlers must
+maintain unwind-safe external state and avoid non-idempotent effects.
+
+There is no automatic ownership acquisition or cross-shard recovery. No durable external-effect guarantee
+is added. Tests exercise MemoryStore and SQLite, exact recipe matching,
+bounded pages, real process termination after admission, integrated outbox
+restart, injected terminal commit failure/repair, pinned retry limits,
+reservation write faults and process termination after the final
+reservation but before handler execution, redrive fences, audit idempotence,
+atomic grant/audit rollback and recovery after a persisted grant.
+
 ## What is not yet a production-wide guarantee
 
 Passing this gate does **not** prove that every `perform`, workflow activity,
@@ -180,9 +628,11 @@ Run:
 bash scripts/test-durability-guarantees.sh
 ```
 
-The gate is deterministic and performs no public network calls, sleeps, or
-wall-clock assertions. It covers semantic-site artifact propagation, storage
-recovery, crash-window behavior, and the lower-level durable-effect contracts.
+The gate performs no public network calls. It covers semantic-site artifact
+propagation, storage recovery, deterministic crash-window behavior and real
+OS-process termination/recovery on SQLite, including the opt-in VM callback. Process waits are bounded by the
+fixture timeout; logical correctness is asserted from the durable journal and
+provider ledger, not elapsed wall-clock time.
 
 ## Competitive benchmark contract
 

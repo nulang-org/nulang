@@ -9,7 +9,7 @@ use crate::bytecode::Constant;
 use crate::primitives::ActorRole;
 use crate::runtime::actor::Actor;
 use crate::runtime::persistence::{
-    ActorSnapshot, DurableTransition, EventEntry, JournalEntry, PersistedValue,
+    ActorSnapshot, DurableOutboxId, DurableTransition, EventEntry, PersistedValue,
     WorkflowActivationId, WorkflowEvent, WorkflowReplayEventId, DURABLE_TRANSITION_VERSION,
 };
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
@@ -241,6 +241,16 @@ pub(crate) fn commit_workflow_command(
     behavior_id: u16,
     payload: Vec<PersistedValue>,
 ) -> std::io::Result<WorkflowActivationId> {
+    commit_workflow_command_with_inbox(rt, actor_id, behavior_id, payload, None)
+}
+
+pub(crate) fn commit_workflow_command_with_inbox(
+    rt: &mut Runtime,
+    actor_id: u64,
+    behavior_id: u16,
+    payload: Vec<PersistedValue>,
+    inbox: Option<DurableOutboxId>,
+) -> std::io::Result<WorkflowActivationId> {
     let activation_epoch = rt
         .actors
         .get(&actor_id)
@@ -253,31 +263,17 @@ pub(crate) fn commit_workflow_command(
             )
         })?;
     let expected_previous_sequence = rt.persistence.latest_sequence(actor_id);
-    let sequence = expected_previous_sequence.checked_add(1).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "workflow command transition sequence overflow",
-        )
-    })?;
-    let activation = WorkflowActivationId::new(actor_id, sequence);
-
-    rt.persistence.commit_transition(DurableTransition {
-        version: DURABLE_TRANSITION_VERSION,
+    let mut transition = DurableTransition::workflow_command(
         actor_id,
         activation_epoch,
-        sequence,
         expected_previous_sequence,
-        command: Some(JournalEntry {
-            sequence,
-            behavior_id,
-            payload,
-        }),
-        snapshot: None,
-        workflow_events: vec![],
-        domain_events: vec![],
-        durable_effects: vec![],
-        outbox: vec![],
-    })?;
+        behavior_id,
+        payload,
+    )?;
+    transition.workflow_inbox = inbox;
+    let sequence = transition.sequence;
+    let activation = WorkflowActivationId::new(actor_id, sequence);
+    rt.persistence.commit_transition(transition)?;
 
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.sequence = sequence;
@@ -312,7 +308,48 @@ pub(crate) fn commit_step_completed(
         )
     })?;
     let activation_epoch = snapshot.activation_epoch;
+    let workflow_effects_consumed =
+        if let Some(open) = rt.persistence.load_open_workflow_command(actor_id)? {
+            let actor = rt.actors.get(&actor_id).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "workflow actor missing at terminal commit",
+                )
+            })?;
+            if activation != Some(open.activation)
+                || actor.current_workflow_activation != Some(open.activation)
+                || activation_epoch != open.tail.activation_epoch
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "terminal workflow execution does not match open admission",
+                ));
+            }
+            Some(crate::durable_effect_runtime::workflow_terminal_effect_count(actor)?)
+        } else {
+            None
+        };
 
+    let outbox = rt
+        .actors
+        .get(&actor_id)
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "workflow sender missing")
+        })?
+        .staged_workflow_messages()?
+        .to_vec();
+    for message in &outbox {
+        let valid_target =
+            rt.is_workflow_outbox_destination(message.destination_actor_id, message.behavior_id);
+        if workflow_effects_consumed.is_none() || !valid_target {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "workflow outbox requires a live same-shard persistent Rust workflow destination",
+            ));
+        }
+    }
+
+    let has_staged_messages = !outbox.is_empty();
     rt.persistence.commit_transition(DurableTransition {
         version: DURABLE_TRANSITION_VERSION,
         actor_id,
@@ -320,6 +357,9 @@ pub(crate) fn commit_step_completed(
         sequence,
         expected_previous_sequence,
         command: None,
+        workflow_admission: false,
+        workflow_inbox: None,
+        workflow_effects_consumed,
         snapshot: Some(snapshot.clone()),
         workflow_events: vec![WorkflowEvent::StepCompleted {
             sequence,
@@ -328,13 +368,17 @@ pub(crate) fn commit_step_completed(
         }],
         domain_events: vec![],
         durable_effects: vec![],
-        outbox: vec![],
+        outbox,
     })?;
 
+    if has_staged_messages {
+        rt.note_workflow_outbox_staged();
+    }
     rt.maybe_shadow_replicate(actor_id, &snapshot);
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.sequence = sequence;
         actor.dirty_fields.clear();
+        actor.clear_workflow_outbox_staging();
     }
     Ok(())
 }

@@ -2861,22 +2861,10 @@ fn sender_thread(
         // correlated with the logical operation that produced this packet.
         let bytes = outgoing.packet.to_bytes(outgoing.seq);
 
-        let result = {
-            let mut conns = lock_ignore_poison(&connections);
-            if let Some(conn) = conns.get_mut(&outgoing.to_node) {
-                conn.send_packet(&bytes)
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "connection disappeared",
-                ))
-            }
-        };
-
-        if let Err(e) = result {
+        write_outgoing_packet(&connections, outgoing.to_node, &bytes, |error| {
             warn!(
-                "[nulang-net] Send to {:?} failed: {}; removing connection",
-                outgoing.to_node, e
+                "[nulang-net] Send to {:?} failed: {}",
+                outgoing.to_node, error
             );
             let _ = send_failure_tx.send(TransportSendFailure {
                 to_node: outgoing.to_node,
@@ -2884,9 +2872,45 @@ fn sender_thread(
                 sender_actor: packet_sender_actor(&outgoing.packet),
                 reason: TransportSendFailureReason::Write,
             });
-            let mut conns = lock_ignore_poison(&connections);
-            if let Some(conn) = conns.remove(&outgoing.to_node) {
-                let _ = conn.stream.shutdown();
+        });
+    }
+}
+
+/// Write a single frame and report failure before retiring its connection.
+#[cfg(feature = "tcp")]
+fn write_outgoing_packet(
+    connections: &Mutex<HashMap<NodeId, TcpConnection>>,
+    to_node: NodeId,
+    bytes: &[u8],
+    report_failure: impl FnOnce(&io::Error),
+) {
+    let (generation, result) = {
+        let mut conns = lock_ignore_poison(connections);
+        if let Some(conn) = conns.get_mut(&to_node) {
+            (Some(conn.generation), conn.send_packet(bytes))
+        } else {
+            (
+                None,
+                Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "connection disappeared",
+                )),
+            )
+        }
+    };
+    if let Err(error) = result {
+        report_failure(&error);
+        let mut conns = lock_ignore_poison(connections);
+        // A reader or inbound handshake may have replaced the socket
+        // while the error was reported. Only retire the failed generation.
+        if let Some(generation) = generation {
+            if conns
+                .get(&to_node)
+                .is_some_and(|conn| conn.generation == generation)
+            {
+                if let Some(conn) = conns.remove(&to_node) {
+                    let _ = conn.stream.shutdown();
+                }
             }
         }
     }
@@ -3938,6 +3962,134 @@ mod tests {
         );
 
         drop(new_client);
+    }
+
+    #[test]
+    #[cfg(feature = "tcp")]
+    fn test_stale_write_failure_does_not_evict_replacement_connection() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _old_client = TcpStream::connect(addr).unwrap();
+        let (old_server, old_addr) = listener.accept().unwrap();
+        old_server.shutdown(std::net::Shutdown::Both).unwrap();
+        let peer = NodeId(0xBEEF);
+        let old_generation = next_connection_generation();
+        let connections = Mutex::new(HashMap::from([(
+            peer,
+            TcpConnection {
+                node_id: peer,
+                generation: old_generation,
+                addr: old_addr,
+                stream: TransportStream::Raw(old_server),
+                last_activity: Instant::now(),
+            },
+        )]));
+        let mut new_client = TcpStream::connect(addr).unwrap();
+        new_client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let (new_server, new_addr) = listener.accept().unwrap();
+        let new_generation = next_connection_generation();
+        let packet = Packet::Heartbeat {
+            node_id: NodeId(42),
+            timestamp: 0,
+        }
+        .to_bytes(17);
+        let mut failures = 0;
+        // Deterministically install the replacement at the exact unlocked
+        // failure-reporting boundary of the real sender write path.
+        write_outgoing_packet(&connections, peer, &packet, |_| {
+            failures += 1;
+            lock_ignore_poison(&connections).insert(
+                peer,
+                TcpConnection {
+                    node_id: peer,
+                    generation: new_generation,
+                    addr: new_addr,
+                    stream: TransportStream::Raw(new_server),
+                    last_activity: Instant::now(),
+                },
+            );
+        });
+        assert_eq!(failures, 1);
+        assert_eq!(
+            lock_ignore_poison(&connections)
+                .get(&peer)
+                .map(|conn| conn.generation),
+            Some(new_generation)
+        );
+        // No automatic resend of the failed frame. A separate next send
+        // must use the live replacement and reach its peer.
+        let next = Packet::Heartbeat {
+            node_id: NodeId(42),
+            timestamp: 0,
+        }
+        .to_bytes(18);
+        write_outgoing_packet(&connections, peer, &next, |e| {
+            panic!("replacement failed: {e}")
+        });
+        let mut len = [0; 4];
+        new_client.read_exact(&mut len).unwrap();
+        let mut frame = vec![0; u32::from_be_bytes(len) as usize];
+        new_client.read_exact(&mut frame).unwrap();
+        assert_eq!(frame, next);
+    }
+
+    #[test]
+    #[cfg(feature = "tcp")]
+    fn test_missing_connection_write_does_not_evict_new_connection() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, addr) = listener.accept().unwrap();
+        let peer = NodeId(0xBEEF);
+        let generation = next_connection_generation();
+        let connections = Mutex::new(HashMap::new());
+        let mut failures = 0;
+        write_outgoing_packet(&connections, peer, b"unused", |e| {
+            assert_eq!(e.kind(), io::ErrorKind::NotConnected);
+            failures += 1;
+            lock_ignore_poison(&connections).insert(
+                peer,
+                TcpConnection {
+                    node_id: peer,
+                    generation,
+                    addr,
+                    stream: TransportStream::Raw(server),
+                    last_activity: Instant::now(),
+                },
+            );
+        });
+        assert_eq!(failures, 1);
+        assert_eq!(
+            lock_ignore_poison(&connections)
+                .get(&peer)
+                .map(|c| c.generation),
+            Some(generation)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "tcp")]
+    fn test_failed_current_write_evicts_only_failed_connection() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, addr) = listener.accept().unwrap();
+        server.shutdown(std::net::Shutdown::Both).unwrap();
+        let peer = NodeId(0xBEEF);
+        let connections = Mutex::new(HashMap::from([(
+            peer,
+            TcpConnection {
+                node_id: peer,
+                generation: next_connection_generation(),
+                addr,
+                stream: TransportStream::Raw(server),
+                last_activity: Instant::now(),
+            },
+        )]));
+        let mut failures = 0;
+        write_outgoing_packet(&connections, peer, b"unused", |_| failures += 1);
+        assert_eq!(failures, 1);
+        assert!(lock_ignore_poison(&connections).is_empty());
     }
 
     // ------------------------------------------------------------------

@@ -83,7 +83,15 @@ pub(crate) use spawn::spawn_from_module_with_authority;
 mod timer;
 mod trace;
 mod workflow;
+mod workflow_outbox;
+mod workflow_recovery;
 pub use trace::TraceContext;
+pub use workflow_outbox::{
+    WorkflowOutboxDispatch, WorkflowOutboxPumpConfig, WorkflowOutboxPumpReport,
+};
+pub use workflow_recovery::{
+    NativeWorkflowHandler, NativeWorkflowRecoveryConfig, NativeWorkflowRecoveryReport,
+};
 
 #[cfg(test)]
 mod cluster_dst;
@@ -454,6 +462,10 @@ pub struct Runtime {
 
     // Persistence engine (v0.7)
     pub persistence: Box<dyn PersistenceStore>,
+    workflow_outbox_pump: Option<Box<workflow_outbox::WorkflowOutboxPump>>,
+    native_workflow_recovery: Option<Box<workflow_recovery::NativeWorkflowRecovery>>,
+    native_workflow_recovery_recipes: HashMap<(String, String), Vec<NativeWorkflowHandler>>,
+    native_workflow_recovery_bound: std::collections::HashSet<u64>,
     // Immutable shared object store for large `val` buffers.
     pub object_store: ObjectStore,
     // Virtual actor (grain) type registry and resident mapping.
@@ -688,6 +700,10 @@ impl Runtime {
             process_groups: ProcessGroups::new(),
             pending_fetched_messages: HashMap::new(),
             persistence: Box::new(MemoryStore::new()),
+            workflow_outbox_pump: None,
+            native_workflow_recovery: None,
+            native_workflow_recovery_recipes: HashMap::new(),
+            native_workflow_recovery_bound: std::collections::HashSet::new(),
             object_store: ObjectStore::new(),
             grain_registry: GrainRegistry::new(),
             grain_residents: HashMap::new(),
@@ -2030,6 +2046,16 @@ impl Runtime {
         behavior_id: u16,
         args: &[Value],
     ) -> crate::types::NuResult<Value> {
+        if self
+            .actors
+            .get(&actor_id)
+            .is_some_and(|actor| actor.mailbox.admitted_workflow_behavior().is_some())
+        {
+            return Err(NuError::VMError {
+                msg: "cannot synchronously ask an actor with an admitted workflow command".into(),
+                span: Span::default(),
+            });
+        }
         let behavior_idx = behavior_id as usize;
         if !self.actor_has_behavior_id(actor_id, behavior_id) {
             return Err(NuError::VMError {
@@ -2207,7 +2233,7 @@ impl Runtime {
                     },
                 );
             }
-            let _ = self.dispatch_native_handler(actor_id, behavior_idx, args);
+            let _ = self.dispatch_native_handler(actor_id, behavior_idx, args, false);
             self.checkpoint_actor(actor_id);
             self.current_actor = None;
             return Ok(Value::nil());
@@ -2256,7 +2282,7 @@ impl Runtime {
             } else if self.has_native_handler(actor_id, behavior_idx) {
                 let prev = self.current_actor;
                 self.current_actor = Some(actor_id);
-                let _ = self.dispatch_native_handler(actor_id, behavior_idx, &msg.payload);
+                let _ = self.dispatch_native_handler(actor_id, behavior_idx, &msg.payload, false);
                 self.checkpoint_actor(actor_id);
                 self.current_actor = prev;
             }
@@ -3119,6 +3145,15 @@ impl Runtime {
     /// Close one actor turn and enqueue it exactly once when runnable mailbox
     /// work remains.
     pub(crate) fn finish_actor_turn(&mut self, actor_id: u64) {
+        // A failed terminal commit can replace this actor with a recovered
+        // instance and enqueue its original command during step_actor.
+        // The old turn must not consume the new instance's ready token.
+        if self.actors.get(&actor_id).is_some_and(|actor| {
+            actor.run_state == ActorRunState::Queued
+                && actor.mailbox.admitted_workflow_behavior().is_some()
+        }) {
+            return;
+        }
         let should_requeue = self
             .actors
             .get(&actor_id)
@@ -3143,7 +3178,7 @@ impl Runtime {
             }
         }
 
-        if should_requeue {
+        if should_requeue && self.admitted_workflow_handler_ready(actor_id) {
             self.enqueue_actor(actor_id);
         }
     }
@@ -3168,11 +3203,23 @@ impl Runtime {
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn run_scheduler(&mut self) {
         let mut ticks: u64 = 0;
+        let mut idle_outbox_pages = 0;
         loop {
             self.drain_cross_shard_messages();
+            let more_recovery = self.tick_native_workflow_recovery();
+            let more_outbox = self.tick_workflow_outbox_pump();
             let actor_id = match self.claim_next_ready_actor() {
                 Some(actor_id) => actor_id,
                 None => {
+                    // A blocked first page must not hide a ready receiver on
+                    // a later page. Bound work while idle so a permanently
+                    // blocked backlog never keeps the synchronous API alive.
+                    if (more_outbox || more_recovery)
+                        && idle_outbox_pages + 1 < workflow_outbox::OUTBOX_IDLE_PAGE_BUDGET
+                    {
+                        idle_outbox_pages += 1;
+                        continue;
+                    }
                     if self.llm_inflight_count() == 0 && self.timer_wheel.is_empty() {
                         if let Some(ref mut cb) = self.idle_callback {
                             cb();
@@ -3201,6 +3248,7 @@ impl Runtime {
                 }
             };
 
+            idle_outbox_pages = 0;
             let reductions_before = self
                 .actors
                 .get(&actor_id)
@@ -3224,7 +3272,7 @@ impl Runtime {
                             && actor.suspended_execution.is_none()
                     })
                     .unwrap_or(false);
-                if !should_continue {
+                if !should_continue || !self.admitted_workflow_handler_ready(actor_id) {
                     break;
                 }
 
@@ -3297,7 +3345,7 @@ impl Runtime {
         let mut ready: Vec<u64> = self
             .actors
             .iter()
-            .filter(|(_, a)| !a.mailbox.is_empty())
+            .filter(|(id, a)| !a.mailbox.is_empty() && self.admitted_workflow_handler_ready(**id))
             .map(|(id, _)| *id)
             .collect();
         if ready.is_empty() {
@@ -3360,6 +3408,7 @@ impl Runtime {
         max_steps: u64,
     ) -> DeterministicRunResult {
         let mut steps: u64 = 0;
+        let mut idle_outbox_pages = 0;
         loop {
             if steps >= max_steps {
                 return DeterministicRunResult::StepLimitExceeded { steps };
@@ -3370,8 +3419,11 @@ impl Runtime {
             self.drain_cross_shard_messages();
             // Tick timers first (respects virtual clock via self.now())
             self.tick_timers();
+            let more_recovery = self.tick_native_workflow_recovery();
+            let more_outbox = self.tick_workflow_outbox_pump();
             match self.pick_ready_actor_deterministic(rng) {
                 Some(actor_id) => {
+                    idle_outbox_pages = 0;
                     self.step_actor(actor_id);
                     steps += 1;
                     if steps % GC_PUMP_INTERVAL == 0 {
@@ -3387,6 +3439,12 @@ impl Runtime {
                     }
                 }
                 None => {
+                    if (more_outbox || more_recovery)
+                        && idle_outbox_pages + 1 < workflow_outbox::OUTBOX_IDLE_PAGE_BUDGET
+                    {
+                        idle_outbox_pages += 1;
+                        continue;
+                    }
                     // No actor is ready. With a virtual clock installed and
                     // timers pending, advance the clock to the next
                     // deadline and re-tick — the fired timer re-enqueues
@@ -3874,6 +3932,11 @@ impl Runtime {
             }
         }
 
+        if !self.admitted_workflow_handler_ready(actor_id) {
+            self.current_actor = None;
+            return;
+        }
+
         let msg_opt = {
             let actor = match self.actors.get_mut(&actor_id) {
                 Some(a) => a,
@@ -4234,7 +4297,18 @@ impl Runtime {
                         }
                     }
                 }
-                processed = self.dispatch_native_handler(actor_id, behavior_idx, &msg.payload);
+                processed = self.dispatch_native_handler(
+                    actor_id,
+                    behavior_idx,
+                    &msg.payload,
+                    atomic_workflow_turn,
+                );
+                // A contained native panic discards the activation. Never
+                // fall through into bytecode dispatch or terminal completion.
+                if atomic_workflow_turn && !self.actors.contains_key(&actor_id) {
+                    self.current_actor = None;
+                    return;
+                }
                 if processed && !atomic_workflow_turn {
                     self.checkpoint_actor(actor_id);
                 }
@@ -4354,12 +4428,14 @@ impl Runtime {
                             %error,
                             "nulang-workflow: terminal durable transition failed; discarding activation"
                         );
-                        self.actors.remove(&actor_id);
-                        if self.recover_actor(actor_id).is_none() {
-                            tracing::error!(
-                                actor_id,
-                                "nulang-workflow: actor recovery failed after terminal durable transition failure"
-                            );
+                        if !self.defer_native_workflow_terminal_failure(actor_id) {
+                            self.actors.remove(&actor_id);
+                            if self.recover_actor(actor_id).is_none() {
+                                tracing::error!(
+                                    actor_id,
+                                    "nulang-workflow: actor recovery failed after terminal durable transition failure"
+                                );
+                            }
                         }
                         self.current_actor = None;
                         return;
@@ -5564,6 +5640,18 @@ impl Runtime {
         // history is accepted solely for replay-identified intermediate records
         // belonging to that same activation; every other mixed-history shape
         // fails closed.
+        let proven_open_command = if is_workflow {
+            match self.persistence.load_open_workflow_command(actor_id) {
+                Ok(open) => open,
+                Err(error) if error.kind() == std::io::ErrorKind::Unsupported => None,
+                Err(error) => {
+                    warn!("nulang-recover: refusing workflow actor {} after open admission read failed: {}", actor_id, error);
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
         let pending_atomic_workflow_replay = if is_workflow {
             match self.persistence.load_durable_tail_position(actor_id) {
                 Ok(Some(tail)) if tail.sequence > snapshot.sequence => {
@@ -5687,6 +5775,16 @@ impl Runtime {
         } else {
             None
         };
+
+        if let Some(open) = proven_open_command {
+            if pending_atomic_workflow_replay.as_ref().map(|(id, _)| *id) != Some(open.activation) {
+                warn!(
+                    "nulang-recover: refusing inconsistent open workflow admission for actor {}",
+                    actor_id
+                );
+                return None;
+            }
+        }
 
         let journal_to_replay: Vec<JournalEntry> = if is_workflow {
             Vec::new()
@@ -5889,23 +5987,13 @@ impl Runtime {
                 .collect();
             actor.current_workflow_activation = Some(*activation);
             actor.sequence = entry.sequence;
-            if actor
-                .mailbox
-                .push_local(Message {
-                    behavior_id: entry.behavior_id,
-                    payload: MessagePayload::from_vec(payload),
-                    sender: 0,
-                    priority: MessagePriority::Normal,
-                    trace_id: None,
-                })
-                .is_err()
-            {
-                warn!(
-                    "nulang-recover: refusing workflow actor {}: recovered atomic command could not enter empty mailbox",
-                    actor_id
-                );
-                return None;
-            }
+            actor.mailbox.push_admitted_workflow(Message {
+                behavior_id: entry.behavior_id,
+                payload: MessagePayload::from_vec(payload),
+                sender: 0,
+                priority: MessagePriority::Normal,
+                trace_id: None,
+            });
         }
         if let Some(schema_name) = recovery_schema_name {
             self.recovery_schema_names.insert(actor_id, schema_name);
@@ -6005,7 +6093,7 @@ impl Runtime {
                         .collect()
                 };
                 if self.has_native_handler(actor_id, behavior_idx) {
-                    let _ = self.dispatch_native_handler(actor_id, behavior_idx, &payload);
+                    let _ = self.dispatch_native_handler(actor_id, behavior_idx, &payload, false);
                     if let Some(actor) = self.actors.get_mut(&actor_id) {
                         actor.sequence = entry.sequence;
                     }
@@ -6552,6 +6640,7 @@ impl Runtime {
         actor_id: u64,
         behavior_idx: usize,
         args: &[Value],
+        stage_workflow_outbox: bool,
     ) -> bool {
         let handler = self
             .actors
@@ -6587,8 +6676,38 @@ impl Runtime {
             }
         }
 
+        let contain_panic = stage_workflow_outbox
+            && self.native_workflow_recovery.is_some()
+            && self.native_workflow_recovery_bound.contains(&actor_id);
         if let Some(actor) = self.actors.get_mut(&actor_id) {
-            handler(actor, args);
+            if stage_workflow_outbox {
+                actor.begin_workflow_outbox_staging();
+            }
+            if contain_panic {
+                // Only trusted, bound ordinary Rust workflow handlers qualify.
+                // Do not catch runtime or persistence panics, nor resume this
+                // partially mutated actor after a handler unwind.
+                if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handler(actor, args);
+                })) {
+                    self.defer_native_workflow_failure(
+                        actor_id,
+                        NativeWorkflowRecoveryFailure::HandlerPanicked,
+                    );
+                    // A custom panic payload can itself panic on drop.
+                    if let Err(secondary) =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
+                    {
+                        std::mem::forget(secondary);
+                    }
+                    return false;
+                }
+            } else {
+                handler(actor, args);
+            }
+            if stage_workflow_outbox {
+                actor.seal_workflow_outbox_staging();
+            }
             true
         } else {
             false

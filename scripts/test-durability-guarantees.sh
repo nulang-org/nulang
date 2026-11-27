@@ -7,4 +7,10 @@ cargo test --locked --no-default-features --test authorized_compiled_durable_dis
 cargo test --locked --no-default-features --test durable_effect_recovery_store
 cargo test --locked --no-default-features --test durable_effect_failure_matrix
 cargo test --locked --no-default-features --features sqlite --test durable_compiled_store_restart
+cargo test --locked --no-default-features --features sqlite --test durable_effect_process_kill
+cargo test --locked --no-default-features --features sqlite --test durable_vm_callback_bridge
+cargo test --locked --no-default-features --features sqlite --test durable_effect_recovery_store
+cargo test --locked --no-default-features --features sqlite --test workflow_effect_tail_recovery
+cargo test --locked --no-default-features --features sqlite --lib workflow
+cargo test --locked --no-default-features --lib test_recovery_replays_unfinished_atomic_native_workflow_activation
 cargo test --locked --no-default-features durable_effect

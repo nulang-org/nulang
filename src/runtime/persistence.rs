@@ -4,12 +4,12 @@
 //! snapshot of durable actor state and an append-only journal of messages.
 //! On recovery the runtime loads the latest snapshot and replays the journal.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use crate::durable_effect::DurableEffectId;
+use crate::durable_effect::{DurableEffectId, DurableEffectRecord};
 use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
 use crate::vm::Value;
 
@@ -392,6 +392,335 @@ pub struct DurableOutboxMessage {
     pub payload: Vec<PersistedValue>,
 }
 
+/// Stable identity of a message in a committed sender transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct DurableOutboxId {
+    pub sender_actor_id: u64,
+    pub sequence: u64,
+    pub ordinal: u32,
+}
+
+/// Shard-local scan page. Ordering is (sequence, sender_actor_id, ordinal).
+/// The watermark is the greatest pending key observed at the start of a
+/// sweep. Preserve it across pages; later keys wait for the next sweep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowOutboxScanPage {
+    pub identities: Vec<DurableOutboxId>,
+    pub watermark: Option<DurableOutboxId>,
+}
+
+/// Trusted-host identity for a native workflow's immutable behavior layout.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NativeWorkflowRecoveryBinding {
+    pub name: String,
+    pub revision: String,
+    pub behaviors: Vec<String>,
+    pub activation_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeWorkflowRecoveryPage {
+    pub actors: Vec<u64>,
+    pub watermark: Option<u64>,
+}
+
+/// Hard cap for a persisted automatic replay budget.
+pub const MAX_NATIVE_WORKFLOW_RECOVERY_ATTEMPTS: u32 = 1024;
+
+/// Reservations are charged before restoration/execution. An exhausted
+/// *open* activation is ineligible for automatic recovery; its receipt,
+/// command journal and last safe checkpoint remain intact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NativeWorkflowRetryStatus {
+    pub activation: WorkflowActivationId,
+    pub activation_epoch: u64,
+    pub attempts_reserved: u32,
+    pub max_attempts: u32,
+}
+
+impl NativeWorkflowRetryStatus {
+    pub fn is_exhausted(self) -> bool {
+        self.attempts_reserved >= self.max_attempts
+    }
+}
+
+/// A classified failure, not a raw error or user payload. Absence of a
+/// diagnostic for a reserved attempt does not prove that it ran or succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum NativeWorkflowRecoveryFailure {
+    ReconstructionRejected,
+    TerminalCommitFailed,
+    HandlerPanicked,
+}
+
+/// Durable, activation-local audit. A grant and its budget change commit
+/// atomically; failure events do not change the budget or command tail.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum NativeWorkflowRecoveryAuditEvent {
+    AttemptFailed {
+        status: NativeWorkflowRetryStatus,
+        failure: NativeWorkflowRecoveryFailure,
+    },
+    RedriveAuthorized {
+        status: NativeWorkflowRetryStatus,
+        new_max_attempts: u32,
+        operator: String,
+        reason: String,
+    },
+}
+
+type NativeWorkflowAuditKey = (u64, u64, u64, u32, u8);
+#[cfg(feature = "sqlite")]
+const MAX_NATIVE_WORKFLOW_AUDIT_EVENTS: usize = 2 * MAX_NATIVE_WORKFLOW_RECOVERY_ATTEMPTS as usize;
+
+impl NativeWorkflowRecoveryAuditEvent {
+    pub fn status(&self) -> NativeWorkflowRetryStatus {
+        match self {
+            Self::AttemptFailed { status, .. } | Self::RedriveAuthorized { status, .. } => *status,
+        }
+    }
+
+    fn key(&self) -> NativeWorkflowAuditKey {
+        let status = self.status();
+        (
+            status.activation.actor_id,
+            status.activation.command_sequence,
+            status.activation_epoch,
+            status.attempts_reserved,
+            if matches!(self, Self::AttemptFailed { .. }) {
+                0
+            } else {
+                1
+            },
+        )
+    }
+
+    fn next_status(&self) -> io::Result<NativeWorkflowRetryStatus> {
+        let mut status = self.status();
+        validate_native_retry_request(status.open_command(), status.max_attempts)?;
+        if status.attempts_reserved == 0 || status.attempts_reserved > status.max_attempts {
+            return Err(native_retry_conflict());
+        }
+        if let Self::RedriveAuthorized {
+            new_max_attempts,
+            operator,
+            reason,
+            ..
+        } = self
+        {
+            let valid_text = |text: &str, max_len| {
+                !text.trim().is_empty()
+                    && text.len() <= max_len
+                    && !text.chars().any(char::is_control)
+            };
+            if !status.is_exhausted()
+                || *new_max_attempts <= status.max_attempts
+                || *new_max_attempts > MAX_NATIVE_WORKFLOW_RECOVERY_ATTEMPTS
+                || !valid_text(operator, 128)
+                || !valid_text(reason, 512)
+            {
+                return Err(native_retry_conflict());
+            }
+            status.max_attempts = *new_max_attempts;
+        }
+        Ok(status)
+    }
+}
+
+impl NativeWorkflowRetryStatus {
+    fn open_command(self) -> OpenWorkflowCommand {
+        OpenWorkflowCommand {
+            activation: self.activation,
+            tail: DurableTailPosition {
+                activation_epoch: self.activation_epoch,
+                sequence: self.activation.command_sequence,
+            },
+        }
+    }
+}
+
+fn validate_quarantine_scan(
+    shard: u16,
+    shards: u16,
+    after: Option<u64>,
+    limit: usize,
+) -> io::Result<()> {
+    validate_native_recovery_scan(shard, shards, None, None, limit)?;
+    if after.is_some_and(|id| {
+        id == 0 || id > i64::MAX as u64 || id % u64::from(shards) != u64::from(shard)
+    }) {
+        return Err(native_retry_conflict());
+    }
+    Ok(())
+}
+
+fn validate_audit_identity(
+    activation: WorkflowActivationId,
+    activation_epoch: u64,
+) -> io::Result<()> {
+    validate_native_retry_request(
+        OpenWorkflowCommand {
+            activation,
+            tail: DurableTailPosition {
+                activation_epoch,
+                sequence: activation.command_sequence,
+            },
+        },
+        1,
+    )
+}
+
+fn validate_native_retry_request(open: OpenWorkflowCommand, max_attempts: u32) -> io::Result<()> {
+    if max_attempts == 0
+        || max_attempts > MAX_NATIVE_WORKFLOW_RECOVERY_ATTEMPTS
+        || open.activation.actor_id == 0
+        || open.activation.actor_id > i64::MAX as u64
+        || open.activation.command_sequence == 0
+        || open.activation.command_sequence > i64::MAX as u64
+        || open.tail.activation_epoch == 0
+        || open.tail.activation_epoch > i64::MAX as u64
+        || open.tail.sequence != open.activation.command_sequence
+    {
+        return Err(native_retry_conflict());
+    }
+    Ok(())
+}
+
+fn native_retry_conflict() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "native recovery retry budget or admission fence mismatch",
+    )
+}
+
+fn next_native_retry(
+    previous: Option<NativeWorkflowRetryStatus>,
+    open: OpenWorkflowCommand,
+    max_attempts: u32,
+) -> io::Result<Option<NativeWorkflowRetryStatus>> {
+    validate_native_retry_request(open, max_attempts)?;
+    let mut next = NativeWorkflowRetryStatus {
+        activation: open.activation,
+        activation_epoch: open.tail.activation_epoch,
+        attempts_reserved: 0,
+        max_attempts,
+    };
+    if let Some(previous) = previous {
+        if previous.activation.actor_id != open.activation.actor_id
+            || previous.activation_epoch != open.tail.activation_epoch
+            || previous.activation.command_sequence > open.activation.command_sequence
+            || previous.attempts_reserved == 0
+            || previous.attempts_reserved > previous.max_attempts
+            || previous.max_attempts > MAX_NATIVE_WORKFLOW_RECOVERY_ATTEMPTS
+        {
+            return Err(native_retry_conflict());
+        }
+        if previous.activation == open.activation {
+            next = previous; // First reservation pins the budget for this activation.
+        }
+    }
+    if next.is_exhausted() {
+        return Ok(None);
+    }
+    next.attempts_reserved += 1;
+    Ok(Some(next))
+}
+
+fn current_native_retry(
+    open: Option<OpenWorkflowCommand>,
+    previous: Option<NativeWorkflowRetryStatus>,
+) -> io::Result<Option<NativeWorkflowRetryStatus>> {
+    let (Some(open), Some(previous)) = (open, previous) else {
+        return Ok(None);
+    };
+    // Reuse validation without consuming a reservation.
+    next_native_retry(Some(previous), open, previous.max_attempts)?;
+    Ok((previous.activation == open.activation).then_some(previous))
+}
+
+fn validate_native_recovery_scan(
+    shard: u16,
+    shards: u16,
+    after: Option<u64>,
+    through: Option<u64>,
+    limit: usize,
+) -> io::Result<()> {
+    validate_outbox_page(None, limit)?;
+    let valid =
+        |id: u64| id > 0 && id <= i64::MAX as u64 && id % u64::from(shards) == u64::from(shard);
+    if shards == 0
+        || shard >= shards
+        || after.is_some_and(|id| !valid(id))
+        || through.is_some_and(|id| !valid(id))
+        || after.is_some_and(|id| through.is_none_or(|w| id > w))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid native recovery scan",
+        ));
+    }
+    Ok(())
+}
+
+fn native_binding_conflict() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "native recovery binding conflicts or actor is not at an initial safe boundary",
+    )
+}
+
+fn outbox_scan_key(id: DurableOutboxId) -> (u64, u64, u32) {
+    (id.sequence, id.sender_actor_id, id.ordinal)
+}
+
+fn validate_outbox_scan(
+    shard: u16,
+    shards: u16,
+    after: Option<DurableOutboxId>,
+    through: Option<DurableOutboxId>,
+    limit: usize,
+) -> io::Result<()> {
+    validate_outbox_page(None, limit)?;
+    let valid = |id: DurableOutboxId| {
+        id.sender_actor_id > 0
+            && id.sender_actor_id <= i64::MAX as u64
+            && id.sequence > 0
+            && id.sequence <= i64::MAX as u64
+            && id.sender_actor_id % u64::from(shards) == u64::from(shard)
+    };
+    if shards == 0
+        || shard >= shards
+        || after.is_some_and(|id| !valid(id))
+        || through.is_some_and(|id| !valid(id))
+        || after.is_some_and(|id| through.is_none_or(|w| outbox_scan_key(id) > outbox_scan_key(w)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid workflow outbox scan cursor or shard",
+        ));
+    }
+    Ok(())
+}
+
+/// Maximum number of pending message identities returned in a dispatcher page.
+pub const MAX_WORKFLOW_OUTBOX_PAGE: usize = 1024;
+
+fn validate_outbox_page(after: Option<(u64, u32)>, limit: usize) -> io::Result<(i64, i64)> {
+    if limit == 0 || limit > MAX_WORKFLOW_OUTBOX_PAGE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid workflow outbox page limit",
+        ));
+    }
+    match after {
+        Some((sequence, ordinal)) => Ok((
+            i64::try_from(sequence).map_err(io::Error::other)?,
+            i64::from(ordinal),
+        )),
+        None => Ok((0, -1)),
+    }
+}
+
 /// One logical durable actor/workflow/entity transition.
 #[derive(Debug, Clone)]
 pub struct DurableTransition {
@@ -401,6 +730,13 @@ pub struct DurableTransition {
     pub sequence: u64,
     pub expected_previous_sequence: u64,
     pub command: Option<JournalEntry>,
+    /// Explicit standalone workflow admission; generic/legacy commands are not proof of admission.
+    pub workflow_admission: bool,
+    /// Optional same-store source message identity, committed with admission.
+    pub workflow_inbox: Option<DurableOutboxId>,
+    /// Number of terminal effects actually consumed by the current execution.
+    /// Required for tracked workflow closure; None on generic/legacy transitions.
+    pub workflow_effects_consumed: Option<u32>,
     pub snapshot: Option<ActorSnapshot>,
     pub workflow_events: Vec<WorkflowEvent>,
     pub domain_events: Vec<EventEntry>,
@@ -418,13 +754,191 @@ pub struct DurableTail {
 
 /// Minimal committed-tail metadata needed to classify crash recovery.
 ///
-/// Recovery intentionally does not need the transition digest; it only needs
-/// the fencing epoch and exact committed sequence to distinguish atomic
-/// command admission from legacy journal history.
+/// Recovery uses the fencing epoch and exact committed sequence to classify
+/// history. This position alone is not evidence that a workflow command was
+/// admitted or remains open; use load_open_workflow_command for that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DurableTailPosition {
     pub activation_epoch: u64,
     pub sequence: u64,
+}
+
+/// A storage-proven, currently open workflow command and its ownership fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenWorkflowCommand {
+    pub activation: WorkflowActivationId,
+    pub tail: DurableTailPosition,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WorkflowAdmission {
+    command_sequence: u64,
+    closed_sequence: Option<u64>,
+}
+
+fn workflow_admission_error(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn validate_workflow_inbox(
+    transition: &DurableTransition,
+    source: Option<DurableOutboxMessage>,
+    previous: Option<WorkflowActivationId>,
+) -> io::Result<()> {
+    if previous.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "durable message already admitted",
+        ));
+    }
+    let source = source.ok_or_else(|| {
+        workflow_admission_error("durable inbox source is not a committed outbox message")
+    })?;
+    let command = transition
+        .command
+        .as_ref()
+        .ok_or_else(|| workflow_admission_error("inbox admission requires a command"))?;
+    if source.destination_actor_id != transition.actor_id
+        || source.behavior_id != command.behavior_id
+        || source
+            .payload
+            .iter()
+            .chain(&command.payload)
+            .any(|value| matches!(value, PersistedValue::Float(f) if !f.is_finite()))
+        || serde_json::to_vec(&source.payload).map_err(io::Error::other)?
+            != serde_json::to_vec(&command.payload).map_err(io::Error::other)?
+    {
+        return Err(workflow_admission_error(
+            "inbox command does not match committed outbox destination, behavior or payload",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_open_boundary(
+    command_sequence: u64,
+    snapshot_sequence: Option<u64>,
+    latest_command: u64,
+    legacy_events: u64,
+    tail: DurableTailPosition,
+) -> io::Result<()> {
+    if command_sequence == 0
+        || snapshot_sequence != command_sequence.checked_sub(1)
+        || latest_command != command_sequence
+        || legacy_events >= command_sequence
+        || tail.sequence < command_sequence
+        || tail.activation_epoch == 0
+    {
+        return Err(workflow_admission_error(
+            "open workflow command history is not at a safe atomic boundary",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_open_workflow_owner(
+    transition: &DurableTransition,
+    open: Option<OpenWorkflowCommand>,
+) -> io::Result<()> {
+    if let Some(open) = open {
+        if transition.activation_epoch != open.tail.activation_epoch
+            && (transition.command.is_some()
+                || transition.snapshot.is_some()
+                || !transition.workflow_events.is_empty()
+                || !transition.domain_events.is_empty()
+                || !transition.durable_effects.is_empty()
+                || !transition.outbox.is_empty())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "workflow owner epoch must be claimed before command writes",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Return the next admission state for an explicitly tracked command.
+/// Existing generic transactions retain their prior contract.
+fn validate_workflow_admission_transition(
+    transition: &DurableTransition,
+    last: Option<WorkflowAdmission>,
+    snapshot_sequence: Option<u64>,
+) -> io::Result<Option<WorkflowAdmission>> {
+    let open = last.filter(|admission| admission.closed_sequence.is_none());
+    if transition.workflow_admission {
+        if open.is_some() || snapshot_sequence != Some(transition.expected_previous_sequence) {
+            return Err(workflow_admission_error(
+                "workflow admission requires a safe snapshot and no open command",
+            ));
+        }
+        return Ok(Some(WorkflowAdmission {
+            command_sequence: transition.sequence,
+            closed_sequence: None,
+        }));
+    }
+    let bound = transition
+        .durable_effects
+        .iter()
+        .any(|record| record.workflow_binding().is_some());
+    if let Some(open) = open {
+        let activation = WorkflowActivationId::new(transition.actor_id, open.command_sequence);
+        let closes = transition.workflow_events.len() == 1
+            && transition.workflow_events[0].activation_id() == Some(activation);
+        if transition.command.is_some() || !transition.domain_events.is_empty() {
+            return Err(workflow_admission_error(
+                "unqualified transition while workflow command is open",
+            ));
+        }
+        if closes {
+            if transition.snapshot.is_none()
+                || !transition.durable_effects.is_empty()
+                || transition.workflow_effects_consumed.is_none()
+            {
+                return Err(workflow_admission_error(
+                    "workflow terminal transition requires a snapshot, consumed effect cursor and no staged effects",
+                ));
+            }
+            return Ok(Some(WorkflowAdmission {
+                command_sequence: open.command_sequence,
+                closed_sequence: Some(transition.sequence),
+            }));
+        }
+        if transition.snapshot.is_some()
+            || !transition.workflow_events.is_empty()
+            || !transition.outbox.is_empty()
+            || transition.durable_effects.iter().any(|record| {
+                record.workflow_binding().map(|binding| binding.activation) != Some(activation)
+            })
+        {
+            return Err(workflow_admission_error(
+                "unqualified snapshot, event or effect while workflow command is open",
+            ));
+        }
+        return Ok(None);
+    }
+    if transition.workflow_effects_consumed.is_some() {
+        return Err(workflow_admission_error(
+            "workflow terminal cursor requires a proven open command",
+        ));
+    }
+    if bound {
+        return Err(workflow_admission_error(
+            "workflow effect requires a proven open command",
+        ));
+    }
+    if let Some(closed) = last {
+        if transition.workflow_events.iter().any(|event| {
+            event
+                .activation_id()
+                .is_some_and(|activation| activation.command_sequence <= closed.command_sequence)
+        }) {
+            return Err(workflow_admission_error(
+                "workflow command is already terminal",
+            ));
+        }
+    }
+    Ok(None)
 }
 
 /// Result of a successfully committed durable transition.
@@ -437,6 +951,44 @@ pub struct DurableCommit {
 }
 
 impl DurableTransition {
+    /// Construct the single fenced transition that admits a workflow command
+    /// from its already-persisted safe snapshot. The store validates that
+    /// boundary and the absence of another open command inside the commit.
+    pub fn workflow_command(
+        actor_id: u64,
+        activation_epoch: u64,
+        expected_previous_sequence: u64,
+        behavior_id: u16,
+        payload: Vec<PersistedValue>,
+    ) -> io::Result<Self> {
+        let sequence = expected_previous_sequence.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workflow command sequence overflow",
+            )
+        })?;
+        Ok(Self {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id,
+            activation_epoch,
+            sequence,
+            expected_previous_sequence,
+            command: Some(JournalEntry {
+                sequence,
+                behavior_id,
+                payload,
+            }),
+            workflow_admission: true,
+            workflow_inbox: None,
+            workflow_effects_consumed: None,
+            snapshot: None,
+            workflow_events: vec![],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![],
+        })
+    }
+
     fn validate_structure(&self) -> io::Result<()> {
         if self.version != DURABLE_TRANSITION_VERSION {
             return Err(io::Error::new(
@@ -478,6 +1030,48 @@ impl DurableTransition {
             ));
         }
 
+        if let Some(source) = self.workflow_inbox {
+            if !self.workflow_admission || source.sequence == 0 || source.sequence > i64::MAX as u64
+            {
+                return Err(workflow_admission_error("inbox identity requires standalone workflow admission and a valid source sequence"));
+            }
+        }
+        if self.workflow_effects_consumed.is_some()
+            && (self.workflow_admission
+                || self.command.is_some()
+                || self.snapshot.is_none()
+                || self.workflow_events.len() != 1
+                || self.workflow_events[0].activation_id().is_none()
+                || !self.durable_effects.is_empty()
+                || !self.domain_events.is_empty())
+        {
+            return Err(workflow_admission_error(
+                "workflow effect cursor evidence requires a standalone terminal transition",
+            ));
+        }
+        if self.workflow_effects_consumed.is_some()
+            && !self.outbox.is_empty()
+            && !matches!(
+                self.workflow_events.as_slice(),
+                [WorkflowEvent::StepCompleted { .. }]
+            )
+        {
+            return Err(workflow_admission_error(
+                "workflow outbox requires successful terminal completion",
+            ));
+        }
+        if self.workflow_admission
+            && (self.command.is_none()
+                || self.snapshot.is_some()
+                || !self.workflow_events.is_empty()
+                || !self.domain_events.is_empty()
+                || !self.durable_effects.is_empty()
+                || !self.outbox.is_empty())
+        {
+            return Err(workflow_admission_error(
+                "workflow admission must be a standalone command transition",
+            ));
+        }
         if let Some(command) = &self.command {
             if command.sequence != self.sequence {
                 return Err(io::Error::new(
@@ -545,8 +1139,35 @@ impl DurableTransition {
             ));
         }
 
+        // The experimental workflow adapter commits one bound effect at a
+        // time. Prevent mixed/duplicate slots inside a single transition.
+        for record in &self.durable_effects {
+            if let Some(binding) = record.workflow_binding() {
+                if self.durable_effects.len() != 1
+                    || binding.activation.actor_id != self.actor_id
+                    || binding.activation.command_sequence == 0
+                    || binding.activation.command_sequence >= self.sequence
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid workflow effect transition binding",
+                    ));
+                }
+            }
+        }
+
         let mut ordinals = BTreeSet::new();
         for message in &self.outbox {
+            if self.workflow_effects_consumed.is_some()
+                && message
+                    .payload
+                    .iter()
+                    .any(|value| matches!(value, PersistedValue::Float(f) if !f.is_finite()))
+            {
+                return Err(workflow_admission_error(
+                    "workflow outbox payload contains a non-finite float",
+                ));
+            }
             if !ordinals.insert(message.ordinal) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -564,6 +1185,9 @@ impl DurableTransition {
     pub fn digest(&self) -> io::Result<[u8; 32]> {
         self.validate_structure()?;
 
+        fn is_false(value: &bool) -> bool {
+            !*value
+        }
         #[derive(serde::Serialize)]
         struct DigestEnvelope<'a> {
             version: u16,
@@ -572,6 +1196,12 @@ impl DurableTransition {
             sequence: u64,
             expected_previous_sequence: u64,
             command: &'a Option<JournalEntry>,
+            #[serde(skip_serializing_if = "is_false")]
+            workflow_admission: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            workflow_inbox: Option<DurableOutboxId>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            workflow_effects_consumed: Option<u32>,
             snapshot: &'a Option<ActorSnapshot>,
             workflow_events: &'a [WorkflowEvent],
             domain_events: &'a [EventEntry],
@@ -596,6 +1226,9 @@ impl DurableTransition {
             sequence: self.sequence,
             expected_previous_sequence: self.expected_previous_sequence,
             command: &self.command,
+            workflow_admission: self.workflow_admission,
+            workflow_inbox: self.workflow_inbox,
+            workflow_effects_consumed: self.workflow_effects_consumed,
             snapshot: &self.snapshot,
             workflow_events: &self.workflow_events,
             domain_events: &self.domain_events,
@@ -632,6 +1265,161 @@ fn canonicalize_json(value: &mut serde_json::Value) {
     }
 }
 
+/// Validate the append-only history of one slot. An intent fixes the site,
+/// spec and request digest before dispatch, and a single completion may
+/// advance it. New-sequence duplicates cannot overwrite either record.
+fn validate_workflow_effect_append(
+    previous: Option<&DurableEffectPersistenceRecord>,
+    next: &DurableEffectPersistenceRecord,
+) -> io::Result<()> {
+    let valid = match previous {
+        None => matches!(next.effect(), DurableEffectRecord::Prepared { .. }),
+        Some(previous) => {
+            previous.workflow_binding() == next.workflow_binding()
+                && previous.effect().spec() == next.effect().spec()
+                && previous.effect().request_digest() == next.effect().request_digest()
+                && matches!(previous.effect(), DurableEffectRecord::Prepared { .. })
+                && matches!(next.effect(), DurableEffectRecord::Completed { .. })
+        }
+    };
+    if !valid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "workflow effect occurrence binding or state conflicts with committed history",
+        ));
+    }
+    Ok(())
+}
+
+/// Scan only an activation's post-command effect history, without requiring
+/// the caller to guess the semantic site in order to find a prior record.
+/// Unbound legacy effects in that window are ambiguous (including old draft
+/// workflow adapter records); never interpret them as an unused slot.
+struct WorkflowOccurrenceHistory {
+    activation: WorkflowActivationId,
+    occurrence: u32,
+    latest: Option<DurableEffectPersistenceRecord>,
+    last: Option<DurableEffectPersistenceRecord>,
+}
+
+impl WorkflowOccurrenceHistory {
+    fn new(activation: WorkflowActivationId, occurrence: u32) -> Self {
+        Self {
+            activation,
+            occurrence,
+            latest: None,
+            last: None,
+        }
+    }
+
+    fn observe(&mut self, record: DurableEffectPersistenceRecord) -> io::Result<()> {
+        let binding = record
+            .workflow_binding()
+            .filter(|binding| binding.activation == self.activation)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unbound or foreign effect in workflow activation history",
+                )
+            })?;
+        // The adapter emits slots serially. Validate the entire relevant
+        // history (not just the target) so a gap, duplicate, or unfinished
+        // predecessor cannot be mistaken for a new effect.
+        let predecessor = self.last.as_ref().and_then(|last| last.workflow_binding());
+        if predecessor.is_some_and(|prior| prior.occurrence == binding.occurrence) {
+            validate_workflow_effect_append(self.last.as_ref(), &record)?;
+        } else {
+            let expected = self.next_unused_occurrence()?;
+            if binding.occurrence != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "workflow effect occurrence history is not contiguous",
+                ));
+            }
+            validate_workflow_effect_append(None, &record)?;
+        }
+        if binding.occurrence == self.occurrence {
+            self.latest = Some(record.clone());
+        }
+        self.last = Some(record);
+        Ok(())
+    }
+
+    fn next_unused_occurrence(&self) -> io::Result<u32> {
+        match &self.last {
+            None => Ok(0),
+            Some(last) if matches!(last.effect(), DurableEffectRecord::Completed { .. }) => last
+                .workflow_binding()
+                .unwrap()
+                .occurrence
+                .checked_add(1)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "workflow effect occurrence exhausted",
+                    )
+                }),
+            Some(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "prior workflow effect occurrence is still prepared",
+            )),
+        }
+    }
+
+    fn reconcile_terminal(&self, consumed: u32) -> io::Result<()> {
+        let committed = self.next_unused_occurrence()?;
+        if committed != consumed {
+            return Err(workflow_admission_error(&format!(
+                "workflow terminal cursor consumed {consumed} effect occurrences but committed history contains {committed}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> io::Result<Option<DurableEffectPersistenceRecord>> {
+        if self.latest.is_none() && self.occurrence != self.next_unused_occurrence()? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "requested workflow effect occurrence is not the next unused slot",
+            ));
+        }
+        Ok(self.latest)
+    }
+}
+
+#[cfg(feature = "sqlite")]
+async fn read_workflow_occurrence_history(
+    mut rows: libsql::Rows,
+    activation: WorkflowActivationId,
+    occurrence: u32,
+) -> io::Result<WorkflowOccurrenceHistory> {
+    let mut history = WorkflowOccurrenceHistory::new(activation, occurrence);
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+    {
+        let json: String = row
+            .get(0)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let record = DurableEffectPersistenceRecord::from_json(json.as_bytes())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        history.observe(record)?;
+    }
+    Ok(history)
+}
+
+#[cfg(feature = "sqlite")]
+async fn read_workflow_occurrence_rows(
+    rows: libsql::Rows,
+    activation: WorkflowActivationId,
+    occurrence: u32,
+) -> io::Result<Option<DurableEffectPersistenceRecord>> {
+    read_workflow_occurrence_history(rows, activation, occurrence)
+        .await?
+        .finish()
+}
+
 /// Persistence backend trait. Implementations may be in-memory or disk-backed.
 pub trait PersistenceStore: Send + Sync {
     /// Atomically commit one logical durable transition.
@@ -642,6 +1430,177 @@ pub trait PersistenceStore: Send + Sync {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "atomic durable transitions are not supported by this persistence backend",
+        ))
+    }
+
+    /// Recover a staged message by its stable sender transition identity.
+    /// This does not deliver or acknowledge the message.
+    fn load_durable_outbox_message(
+        &self,
+        _id: DurableOutboxId,
+    ) -> io::Result<Option<DurableOutboxMessage>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable outbox reads are not supported",
+        ))
+    }
+
+    /// Look up only messages produced by tracked successful workflow closure.
+    /// Generic/legacy outbox messages are deliberately excluded.
+    fn load_workflow_outbox_message(
+        &self,
+        _id: DurableOutboxId,
+    ) -> io::Result<Option<DurableOutboxMessage>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "workflow outbox dispatch is not supported",
+        ))
+    }
+
+    /// Return a bounded, ordered page for one sender, excluding admitted messages.
+    /// The exclusive cursor is (sender sequence, ordinal); wrap to None to revisit
+    /// deferred messages. A page is not a reservation or acknowledgment.
+    fn pending_workflow_outbox(
+        &self,
+        _sender: u64,
+        _after: Option<(u64, u32)>,
+        _limit: usize,
+    ) -> io::Result<Vec<DurableOutboxId>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "workflow outbox polling is not supported",
+        ))
+    }
+
+    /// Discover pending tracked messages across all senders on one shard.
+    /// On the first page pass no cursor/watermark. On subsequent pages use
+    /// the last returned identity and original watermark. No reservation is
+    /// made and already admitted messages are excluded.
+    fn scan_pending_workflow_outbox(
+        &self,
+        _shard: u16,
+        _shards: u16,
+        _after: Option<DurableOutboxId>,
+        _through: Option<DurableOutboxId>,
+        _limit: usize,
+    ) -> io::Result<WorkflowOutboxScanPage> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "shard workflow outbox scanning is not supported",
+        ))
+    }
+
+    /// Bind a host-defined native layout before any command has been admitted.
+    fn save_native_workflow_recovery_binding(
+        &mut self,
+        _actor_id: u64,
+        _binding: &NativeWorkflowRecoveryBinding,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native workflow recovery not supported",
+        ))
+    }
+
+    fn load_native_workflow_recovery_binding(
+        &self,
+        _actor_id: u64,
+    ) -> io::Result<Option<NativeWorkflowRecoveryBinding>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native workflow recovery not supported",
+        ))
+    }
+
+    /// Reserve one automatic recovery attempt before replaying a proven
+    /// ordinary same-epoch open command. None means the budget is exhausted.
+    /// The first reservation pins the limit; a later host configuration cannot
+    /// reset it. No state, journal entry, receipt or command tail is modified.
+    fn reserve_native_workflow_recovery_attempt(
+        &mut self,
+        _open: OpenWorkflowCommand,
+        _max_attempts: u32,
+    ) -> io::Result<Option<NativeWorkflowRetryStatus>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native workflow retry budget not supported",
+        ))
+    }
+
+    /// Read the reservation status for the current open activation, if any.
+    fn load_native_workflow_retry_status(
+        &self,
+        _actor_id: u64,
+    ) -> io::Result<Option<NativeWorkflowRetryStatus>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native workflow retry budget not supported",
+        ))
+    }
+
+    /// Live keyset page of exhausted open retries for operator inspection.
+    /// May include the final resident/runnable reservation; not an execution grant.
+    fn scan_native_workflow_quarantine(
+        &self,
+        _shard: u16,
+        _shards: u16,
+        _after: Option<u64>,
+        _limit: usize,
+    ) -> io::Result<Vec<NativeWorkflowRetryStatus>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native workflow quarantine not supported",
+        ))
+    }
+
+    /// Compare the exact open reservation and append its audit event. A
+    /// redrive grant changes only the limit, in the same transaction.
+    fn append_native_workflow_recovery_audit(
+        &mut self,
+        _event: NativeWorkflowRecoveryAuditEvent,
+    ) -> io::Result<NativeWorkflowRetryStatus> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native workflow recovery audit not supported",
+        ))
+    }
+
+    /// Read the bounded audit for an exact activation/epoch, including after closure.
+    fn load_native_workflow_recovery_audit(
+        &self,
+        _activation: WorkflowActivationId,
+        _activation_epoch: u64,
+    ) -> io::Result<Vec<NativeWorkflowRecoveryAuditEvent>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native workflow recovery audit not supported",
+        ))
+    }
+
+    /// Scan immutable bindings with open admissions and remaining retry budget.
+    /// Watermark includes exhausted open IDs to preserve allocator fencing.
+    fn scan_open_native_workflow_recovery(
+        &self,
+        _shard: u16,
+        _shards: u16,
+        _after: Option<u64>,
+        _through: Option<u64>,
+        _limit: usize,
+    ) -> io::Result<NativeWorkflowRecoveryPage> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native workflow recovery not supported",
+        ))
+    }
+
+    /// Return the original accepted command for this message, even after closure.
+    fn load_workflow_inbox_admission(
+        &self,
+        _id: DurableOutboxId,
+    ) -> io::Result<Option<WorkflowActivationId>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable inbox reads are not supported",
         ))
     }
 
@@ -660,6 +1619,18 @@ pub trait PersistenceStore: Send + Sync {
         ))
     }
 
+    /// Load storage-proven open command identity and the current fence, not
+    /// inferred from a journal entry or atomic tail alone.
+    fn load_open_workflow_command(
+        &self,
+        _actor_id: u64,
+    ) -> io::Result<Option<OpenWorkflowCommand>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic workflow admission recovery is not supported",
+        ))
+    }
+
     /// Load the newest durable record for one logical external effect.
     ///
     /// Backends that cannot recover durable-effect records MUST fail closed
@@ -673,6 +1644,21 @@ pub trait PersistenceStore: Send + Sync {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "durable effect recovery reads are not supported by this persistence backend",
+        ))
+    }
+
+    /// Recover by activation-local dynamic ordinal independently of the
+    /// semantic site. Unsupported backends must fail closed, never return
+    /// a false empty slot. History implementations reject ambiguous legacy
+    /// unbound effects within this activation's command window.
+    fn load_workflow_effect_occurrence(
+        &self,
+        _activation: WorkflowActivationId,
+        _occurrence: u32,
+    ) -> io::Result<Option<DurableEffectPersistenceRecord>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "workflow effect occurrence recovery is not supported",
         ))
     }
 
@@ -856,6 +1842,10 @@ pub struct MemoryStore {
     events: HashMap<u64, Vec<EventEntry>>,
     durable_tails: HashMap<u64, DurableTail>,
     committed_transitions: HashMap<u64, Vec<DurableTransition>>,
+    workflow_admissions: HashMap<u64, WorkflowAdmission>,
+    native_recovery_bindings: BTreeMap<u64, NativeWorkflowRecoveryBinding>,
+    native_recovery_retries: HashMap<u64, NativeWorkflowRetryStatus>,
+    native_recovery_audit: BTreeMap<NativeWorkflowAuditKey, NativeWorkflowRecoveryAuditEvent>,
 }
 
 impl MemoryStore {
@@ -876,6 +1866,408 @@ impl MemoryStore {
 }
 
 impl PersistenceStore for MemoryStore {
+    fn load_durable_outbox_message(
+        &self,
+        id: DurableOutboxId,
+    ) -> io::Result<Option<DurableOutboxMessage>> {
+        Ok(self
+            .committed_transitions(id.sender_actor_id)
+            .iter()
+            .find(|transition| transition.sequence == id.sequence)
+            .and_then(|transition| {
+                transition
+                    .outbox
+                    .iter()
+                    .find(|message| message.ordinal == id.ordinal)
+            })
+            .cloned())
+    }
+
+    fn load_workflow_outbox_message(
+        &self,
+        id: DurableOutboxId,
+    ) -> io::Result<Option<DurableOutboxMessage>> {
+        Ok(self
+            .committed_transitions(id.sender_actor_id)
+            .iter()
+            .find(|transition| {
+                transition.sequence == id.sequence && transition.workflow_effects_consumed.is_some()
+            })
+            .and_then(|transition| {
+                transition
+                    .outbox
+                    .iter()
+                    .find(|message| message.ordinal == id.ordinal)
+            })
+            .cloned())
+    }
+
+    fn pending_workflow_outbox(
+        &self,
+        sender: u64,
+        after: Option<(u64, u32)>,
+        limit: usize,
+    ) -> io::Result<Vec<DurableOutboxId>> {
+        validate_outbox_page(after, limit)?;
+        let mut pending = Vec::new();
+        for transition in self
+            .committed_transitions(sender)
+            .iter()
+            .filter(|t| t.workflow_effects_consumed.is_some())
+        {
+            let mut ordinals: Vec<_> = transition.outbox.iter().map(|m| m.ordinal).collect();
+            ordinals.sort_unstable();
+            for ordinal in ordinals {
+                let id = DurableOutboxId {
+                    sender_actor_id: sender,
+                    sequence: transition.sequence,
+                    ordinal,
+                };
+                if after.is_some_and(|cursor| (id.sequence, id.ordinal) <= cursor)
+                    || self.load_workflow_inbox_admission(id)?.is_some()
+                {
+                    continue;
+                }
+                pending.push(id);
+                if pending.len() == limit {
+                    return Ok(pending);
+                }
+            }
+        }
+        Ok(pending)
+    }
+
+    fn scan_pending_workflow_outbox(
+        &self,
+        shard: u16,
+        shards: u16,
+        after: Option<DurableOutboxId>,
+        through: Option<DurableOutboxId>,
+        limit: usize,
+    ) -> io::Result<WorkflowOutboxScanPage> {
+        validate_outbox_scan(shard, shards, after, through, limit)?;
+        // The ephemeral backend has no persistent index. Keep only the
+        // smallest page keys in memory rather than collecting all messages.
+        let mut page = std::collections::BTreeSet::new();
+        let mut watermark = through.map(outbox_scan_key);
+        for (&sender, transitions) in &self.committed_transitions {
+            if sender == 0
+                || sender > i64::MAX as u64
+                || sender % u64::from(shards) != u64::from(shard)
+            {
+                continue;
+            }
+            for transition in transitions
+                .iter()
+                .filter(|t| t.workflow_effects_consumed.is_some())
+            {
+                for message in &transition.outbox {
+                    let id = DurableOutboxId {
+                        sender_actor_id: sender,
+                        sequence: transition.sequence,
+                        ordinal: message.ordinal,
+                    };
+                    let key = outbox_scan_key(id);
+                    if after.is_some_and(|a| key <= outbox_scan_key(a))
+                        || through.is_some_and(|w| key > outbox_scan_key(w))
+                        || self.load_workflow_inbox_admission(id)?.is_some()
+                    {
+                        continue;
+                    }
+                    if through.is_none() {
+                        watermark = Some(watermark.map_or(key, |previous| previous.max(key)));
+                    }
+                    page.insert(key);
+                    if page.len() > limit {
+                        page.pop_last();
+                    }
+                }
+            }
+        }
+        let decode = |(sequence, sender_actor_id, ordinal)| DurableOutboxId {
+            sequence,
+            sender_actor_id,
+            ordinal,
+        };
+        Ok(WorkflowOutboxScanPage {
+            identities: page.into_iter().map(decode).collect(),
+            watermark: watermark.map(decode),
+        })
+    }
+
+    fn save_native_workflow_recovery_binding(
+        &mut self,
+        actor_id: u64,
+        binding: &NativeWorkflowRecoveryBinding,
+    ) -> io::Result<()> {
+        if let Some(existing) = self.native_recovery_bindings.get(&actor_id) {
+            return if existing == binding {
+                Ok(())
+            } else {
+                Err(native_binding_conflict())
+            };
+        }
+        if actor_id == 0
+            || actor_id > i64::MAX as u64
+            || self.workflow_admissions.contains_key(&actor_id)
+            || self
+                .snapshots
+                .get(&actor_id)
+                .is_none_or(|s| s.activation_epoch != binding.activation_epoch)
+            || self.journals.get(&actor_id).is_some_and(|j| !j.is_empty())
+        {
+            return Err(native_binding_conflict());
+        }
+        self.native_recovery_bindings
+            .insert(actor_id, binding.clone());
+        Ok(())
+    }
+
+    fn load_native_workflow_recovery_binding(
+        &self,
+        actor_id: u64,
+    ) -> io::Result<Option<NativeWorkflowRecoveryBinding>> {
+        Ok(self.native_recovery_bindings.get(&actor_id).cloned())
+    }
+
+    fn reserve_native_workflow_recovery_attempt(
+        &mut self,
+        open: OpenWorkflowCommand,
+        max_attempts: u32,
+    ) -> io::Result<Option<NativeWorkflowRetryStatus>> {
+        validate_native_retry_request(open, max_attempts)?;
+        let id = open.activation.actor_id;
+        if self
+            .native_recovery_bindings
+            .get(&id)
+            .is_none_or(|b| b.activation_epoch != open.tail.activation_epoch)
+            || self.load_open_workflow_command(id)? != Some(open)
+        {
+            return Err(native_retry_conflict());
+        }
+        let next = next_native_retry(
+            self.native_recovery_retries.get(&id).copied(),
+            open,
+            max_attempts,
+        )?;
+        if let Some(next) = next {
+            self.native_recovery_retries.insert(id, next);
+        }
+        Ok(next)
+    }
+
+    fn load_native_workflow_retry_status(
+        &self,
+        actor_id: u64,
+    ) -> io::Result<Option<NativeWorkflowRetryStatus>> {
+        current_native_retry(
+            self.load_open_workflow_command(actor_id)?,
+            self.native_recovery_retries.get(&actor_id).copied(),
+        )
+    }
+
+    fn scan_native_workflow_quarantine(
+        &self,
+        shard: u16,
+        shards: u16,
+        after: Option<u64>,
+        limit: usize,
+    ) -> io::Result<Vec<NativeWorkflowRetryStatus>> {
+        validate_quarantine_scan(shard, shards, after, limit)?;
+        let mut result = Vec::new();
+        for (&id, binding) in &self.native_recovery_bindings {
+            if id <= after.unwrap_or(0)
+                || id % u64::from(shards) != u64::from(shard)
+                || !self
+                    .native_recovery_retries
+                    .get(&id)
+                    .is_some_and(|s| s.is_exhausted())
+            {
+                continue;
+            }
+            if let Some(status) = self.load_native_workflow_retry_status(id)? {
+                if status.activation_epoch != binding.activation_epoch {
+                    return Err(native_retry_conflict());
+                }
+                if status.is_exhausted() {
+                    result.push(status);
+                }
+            }
+            if result.len() == limit {
+                break;
+            }
+        }
+        Ok(result)
+    }
+
+    fn append_native_workflow_recovery_audit(
+        &mut self,
+        event: NativeWorkflowRecoveryAuditEvent,
+    ) -> io::Result<NativeWorkflowRetryStatus> {
+        let next = event.next_status()?;
+        let expected = event.status();
+        let id = expected.activation.actor_id;
+        if self
+            .native_recovery_bindings
+            .get(&id)
+            .is_none_or(|b| b.activation_epoch != expected.activation_epoch)
+            || self.load_native_workflow_retry_status(id)? != Some(expected)
+        {
+            return Err(native_retry_conflict());
+        }
+        let key = event.key();
+        if let Some(existing) = self.native_recovery_audit.get(&key) {
+            if existing != &event {
+                return Err(native_retry_conflict());
+            }
+        } else {
+            self.native_recovery_audit.insert(key, event);
+        }
+        self.native_recovery_retries.insert(id, next);
+        Ok(next)
+    }
+
+    fn load_native_workflow_recovery_audit(
+        &self,
+        activation: WorkflowActivationId,
+        activation_epoch: u64,
+    ) -> io::Result<Vec<NativeWorkflowRecoveryAuditEvent>> {
+        validate_audit_identity(activation, activation_epoch)?;
+        Ok(self
+            .native_recovery_audit
+            .range(
+                (
+                    activation.actor_id,
+                    activation.command_sequence,
+                    activation_epoch,
+                    0,
+                    0,
+                )
+                    ..=(
+                        activation.actor_id,
+                        activation.command_sequence,
+                        activation_epoch,
+                        u32::MAX,
+                        u8::MAX,
+                    ),
+            )
+            .map(|(_, event)| event.clone())
+            .collect())
+    }
+
+    fn scan_open_native_workflow_recovery(
+        &self,
+        shard: u16,
+        shards: u16,
+        after: Option<u64>,
+        through: Option<u64>,
+        limit: usize,
+    ) -> io::Result<NativeWorkflowRecoveryPage> {
+        validate_native_recovery_scan(shard, shards, after, through, limit)?;
+        let open = |id: u64| {
+            id % u64::from(shards) == u64::from(shard)
+                && self
+                    .workflow_admissions
+                    .get(&id)
+                    .is_some_and(|a| a.closed_sequence.is_none())
+        };
+        let watermark = through.or_else(|| {
+            self.native_recovery_bindings
+                .keys()
+                .rev()
+                .copied()
+                .find(|id| open(*id))
+        });
+        let actors = self
+            .native_recovery_bindings
+            .keys()
+            .copied()
+            .filter(|id| *id > after.unwrap_or(0) && *id <= watermark.unwrap_or(0) && open(*id))
+            .filter(|id| {
+                !self.native_recovery_retries.get(id).is_some_and(|retry| {
+                    retry.is_exhausted()
+                        && self.workflow_admissions.get(id).is_some_and(|a| {
+                            a.command_sequence == retry.activation.command_sequence
+                        })
+                })
+            })
+            .take(limit)
+            .collect();
+        Ok(NativeWorkflowRecoveryPage { actors, watermark })
+    }
+
+    fn load_workflow_inbox_admission(
+        &self,
+        id: DurableOutboxId,
+    ) -> io::Result<Option<WorkflowActivationId>> {
+        Ok(self
+            .committed_transitions
+            .values()
+            .flatten()
+            .find(|transition| transition.workflow_inbox == Some(id))
+            .map(|transition| WorkflowActivationId::new(transition.actor_id, transition.sequence)))
+    }
+
+    fn load_open_workflow_command(&self, actor_id: u64) -> io::Result<Option<OpenWorkflowCommand>> {
+        let Some(admission) = self
+            .workflow_admissions
+            .get(&actor_id)
+            .filter(|a| a.closed_sequence.is_none())
+        else {
+            return Ok(None);
+        };
+        let tail = self
+            .load_durable_tail_position(actor_id)?
+            .ok_or_else(|| workflow_admission_error("open workflow command lacks atomic tail"))?;
+        let command_sequence = admission.command_sequence;
+        let journal = self
+            .journals
+            .get(&actor_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if journal
+            .iter()
+            .filter(|entry| entry.sequence == command_sequence)
+            .count()
+            != 1
+        {
+            return Err(workflow_admission_error(
+                "open workflow command lacks a unique journal entry",
+            ));
+        }
+        let latest_command = journal
+            .iter()
+            .map(|entry| entry.sequence)
+            .max()
+            .unwrap_or(0);
+        let legacy_events = self
+            .workflow_events
+            .get(&actor_id)
+            .into_iter()
+            .flatten()
+            .map(WorkflowEvent::sequence)
+            .chain(
+                self.events
+                    .get(&actor_id)
+                    .into_iter()
+                    .flatten()
+                    .map(|entry| entry.sequence),
+            )
+            .max()
+            .unwrap_or(0);
+        validate_open_boundary(
+            command_sequence,
+            self.snapshots.get(&actor_id).map(|s| s.sequence),
+            latest_command,
+            legacy_events,
+            tail,
+        )?;
+        Ok(Some(OpenWorkflowCommand {
+            activation: WorkflowActivationId::new(actor_id, command_sequence),
+            tail,
+        }))
+    }
+
     fn load_durable_tail_position(&self, actor_id: u64) -> io::Result<Option<DurableTailPosition>> {
         Ok(self
             .durable_tails
@@ -898,6 +2290,24 @@ impl PersistenceStore for MemoryStore {
             .flat_map(|transition| transition.durable_effects.iter().rev())
             .find(|record| record.effect().spec().id == effect_id)
             .cloned())
+    }
+
+    fn load_workflow_effect_occurrence(
+        &self,
+        activation: WorkflowActivationId,
+        occurrence: u32,
+    ) -> io::Result<Option<DurableEffectPersistenceRecord>> {
+        let mut history = WorkflowOccurrenceHistory::new(activation, occurrence);
+        for transition in self
+            .committed_transitions(activation.actor_id)
+            .iter()
+            .filter(|transition| transition.sequence > activation.command_sequence)
+        {
+            for record in &transition.durable_effects {
+                history.observe(record.clone())?;
+            }
+        }
+        history.finish()
     }
 
     fn commit_transition(&mut self, transition: DurableTransition) -> io::Result<DurableCommit> {
@@ -978,6 +2388,72 @@ impl PersistenceStore for MemoryStore {
             }
         }
 
+        validate_open_workflow_owner(
+            &transition,
+            self.load_open_workflow_command(transition.actor_id)?,
+        )?;
+        let admission = validate_workflow_admission_transition(
+            &transition,
+            self.workflow_admissions.get(&transition.actor_id).copied(),
+            self.snapshots
+                .get(&transition.actor_id)
+                .filter(|snapshot| {
+                    !transition.workflow_admission
+                        || (snapshot.activation_epoch <= transition.activation_epoch
+                            && self
+                                .journals
+                                .get(&transition.actor_id)
+                                .into_iter()
+                                .flatten()
+                                .all(|entry| entry.sequence <= snapshot.sequence)
+                            && self
+                                .workflow_events
+                                .get(&transition.actor_id)
+                                .into_iter()
+                                .flatten()
+                                .all(|event| event.sequence() <= snapshot.sequence)
+                            && self
+                                .events
+                                .get(&transition.actor_id)
+                                .into_iter()
+                                .flatten()
+                                .all(|event| event.sequence <= snapshot.sequence))
+                })
+                .map(|snapshot| snapshot.sequence),
+        )?;
+        if let Some(id) = transition.workflow_inbox {
+            validate_workflow_inbox(
+                &transition,
+                self.load_durable_outbox_message(id)?,
+                self.load_workflow_inbox_admission(id)?,
+            )?;
+        }
+        if let Some(closed) = admission.filter(|a| a.closed_sequence.is_some()) {
+            let activation =
+                WorkflowActivationId::new(transition.actor_id, closed.command_sequence);
+            let mut history = WorkflowOccurrenceHistory::new(activation, 0);
+            for prior in self
+                .committed_transitions(transition.actor_id)
+                .iter()
+                .filter(|prior| prior.sequence > closed.command_sequence)
+            {
+                for record in &prior.durable_effects {
+                    history.observe(record.clone())?;
+                }
+            }
+            let consumed = transition
+                .workflow_effects_consumed
+                .ok_or_else(|| workflow_admission_error("workflow terminal cursor is missing"))?;
+            history.reconcile_terminal(consumed)?;
+        }
+        for record in &transition.durable_effects {
+            if let Some(binding) = record.workflow_binding() {
+                let previous =
+                    self.load_workflow_effect_occurrence(binding.activation, binding.occurrence)?;
+                validate_workflow_effect_append(previous.as_ref(), record)?;
+            }
+        }
+
         if let Some(snapshot) = &transition.snapshot {
             self.snapshots.insert(transition.actor_id, snapshot.clone());
         }
@@ -1006,6 +2482,10 @@ impl PersistenceStore for MemoryStore {
             digest,
         };
         self.durable_tails.insert(transition.actor_id, tail);
+        if let Some(admission) = admission {
+            self.workflow_admissions
+                .insert(transition.actor_id, admission);
+        }
         self.committed_transitions
             .entry(transition.actor_id)
             .or_default()
@@ -1020,6 +2500,15 @@ impl PersistenceStore for MemoryStore {
     }
 
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
+        if self
+            .workflow_admissions
+            .get(&snapshot.actor_id)
+            .is_some_and(|admission| admission.closed_sequence.is_none())
+        {
+            return Err(workflow_admission_error(
+                "legacy write forbidden while workflow command is open",
+            ));
+        }
         self.snapshots.insert(snapshot.actor_id, snapshot);
         Ok(())
     }
@@ -1029,6 +2518,15 @@ impl PersistenceStore for MemoryStore {
     }
 
     fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> io::Result<()> {
+        if self
+            .workflow_admissions
+            .get(&actor_id)
+            .is_some_and(|admission| admission.closed_sequence.is_none())
+        {
+            return Err(workflow_admission_error(
+                "legacy write forbidden while workflow command is open",
+            ));
+        }
         self.journals.entry(actor_id).or_default().push(entry);
         Ok(())
     }
@@ -1038,6 +2536,15 @@ impl PersistenceStore for MemoryStore {
     }
 
     fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()> {
+        if self
+            .workflow_admissions
+            .get(&actor_id)
+            .is_some_and(|admission| admission.closed_sequence.is_none())
+        {
+            return Err(workflow_admission_error(
+                "legacy write forbidden while workflow command is open",
+            ));
+        }
         self.workflow_events
             .entry(actor_id)
             .or_default()
@@ -1053,6 +2560,15 @@ impl PersistenceStore for MemoryStore {
     }
 
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
+        if self
+            .workflow_admissions
+            .get(&actor_id)
+            .is_some_and(|admission| admission.closed_sequence.is_none())
+        {
+            return Err(workflow_admission_error(
+                "legacy write forbidden while workflow command is open",
+            ));
+        }
         self.events.entry(actor_id).or_default().push(entry);
         Ok(())
     }
@@ -1101,6 +2617,11 @@ impl PersistenceStore for MemoryStore {
         self.events.remove(&actor_id);
         self.durable_tails.remove(&actor_id);
         self.committed_transitions.remove(&actor_id);
+        self.workflow_admissions.remove(&actor_id);
+        self.native_recovery_bindings.remove(&actor_id);
+        self.native_recovery_retries.remove(&actor_id);
+        self.native_recovery_audit
+            .retain(|key, _| key.0 != actor_id);
         Ok(())
     }
 }
@@ -1683,6 +3204,45 @@ impl LibsqlStore {
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             conn.execute(
+                "CREATE TABLE IF NOT EXISTS durable_workflow_admissions (
+                    actor_id INTEGER PRIMARY KEY,
+                    command_sequence INTEGER NOT NULL,
+                    closed_sequence INTEGER
+                )",
+                (),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS durable_native_workflow_recovery (
+                    actor_id INTEGER PRIMARY KEY,
+                    binding TEXT NOT NULL
+                )",
+                (),
+            ).await.map_err(io::Error::other)?;
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS durable_native_workflow_retries (
+                    actor_id INTEGER PRIMARY KEY,
+                    command_sequence INTEGER NOT NULL CHECK(command_sequence > 0),
+                    activation_epoch INTEGER NOT NULL CHECK(activation_epoch > 0),
+                    attempts_reserved INTEGER NOT NULL CHECK(attempts_reserved >= 1 AND attempts_reserved <= max_attempts),
+                    max_attempts INTEGER NOT NULL CHECK(max_attempts BETWEEN 1 AND 1024)
+                )",
+                (),
+            ).await.map_err(io::Error::other)?;
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS durable_native_workflow_audit (
+                    actor_id INTEGER NOT NULL,
+                    command_sequence INTEGER NOT NULL,
+                    activation_epoch INTEGER NOT NULL,
+                    attempt INTEGER NOT NULL CHECK(attempt BETWEEN 1 AND 1024),
+                    kind INTEGER NOT NULL CHECK(kind IN (0,1)),
+                    event TEXT NOT NULL,
+                    PRIMARY KEY(actor_id, command_sequence, activation_epoch, attempt, kind)
+                )",
+                (),
+            ).await.map_err(io::Error::other)?;
+            conn.execute(
                 "CREATE TABLE IF NOT EXISTS durable_workflow_events (
                     actor_id INTEGER NOT NULL,
                     sequence INTEGER NOT NULL,
@@ -1732,6 +3292,37 @@ impl LibsqlStore {
             )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS durable_workflow_outbox (
+                    actor_id INTEGER NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    PRIMARY KEY (actor_id, sequence, ordinal)
+                )",
+                (),
+            )
+            .await
+            .map_err(io::Error::other)?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS durable_workflow_outbox_scan
+                 ON durable_workflow_outbox (sequence, actor_id, ordinal)",
+                (),
+            )
+            .await
+            .map_err(io::Error::other)?;
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS durable_workflow_inbox (
+                    actor_id INTEGER NOT NULL,
+                    command_sequence INTEGER NOT NULL,
+                    sender_actor_id INTEGER NOT NULL,
+                    sender_sequence INTEGER NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    PRIMARY KEY (sender_actor_id, sender_sequence, ordinal)
+                )",
+                (),
+            )
+            .await
+            .map_err(io::Error::other)?;
             Ok(())
         })
     }
@@ -1797,7 +3388,765 @@ impl LibsqlStore {
 }
 
 #[cfg(feature = "sqlite")]
+fn validate_legacy_write(changed: u64) -> io::Result<()> {
+    if changed != 1 {
+        return Err(workflow_admission_error(
+            "legacy write forbidden while workflow command is open",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sqlite")]
+const WORKFLOW_ADMISSION_QUERY: &str =
+    "SELECT a.command_sequence, a.closed_sequence, t.sequence, t.activation_epoch,
+            (SELECT sequence FROM snapshots WHERE actor_id = ?1),
+            COALESCE((SELECT MAX(sequence) FROM journal WHERE actor_id = ?1), 0),
+            MAX(COALESCE((SELECT MAX(sequence) FROM workflow_events WHERE actor_id = ?1), 0),
+                COALESCE((SELECT MAX(sequence) FROM events WHERE actor_id = ?1), 0)),
+            (SELECT activation_epoch FROM snapshots WHERE actor_id = ?1)
+         FROM (SELECT ?1 AS actor_id) x
+         LEFT JOIN durable_workflow_admissions a ON a.actor_id = x.actor_id
+         LEFT JOIN durable_tails t ON t.actor_id = x.actor_id";
+
+#[cfg(feature = "sqlite")]
+async fn read_workflow_admission(
+    mut rows: libsql::Rows,
+    actor_id: u64,
+    admission_epoch: Option<u64>,
+) -> io::Result<(
+    Option<WorkflowAdmission>,
+    Option<u64>,
+    Option<OpenWorkflowCommand>,
+)> {
+    let row = rows
+        .next()
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+        .ok_or_else(|| workflow_admission_error("missing workflow admission metadata"))?;
+    let number = |column| -> io::Result<Option<u64>> {
+        let value: Option<i64> = row
+            .get(column)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        value
+            .map(|value| {
+                u64::try_from(value)
+                    .map_err(|_| workflow_admission_error("negative workflow admission metadata"))
+            })
+            .transpose()
+    };
+    let snapshot_sequence = number(4)?;
+    let latest_command = number(5)?.unwrap_or(0);
+    let legacy_events = number(6)?.unwrap_or(0);
+    let snapshot_epoch = number(7)?;
+    let safe_snapshot = snapshot_sequence.filter(|sequence| {
+        latest_command <= *sequence
+            && legacy_events <= *sequence
+            && admission_epoch.map_or(true, |epoch| {
+                snapshot_epoch.is_some_and(|stored| stored <= epoch)
+            })
+    });
+    let Some(command_sequence) = number(0)? else {
+        return Ok((None, safe_snapshot, None));
+    };
+    let admission = WorkflowAdmission {
+        command_sequence,
+        closed_sequence: number(1)?,
+    };
+    if admission.closed_sequence.is_some() {
+        return Ok((Some(admission), safe_snapshot, None));
+    }
+    let tail = DurableTailPosition {
+        sequence: number(2)?
+            .ok_or_else(|| workflow_admission_error("open workflow command lacks atomic tail"))?,
+        activation_epoch: number(3)?.ok_or_else(|| {
+            workflow_admission_error("open workflow command lacks ownership epoch")
+        })?,
+    };
+    validate_open_boundary(
+        command_sequence,
+        snapshot_sequence,
+        latest_command,
+        legacy_events,
+        tail,
+    )?;
+    Ok((
+        Some(admission),
+        snapshot_sequence,
+        Some(OpenWorkflowCommand {
+            activation: WorkflowActivationId::new(actor_id, command_sequence),
+            tail,
+        }),
+    ))
+}
+
+#[cfg(feature = "sqlite")]
+async fn decode_durable_outbox(
+    mut rows: libsql::Rows,
+    id: DurableOutboxId,
+) -> io::Result<Option<DurableOutboxMessage>> {
+    let Some(row) = rows.next().await.map_err(io::Error::other)? else {
+        return Ok(None);
+    };
+    let destination: i64 = row.get(0).map_err(io::Error::other)?;
+    let behavior: i64 = row.get(1).map_err(io::Error::other)?;
+    let payload: String = row.get(2).map_err(io::Error::other)?;
+    Ok(Some(DurableOutboxMessage {
+        destination_actor_id: destination as u64,
+        ordinal: id.ordinal,
+        behavior_id: u16::try_from(behavior).map_err(io::Error::other)?,
+        payload: serde_json::from_str(&payload).map_err(io::Error::other)?,
+    }))
+}
+
+#[cfg(feature = "sqlite")]
+async fn decode_workflow_inbox(mut rows: libsql::Rows) -> io::Result<Option<WorkflowActivationId>> {
+    let Some(row) = rows.next().await.map_err(io::Error::other)? else {
+        return Ok(None);
+    };
+    let actor: i64 = row.get(0).map_err(io::Error::other)?;
+    let command: i64 = row.get(1).map_err(io::Error::other)?;
+    if command <= 0 {
+        return Err(workflow_admission_error("invalid inbox command sequence"));
+    }
+    Ok(Some(WorkflowActivationId::new(
+        actor as u64,
+        command as u64,
+    )))
+}
+
+#[cfg(feature = "sqlite")]
+const DURABLE_OUTBOX_QUERY: &str = "SELECT o.destination_actor_id, o.behavior_id, o.payload
+    FROM durable_outbox o JOIN durable_transitions t ON t.actor_id=o.actor_id AND t.sequence=o.sequence
+    WHERE o.actor_id=?1 AND o.sequence=?2 AND o.ordinal=?3";
+
+#[cfg(feature = "sqlite")]
+const DURABLE_INBOX_QUERY: &str = "SELECT actor_id, command_sequence FROM durable_workflow_inbox
+    WHERE sender_actor_id=?1 AND sender_sequence=?2 AND ordinal=?3";
+
+#[cfg(feature = "sqlite")]
+async fn decode_outbox_scan_row(rows: &mut libsql::Rows) -> io::Result<Option<DurableOutboxId>> {
+    let Some(row) = rows.next().await.map_err(io::Error::other)? else {
+        return Ok(None);
+    };
+    let sequence: i64 = row.get(0).map_err(io::Error::other)?;
+    let sender: i64 = row.get(1).map_err(io::Error::other)?;
+    let ordinal: i64 = row.get(2).map_err(io::Error::other)?;
+    if sequence <= 0 || sender <= 0 {
+        return Err(workflow_admission_error("invalid shard outbox scan key"));
+    }
+    Ok(Some(DurableOutboxId {
+        sender_actor_id: sender as u64,
+        sequence: sequence as u64,
+        ordinal: u32::try_from(ordinal).map_err(io::Error::other)?,
+    }))
+}
+
+#[cfg(feature = "sqlite")]
+fn decode_native_retry_row(
+    row: &libsql::Row,
+    actor_id: u64,
+    offset: usize,
+) -> io::Result<NativeWorkflowRetryStatus> {
+    let number = |idx| -> io::Result<u64> {
+        u64::try_from(row.get::<i64>(idx).map_err(io::Error::other)?).map_err(io::Error::other)
+    };
+    Ok(NativeWorkflowRetryStatus {
+        activation: WorkflowActivationId::new(actor_id, number(offset)?),
+        activation_epoch: number(offset + 1)?,
+        attempts_reserved: u32::try_from(number(offset + 2)?).map_err(io::Error::other)?,
+        max_attempts: u32::try_from(number(offset + 3)?).map_err(io::Error::other)?,
+    })
+}
+
+#[cfg(feature = "sqlite")]
+async fn decode_native_retry(
+    mut rows: libsql::Rows,
+    actor_id: u64,
+) -> io::Result<Option<NativeWorkflowRetryStatus>> {
+    rows.next()
+        .await
+        .map_err(io::Error::other)?
+        .map(|row| decode_native_retry_row(&row, actor_id, 0))
+        .transpose()
+}
+
+#[cfg(feature = "sqlite")]
 impl PersistenceStore for LibsqlStore {
+    fn load_durable_outbox_message(
+        &self,
+        id: DurableOutboxId,
+    ) -> io::Result<Option<DurableOutboxMessage>> {
+        let sequence = i64::try_from(id.sequence).map_err(io::Error::other)?;
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let rows = conn
+                .query(
+                    DURABLE_OUTBOX_QUERY,
+                    libsql::params![id.sender_actor_id as i64, sequence, id.ordinal as i64],
+                )
+                .await
+                .map_err(io::Error::other)?;
+            decode_durable_outbox(rows, id).await
+        })
+    }
+
+    fn load_workflow_outbox_message(
+        &self,
+        id: DurableOutboxId,
+    ) -> io::Result<Option<DurableOutboxMessage>> {
+        let sequence = i64::try_from(id.sequence).map_err(io::Error::other)?;
+        let conn = self.conn();
+        if !matches!(&*conn, libsql::Connection::Local(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "workflow outbox dispatch requires local SQLite",
+            ));
+        }
+        self.rt.block_on(async {
+            let rows = conn
+                .query(
+                    "SELECT o.destination_actor_id, o.behavior_id, o.payload
+                 FROM durable_workflow_outbox w
+                 JOIN durable_outbox o USING (actor_id, sequence, ordinal)
+                 JOIN durable_transitions t USING (actor_id, sequence)
+                 WHERE w.actor_id=?1 AND w.sequence=?2 AND w.ordinal=?3",
+                    libsql::params![id.sender_actor_id as i64, sequence, id.ordinal as i64],
+                )
+                .await
+                .map_err(io::Error::other)?;
+            decode_durable_outbox(rows, id).await
+        })
+    }
+
+    fn pending_workflow_outbox(
+        &self,
+        sender: u64,
+        after: Option<(u64, u32)>,
+        limit: usize,
+    ) -> io::Result<Vec<DurableOutboxId>> {
+        let (sequence, ordinal) = validate_outbox_page(after, limit)?;
+        let conn = self.conn();
+        if !matches!(&*conn, libsql::Connection::Local(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "workflow outbox dispatch requires local SQLite",
+            ));
+        }
+        self.rt.block_on(async {
+            let mut rows = conn
+                .query(
+                    "SELECT w.sequence, w.ordinal FROM durable_workflow_outbox w
+                 JOIN durable_outbox o USING (actor_id, sequence, ordinal)
+                 JOIN durable_transitions t USING (actor_id, sequence)
+                 LEFT JOIN durable_workflow_inbox i ON i.sender_actor_id=w.actor_id
+                   AND i.sender_sequence=w.sequence AND i.ordinal=w.ordinal
+                 WHERE w.actor_id=?1 AND (w.sequence, w.ordinal) > (?2, ?3)
+                   AND i.sender_actor_id IS NULL
+                 ORDER BY w.sequence, w.ordinal LIMIT ?4",
+                    libsql::params![sender as i64, sequence, ordinal, limit as i64],
+                )
+                .await
+                .map_err(io::Error::other)?;
+            let mut pending = Vec::new();
+            while let Some(row) = rows.next().await.map_err(io::Error::other)? {
+                let sequence: i64 = row.get(0).map_err(io::Error::other)?;
+                let ordinal: i64 = row.get(1).map_err(io::Error::other)?;
+                if sequence <= 0 {
+                    return Err(workflow_admission_error("invalid workflow outbox sequence"));
+                }
+                pending.push(DurableOutboxId {
+                    sender_actor_id: sender,
+                    sequence: sequence as u64,
+                    ordinal: u32::try_from(ordinal).map_err(io::Error::other)?,
+                });
+            }
+            Ok(pending)
+        })
+    }
+
+    fn scan_pending_workflow_outbox(
+        &self,
+        shard: u16,
+        shards: u16,
+        after: Option<DurableOutboxId>,
+        through: Option<DurableOutboxId>,
+        limit: usize,
+    ) -> io::Result<WorkflowOutboxScanPage> {
+        validate_outbox_scan(shard, shards, after, through, limit)?;
+        let conn = self.conn();
+        if !matches!(&*conn, libsql::Connection::Local(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "workflow outbox scan requires local SQLite",
+            ));
+        }
+        self.rt.block_on(async {
+            const BASE: &str = "SELECT w.sequence, w.actor_id, w.ordinal
+                FROM durable_workflow_outbox w
+                JOIN durable_outbox o USING (actor_id, sequence, ordinal)
+                JOIN durable_transitions t USING (actor_id, sequence)
+                LEFT JOIN durable_workflow_inbox i ON i.sender_actor_id=w.actor_id
+                 AND i.sender_sequence=w.sequence AND i.ordinal=w.ordinal
+                WHERE w.actor_id > 0 AND w.actor_id % ?1 = ?2 AND i.sender_actor_id IS NULL";
+            let watermark = match through {
+                Some(id) => Some(id),
+                None => {
+                    let sql = format!(
+                        "{BASE} ORDER BY w.sequence DESC, w.actor_id DESC, w.ordinal DESC LIMIT 1"
+                    );
+                    let mut rows = conn
+                        .query(&sql, libsql::params![i64::from(shards), i64::from(shard)])
+                        .await
+                        .map_err(io::Error::other)?;
+                    decode_outbox_scan_row(&mut rows).await?
+                }
+            };
+            let Some(watermark) = watermark else {
+                return Ok(WorkflowOutboxScanPage {
+                    identities: vec![],
+                    watermark: None,
+                });
+            };
+            let (aseq, asender, aordinal) = after
+                .map(|id| {
+                    (
+                        id.sequence as i64,
+                        id.sender_actor_id as i64,
+                        id.ordinal as i64,
+                    )
+                })
+                .unwrap_or((0, 0, -1));
+            let sql = format!(
+                "{BASE}
+                AND (w.sequence, w.actor_id, w.ordinal) > (?3, ?4, ?5)
+                AND (w.sequence, w.actor_id, w.ordinal) <= (?6, ?7, ?8)
+                ORDER BY w.sequence, w.actor_id, w.ordinal LIMIT ?9"
+            );
+            let mut rows = conn
+                .query(
+                    &sql,
+                    libsql::params![
+                        i64::from(shards),
+                        i64::from(shard),
+                        aseq,
+                        asender,
+                        aordinal,
+                        watermark.sequence as i64,
+                        watermark.sender_actor_id as i64,
+                        watermark.ordinal as i64,
+                        limit as i64
+                    ],
+                )
+                .await
+                .map_err(io::Error::other)?;
+            let mut identities = Vec::new();
+            while let Some(id) = decode_outbox_scan_row(&mut rows).await? {
+                identities.push(id);
+            }
+            Ok(WorkflowOutboxScanPage {
+                identities,
+                watermark: Some(watermark),
+            })
+        })
+    }
+
+    fn save_native_workflow_recovery_binding(
+        &mut self,
+        actor_id: u64,
+        binding: &NativeWorkflowRecoveryBinding,
+    ) -> io::Result<()> {
+        if actor_id == 0 || actor_id > i64::MAX as u64 {
+            return Err(native_binding_conflict());
+        }
+        let serialized = serde_json::to_string(binding).map_err(io::Error::other)?;
+        {
+            let conn = self.conn();
+            if !matches!(&*conn, libsql::Connection::Local(_)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "native recovery requires local SQLite",
+                ));
+            }
+            self.rt.block_on(async {
+                conn.execute(
+                    "INSERT INTO durable_native_workflow_recovery (actor_id, binding)
+                    SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM snapshots WHERE actor_id=?1 AND activation_epoch=?3)
+                    AND NOT EXISTS (SELECT 1 FROM durable_workflow_admissions WHERE actor_id=?1)
+                    AND NOT EXISTS (SELECT 1 FROM journal WHERE actor_id=?1)
+                    ON CONFLICT(actor_id) DO NOTHING",
+                    libsql::params![actor_id as i64, serialized, i64::try_from(binding.activation_epoch).map_err(io::Error::other)?],
+                )
+                .await
+                .map_err(io::Error::other)?;
+                Ok::<_, io::Error>(())
+            })?;
+        }
+        if self
+            .load_native_workflow_recovery_binding(actor_id)?
+            .as_ref()
+            != Some(binding)
+        {
+            return Err(native_binding_conflict());
+        }
+        Ok(())
+    }
+
+    fn load_native_workflow_recovery_binding(
+        &self,
+        actor_id: u64,
+    ) -> io::Result<Option<NativeWorkflowRecoveryBinding>> {
+        let conn = self.conn();
+        if !matches!(&*conn, libsql::Connection::Local(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "native recovery requires local SQLite",
+            ));
+        }
+        self.rt.block_on(async {
+            let mut rows = conn
+                .query(
+                    "SELECT binding FROM durable_native_workflow_recovery WHERE actor_id=?1",
+                    libsql::params![i64::try_from(actor_id).map_err(io::Error::other)?],
+                )
+                .await
+                .map_err(io::Error::other)?;
+            match rows.next().await.map_err(io::Error::other)? {
+                Some(row) => {
+                    let binding: String = row.get(0).map_err(io::Error::other)?;
+                    Ok(Some(
+                        serde_json::from_str(&binding).map_err(io::Error::other)?,
+                    ))
+                }
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn reserve_native_workflow_recovery_attempt(
+        &mut self,
+        open: OpenWorkflowCommand,
+        max_attempts: u32,
+    ) -> io::Result<Option<NativeWorkflowRetryStatus>> {
+        validate_native_retry_request(open, max_attempts)?;
+        let id = open.activation.actor_id;
+        if self
+            .load_native_workflow_recovery_binding(id)?
+            .is_none_or(|b| b.activation_epoch != open.tail.activation_epoch)
+            || self.load_open_workflow_command(id)? != Some(open)
+        {
+            return Err(native_retry_conflict());
+        }
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let tx = conn.transaction_with_behavior(libsql::TransactionBehavior::Immediate).await.map_err(io::Error::other)?;
+            // Recheck the command fence inside the write transaction. An
+            // earlier read alone is not authorization to reserve a replay.
+            let mut fence = tx.query(
+                "SELECT a.actor_id FROM durable_workflow_admissions a
+                 JOIN durable_tails t USING(actor_id)
+                 JOIN durable_native_workflow_recovery b USING(actor_id)
+                 WHERE a.actor_id=?1 AND a.command_sequence=?2 AND a.closed_sequence IS NULL
+                 AND t.sequence=?2 AND t.activation_epoch=?3",
+                libsql::params![id as i64, open.activation.command_sequence as i64, open.tail.activation_epoch as i64],
+            ).await.map_err(io::Error::other)?;
+            if fence.next().await.map_err(io::Error::other)?.is_none() { return Err(native_retry_conflict()); }
+            let previous = decode_native_retry(tx.query(
+                "SELECT command_sequence, activation_epoch, attempts_reserved, max_attempts
+                 FROM durable_native_workflow_retries WHERE actor_id=?1",
+                libsql::params![id as i64],
+            ).await.map_err(io::Error::other)?, id).await?;
+            let next = next_native_retry(previous, open, max_attempts)?;
+            if let Some(next) = next {
+                let changed = tx.execute(
+                    "INSERT INTO durable_native_workflow_retries
+                     (actor_id,command_sequence,activation_epoch,attempts_reserved,max_attempts)
+                     VALUES (?1,?2,?3,?4,?5)
+                     ON CONFLICT(actor_id) DO UPDATE SET command_sequence=excluded.command_sequence,
+                     activation_epoch=excluded.activation_epoch, attempts_reserved=excluded.attempts_reserved,
+                     max_attempts=excluded.max_attempts",
+                    libsql::params![id as i64, next.activation.command_sequence as i64, next.activation_epoch as i64,
+                        i64::from(next.attempts_reserved), i64::from(next.max_attempts)],
+                ).await.map_err(io::Error::other)?;
+                if changed != 1 { return Err(native_retry_conflict()); }
+            }
+            tx.commit().await.map_err(io::Error::other)?;
+            Ok(next)
+        })
+    }
+
+    fn load_native_workflow_retry_status(
+        &self,
+        actor_id: u64,
+    ) -> io::Result<Option<NativeWorkflowRetryStatus>> {
+        let open = self.load_open_workflow_command(actor_id)?;
+        let conn = self.conn();
+        if !matches!(&*conn, libsql::Connection::Local(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "native recovery requires local SQLite",
+            ));
+        }
+        self.rt.block_on(async {
+            let previous = decode_native_retry(
+                conn.query(
+                    "SELECT command_sequence, activation_epoch, attempts_reserved, max_attempts
+                 FROM durable_native_workflow_retries WHERE actor_id=?1",
+                    libsql::params![i64::try_from(actor_id).map_err(io::Error::other)?],
+                )
+                .await
+                .map_err(io::Error::other)?,
+                actor_id,
+            )
+            .await?;
+            current_native_retry(open, previous)
+        })
+    }
+
+    fn scan_native_workflow_quarantine(
+        &self,
+        shard: u16,
+        shards: u16,
+        after: Option<u64>,
+        limit: usize,
+    ) -> io::Result<Vec<NativeWorkflowRetryStatus>> {
+        validate_quarantine_scan(shard, shards, after, limit)?;
+        let conn = self.conn();
+        if !matches!(&*conn, libsql::Connection::Local(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "native recovery requires local SQLite",
+            ));
+        }
+        self.rt.block_on(async {
+            let mut rows = conn.query(
+                "SELECT r.actor_id, r.command_sequence, r.activation_epoch, r.attempts_reserved, r.max_attempts
+                 FROM durable_native_workflow_retries r
+                 JOIN durable_workflow_admissions a USING(actor_id)
+                 JOIN durable_tails t USING(actor_id)
+                 JOIN durable_native_workflow_recovery b USING(actor_id)
+                 WHERE r.actor_id>?3 AND r.actor_id%?1=?2
+                 AND a.closed_sequence IS NULL AND a.command_sequence=r.command_sequence
+                 AND t.sequence=r.command_sequence AND t.activation_epoch=r.activation_epoch
+                 AND r.attempts_reserved=r.max_attempts ORDER BY r.actor_id LIMIT ?4",
+                libsql::params![i64::from(shards), i64::from(shard), after.unwrap_or(0) as i64, limit as i64],
+            ).await.map_err(io::Error::other)?;
+            let mut result = Vec::new();
+            while let Some(row) = rows.next().await.map_err(io::Error::other)? {
+                let id = u64::try_from(row.get::<i64>(0).map_err(io::Error::other)?).map_err(io::Error::other)?;
+                let status = decode_native_retry_row(&row, id, 1)?;
+                validate_native_retry_request(status.open_command(), status.max_attempts)?;
+                if !status.is_exhausted() || status.attempts_reserved != status.max_attempts { return Err(native_retry_conflict()); }
+                result.push(status);
+            }
+            Ok(result)
+        })
+    }
+
+    fn append_native_workflow_recovery_audit(
+        &mut self,
+        event: NativeWorkflowRecoveryAuditEvent,
+    ) -> io::Result<NativeWorkflowRetryStatus> {
+        let next = event.next_status()?;
+        let expected = event.status();
+        let (id, sequence, epoch, attempt, kind) = event.key();
+        if self
+            .load_native_workflow_recovery_binding(id)?
+            .is_none_or(|b| b.activation_epoch != epoch)
+            || self.load_native_workflow_retry_status(id)? != Some(expected)
+        {
+            return Err(native_retry_conflict());
+        }
+        let json = serde_json::to_string(&event).map_err(io::Error::other)?;
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let tx = conn.transaction_with_behavior(libsql::TransactionBehavior::Immediate).await.map_err(io::Error::other)?;
+            let mut fence = tx.query(
+                "SELECT r.actor_id FROM durable_native_workflow_retries r
+                 JOIN durable_workflow_admissions a USING(actor_id)
+                 JOIN durable_tails t USING(actor_id)
+                 JOIN durable_native_workflow_recovery b USING(actor_id)
+                 WHERE r.actor_id=?1 AND r.command_sequence=?2 AND r.activation_epoch=?3
+                 AND r.attempts_reserved=?4 AND r.max_attempts=?5
+                 AND a.command_sequence=?2 AND a.closed_sequence IS NULL
+                 AND t.sequence=?2 AND t.activation_epoch=?3",
+                libsql::params![id as i64, sequence as i64, epoch as i64, i64::from(attempt), i64::from(expected.max_attempts)],
+            ).await.map_err(io::Error::other)?;
+            if fence.next().await.map_err(io::Error::other)?.is_none() { return Err(native_retry_conflict()); }
+            let changed = tx.execute(
+                "INSERT INTO durable_native_workflow_audit
+                 (actor_id,command_sequence,activation_epoch,attempt,kind,event)
+                 VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT DO NOTHING",
+                libsql::params![id as i64, sequence as i64, epoch as i64, i64::from(attempt), i64::from(kind), json],
+            ).await.map_err(io::Error::other)?;
+            if changed == 0 {
+                let mut rows = tx.query(
+                    "SELECT event FROM durable_native_workflow_audit WHERE actor_id=?1 AND command_sequence=?2
+                    AND activation_epoch=?3 AND attempt=?4 AND kind=?5",
+                    libsql::params![id as i64, sequence as i64, epoch as i64, i64::from(attempt), i64::from(kind)],
+                ).await.map_err(io::Error::other)?;
+                let row = rows.next().await.map_err(io::Error::other)?.ok_or_else(native_retry_conflict)?;
+                let old: NativeWorkflowRecoveryAuditEvent = serde_json::from_str(&row.get::<String>(0).map_err(io::Error::other)?).map_err(io::Error::other)?;
+                if old != event { return Err(native_retry_conflict()); }
+            } else if changed != 1 { return Err(native_retry_conflict()); }
+            if next != expected {
+                let changed = tx.execute(
+                    "UPDATE durable_native_workflow_retries SET max_attempts=?2 WHERE actor_id=?1",
+                    libsql::params![id as i64, i64::from(next.max_attempts)],
+                ).await.map_err(io::Error::other)?;
+                if changed != 1 { return Err(native_retry_conflict()); }
+            }
+            tx.commit().await.map_err(io::Error::other)?;
+            Ok(next)
+        })
+    }
+
+    fn load_native_workflow_recovery_audit(
+        &self,
+        activation: WorkflowActivationId,
+        activation_epoch: u64,
+    ) -> io::Result<Vec<NativeWorkflowRecoveryAuditEvent>> {
+        validate_audit_identity(activation, activation_epoch)?;
+        let conn = self.conn();
+        if !matches!(&*conn, libsql::Connection::Local(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "native recovery requires local SQLite",
+            ));
+        }
+        self.rt.block_on(async {
+            let mut rows = conn
+                .query(
+                    "SELECT attempt, kind, event FROM durable_native_workflow_audit
+                 WHERE actor_id=?1 AND command_sequence=?2 AND activation_epoch=?3
+                 ORDER BY attempt,kind LIMIT ?4",
+                    libsql::params![
+                        activation.actor_id as i64,
+                        activation.command_sequence as i64,
+                        activation_epoch as i64,
+                        (MAX_NATIVE_WORKFLOW_AUDIT_EVENTS + 1) as i64
+                    ],
+                )
+                .await
+                .map_err(io::Error::other)?;
+            let mut result = Vec::new();
+            while let Some(row) = rows.next().await.map_err(io::Error::other)? {
+                let event: NativeWorkflowRecoveryAuditEvent =
+                    serde_json::from_str(&row.get::<String>(2).map_err(io::Error::other)?)
+                        .map_err(io::Error::other)?;
+                let key = (
+                    activation.actor_id,
+                    activation.command_sequence,
+                    activation_epoch,
+                    u32::try_from(row.get::<i64>(0).map_err(io::Error::other)?)
+                        .map_err(io::Error::other)?,
+                    u8::try_from(row.get::<i64>(1).map_err(io::Error::other)?)
+                        .map_err(io::Error::other)?,
+                );
+                event.next_status()?;
+                if event.key() != key || result.len() == MAX_NATIVE_WORKFLOW_AUDIT_EVENTS {
+                    return Err(native_retry_conflict());
+                }
+                result.push(event);
+            }
+            Ok(result)
+        })
+    }
+
+    fn scan_open_native_workflow_recovery(
+        &self,
+        shard: u16,
+        shards: u16,
+        after: Option<u64>,
+        through: Option<u64>,
+        limit: usize,
+    ) -> io::Result<NativeWorkflowRecoveryPage> {
+        validate_native_recovery_scan(shard, shards, after, through, limit)?;
+        let conn = self.conn();
+        if !matches!(&*conn, libsql::Connection::Local(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "native recovery requires local SQLite",
+            ));
+        }
+        self.rt.block_on(async {
+            const BASE: &str = "SELECT b.actor_id FROM durable_native_workflow_recovery b
+                JOIN durable_workflow_admissions a USING(actor_id)
+                WHERE b.actor_id > 0 AND b.actor_id % ?1 = ?2 AND a.closed_sequence IS NULL";
+            let watermark = match through {
+                Some(id) => Some(id),
+                None => {
+                    let mut rows = conn
+                        .query(
+                            &format!("{BASE} ORDER BY b.actor_id DESC LIMIT 1"),
+                            libsql::params![i64::from(shards), i64::from(shard)],
+                        )
+                        .await
+                        .map_err(io::Error::other)?;
+                    match rows.next().await.map_err(io::Error::other)? {
+                        Some(row) => Some(row.get::<i64>(0).map_err(io::Error::other)? as u64),
+                        None => None,
+                    }
+                }
+            };
+            let mut actors = Vec::new();
+            if let Some(watermark) = watermark {
+                let mut rows = conn
+                    .query(
+                        &format!(
+                            "{BASE} AND b.actor_id > ?3 AND b.actor_id <= ?4
+                        AND NOT EXISTS (SELECT 1 FROM durable_native_workflow_retries r
+                            WHERE r.actor_id=b.actor_id AND r.command_sequence=a.command_sequence
+                            AND r.attempts_reserved>=r.max_attempts)
+                        ORDER BY b.actor_id LIMIT ?5"
+                        ),
+                        libsql::params![
+                            i64::from(shards),
+                            i64::from(shard),
+                            after.unwrap_or(0) as i64,
+                            watermark as i64,
+                            limit as i64
+                        ],
+                    )
+                    .await
+                    .map_err(io::Error::other)?;
+                while let Some(row) = rows.next().await.map_err(io::Error::other)? {
+                    actors.push(row.get::<i64>(0).map_err(io::Error::other)? as u64);
+                }
+            }
+            Ok(NativeWorkflowRecoveryPage { actors, watermark })
+        })
+    }
+
+    fn load_workflow_inbox_admission(
+        &self,
+        id: DurableOutboxId,
+    ) -> io::Result<Option<WorkflowActivationId>> {
+        let sequence = i64::try_from(id.sequence).map_err(io::Error::other)?;
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let rows = conn
+                .query(
+                    DURABLE_INBOX_QUERY,
+                    libsql::params![id.sender_actor_id as i64, sequence, id.ordinal as i64],
+                )
+                .await
+                .map_err(io::Error::other)?;
+            decode_workflow_inbox(rows).await
+        })
+    }
+
+    fn load_open_workflow_command(&self, actor_id: u64) -> io::Result<Option<OpenWorkflowCommand>> {
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let rows = conn
+                .query(WORKFLOW_ADMISSION_QUERY, libsql::params![actor_id as i64])
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            Ok(read_workflow_admission(rows, actor_id, None).await?.2)
+        })
+    }
+
     fn load_durable_tail_position(&self, actor_id: u64) -> io::Result<Option<DurableTailPosition>> {
         let conn = self.conn();
         self.rt.block_on(async {
@@ -1860,6 +4209,32 @@ impl PersistenceStore for LibsqlStore {
             .await
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             Ok(found)
+        })
+    }
+
+    fn load_workflow_effect_occurrence(
+        &self,
+        activation: WorkflowActivationId,
+        occurrence: u32,
+    ) -> io::Result<Option<DurableEffectPersistenceRecord>> {
+        let command_sequence = i64::try_from(activation.command_sequence).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "workflow command sequence out of SQLite range",
+            )
+        })?;
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let rows = conn
+                .query(
+                    "SELECT record FROM durable_effect_records
+                 WHERE actor_id = ?1 AND sequence > ?2
+                 ORDER BY sequence ASC, ordinal ASC",
+                    libsql::params![activation.actor_id as i64, command_sequence],
+                )
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            read_workflow_occurrence_rows(rows, activation, occurrence).await
         })
     }
 
@@ -2052,6 +4427,77 @@ impl PersistenceStore for LibsqlStore {
                 }
             }
 
+            let admission_metadata = async {
+                let rows = tx.query(WORKFLOW_ADMISSION_QUERY, libsql::params![transition.actor_id as i64])
+                    .await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                read_workflow_admission(rows, transition.actor_id, transition.workflow_admission.then_some(transition.activation_epoch)).await
+            }.await;
+            let (last_admission, safe_snapshot, open) = match admission_metadata {
+                Ok(metadata) => metadata,
+                Err(error) => { let _ = tx.rollback().await; return Err(error); }
+            };
+            if let Err(error) = validate_open_workflow_owner(&transition, open) {
+                let _ = tx.rollback().await;
+                return Err(error);
+            }
+            let admission = match validate_workflow_admission_transition(&transition, last_admission, safe_snapshot) {
+                Ok(admission) => admission,
+                Err(error) => { let _ = tx.rollback().await; return Err(error); }
+            };
+            if let Some(id) = transition.workflow_inbox {
+                let validation = async {
+                    let params = libsql::params![id.sender_actor_id as i64, id.sequence as i64, id.ordinal as i64];
+                    let rows = tx.query(DURABLE_OUTBOX_QUERY, params).await.map_err(io::Error::other)?;
+                    let source = decode_durable_outbox(rows, id).await?;
+                    let rows = tx.query(DURABLE_INBOX_QUERY, libsql::params![id.sender_actor_id as i64, id.sequence as i64, id.ordinal as i64]).await.map_err(io::Error::other)?;
+                    let previous = decode_workflow_inbox(rows).await?;
+                    validate_workflow_inbox(&transition, source, previous)
+                }.await;
+                if let Err(error) = validation { let _ = tx.rollback().await; return Err(error); }
+            }
+            if let Some(closed) = admission.filter(|a| a.closed_sequence.is_some()) {
+                let validation = async {
+                    let command_sequence = i64::try_from(closed.command_sequence)
+                        .map_err(|_| workflow_admission_error("workflow command sequence out of SQLite range"))?;
+                    let rows = tx.query(
+                        "SELECT record FROM durable_effect_records WHERE actor_id = ?1 AND sequence > ?2
+                         ORDER BY sequence ASC, ordinal ASC",
+                        libsql::params![transition.actor_id as i64, command_sequence],
+                    ).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    let activation = WorkflowActivationId::new(transition.actor_id, closed.command_sequence);
+                    let history = read_workflow_occurrence_history(rows, activation, 0).await?;
+                    let consumed = transition.workflow_effects_consumed.ok_or_else(||
+                        workflow_admission_error("workflow terminal cursor is missing"))?;
+                    history.reconcile_terminal(consumed)
+                }.await;
+                if let Err(error) = validation { let _ = tx.rollback().await; return Err(error); }
+            }
+
+            // Validate the immutable slot inside the same immediate write
+            // transaction as Prepared/Completed and the fenced tail update.
+            // A stale pre-dispatch lookup cannot race a conflicting binding
+            // into the same slot using a newer predecessor sequence.
+            for record in &transition.durable_effects {
+                if let Some(binding) = record.workflow_binding() {
+                    let validation = async {
+                        let command_sequence = i64::try_from(binding.activation.command_sequence)
+                            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "workflow command sequence out of SQLite range"))?;
+                        let rows = tx.query(
+                            "SELECT record FROM durable_effect_records
+                             WHERE actor_id = ?1 AND sequence > ?2
+                             ORDER BY sequence ASC, ordinal ASC",
+                            libsql::params![binding.activation.actor_id as i64, command_sequence],
+                        ).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                        let previous = read_workflow_occurrence_rows(rows, binding.activation, binding.occurrence).await?;
+                        validate_workflow_effect_append(previous.as_ref(), record)
+                    }.await;
+                    if let Err(error) = validation {
+                        let _ = tx.rollback().await;
+                        return Err(error);
+                    }
+                }
+            }
+
             if let (
                 Some(snapshot),
                 Some((state_json, crdt_json, crdt_field_map_json, schema_name, authority_json)),
@@ -2099,6 +4545,15 @@ impl PersistenceStore for LibsqlStore {
                 )
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            }
+
+            if let Some(id) = transition.workflow_inbox {
+                tx.execute(
+                    "INSERT INTO durable_workflow_inbox (actor_id, command_sequence, sender_actor_id, sender_sequence, ordinal)
+                    VALUES (?1, ?2, ?3, ?4, ?5)",
+                    libsql::params![transition.actor_id as i64, transition.sequence as i64,
+                        id.sender_actor_id as i64, id.sequence as i64, id.ordinal as i64],
+                ).await.map_err(io::Error::other)?;
             }
 
             for (ordinal, event_json) in workflow_json.iter().enumerate() {
@@ -2162,6 +4617,12 @@ impl PersistenceStore for LibsqlStore {
                 )
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                if transition.workflow_effects_consumed.is_some() {
+                    tx.execute(
+                        "INSERT INTO durable_workflow_outbox (actor_id, sequence, ordinal) VALUES (?1, ?2, ?3)",
+                        libsql::params![transition.actor_id as i64, transition.sequence as i64, message.ordinal as i64],
+                    ).await.map_err(io::Error::other)?;
+                }
             }
 
             tx.execute(
@@ -2178,6 +4639,16 @@ impl PersistenceStore for LibsqlStore {
             )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+            if let Some(admission) = admission {
+                tx.execute(
+                    "INSERT INTO durable_workflow_admissions (actor_id, command_sequence, closed_sequence)
+                     VALUES (?1, ?2, ?3) ON CONFLICT(actor_id) DO UPDATE SET
+                     command_sequence=excluded.command_sequence, closed_sequence=excluded.closed_sequence",
+                    libsql::params![transition.actor_id as i64, admission.command_sequence as i64,
+                        admission.closed_sequence.map(|sequence| sequence as i64)],
+                ).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            }
 
             if let Some((old_epoch, old_sequence, old_digest)) = current_tail {
                 let changed = tx
@@ -2248,10 +4719,11 @@ impl PersistenceStore for LibsqlStore {
         let conn = self.conn();
         self.rt.block_on(async {
             conn.execute(
-                "INSERT INTO snapshots (actor_id, sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "INSERT INTO snapshots (actor_id, sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+                 WHERE NOT EXISTS (SELECT 1 FROM durable_workflow_admissions WHERE actor_id=?1 AND closed_sequence IS NULL)
                  ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, activation_epoch=excluded.activation_epoch, state=excluded.state, waiting_signal=excluded.waiting_signal, crdt_snapshot=excluded.crdt_snapshot, crdt_field_map=excluded.crdt_field_map, schema_name=excluded.schema_name, authority_tokens=excluded.authority_tokens",
                 libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, snapshot.activation_epoch as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str(), crdt_field_map_json.as_str(), snapshot.schema_name.as_deref(), authority_json.as_str()],
-            ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+            ).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string())).and_then(validate_legacy_write)
         })
     }
 
@@ -2325,9 +4797,9 @@ impl PersistenceStore for LibsqlStore {
         let conn = self.conn();
         self.rt.block_on(async {
             conn.execute(
-                "INSERT INTO journal (actor_id, sequence, behavior_id, payload) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO journal (actor_id, sequence, behavior_id, payload) SELECT ?1, ?2, ?3, ?4 WHERE NOT EXISTS (SELECT 1 FROM durable_workflow_admissions WHERE actor_id=?1 AND closed_sequence IS NULL)",
                 libsql::params![actor_id as i64, entry.sequence as i64, entry.behavior_id as i64, payload_json],
-            ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+            ).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string())).and_then(validate_legacy_write)
         })
     }
 
@@ -2376,12 +4848,12 @@ impl PersistenceStore for LibsqlStore {
         let conn = self.conn();
         self.rt.block_on(async {
             conn.execute(
-                "INSERT INTO workflow_events (actor_id, sequence, event) VALUES (?1, ?2, ?3)",
+                "INSERT INTO workflow_events (actor_id, sequence, event) SELECT ?1, ?2, ?3 WHERE NOT EXISTS (SELECT 1 FROM durable_workflow_admissions WHERE actor_id=?1 AND closed_sequence IS NULL)",
                 libsql::params![actor_id as i64, event.sequence() as i64, event_json],
             )
             .await
-            .map(|_| ())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+            .and_then(validate_legacy_write)
         })
     }
 
@@ -2428,9 +4900,9 @@ impl PersistenceStore for LibsqlStore {
             let value_json = serde_json::to_string(&entry.value)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             conn.execute(
-                "INSERT INTO events (actor_id, sequence, field_name, event_name, args, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO events (actor_id, sequence, field_name, event_name, args, value) SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE NOT EXISTS (SELECT 1 FROM durable_workflow_admissions WHERE actor_id=?1 AND closed_sequence IS NULL)",
                 libsql::params![actor_id as i64, entry.sequence as i64, entry.field_name, entry.event_name, args_json, value_json],
-            ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+            ).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string())).and_then(validate_legacy_write)
         })
     }
 
@@ -2576,6 +5048,12 @@ impl PersistenceStore for LibsqlStore {
                 "durable_domain_events",
                 "durable_effect_records",
                 "durable_outbox",
+                "durable_workflow_outbox",
+                "durable_workflow_admissions",
+                "durable_native_workflow_recovery",
+                "durable_native_workflow_retries",
+                "durable_native_workflow_audit",
+                "durable_workflow_inbox",
                 "durable_transitions",
                 "durable_tails",
             ] {
@@ -4196,6 +6674,9 @@ mod durable_transition_tests {
                 behavior_id: 7,
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }),
+            workflow_admission: false,
+            workflow_inbox: None,
+            workflow_effects_consumed: None,
             snapshot: Some(ActorSnapshot {
                 activation_epoch: epoch,
                 ..snapshot(actor_id, sequence, &[("count", sequence as i64)])
@@ -4436,6 +6917,9 @@ mod libsql_atomic_transition_tests {
                 behavior_id: 3,
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }),
+            workflow_admission: false,
+            workflow_inbox: None,
+            workflow_effects_consumed: None,
             snapshot: Some(ActorSnapshot {
                 activation_epoch: epoch,
                 ..snapshot(actor_id, sequence, sequence as i64)

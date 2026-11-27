@@ -6,7 +6,7 @@ Compiler-owned async effect metadata through a real file-backed libSQL restart.
 This is a trusted Rust host-adapter test: it does not claim that an ordinary
 Nulang VM PerformAsync callback automatically uses the durable coordinator, or
 that dropping a store is equivalent to killing a process. Subprocess crash
-windows are covered separately by the pending durable-effect crash fixture.
+windows are covered separately by durable_effect_process_kill.rs.
 */
 
 use nulang::authority::{AuthorityGrant, AuthorityManifest};
