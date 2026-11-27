@@ -213,3 +213,31 @@ capacity rounding, temporary command buffers and connection/queue memory are
 not included in the enforced arena budget. Aggregate server budgets, eviction,
 fallible allocator handling and workload-based limit tuning remain separate
 work.
+
+
+## Shared reactor connection buffer budget
+
+The redirect-only cache reactor reserves input/output vector capacity before
+growth, with a default 256 MiB aggregate connection budget per reactor.
+Embedders can pass the same CacheBufferBudget to CacheShardServer::bind_with_budget
+on multiple reactors for a shared process-level connection-buffer allowance.
+The default bind method creates its own budget. Capacity stays charged while
+retained, including idle connections, and RAII releases it on disconnect or
+reactor teardown. Admission or allocation failure closes the offending
+connection rather than letting buffers grow without limit.
+
+Before executing a complete command, the reactor conservatively sizes its
+reply using read-only cache lookups, the same routing snapshot and clock,
+and topology/redirect response bounds. This prevents repeated-key MGET and
+other large responses from allocating beyond the configured output limit.
+The redirect-only reactor writes synchronous replies in order directly to
+the reserved output vector, without the asynchronous pipeline scratch copy.
+The standalone asynchronous pipeline remains unchanged.
+
+This is a connection-vector capacity budget, not an RSS guarantee. Allocator
+overhead and transient reallocation, OS socket buffers, connection metadata,
+topology and MSET preflight scratch, cache store memory, and asynchronous
+cross-shard queues are separate. Conservative reply bounds may reject a
+response that would fit if encoded exactly; the policy is close-on-pressure
+rather than waiting or evicting another connection. Fairness, idle-capacity
+reclamation and full-system memory qualification remain future work.

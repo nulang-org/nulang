@@ -739,6 +739,27 @@ impl CacheStore {
         Ok(())
     }
 
+    /// Read-only response sizing without changing hit counters or lazy expiry.
+    #[cfg(feature = "cache-server")]
+    pub(crate) fn reply_value_bound(&self, key: &[u8], now_ms: u64) -> usize {
+        let Some(entry) = self
+            .find_slot(key, Self::hash(key))
+            .and_then(|slot| self.slots[slot as usize].entry.as_ref())
+        else {
+            return 5;
+        };
+        if entry
+            .expires_at_ms
+            .is_some_and(|deadline| deadline <= now_ms)
+        {
+            return 5;
+        }
+        match entry.value.view(&self.arena) {
+            CacheValueView::Integer(_) => 32,
+            CacheValueView::Bytes(bytes) => bytes.len().saturating_add(32),
+        }
+    }
+
     pub fn get(&mut self, key: &[u8], now_ms: u64) -> Option<CacheValueView<'_>> {
         let Some(slot_id) = self.live_slot_id(key, now_ms) else {
             self.stats.misses += 1;

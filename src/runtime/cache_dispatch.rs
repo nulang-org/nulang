@@ -301,6 +301,59 @@ impl CacheDispatcher {
         self.channels.install_waker(shard, waker)
     }
 
+    /// Conservative maximum encoded reply size for the redirect-only reactor.
+    /// Uses the same clock and placement as dispatch; no mutation or value copying.
+    #[cfg(feature = "cache-server")]
+    pub(crate) fn redirect_reply_bound(
+        &self,
+        store: &CacheStore,
+        command: super::resp::RespCommand<'_>,
+        now_ms: u64,
+    ) -> usize {
+        let name = command.name();
+        if name.eq_ignore_ascii_case(b"CLUSTER") {
+            // Both topology encodings have fewer than 512 fixed bytes per
+            // range (including node metadata); endpoint text is variable.
+            if command.argc() == 1
+                && command.args().next().is_some_and(|sub| {
+                    sub.eq_ignore_ascii_case(b"SLOTS") || sub.eq_ignore_ascii_case(b"SHARDS")
+                })
+            {
+                return self
+                    .placement
+                    .slot_ranges()
+                    .iter()
+                    .fold(128usize, |sum, range| {
+                        let host = self
+                            .endpoints
+                            .get(range.owner)
+                            .map_or(0, |e| e.host().len());
+                        sum.saturating_add(512).saturating_add(host)
+                    });
+            }
+            return 128;
+        }
+        if let RespCommandSlot::Slot(slot) = command_slot(command) {
+            if let Some(owner) = self.placement.owner_for_slot(slot) {
+                if owner.node_id != self.local_node_id || owner.shard != self.local_shard {
+                    return self
+                        .endpoints
+                        .get(owner)
+                        .map_or(128, |endpoint| endpoint.target().len().saturating_add(32));
+                }
+            }
+            if name.eq_ignore_ascii_case(b"GET") || name.eq_ignore_ascii_case(b"MGET") {
+                return command.args().fold(32usize, |sum, key| {
+                    sum.saturating_add(store.reply_value_bound(key, now_ms))
+                });
+            }
+        }
+        if name.eq_ignore_ascii_case(b"PING") && command.argc() == 1 {
+            return command.args().next().unwrap().len().saturating_add(32);
+        }
+        128
+    }
+
     pub fn dispatch_frame(
         &self,
         store: &mut CacheStore,

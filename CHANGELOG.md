@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Shared RESP reactor buffer admission — 2026-11-27
+- **Reserve retained connection vector capacity before growth**, with a shared optional cross-reactor byte budget and RAII release. Preflight conservative reply size before execution and avoid a synchronous response scratch copy. Close on budget exhaustion; this is not a full-process RSS cap.
+
 ### RESP cache admission limits — 2026-11-27
 - **Bound physical entries and initialized arena extent per shard**, with fallible cache writes and RESP OOM errors. Preflight whole MSET batches before mutation; expose estimated retained allocation capacity separately. Default limits are one million entries and 256 MiB of arena extent; these are not process RSS caps.
 
