@@ -110,6 +110,21 @@ impl BufferLease {
         }
         Ok(())
     }
+
+    /// Release a drained vector's allocation before returning its charge.
+    /// Never discard bytes still needed by the parser or socket writer.
+    fn release_empty(&mut self, buffer: &mut Vec<u8>) {
+        if !buffer.is_empty() {
+            return;
+        }
+        let capacity = buffer.capacity();
+        if capacity == 0 {
+            return;
+        }
+        drop(std::mem::take(buffer));
+        self.charged -= capacity;
+        self.budget.inner.used.fetch_sub(capacity, Ordering::AcqRel);
+    }
 }
 impl Drop for BufferLease {
     fn drop(&mut self) {
@@ -552,6 +567,11 @@ impl CacheShardServer {
             return Err(ConnectionAction::Close);
         }
 
+        // A quiescent connection must not keep its high-water allocation
+        // charged indefinitely. Incomplete frames and unsent replies retain
+        // their reservations until they drain or the connection closes.
+        connection.lease.release_empty(&mut connection.input);
+        connection.lease.release_empty(&mut connection.output);
         Ok(())
     }
 
@@ -928,45 +948,111 @@ mod tests {
         server.buffer_budget = CacheBufferBudget::new(512);
         let addr = server.local_addr().unwrap();
         let ping = b"*1\r\n$4\r\nPING\r\n";
+
+        // Incomplete frames are live data and must retain their charges.
         let mut first = StdTcpStream::connect(addr).unwrap();
         first
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
-        first.write_all(ping).unwrap();
+        first.write_all(&ping[..5]).unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        assert_eq!(server.buffer_budget.used_bytes(), 256);
+
+        let mut second = StdTcpStream::connect(addr).unwrap();
+        second.write_all(&ping[..5]).unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        assert_eq!(server.connection_count(), 2);
+        assert_eq!(server.buffer_budget.used_bytes(), 512);
+
+        let mut third = StdTcpStream::connect(addr).unwrap();
+        third.write_all(ping).unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        assert_eq!(server.connection_count(), 2);
+        assert_eq!(server.buffer_budget.used_bytes(), 512);
+
+        drop(second);
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        assert_eq!(server.connection_count(), 1);
+        assert_eq!(server.buffer_budget.used_bytes(), 256);
+
+        first.write_all(&ping[5..]).unwrap();
         for _ in 0..8 {
             server.poll_once(Some(Duration::from_millis(5))).unwrap();
         }
         let mut response = [0; 7];
         first.read_exact(&mut response).unwrap();
         assert_eq!(&response, b"+PONG\r\n");
-        assert_eq!(server.buffer_budget.used_bytes(), 512);
-
-        let mut second = StdTcpStream::connect(addr).unwrap();
-        second.write_all(ping).unwrap();
-        for _ in 0..8 {
-            server.poll_once(Some(Duration::from_millis(5))).unwrap();
-        }
         assert_eq!(server.connection_count(), 1);
-        assert_eq!(server.buffer_budget.used_bytes(), 512);
-        drop(first);
-        for _ in 0..8 {
-            server.poll_once(Some(Duration::from_millis(5))).unwrap();
-        }
-        assert_eq!(server.connection_count(), 0);
         assert_eq!(server.buffer_budget.used_bytes(), 0);
-        let mut third = StdTcpStream::connect(addr).unwrap();
-        third
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        third.write_all(&ping[..5]).unwrap();
+    }
+
+    #[test]
+    fn test_idle_clients_release_capacity_without_disconnecting() {
+        let mut server = build_server();
+        server.config.max_input_buffer = 256;
+        server.config.max_output_buffer = 256;
+        server.buffer_budget = CacheBufferBudget::new(512);
+        let addr = server.local_addr().unwrap();
+        let ping = b"*1\r\n$4\r\nPING\r\n";
+        let mut clients = Vec::new();
         for _ in 0..4 {
-            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+            let mut client = StdTcpStream::connect(addr).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            client.write_all(ping).unwrap();
+            for _ in 0..8 {
+                server.poll_once(Some(Duration::from_millis(5))).unwrap();
+            }
+            let mut response = [0; 7];
+            client.read_exact(&mut response).unwrap();
+            assert_eq!(&response, b"+PONG\r\n");
+            assert_eq!(server.buffer_budget.used_bytes(), 0);
+            clients.push(client);
         }
-        third.write_all(&ping[5..]).unwrap();
+        assert_eq!(server.connection_count(), 4);
+        clients[0].write_all(ping).unwrap();
         for _ in 0..8 {
             server.poll_once(Some(Duration::from_millis(5))).unwrap();
         }
-        third.read_exact(&mut response).unwrap();
+        let mut response = [0; 7];
+        clients[0].read_exact(&mut response).unwrap();
         assert_eq!(&response, b"+PONG\r\n");
+        assert_eq!(server.buffer_budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn test_release_empty_is_idempotent_and_preserves_live_bytes() {
+        let budget = CacheBufferBudget::new(128);
+        let mut lease = budget.lease();
+        let mut input = Vec::new();
+        let mut output = Vec::new();
+        lease.reserve(&mut input, 32, 64).unwrap();
+        lease.reserve(&mut output, 32, 64).unwrap();
+        output.extend_from_slice(b"unsent");
+        lease.release_empty(&mut output);
+        assert_eq!(&output, b"unsent");
+        assert_eq!(budget.used_bytes(), 128);
+        lease.release_empty(&mut input);
+        lease.release_empty(&mut input);
+        assert_eq!(input.capacity(), 0);
+        assert_eq!(budget.used_bytes(), 64);
+        output.clear();
+        lease.release_empty(&mut output);
+        assert_eq!(budget.used_bytes(), 0);
+        lease.reserve(&mut input, 32, 64).unwrap();
+        assert_eq!(budget.used_bytes(), 64);
+        drop(input);
+        drop(output);
+        drop(lease);
+        assert_eq!(budget.used_bytes(), 0);
     }
 }

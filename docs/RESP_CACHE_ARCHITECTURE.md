@@ -221,9 +221,11 @@ The redirect-only cache reactor reserves input/output vector capacity before
 growth, with a default 256 MiB aggregate connection budget per reactor.
 Embedders can pass the same CacheBufferBudget to CacheShardServer::bind_with_budget
 on multiple reactors for a shared process-level connection-buffer allowance.
-The default bind method creates its own budget. Capacity stays charged while
-retained, including idle connections, and RAII releases it on disconnect or
-reactor teardown. Admission or allocation failure closes the offending
+The default bind method creates its own budget. Capacity stays charged while retained. After each successful reactor drive,
+fully drained input and output vectors release their allocations and charges
+even when the connection remains open. Incomplete frames and unsent replies
+retain capacity until they drain; RAII releases remaining charges on
+disconnect or reactor teardown. Admission or allocation failure closes the offending
 connection rather than letting buffers grow without limit.
 
 Before executing a complete command, the reactor conservatively sizes its
@@ -239,8 +241,11 @@ overhead and transient reallocation, OS socket buffers, connection metadata,
 topology and MSET preflight scratch, cache store memory, and asynchronous
 cross-shard queues are separate. Conservative reply bounds may reject a
 response that would fit if encoded exactly; the policy is close-on-pressure
-rather than waiting or evicting another connection. Fairness, idle-capacity
-reclamation and full-system memory qualification remain future work.
+rather than waiting or evicting another connection. Immediate reclamation of
+empty vectors trades allocation reuse for predictable idle memory availability;
+benchmark the effect on short request/response workloads. Fair scheduling,
+partial-frame deadlines and full-system memory qualification remain future
+work.
 ## Reference-server verification
 
 The explicit same-slot RESP2 differential example starts a fresh local Redis or Valkey
