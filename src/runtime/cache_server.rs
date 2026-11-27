@@ -551,6 +551,28 @@ impl CacheShardServer {
         }
     }
 
+    /// Explicit maintenance checkpoint on the owning reactor thread.
+    /// The reactor does not serve commands while the replacement is written.
+    #[cfg(unix)]
+    pub fn checkpoint(&mut self) -> Result<super::cache_wal::CheckpointReport, CacheServerError> {
+        self.ensure_healthy()?;
+        let now = self.clock.now_ms();
+        let result = match &mut self.backend {
+            CacheBackend::Memory(_) => {
+                return Err(CacheServerError::InvalidConfig(
+                    "checkpoint requires durable mode",
+                ))
+            }
+            CacheBackend::Durable { cache, anchor } => {
+                let time = durable_clock(*anchor, now).map_err(CacheServerError::Durability)?;
+                cache.checkpoint(time).map_err(CacheServerError::Durability)
+            }
+        };
+        // Ambiguous publication must stop the entire shard, not just writes.
+        self.ensure_healthy()?;
+        result
+    }
+
     fn ensure_healthy(&mut self) -> Result<(), CacheServerError> {
         #[cfg(unix)]
         if matches!(&self.backend, CacheBackend::Durable { cache, .. } if cache.is_poisoned()) {
@@ -1494,5 +1516,40 @@ mod tests {
                 matches!(cache.ttl(b"a{t}", recovered.clock.now_ms()).unwrap(), super::super::cache::CacheTtl::RemainingMs(ms) if ms > 0 && ms <= 60_000)
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_durable_reactor_checkpoint_recovers_and_resumes_tcp_service() {
+        let tmp = DurableTestDir::new();
+        let journal = tmp.0.join("checkpoint.wal");
+        let mut server = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        let mut client = connect_client(&server);
+        for _ in 0..4 {
+            roundtrip(
+                &mut server,
+                &mut client,
+                b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n",
+                b"+OK\r\n",
+            );
+        }
+        let report = server.checkpoint().unwrap();
+        assert_eq!(report.entries, 1);
+        assert!(report.after_bytes < report.before_bytes);
+        roundtrip(
+            &mut server,
+            &mut client,
+            b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$3\r\nnew\r\n",
+            b"+OK\r\n",
+        );
+        drop(server);
+        let mut recovered = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        let mut client = connect_client(&recovered);
+        roundtrip(
+            &mut recovered,
+            &mut client,
+            b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
+            b"$3\r\nnew\r\n",
+        );
     }
 }

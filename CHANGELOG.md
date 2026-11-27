@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Atomic durable cache checkpoints — 2026-11-27
+- **Compact durable cache history using an atomically published, checksummed checkpoint journal** with a mandatory snapshot prefix, monotonic sequence continuation, stable writer lock, preserved TTLs, and fail-stop on ambiguous publication. Explicit native and reactor maintenance APIs reclaim journal capacity without cloning live values.
+
 ### Optional durable RESP reactor — 2026-11-27
 - **Integrate memory, buffered journal and synchronized journal backends** with shared RESP validation, restart recovery, bounded response allocation, and shard-wide fail-stop after ambiguous journal failure. Durable mode is Unix-only and opt-in; direct store access is memory-only.
 
