@@ -1669,15 +1669,23 @@ impl Middleware {
                 ));
             }
             Middleware::RequestLog => {
-                eprintln!(
-                    "{} {} -> {}",
-                    request.method.as_str(),
-                    request.path,
-                    response.status
-                );
+                // Format before locking stderr so one complete record is emitted
+                // instead of separate writes for each formatting fragment.
+                // Keep the existing stderr stream and panic-on-write-error behavior.
+                let line = request_log_line(request, response.status);
+                eprint!("{line}");
             }
         }
     }
+}
+
+fn request_log_line(request: &HttpRequest, status: u16) -> String {
+    format!(
+        "{} {} -> {}\n",
+        request.method.as_str(),
+        request.path,
+        status
+    )
 }
 
 /// Match a route pattern against a request path, returning captured parameters.
@@ -4378,6 +4386,23 @@ mod tests {
                 assert_eq!(current_request_method(), Some("POST".to_string()));
             },
         );
+    }
+
+    #[test]
+    fn test_request_log_line_preserves_format() {
+        let mut request = HttpRequest {
+            method: HttpMethod::Get,
+            path: "/assets/app.js?version=2".into(),
+            headers: vec![("Authorization".into(), "not-logged".into())],
+            body: b"not-logged".to_vec(),
+        };
+        assert_eq!(
+            request_log_line(&request, 304),
+            "GET /assets/app.js?version=2 -> 304\n"
+        );
+        request.method = HttpMethod::Post;
+        request.path = "/café".into();
+        assert_eq!(request_log_line(&request, 403), "POST /café -> 403\n");
     }
 
     #[test]
