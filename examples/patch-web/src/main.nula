@@ -1,0 +1,45 @@
+// An HTML fragment response updates one element without reloading the page.
+// Run: nulang nula dev (from this directory) and open http://localhost:8080.
+import stdlib::web::html
+import stdlib::web::types
+import stdlib::web::host
+
+fn current_message() {
+    let value = kv_get("patch-web-message")
+    let display = if value == "" then { "Nothing submitted yet" } else { value }
+    el("p", [("id", text("current-message"))], [text(display)])
+}
+
+fn home() {
+    document(
+        head([title("Progressive HTML patches — Nulang")]),
+        body([
+            el("h1", [], [text("HTML patch demo")]),
+            current_message(),
+            el("form", [
+                ("method", text("POST")),
+                ("data-action", text("save_message")),
+                ("data-action-placement", text("server")),
+                ("data-nulang-target", text("#current-message"))
+            ], [
+                el("label", [], [text("Message"), el("input", [
+                    ("name", text("message")),
+                    ("required", text("required"))
+                ], [])]),
+                el("button", [("type", text("submit"))], [text("Save")])
+            ])
+        ])
+    )
+}
+
+fn save_message() {
+    let msg = form_value("message")
+    kv_set("patch-web-message", msg)
+    // The target ID must occur in both the displayed page and the response.
+    current_message()
+}
+
+app "patch-web" {
+    route "GET" "/" -> home
+    route "POST" "/" -> save_message
+}

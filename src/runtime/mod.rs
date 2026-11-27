@@ -119,7 +119,8 @@ pub use gc::{ForeignRefOp, GcStats, OrcaCoordinator, OrcaGc, OrcaHeap};
 pub use grain::*;
 pub use heap::*;
 pub use http_server::{
-    render_route_handler, HttpMethod, HttpServerState, WebDevServer, WebRoute, WebServerOptions,
+    render_route_handler, HttpMethod, HttpServerState, ScopedUiPublisher, ScopedUiRoomAuthorizer,
+    WebDevServer, WebRoute, WebServerOptions,
 };
 pub use mailbox::*;
 pub use network::NetworkTransport;
