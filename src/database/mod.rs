@@ -7,6 +7,8 @@
 pub mod checkpoint;
 pub mod indexed_sst;
 pub mod optimistic;
+#[cfg(unix)]
+pub mod sst_manifest;
 pub mod store;
 pub mod tablet;
 pub mod wal;
