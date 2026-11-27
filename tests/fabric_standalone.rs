@@ -384,4 +384,11 @@ fn mutual_tls_requires_trusted_client_certificate() {
     let mut pong = [0; 7];
     allowed.read_exact(&mut pong).unwrap();
     assert_eq!(&pong, b"+PONG\r\n");
+    // A single encrypted pipeline spans multiple command quanta.
+    allowed
+        .write_all(&b"*1\r\n$4\r\nPING\r\n".repeat(96))
+        .unwrap();
+    let mut pongs = vec![0; 96 * 7];
+    allowed.read_exact(&mut pongs).unwrap();
+    assert_eq!(pongs, b"+PONG\r\n".repeat(96));
 }

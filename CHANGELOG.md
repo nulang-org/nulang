@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Fabric cooperative reactor fairness — 2026-11-27
+- **Bound per-turn listener, connection and inbox work** with explicit deduplicated readiness continuations for edge-triggered I/O, retain preflighted pipeline ordering across command yields, and qualify competing clients, accept bursts and large/ encrypted replies. No dependency changes.
+
 ### Fabric adversarial transport admission — 2026-11-27
 - **Enforce buffered pipeline depth before command execution**, cap reactor polling by the earliest TLS handshake deadline, and fail closed on unexpected response-buffer growth. Add deterministic connection admission/deadline regressions and authenticated oversized request and amplified-response qualification.
 

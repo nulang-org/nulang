@@ -39,6 +39,11 @@ use std::{
 const LISTENER_TOKEN: Token = Token(0);
 const WAKE_TOKEN: Token = Token(1);
 const FIRST_CONNECTION_TOKEN: usize = 2;
+const ACCEPT_QUANTUM: usize = 32;
+const COMMAND_QUANTUM: usize = 32;
+const READ_QUANTUM: usize = 32;
+const WRITE_QUANTUM: usize = 32;
+const IO_CHUNK_BYTES: usize = 16 * 1024;
 
 /// Shared limit on retained connection input/output vector capacity.
 /// Clone this budget into multiple shard reactors to share one process allowance.
@@ -308,6 +313,7 @@ struct CacheConnection {
     writable_interest: bool,
     tls: Option<Box<rustls::ServerConnection>>,
     accepted_at: Instant,
+    commands_remaining: usize,
 }
 
 impl CacheConnection {
@@ -322,6 +328,7 @@ impl CacheConnection {
             writable_interest: false,
             tls: None,
             accepted_at: Instant::now(),
+            commands_remaining: 0,
         }
     }
 
@@ -339,24 +346,40 @@ impl CacheConnection {
 
     // Drain plaintext before reading more encrypted records. The outer
     // reactor retains its existing application-buffer admission policy.
-    fn read_plaintext(&mut self, scratch: &mut [u8]) -> io::Result<usize> {
+    // None means the quantum ran out before reaching WouldBlock.
+    fn read_plaintext(
+        &mut self,
+        scratch: &mut [u8],
+        remaining: &mut usize,
+    ) -> io::Result<Option<usize>> {
         let Some(tls) = &mut self.tls else {
-            return self.stream.read(scratch);
+            if *remaining == 0 {
+                return Ok(None);
+            }
+            *remaining -= 1;
+            return self.stream.read(scratch).map(Some);
         };
         loop {
+            if *remaining == 0 {
+                return Ok(None);
+            }
             if tls.is_handshaking() && self.accepted_at.elapsed() >= TLS_HANDSHAKE_TIMEOUT {
                 return Err(io::ErrorKind::TimedOut.into());
             }
             if !tls.is_handshaking() {
+                *remaining -= 1;
                 match tls.reader().read(scratch) {
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                    result => return result,
+                    result => return result.map(Some),
                 }
             }
-            // rustls bounds its internal record/handshake buffers.
+            if *remaining == 0 {
+                return Ok(None);
+            }
+            *remaining -= 1;
             let n = tls.read_tls(&mut self.stream)?;
             if n == 0 {
-                return Ok(0);
+                return Ok(Some(0));
             }
             tls.process_new_packets().map_err(io::Error::other)?;
         }
@@ -398,6 +421,26 @@ struct ReadyEvent {
     error: bool,
     read_closed: bool,
     write_closed: bool,
+}
+
+impl ReadyEvent {
+    fn continuation(token: Token, readable: bool, writable: bool) -> Self {
+        Self {
+            token,
+            readable,
+            writable,
+            error: false,
+            read_closed: false,
+            write_closed: false,
+        }
+    }
+    fn merge(&mut self, other: Self) {
+        self.readable |= other.readable;
+        self.writable |= other.writable;
+        self.error |= other.error;
+        self.read_closed |= other.read_closed;
+        self.write_closed |= other.write_closed;
+    }
 }
 
 /// Explicit durable mode configuration. Memory mode remains the default bind API.
@@ -478,6 +521,7 @@ pub struct CacheShardServer {
     poll: Poll,
     events: Events,
     ready: Vec<ReadyEvent>,
+    deferred: HashMap<Token, ReadyEvent>,
     listener: Option<TcpListener>,
     dispatcher: CacheDispatcher,
     inbox: CacheShardInbox,
@@ -628,6 +672,7 @@ impl CacheShardServer {
         Ok(Self {
             events: Events::with_capacity(config.events_capacity),
             ready: Vec::with_capacity(config.events_capacity),
+            deferred: HashMap::new(),
             poll,
             listener: Some(listener),
             dispatcher,
@@ -802,6 +847,7 @@ impl CacheShardServer {
             for (_, mut connection) in self.connections.drain() {
                 let _ = self.poll.registry().deregister(&mut connection.stream);
             }
+            self.deferred.clear();
             self.close_listener();
             self.shutdown.store(true, Ordering::Release);
             return Err(CacheServerError::DurableShardPoisoned);
@@ -838,6 +884,7 @@ impl CacheShardServer {
     fn finish_shutdown(&mut self, timeout: Duration) -> Result<(), CacheServerError> {
         self.ensure_healthy()?;
         self.close_listener();
+        self.deferred.clear();
         let start = Instant::now();
         // Attempt a nonblocking flush only for replies already encoded.
         // Drop incomplete/unexecuted input and idle clients immediately.
@@ -940,17 +987,25 @@ impl CacheShardServer {
                 self.close_connection(token);
             }
         }
+        // Coalesce kernel readiness and deferred work. Each token gets
+        // at most one turn per iteration, even if both sources report it.
         self.ready.clear();
         for event in self.events.iter() {
-            self.ready.push(ReadyEvent {
+            let event = ReadyEvent {
                 token: event.token(),
                 readable: event.is_readable(),
                 writable: event.is_writable(),
                 error: event.is_error(),
                 read_closed: event.is_read_closed(),
                 write_closed: event.is_write_closed(),
-            });
+            };
+            self.deferred
+                .entry(event.token)
+                .and_modify(|old| old.merge(event))
+                .or_insert(event);
         }
+        self.ready
+            .extend(self.deferred.drain().map(|(_, event)| event));
 
         for index in 0..self.ready.len() {
             if self.shutdown.load(Ordering::Acquire) {
@@ -972,6 +1027,9 @@ impl CacheShardServer {
     }
 
     fn poll_timeout(&self, requested: Option<Duration>) -> Option<Duration> {
+        if !self.deferred.is_empty() {
+            return Some(Duration::ZERO);
+        }
         let now = Instant::now();
         let mut deadline = self.next_expiry_sweep.saturating_duration_since(now);
         if self.mutual_tls.is_some() {
@@ -1009,7 +1067,7 @@ impl CacheShardServer {
     }
 
     fn accept_ready(&mut self) -> Result<(), CacheServerError> {
-        loop {
+        for _ in 0..ACCEPT_QUANTUM {
             if self.shutdown.load(Ordering::Acquire) {
                 return Ok(());
             }
@@ -1026,7 +1084,9 @@ impl CacheShardServer {
                         continue;
                     }
 
-                    stream.set_nodelay(true)?;
+                    if stream.set_nodelay(true).is_err() {
+                        continue;
+                    }
                     let token = self.allocate_connection_token();
                     self.poll
                         .registry()
@@ -1040,24 +1100,46 @@ impl CacheShardServer {
                     }
                     self.connections.insert(token, connection);
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    continue
+                }
                 Err(error) => return Err(CacheServerError::Io(error)),
             }
         }
+        self.defer(ReadyEvent::continuation(LISTENER_TOKEN, true, false));
         Ok(())
+    }
+
+    fn defer(&mut self, event: ReadyEvent) {
+        self.deferred
+            .entry(event.token)
+            .and_modify(|old| old.merge(event))
+            .or_insert(event);
     }
 
     fn handle_wake(&mut self) -> Result<(), CacheServerError> {
         match &mut self.backend {
             CacheBackend::Memory(store) => {
-                self.inbox.drain(store, self.config.max_inbox_batch);
+                if self.inbox.drain(store, self.config.max_inbox_batch)
+                    == self.config.max_inbox_batch
+                {
+                    self.defer(ReadyEvent::continuation(WAKE_TOKEN, false, false));
+                }
             }
             #[cfg(unix)]
             CacheBackend::Durable { .. } => {
                 if self.inbox.reject_pending(self.config.max_inbox_batch)
                     == self.config.max_inbox_batch
                 {
-                    self.waker.wake()?;
+                    self.defer(ReadyEvent::continuation(WAKE_TOKEN, false, false));
                 }
             }
         }
@@ -1088,9 +1170,13 @@ impl CacheShardServer {
 
         let result = self.drive_connection_inner(&mut connection, readable, writable);
         match result {
-            Ok(()) => {
+            Ok((read_again, write_again)) => {
                 self.update_interest(token, &mut connection)?;
+                let resume = read_again || write_again || connection.commands_remaining != 0;
                 self.connections.insert(token, connection);
+                if resume {
+                    self.defer(ReadyEvent::continuation(token, read_again, write_again));
+                }
             }
             Err(ConnectionAction::Close) => {
                 let _ = self.poll.registry().deregister(&mut connection.stream);
@@ -1104,52 +1190,64 @@ impl CacheShardServer {
         connection: &mut CacheConnection,
         readable: bool,
         writable: bool,
-    ) -> Result<(), ConnectionAction> {
-        if readable
-            && !self.shutdown.load(Ordering::Acquire)
-            && self.read_connection(connection).is_err()
+    ) -> Result<(bool, bool), ConnectionAction> {
+        let mut read_again = readable;
+        // Finish the preflighted batch before adding more input. Preserve a
+        // readable continuation if a new edge arrived while dispatch yielded.
+        if readable && connection.commands_remaining == 0 && !self.shutdown.load(Ordering::Acquire)
         {
-            return Err(ConnectionAction::Close);
+            read_again = self
+                .read_connection(connection)
+                .map_err(|_| ConnectionAction::Close)?;
         }
 
-        if !connection.handshake_pending() && self.process_input(connection).is_err() {
-            return Err(ConnectionAction::Close);
+        if !connection.handshake_pending() {
+            self.process_input(connection)?;
         }
 
         if connection.pending_output() > self.config.max_output_buffer {
             return Err(ConnectionAction::Close);
         }
 
-        if (writable || connection.has_pending_wire())
-            && Self::flush_connection(connection).is_err()
-        {
-            return Err(ConnectionAction::Close);
+        let mut write_again = false;
+        if writable || connection.has_pending_wire() {
+            let mut remaining = WRITE_QUANTUM;
+            Self::flush_connection_while(connection, || {
+                if remaining == 0 {
+                    return false;
+                }
+                remaining -= 1;
+                true
+            })
+            .map_err(|_| ConnectionAction::Close)?;
+            write_again = remaining == 0 && connection.has_pending_wire();
         }
 
-        // A quiescent connection must not keep its high-water allocation
-        // charged indefinitely. Incomplete frames and unsent replies retain
-        // their reservations until they drain or the connection closes.
+        // Reclaim only empty allocations. A yielded batch retains its input.
         connection.lease.release_empty(&mut connection.input);
         connection.lease.release_empty(&mut connection.output);
-        Ok(())
+        Ok((read_again, write_again))
     }
 
-    fn read_connection(&self, connection: &mut CacheConnection) -> io::Result<()> {
+    // True means there may be unread kernel/TLS data; schedule another turn.
+    fn read_connection(&self, connection: &mut CacheConnection) -> io::Result<bool> {
         connection.compact_input();
-        let mut scratch = [0u8; 16 * 1024];
+        let mut scratch = [0u8; IO_CHUNK_BYTES];
+        let mut remaining = READ_QUANTUM;
 
         loop {
             if self.shutdown.load(Ordering::Acquire) {
-                return Ok(());
+                return Ok(false);
             }
-            match connection.read_plaintext(&mut scratch) {
-                Ok(0) => {
+            match connection.read_plaintext(&mut scratch, &mut remaining) {
+                Ok(None) => return Ok(true),
+                Ok(Some(0)) => {
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
                         "cache client closed connection",
                     ));
                 }
-                Ok(read) => {
+                Ok(Some(read)) => {
                     if connection
                         .input
                         .len()
@@ -1162,7 +1260,6 @@ impl CacheShardServer {
                             "cache input buffer limit exceeded",
                         ));
                     }
-                    // Compact consumed bytes before reserving the next extent.
                     if connection.input_start != 0 {
                         connection.input.copy_within(connection.input_start.., 0);
                         connection
@@ -1178,7 +1275,7 @@ impl CacheShardServer {
                     )?;
                     connection.input.extend_from_slice(&scratch[..read]);
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
                 Err(error) => return Err(error),
             }
         }
@@ -1188,28 +1285,28 @@ impl CacheShardServer {
         // Bound the number of complete commands in a buffered read batch
         // before executing any of that batch. A partial trailing frame is
         // retained for a later read, not counted as a complete command.
-        let mut remaining = &connection.input[connection.input_start..];
-        let mut depth = 0;
-        while !remaining.is_empty() {
-            if self.shutdown.load(Ordering::Acquire) {
-                return Ok(());
+        if connection.commands_remaining == 0 {
+            let mut remaining = &connection.input[connection.input_start..];
+            let mut depth = 0;
+            while !remaining.is_empty() {
+                if self.shutdown.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                let Some((_, consumed)) =
+                    parse_command(remaining).map_err(|_| ConnectionAction::Close)?
+                else {
+                    break;
+                };
+                if depth == self.config.max_pipeline_depth {
+                    return Err(ConnectionAction::Close);
+                }
+                depth += 1;
+                remaining = &remaining[consumed..];
             }
-            let Some((_, consumed)) =
-                parse_command(remaining).map_err(|_| ConnectionAction::Close)?
-            else {
-                break;
-            };
-            if depth == self.config.max_pipeline_depth {
-                return Err(ConnectionAction::Close);
-            }
-            depth += 1;
-            remaining = &remaining[consumed..];
+            connection.commands_remaining = depth;
         }
-        loop {
-            if self.shutdown.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            if connection.input_start == connection.input.len() {
+        for _ in 0..COMMAND_QUANTUM {
+            if self.shutdown.load(Ordering::Acquire) || connection.commands_remaining == 0 {
                 connection.compact_input();
                 return Ok(());
             }
@@ -1217,8 +1314,7 @@ impl CacheShardServer {
             let Some((command, consumed)) =
                 parse_command(input).map_err(|_| ConnectionAction::Close)?
             else {
-                connection.compact_input();
-                return Ok(());
+                return Err(ConnectionAction::Close);
             };
             let now = self.clock.now_ms();
             let sizing_store = match &self.backend {
@@ -1292,6 +1388,7 @@ impl CacheShardServer {
                 return Err(ConnectionAction::Close);
             }
             connection.input_start += consumed;
+            connection.commands_remaining -= 1;
             // Check between pipelined commands as well as between poll cycles.
             #[cfg(unix)]
             if !self.shutdown.load(Ordering::Acquire) {
@@ -1299,8 +1396,11 @@ impl CacheShardServer {
                     .map_err(|_| ConnectionAction::Close)?;
             }
         }
+        connection.compact_input();
+        Ok(())
     }
 
+    #[cfg(test)]
     fn flush_connection(connection: &mut CacheConnection) -> io::Result<()> {
         Self::flush_connection_while(connection, || true)
     }
@@ -1325,7 +1425,7 @@ impl CacheShardServer {
                 if tls.is_handshaking() || connection.output_start == connection.output.len() {
                     break;
                 }
-                let end = (connection.output_start + 16 * 1024).min(connection.output.len());
+                let end = (connection.output_start + IO_CHUNK_BYTES).min(connection.output.len());
                 match tls
                     .writer()
                     .write(&connection.output[connection.output_start..end])
@@ -1339,9 +1439,10 @@ impl CacheShardServer {
             return Ok(());
         }
         while connection.output_start < connection.output.len() && can_write() {
+            let end = (connection.output_start + IO_CHUNK_BYTES).min(connection.output.len());
             match connection
                 .stream
-                .write(&connection.output[connection.output_start..])
+                .write(&connection.output[connection.output_start..end])
             {
                 Ok(0) => {
                     return Err(io::Error::new(
@@ -1381,6 +1482,7 @@ impl CacheShardServer {
     }
 
     fn close_connection(&mut self, token: Token) {
+        self.deferred.remove(&token);
         if let Some(mut connection) = self.connections.remove(&token) {
             let _ = self.poll.registry().deregister(&mut connection.stream);
         }
@@ -2388,6 +2490,114 @@ mod tests {
         let mut response = [0; 7];
         client.read_exact(&mut response).unwrap();
         assert_eq!(&response, b"+PONG\r\n");
+        assert_eq!(server.buffer_budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn accept_burst_yields_and_continues_without_new_connections() {
+        let mut server = build_server();
+        let address = server.local_addr().unwrap();
+        let clients: Vec<_> = (0..40)
+            .map(|_| StdTcpStream::connect(address).unwrap())
+            .collect();
+        server.poll_once(Some(Duration::from_millis(10))).unwrap();
+        assert_eq!(server.connection_count(), 32);
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+            if server.connection_count() == clients.len() {
+                break;
+            }
+        }
+        assert_eq!(server.connection_count(), clients.len());
+    }
+
+    #[test]
+    fn hot_pipeline_yields_to_other_client_and_resumes_in_order() {
+        let mut server = build_server();
+        let address = server.local_addr().unwrap();
+        let mut hot = StdTcpStream::connect(address).unwrap();
+        let mut cold = StdTcpStream::connect(address).unwrap();
+        for client in [&hot, &cold] {
+            client
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+        }
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+            if server.connection_count() == 2 {
+                break;
+            }
+        }
+        hot.write_all(&b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n".repeat(80))
+            .unwrap();
+        cold.write_all(b"*1\r\n$4\r\nPING\r\n").unwrap();
+        server.poll_once(Some(Duration::from_millis(10))).unwrap();
+        assert_eq!(
+            server.store_mut().unwrap().get(b"k", 0),
+            Some(super::super::cache::CacheValueView::Integer(32))
+        );
+        server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        let mut pong = [0; 7];
+        cold.read_exact(&mut pong).unwrap();
+        assert_eq!(&pong, b"+PONG\r\n");
+        assert_eq!(
+            server.store_mut().unwrap().get(b"k", 0),
+            Some(super::super::cache::CacheValueView::Integer(64))
+        );
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        let expected: String = (1..=80).map(|n| format!(":{n}\r\n")).collect();
+        let mut reply = vec![0; expected.len()];
+        hot.read_exact(&mut reply).unwrap();
+        assert_eq!(reply, expected.as_bytes());
+        assert_eq!(server.buffer_budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn large_reply_flush_yields_and_resumes_without_new_client_request() {
+        let mut server = build_server();
+        let address = server.local_addr().unwrap();
+        let mut client = StdTcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let value = vec![b'v'; 768 * 1024];
+        server
+            .store_mut()
+            .unwrap()
+            .set_bytes(b"large", &value, None, 0)
+            .unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+            if server.connection_count() == 1 {
+                break;
+            }
+        }
+        client
+            .write_all(b"*2\r\n$3\r\nGET\r\n$5\r\nlarge\r\n")
+            .unwrap();
+        server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        let connection = server.connections.values().next().unwrap();
+        assert!(connection.pending_output() >= value.len() - WRITE_QUANTUM * IO_CHUNK_BYTES);
+        let expected = [
+            format!("{}{}\r\n", '$', value.len()).as_bytes(),
+            &value,
+            b"\r\n",
+        ]
+        .concat();
+        let reader = std::thread::spawn(move || {
+            let mut actual = vec![0; expected.len()];
+            client.read_exact(&mut actual).unwrap();
+            assert_eq!(actual, expected);
+        });
+        for _ in 0..200 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+            if reader.is_finished() {
+                break;
+            }
+        }
+        reader.join().unwrap();
         assert_eq!(server.buffer_budget.used_bytes(), 0);
     }
 }
