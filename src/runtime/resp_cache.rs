@@ -130,12 +130,171 @@ fn route_key_value_args(mut args: RespArgs<'_>) -> RespCommandSlot {
     RespCommandSlot::Slot(slot)
 }
 
+// Static dispatch keeps the memory-only path free of journal work while sharing
+// all protocol validation and response encoding with the durable backend.
+trait RespBackend {
+    fn get(&mut self, key: &[u8], now: u64) -> Option<CacheValueView<'_>>;
+    fn exists(&mut self, key: &[u8], now: u64) -> bool;
+    fn ttl(&mut self, key: &[u8], now: u64) -> CacheTtl;
+    fn set_bytes(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        ttl: Option<u64>,
+        now: u64,
+    ) -> Result<(), &'static [u8]>;
+    fn set_batch(&mut self, pairs: &[(&[u8], &[u8])], now: u64) -> Result<(), &'static [u8]>;
+    fn delete_many(&mut self, keys: RespArgs<'_>, now: u64) -> Result<usize, &'static [u8]>;
+    fn increment(&mut self, key: &[u8], now: u64) -> Result<i64, &'static [u8]>;
+    fn expire(&mut self, key: &[u8], ttl: u64, now: u64) -> Result<bool, &'static [u8]>;
+}
+
+fn increment_error(error: CacheIncrementError) -> &'static [u8] {
+    match error {
+        CacheIncrementError::Admission(_) => ERR_OOM,
+        CacheIncrementError::NotInteger => ERR_INTEGER,
+        CacheIncrementError::Overflow => b"ERR increment or decrement would overflow",
+    }
+}
+
+impl RespBackend for CacheStore {
+    fn get(&mut self, key: &[u8], now: u64) -> Option<CacheValueView<'_>> {
+        CacheStore::get(self, key, now)
+    }
+    fn exists(&mut self, key: &[u8], now: u64) -> bool {
+        CacheStore::exists(self, key, now)
+    }
+    fn ttl(&mut self, key: &[u8], now: u64) -> CacheTtl {
+        CacheStore::ttl(self, key, now)
+    }
+    fn set_bytes(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        ttl: Option<u64>,
+        now: u64,
+    ) -> Result<(), &'static [u8]> {
+        CacheStore::set_bytes(self, key, value, ttl, now).map_err(|_| ERR_OOM)
+    }
+    fn set_batch(&mut self, pairs: &[(&[u8], &[u8])], now: u64) -> Result<(), &'static [u8]> {
+        CacheStore::set_batch(self, pairs, now).map_err(|_| ERR_OOM)
+    }
+    fn delete_many(&mut self, keys: RespArgs<'_>, now: u64) -> Result<usize, &'static [u8]> {
+        Ok(keys.filter(|key| self.delete_at(key, now)).count())
+    }
+    fn increment(&mut self, key: &[u8], now: u64) -> Result<i64, &'static [u8]> {
+        CacheStore::increment(self, key, 1, now).map_err(increment_error)
+    }
+    fn expire(&mut self, key: &[u8], ttl: u64, now: u64) -> Result<bool, &'static [u8]> {
+        Ok(if ttl == 0 {
+            self.delete_at(key, now)
+        } else {
+            self.expire_ms(key, ttl, now)
+        })
+    }
+}
+
+#[cfg(all(unix, feature = "cache-server"))]
+use super::cache_durable::{CacheTime, DurableCache, DurableError};
+
+#[cfg(all(unix, feature = "cache-server"))]
+fn durable_error(error: DurableError) -> &'static [u8] {
+    match error {
+        DurableError::Admission(_) => ERR_OOM,
+        DurableError::Increment(error) => increment_error(error),
+        DurableError::InvalidTime => ERR_INTEGER,
+        DurableError::Journal(_) | DurableError::Poisoned => b"ERR cache persistence unavailable",
+    }
+}
+
+#[cfg(all(unix, feature = "cache-server"))]
+struct DurableResp<'a> {
+    store: &'a mut DurableCache,
+    time: CacheTime,
+}
+#[cfg(all(unix, feature = "cache-server"))]
+impl RespBackend for DurableResp<'_> {
+    fn get(&mut self, key: &[u8], now: u64) -> Option<CacheValueView<'_>> {
+        self.store.get(key, now).expect("healthy durable read")
+    }
+    fn exists(&mut self, key: &[u8], now: u64) -> bool {
+        self.store.exists(key, now).expect("healthy durable read")
+    }
+    fn ttl(&mut self, key: &[u8], now: u64) -> CacheTtl {
+        self.store.ttl(key, now).expect("healthy durable read")
+    }
+    fn set_bytes(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        ttl: Option<u64>,
+        _: u64,
+    ) -> Result<(), &'static [u8]> {
+        self.store
+            .set_bytes(key, value, ttl, self.time)
+            .map_err(durable_error)
+    }
+    fn set_batch(&mut self, pairs: &[(&[u8], &[u8])], _: u64) -> Result<(), &'static [u8]> {
+        self.store
+            .set_batch(pairs, self.time)
+            .map_err(durable_error)
+    }
+    fn delete_many(&mut self, keys: RespArgs<'_>, _: u64) -> Result<usize, &'static [u8]> {
+        self.store
+            .delete_many(&keys.collect::<Vec<_>>(), self.time)
+            .map_err(durable_error)
+    }
+    fn increment(&mut self, key: &[u8], _: u64) -> Result<i64, &'static [u8]> {
+        self.store
+            .increment(key, 1, self.time)
+            .map_err(durable_error)
+    }
+    fn expire(&mut self, key: &[u8], ttl: u64, _: u64) -> Result<bool, &'static [u8]> {
+        self.store
+            .expire(key, ttl, self.time)
+            .map_err(durable_error)
+    }
+}
+
+#[cfg(all(unix, feature = "cache-server"))]
+pub(super) fn execute_durable_command(
+    store: &mut DurableCache,
+    command: RespCommand<'_>,
+    time: CacheTime,
+    out: &mut Vec<u8>,
+) -> Result<(), DurableError> {
+    if store.is_poisoned() {
+        return Err(DurableError::Poisoned);
+    }
+    let start = out.len();
+    execute_command_inner(
+        &mut DurableResp { store, time },
+        command,
+        time.monotonic_ms,
+        out,
+    );
+    if store.is_poisoned() {
+        out.truncate(start);
+        return Err(DurableError::Poisoned);
+    }
+    Ok(())
+}
+
 /// Execute a validated RESP command against one shard-local cache store.
 ///
 /// Multi-key commands fail with Redis-compatible `CROSSSLOT` before any
 /// mutation when their keys do not share the same logical slot.
 pub fn execute_command(
     store: &mut CacheStore,
+    command: RespCommand<'_>,
+    now_ms: u64,
+    out: &mut Vec<u8>,
+) {
+    execute_command_inner(store, command, now_ms, out);
+}
+
+fn execute_command_inner(
+    store: &mut impl RespBackend,
     command: RespCommand<'_>,
     now_ms: u64,
     out: &mut Vec<u8>,
@@ -175,7 +334,12 @@ fn execute_ping(command: RespCommand<'_>, out: &mut Vec<u8>) {
     }
 }
 
-fn execute_get(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
+fn execute_get(
+    store: &mut impl RespBackend,
+    command: RespCommand<'_>,
+    now_ms: u64,
+    out: &mut Vec<u8>,
+) {
     if command.argc() != 1 {
         wrong_arity(out, b"get");
         return;
@@ -185,7 +349,12 @@ fn execute_get(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, ou
     write_value(store.get(key, now_ms), out);
 }
 
-fn execute_set(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
+fn execute_set(
+    store: &mut impl RespBackend,
+    command: RespCommand<'_>,
+    now_ms: u64,
+    out: &mut Vec<u8>,
+) {
     if command.argc() != 2 && command.argc() != 4 {
         wrong_arity(out, b"set");
         return;
@@ -224,11 +393,16 @@ fn execute_set(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, ou
 
     match store.set_bytes(key, value, ttl_ms, now_ms) {
         Ok(()) => write_simple(out, b"OK"),
-        Err(_) => write_error(out, ERR_OOM),
+        Err(error) => write_error(out, error),
     }
 }
 
-fn execute_del(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
+fn execute_del(
+    store: &mut impl RespBackend,
+    command: RespCommand<'_>,
+    now_ms: u64,
+    out: &mut Vec<u8>,
+) {
     if command.argc() == 0 {
         wrong_arity(out, b"del");
         return;
@@ -238,17 +412,14 @@ fn execute_del(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, ou
         return;
     }
 
-    let mut deleted = 0i64;
-    for key in command.args() {
-        if store.delete_at(key, now_ms) {
-            deleted += 1;
-        }
+    match store.delete_many(command.args(), now_ms) {
+        Ok(deleted) => write_integer(out, deleted as i64),
+        Err(error) => write_error(out, error),
     }
-    write_integer(out, deleted);
 }
 
 fn execute_exists(
-    store: &mut CacheStore,
+    store: &mut impl RespBackend,
     command: RespCommand<'_>,
     now_ms: u64,
     out: &mut Vec<u8>,
@@ -271,25 +442,26 @@ fn execute_exists(
     write_integer(out, count);
 }
 
-fn execute_incr(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
+fn execute_incr(
+    store: &mut impl RespBackend,
+    command: RespCommand<'_>,
+    now_ms: u64,
+    out: &mut Vec<u8>,
+) {
     if command.argc() != 1 {
         wrong_arity(out, b"incr");
         return;
     }
 
     let key = command.args().next().expect("validated argument");
-    match store.increment(key, 1, now_ms) {
+    match store.increment(key, now_ms) {
         Ok(value) => write_integer(out, value),
-        Err(CacheIncrementError::Admission(_)) => write_error(out, ERR_OOM),
-        Err(CacheIncrementError::NotInteger) => write_error(out, ERR_INTEGER),
-        Err(CacheIncrementError::Overflow) => {
-            write_error(out, b"ERR increment or decrement would overflow")
-        }
+        Err(error) => write_error(out, error),
     }
 }
 
 fn execute_expire(
-    store: &mut CacheStore,
+    store: &mut impl RespBackend,
     command: RespCommand<'_>,
     now_ms: u64,
     out: &mut Vec<u8>,
@@ -306,19 +478,27 @@ fn execute_expire(
         return;
     };
 
-    let changed = if seconds <= 0 {
-        store.delete_at(key, now_ms)
+    let ttl = if seconds <= 0 {
+        0
     } else {
         let Some(ttl_ms) = (seconds as u64).checked_mul(1_000) else {
             write_error(out, ERR_INTEGER);
             return;
         };
-        store.expire_ms(key, ttl_ms, now_ms)
+        ttl_ms
     };
-    write_integer(out, if changed { 1 } else { 0 });
+    match store.expire(key, ttl, now_ms) {
+        Ok(changed) => write_integer(out, i64::from(changed)),
+        Err(error) => write_error(out, error),
+    }
 }
 
-fn execute_ttl(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
+fn execute_ttl(
+    store: &mut impl RespBackend,
+    command: RespCommand<'_>,
+    now_ms: u64,
+    out: &mut Vec<u8>,
+) {
     if command.argc() != 1 {
         wrong_arity(out, b"ttl");
         return;
@@ -334,7 +514,12 @@ fn execute_ttl(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, ou
     write_integer(out, ttl);
 }
 
-fn execute_mget(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
+fn execute_mget(
+    store: &mut impl RespBackend,
+    command: RespCommand<'_>,
+    now_ms: u64,
+    out: &mut Vec<u8>,
+) {
     if command.argc() == 0 {
         wrong_arity(out, b"mget");
         return;
@@ -350,7 +535,12 @@ fn execute_mget(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, o
     }
 }
 
-fn execute_mset(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
+fn execute_mset(
+    store: &mut impl RespBackend,
+    command: RespCommand<'_>,
+    now_ms: u64,
+    out: &mut Vec<u8>,
+) {
     if command.argc() == 0 || !command.argc().is_multiple_of(2) {
         wrong_arity(out, b"mset");
         return;
@@ -370,7 +560,7 @@ fn execute_mset(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, o
     }
     match store.set_batch(&pairs, now_ms) {
         Ok(()) => write_simple(out, b"OK"),
-        Err(_) => write_error(out, ERR_OOM),
+        Err(error) => write_error(out, error),
     }
 }
 

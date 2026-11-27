@@ -24,6 +24,17 @@ use super::cache_dispatch::{
     CacheShardInbox,
 };
 use super::resp::parse_command;
+#[cfg(unix)]
+use super::{
+    cache::CacheLimits,
+    cache_durable::{CacheTime, DurableCache, DurableError},
+    cache_wal::{WalLimits, WalSync},
+};
+#[cfg(unix)]
+use std::{
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 const LISTENER_TOKEN: Token = Token(0);
 const WAKE_TOKEN: Token = Token(1);
@@ -169,6 +180,10 @@ pub enum CacheServerError {
     Io(io::Error),
     DispatchConfig(CacheDispatchConfigError),
     RedirectModeRequired,
+    #[cfg(unix)]
+    Durability(DurableError),
+    #[cfg(unix)]
+    DurableShardPoisoned,
     InvalidConfig(&'static str),
 }
 
@@ -300,6 +315,39 @@ struct ReadyEvent {
     write_closed: bool,
 }
 
+/// Explicit durable mode configuration. Memory mode remains the default bind API.
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub struct CacheDurableConfig {
+    pub path: PathBuf,
+    pub cache_limits: CacheLimits,
+    pub wal_limits: WalLimits,
+    pub sync: WalSync,
+}
+
+enum CacheBackend {
+    Memory(CacheStore),
+    #[cfg(unix)]
+    Durable {
+        cache: DurableCache,
+        anchor: CacheTime,
+    },
+}
+
+#[cfg(unix)]
+fn durable_clock(anchor: CacheTime, now: u64) -> Result<CacheTime, DurableError> {
+    let elapsed = now
+        .checked_sub(anchor.monotonic_ms)
+        .ok_or(DurableError::InvalidTime)?;
+    Ok(CacheTime {
+        monotonic_ms: now,
+        unix_ms: anchor
+            .unix_ms
+            .checked_add(elapsed)
+            .ok_or(DurableError::InvalidTime)?,
+    })
+}
+
 /// One physical cache shard and its network reactor.
 ///
 /// CacheShardServer requires redirect routing. A client that reaches the wrong
@@ -312,7 +360,7 @@ pub struct CacheShardServer {
     listener: TcpListener,
     dispatcher: CacheDispatcher,
     inbox: CacheShardInbox,
-    store: CacheStore,
+    backend: CacheBackend,
     connections: HashMap<Token, CacheConnection>,
     next_connection_token: usize,
     config: CacheServerConfig,
@@ -342,6 +390,83 @@ impl CacheShardServer {
         dispatcher: CacheDispatcher,
         inbox: CacheShardInbox,
         store: CacheStore,
+        config: CacheServerConfig,
+        clock: CacheServerClock,
+        buffer_budget: CacheBufferBudget,
+    ) -> Result<Self, CacheServerError> {
+        Self::bind_backend(
+            bind_addr,
+            dispatcher,
+            inbox,
+            CacheBackend::Memory(store),
+            config,
+            clock,
+            buffer_budget,
+        )
+    }
+
+    /// Recover a private journal before accepting any network traffic.
+    #[cfg(unix)]
+    pub fn bind_durable(
+        bind_addr: SocketAddr,
+        dispatcher: CacheDispatcher,
+        inbox: CacheShardInbox,
+        durability: CacheDurableConfig,
+        config: CacheServerConfig,
+        clock: CacheServerClock,
+    ) -> Result<Self, CacheServerError> {
+        let budget = CacheBufferBudget::new(config.max_total_connection_bytes);
+        Self::bind_durable_with_budget(
+            bind_addr, dispatcher, inbox, durability, config, clock, budget,
+        )
+    }
+
+    #[cfg(unix)]
+    pub fn bind_durable_with_budget(
+        bind_addr: SocketAddr,
+        dispatcher: CacheDispatcher,
+        inbox: CacheShardInbox,
+        durability: CacheDurableConfig,
+        config: CacheServerConfig,
+        clock: CacheServerClock,
+        buffer_budget: CacheBufferBudget,
+    ) -> Result<Self, CacheServerError> {
+        validate_config(&config)?;
+        if dispatcher.routing_mode() != CacheRoutingMode::Redirect {
+            return Err(CacheServerError::RedirectModeRequired);
+        }
+        let anchor = CacheTime {
+            monotonic_ms: clock.now_ms(),
+            unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+                .ok_or(CacheServerError::Durability(DurableError::InvalidTime))?,
+        };
+        let cache = DurableCache::open(
+            durability.path,
+            durability.cache_limits,
+            durability.wal_limits,
+            durability.sync,
+            anchor,
+        )
+        .map_err(CacheServerError::Durability)?;
+        Self::bind_backend(
+            bind_addr,
+            dispatcher,
+            inbox,
+            CacheBackend::Durable { cache, anchor },
+            config,
+            clock,
+            buffer_budget,
+        )
+    }
+
+    fn bind_backend(
+        bind_addr: SocketAddr,
+        dispatcher: CacheDispatcher,
+        inbox: CacheShardInbox,
+        backend: CacheBackend,
         config: CacheServerConfig,
         clock: CacheServerClock,
         buffer_budget: CacheBufferBudget,
@@ -382,7 +507,7 @@ impl CacheShardServer {
             listener,
             dispatcher,
             inbox,
-            store,
+            backend,
             connections: HashMap::new(),
             next_connection_token: FIRST_CONNECTION_TOKEN,
             config,
@@ -409,15 +534,38 @@ impl CacheShardServer {
         self.connections.len()
     }
 
-    pub fn store(&self) -> &CacheStore {
-        &self.store
+    /// Direct native access is memory-mode only; durable mutations must be journaled.
+    pub fn store(&self) -> Option<&CacheStore> {
+        match &self.backend {
+            CacheBackend::Memory(store) => Some(store),
+            #[cfg(unix)]
+            CacheBackend::Durable { .. } => None,
+        }
     }
 
-    pub fn store_mut(&mut self) -> &mut CacheStore {
-        &mut self.store
+    pub fn store_mut(&mut self) -> Option<&mut CacheStore> {
+        match &mut self.backend {
+            CacheBackend::Memory(store) => Some(store),
+            #[cfg(unix)]
+            CacheBackend::Durable { .. } => None,
+        }
+    }
+
+    fn ensure_healthy(&mut self) -> Result<(), CacheServerError> {
+        #[cfg(unix)]
+        if matches!(&self.backend, CacheBackend::Durable { cache, .. } if cache.is_poisoned()) {
+            for (_, mut connection) in self.connections.drain() {
+                let _ = self.poll.registry().deregister(&mut connection.stream);
+            }
+            let _ = self.poll.registry().deregister(&mut self.listener);
+            self.shutdown.store(true, Ordering::Release);
+            return Err(CacheServerError::DurableShardPoisoned);
+        }
+        Ok(())
     }
 
     pub fn run(&mut self) -> Result<(), CacheServerError> {
+        self.ensure_healthy()?;
         while !self.shutdown.load(Ordering::Acquire) {
             self.poll_once(None)?;
         }
@@ -427,6 +575,7 @@ impl CacheShardServer {
     /// Drive one reactor iteration. A caller-supplied timeout is capped by the
     /// next expiration sweep deadline so TTL reclamation progresses while idle.
     pub fn poll_once(&mut self, timeout: Option<Duration>) -> Result<(), CacheServerError> {
+        self.ensure_healthy()?;
         let timeout = self.poll_timeout(timeout);
         self.poll.poll(&mut self.events, timeout)?;
 
@@ -449,9 +598,10 @@ impl CacheShardServer {
                 WAKE_TOKEN => self.handle_wake()?,
                 token => self.connection_ready(token, event)?,
             }
+            self.ensure_healthy()?;
         }
 
-        self.sweep_expired_if_due();
+        self.sweep_expired_if_due()?;
         Ok(())
     }
 
@@ -465,15 +615,27 @@ impl CacheShardServer {
         }
     }
 
-    fn sweep_expired_if_due(&mut self) {
+    fn sweep_expired_if_due(&mut self) -> Result<(), CacheServerError> {
         let now = Instant::now();
         if now < self.next_expiry_sweep {
-            return;
+            return Ok(());
         }
 
-        self.store
-            .purge_expired(self.clock.now_ms(), self.config.max_expiry_items_per_sweep);
+        let now_ms = self.clock.now_ms();
+        let budget = self.config.max_expiry_items_per_sweep;
+        match &mut self.backend {
+            CacheBackend::Memory(store) => {
+                store.purge_expired(now_ms, budget);
+            }
+            #[cfg(unix)]
+            CacheBackend::Durable { cache, .. } => {
+                cache
+                    .purge_expired(now_ms, budget)
+                    .map_err(CacheServerError::Durability)?;
+            }
+        }
         self.next_expiry_sweep = now + self.config.expiry_sweep_interval;
+        Ok(())
     }
 
     fn accept_ready(&mut self) -> Result<(), CacheServerError> {
@@ -503,8 +665,19 @@ impl CacheShardServer {
     }
 
     fn handle_wake(&mut self) -> Result<(), CacheServerError> {
-        self.inbox
-            .drain(&mut self.store, self.config.max_inbox_batch);
+        match &mut self.backend {
+            CacheBackend::Memory(store) => {
+                self.inbox.drain(store, self.config.max_inbox_batch);
+            }
+            #[cfg(unix)]
+            CacheBackend::Durable { .. } => {
+                if self.inbox.reject_pending(self.config.max_inbox_batch)
+                    == self.config.max_inbox_batch
+                {
+                    self.waker.wake()?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -636,9 +809,16 @@ impl CacheShardServer {
                 return Ok(());
             };
             let now = self.clock.now_ms();
+            let sizing_store = match &self.backend {
+                CacheBackend::Memory(store) => store,
+                #[cfg(unix)]
+                CacheBackend::Durable { cache, .. } => cache
+                    .store_for_sizing()
+                    .map_err(|_| ConnectionAction::Close)?,
+            };
             let bound = self
                 .dispatcher
-                .redirect_reply_bound(&self.store, command, now);
+                .redirect_reply_bound(sizing_store, command, now);
             // The redirect-only server never queues asynchronous replies.
             // Compact already sent bytes and reserve before executing, avoiding
             // the response pipeline's second copy and large MGET amplification.
@@ -658,16 +838,38 @@ impl CacheShardServer {
                     self.config.max_output_buffer,
                 )
                 .map_err(|_| ConnectionAction::Close)?;
-            let outcome = self
-                .dispatcher
-                .dispatch_frame(&mut self.store, input, now, &mut connection.output)
-                .map_err(|_| ConnectionAction::Close)?;
-            match outcome {
-                Some(CacheDispatchOutcome::Executed { consumed: actual })
-                | Some(CacheDispatchOutcome::Redirected {
-                    consumed: actual, ..
-                }) if actual == consumed => {}
-                _ => return Err(ConnectionAction::Close),
+            match &mut self.backend {
+                CacheBackend::Memory(store) => {
+                    let outcome = self
+                        .dispatcher
+                        .dispatch_frame(store, input, now, &mut connection.output)
+                        .map_err(|_| ConnectionAction::Close)?;
+                    match outcome {
+                        Some(CacheDispatchOutcome::Executed { consumed: actual })
+                        | Some(CacheDispatchOutcome::Redirected {
+                            consumed: actual, ..
+                        }) if actual == consumed => {}
+                        _ => return Err(ConnectionAction::Close),
+                    }
+                }
+                #[cfg(unix)]
+                CacheBackend::Durable { cache, anchor } => {
+                    if !self
+                        .dispatcher
+                        .redirect_only(command, &mut connection.output)
+                        .map_err(|_| ConnectionAction::Close)?
+                    {
+                        let time =
+                            durable_clock(*anchor, now).map_err(|_| ConnectionAction::Close)?;
+                        super::resp_cache::execute_durable_command(
+                            cache,
+                            command,
+                            time,
+                            &mut connection.output,
+                        )
+                        .map_err(|_| ConnectionAction::Close)?;
+                    }
+                }
             }
             debug_assert!(connection.output.len() <= required);
             connection.input_start += consumed;
@@ -872,6 +1074,7 @@ mod tests {
         let now = server.clock.now_ms();
         server
             .store_mut()
+            .unwrap()
             .set_bytes(b"ttl", b"value", Some(1), now)
             .unwrap();
 
@@ -879,7 +1082,7 @@ mod tests {
         server.poll_once(Some(Duration::from_millis(1))).unwrap();
 
         let now = server.clock.now_ms();
-        assert!(server.store_mut().get(b"ttl", now).is_none());
+        assert!(server.store_mut().unwrap().get(b"ttl", now).is_none());
     }
 
     #[test]
@@ -926,6 +1129,7 @@ mod tests {
         server.config.max_output_buffer = 256;
         server
             .store_mut()
+            .unwrap()
             .set_bytes(b"k", &[b'x'; 120], None, 0)
             .unwrap();
         let mut client = StdTcpStream::connect(server.local_addr().unwrap()).unwrap();
@@ -937,7 +1141,7 @@ mod tests {
         }
         assert_eq!(server.connection_count(), 0);
         assert_eq!(server.buffer_budget.used_bytes(), 0);
-        assert!(server.store_mut().exists(b"k", 0));
+        assert!(server.store_mut().unwrap().exists(b"k", 0));
     }
 
     #[test]
@@ -1054,5 +1258,241 @@ mod tests {
         drop(output);
         drop(lease);
         assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[cfg(unix)]
+    struct DurableTestDir(PathBuf);
+    #[cfg(unix)]
+    impl DurableTestDir {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "nulang-durable-reactor-{}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for DurableTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    #[cfg(unix)]
+    fn build_durable_server(
+        path: &std::path::Path,
+        sync: WalSync,
+        limits: WalLimits,
+    ) -> CacheShardServer {
+        let placement = CacheSlotMap::new_local(1, 1).unwrap();
+        let owner = placement.owner_for_slot(0).unwrap();
+        let (channels, mut inboxes) = CacheDispatchChannels::new(1, 32).unwrap();
+        let mut endpoints = CacheEndpointMap::new();
+        endpoints.insert(owner, CacheAdvertisedEndpoint::new("127.0.0.1", 7000));
+        let dispatcher = CacheDispatcher::new(1, 0, placement, channels)
+            .unwrap()
+            .with_cluster_redirects(endpoints);
+        CacheShardServer::bind_durable(
+            "127.0.0.1:0".parse().unwrap(),
+            dispatcher,
+            inboxes.remove(0),
+            CacheDurableConfig {
+                path: path.to_path_buf(),
+                cache_limits: CacheLimits::default(),
+                wal_limits: limits,
+                sync,
+            },
+            CacheServerConfig::default(),
+            CacheServerClock::new(),
+        )
+        .unwrap()
+    }
+    #[cfg(unix)]
+    fn connect_client(server: &CacheShardServer) -> StdTcpStream {
+        let client = StdTcpStream::connect(server.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        client
+    }
+    #[cfg(unix)]
+    fn roundtrip(
+        server: &mut CacheShardServer,
+        client: &mut StdTcpStream,
+        request: &[u8],
+        expected: &[u8],
+    ) {
+        client.write_all(request).unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        let mut response = vec![0; expected.len()];
+        client.read_exact(&mut response).unwrap();
+        assert_eq!(response, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_durable_reactor_restarts_and_preserves_mutations() {
+        let tmp = DurableTestDir::new();
+        for mode in [
+            super::super::cache_wal::WalSync::Buffered,
+            super::super::cache_wal::WalSync::Data,
+        ] {
+            let journal = tmp.0.join(format!("{mode:?}.wal"));
+            {
+                let mut server = build_durable_server(
+                    &journal,
+                    mode,
+                    super::super::cache_wal::WalLimits::default(),
+                );
+                assert!(server.store_mut().is_none());
+                let mut client = connect_client(&server);
+                roundtrip(&mut server, &mut client, b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$2\r\n41\r\n*2\r\n$4\r\nINCR\r\n$3\r\nkey\r\n*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n", b"+OK\r\n:42\r\n$2\r\n42\r\n");
+            }
+            let mut server = build_durable_server(
+                &journal,
+                mode,
+                super::super::cache_wal::WalLimits::default(),
+            );
+            let mut client = connect_client(&server);
+            roundtrip(
+                &mut server,
+                &mut client,
+                b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n",
+                b"$2\r\n42\r\n",
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_durable_reactor_poison_closes_every_client_and_recovers() {
+        let tmp = DurableTestDir::new();
+        let journal = tmp.0.join("failure.wal");
+        let mut server = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        let mut first = connect_client(&server);
+        let mut second = connect_client(&server);
+        roundtrip(
+            &mut server,
+            &mut first,
+            b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$3\r\nold\r\n",
+            b"+OK\r\n",
+        );
+        roundtrip(
+            &mut server,
+            &mut second,
+            b"*1\r\n$4\r\nPING\r\n",
+            b"+PONG\r\n",
+        );
+        assert_eq!(server.connection_count(), 2);
+        if let CacheBackend::Durable { cache, .. } = &mut server.backend {
+            cache.fail_next_append();
+        }
+        first
+            .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$3\r\nnew\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+            .unwrap();
+        let mut failed = false;
+        for _ in 0..8 {
+            match server.poll_once(Some(Duration::from_millis(5))) {
+                Err(CacheServerError::DurableShardPoisoned) => {
+                    failed = true;
+                    break;
+                }
+                other => other.unwrap(),
+            }
+        }
+        assert!(failed);
+        assert_eq!(server.connection_count(), 0);
+        assert_eq!(server.buffer_budget.used_bytes(), 0);
+        assert!(matches!(
+            server.poll_once(Some(Duration::ZERO)),
+            Err(CacheServerError::DurableShardPoisoned)
+        ));
+        for client in [&mut first, &mut second] {
+            let mut byte = [0];
+            match client.read(&mut byte) {
+                Ok(0) => {}
+                Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+                other => panic!("poisoned shard served data or remained open: {other:?}"),
+            }
+        }
+        drop(server);
+        let mut recovered = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        let mut client = connect_client(&recovered);
+        roundtrip(
+            &mut recovered,
+            &mut client,
+            b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
+            b"$3\r\nold\r\n",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_durable_reactor_limit_error_does_not_poison_or_mutate() {
+        let tmp = DurableTestDir::new();
+        let journal = tmp.0.join("limit.wal");
+        let mut server = build_durable_server(
+            &journal,
+            WalSync::Data,
+            WalLimits {
+                max_record_bytes: 128,
+                max_file_bytes: 96,
+            },
+        );
+        let mut client = connect_client(&server);
+        roundtrip(
+            &mut server,
+            &mut client,
+            b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n",
+            b"+OK\r\n",
+        );
+        roundtrip(
+            &mut server,
+            &mut client,
+            b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$3\r\nnew\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
+            b"-ERR cache persistence unavailable\r\n$1\r\nv\r\n",
+        );
+        assert_eq!(server.connection_count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_durable_reactor_batches_and_ttl_recovery() {
+        let tmp = DurableTestDir::new();
+        let journal = tmp.0.join("batch.wal");
+        let mut server = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        let mut client = connect_client(&server);
+        roundtrip(&mut server, &mut client,
+            b"*5\r\n$4\r\nMSET\r\n$4\r\na{t}\r\n$1\r\nx\r\n$4\r\nb{t}\r\n$1\r\ny\r\n*3\r\n$4\r\nMGET\r\n$4\r\na{t}\r\n$4\r\nb{t}\r\n*3\r\n$6\r\nEXPIRE\r\n$4\r\na{t}\r\n$2\r\n60\r\n*2\r\n$3\r\nDEL\r\n$4\r\nb{t}\r\n",
+            b"+OK\r\n*2\r\n$1\r\nx\r\n$1\r\ny\r\n:1\r\n:1\r\n");
+        roundtrip(
+            &mut server,
+            &mut client,
+            b"*3\r\n$6\r\nEXISTS\r\n$4\r\na{t}\r\n$4\r\nb{t}\r\n",
+            b":1\r\n",
+        );
+        drop(server);
+        let mut recovered = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        let mut client = connect_client(&recovered);
+        roundtrip(
+            &mut recovered,
+            &mut client,
+            b"*3\r\n$4\r\nMGET\r\n$4\r\na{t}\r\n$4\r\nb{t}\r\n",
+            b"*2\r\n$1\r\nx\r\n$-1\r\n",
+        );
+        if let CacheBackend::Durable { cache, .. } = &mut recovered.backend {
+            assert!(
+                matches!(cache.ttl(b"a{t}", recovered.clock.now_ms()).unwrap(), super::super::cache::CacheTtl::RemainingMs(ms) if ms > 0 && ms <= 60_000)
+            );
+        }
     }
 }

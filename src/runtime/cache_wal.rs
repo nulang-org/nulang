@@ -43,6 +43,8 @@ pub struct CacheWal {
     last_sequence: u64,
     valid_len: u64,
     poisoned: bool,
+    #[cfg(all(test, feature = "cache-server"))]
+    pub(super) fail_next_append: bool,
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -157,6 +159,8 @@ impl CacheWal {
             last_sequence,
             valid_len: position,
             poisoned: false,
+            #[cfg(all(test, feature = "cache-server"))]
+            fail_next_append: false,
         })
     }
 
@@ -168,6 +172,13 @@ impl CacheWal {
     }
 
     pub fn append(&mut self, payload: &[u8], sync: WalSync) -> io::Result<u64> {
+        #[cfg(all(test, feature = "cache-server"))]
+        if std::mem::take(&mut self.fail_next_append) {
+            return self.append_with(payload, sync, |file, header, _, _, _| {
+                file.write_all(&header[..4])?;
+                Err(io::Error::other("injected partial journal write"))
+            });
+        }
         self.append_with(payload, sync, |file, header, payload, digest, sync| {
             file.write_all(header)?;
             file.write_all(payload)?;

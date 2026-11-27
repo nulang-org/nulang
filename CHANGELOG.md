@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Optional durable RESP reactor — 2026-11-27
+- **Integrate memory, buffered journal and synchronized journal backends** with shared RESP validation, restart recovery, bounded response allocation, and shard-wide fail-stop after ambiguous journal failure. Durable mode is Unix-only and opt-in; direct store access is memory-only.
+
 ### Native durable RESP cache mutation coordinator — 2026-11-27
 - **Journal native cache mutations before live publication**, including typed after-images, atomic batches, absolute TTL recovery, admission preflight and fail-stop reads/writes following ambiguous persistence failure. Live RESP reactor integration remains pending.
 
