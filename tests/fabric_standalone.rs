@@ -141,3 +141,53 @@ fn automatic_checkpoint_keeps_small_journal_writable_across_restart() {
     let _server = Server::start(address, &args);
     request(address, GET, b"$5\r\nvalue\r\n");
 }
+
+#[test]
+fn termination_signals_exit_successfully_and_release_journal() {
+    let temp = Temp(std::env::temp_dir().join(format!(
+            "nulang-fabric-stop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )));
+    std::fs::create_dir(&temp.0).unwrap();
+    let path = temp.0.join("stop.wal");
+    let args = ["--mode", "buffered", "--journal", path.to_str().unwrap()];
+    let address = port();
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        let mut server = Server::start(address, &args);
+        request(address, SET, b"+OK\r\n");
+        let mut idle = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
+        idle.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        // Incomplete input must not hold shutdown open.
+        idle.write_all(b"*3\r\n$3\r\nSET\r\n").unwrap();
+        // SAFETY: the PID belongs to our live child process.
+        assert_eq!(
+            unsafe { libc::kill(server.0.id() as libc::pid_t, signal) },
+            0
+        );
+        let start = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = server.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "shutdown timed out"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(status.success(), "signal {signal}: {status}");
+        let mut byte = [0];
+        match idle.read(&mut byte) {
+            Ok(0) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("connection was not closed: {other:?}"),
+        }
+        drop(server);
+        let _recovered = Server::start(address, &args);
+        request(address, GET, b"$5\r\nvalue\r\n");
+    }
+}

@@ -21,6 +21,7 @@ mod unix {
     --checkpoint-percent 0..99 (default 70; 0 disables)
     --checkpoint-min-savings-percent 1..99 (default 10)
     --checkpoint-retry-ms N (default 5000)
+    --shutdown-drain-ms 0..60000 (default 5000)
 
 Loopback-only, single-shard RESP server. No authentication or TLS.
 Durable modes require a private journal path. Memory mode is the default.";
@@ -41,6 +42,7 @@ Durable modes require a private journal path. Memory mode is the default.";
         server: CacheServerConfig,
         wal: WalLimits,
         checkpoint: AutomaticCheckpointConfig,
+        shutdown_drain_ms: u64,
     }
 
     fn positive<T: std::str::FromStr + PartialEq + Default>(
@@ -64,6 +66,7 @@ Durable modes require a private journal path. Memory mode is the default.";
                 server: CacheServerConfig::default(),
                 wal: WalLimits::default(),
                 checkpoint: AutomaticCheckpointConfig::default(),
+                shutdown_drain_ms: 5000,
             };
             let mut seen = HashSet::new();
             let mut args = args.into_iter();
@@ -117,6 +120,14 @@ Durable modes require a private journal path. Memory mode is the default.";
                     }
                     "--checkpoint-retry-ms" => {
                         config.checkpoint.retry_cooldown_ms = positive(&value, &flag)?
+                    }
+                    "--shutdown-drain-ms" => {
+                        config.shutdown_drain_ms = value
+                            .parse()
+                            .map_err(|_| "invalid shutdown drain interval")?;
+                        if config.shutdown_drain_ms > 60_000 {
+                            return Err("shutdown drain interval exceeds 60000 ms".into());
+                        }
                     }
 
                     _ => return Err(format!("unknown option {flag}")),
@@ -203,6 +214,30 @@ Durable modes require a private journal path. Memory mode is the default.";
         }
     }
 
+    // Block termination signals before opening the journal or starting any
+    // thread. A dedicated sigwait thread handles them in ordinary Rust
+    // context, so no allocation, locks, or wake calls occur in a handler.
+    fn block_termination_signals() -> Result<libc::sigset_t, String> {
+        // SAFETY: initialize a POSIX signal set before using it.
+        unsafe {
+            let mut signals = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+            if libc::sigemptyset(signals.as_mut_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            let mut signals = signals.assume_init();
+            if libc::sigaddset(&mut signals, libc::SIGTERM) != 0
+                || libc::sigaddset(&mut signals, libc::SIGINT) != 0
+            {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            let result = libc::pthread_sigmask(libc::SIG_BLOCK, &signals, std::ptr::null_mut());
+            if result != 0 {
+                return Err(std::io::Error::from_raw_os_error(result).to_string());
+            }
+            Ok(signals)
+        }
+    }
+
     pub fn run() -> Result<(), String> {
         let args = std::env::args_os()
             .skip(1)
@@ -217,13 +252,37 @@ Durable modes require a private journal path. Memory mode is the default.";
         }
         let config = Config::parse(args)?;
         let mode = config.mode;
+        let timeout = std::time::Duration::from_millis(config.shutdown_drain_ms);
+        let signals = block_termination_signals()?;
         let mut server = config.bind()?;
+        let control = server.control();
+        let signal_error = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let thread_error = signal_error.clone();
+        std::thread::Builder::new()
+            .name("fabric-signals".into())
+            .spawn(move || {
+                let mut signal = 0;
+                // SAFETY: signals is initialized and blocked in this thread;
+                // sigwait synchronously consumes one of the termination signals.
+                let result = unsafe { libc::sigwait(&signals, &mut signal) };
+                thread_error.store(result, std::sync::atomic::Ordering::Release);
+                control.shutdown();
+            })
+            .map_err(|e| e.to_string())?;
+
         println!(
             "READY {} {mode:?}",
             server.local_addr().map_err(|e| e.to_string())?
         );
         std::io::stdout().flush().map_err(|e| e.to_string())?;
-        server.run().map_err(|e| format!("reactor stopped: {e:?}"))
+        server
+            .run_with_shutdown_timeout(timeout)
+            .map_err(|e| format!("reactor stopped: {e:?}"))?;
+        let result = signal_error.load(std::sync::atomic::Ordering::Acquire);
+        if result != 0 {
+            return Err(std::io::Error::from_raw_os_error(result).to_string());
+        }
+        Ok(())
     }
     #[cfg(test)]
     mod tests {
@@ -299,6 +358,24 @@ Durable modes require a private journal path. Memory mode is the default.";
             ] {
                 assert!(parse(&args).is_err(), "{args:?}");
             }
+        }
+
+        #[test]
+        fn shutdown_drain_duration_is_bounded() {
+            assert_eq!(parse(&[]).unwrap().shutdown_drain_ms, 5000);
+            assert_eq!(
+                parse(&["--shutdown-drain-ms", "0"])
+                    .unwrap()
+                    .shutdown_drain_ms,
+                0
+            );
+            assert_eq!(
+                parse(&["--shutdown-drain-ms", "60000"])
+                    .unwrap()
+                    .shutdown_drain_ms,
+                60000
+            );
+            assert!(parse(&["--shutdown-drain-ms", "60001"]).is_err());
         }
 
         #[test]

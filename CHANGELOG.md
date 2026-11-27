@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Fabric graceful shutdown — 2026-11-27
+- **Handle SIGTERM and SIGINT in the standalone Unix server with synchronous signal waiting**, close listener admission, drain encoded replies to a configurable deadline, discard unexecuted input, release connection reservations, and synchronize durable journals before a successful exit. Sync errors poison the journal. Add real process and reactor regressions.
+
 ### Automatic Fabric checkpoint maintenance — 2026-11-27
 - **Schedule durable journal compaction at configurable utilization thresholds**, with live-snapshot size preflight, ineffective/error retry cooldown, reactor maintenance counters, and default-on standalone durable operation. Verify 100 pipelined writes through a 1 KiB journal and process restart.
 

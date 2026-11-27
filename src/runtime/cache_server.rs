@@ -393,7 +393,7 @@ pub struct CacheShardServer {
     poll: Poll,
     events: Events,
     ready: Vec<ReadyEvent>,
-    listener: TcpListener,
+    listener: Option<TcpListener>,
     dispatcher: CacheDispatcher,
     inbox: CacheShardInbox,
     backend: CacheBackend,
@@ -542,7 +542,7 @@ impl CacheShardServer {
             events: Events::with_capacity(config.events_capacity),
             ready: Vec::with_capacity(config.events_capacity),
             poll,
-            listener,
+            listener: Some(listener),
             dispatcher,
             inbox,
             backend,
@@ -560,7 +560,10 @@ impl CacheShardServer {
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.listener.local_addr()
+        self.listener
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "cache listener closed"))?
+            .local_addr()
     }
 
     pub fn control(&self) -> CacheShardServerControl {
@@ -697,7 +700,7 @@ impl CacheShardServer {
             for (_, mut connection) in self.connections.drain() {
                 let _ = self.poll.registry().deregister(&mut connection.stream);
             }
-            let _ = self.poll.registry().deregister(&mut self.listener);
+            self.close_listener();
             self.shutdown.store(true, Ordering::Release);
             return Err(CacheServerError::DurableShardPoisoned);
         }
@@ -705,10 +708,100 @@ impl CacheShardServer {
     }
 
     pub fn run(&mut self) -> Result<(), CacheServerError> {
+        self.run_with_shutdown_timeout(Duration::from_secs(5))
+    }
+
+    /// Stop accepting/reading on shutdown, drain already encoded replies
+    /// until the deadline, then synchronize the durable journal. No new
+    /// commands execute during the drain, even on existing connections.
+    pub fn run_with_shutdown_timeout(&mut self, timeout: Duration) -> Result<(), CacheServerError> {
         self.ensure_healthy()?;
         while !self.shutdown.load(Ordering::Acquire) {
-            self.poll_once(None)?;
+            match self.poll_once(None) {
+                Err(CacheServerError::Io(error)) if error.kind() == io::ErrorKind::Interrupted => {
+                    continue
+                }
+                other => other?,
+            }
         }
+        self.finish_shutdown(timeout)
+    }
+
+    fn close_listener(&mut self) {
+        if let Some(mut listener) = self.listener.take() {
+            let _ = self.poll.registry().deregister(&mut listener);
+        }
+    }
+
+    fn finish_shutdown(&mut self, timeout: Duration) -> Result<(), CacheServerError> {
+        self.ensure_healthy()?;
+        self.close_listener();
+        let start = Instant::now();
+        // Attempt a nonblocking flush only for replies already encoded.
+        // Drop incomplete/unexecuted input and idle clients immediately.
+        let mut connections = std::mem::take(&mut self.connections);
+        for (token, mut connection) in connections.drain() {
+            connection.input.clear();
+            connection.input_start = 0;
+            connection.lease.release_empty(&mut connection.input);
+            if start.elapsed() < timeout
+                && connection.pending_output() != 0
+                && Self::flush_connection(&mut connection).is_ok()
+                && connection.pending_output() != 0
+                && self
+                    .poll
+                    .registry()
+                    .reregister(&mut connection.stream, token, Interest::WRITABLE)
+                    .is_ok()
+            {
+                self.connections.insert(token, connection);
+            } else {
+                let _ = self.poll.registry().deregister(&mut connection.stream);
+            }
+        }
+        let drain_result = (|| -> io::Result<()> {
+            while !self.connections.is_empty() {
+                let remaining = timeout.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    break;
+                }
+                match self.poll.poll(&mut self.events, Some(remaining)) {
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    other => other?,
+                }
+                for event in self.events.iter() {
+                    if start.elapsed() >= timeout {
+                        break;
+                    }
+                    let Some(connection) = self.connections.get_mut(&event.token()) else {
+                        continue;
+                    };
+                    if event.is_error()
+                        || event.is_write_closed()
+                        || (event.is_writable()
+                            && (Self::flush_connection(connection).is_err()
+                                || connection.pending_output() == 0))
+                    {
+                        let mut connection = self
+                            .connections
+                            .remove(&event.token())
+                            .expect("connection present");
+                        let _ = self.poll.registry().deregister(&mut connection.stream);
+                    }
+                }
+            }
+            Ok(())
+        })();
+        for (_, mut connection) in self.connections.drain() {
+            let _ = self.poll.registry().deregister(&mut connection.stream);
+        }
+        // Always try final sync, even if the network drain encountered an
+        // error. A sync failure is never reported as a clean shutdown.
+        #[cfg(unix)]
+        if let CacheBackend::Durable { cache, .. } = &mut self.backend {
+            cache.synchronize().map_err(CacheServerError::Durability)?;
+        }
+        drain_result?;
         Ok(())
     }
 
@@ -716,6 +809,9 @@ impl CacheShardServer {
     /// next expiration sweep deadline so TTL reclamation progresses while idle.
     pub fn poll_once(&mut self, timeout: Option<Duration>) -> Result<(), CacheServerError> {
         self.ensure_healthy()?;
+        if self.shutdown.load(Ordering::Acquire) {
+            return Ok(());
+        }
         #[cfg(unix)]
         self.maybe_checkpoint(self.clock.now_ms())?;
         let timeout = self.poll_timeout(timeout);
@@ -734,6 +830,9 @@ impl CacheShardServer {
         }
 
         for index in 0..self.ready.len() {
+            if self.shutdown.load(Ordering::Acquire) {
+                break;
+            }
             let event = self.ready[index];
             match event.token {
                 LISTENER_TOKEN => self.accept_ready()?,
@@ -743,7 +842,9 @@ impl CacheShardServer {
             self.ensure_healthy()?;
         }
 
-        self.sweep_expired_if_due()?;
+        if !self.shutdown.load(Ordering::Acquire) {
+            self.sweep_expired_if_due()?;
+        }
         Ok(())
     }
 
@@ -782,7 +883,13 @@ impl CacheShardServer {
 
     fn accept_ready(&mut self) -> Result<(), CacheServerError> {
         loop {
-            match self.listener.accept() {
+            if self.shutdown.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let Some(listener) = &self.listener else {
+                return Ok(());
+            };
+            match listener.accept() {
                 Ok((mut stream, _peer)) => {
                     if self.connections.len() >= self.config.max_connections {
                         drop(stream);
@@ -864,7 +971,10 @@ impl CacheShardServer {
         readable: bool,
         writable: bool,
     ) -> Result<(), ConnectionAction> {
-        if readable && self.read_connection(connection).is_err() {
+        if readable
+            && !self.shutdown.load(Ordering::Acquire)
+            && self.read_connection(connection).is_err()
+        {
             return Err(ConnectionAction::Close);
         }
 
@@ -877,7 +987,7 @@ impl CacheShardServer {
         }
 
         if (writable || connection.pending_output() != 0)
-            && self.flush_connection(connection).is_err()
+            && Self::flush_connection(connection).is_err()
         {
             return Err(ConnectionAction::Close);
         }
@@ -895,6 +1005,9 @@ impl CacheShardServer {
         let mut scratch = [0u8; 16 * 1024];
 
         loop {
+            if self.shutdown.load(Ordering::Acquire) {
+                return Ok(());
+            }
             match connection.stream.read(&mut scratch) {
                 Ok(0) => {
                     return Err(io::Error::new(
@@ -939,6 +1052,9 @@ impl CacheShardServer {
 
     fn process_input(&mut self, connection: &mut CacheConnection) -> Result<(), ConnectionAction> {
         loop {
+            if self.shutdown.load(Ordering::Acquire) {
+                return Ok(());
+            }
             if connection.input_start == connection.input.len() {
                 connection.compact_input();
                 return Ok(());
@@ -1017,12 +1133,14 @@ impl CacheShardServer {
             connection.input_start += consumed;
             // Check between pipelined commands as well as between poll cycles.
             #[cfg(unix)]
-            self.maybe_checkpoint(self.clock.now_ms())
-                .map_err(|_| ConnectionAction::Close)?;
+            if !self.shutdown.load(Ordering::Acquire) {
+                self.maybe_checkpoint(self.clock.now_ms())
+                    .map_err(|_| ConnectionAction::Close)?;
+            }
         }
     }
 
-    fn flush_connection(&self, connection: &mut CacheConnection) -> io::Result<()> {
+    fn flush_connection(connection: &mut CacheConnection) -> io::Result<()> {
         while connection.output_start < connection.output.len() {
             match connection
                 .stream
@@ -1782,5 +1900,119 @@ mod tests {
             b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
             b"$1\r\nv\r\n",
         );
+    }
+
+    #[test]
+    fn graceful_shutdown_drains_encoded_replies_without_executing_pending_input() {
+        let mut server = build_server();
+        let address = server.local_addr().unwrap();
+        let mut client = std::net::TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+            if server.connection_count() == 1 {
+                break;
+            }
+        }
+        let connection = server.connections.values_mut().next().unwrap();
+        let pending = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n";
+        connection
+            .lease
+            .reserve(&mut connection.input, pending.len(), 1024)
+            .unwrap();
+        connection.input.extend_from_slice(pending);
+        connection
+            .lease
+            .reserve(&mut connection.output, 7, 1024)
+            .unwrap();
+        connection.output.extend_from_slice(b"+PONG\r\n");
+
+        server.control().shutdown();
+        server
+            .run_with_shutdown_timeout(Duration::from_secs(1))
+            .unwrap();
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).unwrap();
+        assert_eq!(reply, b"+PONG\r\n");
+        assert!(server.store_mut().unwrap().get(b"k", 0).is_none());
+        assert_eq!(server.connection_count(), 0);
+        assert_eq!(server.buffer_budget.used_bytes(), 0);
+        assert!(server.local_addr().is_err());
+        assert!(mio::net::TcpListener::bind(address).is_ok());
+    }
+
+    #[test]
+    fn zero_shutdown_drain_drops_pending_replies_and_releases_budget() {
+        let mut server = build_server();
+        let mut client = std::net::TcpStream::connect(server.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+            if server.connection_count() == 1 {
+                break;
+            }
+        }
+        let connection = server.connections.values_mut().next().unwrap();
+        connection
+            .lease
+            .reserve(&mut connection.output, 7, 1024)
+            .unwrap();
+        connection.output.extend_from_slice(b"+PONG\r\n");
+        server.control().shutdown();
+        server.run_with_shutdown_timeout(Duration::ZERO).unwrap();
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).unwrap();
+        assert!(reply.is_empty());
+        assert_eq!(server.buffer_budget.used_bytes(), 0);
+        assert_eq!(server.connection_count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_deadline_releases_a_backpressured_connection() {
+        use std::os::fd::AsRawFd;
+        let mut server = build_server();
+        let client = std::net::TcpStream::connect(server.local_addr().unwrap()).unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+            if server.connection_count() == 1 {
+                break;
+            }
+        }
+        let connection = server.connections.values_mut().next().unwrap();
+        let size: libc::c_int = 4096;
+        // SAFETY: valid live socket, pointer to correctly sized integer option.
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    connection.stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&size as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&size) as libc::socklen_t,
+                )
+            },
+            0
+        );
+        let bytes = 1024 * 1024;
+        connection
+            .lease
+            .reserve(&mut connection.output, bytes, bytes)
+            .unwrap();
+        connection.output.resize(bytes, b'x');
+        CacheShardServer::flush_connection(connection).unwrap();
+        assert!(connection.pending_output() > 0);
+        let timeout = Duration::from_millis(30);
+        server.control().shutdown();
+        let started = Instant::now();
+        server.run_with_shutdown_timeout(timeout).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(server.connection_count(), 0);
+        assert_eq!(server.buffer_budget.used_bytes(), 0);
+        drop(client);
     }
 }
