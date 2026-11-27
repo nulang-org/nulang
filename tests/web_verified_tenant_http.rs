@@ -462,4 +462,111 @@ fn scoped_ui_sse_uses_verified_tenant_and_room_policy() {
     assert!(publisher.publish("tenant-a", "invoices", "#status", "<p>must-not-leak</p>"));
     line.clear();
     assert_eq!(reader.read_line(&mut line).unwrap(), 0, "{line}");
+
+    // The other server received no patch. Idle membership rechecks must
+    // independently terminate its revoked subscription without leaking data.
+    let started = std::time::Instant::now();
+    loop {
+        line.clear();
+        if other.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        assert!(line == "\n" || line.starts_with(':'), "{line}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "idle revocation was not enforced"
+        );
+    }
+}
+
+#[test]
+fn scoped_ui_idle_disconnect_releases_room_and_host_capacity() {
+    use nulang::runtime::{ScopedUiRoomAuthorizer, WebServerOptions};
+    use nulang::web::runtime_bindings::RuntimeWebRoute;
+    use std::io::{BufRead, BufReader};
+    use std::time::Instant;
+
+    let policy: ScopedUiRoomAuthorizer =
+        Arc::new(|principal, room| principal.subject_id() == "user-a" && room == "idle");
+    let server = WebDevServer::bind_runtime_with_tenant_guard_and_ui_authorizer(
+        0,
+        None,
+        None,
+        vec![RuntimeWebRoute {
+            route: route("/secure"),
+            plan: None,
+        }],
+        vec![],
+        guard(),
+        policy,
+        WebServerOptions {
+            max_concurrent_connections: 8,
+            ..WebServerOptions::default()
+        },
+    )
+    .unwrap();
+    let subscribe = |session: &str| {
+        let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        write!(
+            stream,
+            "GET /__nulang/scoped-ui-sse/tenant-a/idle HTTP/1.1\r\nHost: localhost:{}\r\nCookie: __Host-nulang_tenant={session}\r\n\r\n",
+            server.port
+        )
+        .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut status = String::new();
+        reader.read_line(&mut status).unwrap();
+        if status == "HTTP/1.1 200 OK\r\n" {
+            let mut wire = String::new();
+            while !wire.ends_with("\r\n\r\n") {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                wire.push_str(&line);
+            }
+            assert!(wire.contains("Cache-Control: no-store"));
+            let mut snapshot = String::new();
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\n" {
+                    break;
+                }
+                snapshot.push_str(&line);
+            }
+            assert!(snapshot.contains("event: nulang-ui-snapshot"));
+        }
+        (status, reader)
+    };
+
+    let mut active = Vec::new();
+    for _ in 0..8 {
+        let (status, reader) = subscribe(SESSION_A);
+        assert_eq!(status, "HTTP/1.1 200 OK\r\n");
+        active.push(reader);
+    }
+    let (overflow, _) = subscribe(SESSION_A);
+    assert!(overflow.starts_with("HTTP/1.1 503 "), "{overflow}");
+    let closing = active.pop().unwrap();
+    closing.get_ref().shutdown(Shutdown::Both).unwrap();
+    drop(closing);
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        let (status, replacement) = subscribe(SESSION_A);
+        if status == "HTTP/1.1 200 OK\r\n" {
+            assert!(Instant::now() < deadline);
+            active.push(replacement);
+            break;
+        }
+        assert!(status.starts_with("HTTP/1.1 503 "), "{status}");
+        assert!(
+            Instant::now() < deadline,
+            "scoped SSE did not recover idle capacity"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let (overflow, _) = subscribe(SESSION_A);
+    assert!(overflow.starts_with("HTTP/1.1 503 "), "{overflow}");
 }

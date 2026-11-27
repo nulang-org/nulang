@@ -2,19 +2,19 @@
 
 use nulang::runtime::{WebDevServer, WebServerOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
-use std::time::Duration;
+use std::net::{Shutdown, TcpStream};
+use std::time::{Duration, Instant};
 
 fn subscribe(server: &WebDevServer, room: &str) -> (String, BufReader<TcpStream>) {
+    subscribe_path(server, &format!("/__nulang/sse/{room}"))
+}
+
+fn subscribe_path(server: &WebDevServer, path: &str) -> (String, BufReader<TcpStream>) {
     let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();
-    write!(
-        stream,
-        "GET /__nulang/sse/{room} HTTP/1.1\r\nHost: localhost\r\n\r\n"
-    )
-    .unwrap();
+    write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
     let mut reader = BufReader::new(stream);
     let mut status = String::new();
     reader.read_line(&mut status).unwrap();
@@ -149,4 +149,102 @@ fn request_status(server: &WebDevServer, method: &str, host: &str, extra: &str) 
     let mut status = String::new();
     reader.read_line(&mut status).unwrap();
     status
+}
+
+fn drain_snapshot(reader: &mut BufReader<TcpStream>) {
+    let mut frame = String::new();
+    loop {
+        let mut line = String::new();
+        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+        if line == "\n" {
+            break;
+        }
+        frame.push_str(&line);
+    }
+    assert!(frame.contains("event: nulang-ui-snapshot"), "{frame}");
+}
+
+fn assert_idle_disconnect_recovers(path: &str, has_snapshot: bool) {
+    // Saturate both the per-room bound and the host-wide connection bound.
+    let server = WebDevServer::bind_runtime_with_options(
+        0,
+        None,
+        None,
+        vec![],
+        WebServerOptions {
+            max_concurrent_connections: 8,
+            ..WebServerOptions::default()
+        },
+    )
+    .unwrap();
+    let mut readers = Vec::new();
+    for _ in 0..8 {
+        let (status, mut reader) = subscribe_path(&server, path);
+        assert_eq!(status, "HTTP/1.1 200 OK\r\n");
+        if has_snapshot {
+            drain_snapshot(&mut reader);
+        }
+        readers.push(reader);
+    }
+    let (overflow, reader) = subscribe_path(&server, path);
+    assert!(overflow.starts_with("HTTP/1.1 503 "), "{overflow}");
+    drop(reader);
+
+    // Read the complete initial frame before closing, so this also exercises
+    // ordinary FIN rather than relying on unread data causing an abortive RST.
+    let closing = readers.pop().unwrap();
+    closing.get_ref().shutdown(Shutdown::Both).unwrap();
+    drop(closing);
+    let started = Instant::now();
+    loop {
+        let (status, mut replacement) = subscribe_path(&server, path);
+        if status == "HTTP/1.1 200 OK\r\n" {
+            if has_snapshot {
+                drain_snapshot(&mut replacement);
+            }
+            assert!(started.elapsed() < Duration::from_secs(6));
+            readers.push(replacement);
+            break;
+        }
+        assert!(status.starts_with("HTTP/1.1 503 "), "{status}");
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "idle disconnection did not release room and host capacity within six seconds"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let (overflow, _reader) = subscribe_path(&server, path);
+    assert!(overflow.starts_with("HTTP/1.1 503 "), "{overflow}");
+}
+
+#[test]
+fn sse_idle_disconnect_releases_room_and_host_capacity() {
+    assert_idle_disconnect_recovers("/__nulang/sse/wire-idle-release", false);
+}
+
+#[test]
+fn ui_sse_idle_disconnect_releases_room_and_host_capacity() {
+    assert_idle_disconnect_recovers("/__nulang/ui-sse/wire-ui-idle-release", true);
+}
+
+#[test]
+fn sse_request_write_half_close_preserves_response_stream() {
+    let server = WebDevServer::bind_runtime(0, None, None, vec![]).unwrap();
+    let (status, mut reader) = subscribe(&server, "wire-half-close");
+    assert_eq!(status, "HTTP/1.1 200 OK\r\n");
+    reader.get_ref().shutdown(Shutdown::Write).unwrap();
+    reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(6)))
+        .unwrap();
+    // Receiving repeated comment frames proves that request-side EOF does not
+    // cancel a client that is still receiving the response.
+    for _ in 0..2 {
+        let mut comment = String::new();
+        assert_ne!(reader.read_line(&mut comment).unwrap(), 0);
+        assert_eq!(comment, ": keep-alive\n");
+        let mut blank = String::new();
+        assert_ne!(reader.read_line(&mut blank).unwrap(), 0);
+        assert_eq!(blank, "\n");
+    }
 }

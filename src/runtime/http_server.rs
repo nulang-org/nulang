@@ -2128,6 +2128,13 @@ impl Drop for WebDevServer {
 
 impl WebDevServer {
     const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+    // Existing channel waits also provide a cheap check for pending TCP errors.
+    // Probe an idle write side more often than the former 15-second heartbeat
+    // so a closed peer does not retain a room and connection lease for long.
+    const SSE_IDLE_TICK: Duration = Duration::from_millis(100);
+    const SSE_IDLE_HEARTBEAT: Duration = Duration::from_secs(2);
+    const LEGACY_SSE_COMMENT: &'static [u8] = b": keep-alive\n\n";
+    const UI_SSE_COMMENT: &'static [u8] = b": heartbeat\n\n";
     const SSE_PATH_PREFIX: &'static str = "/__nulang/sse/";
     const UI_SSE_PATH_PREFIX: &'static str = "/__nulang/ui-sse/";
     const SCOPED_UI_SSE_PATH_PREFIX: &'static str = "/__nulang/scoped-ui-sse/";
@@ -2879,7 +2886,7 @@ impl WebDevServer {
             if shutdown.load(Ordering::Relaxed) {
                 break;
             }
-            match subscription.rx.recv_timeout(Duration::from_millis(100)) {
+            match subscription.rx.recv_timeout(Self::SSE_IDLE_TICK) {
                 Ok(msg) => {
                     if Self::write_sse_event(stream, &msg).is_err() {
                         break;
@@ -2887,14 +2894,8 @@ impl WebDevServer {
                     last_write = Instant::now();
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    // Test the TCP connection even when the room is idle.
-                    // Otherwise abandoned EventSource subscriptions can hold
-                    // room slots indefinitely without further broadcasts.
-                    if last_write.elapsed() >= Duration::from_secs(15) {
-                        if Self::write_sse_keepalive(stream).is_err() {
-                            break;
-                        }
-                        last_write = Instant::now();
+                    if !Self::check_idle_sse(stream, &mut last_write, Self::LEGACY_SSE_COMMENT) {
+                        break;
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -2902,8 +2903,27 @@ impl WebDevServer {
         }
     }
 
-    fn write_sse_keepalive<W: Write>(stream: &mut W) -> std::io::Result<()> {
-        stream.write_all(b": keep-alive\n\n")?;
+    /// A pending socket error (e.g. RST) is terminal even without a broadcast.
+    /// An ordinary FIN may mean only that the client closed its request half,
+    /// so do not use read EOF as evidence that it stopped reading. Instead
+    /// send a comment on the write side of an idle stream. The existing write
+    /// timeout still applies; a network black hole is not detectable within a
+    /// guaranteed wall-clock bound by application heartbeats alone.
+    fn check_idle_sse(stream: &mut TcpStream, last_write: &mut Instant, comment: &[u8]) -> bool {
+        if !matches!(stream.take_error(), Ok(None)) {
+            return false;
+        }
+        if last_write.elapsed() >= Self::SSE_IDLE_HEARTBEAT {
+            if Self::write_sse_comment(stream, comment).is_err() {
+                return false;
+            }
+            *last_write = Instant::now();
+        }
+        true
+    }
+
+    fn write_sse_comment<W: Write>(stream: &mut W, comment: &[u8]) -> std::io::Result<()> {
+        stream.write_all(comment)?;
         stream.flush()
     }
 
@@ -2943,9 +2963,9 @@ impl WebDevServer {
             return;
         }
         let mut last_check = Instant::now();
-        let mut last_heartbeat = Instant::now();
+        let mut last_write = Instant::now();
         while !shutdown.load(Ordering::Relaxed) {
-            match subscriber.rx.recv_timeout(Duration::from_millis(100)) {
+            let idle = match subscriber.rx.recv_timeout(Self::SSE_IDLE_TICK) {
                 Ok(patch) => {
                     // Verify current membership before writing any next update.
                     if !(verify)(request, app, room)
@@ -2954,21 +2974,20 @@ impl WebDevServer {
                         break;
                     }
                     last_check = Instant::now();
+                    last_write = last_check;
+                    false
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => true,
+            };
             if last_check.elapsed() >= Duration::from_secs(1) {
                 if !(verify)(request, app, room) {
                     break;
                 }
                 last_check = Instant::now();
             }
-            if last_heartbeat.elapsed() >= Duration::from_secs(15) {
-                if stream.write_all(b": heartbeat\n\n").is_err() {
-                    break;
-                }
-                last_heartbeat = Instant::now();
+            if idle && !Self::check_idle_sse(stream, &mut last_write, Self::UI_SSE_COMMENT) {
+                break;
             }
         }
     }
@@ -2993,22 +3012,21 @@ impl WebDevServer {
         if Self::write_ui_sse_event(stream, &snapshot).is_err() {
             return;
         }
-        let mut last_heartbeat = Instant::now();
+        let mut last_write = Instant::now();
         while !shutdown.load(Ordering::Relaxed) {
-            match rx.recv_timeout(Duration::from_millis(100)) {
+            match rx.recv_timeout(Self::SSE_IDLE_TICK) {
                 Ok(patch) => {
                     if Self::write_ui_sse_event(stream, &patch).is_err() {
                         break;
                     }
+                    last_write = Instant::now();
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            }
-            if last_heartbeat.elapsed() >= Duration::from_secs(15) {
-                if stream.write_all(b": heartbeat\n\n").is_err() {
-                    break;
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if !Self::check_idle_sse(stream, &mut last_write, Self::UI_SSE_COMMENT) {
+                        break;
+                    }
                 }
-                last_heartbeat = Instant::now();
             }
         }
     }
@@ -4605,8 +4623,11 @@ mod tests {
     #[test]
     fn test_sse_heartbeat_is_a_comment_and_not_an_application_message() {
         let mut wire = Vec::new();
-        WebDevServer::write_sse_keepalive(&mut wire).unwrap();
+        WebDevServer::write_sse_comment(&mut wire, WebDevServer::LEGACY_SSE_COMMENT).unwrap();
         assert_eq!(wire.as_slice(), b": keep-alive\n\n");
+        wire.clear();
+        WebDevServer::write_sse_comment(&mut wire, WebDevServer::UI_SSE_COMMENT).unwrap();
+        assert_eq!(wire.as_slice(), b": heartbeat\n\n");
     }
 
     #[test]
