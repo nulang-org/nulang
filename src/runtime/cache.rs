@@ -16,7 +16,7 @@
 //! - Redis Cluster compatible 16,384-slot hashing and hash tags.
 
 use rustc_hash::FxHasher;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::hash::Hasher;
 
 pub const REDIS_CLUSTER_SLOTS: u16 = 16_384;
@@ -149,6 +149,7 @@ pub enum CacheTtl {
 pub enum CacheIncrementError {
     NotInteger,
     Overflow,
+    Admission(CacheAdmissionError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,11 +362,35 @@ pub struct CacheStats {
     pub expirations: u64,
 }
 
+/// Bounds physical entry count and initialized size-class arena extent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheLimits {
+    pub max_entries: usize,
+    pub max_arena_bytes: usize,
+}
+
+impl Default for CacheLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: 1_000_000,
+            max_arena_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheAdmissionError {
+    EntryLimit,
+    ArenaLimit,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheMemoryStats {
     pub entries: usize,
     pub index_capacity: usize,
     pub arena_reserved_bytes: usize,
+    /// Approximate retained cache allocations, excluding allocator overhead and temporary command buffers.
+    pub retained_capacity_bytes: usize,
     pub reusable_slots: usize,
 }
 
@@ -376,6 +401,7 @@ pub struct CacheMemoryStats {
 /// internally.
 #[derive(Debug)]
 pub struct CacheStore {
+    limits: CacheLimits,
     arena: ByteArena,
     slots: Vec<EntrySlot>,
     free_slots: Vec<u32>,
@@ -395,7 +421,12 @@ impl Default for CacheStore {
 
 impl CacheStore {
     pub fn new() -> Self {
+        Self::with_limits(CacheLimits::default())
+    }
+
+    pub fn with_limits(limits: CacheLimits) -> Self {
         Self {
+            limits,
             arena: ByteArena::new(),
             slots: Vec::new(),
             free_slots: Vec::new(),
@@ -602,13 +633,110 @@ impl CacheStore {
         self.stats.sets += 1;
     }
 
-    pub fn set_bytes(&mut self, key: &[u8], value: &[u8], ttl_ms: Option<u64>, now_ms: u64) {
+    fn admit_block(
+        &self,
+        len: usize,
+        free: &mut [usize; FREE_LIST_COUNT],
+        extent: &mut usize,
+    ) -> Result<(), CacheAdmissionError> {
+        if len <= INLINE_BYTES {
+            return Ok(());
+        }
+        if len > (1usize << MAX_ARENA_EXP) {
+            return Err(CacheAdmissionError::ArenaLimit);
+        }
+        let (class, capacity) = ByteArena::class_for(len);
+        if free[class] > 0 {
+            free[class] -= 1;
+        } else {
+            *extent = extent
+                .checked_add(capacity)
+                .ok_or(CacheAdmissionError::ArenaLimit)?;
+            if *extent > self.limits.max_arena_bytes.min(u32::MAX as usize) {
+                return Err(CacheAdmissionError::ArenaLimit);
+            }
+        }
+        Ok(())
+    }
+
+    fn admit_entries(&self, new_entries: usize) -> Result<(), CacheAdmissionError> {
+        if new_entries
+            > self
+                .limits
+                .max_entries
+                .min(TOMBSTONE_SLOT as usize)
+                .saturating_sub(self.index_len)
+        {
+            return Err(CacheAdmissionError::EntryLimit);
+        }
+        Ok(())
+    }
+
+    fn admit_single(&self, key: &[u8], value_len: usize) -> Result<(), CacheAdmissionError> {
+        let new_key = self.find_slot(key, Self::hash(key)).is_none();
+        self.admit_entries(usize::from(new_key))?;
+        if value_len <= INLINE_BYTES && (!new_key || key.len() <= INLINE_BYTES) {
+            return Ok(());
+        }
+        let mut free = std::array::from_fn(|i| self.arena.free[i].len());
+        let mut extent = self.arena.bytes.len();
+        self.admit_block(value_len, &mut free, &mut extent)?;
+        if new_key {
+            self.admit_block(key.len(), &mut free, &mut extent)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_bytes(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        ttl_ms: Option<u64>,
+        now_ms: u64,
+    ) -> Result<(), CacheAdmissionError> {
+        self.admit_single(key, value.len())?;
+        self.set_bytes_admitted(key, value, ttl_ms, now_ms);
+        Ok(())
+    }
+
+    fn set_bytes_admitted(&mut self, key: &[u8], value: &[u8], ttl_ms: Option<u64>, now_ms: u64) {
         let value = CacheValue::Bytes(PackedBytes::pack(value, &mut self.arena));
         self.set_value(key, value, ttl_ms, now_ms);
     }
 
-    pub fn set_integer(&mut self, key: &[u8], value: i64, ttl_ms: Option<u64>, now_ms: u64) {
+    /// Preflight the complete batch before any mutation. Conservative: blocks
+    /// freed during the batch are not counted as available for admission.
+    pub fn set_batch(
+        &mut self,
+        pairs: &[(&[u8], &[u8])],
+        now_ms: u64,
+    ) -> Result<(), CacheAdmissionError> {
+        let mut new_keys = HashSet::new();
+        let mut free = std::array::from_fn(|i| self.arena.free[i].len());
+        let mut extent = self.arena.bytes.len();
+        for &(key, value) in pairs {
+            self.admit_block(value.len(), &mut free, &mut extent)?;
+            if self.find_slot(key, Self::hash(key)).is_none() && new_keys.insert(key) {
+                self.admit_entries(new_keys.len())?;
+                self.admit_block(key.len(), &mut free, &mut extent)?;
+            }
+        }
+        for &(key, value) in pairs {
+            self.set_bytes_admitted(key, value, None, now_ms);
+        }
+        Ok(())
+    }
+
+    pub fn set_integer(
+        &mut self,
+        key: &[u8],
+        value: i64,
+        ttl_ms: Option<u64>,
+        now_ms: u64,
+    ) -> Result<(), CacheAdmissionError> {
+        self.admit_single(key, 0)?;
         self.set_value(key, CacheValue::Integer(value), ttl_ms, now_ms);
+        Ok(())
     }
 
     pub fn get(&mut self, key: &[u8], now_ms: u64) -> Option<CacheValueView<'_>> {
@@ -692,7 +820,8 @@ impl CacheStore {
         now_ms: u64,
     ) -> Result<i64, CacheIncrementError> {
         let Some(slot_id) = self.live_slot_id(key, now_ms) else {
-            self.set_integer(key, delta, None, now_ms);
+            self.set_integer(key, delta, None, now_ms)
+                .map_err(CacheIncrementError::Admission)?;
             return Ok(delta);
         };
 
@@ -791,11 +920,40 @@ impl CacheStore {
         self.stats
     }
 
+    fn retained_capacity_bytes(&self) -> usize {
+        fn vec_bytes<T>(v: &Vec<T>) -> usize {
+            v.capacity().saturating_mul(std::mem::size_of::<T>())
+        }
+        let mut bytes = std::mem::size_of::<Self>();
+        for size in [
+            vec_bytes(&self.arena.bytes),
+            vec_bytes(&self.arena.free),
+            vec_bytes(&self.slots),
+            vec_bytes(&self.free_slots),
+            vec_bytes(&self.index),
+            vec_bytes(&self.expiry.buckets),
+            vec_bytes(&self.expiry.nodes),
+            vec_bytes(&self.expiry.queued),
+            self.expiry
+                .pending
+                .capacity()
+                .saturating_mul(std::mem::size_of::<usize>()),
+            vec_bytes(&self.expiry_scratch),
+        ] {
+            bytes = bytes.saturating_add(size);
+        }
+        for list in &self.arena.free {
+            bytes = bytes.saturating_add(vec_bytes(list));
+        }
+        bytes
+    }
+
     pub fn memory_stats(&self) -> CacheMemoryStats {
         CacheMemoryStats {
             entries: self.index_len,
             index_capacity: self.index.len(),
             arena_reserved_bytes: self.arena.reserved_bytes(),
+            retained_capacity_bytes: self.retained_capacity_bytes(),
             reusable_slots: self.free_slots.len(),
         }
     }
@@ -847,7 +1005,7 @@ mod tests {
     #[test]
     fn inline_values_do_not_touch_arena() {
         let mut store = CacheStore::new();
-        store.set_bytes(b"k", b"small", None, 0);
+        store.set_bytes(b"k", b"small", None, 0).unwrap();
         assert_eq!(store.memory_stats().arena_reserved_bytes, 0);
         assert_eq!(store.get(b"k", 0), Some(CacheValueView::Bytes(b"small")));
     }
@@ -857,11 +1015,11 @@ mod tests {
         let mut store = CacheStore::new();
         let a = vec![1u8; 100];
         let b = vec![2u8; 100];
-        store.set_bytes(b"a", &a, None, 0);
+        store.set_bytes(b"a", &a, None, 0).unwrap();
         let reserved = store.memory_stats().arena_reserved_bytes;
         assert_eq!(reserved, 128);
         assert!(store.delete(b"a"));
-        store.set_bytes(b"b", &b, None, 0);
+        store.set_bytes(b"b", &b, None, 0).unwrap();
         assert_eq!(store.memory_stats().arena_reserved_bytes, reserved);
         assert_eq!(
             store.get(b"b", 0),
@@ -872,11 +1030,11 @@ mod tests {
     #[test]
     fn ttl_is_lazy_and_wheel_reaped() {
         let mut store = CacheStore::new();
-        store.set_integer(b"a", 7, Some(5), 100);
+        store.set_integer(b"a", 7, Some(5), 100).unwrap();
         assert_eq!(store.get(b"a", 104), Some(CacheValueView::Integer(7)));
         assert_eq!(store.get(b"a", 105), None);
 
-        store.set_integer(b"b", 9, Some(10), 200);
+        store.set_integer(b"b", 9, Some(10), 200).unwrap();
         assert_eq!(store.purge_expired(210, 100), 1);
         assert_eq!(store.get(b"b", 210), None);
     }
@@ -884,7 +1042,7 @@ mod tests {
     #[test]
     fn sub_tick_expiry_is_reaped_after_tick_advance() {
         let mut store = CacheStore::new();
-        store.set_integer(b"short", 1, Some(5), 100);
+        store.set_integer(b"short", 1, Some(5), 100).unwrap();
         assert_eq!(store.purge_expired(110, 100), 1);
         assert!(store.is_empty());
     }
@@ -894,7 +1052,7 @@ mod tests {
         let mut store = CacheStore::new();
         for i in 0..48u64 {
             let key = i.to_le_bytes();
-            store.set_integer(&key, i as i64, None, 0);
+            store.set_integer(&key, i as i64, None, 0).unwrap();
         }
         let capacity = store.memory_stats().index_capacity;
 
@@ -905,7 +1063,7 @@ mod tests {
 
         for i in 100..132u64 {
             let key = i.to_le_bytes();
-            store.set_integer(&key, i as i64, None, 0);
+            store.set_integer(&key, i as i64, None, 0).unwrap();
         }
 
         assert_eq!(store.memory_stats().index_capacity, capacity);
@@ -914,7 +1072,7 @@ mod tests {
     #[test]
     fn expire_and_ttl_preserve_live_key_semantics() {
         let mut store = CacheStore::new();
-        store.set_bytes(b"k", b"v", None, 100);
+        store.set_bytes(b"k", b"v", None, 100).unwrap();
         assert_eq!(store.ttl(b"k", 100), CacheTtl::Persistent);
         assert!(store.expire_ms(b"k", 2_500, 100));
         assert_eq!(store.ttl(b"k", 600), CacheTtl::RemainingMs(2_000));
@@ -924,7 +1082,7 @@ mod tests {
     #[test]
     fn increment_promotes_bytes_and_preserves_ttl() {
         let mut store = CacheStore::new();
-        store.set_bytes(b"n", b"41", Some(5_000), 100);
+        store.set_bytes(b"n", b"41", Some(5_000), 100).unwrap();
         assert_eq!(store.increment(b"n", 1, 200), Ok(42));
         assert_eq!(store.get(b"n", 200), Some(CacheValueView::Integer(42)));
         assert_eq!(store.ttl(b"n", 200), CacheTtl::RemainingMs(4_900));
@@ -933,12 +1091,12 @@ mod tests {
     #[test]
     fn increment_rejects_non_integer_and_overflow() {
         let mut store = CacheStore::new();
-        store.set_bytes(b"text", b"nope", None, 0);
+        store.set_bytes(b"text", b"nope", None, 0).unwrap();
         assert_eq!(
             store.increment(b"text", 1, 0),
             Err(CacheIncrementError::NotInteger)
         );
-        store.set_integer(b"max", i64::MAX, None, 0);
+        store.set_integer(b"max", i64::MAX, None, 0).unwrap();
         assert_eq!(
             store.increment(b"max", 1, 0),
             Err(CacheIncrementError::Overflow)
@@ -948,7 +1106,7 @@ mod tests {
     #[test]
     fn delete_at_treats_expired_keys_as_missing() {
         let mut store = CacheStore::new();
-        store.set_bytes(b"k", b"v", Some(5), 100);
+        store.set_bytes(b"k", b"v", Some(5), 100).unwrap();
         assert!(!store.delete_at(b"k", 105));
         assert!(store.is_empty());
     }
@@ -956,9 +1114,9 @@ mod tests {
     #[test]
     fn stale_expiry_cannot_delete_recycled_slot() {
         let mut store = CacheStore::new();
-        store.set_integer(b"old", 1, Some(10), 0);
+        store.set_integer(b"old", 1, Some(10), 0).unwrap();
         assert!(store.delete(b"old"));
-        store.set_integer(b"new", 2, Some(1_000), 0);
+        store.set_integer(b"new", 2, Some(1_000), 0).unwrap();
         store.purge_expired(10, 100);
         assert_eq!(store.get(b"new", 10), Some(CacheValueView::Integer(2)));
     }
@@ -991,7 +1149,9 @@ mod tests {
     fn expiry_sweep_bounds_candidate_buffer_and_resumes_after_clock_jump() {
         let mut store = CacheStore::new();
         for i in 0u32..1000 {
-            store.set_bytes(&i.to_le_bytes(), b"v", Some(10), 0);
+            store
+                .set_bytes(&i.to_le_bytes(), b"v", Some(10), 0)
+                .unwrap();
         }
         assert_eq!(store.purge_expired(20, 0), 0);
         assert_eq!(store.expiry_scratch.capacity(), 0);
@@ -1013,11 +1173,13 @@ mod tests {
         let mut store = CacheStore::new();
         let rotation = DEFAULT_WHEEL_BUCKETS as u64 * DEFAULT_WHEEL_TICK_MS;
         for i in 0u32..100 {
-            store.set_bytes(&i.to_le_bytes(), b"future", Some(rotation + 10), 0);
+            store
+                .set_bytes(&i.to_le_bytes(), b"future", Some(rotation + 10), 0)
+                .unwrap();
         }
-        store.set_bytes(b"stale", b"v", Some(10), 0);
-        store.set_bytes(b"stale", b"persistent", None, 0);
-        store.set_bytes(b"due", b"v", Some(10), 0);
+        store.set_bytes(b"stale", b"v", Some(10), 0).unwrap();
+        store.set_bytes(b"stale", b"persistent", None, 0).unwrap();
+        store.set_bytes(b"due", b"v", Some(10), 0).unwrap();
         assert_eq!(store.purge_expired(10, 1), 0);
         assert!(store.expiry_scratch.capacity() <= 4);
         let mut removed = 0;
@@ -1032,9 +1194,11 @@ mod tests {
     fn expiry_pending_buckets_rotate_without_starving_other_due_keys() {
         let mut store = CacheStore::new();
         for i in 0u32..100 {
-            store.set_bytes(&i.to_le_bytes(), b"v", Some(10), 0);
+            store
+                .set_bytes(&i.to_le_bytes(), b"v", Some(10), 0)
+                .unwrap();
         }
-        store.set_bytes(b"later", b"v", Some(20), 0);
+        store.set_bytes(b"later", b"v", Some(20), 0).unwrap();
         assert_eq!(store.purge_expired(30, 1), 1);
         assert_eq!(store.purge_expired(30, 1), 1);
         // Check physical removal rather than lazy expiry through GET.
@@ -1049,24 +1213,24 @@ mod tests {
     fn ttl_refresh_does_not_accumulate_expiration_records() {
         let mut store = CacheStore::new();
         for i in 0..10_000u64 {
-            store.set_bytes(b"hot", b"v", Some(60_000 + i), 0);
+            store.set_bytes(b"hot", b"v", Some(60_000 + i), 0).unwrap();
             assert!(store.expire_ms(b"hot", 120_000 + i, 0));
         }
         assert_eq!(store.expiry.nodes.iter().flatten().count(), 1);
         assert_eq!(store.ttl(b"hot", 0), CacheTtl::RemainingMs(129_999));
-        store.set_bytes(b"hot", b"persistent", None, 0);
+        store.set_bytes(b"hot", b"persistent", None, 0).unwrap();
         assert_eq!(store.expiry.nodes.iter().flatten().count(), 0);
     }
 
     #[test]
     fn ttl_delete_lazy_expiry_and_slot_reuse_cancel_records() {
         let mut store = CacheStore::new();
-        store.set_bytes(b"a", b"v", Some(10), 0);
-        store.set_bytes(b"b", b"v", Some(10), 0);
-        store.set_bytes(b"c", b"v", Some(10), 0);
+        store.set_bytes(b"a", b"v", Some(10), 0).unwrap();
+        store.set_bytes(b"b", b"v", Some(10), 0).unwrap();
+        store.set_bytes(b"c", b"v", Some(10), 0).unwrap();
         assert!(store.delete(b"b"));
         assert!(!store.exists(b"a", 10));
-        store.set_bytes(b"d", b"v", Some(50), 10);
+        store.set_bytes(b"d", b"v", Some(50), 10).unwrap();
         assert_eq!(store.expiry.nodes.iter().flatten().count(), 2);
         assert_eq!(store.purge_expired(10, 1), 1);
         assert!(store.exists(b"d", 10));
@@ -1079,14 +1243,14 @@ mod tests {
     fn cancellation_while_bucket_is_pending_preserves_fifo_and_reused_slots() {
         let mut store = CacheStore::new();
         for key in [b"a", b"b", b"c", b"d", b"e"] {
-            store.set_bytes(key, b"v", Some(10), 0);
+            store.set_bytes(key, b"v", Some(10), 0).unwrap();
         }
         assert_eq!(store.purge_expired(10, 1), 1);
         // Cancel a pending head, middle, and tail without lazy-expiry reads.
         assert!(store.delete(b"b"));
         assert!(store.delete(b"d"));
         assert!(store.delete(b"e"));
-        store.set_bytes(b"new", b"v", Some(30), 10);
+        store.set_bytes(b"new", b"v", Some(30), 10).unwrap();
         assert_eq!(store.purge_expired(20, 1), 1);
         assert_eq!(store.len(), 1);
         assert!(store.exists(b"new", 39));
@@ -1098,5 +1262,30 @@ mod tests {
             .buckets
             .iter()
             .all(|b| b.head.is_none() && b.tail.is_none()));
+    }
+
+    #[test]
+    fn batch_arena_preflight_counts_key_and_value_blocks_and_preserves_ttl() {
+        let mut store = CacheStore::with_limits(CacheLimits {
+            max_entries: 4,
+            max_arena_bytes: 64,
+        });
+        store.set_bytes(b"old", b"v", Some(100), 0).unwrap();
+        let long = [b'x'; 32];
+        let other = [b'y'; 32];
+        assert_eq!(
+            store.set_batch(&[(b"old", &long), (&long, &other)], 0),
+            Err(CacheAdmissionError::ArenaLimit)
+        );
+        assert_eq!(store.get(b"old", 0), Some(CacheValueView::Bytes(b"v")));
+        assert_eq!(store.ttl(b"old", 0), CacheTtl::RemainingMs(100));
+        assert_eq!(store.memory_stats().arena_reserved_bytes, 0);
+        store.set_bytes(&long, &other, None, 0).unwrap();
+        let stats = store.memory_stats();
+        assert_eq!(stats.arena_reserved_bytes, 64);
+        assert!(stats.retained_capacity_bytes >= 64);
+        assert!(store.delete(&long));
+        store.set_bytes(&other, &long, None, 0).unwrap();
+        assert_eq!(store.memory_stats().arena_reserved_bytes, 64);
     }
 }

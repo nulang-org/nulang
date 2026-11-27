@@ -191,3 +191,25 @@ must be measured separately from steady-state command execution.
 6. Expand RESP compatibility and add Nulang-native leases, locks, semaphores,
    fencing tokens, queues, and stored functions where they fit the product
    boundary.
+
+
+## Cache admission limits
+
+The default store admits at most 1,000,000 physical entries and 256 MiB of
+initialized size-class arena extent. Use CacheStore::with_limits(CacheLimits
+{ max_entries, max_arena_bytes }) to configure a shard before binding its
+server. SET, INCR creation, and MSET reject over-budget requests with RESP OOM;
+native set_bytes and set_integer return Result. MSET preflights the entire
+batch with distinct-key counting and conservative free-block accounting before
+mutation, so a rejected batch does not partially commit. Blocks released by a
+write are not credited until subsequent admission; replacement can therefore
+be rejected even when a more sophisticated allocator could accommodate it.
+Expired entries still physically present count toward the limit.
+
+Memory stats distinguish initialized arena extent from estimated retained
+capacity (including key index, slots, free lists, TTL metadata and sweep
+scratch). The latter is diagnostic, not a hard cap: allocator overhead,
+capacity rounding, temporary command buffers and connection/queue memory are
+not included in the enforced arena budget. Aggregate server budgets, eviction,
+fallible allocator handling and workload-based limit tuning remain separate
+work.

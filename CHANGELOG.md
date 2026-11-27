@@ -1,4 +1,7 @@
 # Nulang Changelog
+### RESP cache admission limits — 2026-11-27
+- **Bound physical entries and initialized arena extent per shard**, with fallible cache writes and RESP OOM errors. Preflight whole MSET batches before mutation; expose estimated retained allocation capacity separately. Default limits are one million entries and 256 MiB of arena extent; these are not process RSS caps.
+
 ### Cancellable RESP expiration records — 2026-11-27
 - **Unlink prior TTL records in constant time** on refresh, persistent overwrite, deletion and lazy expiry using slot-indexed FIFO handles. Preserve bounded sweeps and safe slot reuse. Metadata capacity remains tied to the slot high-water mark; this is not a total memory cap.
 

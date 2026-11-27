@@ -711,7 +711,10 @@ mod tests {
     fn idle_reactor_purges_expired_values() {
         let mut server = build_server();
         let now = server.clock.now_ms();
-        server.store_mut().set_bytes(b"ttl", b"value", Some(1), now);
+        server
+            .store_mut()
+            .set_bytes(b"ttl", b"value", Some(1), now)
+            .unwrap();
 
         std::thread::sleep(Duration::from_millis(3));
         server.poll_once(Some(Duration::from_millis(1))).unwrap();
