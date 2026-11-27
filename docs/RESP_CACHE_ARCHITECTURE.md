@@ -64,10 +64,14 @@ hashed timing wheel with generation checks and lazy expiry on reads. Each explic
 future records, and keeps partially drained buckets eligible for later sweeps.
 FIFO records and round-robin bucket selection prevent a future collision or a
 large expiration burst from monopolizing subsequent sweeps. Bucket discovery
-is bounded by the fixed wheel size. This is not a wall-clock CPU deadline or a
-bound on all TTL metadata: stale records may accumulate under TTL refreshes.
-The next iteration should promote this to a hierarchical wheel with cancellable
-handles so long TTLs do not revisit the same bucket each rotation.
+is bounded by the fixed wheel size. Slot-indexed intrusive FIFO handles unlink
+the previous expiration record in O(1) on TTL refresh, persistent overwrite,
+explicit deletion, and lazy expiration. Each TTL-bearing entry retains at most
+one linked record; a reusable node table retains capacity at the highest slot
+index that has carried a TTL. Generation and deadline checks remain defensive
+guards. This is not a wall-clock CPU deadline or a total memory admission cap.
+The next iteration should promote the wheel to a hierarchy so long TTLs do not
+revisit the same bucket each rotation.
 
 ## RESP ingress and command execution
 

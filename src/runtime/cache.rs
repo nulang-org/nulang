@@ -210,10 +210,27 @@ struct ExpirationRef {
     expires_at_ms: u64,
 }
 
+// Slot-indexed intrusive FIFO lists: refresh/delete unlinks one record
+// without scanning a bucket or moving other records.
+#[derive(Debug, Clone, Copy)]
+struct ExpirationNode {
+    item: ExpirationRef,
+    bucket: usize,
+    prev: Option<u32>,
+    next: Option<u32>,
+}
+
+#[derive(Debug, Default)]
+struct ExpirationBucket {
+    head: Option<u32>,
+    tail: Option<u32>,
+}
+
 #[derive(Debug)]
 struct ExpirationWheel {
     tick_ms: u64,
-    buckets: Vec<VecDeque<ExpirationRef>>,
+    buckets: Vec<ExpirationBucket>,
+    nodes: Vec<Option<ExpirationNode>>,
     pending: VecDeque<usize>,
     queued: Vec<bool>,
     last_tick: Option<u64>,
@@ -225,21 +242,67 @@ impl ExpirationWheel {
         assert!(tick_ms > 0);
         Self {
             tick_ms,
-            buckets: (0..bucket_count).map(|_| VecDeque::new()).collect(),
+            buckets: (0..bucket_count)
+                .map(|_| ExpirationBucket::default())
+                .collect(),
+            nodes: Vec::new(),
             pending: VecDeque::new(),
             queued: vec![false; bucket_count],
             last_tick: None,
         }
     }
 
+    fn cancel(&mut self, slot: u32) -> Option<ExpirationRef> {
+        let node = self.nodes.get_mut(slot as usize)?.take()?;
+        let bucket = &mut self.buckets[node.bucket];
+        if let Some(prev) = node.prev {
+            self.nodes[prev as usize]
+                .as_mut()
+                .expect("linked expiration")
+                .next = node.next;
+        } else {
+            bucket.head = node.next;
+        }
+        if let Some(next) = node.next {
+            self.nodes[next as usize]
+                .as_mut()
+                .expect("linked expiration")
+                .prev = node.prev;
+        } else {
+            bucket.tail = node.prev;
+        }
+        Some(node.item)
+    }
+
     fn schedule(&mut self, item: ExpirationRef, now_ms: u64) {
+        self.cancel(item.slot);
         self.last_tick.get_or_insert(now_ms / self.tick_ms);
-        let bucket = ((item.expires_at_ms / self.tick_ms) % self.buckets.len() as u64) as usize;
-        self.buckets[bucket].push_back(item);
+        let idx = ((item.expires_at_ms / self.tick_ms) % self.buckets.len() as u64) as usize;
+        let slot = item.slot as usize;
+        if self.nodes.len() <= slot {
+            self.nodes.resize(slot + 1, None);
+        }
+        let bucket = &mut self.buckets[idx];
+        let prev = bucket.tail;
+        if let Some(prev) = prev {
+            self.nodes[prev as usize]
+                .as_mut()
+                .expect("linked expiration")
+                .next = Some(item.slot);
+        } else {
+            bucket.head = Some(item.slot);
+        }
+        bucket.tail = Some(item.slot);
+        self.nodes[slot] = Some(ExpirationNode {
+            item,
+            bucket: idx,
+            prev,
+            next: None,
+        });
     }
 
     fn enqueue_bucket(&mut self, idx: usize) {
-        if !self.queued[idx] && !self.buckets[idx].is_empty() {
+        if !self.queued[idx] && self.buckets[idx].head.is_some() {
             self.queued[idx] = true;
             self.pending.push_back(idx);
         }
@@ -278,9 +341,12 @@ impl ExpirationWheel {
                 break;
             };
             self.queued[idx] = false;
-            let remaining = budget - (out.len() - initial_len);
-            let count = remaining.min(self.buckets[idx].len());
-            out.extend(self.buckets[idx].drain(..count));
+            while out.len() - initial_len < budget {
+                let Some(slot) = self.buckets[idx].head else {
+                    break;
+                };
+                out.push(self.cancel(slot).expect("linked expiration"));
+            }
             self.enqueue_bucket(idx);
         }
     }
@@ -473,6 +539,7 @@ impl CacheStore {
         let Some(entry) = slot.entry.take() else {
             return false;
         };
+        self.expiry.cancel(slot_id);
         self.remove_bucket(entry.hash, slot_id);
         entry.key.release(&mut self.arena);
         entry.value.release(&mut self.arena);
@@ -504,6 +571,8 @@ impl CacheStore {
                     },
                     now_ms,
                 );
+            } else {
+                self.expiry.cancel(slot_id);
             }
             self.stats.sets += 1;
             return;
@@ -974,5 +1043,60 @@ mod tests {
             .is_none());
         assert_eq!(store.len(), 99);
         assert!(store.expiry.pending.len() <= DEFAULT_WHEEL_BUCKETS);
+    }
+
+    #[test]
+    fn ttl_refresh_does_not_accumulate_expiration_records() {
+        let mut store = CacheStore::new();
+        for i in 0..10_000u64 {
+            store.set_bytes(b"hot", b"v", Some(60_000 + i), 0);
+            assert!(store.expire_ms(b"hot", 120_000 + i, 0));
+        }
+        assert_eq!(store.expiry.nodes.iter().flatten().count(), 1);
+        assert_eq!(store.ttl(b"hot", 0), CacheTtl::RemainingMs(129_999));
+        store.set_bytes(b"hot", b"persistent", None, 0);
+        assert_eq!(store.expiry.nodes.iter().flatten().count(), 0);
+    }
+
+    #[test]
+    fn ttl_delete_lazy_expiry_and_slot_reuse_cancel_records() {
+        let mut store = CacheStore::new();
+        store.set_bytes(b"a", b"v", Some(10), 0);
+        store.set_bytes(b"b", b"v", Some(10), 0);
+        store.set_bytes(b"c", b"v", Some(10), 0);
+        assert!(store.delete(b"b"));
+        assert!(!store.exists(b"a", 10));
+        store.set_bytes(b"d", b"v", Some(50), 10);
+        assert_eq!(store.expiry.nodes.iter().flatten().count(), 2);
+        assert_eq!(store.purge_expired(10, 1), 1);
+        assert!(store.exists(b"d", 10));
+        assert_eq!(store.purge_expired(60, 1), 1);
+        assert!(store.is_empty());
+        assert_eq!(store.expiry.nodes.iter().flatten().count(), 0);
+    }
+
+    #[test]
+    fn cancellation_while_bucket_is_pending_preserves_fifo_and_reused_slots() {
+        let mut store = CacheStore::new();
+        for key in [b"a", b"b", b"c", b"d", b"e"] {
+            store.set_bytes(key, b"v", Some(10), 0);
+        }
+        assert_eq!(store.purge_expired(10, 1), 1);
+        // Cancel a pending head, middle, and tail without lazy-expiry reads.
+        assert!(store.delete(b"b"));
+        assert!(store.delete(b"d"));
+        assert!(store.delete(b"e"));
+        store.set_bytes(b"new", b"v", Some(30), 10);
+        assert_eq!(store.purge_expired(20, 1), 1);
+        assert_eq!(store.len(), 1);
+        assert!(store.exists(b"new", 39));
+        assert_eq!(store.purge_expired(40, 1), 1);
+        assert!(store.is_empty());
+        assert_eq!(store.expiry.nodes.iter().flatten().count(), 0);
+        assert!(store
+            .expiry
+            .buckets
+            .iter()
+            .all(|b| b.head.is_none() && b.tail.is_none()));
     }
 }
