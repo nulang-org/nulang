@@ -65,3 +65,30 @@ cargo test --locked --no-default-features --features tcp --test web_sse_bounds -
 ```
 The tests saturate both limits, close a fully read stream, and require
 successful readmission within six seconds with no further room broadcasts.
+
+## Optional native throughput comparator
+
+For high-concurrency HTTP 200 measurements, a Go standard-library client is
+available. The Python harness remains the functional/conditional-response
+reference and requires no Go installation. Neither client is a runtime
+dependency or a mandatory CI gate.
+
+```sh
+GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off go build -trimpath -o /tmp/nulang-web-http-go scripts/web_http_bench.go
+/tmp/nulang-web-http-go -port 8080 -path /app.js -requests 80 -concurrency 4
+/tmp/nulang-web-http-go -port 8080 -path /app.js -requests 1500 -concurrency 4
+GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off go test scripts/web_http_bench.go scripts/web_http_bench_test.go
+```
+
+The first invocation is a separate warmup: discard its results and proceed
+only if it succeeds. Add `-bytes 16384` if the expected HTTP 200 body size
+is known and equals 16 KiB. The native client fixes the host to 127.0.0.1,
+disables proxies, redirects and keep-alive, caps concurrency at 64 and
+requests at 100,000, and enforces a three-second per-request timeout.
+It emits JSON to stdout and exits nonzero on any failed request. Throughput
+includes all attempted requests; latency includes only successful requests.
+This microbenchmark does not validate response contents beyond status and
+optional byte count. Do not use it for production capacity forecasts.
+
+See [HTTP worker profiling](WEB_HTTP_WORKER_PROFILE.md) for paired
+measurements, limitations and the worker-reuse investigation.
