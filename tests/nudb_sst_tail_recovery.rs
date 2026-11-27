@@ -940,3 +940,97 @@ fn quarantine_refuses_corrupt_backup_and_unrelated_files_or_existing_target() {
     assert!(old_dir.exists());
     assert!(quarantine.read_dir().unwrap().next().is_none());
 }
+
+#[test]
+fn durable_registry_keeps_old_and_new_references_until_exact_wal_reconciliation() {
+    use nulang::database::generation_registry::{
+        GenerationRegistry, GenerationStatus, ReferenceKind,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let old = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let registry_dir = f.0.join("registry");
+    fs::create_dir(&registry_dir).unwrap();
+    let mut registry = GenerationRegistry::create(&registry_dir, 7, 3).unwrap();
+    assert_eq!(registry.status(&old).unwrap(), GenerationStatus::Unknown);
+    db.register_generation_wal(&mut registry, &old).unwrap();
+    registry
+        .register_reference(ReferenceKind::Reader, [1; 16], &old)
+        .unwrap();
+    assert_eq!(registry.status(&old).unwrap(), GenerationStatus::Referenced);
+    db.commit_idempotent(id(2), vec![put(b"tail")]).unwrap();
+    let next_dir = f.0.join("next");
+    fs::create_dir(&next_dir).unwrap();
+    let mut next = ManifestStore::create(&next_dir, 7, 3).unwrap();
+    db.prepare_sst_successor(&old, &mut next, 1).unwrap();
+    db.reserve_generation_rotation(&mut registry, &old, &next)
+        .unwrap();
+    assert_eq!(registry.status(&old).unwrap(), GenerationStatus::Referenced);
+    assert_eq!(
+        registry.status(&next).unwrap(),
+        GenerationStatus::Referenced
+    );
+    drop(registry);
+    let mut registry = GenerationRegistry::open(&registry_dir, 7, 3).unwrap();
+    assert_eq!(
+        registry.status(&next).unwrap(),
+        GenerationStatus::Referenced
+    );
+    db.reclaim_to_sst_successor(&old, &next).unwrap();
+    db.reconcile_generation_wal(&mut registry, &next).unwrap();
+    assert_eq!(registry.status(&old).unwrap(), GenerationStatus::Referenced);
+    registry
+        .release_reference(ReferenceKind::Reader, [1; 16], &old)
+        .unwrap();
+    assert_eq!(
+        registry.status(&old).unwrap(),
+        GenerationStatus::Unreferenced
+    );
+    assert_eq!(
+        registry.status(&next).unwrap(),
+        GenerationStatus::Referenced
+    );
+    drop(registry);
+    let registry = GenerationRegistry::open(&registry_dir, 7, 3).unwrap();
+    assert_eq!(
+        registry.status(&old).unwrap(),
+        GenerationStatus::Unreferenced
+    );
+    assert_eq!(
+        registry.status(&next).unwrap(),
+        GenerationStatus::Referenced
+    );
+}
+
+#[test]
+fn registry_rejects_wrong_identity_duplicate_reference_and_corruption() {
+    use nulang::database::generation_registry::{
+        GenerationRegistry, GenerationStatus, ReferenceKind,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let old = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let dir = f.0.join("registry");
+    fs::create_dir(&dir).unwrap();
+    let mut r = GenerationRegistry::create(&dir, 7, 3).unwrap();
+    assert!(GenerationRegistry::open(&dir, 7, 3).is_err());
+    assert!(GenerationRegistry::create(&dir, 7, 3).is_err());
+    r.register_reference(ReferenceKind::Backup, [1; 16], &old)
+        .unwrap();
+    assert!(r
+        .release_reference(ReferenceKind::Reader, [1; 16], &old)
+        .is_err());
+    assert_eq!(r.status(&old).unwrap(), GenerationStatus::Referenced);
+    drop(r);
+    assert!(GenerationRegistry::open(&dir, 7, 4).is_err());
+    let p = dir.join("GENERATIONS");
+    let mut bytes = fs::read(&p).unwrap();
+    bytes[10] ^= 1;
+    fs::write(&p, bytes).unwrap();
+    assert!(GenerationRegistry::open(&dir, 7, 3).is_err());
+    assert!(GenerationRegistry::create(&dir, 7, 3).is_err());
+}

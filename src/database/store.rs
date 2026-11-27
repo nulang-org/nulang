@@ -866,6 +866,74 @@ impl WalBackedTablet {
         obsolete.quarantine(destination.as_ref())
     }
 
+    /// Register the actual recovered bound WAL under its canonical path.
+    /// This is opt-in: existing raw cutover APIs do not enforce registration.
+    #[cfg(unix)]
+    pub fn register_generation_wal(
+        &self,
+        registry: &mut super::generation_registry::GenerationRegistry,
+        manifest: &super::sst_manifest::ManifestStore,
+    ) -> std::io::Result<()> {
+        registry.register_wal(self.wal.path(), self.verified_registry_binding(manifest)?)
+    }
+
+    #[cfg(unix)]
+    fn verified_registry_binding(
+        &self,
+        manifest: &super::sst_manifest::ManifestStore,
+    ) -> std::io::Result<super::wal::SealBinding> {
+        let binding = manifest.sync_for_wal_binding()?;
+        if self.recovery_required
+            || self.wal.is_poisoned()
+            || !self.wal.matches_seal(binding)
+            || manifest.current().recovery_descriptor() != Some(self.descriptor())
+            || self.wal.last_sequence() != self.current_sequence()
+            || manifest.current().recovery_floor() != Some(self.oldest_retained_snapshot())
+        {
+            return Err(std::io::Error::other(
+                "registry requires recovered exact WAL binding",
+            ));
+        }
+        self.wal
+            .sync_for_registry()
+            .map_err(std::io::Error::other)?;
+        Ok(binding)
+    }
+
+    /// Reserve both generations durably before a caller performs rotation.
+    /// If publication fails, do not rotate until the registry is reopened.
+    #[cfg(unix)]
+    pub fn reserve_generation_rotation(
+        &self,
+        registry: &mut super::generation_registry::GenerationRegistry,
+        previous: &super::sst_manifest::ManifestStore,
+        next: &super::sst_manifest::ManifestStore,
+    ) -> std::io::Result<()> {
+        let old = self.verified_registry_binding(previous)?;
+        let floor = next
+            .current()
+            .recovery_floor()
+            .ok_or_else(|| std::io::Error::other("successor not sealed"))?;
+        self.validate_successor_base(previous, floor)?;
+        if next.current().recovery_descriptor() != Some(self.descriptor())
+            || next.directory() == previous.directory()
+        {
+            return Err(std::io::Error::other("invalid successor for registry"));
+        }
+        super::wal_sst_shadow::verify_successor(&self.wal, previous, next)?;
+        registry.reserve_rotation(self.wal.path(), old, next.sync_for_wal_binding()?)
+    }
+
+    /// Resolve a pending rotation using the actual recovered bound WAL.
+    #[cfg(unix)]
+    pub fn reconcile_generation_wal(
+        &self,
+        registry: &mut super::generation_registry::GenerationRegistry,
+        manifest: &super::sst_manifest::ManifestStore,
+    ) -> std::io::Result<()> {
+        registry.reconcile_wal(self.wal.path(), self.verified_registry_binding(manifest)?)
+    }
+
     /// Diagnostic point read against the published shadow SST prefix.
     /// No fallback or authoritative read routing. Compare both the exact
     /// WAL mutation (including sequence and tombstone) and the live tablet.
