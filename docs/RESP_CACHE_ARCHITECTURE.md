@@ -496,3 +496,49 @@ do not guarantee power-loss durability. The process tests verify successful
 SIGTERM and SIGINT exits with incomplete input and journal reopening;
 reactor tests cover pending replies, discarded commands, a zero deadline,
 a backpressured socket, and injected journal sync failure.
+
+
+## Durable TTL clock floor
+
+A durable cache now maintains a 48-byte checksummed journal-name.clock
+sidecar under the existing stable journal-name.lock writer lock. The
+sidecar contains the latest persisted Unix-millisecond clock observation.
+At startup, recovery refuses a wall clock earlier than the durable floor.
+Correct the operating-system clock before retrying; never reset the floor
+to make a rollback start succeed. Startup publishes its clock observation
+before replay, including replay that skips expired records. Within a
+process, the original wall/monotonic anchor is used; native mutation time
+pairs must agree with that anchor.
+
+TTL creation, time-sensitive key access and mutations, removal by expiry
+sweeps, checkpoints with surviving TTLs, and orderly reactor shutdown
+advance the floor when needed. An observation of a timed key synchronizes
+the new floor before returning its result. Persistent-key reads do not
+write the clock sidecar. Same-millisecond observations need no extra
+publication. Clock publication writes a private temporary file, syncs it,
+atomically renames it, and syncs its directory; it does not consume the
+bounded mutation journal's capacity. I/O failure during an active clock
+publication poisons the cache, and fallible RESP reads stop the shard
+rather than exposing stale results or panicking.
+
+Keep the WAL, stable lock file (which now contains an initialization marker),
+and clock sidecar together in a trusted private directory. A missing
+sidecar with an initialized marker, corrupt marker, or damaged checksum
+fails recovery. Existing journals with an empty lock file and no clock
+sidecar migrate on first guarded open. They have no historical clock
+observations before migration. Do not mix older binaries or restore just
+the WAL, delete the lock marker, or restore an older clock sidecar. Back
+up all three files consistently with the writer stopped. The checksum
+detects accidental corruption, not malicious rollback of an entire backup.
+
+The policy protects against rollback below a *persisted* observation,
+not an unobserved time interval lost in an abrupt crash, an erroneous
+forward wall-clock jump, or administrative replacement of all metadata.
+Timed reads can incur synchronous storage latency, even in buffered mode;
+benchmarking and a separately qualified batching strategy remain pending.
+Buffered mutation acknowledgements retain their original durability
+limitations.
+
+The shutdown drain additionally checks its deadline between socket writes,
+not only before each flush, so a continually reading peer cannot extend
+the flush loop indefinitely.

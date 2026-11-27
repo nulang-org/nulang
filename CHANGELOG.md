@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Durable TTL clock regression guard — 2026-11-27
+- **Fail closed on recovery behind a persisted clock observation**, using a checksummed independently synchronized clock sidecar and stable-lock initialization marker; guard TTL observations and expiry sweeps without consuming journal capacity. Propagate fallible RESP reads and stop the shard on clock publication failure. Check the graceful drain deadline between socket writes.
+
 ### Fabric graceful shutdown — 2026-11-27
 - **Handle SIGTERM and SIGINT in the standalone Unix server with synchronous signal waiting**, close listener admission, drain encoded replies to a configurable deadline, discard unexecuted input, release connection reservations, and synchronize durable journals before a successful exit. Sync errors poison the journal. Add real process and reactor regressions.
 

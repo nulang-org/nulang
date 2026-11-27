@@ -6,7 +6,7 @@ use super::cache::{
     parse_cache_integer, CacheAdmissionError, CacheIncrementError, CacheLimits, CacheStore,
     CacheTtl, CacheValueView,
 };
-use super::cache_wal::{CacheWal, CheckpointReport, WalLimits, WalSync};
+use super::cache_wal::{CacheWal, CheckpointReport, ClockFloor, WalLimits, WalSync};
 use std::io;
 use std::path::Path;
 
@@ -290,6 +290,8 @@ impl Mutation<'_> {
 pub struct DurableCache {
     store: CacheStore,
     wal: CacheWal,
+    clock: ClockFloor,
+    anchor: CacheTime,
     limits: WalLimits,
     sync: WalSync,
     poisoned: bool,
@@ -304,23 +306,77 @@ impl DurableCache {
         time: CacheTime,
     ) -> Result<Self, DurableError> {
         let mut store = CacheStore::with_limits(cache_limits);
-        let wal = CacheWal::open(path, limits, |_, bytes| {
-            let record = decode(bytes)?;
-            record.apply(&mut store, time).map_err(io::Error::other)?;
-            Ok(())
-        })?;
+        let mut clock = None;
+        let wal = CacheWal::open_prepared(
+            path,
+            limits,
+            |path, lock| {
+                clock = Some(ClockFloor::open(path, lock, time.unix_ms)?);
+                Ok(())
+            },
+            |_, bytes| {
+                let record = decode(bytes)?;
+                record.apply(&mut store, time).map_err(io::Error::other)?;
+                Ok(())
+            },
+        )?;
+        let clock = clock.ok_or_else(|| io::Error::other("missing cache clock floor"))?;
         Ok(Self {
             store,
             wal,
+            clock,
+            anchor: time,
             limits,
             sync,
             poisoned: false,
         })
     }
+    fn anchored_unix(&self, now_ms: u64) -> Result<u64, DurableError> {
+        let elapsed = now_ms
+            .checked_sub(self.anchor.monotonic_ms)
+            .ok_or(DurableError::InvalidTime)?;
+        self.anchor
+            .unix_ms
+            .checked_add(elapsed)
+            .ok_or(DurableError::InvalidTime)
+    }
+
+    fn validate_time(&self, time: CacheTime) -> Result<(), DurableError> {
+        if self.anchored_unix(time.monotonic_ms)? != time.unix_ms {
+            return Err(DurableError::InvalidTime);
+        }
+        Ok(())
+    }
+
+    fn observe(&mut self, now_ms: u64) -> Result<(), DurableError> {
+        let unix_ms = self.anchored_unix(now_ms)?;
+        // Fail closed on any clock persistence error, including uncertainty
+        // about whether the new floor was durably published.
+        self.poisoned = true;
+        self.clock.advance(unix_ms)?;
+        self.poisoned = false;
+        Ok(())
+    }
+
+    fn observe_key(&mut self, key: &[u8], now_ms: u64) -> Result<(), DurableError> {
+        if self.store.has_deadline(key) {
+            self.observe(now_ms)?;
+        }
+        Ok(())
+    }
+
     /// Publish a complete snapshot as the new journal prefix, then continue
     /// appending to it. One entry is encoded at a time; no whole-cache clone.
     pub fn checkpoint(&mut self, time: CacheTime) -> Result<CheckpointReport, DurableError> {
         self.healthy()?;
+        self.validate_time(time)?;
+        if self
+            .store
+            .checkpoint_entries(time.monotonic_ms)
+            .any(|(_, _, ttl)| ttl.is_some())
+        {
+            self.observe(time.monotonic_ms)?;
+        }
         let entries = self.store.checkpoint_entries(time.monotonic_ms).count() as u64;
         let store = &self.store;
         let max_record = self.limits.max_record_bytes;
@@ -371,6 +427,14 @@ impl DurableCache {
         Ok(())
     }
 
+    /// Record the orderly shutdown time as well as syncing mutation data.
+    #[cfg(feature = "cache-server")]
+    pub(super) fn synchronize_at(&mut self, now_ms: u64) -> Result<(), DurableError> {
+        self.healthy()?;
+        self.observe(now_ms)?;
+        self.synchronize()
+    }
+
     pub fn is_poisoned(&self) -> bool {
         self.poisoned || self.wal.is_poisoned()
     }
@@ -396,6 +460,7 @@ impl DurableCache {
         append: impl FnOnce(&mut CacheWal, &[u8], WalSync) -> io::Result<u64>,
     ) -> Result<usize, DurableError> {
         self.healthy()?;
+        self.validate_time(time)?;
         let record = decode(payload)?;
         record.preflight(&self.store, time)?;
         // Poison before the append so unwinding cannot expose uncertain state.
@@ -420,6 +485,10 @@ impl DurableCache {
             &Mutation::Bytes(key, value, absolute(ttl, time)?),
             self.limits.max_record_bytes,
         )?;
+        self.validate_time(time)?;
+        if ttl.is_some() {
+            self.observe(time.monotonic_ms)?;
+        }
         self.commit(&payload, time)?;
         Ok(())
     }
@@ -444,6 +513,10 @@ impl DurableCache {
         if keys.len() > MAX_BATCH_ITEMS {
             return Err(too_large().into());
         }
+        self.validate_time(time)?;
+        if keys.iter().any(|key| self.store.has_deadline(key)) {
+            self.observe(time.monotonic_ms)?;
+        }
         let payload = encode(
             &Mutation::Delete(keys.to_vec()),
             self.limits.max_record_bytes,
@@ -457,6 +530,8 @@ impl DurableCache {
         time: CacheTime,
     ) -> Result<i64, DurableError> {
         self.healthy()?;
+        self.validate_time(time)?;
+        self.observe_key(key, time.monotonic_ms)?;
         let ttl = match self.store.ttl(key, time.monotonic_ms) {
             CacheTtl::RemainingMs(ms) => Some(ms),
             _ => None,
@@ -479,6 +554,8 @@ impl DurableCache {
     }
     pub fn expire(&mut self, key: &[u8], ttl: u64, time: CacheTime) -> Result<bool, DurableError> {
         self.healthy()?;
+        self.validate_time(time)?;
+        self.observe(time.monotonic_ms)?;
         let Some(value) = self.store.get(key, time.monotonic_ms) else {
             return Ok(false);
         };
@@ -501,10 +578,12 @@ impl DurableCache {
         now_ms: u64,
     ) -> Result<Option<CacheValueView<'_>>, DurableError> {
         self.healthy()?;
+        self.observe_key(key, now_ms)?;
         Ok(self.store.get(key, now_ms))
     }
     pub fn exists(&mut self, key: &[u8], now_ms: u64) -> Result<bool, DurableError> {
         self.healthy()?;
+        self.observe_key(key, now_ms)?;
         Ok(self.store.exists(key, now_ms))
     }
 
@@ -521,11 +600,18 @@ impl DurableCache {
 
     pub fn ttl(&mut self, key: &[u8], now_ms: u64) -> Result<CacheTtl, DurableError> {
         self.healthy()?;
+        self.observe_key(key, now_ms)?;
         Ok(self.store.ttl(key, now_ms))
     }
     pub fn purge_expired(&mut self, now_ms: u64, budget: usize) -> Result<usize, DurableError> {
         self.healthy()?;
-        Ok(self.store.purge_expired(now_ms, budget))
+        // Validate the monotonic reading before the sweep can remove keys.
+        self.anchored_unix(now_ms)?;
+        let removed = self.store.purge_expired(now_ms, budget);
+        if removed != 0 {
+            self.observe(now_ms)?;
+        }
+        Ok(removed)
     }
 }
 
@@ -872,5 +958,179 @@ mod tests {
             recovered.get(b"k", 0).unwrap(),
             Some(CacheValueView::Bytes(b"more"))
         );
+    }
+
+    #[test]
+    fn clock_rollback_after_observed_expiry_cannot_resurrect_key() {
+        let tmp = Temp::new();
+        let mut cache = tmp.open(time(0, 1000));
+        cache
+            .set_bytes(b"ttl", b"value", Some(100), time(0, 1000))
+            .unwrap();
+        assert_eq!(cache.get(b"ttl", 101).unwrap(), None);
+        drop(cache);
+        assert!(DurableCache::open(
+            tmp.path(),
+            CacheLimits::default(),
+            WalLimits::default(),
+            WalSync::Data,
+            time(0, 1050)
+        )
+        .is_err());
+        let mut recovered = tmp.open(time(0, 1101));
+        assert_eq!(recovered.get(b"ttl", 0).unwrap(), None);
+    }
+
+    #[test]
+    fn clock_rollback_after_ttl_observation_cannot_extend_remaining_ttl() {
+        let tmp = Temp::new();
+        let mut cache = tmp.open(time(0, 1000));
+        cache
+            .set_bytes(b"ttl", b"value", Some(1000), time(0, 1000))
+            .unwrap();
+        assert_eq!(cache.ttl(b"ttl", 400).unwrap(), CacheTtl::RemainingMs(600));
+        drop(cache);
+        assert!(DurableCache::open(
+            tmp.path(),
+            CacheLimits::default(),
+            WalLimits::default(),
+            WalSync::Data,
+            time(0, 1300)
+        )
+        .is_err());
+        let mut recovered = tmp.open(time(0, 1400));
+        assert_eq!(
+            recovered.ttl(b"ttl", 0).unwrap(),
+            CacheTtl::RemainingMs(600)
+        );
+    }
+
+    fn try_open(tmp: &Temp, now: u64) -> Result<DurableCache, DurableError> {
+        DurableCache::open(
+            tmp.path(),
+            CacheLimits::default(),
+            WalLimits::default(),
+            WalSync::Data,
+            time(0, now),
+        )
+    }
+
+    #[test]
+    fn clock_floor_survives_sweep_checkpoint_and_reopen() {
+        let tmp = Temp::new();
+        let mut cache = tmp.open(time(0, 1000));
+        cache
+            .set_bytes(b"expired", b"gone", Some(10), time(0, 1000))
+            .unwrap();
+        cache
+            .set_bytes(b"live", b"value", Some(1000), time(0, 1000))
+            .unwrap();
+        assert_eq!(cache.purge_expired(200, 100).unwrap(), 1);
+        cache.checkpoint(time(400, 1400)).unwrap();
+        drop(cache);
+        assert!(try_open(&tmp, 1399).is_err());
+        let mut recovered = try_open(&tmp, 1400).unwrap();
+        assert_eq!(recovered.get(b"expired", 0).unwrap(), None);
+        assert_eq!(
+            recovered.ttl(b"live", 0).unwrap(),
+            CacheTtl::RemainingMs(600)
+        );
+    }
+
+    #[test]
+    fn corrupt_or_missing_clock_floor_refuses_recovery() {
+        let tmp = Temp::new();
+        let mut cache = tmp.open(time(0, 1000));
+        cache
+            .set_bytes(b"ttl", b"value", Some(100), time(0, 1000))
+            .unwrap();
+        drop(cache);
+        let clock = tmp.0.join("cache.wal.clock");
+        let original = std::fs::read(&clock).unwrap();
+        let mut corrupt = original.clone();
+        corrupt[9] ^= 1;
+        std::fs::write(&clock, corrupt).unwrap();
+        assert!(try_open(&tmp, 1200).is_err());
+        std::fs::remove_file(&clock).unwrap();
+        assert!(try_open(&tmp, 1200).is_err());
+        std::fs::write(&clock, original).unwrap();
+        assert!(try_open(&tmp, 1200).is_ok());
+    }
+
+    #[test]
+    fn full_journal_still_records_clock_floor_for_expiration() {
+        let tmp = Temp::new();
+        let limits = WalLimits {
+            max_record_bytes: 128,
+            max_file_bytes: 96,
+        };
+        let open = |now| {
+            DurableCache::open(
+                tmp.path(),
+                CacheLimits::default(),
+                limits,
+                WalSync::Data,
+                time(0, now),
+            )
+        };
+        let mut cache = open(1000).unwrap();
+        cache
+            .set_bytes(b"k", b"v", Some(10), time(0, 1000))
+            .unwrap();
+        assert!(cache
+            .set_bytes(b"k", b"v", Some(10), time(0, 1000))
+            .is_err());
+        let journal = std::fs::read(tmp.path()).unwrap();
+        assert_eq!(cache.get(b"k", 11).unwrap(), None);
+        assert_eq!(std::fs::read(tmp.path()).unwrap(), journal);
+        drop(cache);
+        assert!(open(1010).is_err());
+        assert_eq!(open(1011).unwrap().get(b"k", 0).unwrap(), None);
+    }
+
+    #[test]
+    fn clock_publication_failure_blocks_reads_and_writes() {
+        let tmp = Temp::new();
+        let mut cache = tmp.open(time(0, 1000));
+        cache
+            .set_bytes(b"k", b"v", Some(10), time(0, 1000))
+            .unwrap();
+        let clock = tmp.0.join("cache.wal.clock");
+        std::fs::remove_file(&clock).unwrap();
+        std::fs::create_dir(&clock).unwrap();
+        assert!(cache.get(b"k", 11).is_err());
+        assert!(cache.is_poisoned());
+        assert!(cache.set_bytes(b"x", b"y", None, time(12, 1012)).is_err());
+        assert!(cache.get(b"k", 12).is_err());
+    }
+
+    #[test]
+    fn inconsistent_native_time_pair_cannot_change_ttl() {
+        let tmp = Temp::new();
+        let mut cache = tmp.open(time(50, 1000));
+        cache
+            .set_bytes(b"k", b"v", Some(100), time(50, 1000))
+            .unwrap();
+        let old = std::fs::read(tmp.path()).unwrap();
+        assert!(matches!(
+            cache.expire(b"k", 200, time(60, 999)),
+            Err(DurableError::InvalidTime)
+        ));
+        assert_eq!(std::fs::read(tmp.path()).unwrap(), old);
+        assert_eq!(cache.ttl(b"k", 60).unwrap(), CacheTtl::RemainingMs(90));
+    }
+
+    #[test]
+    fn startup_expiration_advances_floor_before_replay_is_published() {
+        let tmp = Temp::new();
+        let mut cache = tmp.open(time(0, 1000));
+        cache
+            .set_bytes(b"ttl", b"value", Some(100), time(0, 1000))
+            .unwrap();
+        drop(cache);
+        let mut recovered = try_open(&tmp, 1200).unwrap();
+        assert_eq!(recovered.get(b"ttl", 0).unwrap(), None);
+        drop(recovered);
+        assert!(try_open(&tmp, 1050).is_err());
     }
 }

@@ -785,6 +785,14 @@ impl CacheStore {
         }
     }
 
+    /// Inspect TTL metadata before a durable operation may lazily expire a key.
+    #[cfg(unix)]
+    pub(super) fn has_deadline(&self, key: &[u8]) -> bool {
+        self.find_slot(key, Self::hash(key))
+            .and_then(|slot| self.slots[slot as usize].entry.as_ref())
+            .is_some_and(|entry| entry.expires_at_ms.is_some())
+    }
+
     pub fn get(&mut self, key: &[u8], now_ms: u64) -> Option<CacheValueView<'_>> {
         let Some(slot_id) = self.live_slot_id(key, now_ms) else {
             self.stats.misses += 1;

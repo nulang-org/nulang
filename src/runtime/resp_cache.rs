@@ -133,9 +133,9 @@ fn route_key_value_args(mut args: RespArgs<'_>) -> RespCommandSlot {
 // Static dispatch keeps the memory-only path free of journal work while sharing
 // all protocol validation and response encoding with the durable backend.
 trait RespBackend {
-    fn get(&mut self, key: &[u8], now: u64) -> Option<CacheValueView<'_>>;
-    fn exists(&mut self, key: &[u8], now: u64) -> bool;
-    fn ttl(&mut self, key: &[u8], now: u64) -> CacheTtl;
+    fn get(&mut self, key: &[u8], now: u64) -> Result<Option<CacheValueView<'_>>, &'static [u8]>;
+    fn exists(&mut self, key: &[u8], now: u64) -> Result<bool, &'static [u8]>;
+    fn ttl(&mut self, key: &[u8], now: u64) -> Result<CacheTtl, &'static [u8]>;
     fn set_bytes(
         &mut self,
         key: &[u8],
@@ -158,14 +158,14 @@ fn increment_error(error: CacheIncrementError) -> &'static [u8] {
 }
 
 impl RespBackend for CacheStore {
-    fn get(&mut self, key: &[u8], now: u64) -> Option<CacheValueView<'_>> {
-        CacheStore::get(self, key, now)
+    fn get(&mut self, key: &[u8], now: u64) -> Result<Option<CacheValueView<'_>>, &'static [u8]> {
+        Ok(CacheStore::get(self, key, now))
     }
-    fn exists(&mut self, key: &[u8], now: u64) -> bool {
-        CacheStore::exists(self, key, now)
+    fn exists(&mut self, key: &[u8], now: u64) -> Result<bool, &'static [u8]> {
+        Ok(CacheStore::exists(self, key, now))
     }
-    fn ttl(&mut self, key: &[u8], now: u64) -> CacheTtl {
-        CacheStore::ttl(self, key, now)
+    fn ttl(&mut self, key: &[u8], now: u64) -> Result<CacheTtl, &'static [u8]> {
+        Ok(CacheStore::ttl(self, key, now))
     }
     fn set_bytes(
         &mut self,
@@ -214,14 +214,14 @@ struct DurableResp<'a> {
 }
 #[cfg(all(unix, feature = "cache-server"))]
 impl RespBackend for DurableResp<'_> {
-    fn get(&mut self, key: &[u8], now: u64) -> Option<CacheValueView<'_>> {
-        self.store.get(key, now).expect("healthy durable read")
+    fn get(&mut self, key: &[u8], now: u64) -> Result<Option<CacheValueView<'_>>, &'static [u8]> {
+        self.store.get(key, now).map_err(durable_error)
     }
-    fn exists(&mut self, key: &[u8], now: u64) -> bool {
-        self.store.exists(key, now).expect("healthy durable read")
+    fn exists(&mut self, key: &[u8], now: u64) -> Result<bool, &'static [u8]> {
+        self.store.exists(key, now).map_err(durable_error)
     }
-    fn ttl(&mut self, key: &[u8], now: u64) -> CacheTtl {
-        self.store.ttl(key, now).expect("healthy durable read")
+    fn ttl(&mut self, key: &[u8], now: u64) -> Result<CacheTtl, &'static [u8]> {
+        self.store.ttl(key, now).map_err(durable_error)
     }
     fn set_bytes(
         &mut self,
@@ -346,7 +346,10 @@ fn execute_get(
     }
 
     let key = command.args().next().expect("validated argument");
-    write_value(store.get(key, now_ms), out);
+    match store.get(key, now_ms) {
+        Ok(value) => write_value(value, out),
+        Err(error) => write_error(out, error),
+    }
 }
 
 fn execute_set(
@@ -435,8 +438,12 @@ fn execute_exists(
 
     let mut count = 0i64;
     for key in command.args() {
-        if store.exists(key, now_ms) {
-            count += 1;
+        match store.exists(key, now_ms) {
+            Ok(exists) => count += i64::from(exists),
+            Err(error) => {
+                write_error(out, error);
+                return;
+            }
         }
     }
     write_integer(out, count);
@@ -506,10 +513,14 @@ fn execute_ttl(
 
     let key = command.args().next().expect("validated argument");
     let ttl = match store.ttl(key, now_ms) {
-        CacheTtl::Missing => -2,
-        CacheTtl::Persistent => -1,
+        Ok(CacheTtl::Missing) => -2,
+        Ok(CacheTtl::Persistent) => -1,
         // Redis rounds to the nearest second. Divide first to avoid overflow.
-        CacheTtl::RemainingMs(ms) => (ms / 1_000 + u64::from(ms % 1_000 >= 500)) as i64,
+        Ok(CacheTtl::RemainingMs(ms)) => (ms / 1_000 + u64::from(ms % 1_000 >= 500)) as i64,
+        Err(error) => {
+            write_error(out, error);
+            return;
+        }
     };
     write_integer(out, ttl);
 }
@@ -529,9 +540,17 @@ fn execute_mget(
         return;
     }
 
+    let start = out.len();
     write_array_len(out, command.argc());
     for key in command.args() {
-        write_value(store.get(key, now_ms), out);
+        match store.get(key, now_ms) {
+            Ok(value) => write_value(value, out),
+            Err(error) => {
+                out.truncate(start);
+                write_error(out, error);
+                return;
+            }
+        }
     }
 }
 
