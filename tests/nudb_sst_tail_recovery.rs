@@ -514,3 +514,96 @@ fn empty_seal_does_not_reclaim_empty_wal() {
     assert_eq!(fs::read(&path).unwrap(), before);
     db.commit_idempotent(id(1), vec![]).unwrap();
 }
+
+#[test]
+fn sealed_floor_takes_effect_only_on_bound_cutover_and_preserves_receipts() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let r1 = db.commit_idempotent(id(1), vec![put(b"old")]).unwrap();
+    db.commit_idempotent(id(2), vec![put(b"anchor")]).unwrap();
+    db.commit_idempotent(id(3), vec![]).unwrap();
+    db.commit_idempotent(id(4), vec![TabletMutation::Delete { key: b"k".to_vec() }])
+        .unwrap();
+    db.commit_idempotent(id(5), vec![put(b"new")]).unwrap();
+    let mut m = f.manifest();
+    while db.flush_sst_shadow(&mut m, 2).unwrap().is_some() {}
+    let pin = db.pin_snapshot(1).unwrap();
+    assert!(db.seal_sst_recovery_at_floor(&mut m, 3).is_err());
+    assert!(db.seal_sst_recovery_at_floor(&mut m, 6).is_err());
+    assert!(!m.current().is_recovery_sealed());
+    drop(pin);
+    db.seal_sst_recovery_at_floor(&mut m, 3).unwrap();
+    assert_eq!(db.oldest_retained_snapshot(), 0);
+    assert_eq!(m.current().recovery_floor(), Some(3));
+    assert!(m.recovered_read_at(b"k", 2).is_err());
+    assert_eq!(
+        m.recovered_read_at(b"k", 3).unwrap(),
+        Some(b"anchor".to_vec())
+    );
+    assert_eq!(m.recovered_read_at(b"k", 4).unwrap(), None);
+    assert_eq!(m.recovered_receipt(id(1)).unwrap(), Some(r1));
+    let path = f.0.join("tablet.wal");
+    let before = fs::read(&path).unwrap();
+    let pin = db.pin_snapshot(2).unwrap();
+    assert!(db.reclaim_to_sealed_sst(&m).is_err());
+    assert_eq!(fs::read(&path).unwrap(), before);
+    drop(pin);
+    drop(db);
+    drop(m);
+    assert!(recover(&f).is_err());
+    let mut db = f.open();
+    assert_eq!(db.oldest_retained_snapshot(), 0);
+    let m = ManifestStore::open(f.0.join("sst"), 7, 3).unwrap();
+    db.reclaim_to_sealed_sst(&m).unwrap();
+    assert_eq!(db.oldest_retained_snapshot(), 3);
+    assert!(db.read_at(b"k", 2).is_err());
+    assert_eq!(db.read_at(b"k", 3).unwrap(), Some(b"anchor".as_slice()));
+    assert_eq!(db.read_at(b"k", 4).unwrap(), None);
+    assert_eq!(db.commit_idempotent(id(1), vec![put(b"old")]).unwrap(), r1);
+    db.commit_idempotent(id(6), vec![put(b"tail")]).unwrap();
+    drop(db);
+    drop(m);
+    let mut db = recover(&f).unwrap();
+    assert_eq!(db.oldest_retained_snapshot(), 3);
+    assert!(db.read_at(b"k", 2).is_err());
+    assert_eq!(db.read_at(b"k", 3).unwrap(), Some(b"anchor".as_slice()));
+    assert_eq!(db.read_at(b"k", 4).unwrap(), None);
+    assert_eq!(db.read_latest(b"k"), Some(b"tail".as_slice()));
+    assert_eq!(db.commit_idempotent(id(1), vec![put(b"old")]).unwrap(), r1);
+    assert!(db.pin_snapshot(2).is_err());
+}
+
+#[test]
+fn nonzero_floor_format_rejects_zero_future_and_version_downgrade() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"v")]).unwrap();
+    let mut m = f.manifest();
+    db.flush_sst_shadow(&mut m, 1).unwrap();
+    db.seal_sst_recovery_at_floor(&mut m, 1).unwrap();
+    drop(m);
+    drop(db);
+    let p = f.0.join("sst/MANIFEST");
+    let original = fs::read(&p).unwrap();
+    assert_eq!(&original[8..10], &3u16.to_le_bytes());
+    for variant in 0..3 {
+        let mut bytes = original[..original.len() - 32].to_vec();
+        match variant {
+            0 => bytes[98..106].copy_from_slice(&0u64.to_le_bytes()),
+            1 => bytes[98..106].copy_from_slice(&2u64.to_le_bytes()),
+            _ => bytes[8..10].copy_from_slice(&2u16.to_le_bytes()),
+        }
+        let hash = blake3::hash(&bytes);
+        bytes.extend_from_slice(hash.as_bytes());
+        fs::write(&p, &bytes).unwrap();
+        assert!(ManifestStore::open(f.0.join("sst"), 7, 3).is_err());
+    }
+    fs::write(&p, original).unwrap();
+    assert_eq!(
+        ManifestStore::open(f.0.join("sst"), 7, 3)
+            .unwrap()
+            .current()
+            .recovery_floor(),
+        Some(1)
+    );
+}
