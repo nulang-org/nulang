@@ -256,3 +256,213 @@ impl IndexedSst {
         })
     }
 }
+
+/// Exact counts for one immutable committed sequence interval. Empty intervals
+/// of mutations still require a nonempty sequence interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SstHeader {
+    pub generation: u64,
+    pub min_sequence: u64,
+    pub max_sequence: u64,
+    pub key_count: u64,
+    pub version_count: u64,
+}
+
+pub type SstVersion<'a> = (u64, Option<&'a [u8]>);
+pub type SstRow<'a> = (&'a [u8], &'a [SstVersion<'a>]);
+
+/// Stream one sorted immutable table without buffering its encoded contents.
+/// Rows and versions must be strictly ordered, and header counts must match.
+/// The destination must not exist. On Unix, publication uses a synchronized
+/// same-directory staging file, an exclusive hard link, and directory sync.
+/// Requires a trusted directory and a local filesystem supporting these
+/// operations. An error after publication may leave a complete table; callers
+/// must reconcile before retrying. This is not manifest/WAL publication.
+pub fn write_immutable_table<'a>(
+    path: impl AsRef<Path>,
+    header: SstHeader,
+    rows: impl IntoIterator<Item = SstRow<'a>>,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        streaming_writer::write(path.as_ref(), header, rows)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, header, rows);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable SST publication is supported on Unix only",
+        ))
+    }
+}
+
+#[cfg(unix)]
+mod streaming_writer {
+    use super::*;
+    use std::fs::{self, OpenOptions};
+    use std::io::{BufWriter, Write};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    struct Staged(PathBuf);
+    impl Drop for Staged {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    struct Encoder {
+        writer: BufWriter<File>,
+        digest: blake3::Hasher,
+        bytes: u64,
+    }
+    impl Encoder {
+        fn emit(&mut self, data: &[u8]) -> io::Result<()> {
+            let bytes = self
+                .bytes
+                .checked_add(data.len() as u64)
+                .ok_or_else(|| invalid("SST size overflow"))?;
+            if bytes > MAX_TABLE_BYTES - 32 {
+                return Err(invalid("SST exceeds table size limit"));
+            }
+            self.writer.write_all(data)?;
+            self.digest.update(data);
+            self.bytes = bytes;
+            Ok(())
+        }
+    }
+
+    fn stage(parent: &Path, destination: &Path) -> io::Result<(Staged, File)> {
+        for _ in 0..64 {
+            let path = parent.join(format!(
+                ".nudb-sst-{}-{}.tmp",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            if path == destination {
+                continue;
+            }
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => return Ok((Staged(path), file)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate SST staging file",
+        ))
+    }
+
+    pub(super) fn write<'a>(
+        path: &Path,
+        header: SstHeader,
+        rows: impl IntoIterator<Item = SstRow<'a>>,
+    ) -> io::Result<()> {
+        if header.generation == 0
+            || header.min_sequence == 0
+            || header.min_sequence > header.max_sequence
+            || header.key_count > header.version_count
+            || header.version_count > MAX_INDEX_VERSIONS as u64
+        {
+            return Err(invalid("invalid SST header"));
+        }
+        let filename = path
+            .file_name()
+            .ok_or_else(|| invalid("missing SST filename"))?;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .canonicalize()?;
+        let destination = parent.join(filename);
+        let (staged, file) = stage(&parent, &destination)?;
+        let mut encoder = Encoder {
+            writer: BufWriter::new(file),
+            digest: blake3::Hasher::new(),
+            bytes: 0,
+        };
+        encoder.emit(b"NUDBSST1")?;
+        encoder.emit(&1u16.to_le_bytes())?;
+        for n in [
+            header.generation,
+            header.min_sequence,
+            header.max_sequence,
+            header.key_count,
+            header.version_count,
+        ] {
+            encoder.emit(&n.to_le_bytes())?;
+        }
+        let mut previous_key: Option<&[u8]> = None;
+        let mut keys = 0u64;
+        let mut versions = 0u64;
+        let mut key_bytes = 0usize;
+        for (key, history) in rows {
+            if previous_key.is_some_and(|prev| prev >= key) {
+                return Err(invalid("SST keys must be strictly ordered"));
+            }
+            previous_key = Some(key);
+            key_bytes = key_bytes
+                .checked_add(key.len())
+                .ok_or_else(|| invalid("SST key bytes overflow"))?;
+            keys = keys
+                .checked_add(1)
+                .ok_or_else(|| invalid("SST key count overflow"))?;
+            versions = versions
+                .checked_add(history.len() as u64)
+                .ok_or_else(|| invalid("SST version count overflow"))?;
+            if key.len() > MAX_KEY_BYTES
+                || key_bytes > MAX_INDEX_KEY_BYTES
+                || history.is_empty()
+                || keys > header.key_count
+                || versions > header.version_count
+            {
+                return Err(invalid("SST row exceeds declared counts or index limits"));
+            }
+            encoder.emit(&(key.len() as u32).to_le_bytes())?;
+            encoder.emit(key)?;
+            encoder.emit(&(history.len() as u32).to_le_bytes())?;
+            let mut previous = 0;
+            for &(sequence, value) in history {
+                if sequence <= previous
+                    || sequence < header.min_sequence
+                    || sequence > header.max_sequence
+                {
+                    return Err(invalid("invalid SST MVCC sequence"));
+                }
+                previous = sequence;
+                encoder.emit(&sequence.to_le_bytes())?;
+                match value {
+                    None => encoder.emit(&[0])?,
+                    Some(value) => {
+                        if value.len() > MAX_VALUE_BYTES {
+                            return Err(invalid("SST value too large"));
+                        }
+                        encoder.emit(&[1])?;
+                        encoder.emit(&(value.len() as u32).to_le_bytes())?;
+                        encoder.emit(value)?;
+                    }
+                }
+            }
+        }
+        if keys != header.key_count || versions != header.version_count {
+            return Err(invalid("SST count mismatch"));
+        }
+        encoder
+            .writer
+            .write_all(encoder.digest.finalize().as_bytes())?;
+        encoder.writer.flush()?;
+        encoder.writer.get_ref().sync_all()?;
+        drop(encoder);
+
+        // Unlike rename on Unix, hard_link refuses to replace an existing
+        // immutable generation. Sync directory entries before acknowledgement.
+        fs::hard_link(&staged.0, &destination)?;
+        fs::remove_file(&staged.0)?;
+        File::open(&parent)?.sync_all()?;
+        Ok(())
+    }
+}
