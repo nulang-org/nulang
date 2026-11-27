@@ -21,7 +21,10 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::tablet::{MemoryTablet, TabletDescriptor, TabletId, TabletMutation, TabletWrite};
+use super::tablet::{
+    transaction_digest, MemoryTablet, TabletDescriptor, TabletId, TabletMutation, TabletWrite,
+    TransactionIdentity,
+};
 
 const WAL_MAGIC: &[u8; 8] = b"NUDBWAL3";
 const WAL_HEADER_PREFIX_BYTES: usize = 8 + 8 + 8 + 8;
@@ -29,6 +32,7 @@ const WAL_HEADER_BYTES: usize = WAL_HEADER_PREFIX_BYTES + 32;
 const WAL_FRAME_MAGIC: &[u8; 4] = b"NREC";
 const WAL_FRAME_VERSION: u16 = 1;
 const WAL_RECORD_VERSION: u16 = 1;
+const IDENTIFIED_WAL_RECORD_VERSION: u16 = 2;
 const WAL_FRAME_PREFIX_BYTES: usize = 4 + 2 + 4;
 const WAL_FRAME_HEADER_BYTES: usize = WAL_FRAME_PREFIX_BYTES + 32;
 const MAX_WAL_RECORD_BYTES: usize = 64 * 1024 * 1024;
@@ -50,6 +54,8 @@ struct DiskWalRecord {
     sequence: u64,
     expected_previous_sequence: u64,
     mutations: Vec<TabletMutation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity: Option<TransactionIdentity>,
 }
 
 /// One validated record recovered from or appended to a tablet WAL.
@@ -60,6 +66,7 @@ pub struct WalRecord {
     sequence: u64,
     expected_previous_sequence: u64,
     mutations: Vec<TabletMutation>,
+    identity: Option<TransactionIdentity>,
 }
 
 impl WalRecord {
@@ -70,11 +77,15 @@ impl WalRecord {
             sequence: write.sequence(),
             expected_previous_sequence: write.expected_previous_sequence(),
             mutations: write.mutations().to_vec(),
+            identity: write.identity(),
         }
     }
 
     fn from_disk(disk: DiskWalRecord, offset: u64) -> Result<Self, WalError> {
-        if disk.version != WAL_RECORD_VERSION {
+        if !matches!(
+            (disk.version, disk.identity),
+            (WAL_RECORD_VERSION, None) | (IDENTIFIED_WAL_RECORD_VERSION, Some(_))
+        ) {
             return Err(WalError::UnsupportedRecordVersion {
                 offset,
                 version: disk.version,
@@ -91,23 +102,37 @@ impl WalRecord {
             });
         }
 
+        if let Some(identity) = disk.identity {
+            if transaction_digest(&disk.mutations) != identity.digest {
+                return Err(WalError::InvalidRecord {
+                    offset,
+                    reason: "transaction digest mismatch".into(),
+                });
+            }
+        }
         Ok(Self {
             tablet_id,
             ownership_epoch: disk.ownership_epoch,
             sequence: disk.sequence,
             expected_previous_sequence: disk.expected_previous_sequence,
             mutations: disk.mutations,
+            identity: disk.identity,
         })
     }
 
     fn to_disk(&self) -> DiskWalRecord {
         DiskWalRecord {
-            version: WAL_RECORD_VERSION,
+            version: if self.identity.is_some() {
+                IDENTIFIED_WAL_RECORD_VERSION
+            } else {
+                WAL_RECORD_VERSION
+            },
             tablet_id: self.tablet_id.get(),
             ownership_epoch: self.ownership_epoch,
             sequence: self.sequence,
             expected_previous_sequence: self.expected_previous_sequence,
             mutations: self.mutations.clone(),
+            identity: self.identity,
         }
     }
 
@@ -225,6 +250,7 @@ impl FileWal {
         let mut records = Vec::new();
         let mut record_end_offsets = Vec::new();
         let mut last_sequence = base_sequence;
+        let mut seen_ids = std::collections::BTreeSet::new();
 
         loop {
             let record_start = file.stream_position()?;
@@ -273,6 +299,14 @@ impl FileWal {
                 record_start,
             )?;
 
+            if let Some(identity) = record.identity {
+                if !seen_ids.insert(identity.id) {
+                    return Err(WalError::InvalidRecord {
+                        offset: record_start,
+                        reason: "duplicate transaction ID in WAL".into(),
+                    });
+                }
+            }
             tablet_id = Some(record.tablet_id);
             latest_ownership_epoch = Some(record.ownership_epoch);
             last_sequence = record.sequence;
@@ -365,6 +399,7 @@ impl FileWal {
                     record.sequence,
                     record.expected_previous_sequence,
                     record.mutations.clone(),
+                    record.identity,
                 )
                 .map_err(|error| WalError::ReplayRejected {
                     sequence: record.sequence,
@@ -406,6 +441,33 @@ impl FileWal {
         }
 
         let checkpoint_sequence = tablet.current_sequence();
+        // Check every overlapping receipt against the independently checksummed
+        // WAL record, and reject extra checkpoint receipts in that interval.
+        let mut overlap_receipts = 0;
+        for record in self
+            .records
+            .iter()
+            .take_while(|r| r.sequence <= checkpoint_sequence)
+        {
+            if let Some(identity) = record.identity {
+                let receipt = tablet.transaction_receipt(identity.id);
+                if !receipt.is_some_and(|r| {
+                    r.sequence() == record.sequence && r.digest() == identity.digest
+                }) {
+                    return Err(WalError::ReplayRejected {
+                        sequence: record.sequence,
+                        reason: "checkpoint receipt does not match WAL".into(),
+                    });
+                }
+                overlap_receipts += 1;
+            }
+        }
+        if overlap_receipts != tablet.receipt_count_after(self.base_sequence) {
+            return Err(WalError::ReplayRejected {
+                sequence: checkpoint_sequence,
+                reason: "checkpoint has unmatched receipts".into(),
+            });
+        }
         for record in self
             .records
             .iter()
@@ -416,6 +478,7 @@ impl FileWal {
                     record.sequence,
                     record.expected_previous_sequence,
                     record.mutations.clone(),
+                    record.identity,
                 )
                 .map_err(|error| WalError::ReplayRejected {
                     sequence: record.sequence,
