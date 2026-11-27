@@ -11,3 +11,8 @@ pub mod wal;
 
 #[cfg(test)]
 mod interruption;
+#[cfg(test)]
+mod model_tests;
+
+#[cfg(test)]
+mod receipt_tests;
