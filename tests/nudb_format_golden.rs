@@ -197,3 +197,48 @@ fn unknown_checkpoint_version_and_checksum_corruption_fail_closed() {
         assert_eq!(fs::read(fixture.checkpoint()).unwrap(), bytes);
     }
 }
+
+#[test]
+fn checksummed_foreign_checkpoint_cannot_replace_full_wal_history() {
+    // Same identity, epoch and checkpoint sequence; only the historical
+    // value differs. The checksum is valid and the latest value is unchanged.
+    let mut foreign = CANONICAL.to_vec();
+    let payload_len = u32::from_le_bytes(foreign[8..12].try_into().unwrap()) as usize;
+    let start = foreign
+        .windows(b"[0,255]".len())
+        .position(|b| b == b"[0,255]")
+        .unwrap();
+    foreign[start + 1] = b'9';
+    rehash(&mut foreign, 12, 12 + payload_len);
+    let fixture = Fixture::new(FULL, Some(&foreign));
+    assert!(
+        WalBackedTablet::open(descriptor(), fixture.wal()).is_err(),
+        "foreign checkpoint silently replaced acknowledged history"
+    );
+    assert_eq!(fs::read(fixture.wal()).unwrap(), FULL);
+    assert_eq!(fs::read(fixture.checkpoint()).unwrap(), foreign);
+}
+
+#[test]
+fn retained_wal_overlap_must_match_checkpoint_even_after_reclamation() {
+    let fixture = Fixture::new(RECLAIMED, Some(CANONICAL));
+    let tablet = WalBackedTablet::open(descriptor(), fixture.wal()).unwrap();
+    tablet.publish_checkpoint().unwrap();
+    drop(tablet);
+    let mut foreign = fs::read(fixture.checkpoint()).unwrap();
+    let payload_len = u32::from_le_bytes(foreign[8..12].try_into().unwrap()) as usize;
+    // Change the value introduced at sequence 3, which is still in the WAL.
+    let start = foreign
+        .windows(b"[116,97,105,108]".len())
+        .position(|b| b == b"[116,97,105,108]")
+        .unwrap();
+    foreign[start + 3] = b'7';
+    rehash(&mut foreign, 12, 12 + payload_len);
+    fs::write(fixture.checkpoint(), &foreign).unwrap();
+    assert!(
+        WalBackedTablet::open(descriptor(), fixture.wal()).is_err(),
+        "foreign retained history silently accepted"
+    );
+    assert_eq!(fs::read(fixture.wal()).unwrap(), RECLAIMED);
+    assert_eq!(fs::read(fixture.checkpoint()).unwrap(), foreign);
+}

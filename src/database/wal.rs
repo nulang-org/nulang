@@ -410,6 +410,42 @@ impl FileWal {
         }
 
         let checkpoint_sequence = tablet.current_sequence();
+        // Individually valid checksums and matching sequence/identity are
+        // insufficient. Verify the actual overlapping MVCC versions before
+        // accepting the checkpoint. This cannot prove reclaimed history.
+        let mut matched_versions = 0;
+        for record in self
+            .records
+            .iter()
+            .take_while(|r| r.sequence <= checkpoint_sequence)
+        {
+            let mut final_values = std::collections::BTreeMap::new();
+            for mutation in &record.mutations {
+                match mutation {
+                    TabletMutation::Put { key, value } => {
+                        final_values.insert(key.as_slice(), Some(value.as_slice()));
+                    }
+                    TabletMutation::Delete { key } => {
+                        final_values.insert(key.as_slice(), None);
+                    }
+                }
+            }
+            for (key, value) in final_values {
+                if tablet.exact_version_at(key, record.sequence) != Some(value) {
+                    return Err(WalError::ReplayRejected {
+                        sequence: record.sequence,
+                        reason: "checkpoint MVCC version does not match WAL".into(),
+                    });
+                }
+                matched_versions += 1;
+            }
+        }
+        if matched_versions != tablet.version_count_after(self.base_sequence) {
+            return Err(WalError::ReplayRejected {
+                sequence: checkpoint_sequence,
+                reason: "checkpoint has unmatched MVCC versions".into(),
+            });
+        }
         for record in self
             .records
             .iter()
