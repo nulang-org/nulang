@@ -247,6 +247,31 @@ impl IndexedSst {
         self.key_bytes
     }
 
+    /// Materialize a single table into the existing MVCC representation.
+    /// Used only by the guarded in-memory recovery candidate.
+    #[cfg(unix)]
+    pub(super) fn into_snapshot_rows(
+        mut self,
+    ) -> io::Result<Vec<super::tablet::TabletSnapshotRow>> {
+        use super::tablet::{TabletSnapshotRow, VersionedValue};
+        let mut rows = Vec::with_capacity(self.rows.len());
+        for (key, history) in std::mem::take(&mut self.rows) {
+            let mut versions = Vec::with_capacity(history.len());
+            for version in history {
+                let value = match version.value {
+                    None => None,
+                    Some(location) => Some(read_value(&mut self.file, &location)?),
+                };
+                versions.push(VersionedValue {
+                    sequence: version.sequence,
+                    value,
+                });
+            }
+            rows.push(TabletSnapshotRow { key, versions });
+        }
+        Ok(rows)
+    }
+
     /// Read a table-local visible version. Snapshots beyond this table's max
     /// may select its latest version; global snapshot validity is the caller's
     /// responsibility. Distinguishes deletion from no visible version.
@@ -264,17 +289,22 @@ impl IndexedSst {
                 sequence: version.sequence,
             });
         };
-        self.file.seek(SeekFrom::Start(location.offset))?;
-        let mut value = vec![0; location.length];
-        self.file.read_exact(&mut value)?;
-        if blake3::hash(&value) != location.digest {
-            return Err(invalid("SST value changed since index validation"));
-        }
+        let value = read_value(&mut self.file, location)?;
         Ok(DiskLookup::Value {
             sequence: version.sequence,
             value,
         })
     }
+}
+
+fn read_value(file: &mut File, location: &Location) -> io::Result<Vec<u8>> {
+    file.seek(SeekFrom::Start(location.offset))?;
+    let mut value = vec![0; location.length];
+    file.read_exact(&mut value)?;
+    if blake3::hash(&value) != location.digest {
+        return Err(invalid("SST value changed since index validation"));
+    }
+    Ok(value)
 }
 
 /// Exact counts for one immutable committed sequence interval. Empty intervals

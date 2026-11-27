@@ -410,6 +410,30 @@ impl ManifestStore {
         }
         Ok(None)
     }
+    /// Rebuild the existing in-memory MVCC state from sealed disk tables.
+    /// The caller must verify WAL correspondence before using it for writes.
+    pub(super) fn restore_memory_tablet(&self) -> io::Result<super::tablet::MemoryTablet> {
+        use super::tablet::{MemoryTablet, TabletSnapshotRow, TabletSnapshotState, VersionedValue};
+        let meta = self.recovery_meta()?;
+        let mut rows = std::collections::BTreeMap::<Vec<u8>, Vec<VersionedValue>>::new();
+        for entry in &self.manifest.entries {
+            for row in self.open_verified_table(entry)?.into_snapshot_rows()? {
+                rows.entry(row.key).or_default().extend(row.versions);
+            }
+        }
+        let state = TabletSnapshotState {
+            current_sequence: self.manifest.durable_sequence(),
+            oldest_retained_snapshot: (meta.floor != 0).then_some(meta.floor),
+            rows: rows
+                .into_iter()
+                .map(|(key, versions)| TabletSnapshotRow { key, versions })
+                .collect(),
+            receipts: meta.receipts.values().copied().collect(),
+        };
+        MemoryTablet::restore_snapshot(meta.descriptor.clone(), state)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+    }
+
     pub fn recovered_receipt(&self, id: TransactionId) -> io::Result<Option<TransactionReceipt>> {
         Ok(self.recovery_meta()?.receipts.get(&id).copied())
     }
