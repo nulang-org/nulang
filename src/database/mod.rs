@@ -5,6 +5,8 @@
 //! inner storage and query loops remain ordinary local computation.
 
 pub mod checkpoint;
+#[cfg(unix)]
+pub mod generation_registry;
 pub mod indexed_sst;
 pub mod optimistic;
 #[cfg(unix)]

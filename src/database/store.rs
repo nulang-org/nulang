@@ -781,6 +781,161 @@ impl WalBackedTablet {
         Ok(restored)
     }
 
+    /// Explicitly quarantine a strict obsolete prefix after verifying the
+    /// current binding and an exact completed backup of the current state.
+    /// The obsolete directory is moved, never deleted. Caller must ensure
+    /// it is dedicated to this tablet, no other WAL/reader/backup relies on
+    /// its original pathname, and the parent namespace is not concurrently
+    /// modified. Do not reuse the old pathname. After ambiguous rename/sync,
+    /// inspect both paths; the active generation and WAL are unchanged.
+    #[cfg(unix)]
+    pub fn quarantine_obsolete_sst(
+        &self,
+        active: &super::sst_manifest::ManifestStore,
+        obsolete: super::sst_manifest::ManifestStore,
+        backup: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> std::io::Result<()> {
+        use super::sealed_backup::{self, Completion};
+        use std::io;
+        let binding = active.wal_binding()?;
+        if self.recovery_required
+            || self.wal.is_poisoned()
+            || !self.wal.matches_seal(binding)
+            || active.current().recovery_descriptor() != Some(self.descriptor())
+            || active.current().recovery_floor() != Some(self.oldest_retained_snapshot())
+            || self.current_sequence() != self.wal.last_sequence()
+        {
+            return Err(io::Error::other(
+                "quarantine requires active recovered sealed binding",
+            ));
+        }
+        match std::fs::symlink_metadata(&self.checkpoint_path) {
+            Ok(_) => return Err(io::Error::other("legacy checkpoint prevents quarantine")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let backup = backup.as_ref().canonicalize()?;
+        let old = obsolete.directory();
+        let active_dir = active.directory();
+        let overlaps = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+        if overlaps(old, active_dir)
+            || overlaps(old, &backup)
+            || overlaps(active_dir, &backup)
+            || self.wal.path().starts_with(old)
+            || self.wal.path().starts_with(&backup)
+        {
+            return Err(io::Error::other("quarantine paths must be independent"));
+        }
+        obsolete.verify_obsolete_prefix(active)?;
+        if active.sync_for_wal_binding()? != binding {
+            return Err(io::Error::other("active seal binding changed"));
+        }
+        let completion = Completion::read(&backup)?;
+        let wal_len = self
+            .wal
+            .records()
+            .len()
+            .checked_sub(1)
+            .and_then(|i| self.wal.record_end_offset(i))
+            .unwrap_or(96);
+        if completion.sequence != self.current_sequence()
+            || completion.floor != self.oldest_retained_snapshot()
+            || completion.seal_digest != binding.digest
+            || completion.wal_len != wal_len
+        {
+            return Err(io::Error::other(
+                "quarantine requires a current completed backup",
+            ));
+        }
+        let archived = super::sst_manifest::ManifestStore::open(
+            backup.join("sst"),
+            self.descriptor().id().get(),
+            self.descriptor().ownership_epoch(),
+        )?;
+        if archived.sync_for_wal_binding()? != binding
+            || archived.current().recovery_descriptor() != Some(self.descriptor())
+            || sealed_backup::wal_digest(&backup.join("tablet.wal"), wal_len)?
+                != completion.wal_digest
+            || sealed_backup::wal_digest(self.wal.path(), wal_len)? != completion.wal_digest
+        {
+            return Err(io::Error::other(
+                "backup contents do not match active generation and WAL",
+            ));
+        }
+        // Keep archive and active locks held through the rename. A full
+        // logical reconstruction was required to publish the backup marker.
+        obsolete.quarantine(destination.as_ref())
+    }
+
+    /// Register the actual recovered bound WAL under its canonical path.
+    /// This is opt-in: existing raw cutover APIs do not enforce registration.
+    #[cfg(unix)]
+    pub fn register_generation_wal(
+        &self,
+        registry: &mut super::generation_registry::GenerationRegistry,
+        manifest: &super::sst_manifest::ManifestStore,
+    ) -> std::io::Result<()> {
+        registry.register_wal(self.wal.path(), self.verified_registry_binding(manifest)?)
+    }
+
+    #[cfg(unix)]
+    fn verified_registry_binding(
+        &self,
+        manifest: &super::sst_manifest::ManifestStore,
+    ) -> std::io::Result<super::wal::SealBinding> {
+        let binding = manifest.sync_for_wal_binding()?;
+        if self.recovery_required
+            || self.wal.is_poisoned()
+            || !self.wal.matches_seal(binding)
+            || manifest.current().recovery_descriptor() != Some(self.descriptor())
+            || self.wal.last_sequence() != self.current_sequence()
+            || manifest.current().recovery_floor() != Some(self.oldest_retained_snapshot())
+        {
+            return Err(std::io::Error::other(
+                "registry requires recovered exact WAL binding",
+            ));
+        }
+        self.wal
+            .sync_for_registry()
+            .map_err(std::io::Error::other)?;
+        Ok(binding)
+    }
+
+    /// Reserve both generations durably before a caller performs rotation.
+    /// If publication fails, do not rotate until the registry is reopened.
+    #[cfg(unix)]
+    pub fn reserve_generation_rotation(
+        &self,
+        registry: &mut super::generation_registry::GenerationRegistry,
+        previous: &super::sst_manifest::ManifestStore,
+        next: &super::sst_manifest::ManifestStore,
+    ) -> std::io::Result<()> {
+        let old = self.verified_registry_binding(previous)?;
+        let floor = next
+            .current()
+            .recovery_floor()
+            .ok_or_else(|| std::io::Error::other("successor not sealed"))?;
+        self.validate_successor_base(previous, floor)?;
+        if next.current().recovery_descriptor() != Some(self.descriptor())
+            || next.directory() == previous.directory()
+        {
+            return Err(std::io::Error::other("invalid successor for registry"));
+        }
+        super::wal_sst_shadow::verify_successor(&self.wal, previous, next)?;
+        registry.reserve_rotation(self.wal.path(), old, next.sync_for_wal_binding()?)
+    }
+
+    /// Resolve a pending rotation using the actual recovered bound WAL.
+    #[cfg(unix)]
+    pub fn reconcile_generation_wal(
+        &self,
+        registry: &mut super::generation_registry::GenerationRegistry,
+        manifest: &super::sst_manifest::ManifestStore,
+    ) -> std::io::Result<()> {
+        registry.reconcile_wal(self.wal.path(), self.verified_registry_binding(manifest)?)
+    }
+
     /// Diagnostic point read against the published shadow SST prefix.
     /// No fallback or authoritative read routing. Compare both the exact
     /// WAL mutation (including sequence and tombstone) and the live tablet.

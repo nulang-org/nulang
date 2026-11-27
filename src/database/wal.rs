@@ -462,6 +462,29 @@ impl FileWal {
         self.seal_binding == Some(binding)
     }
 
+    /// Re-establish the durability of a recovered WAL's canonical name before
+    /// dropping its old registry reference after an interrupted rotation.
+    #[cfg(unix)]
+    pub(super) fn sync_for_registry(&self) -> Result<(), WalError> {
+        if self.poisoned || !self.is_seal_bound() {
+            return Err(WalError::SealBindingMismatch);
+        }
+        reject_path_aliases(&self.path)?;
+        use std::os::unix::fs::MetadataExt;
+        let named = fs::metadata(&self.path)?;
+        let opened = self.file.metadata()?;
+        if named.dev() != opened.dev() || named.ino() != opened.ino() {
+            return Err(WalError::AliasedWalPath);
+        }
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::RegistryBeforeWalSync,
+        )?;
+        self.file.sync_all()?;
+        sync_parent_directory(&self.path)?;
+        Ok(())
+    }
+
     pub fn base_sequence(&self) -> u64 {
         self.base_sequence
     }

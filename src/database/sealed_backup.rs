@@ -68,6 +68,27 @@ pub(super) fn copy_wal(source: &Path, dest: &Path, expected_len: u64) -> io::Res
     Ok(*hash.finalize().as_bytes())
 }
 
+/// Verify a complete WAL without opening it for recovery or changing bytes.
+pub(super) fn wal_digest(path: &Path, expected_len: u64) -> io::Result<[u8; 32]> {
+    let mut input = unique_file(path)?;
+    if input.metadata()?.len() != expected_len || expected_len < 96 {
+        return Err(invalid("backup WAL length mismatch"));
+    }
+    let mut hash = blake3::Hasher::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut remaining = expected_len;
+    while remaining != 0 {
+        let n = remaining.min(buf.len() as u64) as usize;
+        input.read_exact(&mut buf[..n])?;
+        hash.update(&buf[..n]);
+        remaining -= n as u64;
+    }
+    if input.read(&mut buf[..1])? != 0 {
+        return Err(invalid("WAL grew during verification"));
+    }
+    Ok(*hash.finalize().as_bytes())
+}
+
 pub(super) struct Completion {
     pub sequence: u64,
     pub floor: u64,
