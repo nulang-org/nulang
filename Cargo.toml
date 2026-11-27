@@ -55,6 +55,9 @@ native-codegen = [
     "dep:cranelift-codegen",
     "dep:target-lexicon",
 ]
+# Standalone Linux object+linker emission is deliberately opt-in. JIT-only
+# embedders do not depend on object emission or temporary-file management.
+native-executable = ["native-codegen", "dep:cranelift-object", "dep:tempfile"]
 # Marker profile for embedded mobile runtimes. Intentionally empty: the
 # bytecode interpreter and pre-registered host callbacks need no JIT.
 mobile-runtime = []
@@ -129,6 +132,8 @@ rustyline = { version = "15", default-features = false, features = ["with-file-h
 # Cranelift JIT backend
 cranelift = { version = "0.132", optional = true }
 cranelift-jit = { version = "0.132", optional = true }
+cranelift-object = { version = "=0.132.0", optional = true }
+tempfile = { version = "3", optional = true }
 cranelift-module = { version = "0.132", optional = true }
 cranelift-native = { version = "0.132", optional = true }
 cranelift-frontend = { version = "0.132", optional = true }

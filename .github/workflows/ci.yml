@@ -249,6 +249,67 @@ jobs:
           echo "$output" | grep -F '"benchmark":"ping_pong"'
 
   # -----------------------------------------------------------------------
+  # Opt-in standalone native executable smoke — isolates linker and ELF
+  # failures from the no-default-features interpreter baseline.
+  # -----------------------------------------------------------------------
+  native-executable:
+    name: Standalone Linux executable and size smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Compile and execute the first truly linked Nulang artifact using
+      # only the opt-in native executable feature. Default/JIT-only builds
+      # must not need cranelift-object or tempfile.
+      - name: Test opt-in standalone native executable (Linux)
+        run: cargo test --locked --no-default-features --features native-executable --test native_tiny_executable
+
+      - name: Build opt-in native executable compiler for size smoke
+        run: cargo build --locked --no-default-features --features native-executable --bin nulang
+
+      - name: Measure native binary size and dynamic dependencies
+        run: |
+          cargo_target="$(cargo metadata --locked --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+          bash scripts/measure_native_binaries.sh "$cargo_target/debug/nulang" "$cargo_target/native-size-smoke"
+          python3 scripts/measure_native_binary_size.py \
+            --nulang "$cargo_target/debug/nulang" \
+            --json-out native-binary-size.json
+          cp "$cargo_target/native-size-smoke/report.tsv" native-size-report.tsv
+          profile_binaries=(
+            "nulang=$cargo_target/native-size-smoke/hello-nulang"
+            "c=$cargo_target/native-size-smoke/hello-c"
+          )
+          for language in rust go tinygo; do
+            if [[ -x "$cargo_target/native-size-smoke/hello-$language" ]]; then
+              profile_binaries+=("$language=$cargo_target/native-size-smoke/hello-$language")
+            fi
+          done
+          python3 scripts/measure_native_runtime.py \
+            --runs 21 --warmup 3 \
+            --json-out native-runtime-profile.json \
+            "${profile_binaries[@]}"
+
+      - name: Upload native executable size report
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-elf-size-${{ github.sha }}
+          path: |
+            native-binary-size.json
+            native-size-report.tsv
+            native-runtime-profile.json
+          if-no-files-found: error
+          retention-days: 7
+
+  # -----------------------------------------------------------------------
   # WASM backend
   # -----------------------------------------------------------------------
   wasm-backend:
