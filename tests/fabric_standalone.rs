@@ -465,3 +465,138 @@ fn descriptor_exhaustion_preserves_existing_client_and_recovers_listener() {
     request(addr, ping, b"+PONG\r\n");
     assert!(server.0.try_wait().unwrap().is_none());
 }
+
+fn metrics_request(address: SocketAddr, path: &str) -> String {
+    let mut connection = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
+    connection
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    write!(connection, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+    let mut response = String::new();
+    connection.read_to_string(&mut response).unwrap();
+    response
+}
+
+#[test]
+fn operational_metrics_report_activity_and_health_over_loopback() {
+    let address = port();
+    let metrics = port();
+    assert_ne!(address, metrics);
+    let _server = Server::start(
+        address,
+        &[
+            "--metrics-bind",
+            &metrics.to_string(),
+            "--max-connections-per-peer",
+            "1",
+        ],
+    );
+    let mut established = TcpStream::connect(address).unwrap();
+    established
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    established.write_all(SET).unwrap();
+    let mut ok = [0; 5];
+    established.read_exact(&mut ok).unwrap();
+    assert_eq!(&ok, b"+OK\r\n");
+    established.write_all(GET).unwrap();
+    let mut value = [0; 11];
+    established.read_exact(&mut value).unwrap();
+    assert_eq!(&value, b"$5\r\nvalue\r\n");
+    let mut denied = TcpStream::connect(address).unwrap();
+    denied
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    match denied.read(&mut [0; 1]) {
+        Ok(0) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("peer admission not enforced: {other:?}"),
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let response = metrics_request(metrics, "/metrics");
+        assert!(response.starts_with("HTTP/1.1 200"));
+        if response.contains("fabric_commands_dispatched_total 2\n")
+            && response.contains("fabric_connections_rejected_peer_total 1\n")
+        {
+            assert!(response.contains("fabric_connections_active 1\n"));
+            assert!(response.contains("fabric_cache_entries 1\n"));
+            assert!(response.contains("fabric_connection_budget_used_bytes 0\n"));
+            assert!(!response.contains("value"));
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{response}");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(metrics_request(metrics, "/healthz").starts_with("HTTP/1.1 200"));
+    assert!(metrics_request(metrics, "/readyz").starts_with("HTTP/1.1 200"));
+    assert!(metrics_request(metrics, "/unknown").starts_with("HTTP/1.1 404"));
+    // An incomplete probe must not stall the data reactor or retain the
+    // single metrics worker indefinitely.
+    let mut slow = TcpStream::connect(metrics).unwrap();
+    slow.write_all(b"GET /metrics HTTP/1.1\r\n").unwrap();
+    established.write_all(b"*1\r\n$4\r\nPING\r\n").unwrap();
+    let mut pong = [0; 7];
+    established.read_exact(&mut pong).unwrap();
+    assert_eq!(&pong, b"+PONG\r\n");
+    assert!(metrics_request(metrics, "/healthz").starts_with("HTTP/1.1 200"));
+}
+
+#[test]
+fn durable_metrics_include_journal_and_automatic_checkpoint_progress() {
+    let temp = Temp(std::env::temp_dir().join(format!(
+            "nulang-fabric-metrics-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )));
+    std::fs::create_dir(&temp.0).unwrap();
+    let path = temp.0.join("cache.wal");
+    let address = port();
+    let metrics = port();
+    assert_ne!(address, metrics);
+    let _server = Server::start(
+        address,
+        &[
+            "--mode",
+            "buffered",
+            "--journal",
+            path.to_str().unwrap(),
+            "--max-journal-bytes",
+            "1024",
+            "--max-record-bytes",
+            "256",
+            "--metrics-bind",
+            &metrics.to_string(),
+        ],
+    );
+    let mut client = TcpStream::connect(address).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    client.write_all(&SET.repeat(100)).unwrap();
+    let mut replies = vec![0; 500];
+    client.read_exact(&mut replies).unwrap();
+    assert_eq!(replies, b"+OK\r\n".repeat(100));
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let body = metrics_request(metrics, "/metrics");
+        let metric = |name: &str| -> u64 {
+            body.lines()
+                .find_map(|line| line.strip_prefix(name).and_then(|v| v.trim().parse().ok()))
+                .unwrap()
+        };
+        if metric("fabric_commands_dispatched_total ") == 100 {
+            assert_eq!(metric("fabric_durable "), 1);
+            assert_eq!(metric("fabric_journal_limit_bytes "), 1024);
+            assert!(metric("fabric_journal_bytes ") <= 1024);
+            assert!(metric("fabric_checkpoint_completed_total ") > 0);
+            assert!(metric("fabric_checkpoint_reclaimed_bytes_total ") > 0);
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{body}");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}

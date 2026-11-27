@@ -395,6 +395,11 @@ impl DurableCache {
         Ok(report)
     }
 
+    #[cfg(feature = "cache-server")]
+    pub(super) fn operational_store(&self) -> &CacheStore {
+        &self.store
+    }
+
     /// Retained on-disk journal length and configured limit.
     pub fn journal_usage(&self) -> (u64, u64) {
         (self.wal.journal_bytes(), self.limits.max_file_bytes)
