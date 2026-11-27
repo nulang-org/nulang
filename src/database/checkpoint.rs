@@ -13,6 +13,9 @@ use super::tablet::{MemoryTablet, TabletDescriptor, TabletSnapshotState};
 
 const CHECKPOINT_MAGIC: &[u8; 8] = b"NUDBCKP1";
 const CHECKPOINT_VERSION: u16 = 1;
+const RETENTION_CHECKPOINT_VERSION: u16 = 2;
+const RECEIPT_CHECKPOINT_VERSION: u16 = 3;
+const RETENTION_RECEIPT_CHECKPOINT_VERSION: u16 = 4;
 const MAX_CHECKPOINT_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -32,7 +35,14 @@ pub(crate) fn checkpoint_path_for_wal(wal_path: &Path) -> PathBuf {
 pub(crate) fn write_checkpoint(path: &Path, tablet: &MemoryTablet) -> Result<(), CheckpointError> {
     let descriptor = tablet.descriptor();
     let disk = DiskCheckpoint {
-        version: CHECKPOINT_VERSION,
+        // Each format explicitly identifies its required metadata so older
+        // readers cannot silently discard retention or idempotency state.
+        version: match (tablet.oldest_retained_snapshot() > 0, tablet.has_receipts()) {
+            (false, false) => CHECKPOINT_VERSION,
+            (true, false) => RETENTION_CHECKPOINT_VERSION,
+            (false, true) => RECEIPT_CHECKPOINT_VERSION,
+            (true, true) => RETENTION_RECEIPT_CHECKPOINT_VERSION,
+        },
         tablet_id: descriptor.id().get(),
         ownership_epoch: descriptor.ownership_epoch(),
         range_start: descriptor.range().start().to_vec(),
@@ -124,8 +134,28 @@ pub(crate) fn load_checkpoint(
 
     let disk: DiskCheckpoint = serde_json::from_slice(&payload)
         .map_err(|error| CheckpointError::Serialization(error.to_string()))?;
-    if disk.version != CHECKPOINT_VERSION {
-        return Err(CheckpointError::UnsupportedVersion(disk.version));
+    match (
+        disk.version,
+        disk.state.oldest_retained_snapshot,
+        disk.state.receipts.is_empty(),
+    ) {
+        (CHECKPOINT_VERSION, None, true) => {}
+        (RETENTION_CHECKPOINT_VERSION, Some(floor), true) if floor > 0 => {}
+        (RECEIPT_CHECKPOINT_VERSION, None, false) => {}
+        (RETENTION_RECEIPT_CHECKPOINT_VERSION, Some(floor), false) if floor > 0 => {}
+        (
+            CHECKPOINT_VERSION
+            | RETENTION_CHECKPOINT_VERSION
+            | RECEIPT_CHECKPOINT_VERSION
+            | RETENTION_RECEIPT_CHECKPOINT_VERSION,
+            _,
+            _,
+        ) => {
+            return Err(CheckpointError::InvalidState(
+                "checkpoint version/retention or receipt metadata mismatch".into(),
+            ));
+        }
+        _ => return Err(CheckpointError::UnsupportedVersion(disk.version)),
     }
     if disk.tablet_id != descriptor.id().get() {
         return Err(CheckpointError::DescriptorMismatch);
