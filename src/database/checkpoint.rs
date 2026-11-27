@@ -13,6 +13,7 @@ use super::tablet::{MemoryTablet, TabletDescriptor, TabletSnapshotState};
 
 const CHECKPOINT_MAGIC: &[u8; 8] = b"NUDBCKP1";
 const CHECKPOINT_VERSION: u16 = 1;
+const RETENTION_CHECKPOINT_VERSION: u16 = 2;
 const MAX_CHECKPOINT_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -32,7 +33,12 @@ pub(crate) fn checkpoint_path_for_wal(wal_path: &Path) -> PathBuf {
 pub(crate) fn write_checkpoint(path: &Path, tablet: &MemoryTablet) -> Result<(), CheckpointError> {
     let descriptor = tablet.descriptor();
     let disk = DiskCheckpoint {
-        version: CHECKPOINT_VERSION,
+        // Older readers reject v2 instead of silently serving pruned history.
+        version: if tablet.oldest_retained_snapshot() == 0 {
+            CHECKPOINT_VERSION
+        } else {
+            RETENTION_CHECKPOINT_VERSION
+        },
         tablet_id: descriptor.id().get(),
         ownership_epoch: descriptor.ownership_epoch(),
         range_start: descriptor.range().start().to_vec(),
@@ -124,8 +130,15 @@ pub(crate) fn load_checkpoint(
 
     let disk: DiskCheckpoint = serde_json::from_slice(&payload)
         .map_err(|error| CheckpointError::Serialization(error.to_string()))?;
-    if disk.version != CHECKPOINT_VERSION {
-        return Err(CheckpointError::UnsupportedVersion(disk.version));
+    match (disk.version, disk.state.oldest_retained_snapshot) {
+        (CHECKPOINT_VERSION, None) => {}
+        (RETENTION_CHECKPOINT_VERSION, Some(floor)) if floor > 0 => {}
+        (CHECKPOINT_VERSION | RETENTION_CHECKPOINT_VERSION, _) => {
+            return Err(CheckpointError::InvalidState(
+                "checkpoint version/retention floor mismatch".into(),
+            ));
+        }
+        _ => return Err(CheckpointError::UnsupportedVersion(disk.version)),
     }
     if disk.tablet_id != descriptor.id().get() {
         return Err(CheckpointError::DescriptorMismatch);

@@ -297,6 +297,10 @@ impl FileWal {
         })
     }
 
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

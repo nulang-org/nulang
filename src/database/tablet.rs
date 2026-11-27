@@ -260,6 +260,8 @@ pub(crate) struct TabletSnapshotRow {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TabletSnapshotState {
     pub(crate) current_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) oldest_retained_snapshot: Option<u64>,
     pub(crate) rows: Vec<TabletSnapshotRow>,
 }
 
@@ -273,6 +275,7 @@ pub(crate) struct TabletSnapshotState {
 pub struct MemoryTablet {
     descriptor: TabletDescriptor,
     current_sequence: u64,
+    oldest_retained_snapshot: u64,
     rows: BTreeMap<Vec<u8>, Vec<VersionedValue>>,
 }
 
@@ -281,6 +284,7 @@ impl MemoryTablet {
         Self {
             descriptor,
             current_sequence: 0,
+            oldest_retained_snapshot: 0,
             rows: BTreeMap::new(),
         }
     }
@@ -293,9 +297,15 @@ impl MemoryTablet {
         self.current_sequence
     }
 
+    pub fn oldest_retained_snapshot(&self) -> u64 {
+        self.oldest_retained_snapshot
+    }
+
     pub(crate) fn snapshot_state(&self) -> TabletSnapshotState {
         TabletSnapshotState {
             current_sequence: self.current_sequence,
+            oldest_retained_snapshot: (self.oldest_retained_snapshot != 0)
+                .then_some(self.oldest_retained_snapshot),
             rows: self
                 .rows
                 .iter()
@@ -311,6 +321,10 @@ impl MemoryTablet {
         descriptor: TabletDescriptor,
         state: TabletSnapshotState,
     ) -> Result<Self, TabletError> {
+        let oldest_retained_snapshot = state.oldest_retained_snapshot.unwrap_or(0);
+        if oldest_retained_snapshot > state.current_sequence {
+            return Err(TabletError::InvalidSnapshotHistory);
+        }
         let mut rows = BTreeMap::new();
         for row in state.rows {
             if !descriptor.range.contains(&row.key) {
@@ -350,6 +364,7 @@ impl MemoryTablet {
         Ok(Self {
             descriptor,
             current_sequence: state.current_sequence,
+            oldest_retained_snapshot,
             rows,
         })
     }
@@ -500,14 +515,51 @@ impl MemoryTablet {
         self.current_sequence = sequence;
     }
 
-    /// Read one key at an already committed snapshot sequence.
-    pub fn read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, TabletError> {
+    /// Prune a candidate state; the durable coordinator enforces snapshot pins.
+    pub(crate) fn prune_history_before(&mut self, floor: u64) -> Result<(), TabletError> {
+        if floor < self.oldest_retained_snapshot {
+            return Err(TabletError::RetentionFloorRegression {
+                requested: floor,
+                oldest_retained: self.oldest_retained_snapshot,
+            });
+        }
+        self.validate_snapshot(floor)?;
+        for versions in self.rows.values_mut() {
+            let boundary = versions.partition_point(|v| v.sequence <= floor);
+            if boundary > 0 {
+                // Keep the visible value at the floor; a tombstone is equivalent
+                // to absence after all preceding values have been discarded.
+                let discard = boundary - usize::from(versions[boundary - 1].value.is_some());
+                if discard > 0 {
+                    versions.drain(..discard);
+                    versions.shrink_to_fit();
+                }
+            }
+        }
+        self.rows.retain(|_, versions| !versions.is_empty());
+        self.oldest_retained_snapshot = floor;
+        Ok(())
+    }
+
+    pub(crate) fn validate_snapshot(&self, snapshot: u64) -> Result<(), TabletError> {
         if snapshot > self.current_sequence {
             return Err(TabletError::SnapshotAhead {
                 committed: self.current_sequence,
                 requested: snapshot,
             });
         }
+        if snapshot < self.oldest_retained_snapshot {
+            return Err(TabletError::SnapshotExpired {
+                requested: snapshot,
+                oldest_retained: self.oldest_retained_snapshot,
+            });
+        }
+        Ok(())
+    }
+
+    /// Read one key at an already committed and retained snapshot sequence.
+    pub fn read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, TabletError> {
+        self.validate_snapshot(snapshot)?;
         if !self.descriptor.range.contains(key) {
             return Err(TabletError::KeyOutsideTabletRange);
         }
@@ -565,6 +617,19 @@ pub enum TabletError {
         committed: u64,
         requested: u64,
     },
+    SnapshotExpired {
+        requested: u64,
+        oldest_retained: u64,
+    },
+    RetentionFloorRegression {
+        requested: u64,
+        oldest_retained: u64,
+    },
+    SnapshotPinned {
+        requested: u64,
+        oldest_pinned: u64,
+    },
+    RecoveryRequired,
     InvalidSnapshotHistory,
     KeyOutsideTabletRange,
 }
@@ -622,6 +687,13 @@ impl fmt::Display for TabletError {
                 f,
                 "snapshot {requested} is ahead of committed tablet sequence {committed}"
             ),
+            Self::SnapshotExpired { requested, oldest_retained } => write!(f,
+                "snapshot {requested} expired; oldest retained snapshot is {oldest_retained}"),
+            Self::RetentionFloorRegression { requested, oldest_retained } => write!(f,
+                "retention floor {requested} is below current floor {oldest_retained}"),
+            Self::SnapshotPinned { requested, oldest_pinned } => write!(f,
+                "retention floor {requested} exceeds active snapshot {oldest_pinned}"),
+            Self::RecoveryRequired => f.write_str("tablet recovery required before further snapshot reads or writes"),
             Self::InvalidSnapshotHistory => {
                 f.write_str("tablet snapshot contains invalid MVCC version history")
             }
