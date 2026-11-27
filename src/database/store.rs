@@ -31,8 +31,8 @@ impl WalBackedTablet {
         wal_path: impl AsRef<Path>,
     ) -> Result<Self, WalBackedError> {
         let wal_path = wal_path.as_ref();
-        let checkpoint_path = checkpoint::checkpoint_path_for_wal(wal_path);
         let wal = FileWal::open(wal_path)?;
+        let checkpoint_path = checkpoint::checkpoint_path_for_wal(wal.path());
         let mut tablet = match checkpoint::load_checkpoint(&checkpoint_path, descriptor.clone())? {
             Some(tablet) => tablet,
             None => wal.recover_memory_tablet(descriptor)?,
