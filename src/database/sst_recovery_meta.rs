@@ -1,5 +1,5 @@
 //! Bounded recovery metadata included atomically in a v2 manifest.
-//! Version one of this metadata supports only complete, unpruned history.
+//! Nonzero floors restrict recovery visibility; immutable SSTs retain full history.
 
 use super::tablet::{KeyRange, TabletDescriptor, TabletId, TransactionId, TransactionReceipt};
 use std::collections::{BTreeMap, BTreeSet};
@@ -44,7 +44,7 @@ impl RecoveryMeta {
         Ok(result)
     }
     pub(super) fn validate(&self, sequence: u64) -> io::Result<()> {
-        if self.floor != 0
+        if self.floor > sequence
             || self.descriptor.range().start().len() > MAX_RANGE_BYTES
             || self
                 .descriptor
@@ -53,7 +53,7 @@ impl RecoveryMeta {
                 .is_some_and(|end| end.len() > MAX_RANGE_BYTES)
             || self.receipts.len() > MAX_RECEIPTS
         {
-            return Err(invalid("unsupported recovery floor or metadata limit"));
+            return Err(invalid("invalid recovery floor or metadata limit"));
         }
         let mut seen = BTreeSet::new();
         for receipt in self.receipts.values() {

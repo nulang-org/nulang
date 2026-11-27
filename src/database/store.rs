@@ -104,6 +104,11 @@ impl WalBackedTablet {
             Err(error) => return Err(error),
         }
         if !wal.is_seal_bound() {
+            if manifest.current().recovery_floor() != Some(0) {
+                return Err(invalid(
+                    "nonzero seal floor is pending WAL4 cutover; reopen complete WAL normally",
+                ));
+            }
             super::wal_sst_shadow::verify_prefix(&wal, &descriptor, &manifest)?;
         }
         let mut tablet = manifest.restore_memory_tablet()?;
@@ -433,6 +438,27 @@ impl WalBackedTablet {
         &self,
         manifest: &mut super::sst_manifest::ManifestStore,
     ) -> std::io::Result<()> {
+        self.seal_sst_recovery_at_floor(manifest, 0)
+    }
+
+    /// Prepare an immutable seal with a requested logical retention floor.
+    /// This changes only the sealed snapshot, not the live tablet. The floor
+    /// becomes authoritative for live recovery only after explicit WAL4 cutover.
+    /// External consumers and backups must be coordinated by the caller.
+    #[cfg(unix)]
+    pub fn seal_sst_recovery_at_floor(
+        &self,
+        manifest: &mut super::sst_manifest::ManifestStore,
+        floor: u64,
+    ) -> std::io::Result<()> {
+        self.tablet
+            .validate_snapshot(floor)
+            .map_err(std::io::Error::other)?;
+        if floor > self.safe_retention_floor() {
+            return Err(std::io::Error::other(
+                "seal retention floor exceeds live snapshot pin",
+            ));
+        }
         if manifest.current().durable_sequence() != self.current_sequence() {
             return Err(std::io::Error::other(
                 "shadow manifest must cover entire committed WAL",
@@ -445,7 +471,7 @@ impl WalBackedTablet {
         }
         let meta = super::sst_recovery_meta::RecoveryMeta::new(
             self.descriptor().clone(),
-            self.oldest_retained_snapshot(),
+            floor,
             self.current_sequence(),
             self.tablet.receipts(),
         )?;
@@ -487,14 +513,27 @@ impl WalBackedTablet {
         // Independently validate all SST versions and receipt correspondence,
         // then check the complete restored logical state against the live tablet.
         super::wal_sst_shadow::verify_prefix(&self.wal, self.descriptor(), manifest)?;
+        let floor = manifest
+            .current()
+            .recovery_floor()
+            .ok_or_else(|| invalid("missing sealed floor"))?;
+        if floor > self.safe_retention_floor() {
+            return Err(invalid("seal retention floor exceeds live snapshot pin"));
+        }
         let mut restored = manifest.restore_memory_tablet()?;
         self.wal
             .replay_after_checkpoint(&mut restored)
             .map_err(io::Error::other)?;
-        if restored.snapshot_state() != self.tablet.snapshot_state() {
+        let mut expected = self.tablet.clone();
+        if floor != 0 {
+            expected
+                .prune_history_before(floor)
+                .map_err(io::Error::other)?;
+        }
+        if restored.snapshot_state() != expected.snapshot_state() {
             return Err(invalid("sealed recovery state disagrees with live tablet"));
         }
-        drop(restored);
+        drop(expected);
         // Re-establish durability even if a previous seal publication was
         // interrupted after rename but before its directory sync.
         let binding = manifest.sync_for_wal_binding()?;
@@ -502,6 +541,7 @@ impl WalBackedTablet {
             self.recovery_required = true;
             return Err(io::Error::other(error));
         }
+        self.tablet = restored;
         Ok(())
     }
 

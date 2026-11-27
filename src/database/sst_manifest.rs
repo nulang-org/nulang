@@ -150,7 +150,11 @@ impl Manifest {
     fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(HEADER_BYTES + ENTRY_BYTES * self.entries.len() + 32);
         bytes.extend_from_slice(MAGIC);
-        let version: u16 = if self.recovery.is_some() { 2 } else { 1 };
+        let version: u16 = match self.recovery.as_ref() {
+            None => 1,
+            Some(meta) if meta.floor == 0 => 2,
+            Some(_) => 3,
+        };
         bytes.extend_from_slice(&version.to_le_bytes());
         for n in [self.tablet_id, self.epoch, self.entries.len() as u64] {
             bytes.extend_from_slice(&n.to_le_bytes());
@@ -173,7 +177,7 @@ impl Manifest {
             return Err(invalid("unsupported or malformed manifest"));
         }
         let version = u16::from_le_bytes(bytes[8..10].try_into().expect("fixed version"));
-        if !matches!(version, 1 | 2) {
+        if !matches!(version, 1..=3) {
             return Err(invalid("unsupported manifest version"));
         }
         let (body, hash) = bytes.split_at(bytes.len() - 32);
@@ -205,13 +209,17 @@ impl Manifest {
                 checksum: record[32..64].try_into().expect("fixed checksum"),
             })?;
         }
-        if version == 2 {
-            manifest.recovery = Some(RecoveryMeta::decode(
+        if version >= 2 {
+            let meta = RecoveryMeta::decode(
                 &body[end..],
                 manifest.tablet_id,
                 manifest.epoch,
                 manifest.durable_sequence(),
-            )?);
+            )?;
+            if (version == 2) != (meta.floor == 0) {
+                return Err(invalid("manifest version and retention floor disagree"));
+            }
+            manifest.recovery = Some(meta);
         }
         Ok(manifest)
     }
@@ -423,15 +431,21 @@ impl ManifestStore {
         }
         let state = TabletSnapshotState {
             current_sequence: self.manifest.durable_sequence(),
-            oldest_retained_snapshot: (meta.floor != 0).then_some(meta.floor),
+            oldest_retained_snapshot: None,
             rows: rows
                 .into_iter()
                 .map(|(key, versions)| TabletSnapshotRow { key, versions })
                 .collect(),
             receipts: meta.receipts.values().copied().collect(),
         };
-        MemoryTablet::restore_snapshot(meta.descriptor.clone(), state)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+        let mut tablet = MemoryTablet::restore_snapshot(meta.descriptor.clone(), state)
+            .map_err(io::Error::other)?;
+        if meta.floor != 0 {
+            tablet
+                .prune_history_before(meta.floor)
+                .map_err(io::Error::other)?;
+        }
+        Ok(tablet)
     }
 
     pub fn recovered_receipt(&self, id: TransactionId) -> io::Result<Option<TransactionReceipt>> {
