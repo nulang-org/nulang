@@ -74,8 +74,9 @@ impl WalBackedTablet {
     /// Explicitly recover a live in-memory tablet from a sealed SST prefix
     /// plus the complete existing WAL. Verify every overlapping mutation and
     /// receipt before replaying the tail. Refuses existing checkpoints and
-    /// compacted WALs: their retention or lineage cannot yet be reconciled
-    /// with the seal. Does not enable SST-based WAL reclamation.
+    /// unbound compacted WALs. A version-four header must bind exactly to
+    /// the sealed manifest before tail repair. No production writer emits
+    /// such a header yet; legacy checkpoint/reclamation is disabled for it.
     #[cfg(unix)]
     pub fn open_from_sealed_sst(
         descriptor: TabletDescriptor,
@@ -84,14 +85,8 @@ impl WalBackedTablet {
     ) -> std::io::Result<Self> {
         use std::io;
         let invalid = |reason: &'static str| io::Error::new(io::ErrorKind::InvalidData, reason);
-        let wal = FileWal::open_existing(wal_path.as_ref())
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        let checkpoint_path = checkpoint::checkpoint_path_for_wal(wal.path());
-        match std::fs::symlink_metadata(&checkpoint_path) {
-            Ok(_) => return Err(invalid("existing checkpoint requires normal recovery")),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
+        // Both locks are nonblocking. Resolve the expected seal before opening
+        // the WAL so a mismatched bound header cannot trigger tail repair.
         let manifest = super::sst_manifest::ManifestStore::open(
             manifest_dir,
             descriptor.id().get(),
@@ -100,7 +95,17 @@ impl WalBackedTablet {
         if manifest.current().recovery_descriptor() != Some(&descriptor) {
             return Err(invalid("sealed recovery descriptor mismatch"));
         }
-        super::wal_sst_shadow::verify_prefix(&wal, &descriptor, &manifest)?;
+        let wal = FileWal::open_existing(wal_path.as_ref(), manifest.wal_binding()?)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let checkpoint_path = checkpoint::checkpoint_path_for_wal(wal.path());
+        match std::fs::symlink_metadata(&checkpoint_path) {
+            Ok(_) => return Err(invalid("existing checkpoint requires normal recovery")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if !wal.is_seal_bound() {
+            super::wal_sst_shadow::verify_prefix(&wal, &descriptor, &manifest)?;
+        }
         let mut tablet = manifest.restore_memory_tablet()?;
         wal.replay_after_checkpoint(&mut tablet)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
@@ -483,6 +488,9 @@ impl WalBackedTablet {
     /// This is a valid crash state and is intentionally public so operators can
     /// separate checkpoint publication from later space reclamation.
     pub fn publish_checkpoint(&self) -> Result<(), WalBackedError> {
+        if self.wal.is_seal_bound() {
+            return Err(WalError::SealBindingMismatch.into());
+        }
         self.require_recovered()?;
         checkpoint::write_checkpoint(&self.checkpoint_path, &self.tablet)?;
         Ok(())
@@ -502,6 +510,9 @@ impl WalBackedTablet {
     /// callers must separately coordinate backups and external consumers.
     /// Checkpoint the candidate before publishing it or reclaiming the WAL.
     pub fn reclaim_history_before(&mut self, floor: u64) -> Result<(), WalBackedError> {
+        if self.wal.is_seal_bound() {
+            return Err(WalError::SealBindingMismatch.into());
+        }
         self.require_recovered()?;
         if self.wal.is_poisoned() {
             return Err(WalError::Poisoned.into());
