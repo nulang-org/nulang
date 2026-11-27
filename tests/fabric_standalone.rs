@@ -17,12 +17,21 @@ impl Drop for Server {
 }
 impl Server {
     fn start(address: SocketAddr, args: &[&str]) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_nulang-fabric"))
+        Self::start_with(address, args, |_| {})
+    }
+
+    fn start_with(
+        address: SocketAddr,
+        args: &[&str],
+        configure: impl FnOnce(&mut Command),
+    ) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_nulang-fabric"));
+        command
             .args(["--bind", &address.to_string()])
             .args(args)
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stdout(Stdio::piped());
+        configure(&mut command);
+        let child = command.spawn().unwrap();
         let mut server = Self(child);
         let stdout = server.0.stdout.take().unwrap();
         let (tx, rx) = mpsc::channel();
@@ -391,4 +400,68 @@ fn mutual_tls_requires_trusted_client_certificate() {
     let mut pongs = vec![0; 96 * 7];
     allowed.read_exact(&mut pongs).unwrap();
     assert_eq!(pongs, b"+PONG\r\n".repeat(96));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn descriptor_exhaustion_preserves_existing_client_and_recovers_listener() {
+    use std::os::unix::process::CommandExt;
+    let addr = port();
+    let mut server = Server::start_with(addr, &[], |command| {
+        // SAFETY: only async-signal-safe setrlimit is invoked in the child.
+        unsafe {
+            command.pre_exec(|| {
+                let limit = libc::rlimit {
+                    rlim_cur: 32,
+                    rlim_max: 32,
+                };
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    });
+    let mut established = TcpStream::connect(addr).unwrap();
+    established
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let ping = b"*1\r\n$4\r\nPING\r\n";
+    let mut pong = [0; 7];
+    established.write_all(ping).unwrap();
+    established.read_exact(&mut pong).unwrap();
+    assert_eq!(&pong, b"+PONG\r\n");
+    let mut idle = Vec::new();
+    for _ in 0..40 {
+        if let Ok(socket) = TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
+            idle.push(socket);
+        }
+    }
+    let fd_path = format!("/proc/{}/fd", server.0.id());
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "server exited under descriptor pressure"
+        );
+        if std::fs::read_dir(&fd_path)
+            .map(|fds| fds.count())
+            .unwrap_or(0)
+            >= 32
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "did not reach descriptor limit"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(150));
+    established.write_all(ping).unwrap();
+    established.read_exact(&mut pong).unwrap();
+    assert_eq!(&pong, b"+PONG\r\n");
+    drop(idle);
+    request(addr, ping, b"+PONG\r\n");
+    assert!(server.0.try_wait().unwrap().is_none());
 }

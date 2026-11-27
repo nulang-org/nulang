@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Fabric peer and descriptor admission — 2026-11-27
+- **Bound concurrent source-IP admission across shared-budget shards**, normalize mapped IPv4 identities, reclaim peer leases on all connection-close paths, and retry resource-exhausted accepts after a bounded listener backoff. Qualify real Linux descriptor saturation while preserving established client service.
+
 ### Fabric shared TLS admission budget — 2026-11-27
 - **Charge a fixed 512 KiB modeled reservation per TLS session against the shared connection budget before session creation**, retain it through idle buffer reclamation and release it on every close. Expose per-shard reservation and shared budget limit; reject insufficient TLS configuration. Qualify cross-shard and concurrent admission without adding dependencies.
 

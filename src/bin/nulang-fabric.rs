@@ -15,7 +15,7 @@ mod unix {
 
     const HELP: &str =
         "nulang-fabric [--bind 127.0.0.1:6380] [--mode memory|buffered|sync] [--journal PATH]
-    --max-entries N --max-arena-bytes N --max-connections N
+    --max-entries N --max-arena-bytes N --max-connections N --max-connections-per-peer N
     --max-connection-bytes N --max-input-bytes N --max-output-bytes N --max-pipeline-depth N
     --max-record-bytes N --max-journal-bytes N
     --checkpoint-percent 0..99 (default 70; 0 disables)
@@ -110,6 +110,9 @@ Durable modes require a private journal path. Memory mode is the default.";
                         config.server.max_pipeline_depth = positive(&value, &flag)?
                     }
                     "--max-connections" => config.server.max_connections = positive(&value, &flag)?,
+                    "--max-connections-per-peer" => {
+                        config.server.max_connections_per_peer = positive(&value, &flag)?
+                    }
                     "--max-connection-bytes" => {
                         config.server.max_total_connection_bytes = positive(&value, &flag)?
                     }
@@ -485,6 +488,19 @@ Durable modes require a private journal path. Memory mode is the default.";
                 "1048576"
             ])
             .is_ok());
+        }
+
+        #[test]
+        fn peer_limit_is_positive_and_configurable() {
+            assert_eq!(parse(&[]).unwrap().server.max_connections_per_peer, 64);
+            assert_eq!(
+                parse(&["--max-connections-per-peer", "3"])
+                    .unwrap()
+                    .server
+                    .max_connections_per_peer,
+                3
+            );
+            assert!(parse(&["--max-connections-per-peer", "0"]).is_err());
         }
 
         #[test]
