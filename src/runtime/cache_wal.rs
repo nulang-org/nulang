@@ -94,6 +94,125 @@ pub struct CheckpointReport {
     pub after_bytes: u64,
 }
 
+/// A tiny independently synced clock floor, coordinated by the WAL's stable
+/// writer lock. Keeping this out of the bounded journal permits safe TTL reads
+/// even when the mutation journal is full. Never restore the WAL alone.
+#[derive(Debug)]
+pub(super) struct ClockFloor {
+    path: PathBuf,
+    unix_ms: u64,
+}
+
+const CLOCK_MAGIC: &[u8; 8] = b"NLCLK001";
+
+impl ClockFloor {
+    fn path_for(journal: &Path) -> PathBuf {
+        let mut path = journal.as_os_str().to_os_string();
+        path.push(".clock");
+        PathBuf::from(path)
+    }
+
+    fn encode(unix_ms: u64) -> [u8; 48] {
+        let mut record = [0; 48];
+        record[..8].copy_from_slice(CLOCK_MAGIC);
+        record[8..16].copy_from_slice(&unix_ms.to_le_bytes());
+        let digest = blake3::hash(&record[..16]);
+        record[16..].copy_from_slice(digest.as_bytes());
+        record
+    }
+
+    /// Called exclusively while holding the stable lock, before replay.
+    pub(super) fn open(journal: &Path, lock: &mut File, now: u64) -> io::Result<Self> {
+        let path = Self::path_for(journal);
+        let marker_len = lock.metadata()?.len();
+        if marker_len != 0 {
+            let mut marker = [0; 8];
+            if marker_len != 8 {
+                return Err(invalid("invalid cache clock lock marker"));
+            }
+            lock.seek(SeekFrom::Start(0))?;
+            lock.read_exact(&mut marker)?;
+            if &marker != CLOCK_MAGIC {
+                return Err(invalid("invalid cache clock lock marker"));
+            }
+        }
+        let previous = match File::open(&path) {
+            Ok(mut file) => {
+                let mut record = [0; 48];
+                if file.metadata()?.len() != record.len() as u64 {
+                    return Err(invalid("invalid cache clock floor length"));
+                }
+                file.read_exact(&mut record)?;
+                let floor = u64::from_le_bytes(record[8..16].try_into().unwrap());
+                if record != Self::encode(floor) {
+                    return Err(invalid("invalid cache clock floor checksum"));
+                }
+                Some(floor)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound && marker_len == 0 => None,
+            Err(error) => return Err(error),
+        };
+        if previous.is_some_and(|floor| now < floor) {
+            return Err(invalid(
+                "cache wall clock regressed below durable floor; correct clock before recovery",
+            ));
+        }
+        let mut clock = Self {
+            path,
+            unix_ms: previous.unwrap_or(0),
+        };
+        if previous.is_none() || previous != Some(now) {
+            clock.publish(now)?;
+        }
+        // Marker is durable only after the initial floor is durable. If the
+        // floor disappears later, refuse recovery rather than reset it.
+        if marker_len == 0 {
+            lock.seek(SeekFrom::Start(0))?;
+            lock.write_all(CLOCK_MAGIC)?;
+            lock.sync_all()?;
+        }
+        Ok(clock)
+    }
+
+    pub(super) fn advance(&mut self, now: u64) -> io::Result<()> {
+        if now < self.unix_ms {
+            return Err(invalid("cache clock moved backwards"));
+        }
+        if now != self.unix_ms {
+            self.publish(now)?;
+        }
+        Ok(())
+    }
+
+    fn publish(&mut self, now: u64) -> io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = parent_dir(&self.path);
+        let directory = File::open(parent)?;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let path = parent.join(format!(
+            ".nulang-clock-{}-{nonce}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        let temp = TemporaryJournal(path);
+        file.write_all(&Self::encode(now))?;
+        file.sync_all()?;
+        std::fs::rename(&temp.0, &self.path)?;
+        directory.sync_all()?;
+        self.unix_ms = now;
+        Ok(())
+    }
+}
+
 impl CacheWal {
     /// Open or exclusively create a journal, stream validated records to a
     /// staging callback, and repair an incomplete final record only. The
@@ -102,6 +221,15 @@ impl CacheWal {
     pub fn open(
         path: impl AsRef<Path>,
         limits: WalLimits,
+        on_record: impl FnMut(u64, &[u8]) -> io::Result<()>,
+    ) -> io::Result<Self> {
+        Self::open_prepared(path, limits, |_, _| Ok(()), on_record)
+    }
+
+    pub(super) fn open_prepared(
+        path: impl AsRef<Path>,
+        limits: WalLimits,
+        prepare: impl FnOnce(&Path, &mut File) -> io::Result<()>,
         mut on_record: impl FnMut(u64, &[u8]) -> io::Result<()>,
     ) -> io::Result<Self> {
         if limits.max_record_bytes == 0
@@ -118,7 +246,7 @@ impl CacheWal {
         // unlink this sidecar while any cooperating writer may be active.
         let mut lock_path = path.as_os_str().to_os_string();
         lock_path.push(".lock");
-        let lock = OpenOptions::new()
+        let mut lock = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -168,6 +296,7 @@ impl CacheWal {
         } else {
             return Err(invalid("unsupported cache WAL magic/version"));
         };
+        prepare(path, &mut lock)?;
         let mut payload = Vec::new();
         while length - position >= RECORD_HEADER_BYTES as u64 {
             let mut header = [0; RECORD_HEADER_BYTES];

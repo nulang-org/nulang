@@ -746,7 +746,8 @@ impl CacheShardServer {
             connection.lease.release_empty(&mut connection.input);
             if start.elapsed() < timeout
                 && connection.pending_output() != 0
-                && Self::flush_connection(&mut connection).is_ok()
+                && Self::flush_connection_while(&mut connection, || start.elapsed() < timeout)
+                    .is_ok()
                 && connection.pending_output() != 0
                 && self
                     .poll
@@ -779,7 +780,10 @@ impl CacheShardServer {
                     if event.is_error()
                         || event.is_write_closed()
                         || (event.is_writable()
-                            && (Self::flush_connection(connection).is_err()
+                            && (Self::flush_connection_while(connection, || {
+                                start.elapsed() < timeout
+                            })
+                            .is_err()
                                 || connection.pending_output() == 0))
                     {
                         let mut connection = self
@@ -799,7 +803,9 @@ impl CacheShardServer {
         // error. A sync failure is never reported as a clean shutdown.
         #[cfg(unix)]
         if let CacheBackend::Durable { cache, .. } = &mut self.backend {
-            cache.synchronize().map_err(CacheServerError::Durability)?;
+            cache
+                .synchronize_at(self.clock.now_ms())
+                .map_err(CacheServerError::Durability)?;
         }
         drain_result?;
         Ok(())
@@ -1141,7 +1147,14 @@ impl CacheShardServer {
     }
 
     fn flush_connection(connection: &mut CacheConnection) -> io::Result<()> {
-        while connection.output_start < connection.output.len() {
+        Self::flush_connection_while(connection, || true)
+    }
+
+    fn flush_connection_while(
+        connection: &mut CacheConnection,
+        mut can_write: impl FnMut() -> bool,
+    ) -> io::Result<()> {
+        while connection.output_start < connection.output.len() && can_write() {
             match connection
                 .stream
                 .write(&connection.output[connection.output_start..])
@@ -2014,5 +2027,73 @@ mod tests {
         assert_eq!(server.connection_count(), 0);
         assert_eq!(server.buffer_budget.used_bytes(), 0);
         drop(client);
+    }
+
+    #[test]
+    fn shutdown_flush_checks_write_permission_before_sending() {
+        let mut server = build_server();
+        let mut client = std::net::TcpStream::connect(server.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+            if server.connection_count() == 1 {
+                break;
+            }
+        }
+        let connection = server.connections.values_mut().next().unwrap();
+        connection
+            .lease
+            .reserve(&mut connection.output, 7, 1024)
+            .unwrap();
+        connection.output.extend_from_slice(b"+PONG\r\n");
+        CacheShardServer::flush_connection_while(connection, || false).unwrap();
+        assert_eq!(connection.pending_output(), 7);
+        CacheShardServer::flush_connection_while(connection, || true).unwrap();
+        let mut reply = [0; 7];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"+PONG\r\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clock_persistence_failure_during_resp_read_stops_shard() {
+        let tmp = DurableTestDir::new();
+        let journal = tmp.0.join("clock.wal");
+        let mut server = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        let mut client = connect_client(&server);
+        roundtrip(
+            &mut server,
+            &mut client,
+            b"*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nPX\r\n$5\r\n60000\r\n",
+            b"+OK\r\n",
+        );
+        let clock_path = tmp.0.join("clock.wal.clock");
+        std::fs::remove_file(&clock_path).unwrap();
+        std::fs::create_dir(&clock_path).unwrap();
+        // Ensure the next time-sensitive command advances beyond the SET floor.
+        std::thread::sleep(Duration::from_millis(2));
+        client.write_all(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n").unwrap();
+        let mut failed = false;
+        for _ in 0..8 {
+            match server.poll_once(Some(Duration::from_millis(5))) {
+                Err(CacheServerError::DurableShardPoisoned) => {
+                    failed = true;
+                    break;
+                }
+                Ok(()) => {}
+                other => panic!("unexpected reactor result {other:?}"),
+            }
+        }
+        assert!(failed);
+        assert_eq!(server.connection_count(), 0);
+        assert_eq!(server.buffer_budget.used_bytes(), 0);
+        let mut byte = [0];
+        match client.read(&mut byte) {
+            Ok(0) => {}
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+            other => panic!("unexpected reply after poisoned clock: {other:?}"),
+        }
     }
 }
