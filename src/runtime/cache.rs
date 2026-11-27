@@ -16,6 +16,7 @@
 //! - Redis Cluster compatible 16,384-slot hashing and hash tags.
 
 use rustc_hash::FxHasher;
+use std::collections::VecDeque;
 use std::hash::Hasher;
 
 pub const REDIS_CLUSTER_SLOTS: u16 = 16_384;
@@ -209,10 +210,29 @@ struct ExpirationRef {
     expires_at_ms: u64,
 }
 
+// Slot-indexed intrusive FIFO lists: refresh/delete unlinks one record
+// without scanning a bucket or moving other records.
+#[derive(Debug, Clone, Copy)]
+struct ExpirationNode {
+    item: ExpirationRef,
+    bucket: usize,
+    prev: Option<u32>,
+    next: Option<u32>,
+}
+
+#[derive(Debug, Default)]
+struct ExpirationBucket {
+    head: Option<u32>,
+    tail: Option<u32>,
+}
+
 #[derive(Debug)]
 struct ExpirationWheel {
     tick_ms: u64,
-    buckets: Vec<Vec<ExpirationRef>>,
+    buckets: Vec<ExpirationBucket>,
+    nodes: Vec<Option<ExpirationNode>>,
+    pending: VecDeque<usize>,
+    queued: Vec<bool>,
     last_tick: Option<u64>,
 }
 
@@ -222,43 +242,113 @@ impl ExpirationWheel {
         assert!(tick_ms > 0);
         Self {
             tick_ms,
-            buckets: (0..bucket_count).map(|_| Vec::new()).collect(),
+            buckets: (0..bucket_count)
+                .map(|_| ExpirationBucket::default())
+                .collect(),
+            nodes: Vec::new(),
+            pending: VecDeque::new(),
+            queued: vec![false; bucket_count],
             last_tick: None,
         }
     }
 
-    fn schedule(&mut self, item: ExpirationRef, now_ms: u64) {
-        self.last_tick.get_or_insert(now_ms / self.tick_ms);
-        let bucket = ((item.expires_at_ms / self.tick_ms) % self.buckets.len() as u64) as usize;
-        self.buckets[bucket].push(item);
+    fn cancel(&mut self, slot: u32) -> Option<ExpirationRef> {
+        let node = self.nodes.get_mut(slot as usize)?.take()?;
+        let bucket = &mut self.buckets[node.bucket];
+        if let Some(prev) = node.prev {
+            self.nodes[prev as usize]
+                .as_mut()
+                .expect("linked expiration")
+                .next = node.next;
+        } else {
+            bucket.head = node.next;
+        }
+        if let Some(next) = node.next {
+            self.nodes[next as usize]
+                .as_mut()
+                .expect("linked expiration")
+                .prev = node.prev;
+        } else {
+            bucket.tail = node.prev;
+        }
+        Some(node.item)
     }
 
-    fn drain_candidates(&mut self, now_ms: u64, out: &mut Vec<ExpirationRef>) {
+    fn schedule(&mut self, item: ExpirationRef, now_ms: u64) {
+        self.cancel(item.slot);
+        self.last_tick.get_or_insert(now_ms / self.tick_ms);
+        let idx = ((item.expires_at_ms / self.tick_ms) % self.buckets.len() as u64) as usize;
+        let slot = item.slot as usize;
+        if self.nodes.len() <= slot {
+            self.nodes.resize(slot + 1, None);
+        }
+        let bucket = &mut self.buckets[idx];
+        let prev = bucket.tail;
+        if let Some(prev) = prev {
+            self.nodes[prev as usize]
+                .as_mut()
+                .expect("linked expiration")
+                .next = Some(item.slot);
+        } else {
+            bucket.head = Some(item.slot);
+        }
+        bucket.tail = Some(item.slot);
+        self.nodes[slot] = Some(ExpirationNode {
+            item,
+            bucket: idx,
+            prev,
+            next: None,
+        });
+    }
+
+    fn enqueue_bucket(&mut self, idx: usize) {
+        if !self.queued[idx] && self.buckets[idx].head.is_some() {
+            self.queued[idx] = true;
+            self.pending.push_back(idx);
+        }
+    }
+
+    /// Retain eligible buckets across calls and inspect at most the supplied
+    /// number of records, including stale and not-yet-due records.
+    fn drain_candidates(&mut self, now_ms: u64, out: &mut Vec<ExpirationRef>, budget: usize) {
+        if budget == 0 {
+            return;
+        }
         let current = now_ms / self.tick_ms;
         let Some(last) = self.last_tick else {
             self.last_tick = Some(current);
             return;
         };
-
         let bucket_count = self.buckets.len() as u64;
         let elapsed = current.saturating_sub(last);
-
         if elapsed >= bucket_count {
-            for bucket in &mut self.buckets {
-                out.append(bucket);
+            for idx in 0..self.buckets.len() {
+                self.enqueue_bucket(idx);
             }
         } else {
-            // Include the current bucket even when no full tick elapsed so
-            // sub-tick TTLs can be reaped by an explicit purge call.
-            // Revisit the previous tick as well. A sub-tick TTL may have
-            // been scheduled into that bucket after the prior purge and can
-            // become due before the clock advances into the next bucket.
+            // Revisit the previous and current ticks for sub-tick TTLs.
             for tick in last..=current {
-                let idx = (tick % bucket_count) as usize;
-                out.append(&mut self.buckets[idx]);
+                self.enqueue_bucket((tick % bucket_count) as usize);
             }
         }
         self.last_tick = Some(current);
+
+        // Each bucket receives one turn per pass. FIFO records prevent a
+        // rescheduled future collision from repeatedly hiding older entries.
+        let initial_len = out.len();
+        while out.len() - initial_len < budget {
+            let Some(idx) = self.pending.pop_front() else {
+                break;
+            };
+            self.queued[idx] = false;
+            while out.len() - initial_len < budget {
+                let Some(slot) = self.buckets[idx].head else {
+                    break;
+                };
+                out.push(self.cancel(slot).expect("linked expiration"));
+            }
+            self.enqueue_bucket(idx);
+        }
     }
 }
 
@@ -449,6 +539,7 @@ impl CacheStore {
         let Some(entry) = slot.entry.take() else {
             return false;
         };
+        self.expiry.cancel(slot_id);
         self.remove_bucket(entry.hash, slot_id);
         entry.key.release(&mut self.arena);
         entry.value.release(&mut self.arena);
@@ -480,6 +571,8 @@ impl CacheStore {
                     },
                     now_ms,
                 );
+            } else {
+                self.expiry.cancel(slot_id);
             }
             self.stats.sets += 1;
             return;
@@ -645,19 +738,20 @@ impl CacheStore {
         removed
     }
 
+    /// Inspect at most max_items expiration records and return the number of
+    /// live entries removed. Deferred records remain queued for later sweeps.
     pub fn purge_expired(&mut self, now_ms: u64, max_items: usize) -> usize {
+        if max_items == 0 {
+            return 0;
+        }
         self.expiry_scratch.clear();
         self.expiry
-            .drain_candidates(now_ms, &mut self.expiry_scratch);
+            .drain_candidates(now_ms, &mut self.expiry_scratch, max_items);
 
         let mut expired = 0usize;
         let mut candidates = std::mem::take(&mut self.expiry_scratch);
 
         for item in candidates.iter().copied() {
-            if expired >= max_items {
-                self.expiry.schedule(item, now_ms);
-                continue;
-            }
             let Some(slot) = self.slots.get(item.slot as usize) else {
                 continue;
             };
@@ -891,5 +985,118 @@ mod tests {
             default_physical_shard(slot, 8),
             default_physical_shard(slot, 8)
         );
+    }
+
+    #[test]
+    fn expiry_sweep_bounds_candidate_buffer_and_resumes_after_clock_jump() {
+        let mut store = CacheStore::new();
+        for i in 0u32..1000 {
+            store.set_bytes(&i.to_le_bytes(), b"v", Some(10), 0);
+        }
+        assert_eq!(store.purge_expired(20, 0), 0);
+        assert_eq!(store.expiry_scratch.capacity(), 0);
+        assert_eq!(store.purge_expired(20, 3), 3);
+        assert!(store.expiry_scratch.capacity() <= 8);
+        // The partially drained old bucket must remain eligible even after
+        // the clock leaves it; no full wheel rotation is required.
+        assert_eq!(store.purge_expired(40, 3), 3);
+        let mut removed = 6;
+        for _ in 0..334 {
+            removed += store.purge_expired(40, 3);
+        }
+        assert_eq!(removed, 1000);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn expiry_budget_counts_stale_records_and_future_collisions() {
+        let mut store = CacheStore::new();
+        let rotation = DEFAULT_WHEEL_BUCKETS as u64 * DEFAULT_WHEEL_TICK_MS;
+        for i in 0u32..100 {
+            store.set_bytes(&i.to_le_bytes(), b"future", Some(rotation + 10), 0);
+        }
+        store.set_bytes(b"stale", b"v", Some(10), 0);
+        store.set_bytes(b"stale", b"persistent", None, 0);
+        store.set_bytes(b"due", b"v", Some(10), 0);
+        assert_eq!(store.purge_expired(10, 1), 0);
+        assert!(store.expiry_scratch.capacity() <= 4);
+        let mut removed = 0;
+        for _ in 0..102 {
+            removed += store.purge_expired(10, 1);
+        }
+        assert_eq!(removed, 1);
+        assert_eq!(store.len(), 101);
+    }
+
+    #[test]
+    fn expiry_pending_buckets_rotate_without_starving_other_due_keys() {
+        let mut store = CacheStore::new();
+        for i in 0u32..100 {
+            store.set_bytes(&i.to_le_bytes(), b"v", Some(10), 0);
+        }
+        store.set_bytes(b"later", b"v", Some(20), 0);
+        assert_eq!(store.purge_expired(30, 1), 1);
+        assert_eq!(store.purge_expired(30, 1), 1);
+        // Check physical removal rather than lazy expiry through GET.
+        assert!(store
+            .find_slot(b"later", CacheStore::hash(b"later"))
+            .is_none());
+        assert_eq!(store.len(), 99);
+        assert!(store.expiry.pending.len() <= DEFAULT_WHEEL_BUCKETS);
+    }
+
+    #[test]
+    fn ttl_refresh_does_not_accumulate_expiration_records() {
+        let mut store = CacheStore::new();
+        for i in 0..10_000u64 {
+            store.set_bytes(b"hot", b"v", Some(60_000 + i), 0);
+            assert!(store.expire_ms(b"hot", 120_000 + i, 0));
+        }
+        assert_eq!(store.expiry.nodes.iter().flatten().count(), 1);
+        assert_eq!(store.ttl(b"hot", 0), CacheTtl::RemainingMs(129_999));
+        store.set_bytes(b"hot", b"persistent", None, 0);
+        assert_eq!(store.expiry.nodes.iter().flatten().count(), 0);
+    }
+
+    #[test]
+    fn ttl_delete_lazy_expiry_and_slot_reuse_cancel_records() {
+        let mut store = CacheStore::new();
+        store.set_bytes(b"a", b"v", Some(10), 0);
+        store.set_bytes(b"b", b"v", Some(10), 0);
+        store.set_bytes(b"c", b"v", Some(10), 0);
+        assert!(store.delete(b"b"));
+        assert!(!store.exists(b"a", 10));
+        store.set_bytes(b"d", b"v", Some(50), 10);
+        assert_eq!(store.expiry.nodes.iter().flatten().count(), 2);
+        assert_eq!(store.purge_expired(10, 1), 1);
+        assert!(store.exists(b"d", 10));
+        assert_eq!(store.purge_expired(60, 1), 1);
+        assert!(store.is_empty());
+        assert_eq!(store.expiry.nodes.iter().flatten().count(), 0);
+    }
+
+    #[test]
+    fn cancellation_while_bucket_is_pending_preserves_fifo_and_reused_slots() {
+        let mut store = CacheStore::new();
+        for key in [b"a", b"b", b"c", b"d", b"e"] {
+            store.set_bytes(key, b"v", Some(10), 0);
+        }
+        assert_eq!(store.purge_expired(10, 1), 1);
+        // Cancel a pending head, middle, and tail without lazy-expiry reads.
+        assert!(store.delete(b"b"));
+        assert!(store.delete(b"d"));
+        assert!(store.delete(b"e"));
+        store.set_bytes(b"new", b"v", Some(30), 10);
+        assert_eq!(store.purge_expired(20, 1), 1);
+        assert_eq!(store.len(), 1);
+        assert!(store.exists(b"new", 39));
+        assert_eq!(store.purge_expired(40, 1), 1);
+        assert!(store.is_empty());
+        assert_eq!(store.expiry.nodes.iter().flatten().count(), 0);
+        assert!(store
+            .expiry
+            .buckets
+            .iter()
+            .all(|b| b.head.is_none() && b.tail.is_none()));
     }
 }

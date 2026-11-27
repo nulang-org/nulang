@@ -60,8 +60,17 @@ encodings for hashes, sets, lists, and sorted sets.
 ## Expiration
 
 TTL work is separate from actor timers. The initial implementation uses a
-hashed timing wheel with generation checks and lazy expiry on reads. The next
-iteration should promote this to a hierarchical wheel so long TTLs do not
+hashed timing wheel with generation checks and lazy expiry on reads. Each explicit sweep inspects at most its candidate budget, including stale and
+future records, and keeps partially drained buckets eligible for later sweeps.
+FIFO records and round-robin bucket selection prevent a future collision or a
+large expiration burst from monopolizing subsequent sweeps. Bucket discovery
+is bounded by the fixed wheel size. Slot-indexed intrusive FIFO handles unlink
+the previous expiration record in O(1) on TTL refresh, persistent overwrite,
+explicit deletion, and lazy expiration. Each TTL-bearing entry retains at most
+one linked record; a reusable node table retains capacity at the highest slot
+index that has carried a TTL. Generation and deadline checks remain defensive
+guards. This is not a wall-clock CPU deadline or a total memory admission cap.
+The next iteration should promote the wheel to a hierarchy so long TTLs do not
 revisit the same bucket each rotation.
 
 ## RESP ingress and command execution
