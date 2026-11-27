@@ -270,13 +270,13 @@ fn assert_slot_contract(store: &mut dyn PersistenceStore) {
 }
 
 #[test]
-fn memory_workflow_slot_commit_is_immutable_and_atomic() {
+fn test_memory_workflow_slot_commit_is_immutable_and_atomic() {
     assert_slot_contract(&mut MemoryStore::new());
 }
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn sqlite_workflow_slot_commit_is_immutable_and_atomic() {
+fn test_sqlite_workflow_slot_commit_is_immutable_and_atomic() {
     assert_slot_contract(&mut nulang::runtime::LibsqlStore::in_memory().unwrap());
 }
 
@@ -308,18 +308,18 @@ fn assert_unbound_history_rejected(store: &mut dyn PersistenceStore) {
 }
 
 #[test]
-fn memory_old_unbound_workflow_history_fails_closed() {
+fn test_memory_old_unbound_workflow_history_fails_closed() {
     assert_unbound_history_rejected(&mut MemoryStore::new());
 }
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn sqlite_old_unbound_workflow_history_fails_closed() {
+fn test_sqlite_old_unbound_workflow_history_fails_closed() {
     assert_unbound_history_rejected(&mut nulang::runtime::LibsqlStore::in_memory().unwrap());
 }
 
 #[test]
-fn workflow_binding_codec_keeps_v1_unchanged_and_validates_v2_identity() {
+fn test_workflow_binding_codec_keeps_v1_unchanged_and_validates_v2_identity() {
     let binding = slot(0, 1);
     let prepared = bound_prepared(binding, b"request");
     let completed = bound_completed(&prepared, b"result");
@@ -529,18 +529,18 @@ fn assert_workflow_admission_contract(store: &mut dyn PersistenceStore) {
 }
 
 #[test]
-fn memory_atomic_admission_lifecycle() {
+fn test_memory_atomic_admission_lifecycle() {
     assert_workflow_admission_contract(&mut MemoryStore::new());
 }
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn sqlite_atomic_admission_lifecycle() {
+fn test_sqlite_atomic_admission_lifecycle() {
     assert_workflow_admission_contract(&mut nulang::runtime::LibsqlStore::in_memory().unwrap());
 }
 
 #[test]
-fn workflow_admission_digest_distinguishes_explicit_marker() {
+fn test_workflow_admission_digest_distinguishes_explicit_marker() {
     let admission = DurableTransition::workflow_command(42, 1, 0, 0, vec![]).unwrap();
     let mut generic = admission.clone();
     generic.workflow_admission = false;
@@ -556,7 +556,7 @@ fn workflow_admission_digest_distinguishes_explicit_marker() {
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn sqlite_admission_and_terminal_marker_rollback_and_reopen() {
+fn test_sqlite_admission_and_terminal_marker_rollback_and_reopen() {
     use nulang::runtime::{LibsqlStore, WorkflowEvent};
     use std::time::{SystemTime, UNIX_EPOCH};
     let path = std::env::temp_dir().join(format!(
@@ -738,19 +738,19 @@ fn assert_terminal_cursor_contract(store: &mut dyn PersistenceStore) {
 }
 
 #[test]
-fn memory_terminal_cursor_reconciles_all_effect_occurrences() {
+fn test_memory_terminal_cursor_reconciles_all_effect_occurrences() {
     assert_terminal_cursor_contract(&mut MemoryStore::new());
 }
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn sqlite_terminal_cursor_reconciles_all_effect_occurrences() {
+fn test_sqlite_terminal_cursor_reconciles_all_effect_occurrences() {
     assert_terminal_cursor_contract(&mut nulang::runtime::LibsqlStore::in_memory().unwrap());
 }
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn sqlite_terminal_rejects_missing_earlier_intent_even_with_valid_last_receipt() {
+fn test_sqlite_terminal_rejects_missing_earlier_intent_even_with_valid_last_receipt() {
     use nulang::runtime::LibsqlStore;
     use std::time::{SystemTime, UNIX_EPOCH};
     let path = std::env::temp_dir().join(format!(
@@ -840,13 +840,13 @@ fn assert_terminal_outbox_contract(store: &mut dyn PersistenceStore) {
 }
 
 #[test]
-fn memory_workflow_terminal_can_stage_outbox_atomically() {
+fn test_memory_workflow_terminal_can_stage_outbox_atomically() {
     assert_terminal_outbox_contract(&mut MemoryStore::new());
 }
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn sqlite_workflow_terminal_can_stage_outbox_atomically() {
+fn test_sqlite_workflow_terminal_can_stage_outbox_atomically() {
     assert_terminal_outbox_contract(&mut nulang::runtime::LibsqlStore::in_memory().unwrap());
 }
 
@@ -969,19 +969,19 @@ fn assert_same_store_inbox(store: &mut dyn PersistenceStore) {
 }
 
 #[test]
-fn memory_same_store_inbox_deduplicates_committed_message() {
+fn test_memory_same_store_inbox_deduplicates_committed_message() {
     assert_same_store_inbox(&mut MemoryStore::new());
 }
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn sqlite_same_store_inbox_deduplicates_committed_message() {
+fn test_sqlite_same_store_inbox_deduplicates_committed_message() {
     assert_same_store_inbox(&mut nulang::runtime::LibsqlStore::in_memory().unwrap());
 }
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn sqlite_workflow_outbox_and_inbox_rollback_and_reopen() {
+fn test_sqlite_workflow_outbox_and_inbox_rollback_and_reopen() {
     use nulang::runtime::{DurableOutboxId, DurableOutboxMessage, LibsqlStore, PersistedValue};
     use std::time::{SystemTime, UNIX_EPOCH};
     let path = std::env::temp_dir().join(format!(

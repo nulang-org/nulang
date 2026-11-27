@@ -6412,7 +6412,7 @@ mod vm_tests {
     }
 
     #[test]
-    fn perform_async_context_callback_can_fail_closed_without_effect_site() {
+    fn test_perform_async_context_callback_can_fail_closed_without_effect_site() {
         let mut vm = VM::new_without_jit();
         let mut module = CodeModule::new("legacy-no-site");
         let effect_idx = module.add_string_constant("Test.value");
@@ -6445,7 +6445,7 @@ mod vm_tests {
     }
 
     #[test]
-    fn perform_async_passes_exact_site_context_to_runtime_callback() {
+    fn test_perform_async_passes_exact_site_context_to_runtime_callback() {
         let mut vm = VM::new_without_jit();
         let mut module = CodeModule::new("site-context");
         let effect_idx = module.add_string_constant("Test.value");

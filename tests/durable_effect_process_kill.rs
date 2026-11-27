@@ -155,7 +155,7 @@ fn expected_dispatch(decision: DurableEffectDispatchDecision, id: DurableEffectI
 /// The parent uses the *same test executable* rather than depending on cargo's
 /// location or a custom fixture binary in the CI workspace.
 #[test]
-fn durability_crash_worker() {
+fn test_durability_crash_worker() {
     let Ok(stage) = std::env::var(STAGE_ENV) else {
         return;
     };
@@ -256,7 +256,7 @@ fn durability_crash_worker() {
 fn spawn_worker(stage: &str, fixture: &Fixture) -> Command {
     let mut cmd = Command::new(std::env::current_exe().expect("locate test executable"));
     cmd.arg("--exact")
-        .arg("durability_crash_worker")
+        .arg("test_durability_crash_worker")
         .arg("--nocapture")
         .env(STAGE_ENV, stage)
         .env(ROOT_ENV, &fixture.root)
@@ -352,7 +352,7 @@ fn restart_worker(stage: &str, fixture: &Fixture) {
 }
 
 #[test]
-fn os_kill_restarts_all_three_receipt_crash_windows() {
+fn test_os_kill_restarts_all_three_receipt_crash_windows() {
     for (stage, expected_calls_before) in [
         ("crash_prepared", 0),
         ("crash_provider", 1),
@@ -387,7 +387,7 @@ fn os_kill_restarts_all_three_receipt_crash_windows() {
 }
 
 #[test]
-fn os_kill_and_epoch_handoff_fence_stale_receipt_then_deduplicate() {
+fn test_os_kill_and_epoch_handoff_fence_stale_receipt_then_deduplicate() {
     let fixture = Fixture::new("stale-epoch");
     kill_at_checkpoint("crash_provider", &fixture);
     restart_worker("recover_fenced", &fixture);

@@ -9112,7 +9112,7 @@ fn assert_staged_messages(rt: &Runtime, sender: u64, receiver: u64, behavior: u1
 }
 
 #[test]
-fn workflow_native_staging_commits_messages_without_mailbox_delivery() {
+fn test_workflow_native_staging_commits_messages_without_mailbox_delivery() {
     let mut rt = Runtime::new();
     let (sender, receiver, behavior) = workflow_staging_fixture(&mut rt);
     rt.actors
@@ -9137,7 +9137,7 @@ fn workflow_native_staging_commits_messages_without_mailbox_delivery() {
 }
 
 #[test]
-fn workflow_native_staging_rejects_internal_target_without_committing() {
+fn test_workflow_native_staging_rejects_internal_target_without_committing() {
     let mut rt = Runtime::new();
     let (sender, receiver, _) = workflow_staging_fixture(&mut rt);
     let internal = rt.behavior_id_for(receiver, "__timer_fired").unwrap();
@@ -9173,7 +9173,7 @@ fn workflow_native_staging_rejects_internal_target_without_committing() {
 }
 
 #[test]
-fn workflow_native_staging_ignored_error_poisons_terminal_commit() {
+fn test_workflow_native_staging_ignored_error_poisons_terminal_commit() {
     let mut rt = Runtime::new();
     let (sender, receiver, behavior) = workflow_staging_fixture(&mut rt);
     rt.actors
@@ -9212,7 +9212,7 @@ fn workflow_native_staging_ignored_error_poisons_terminal_commit() {
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn workflow_native_staging_sqlite_failure_recovers_original_command() {
+fn test_workflow_native_staging_sqlite_failure_recovers_original_command() {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -9404,13 +9404,13 @@ fn assert_workflow_dispatch(rt: &mut Runtime) {
 }
 
 #[test]
-fn workflow_dispatch_memory_admission_retry_and_ordering() {
+fn test_workflow_dispatch_memory_admission_retry_and_ordering() {
     assert_workflow_dispatch(&mut Runtime::new());
 }
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn workflow_dispatch_sqlite_admission_retry_and_ordering() {
+fn test_workflow_dispatch_sqlite_admission_retry_and_ordering() {
     let mut rt = Runtime::new();
     rt.persistence = Box::new(LibsqlStore::in_memory().unwrap());
     assert_workflow_dispatch(&mut rt);
@@ -9470,13 +9470,13 @@ fn assert_generic_outbox_not_dispatched(rt: &mut Runtime) {
 }
 
 #[test]
-fn workflow_dispatch_excludes_generic_memory_outbox() {
+fn test_workflow_dispatch_excludes_generic_memory_outbox() {
     assert_generic_outbox_not_dispatched(&mut Runtime::new());
 }
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn workflow_dispatch_excludes_generic_sqlite_outbox() {
+fn test_workflow_dispatch_excludes_generic_sqlite_outbox() {
     let mut rt = Runtime::new();
     rt.persistence = Box::new(LibsqlStore::in_memory().unwrap());
     assert_generic_outbox_not_dispatched(&mut rt);
@@ -9484,7 +9484,7 @@ fn workflow_dispatch_excludes_generic_sqlite_outbox() {
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn workflow_dispatch_sqlite_rollback_and_recovery_before_execution() {
+fn test_workflow_dispatch_sqlite_rollback_and_recovery_before_execution() {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -9591,7 +9591,7 @@ fn workflow_dispatch_sqlite_rollback_and_recovery_before_execution() {
 }
 
 #[test]
-fn workflow_dispatch_unrepresentable_staged_payload_poisoned() {
+fn test_workflow_dispatch_unrepresentable_staged_payload_poisoned() {
     let mut rt = Runtime::new();
     let (sender, receiver, behavior) = workflow_staging_fixture(&mut rt);
     rt.actors
@@ -9625,8 +9625,10 @@ fn workflow_dispatch_unrepresentable_staged_payload_poisoned() {
 
 #[cfg(feature = "sqlite")]
 #[test]
-#[ignore = "child fixture invoked by workflow_dispatch_process_kill_after_admission"]
-fn workflow_dispatch_process_kill_child() {
+fn test_workflow_dispatch_process_kill_child() {
+    if std::env::var_os("NULANG_DISPATCH_KILL_DB").is_none() {
+        return; // Parent-only crash fixture; ordinary test run is inert.
+    }
     let path = std::env::var("NULANG_DISPATCH_KILL_DB").unwrap();
     let id: DurableOutboxId =
         serde_json::from_str(&std::env::var("NULANG_DISPATCH_KILL_ID").unwrap()).unwrap();
@@ -9659,7 +9661,7 @@ fn workflow_dispatch_process_kill_child() {
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn workflow_dispatch_process_kill_after_admission() {
+fn test_workflow_dispatch_process_kill_after_admission() {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -9679,8 +9681,7 @@ fn workflow_dispatch_process_kill_after_admission() {
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "runtime::tests::workflow_dispatch_process_kill_child",
-            "--ignored",
+            "runtime::tests::test_workflow_dispatch_process_kill_child",
             "--nocapture",
         ])
         .env("NULANG_DISPATCH_KILL_DB", &path)
@@ -9816,13 +9817,13 @@ fn assert_shard_outbox_scan(rt: &mut Runtime) {
 }
 
 #[test]
-fn workflow_outbox_pump_memory_scan_watermark_shards_and_bounds() {
+fn test_workflow_outbox_pump_memory_scan_watermark_shards_and_bounds() {
     assert_shard_outbox_scan(&mut Runtime::new());
 }
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn workflow_outbox_pump_sqlite_scan_watermark_shards_and_bounds() {
+fn test_workflow_outbox_pump_sqlite_scan_watermark_shards_and_bounds() {
     let mut rt = Runtime::new();
     rt.persistence = Box::new(LibsqlStore::in_memory().unwrap());
     assert_shard_outbox_scan(&mut rt);
@@ -9905,20 +9906,20 @@ fn assert_outbox_pump_fairness(rt: &mut Runtime) {
 }
 
 #[test]
-fn workflow_outbox_pump_memory_fairness_and_retry_cooldown() {
+fn test_workflow_outbox_pump_memory_fairness_and_retry_cooldown() {
     assert_outbox_pump_fairness(&mut Runtime::new());
 }
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn workflow_outbox_pump_sqlite_fairness_and_retry_cooldown() {
+fn test_workflow_outbox_pump_sqlite_fairness_and_retry_cooldown() {
     let mut rt = Runtime::new();
     rt.persistence = Box::new(LibsqlStore::in_memory().unwrap());
     assert_outbox_pump_fairness(&mut rt);
 }
 
 #[test]
-fn workflow_outbox_pump_idle_budget_preserves_cursor_and_quiesces() {
+fn test_workflow_outbox_pump_idle_budget_preserves_cursor_and_quiesces() {
     let mut rt = Runtime::new();
     rt.install_virtual_clock();
     for _ in 0..3 {
@@ -9939,7 +9940,7 @@ fn workflow_outbox_pump_idle_budget_preserves_cursor_and_quiesces() {
 }
 
 #[test]
-fn workflow_outbox_pump_new_terminal_commit_wakes_idle_scan() {
+fn test_workflow_outbox_pump_new_terminal_commit_wakes_idle_scan() {
     let mut rt = Runtime::new();
     rt.install_virtual_clock();
     let (sender, receiver, behavior) = workflow_staging_fixture(&mut rt);
@@ -9970,7 +9971,7 @@ fn workflow_outbox_pump_new_terminal_commit_wakes_idle_scan() {
 }
 
 #[test]
-fn workflow_outbox_pump_deterministic_scheduler_uses_virtual_cooldown() {
+fn test_workflow_outbox_pump_deterministic_scheduler_uses_virtual_cooldown() {
     let mut rt = Runtime::new();
     rt.install_virtual_clock();
     let (sender, receiver, _, _, _) = dispatch_fixture(&mut rt);
@@ -9999,7 +10000,7 @@ fn workflow_outbox_pump_deterministic_scheduler_uses_virtual_cooldown() {
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn workflow_outbox_pump_restart_discovers_unadmitted_without_sender_residency() {
+fn test_workflow_outbox_pump_restart_discovers_unadmitted_without_sender_residency() {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -10049,7 +10050,7 @@ fn workflow_outbox_pump_restart_discovers_unadmitted_without_sender_residency() 
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn workflow_outbox_pump_failed_admission_does_not_starve_other_receivers() {
+fn test_workflow_outbox_pump_failed_admission_does_not_starve_other_receivers() {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -10105,7 +10106,7 @@ fn workflow_outbox_pump_failed_admission_does_not_starve_other_receivers() {
 }
 
 #[test]
-fn workflow_outbox_pump_unsupported_store_fails_closed() {
+fn test_workflow_outbox_pump_unsupported_store_fails_closed() {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -10136,7 +10137,7 @@ fn workflow_outbox_pump_unsupported_store_fails_closed() {
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn workflow_outbox_pump_scan_error_preserves_cursor_and_backs_off() {
+fn test_workflow_outbox_pump_scan_error_preserves_cursor_and_backs_off() {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -10189,7 +10190,7 @@ fn register_native_recovery_fixture(rt: &mut Runtime, revision: &str) {
 }
 
 #[test]
-fn workflow_supervised_recovery_memory_requires_exact_recipe_and_keeps_admission() {
+fn test_workflow_supervised_recovery_memory_requires_exact_recipe_and_keeps_admission() {
     let mut rt = Runtime::new();
     rt.install_virtual_clock();
     let (_, receiver, _, first, _) = dispatch_fixture(&mut rt);
@@ -10245,7 +10246,7 @@ fn workflow_supervised_recovery_memory_requires_exact_recipe_and_keeps_admission
 }
 
 #[test]
-fn workflow_supervised_recovery_scan_is_bounded_and_excludes_unbound_closed_actors() {
+fn test_workflow_supervised_recovery_scan_is_bounded_and_excludes_unbound_closed_actors() {
     let mut rt = Runtime::new();
     register_native_recovery_fixture(&mut rt, "v1");
     let (_, a, _, first, _) = dispatch_fixture(&mut rt);
@@ -10309,7 +10310,7 @@ fn workflow_supervised_recovery_scan_is_bounded_and_excludes_unbound_closed_acto
 }
 
 #[test]
-fn workflow_supervised_recovery_rejects_changed_layout_and_late_binding() {
+fn test_workflow_supervised_recovery_rejects_changed_layout_and_late_binding() {
     let mut rt = Runtime::new();
     register_native_recovery_fixture(&mut rt, "v1");
     let (_, receiver, _, first, _) = dispatch_fixture(&mut rt);
@@ -10339,7 +10340,7 @@ fn workflow_supervised_recovery_rejects_changed_layout_and_late_binding() {
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn workflow_supervised_recovery_terminal_failure_is_rate_limited_and_isolated() {
+fn test_workflow_supervised_recovery_terminal_failure_is_rate_limited_and_isolated() {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -10512,13 +10513,13 @@ fn assert_native_workflow_retry_budget(rt: &mut Runtime) {
 }
 
 #[test]
-fn workflow_native_retry_budget_is_fenced_and_scoped_to_activation_memory() {
+fn test_workflow_native_retry_budget_is_fenced_and_scoped_to_activation_memory() {
     assert_native_workflow_retry_budget(&mut Runtime::new());
 }
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn workflow_native_retry_budget_is_fenced_and_scoped_to_activation_sqlite() {
+fn test_workflow_native_retry_budget_is_fenced_and_scoped_to_activation_sqlite() {
     let mut rt = Runtime::new();
     rt.persistence = Box::new(LibsqlStore::in_memory().unwrap());
     assert_native_workflow_retry_budget(&mut rt);
@@ -10526,7 +10527,7 @@ fn workflow_native_retry_budget_is_fenced_and_scoped_to_activation_sqlite() {
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn workflow_native_retry_quarantine_survives_failure_restart_and_config_change() {
+fn test_workflow_native_retry_quarantine_survives_failure_restart_and_config_change() {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -10724,7 +10725,7 @@ fn workflow_native_retry_quarantine_survives_failure_restart_and_config_change()
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn workflow_native_retry_reservation_write_failure_never_runs_handler() {
+fn test_workflow_native_retry_reservation_write_failure_never_runs_handler() {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -10769,8 +10770,10 @@ fn workflow_native_retry_reservation_write_failure_never_runs_handler() {
 
 #[cfg(feature = "sqlite")]
 #[test]
-#[ignore = "child fixture invoked by workflow_native_retry_process_kill_after_reservation"]
-fn workflow_native_retry_process_kill_child() {
+fn test_workflow_native_retry_process_kill_child() {
+    if std::env::var_os("NULANG_RETRY_KILL_DB").is_none() {
+        return; // Parent-only crash fixture; ordinary test run is inert.
+    }
     let path = std::env::var("NULANG_RETRY_KILL_DB").unwrap();
     let mut rt = Runtime::new();
     rt.persistence = Box::new(LibsqlStore::new(path).unwrap());
@@ -10794,7 +10797,7 @@ fn workflow_native_retry_process_kill_child() {
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn workflow_native_retry_process_kill_after_reservation() {
+fn test_workflow_native_retry_process_kill_after_reservation() {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -10818,8 +10821,7 @@ fn workflow_native_retry_process_kill_after_reservation() {
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "runtime::tests::workflow_native_retry_process_kill_child",
-            "--ignored",
+            "runtime::tests::test_workflow_native_retry_process_kill_child",
             "--nocapture",
         ])
         .env("NULANG_RETRY_KILL_DB", &path)
@@ -11096,13 +11098,13 @@ fn assert_native_workflow_redrive(rt: &mut Runtime) {
 }
 
 #[test]
-fn workflow_native_redrive_requires_exact_exhausted_nonresident_command_memory() {
+fn test_workflow_native_redrive_requires_exact_exhausted_nonresident_command_memory() {
     assert_native_workflow_redrive(&mut Runtime::new());
 }
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn workflow_native_redrive_requires_exact_exhausted_nonresident_command_sqlite() {
+fn test_workflow_native_redrive_requires_exact_exhausted_nonresident_command_sqlite() {
     let mut rt = Runtime::new();
     rt.persistence = Box::new(LibsqlStore::in_memory().unwrap());
     assert_native_workflow_redrive(&mut rt);
@@ -11208,13 +11210,13 @@ fn assert_workflow_native_panic_contained(rt: &mut Runtime) {
 
 #[test]
 #[cfg(panic = "unwind")]
-fn workflow_native_panic_containment_memory() {
+fn test_workflow_native_panic_containment_memory() {
     assert_workflow_native_panic_contained(&mut Runtime::new());
 }
 
 #[test]
 #[cfg(all(feature = "sqlite", panic = "unwind"))]
-fn workflow_native_panic_containment_sqlite() {
+fn test_workflow_native_panic_containment_sqlite() {
     let mut rt = Runtime::new();
     rt.persistence = Box::new(LibsqlStore::in_memory().unwrap());
     assert_workflow_native_panic_contained(&mut rt);

@@ -379,7 +379,7 @@ fn execute_vm(
 }
 
 #[test]
-fn real_vm_retries_prepared_effect_after_store_reopen_with_same_provider_key() {
+fn test_real_vm_retries_prepared_effect_after_store_reopen_with_same_provider_key() {
     let db = TestDb::new();
     let provider = Rc::new(RefCell::new(Provider {
         lose_first_response: true,
@@ -452,7 +452,7 @@ fn real_vm_retries_prepared_effect_after_store_reopen_with_same_provider_key() {
 }
 
 #[test]
-fn vm_replay_rejects_revoked_grant_request_drift_and_missing_site() {
+fn test_vm_replay_rejects_revoked_grant_request_drift_and_missing_site() {
     let db = TestDb::new();
     let provider = Rc::new(RefCell::new(Provider::default()));
     let observed = Rc::new(RefCell::new(Vec::new()));
@@ -508,7 +508,7 @@ fn vm_replay_rejects_revoked_grant_request_drift_and_missing_site() {
 }
 
 #[test]
-fn vm_prepared_retry_rejects_stale_activation_after_new_owner_claims() {
+fn test_vm_prepared_retry_rejects_stale_activation_after_new_owner_claims() {
     let db = TestDb::new();
     let provider = Rc::new(RefCell::new(Provider {
         lose_first_response: true,
@@ -565,7 +565,7 @@ fn vm_prepared_retry_rejects_stale_activation_after_new_owner_claims() {
 }
 
 #[test]
-fn vm_invalid_text_receipt_fails_closed_and_never_redispatches() {
+fn test_vm_invalid_text_receipt_fails_closed_and_never_redispatches() {
     let db = TestDb::new();
     let provider = Rc::new(RefCell::new(Provider {
         invalid_utf8_response: true,
@@ -703,7 +703,7 @@ fn workflow_terminal_transition(
 }
 
 #[test]
-fn workflow_vm_occurrences_reconstruct_after_reopen_and_retry() {
+fn test_workflow_vm_occurrences_reconstruct_after_reopen_and_retry() {
     let db = TestDb::new();
     let activation = admit_command(&mut LibsqlStore::new(&db.path).unwrap());
     let provider = Rc::new(RefCell::new(Provider {
@@ -795,7 +795,7 @@ fn workflow_vm_occurrences_reconstruct_after_reopen_and_retry() {
 }
 
 #[test]
-fn workflow_cursor_rejects_unadmitted_wrong_actor_and_stale_owners() {
+fn test_workflow_cursor_rejects_unadmitted_wrong_actor_and_stale_owners() {
     let db = TestDb::new();
     let mut store = LibsqlStore::new(&db.path).unwrap();
     let module = workflow_module();
@@ -866,7 +866,7 @@ fn workflow_cursor_rejects_unadmitted_wrong_actor_and_stale_owners() {
 }
 
 #[test]
-fn workflow_cursor_pins_pending_request_and_separates_new_commands() {
+fn test_workflow_cursor_pins_pending_request_and_separates_new_commands() {
     let db = TestDb::new();
     let mut store = LibsqlStore::new(&db.path).unwrap();
     let module = workflow_module();
@@ -999,15 +999,14 @@ impl Drop for CrashWorker {
 }
 
 #[test]
-fn process_kill_after_provider_commit_restarts_vm_with_one_external_mutation() {
+fn test_process_kill_after_provider_commit_restarts_vm_with_one_external_mutation() {
     let db = TestDb::new();
     let receipt_path = db.dir.join("provider-receipt");
     let ready_path = db.dir.join("provider-ready");
     let mut child = CrashWorker(
         Command::new(std::env::current_exe().expect("integration test binary"))
             .arg("--exact")
-            .arg("durable_vm_crash_fixture_child")
-            .arg("--ignored")
+            .arg("test_durable_vm_crash_fixture_child")
             .arg("--nocapture")
             .env("NULANG_VM_BRIDGE_DB_PATH", &db.path)
             .env("NULANG_VM_BRIDGE_PROVIDER_PATH", &receipt_path)
@@ -1102,8 +1101,10 @@ fn process_kill_after_provider_commit_restarts_vm_with_one_external_mutation() {
 }
 
 #[test]
-#[ignore = "subprocess crash fixture; invoked only by the parent test"]
-fn durable_vm_crash_fixture_child() {
+fn test_durable_vm_crash_fixture_child() {
+    if std::env::var_os("NULANG_VM_BRIDGE_DB_PATH").is_none() {
+        return; // Parent-only crash fixture; ordinary test run is inert.
+    }
     let db = TestDb::from_existing(PathBuf::from(
         std::env::var_os("NULANG_VM_BRIDGE_DB_PATH").expect("parent db path"),
     ));
@@ -1121,7 +1122,7 @@ fn durable_vm_crash_fixture_child() {
 }
 
 #[test]
-fn workflow_later_occurrence_recovers_after_new_owner_claim() {
+fn test_workflow_later_occurrence_recovers_after_new_owner_claim() {
     let db = TestDb::new();
     let mut store = LibsqlStore::new(&db.path).unwrap();
     let module = workflow_module();
@@ -1272,7 +1273,7 @@ fn workflow_later_occurrence_recovers_after_new_owner_claim() {
 }
 
 #[test]
-fn workflow_restart_rejects_changed_site_before_provider_and_replays_original_slot() {
+fn test_workflow_restart_rejects_changed_site_before_provider_and_replays_original_slot() {
     let db = TestDb::new();
     let mut store = LibsqlStore::new(&db.path).unwrap();
     let module = workflow_module();
@@ -1407,7 +1408,7 @@ fn workflow_restart_rejects_changed_site_before_provider_and_replays_original_sl
 }
 
 #[test]
-fn workflow_adapter_requires_proven_open_admission_after_restart() {
+fn test_workflow_adapter_requires_proven_open_admission_after_restart() {
     let db = TestDb::new();
     let module = workflow_module();
     let pc = module.effect_sites[0].pc;
@@ -1446,7 +1447,7 @@ fn workflow_adapter_requires_proven_open_admission_after_restart() {
 }
 
 #[test]
-fn workflow_closed_admission_rejects_completed_receipt_on_fresh_actor() {
+fn test_workflow_closed_admission_rejects_completed_receipt_on_fresh_actor() {
     let db = TestDb::new();
     let module = workflow_module();
     let pc = module.effect_sites[0].pc;
@@ -1517,7 +1518,7 @@ fn workflow_closed_admission_rejects_completed_receipt_on_fresh_actor() {
 }
 
 #[test]
-fn workflow_invalid_completed_text_cannot_produce_terminal_cursor() {
+fn test_workflow_invalid_completed_text_cannot_produce_terminal_cursor() {
     let db = TestDb::new();
     let activation = admit_command(&mut LibsqlStore::new(&db.path).unwrap());
     let provider = Rc::new(RefCell::new(Provider {
