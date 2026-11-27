@@ -1,4 +1,19 @@
 # Nulang Changelog
+### RESP cache reference-server parity — 2026-11-27
+- **Match canonical integer validation, overflow responses and nearest-second TTL rounding** for the supported RESP subset. Always-on regressions and an explicit reference-server example avoid ignored tests.
+
+### Shared RESP reactor buffer admission — 2026-11-27
+- **Reserve retained connection vector capacity before growth**, with a shared optional cross-reactor byte budget and RAII release. Preflight conservative reply size before execution and avoid a synchronous response scratch copy. Close on budget exhaustion; this is not a full-process RSS cap.
+
+### RESP cache admission limits — 2026-11-27
+- **Bound physical entries and initialized arena extent per shard**, with fallible cache writes and RESP OOM errors. Preflight whole MSET batches before mutation; expose estimated retained allocation capacity separately. Default limits are one million entries and 256 MiB of arena extent; these are not process RSS caps.
+
+### Cancellable RESP expiration records — 2026-11-27
+- **Unlink prior TTL records in constant time** on refresh, persistent overwrite, deletion and lazy expiry using slot-indexed FIFO handles. Preserve bounded sweeps and safe slot reuse. Metadata capacity remains tied to the slot high-water mark; this is not a total memory cap.
+
+### Bounded RESP cache expiration sweeps — 2026-11-27
+- **Bound inspected expiration candidates per sweep**, including stale and future records. Preserve partially drained buckets across clock advances and rotate between eligible buckets; zero budget does no work. This does not yet cap total TTL metadata or wall-clock latency.
+
 ### Per-priority scheduler runnable backlog diagnostics — 2026-11-20
 - **Expose approximate queued High, Normal, and Low runnable task counts** in the existing scheduler metrics snapshot, including global injector and worker-local queues, without adding counters to scheduling hot paths.
 - **Regression tests cover mixed priority queues, dequeues, and metrics-counter reset.** Queue depths are sampled non-atomically for diagnostics only; they are not admission, fairness, or backpressure guarantees.

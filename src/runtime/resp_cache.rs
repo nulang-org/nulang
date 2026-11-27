@@ -15,6 +15,7 @@ const ERR_INTEGER: &[u8] = b"ERR value is not an integer or out of range";
 const ERR_SYNTAX: &[u8] = b"ERR syntax error";
 const ERR_SET_EXPIRE: &[u8] = b"ERR invalid expire time in 'set' command";
 const ERR_CROSS_SLOT: &[u8] = b"CROSSSLOT Keys in request don't hash to the same slot";
+const ERR_OOM: &[u8] = b"OOM cache admission limit exceeded";
 const ERR_UNKNOWN: &[u8] = b"ERR unknown command";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,7 +91,7 @@ pub fn command_slot(command: RespCommand<'_>) -> RespCommandSlot {
     }
 
     if name.eq_ignore_ascii_case(b"MSET") {
-        return if command.argc() == 0 || command.argc() % 2 != 0 {
+        return if command.argc() == 0 || !command.argc().is_multiple_of(2) {
             RespCommandSlot::Unkeyed
         } else {
             route_key_value_args(command.args())
@@ -221,8 +222,10 @@ fn execute_set(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, ou
         None
     };
 
-    store.set_bytes(key, value, ttl_ms, now_ms);
-    write_simple(out, b"OK");
+    match store.set_bytes(key, value, ttl_ms, now_ms) {
+        Ok(()) => write_simple(out, b"OK"),
+        Err(_) => write_error(out, ERR_OOM),
+    }
 }
 
 fn execute_del(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
@@ -277,8 +280,10 @@ fn execute_incr(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, o
     let key = command.args().next().expect("validated argument");
     match store.increment(key, 1, now_ms) {
         Ok(value) => write_integer(out, value),
-        Err(CacheIncrementError::NotInteger | CacheIncrementError::Overflow) => {
-            write_error(out, ERR_INTEGER)
+        Err(CacheIncrementError::Admission(_)) => write_error(out, ERR_OOM),
+        Err(CacheIncrementError::NotInteger) => write_error(out, ERR_INTEGER),
+        Err(CacheIncrementError::Overflow) => {
+            write_error(out, b"ERR increment or decrement would overflow")
         }
     }
 }
@@ -323,7 +328,8 @@ fn execute_ttl(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, ou
     let ttl = match store.ttl(key, now_ms) {
         CacheTtl::Missing => -2,
         CacheTtl::Persistent => -1,
-        CacheTtl::RemainingMs(ms) => (ms / 1_000) as i64,
+        // Redis rounds to the nearest second. Divide first to avoid overflow.
+        CacheTtl::RemainingMs(ms) => (ms / 1_000 + u64::from(ms % 1_000 >= 500)) as i64,
     };
     write_integer(out, ttl);
 }
@@ -345,7 +351,7 @@ fn execute_mget(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, o
 }
 
 fn execute_mset(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
-    if command.argc() == 0 || command.argc() % 2 != 0 {
+    if command.argc() == 0 || !command.argc().is_multiple_of(2) {
         wrong_arity(out, b"mset");
         return;
     }
@@ -358,11 +364,14 @@ fn execute_mset(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, o
     // all keys have passed the slot check, these writes are atomic with respect
     // to other commands on this shard.
     let mut args = command.args();
+    let mut pairs = Vec::new();
     while let Some(key) = args.next() {
-        let value = args.next().expect("validated value pair");
-        store.set_bytes(key, value, None, now_ms);
+        pairs.push((key, args.next().expect("validated value pair")));
     }
-    write_simple(out, b"OK");
+    match store.set_batch(&pairs, now_ms) {
+        Ok(()) => write_simple(out, b"OK"),
+        Err(_) => write_error(out, ERR_OOM),
+    }
 }
 
 fn write_value(value: Option<CacheValueView<'_>>, out: &mut Vec<u8>) {
@@ -561,5 +570,72 @@ mod tests {
             .unwrap();
         assert_eq!(consumed, first.len());
         assert_eq!(out, b"+PONG\r\n");
+    }
+
+    #[test]
+    fn admission_rejects_set_and_incr_without_mutating_existing_keys() {
+        let mut store = CacheStore::with_limits(super::super::cache::CacheLimits {
+            max_entries: 1,
+            max_arena_bytes: 32,
+        });
+        let large = vec![b'x'; 32];
+        let cmd = |args: &[&[u8]]| {
+            let mut wire = format!("*{}\r\n", args.len()).into_bytes();
+            for arg in args {
+                wire.extend_from_slice(format!("{}{}\r\n", '$', arg.len()).as_bytes());
+                wire.extend_from_slice(arg);
+                wire.extend_from_slice(b"\r\n");
+            }
+            wire
+        };
+        assert_eq!(
+            run(&mut store, &cmd(&[b"SET", b"a", b"old"]), 0),
+            b"+OK\r\n"
+        );
+        assert!(run(&mut store, &cmd(&[b"SET", b"b", b"v"]), 0).starts_with(b"-OOM "));
+        assert!(run(&mut store, &cmd(&[b"INCR", b"b"]), 0).starts_with(b"-OOM "));
+        assert_eq!(
+            run(&mut store, &cmd(&[b"SET", b"a", &large]), 0),
+            b"+OK\r\n"
+        );
+        assert!(run(&mut store, &cmd(&[b"SET", b"a", &[b'y'; 33]]), 0).starts_with(b"-OOM "));
+        assert_eq!(store.get(b"a", 0), Some(CacheValueView::Bytes(&large)));
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.memory_stats().arena_reserved_bytes, 32);
+        assert!(store.delete(b"a"));
+        assert_eq!(
+            run(&mut store, &cmd(&[b"SET", b"b", &large]), 0),
+            b"+OK\r\n"
+        );
+    }
+
+    #[test]
+    fn admission_rejects_whole_mset_before_mutation() {
+        let mut store = CacheStore::with_limits(super::super::cache::CacheLimits {
+            max_entries: 1,
+            max_arena_bytes: 32,
+        });
+        run(
+            &mut store,
+            b"*3\r\n$3\r\nSET\r\n$4\r\na{t}\r\n$3\r\nold\r\n",
+            0,
+        );
+        assert!(run(
+            &mut store,
+            b"*5\r\n$4\r\nMSET\r\n$4\r\na{t}\r\n$1\r\nx\r\n$4\r\nb{t}\r\n$1\r\ny\r\n",
+            0
+        )
+        .starts_with(b"-OOM "));
+        assert_eq!(store.get(b"a{t}", 0), Some(CacheValueView::Bytes(b"old")));
+        assert_eq!(store.len(), 1);
+        assert_eq!(
+            run(
+                &mut store,
+                b"*5\r\n$4\r\nMSET\r\n$4\r\na{t}\r\n$1\r\nx\r\n$4\r\na{t}\r\n$1\r\ny\r\n",
+                0
+            ),
+            b"+OK\r\n"
+        );
+        assert_eq!(store.get(b"a{t}", 0), Some(CacheValueView::Bytes(b"y")));
     }
 }

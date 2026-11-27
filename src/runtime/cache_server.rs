@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,17 +20,110 @@ use mio::{Events, Interest, Poll, Token, Waker};
 use super::cache::CacheStore;
 use super::cache_cluster::CacheRoutingMode;
 use super::cache_dispatch::{
-    CacheDispatchConfigError, CacheDispatchWake, CacheDispatcher, CacheShardInbox,
+    CacheDispatchConfigError, CacheDispatchOutcome, CacheDispatchWake, CacheDispatcher,
+    CacheShardInbox,
 };
-use super::cache_pipeline::{CachePipelineError, CacheResponsePipeline};
+use super::resp::parse_command;
 
 const LISTENER_TOKEN: Token = Token(0);
 const WAKE_TOKEN: Token = Token(1);
 const FIRST_CONNECTION_TOKEN: usize = 2;
 
+/// Shared limit on retained connection input/output vector capacity.
+/// Clone this budget into multiple shard reactors to share one process allowance.
+#[derive(Debug, Clone)]
+pub struct CacheBufferBudget {
+    inner: Arc<BufferBudgetInner>,
+}
+#[derive(Debug)]
+struct BufferBudgetInner {
+    limit: usize,
+    used: AtomicUsize,
+}
+impl CacheBufferBudget {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            inner: Arc::new(BufferBudgetInner {
+                limit,
+                used: AtomicUsize::new(0),
+            }),
+        }
+    }
+    pub fn used_bytes(&self) -> usize {
+        self.inner.used.load(Ordering::Acquire)
+    }
+    fn acquire(&self, amount: usize) -> bool {
+        self.inner
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(amount)
+                    .filter(|next| *next <= self.inner.limit)
+            })
+            .is_ok()
+    }
+    fn lease(&self) -> BufferLease {
+        BufferLease {
+            budget: self.clone(),
+            charged: 0,
+        }
+    }
+}
+struct BufferLease {
+    budget: CacheBufferBudget,
+    charged: usize,
+}
+impl BufferLease {
+    fn reserve(&mut self, buffer: &mut Vec<u8>, required: usize, max: usize) -> io::Result<()> {
+        let denied = || {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "cache connection buffer budget exceeded",
+            )
+        };
+        if required > max {
+            return Err(denied());
+        }
+        let old = buffer.capacity();
+        if required <= old {
+            return Ok(());
+        }
+        let preferred = required.max(old.saturating_mul(2)).max(4096).min(max);
+        let target = if self.budget.acquire(preferred - old) {
+            preferred
+        } else if self.budget.acquire(required - old) {
+            required
+        } else {
+            return Err(denied());
+        };
+        self.charged += target - old;
+        if buffer.try_reserve_exact(target - buffer.len()).is_err() {
+            return Err(denied());
+        }
+        // Vec may report more capacity than requested. Fail closed if the
+        // allocator's additional capacity cannot be charged.
+        let extra = buffer.capacity().saturating_sub(target);
+        if extra != 0 {
+            if !self.budget.acquire(extra) {
+                return Err(denied());
+            }
+            self.charged += extra;
+        }
+        Ok(())
+    }
+}
+impl Drop for BufferLease {
+    fn drop(&mut self) {
+        self.budget
+            .inner
+            .used
+            .fetch_sub(self.charged, Ordering::AcqRel);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CacheServerConfig {
     pub max_connections: usize,
+    pub max_total_connection_bytes: usize,
     pub max_input_buffer: usize,
     pub max_output_buffer: usize,
     pub max_pipeline_depth: usize,
@@ -44,6 +137,7 @@ impl Default for CacheServerConfig {
     fn default() -> Self {
         Self {
             max_connections: 16_384,
+            max_total_connection_bytes: 256 * 1024 * 1024,
             max_input_buffer: 1024 * 1024,
             max_output_buffer: 8 * 1024 * 1024,
             max_pipeline_depth: 1024,
@@ -132,19 +226,19 @@ struct CacheConnection {
     input_start: usize,
     output: Vec<u8>,
     output_start: usize,
-    pipeline: CacheResponsePipeline,
+    lease: BufferLease,
     writable_interest: bool,
 }
 
 impl CacheConnection {
-    fn new(stream: TcpStream, max_pipeline_depth: usize) -> Self {
+    fn new(stream: TcpStream, lease: BufferLease) -> Self {
         Self {
             stream,
-            input: Vec::with_capacity(4096),
+            input: Vec::new(),
             input_start: 0,
-            output: Vec::with_capacity(4096),
+            output: Vec::new(),
             output_start: 0,
-            pipeline: CacheResponsePipeline::new(max_pipeline_depth),
+            lease,
             writable_interest: false,
         }
     }
@@ -207,6 +301,7 @@ pub struct CacheShardServer {
     connections: HashMap<Token, CacheConnection>,
     next_connection_token: usize,
     config: CacheServerConfig,
+    buffer_budget: CacheBufferBudget,
     clock: CacheServerClock,
     shutdown: Arc<AtomicBool>,
     waker: Arc<Waker>,
@@ -222,7 +317,26 @@ impl CacheShardServer {
         config: CacheServerConfig,
         clock: CacheServerClock,
     ) -> Result<Self, CacheServerError> {
+        let budget = CacheBufferBudget::new(config.max_total_connection_bytes);
+        Self::bind_with_budget(bind_addr, dispatcher, inbox, store, config, clock, budget)
+    }
+
+    /// Bind a shard using a budget shared by all participating reactors.
+    pub fn bind_with_budget(
+        bind_addr: SocketAddr,
+        dispatcher: CacheDispatcher,
+        inbox: CacheShardInbox,
+        store: CacheStore,
+        config: CacheServerConfig,
+        clock: CacheServerClock,
+        buffer_budget: CacheBufferBudget,
+    ) -> Result<Self, CacheServerError> {
         validate_config(&config)?;
+        if buffer_budget.inner.limit == 0 {
+            return Err(CacheServerError::InvalidConfig(
+                "shared connection byte budget must be non-zero",
+            ));
+        }
         if dispatcher.routing_mode() != CacheRoutingMode::Redirect {
             return Err(CacheServerError::RedirectModeRequired);
         }
@@ -257,6 +371,7 @@ impl CacheShardServer {
             connections: HashMap::new(),
             next_connection_token: FIRST_CONNECTION_TOKEN,
             config,
+            buffer_budget,
             clock,
             shutdown,
             waker,
@@ -362,7 +477,7 @@ impl CacheShardServer {
                         .register(&mut stream, token, Interest::READABLE)?;
                     self.connections.insert(
                         token,
-                        CacheConnection::new(stream, self.config.max_pipeline_depth),
+                        CacheConnection::new(stream, self.buffer_budget.lease()),
                     );
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
@@ -419,14 +534,6 @@ impl CacheShardServer {
         readable: bool,
         writable: bool,
     ) -> Result<(), ConnectionAction> {
-        if connection
-            .pipeline
-            .drain_ready(&mut connection.output)
-            .is_err()
-        {
-            return Err(ConnectionAction::Close);
-        }
-
         if readable && self.read_connection(connection).is_err() {
             return Err(ConnectionAction::Close);
         }
@@ -473,6 +580,20 @@ impl CacheShardServer {
                             "cache input buffer limit exceeded",
                         ));
                     }
+                    // Compact consumed bytes before reserving the next extent.
+                    if connection.input_start != 0 {
+                        connection.input.copy_within(connection.input_start.., 0);
+                        connection
+                            .input
+                            .truncate(connection.input.len() - connection.input_start);
+                        connection.input_start = 0;
+                    }
+                    let required = connection.input.len().saturating_add(read);
+                    connection.lease.reserve(
+                        &mut connection.input,
+                        required,
+                        self.config.max_input_buffer,
+                    )?;
                     connection.input.extend_from_slice(&scratch[..read]);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
@@ -481,42 +602,55 @@ impl CacheShardServer {
         }
     }
 
-    fn process_input(
-        &mut self,
-        connection: &mut CacheConnection,
-    ) -> Result<(), CachePipelineError> {
+    fn process_input(&mut self, connection: &mut CacheConnection) -> Result<(), ConnectionAction> {
         loop {
             if connection.input_start == connection.input.len() {
                 connection.compact_input();
                 return Ok(());
             }
-
             let input = &connection.input[connection.input_start..];
-            let Some(submit) = connection.pipeline.submit_frame(
-                &self.dispatcher,
-                &mut self.store,
-                input,
-                self.clock.now_ms(),
-                &mut connection.output,
-            )?
+            let Some((command, consumed)) =
+                parse_command(input).map_err(|_| ConnectionAction::Close)?
             else {
                 connection.compact_input();
                 return Ok(());
             };
-
-            if submit.remote.is_some() {
-                return Err(CachePipelineError::Dispatch(
-                    super::cache_dispatch::CacheDispatchError::QueueDisconnected(
-                        self.dispatcher.local_shard(),
-                    ),
-                ));
+            let now = self.clock.now_ms();
+            let bound = self
+                .dispatcher
+                .redirect_reply_bound(&self.store, command, now);
+            // The redirect-only server never queues asynchronous replies.
+            // Compact already sent bytes and reserve before executing, avoiding
+            // the response pipeline's second copy and large MGET amplification.
+            if connection.output_start != 0 {
+                connection.output.copy_within(connection.output_start.., 0);
+                connection
+                    .output
+                    .truncate(connection.output.len() - connection.output_start);
+                connection.output_start = 0;
             }
-
-            connection.input_start += submit.consumed;
-            if connection.pending_output() > self.config.max_output_buffer {
-                connection.compact_input();
-                return Ok(());
+            let required = connection.output.len().saturating_add(bound);
+            connection
+                .lease
+                .reserve(
+                    &mut connection.output,
+                    required,
+                    self.config.max_output_buffer,
+                )
+                .map_err(|_| ConnectionAction::Close)?;
+            let outcome = self
+                .dispatcher
+                .dispatch_frame(&mut self.store, input, now, &mut connection.output)
+                .map_err(|_| ConnectionAction::Close)?;
+            match outcome {
+                Some(CacheDispatchOutcome::Executed { consumed: actual })
+                | Some(CacheDispatchOutcome::Redirected {
+                    consumed: actual, ..
+                }) if actual == consumed => {}
+                _ => return Err(ConnectionAction::Close),
             }
+            debug_assert!(connection.output.len() <= required);
+            connection.input_start += consumed;
         }
     }
 
@@ -594,6 +728,11 @@ enum ConnectionAction {
 }
 
 fn validate_config(config: &CacheServerConfig) -> Result<(), CacheServerError> {
+    if config.max_total_connection_bytes == 0 {
+        return Err(CacheServerError::InvalidConfig(
+            "max_total_connection_bytes must be non-zero",
+        ));
+    }
     if config.max_connections == 0 {
         return Err(CacheServerError::InvalidConfig(
             "max_connections must be non-zero",
@@ -711,7 +850,10 @@ mod tests {
     fn idle_reactor_purges_expired_values() {
         let mut server = build_server();
         let now = server.clock.now_ms();
-        server.store_mut().set_bytes(b"ttl", b"value", Some(1), now);
+        server
+            .store_mut()
+            .set_bytes(b"ttl", b"value", Some(1), now)
+            .unwrap();
 
         std::thread::sleep(Duration::from_millis(3));
         server.poll_once(Some(Duration::from_millis(1))).unwrap();
@@ -739,5 +881,92 @@ mod tests {
             result,
             Err(CacheServerError::RedirectModeRequired)
         ));
+    }
+
+    #[test]
+    fn shared_buffer_budget_rejects_growth_and_recovers_on_drop() {
+        let budget = CacheBufferBudget::new(64);
+        let mut a = budget.lease();
+        let mut b = budget.lease();
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        a.reserve(&mut first, 40, 64).unwrap();
+        assert!(b.reserve(&mut second, 40, 64).is_err());
+        assert_eq!(second.capacity(), 0);
+        assert_eq!(budget.used_bytes(), first.capacity());
+        drop(first);
+        drop(a);
+        b.reserve(&mut second, 40, 64).unwrap();
+        assert_eq!(budget.used_bytes(), second.capacity());
+    }
+
+    #[test]
+    fn repeated_large_mget_is_rejected_before_reply_allocation() {
+        let mut server = build_server();
+        server.config.max_output_buffer = 256;
+        server
+            .store_mut()
+            .set_bytes(b"k", &[b'x'; 120], None, 0)
+            .unwrap();
+        let mut client = StdTcpStream::connect(server.local_addr().unwrap()).unwrap();
+        client
+            .write_all(b"*4\r\n$4\r\nMGET\r\n$1\r\nk\r\n$1\r\nk\r\n$1\r\nk\r\n")
+            .unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        assert_eq!(server.connection_count(), 0);
+        assert_eq!(server.buffer_budget.used_bytes(), 0);
+        assert!(server.store_mut().exists(b"k", 0));
+    }
+
+    #[test]
+    fn network_clients_share_budget_and_disconnect_releases_capacity() {
+        let mut server = build_server();
+        server.config.max_input_buffer = 256;
+        server.config.max_output_buffer = 256;
+        server.buffer_budget = CacheBufferBudget::new(512);
+        let addr = server.local_addr().unwrap();
+        let ping = b"*1\r\n$4\r\nPING\r\n";
+        let mut first = StdTcpStream::connect(addr).unwrap();
+        first
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        first.write_all(ping).unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        let mut response = [0; 7];
+        first.read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"+PONG\r\n");
+        assert_eq!(server.buffer_budget.used_bytes(), 512);
+
+        let mut second = StdTcpStream::connect(addr).unwrap();
+        second.write_all(ping).unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        assert_eq!(server.connection_count(), 1);
+        assert_eq!(server.buffer_budget.used_bytes(), 512);
+        drop(first);
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        assert_eq!(server.connection_count(), 0);
+        assert_eq!(server.buffer_budget.used_bytes(), 0);
+        let mut third = StdTcpStream::connect(addr).unwrap();
+        third
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        third.write_all(&ping[..5]).unwrap();
+        for _ in 0..4 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        third.write_all(&ping[5..]).unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        third.read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"+PONG\r\n");
     }
 }
