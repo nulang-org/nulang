@@ -310,3 +310,57 @@ fn failed_write_requires_reconciliation_before_retry() {
     drop(recovered);
     cleanup(&path);
 }
+
+#[test]
+fn checkpoint_faults_preserve_history_and_writer_fence() {
+    use StorageInterruptionPoint::*;
+    let faults = [
+        CheckpointAfterTempWrite,
+        CheckpointAfterTempSync,
+        CheckpointAfterRename,
+        CheckpointAfterDirectorySync,
+        WalReclaimAfterReplacementWrite,
+        WalReclaimAfterReplacementSync,
+        WalReclaimAfterRename,
+        WalReclaimAfterDirectorySync,
+    ];
+    for seed in [0xfeed_u64, 0xdecaf] {
+        let path = temp_wal("fenced_checkpoint");
+        let mut rng = Seeded(seed);
+        let mut reference = Reference::default();
+        let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
+        for (step, point) in faults.into_iter().enumerate() {
+            for batch in 0..4 {
+                let mutations = rng.mutations(seed, step * 4 + batch);
+                let write = tablet
+                    .prepare_write(EPOCH, reference.sequence, mutations.clone())
+                    .unwrap();
+                reference.apply(&mutations);
+                assert_eq!(tablet.commit(write).unwrap(), reference.sequence);
+            }
+            assert!(
+                with_interruption(point, || tablet.checkpoint()).is_err(),
+                "seed={seed:#x}, step={step}: {point:?} did not interrupt"
+            );
+            assert_eq!(
+                WalBackedTablet::open(descriptor(), &path).unwrap_err(),
+                WalBackedError::Wal(WalError::WriterLocked),
+                "seed={seed:#x}, step={step}: {point:?} released writer fence"
+            );
+            assert_matches_reference(&tablet, &reference, seed, step);
+            drop(tablet);
+            tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
+            assert_matches_reference(&tablet, &reference, seed, step);
+        }
+        tablet.checkpoint().unwrap();
+        drop(tablet);
+        let reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
+        assert_matches_reference(&reopened, &reference, seed, faults.len());
+        drop(reopened);
+        cleanup(&path);
+        // Unique fixture path, no live owners remain.
+        let mut lock = path.into_os_string();
+        lock.push(".lock");
+        fs::remove_file(PathBuf::from(lock)).unwrap();
+    }
+}
