@@ -7,7 +7,7 @@ mod unix {
         cache_routing::CacheSlotMap,
         cache_server::{
             AutomaticCheckpointConfig, CacheDurableConfig, CacheMutualTls, CacheServerClock,
-            CacheServerConfig, CacheShardServer,
+            CacheServerConfig, CacheShardServer, TLS_RESERVATION_BYTES,
         },
         cache_wal::{WalLimits, WalSync},
     };
@@ -152,6 +152,11 @@ Durable modes require a private journal path. Memory mode is the default.";
                 .count();
             if tls_count != 0 && tls_count != 3 {
                 return Err("all three TLS paths are required".into());
+            }
+            if tls_count == 3 && config.server.max_total_connection_bytes <= TLS_RESERVATION_BYTES {
+                return Err(
+                    "TLS requires a connection byte budget greater than 524288 bytes".into(),
+                );
             }
             if config.bind.port() == 0 || (!config.bind.ip().is_loopback() && tls_count != 3) {
                 return Err("non-loopback bind requires mutual TLS and a nonzero port".into());
@@ -453,6 +458,33 @@ Durable modes require a private journal path. Memory mode is the default.";
             .unwrap()
             .bind()
             .is_err());
+        }
+
+        #[test]
+        fn tls_budget_requires_headroom_but_plaintext_can_use_small_budget() {
+            assert!(parse(&["--max-connection-bytes", "4096"]).is_ok());
+            assert!(parse(&[
+                "--tls-ca",
+                "ca.pem",
+                "--tls-cert",
+                "server.pem",
+                "--tls-key",
+                "server.key",
+                "--max-connection-bytes",
+                "524288"
+            ])
+            .is_err());
+            assert!(parse(&[
+                "--tls-ca",
+                "ca.pem",
+                "--tls-cert",
+                "server.pem",
+                "--tls-key",
+                "server.key",
+                "--max-connection-bytes",
+                "1048576"
+            ])
+            .is_ok());
         }
 
         #[test]

@@ -572,9 +572,9 @@ The mio reactor handles encrypted reads and writes nonblockingly and
 accounts for pending encrypted output when choosing writable readiness
 and draining shutdown replies. TLS mode has at most 256 connections (or
 the lower configured limit), a 10-second handshake deadline checked by
-the reactor, and a 64 KiB rustls send-buffer target. TLS state, handshake
-allocations and kernel buffers are additional to the RESP vector budget;
-this is not an RSS guarantee. Socket close does not guarantee delivery
+the reactor, and a 64 KiB rustls send-buffer target. TLS session state carries a fixed admission reservation in the shared
+connection budget (see below); actual allocations and kernel buffers are
+not measured by that reservation. This is not an RSS guarantee. Socket close does not guarantee delivery
 of pending replies or a TLS close-notify exchange.
 
 The loopback process test generates a private CA and certificates,
@@ -656,3 +656,43 @@ synchronous journal/clock writes, checkpointing, and a large ready set
 can still consume significant wall time. Sustained connection-flood
 availability, per-peer quotas, FD exhaustion, aggregate TLS memory and
 WAN tail-latency benchmarks are separate gates.
+
+
+## Shared TLS admission accounting
+
+Each admitted TLS connection reserves 512 KiB against the same shared
+connection admission budget that accounts for retained RESP input/output
+vector capacity. Reserve before constructing the Rustls session, including
+for connections that have not sent a ClientHello. The reservation remains
+charged for the connection's entire lifetime, even when its RESP vectors
+are empty, and is released after session destruction. Rejected admission
+closes the new socket without constructing a TLS session.
+
+The 512 KiB charge is a conservative sizing policy for modeled Rustls
+record buffers, handshake state and overhead; it is not a measurement or
+proven upper bound on TLS heap allocations. Rustls's 64 KiB send-buffer
+target remains in effect. Shared TLS configuration, certificate processing,
+allocator overhead, temporary allocations and kernel socket buffers can
+consume additional memory. Use OS-level process/container memory limits
+and benchmark real workloads before production deployment.
+
+With the default 256 MiB shared budget and 256 TLS connection cap,
+256 admitted TLS connections reserve 128 MiB, leaving 128 MiB for
+RESP vector charges. Actual admission may be lower if RESP allocations
+consume the shared budget. The embedded budget can be shared across
+shards. The CLI --max-connection-bytes option includes both charges in
+TLS mode; TLS configuration requires a budget greater than a single
+512 KiB reservation, and practical deployments require additional
+application headroom. Plaintext accounting is unchanged.
+
+CacheBufferBudget::used_bytes includes both charges; limit_bytes returns
+the configured shared limit. CacheShardServer::tls_reserved_bytes reports
+the modeled reservation for that shard. This is a per-shard snapshot,
+not a separate actual-RSS metric. No TLS reservation is released during
+idle RESP vector reclamation.
+
+Tests exercise shared two-reactor admission, eight concurrent reservation
+attempts competing for three slots, invalid handshakes, timeout,
+disconnect, zero-deadline shutdown, insufficient configuration and idle
+vector reclamation. Actual TLS allocator profiling, per-peer limits and
+file descriptor exhaustion remain separate qualification tasks.
