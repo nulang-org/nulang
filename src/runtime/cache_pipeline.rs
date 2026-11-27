@@ -507,7 +507,9 @@ mod tests {
         let mut pipeline = CacheResponsePipeline::with_limits(16, 8);
         let mut ingress_store = CacheStore::new();
         let mut owner_store = CacheStore::new();
-        owner_store.set_bytes(&local_key, b"0123456789abcdef", None, 0);
+        owner_store
+            .set_bytes(&local_key, b"0123456789abcdef", None, 0)
+            .unwrap();
         let mut socket_out = Vec::new();
 
         let remote_get = frame(&[b"GET", remote_key]);

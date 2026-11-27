@@ -1,7 +1,85 @@
 # Nulang Changelog
+### Fabric mutual TLS authentication — 2026-11-27
+- **Add explicit mutual TLS using existing Rustls and private CA material** with mandatory client certificates, no early data or session resumption, bounded connection count and handshake deadline, nonblocking encrypted reactor I/O, and encrypted output draining. Standalone remote binds require complete TLS configuration; plaintext remains loopback-only. Qualify against the audited dependency baseline before remote deployment.
+
+### Durable TTL clock regression guard — 2026-11-27
+- **Fail closed on recovery behind a persisted clock observation**, using a checksummed independently synchronized clock sidecar and stable-lock initialization marker; guard TTL observations and expiry sweeps without consuming journal capacity. Propagate fallible RESP reads and stop the shard on clock publication failure. Check the graceful drain deadline between socket writes.
+
+### Fabric graceful shutdown — 2026-11-27
+- **Handle SIGTERM and SIGINT in the standalone Unix server with synchronous signal waiting**, close listener admission, drain encoded replies to a configurable deadline, discard unexecuted input, release connection reservations, and synchronize durable journals before a successful exit. Sync errors poison the journal. Add real process and reactor regressions.
+
+### Automatic Fabric checkpoint maintenance — 2026-11-27
+- **Schedule durable journal compaction at configurable utilization thresholds**, with live-snapshot size preflight, ineffective/error retry cooldown, reactor maintenance counters, and default-on standalone durable operation. Verify 100 pipelined writes through a 1 KiB journal and process restart.
+
+### Standalone Fabric server — 2026-11-27
+- **Add a feature-gated Unix-only single-shard RESP executable** with loopback-only binding, explicit memory/buffered/synchronized journal modes, validated memory/journal limits and process-level restart regressions.
+### Fabric and audited runtime integration — 2026-11-27
+- **Qualify the combined Fabric durability and security integration branches** without weakening dependency auditing, preserving both changelog histories and patched local SQLite and HTTPS-only remote libSQL support.
+
+### Fabric durability integration qualification — 2026-11-27
+- **Exercise memory and durable RESP parity across 768 deterministic operations and 21 checkpoint/reopen cycles**, and explicitly run the feature-gated RESP suite in CI. The complete durability stack targets main without dependency changes.
+
+### Atomic durable cache checkpoints — 2026-11-27
+- **Compact durable cache history using an atomically published, checksummed checkpoint journal** with a mandatory snapshot prefix, monotonic sequence continuation, stable writer lock, preserved TTLs, and fail-stop on ambiguous publication. Explicit native and reactor maintenance APIs reclaim journal capacity without cloning live values.
+
+### Optional durable RESP reactor — 2026-11-27
+- **Integrate memory, buffered journal and synchronized journal backends** with shared RESP validation, restart recovery, bounded response allocation, and shard-wide fail-stop after ambiguous journal failure. Durable mode is Unix-only and opt-in; direct store access is memory-only.
+
+### Native durable RESP cache mutation coordinator — 2026-11-27
+- **Journal native cache mutations before live publication**, including typed after-images, atomic batches, absolute TTL recovery, admission preflight and fail-stop reads/writes following ambiguous persistence failure. Live RESP reactor integration remains pending.
+
+### RESP cache journal substrate — 2026-11-27
+- **Add a bounded, single-writer, checksummed WAL primitive** with streaming recovery, torn-tail repair, corruption rejection, buffered/synced acknowledgement and fail-stop append poisoning. Reuse BLAKE3; live RESP persistence integration remains pending.
+
+### Idle RESP connection buffer reclamation — 2026-11-27
+- **Release drained input/output vector allocations and their shared budget charges without disconnecting clients.** Preserve partial frames and unsent replies; verify live-data saturation, disconnect recovery, repeated reclamation and multiple idle TCP connections.
+
+### RESP cache reference-server parity — 2026-11-27
+- **Match canonical integer validation, overflow responses and nearest-second TTL rounding** for the supported RESP subset. Always-on regressions and an explicit reference-server example avoid ignored tests.
+
+### Shared RESP reactor buffer admission — 2026-11-27
+- **Reserve retained connection vector capacity before growth**, with a shared optional cross-reactor byte budget and RAII release. Preflight conservative reply size before execution and avoid a synchronous response scratch copy. Close on budget exhaustion; this is not a full-process RSS cap.
+
+### RESP cache admission limits — 2026-11-27
+- **Bound physical entries and initialized arena extent per shard**, with fallible cache writes and RESP OOM errors. Preflight whole MSET batches before mutation; expose estimated retained allocation capacity separately. Default limits are one million entries and 256 MiB of arena extent; these are not process RSS caps.
+
+### Cancellable RESP expiration records — 2026-11-27
+- **Unlink prior TTL records in constant time** on refresh, persistent overwrite, deletion and lazy expiry using slot-indexed FIFO handles. Preserve bounded sweeps and safe slot reuse. Metadata capacity remains tied to the slot high-water mark; this is not a total memory cap.
+
+### Bounded RESP cache expiration sweeps — 2026-11-27
+- **Bound inspected expiration candidates per sweep**, including stale and future records. Preserve partially drained buckets across clock advances and rotate between eligible buckets; zero budget does no work. This does not yet cap total TTL metadata or wall-clock latency.
+
+### Fail-closed SQLite history recovery and trusted streaming — 2026-11-26
+- **Keep untrusted `DB.query` results bounded** while visiting fixed internal actor snapshot, journal, workflow/domain event and durable-effect rows incrementally. Recovery no longer mistakes histories beyond the general 100,000-row/64 MiB adapter buffer budget for absent data.
+- Introduce checked persistence-history reads for actor/virtual-actor activation. SQLite query, decode or corruption failures now refuse recovery before publishing a partially restored actor; legacy reader APIs retain compatibility, with warnings for their fallback paths.
+- Regression tests cover over-budget streamed rows/bytes, 100,001 committed events and journal entries, invalid snapshots/events/workflow rows, and preserved user-query limits. Full profile, live Turso and release qualification remain separate.
+
+### Fail-closed legacy snapshots schema validation (draft) — 2026-11-22
+- **Reject pre-existing SQLite `snapshots` tables missing mandatory `actor_id`, `sequence`, or `state` columns before adding optional columns.** Previously, `CREATE TABLE IF NOT EXISTS` accepted an incomplete table and startup could succeed despite an unusable durable-state schema.
+- **Match SQLite column names case-insensitively during optional migrations**, preserving compatible older schemas with uppercased optional column identifiers. The change applies only to the audited SQLite integration candidate, remains draft, and requires exact-head regression and migration/recovery qualification before release.
+
+### Bounded local SQLite result materialization (draft) — 2026-11-20
+- **Fail closed when an eager local SQLite query would buffer more than 100,000 rows or an estimated 64 MiB of row/value storage.** Reject the query with a pagination hint rather than returning a truncated result or retaining an unbounded in-memory buffer. Text/blob byte lengths are checked before cloning each cell.
+- The limit affects only local SQLite in the security integration adapter; remote Turso/Hrana and downstream JSON serialization have separate memory behavior. Existing large-result callers must paginate. Exact-head testing and review are required before release.
+
+### Single patched SQLite engine with preserved remote HTTPS (draft) — 2026-11-19
+- **The local actor store and AI-local runtime now use the same bundled rusqlite 0.41.1 / libsqlite3-sys 0.39.1 SQLite provider**, while the existing libSQL Hrana client runs remote-only without linking libsql-ffi's separate SQLite 3.47 engine.
+- **A compatibility adapter preserves the existing LibsqlStore persistence API, including immediate transactions and remote HTTPS/Turso operations.** Cross-provider durability, full linked feature matrix, and authenticated disposable remote smoke tests are required before release.
+- **Removed historical RustSec audit ignore entries**, exposing the previously suppressed RUSTSEC-2026-0258 on the legacy Hyper 0.14/h2 0.3 remote-libSQL path; patched the independent h2 0.4 chain to 0.4.16. The legacy h2 dependency still needs secure remediation without disabling remote HTTPS. This draft is not approved for merge until the audit is clean, exact-head validation and independent security review are complete.
+
+### Follow-up Wasmtime security maintenance (draft) — 2026-11-19
+- **Raise the Wasmtime 48.x minimum to 48.0.9, resolving to 48.0.10**, with matching internal Wasmtime/Cranelift/Pulley crates. This addresses RUSTSEC-2026-0566 through RUSTSEC-2026-0573 without changing SQLite providers or remote libSQL transport.
+- **Current RustSec audit remains red:** the updated exact-head lockfile has one finding, RUSTSEC-2026-0459 (`libsqlite3-sys 0.30.1`). The previous November 12 zero-vulnerability audit result below is historical and is not the current release status. Never bypass or ignore the remaining advisory.
+- **SQLite remediation is a separate stop-ship:** an isolated bundled-`rusqlite` upgrade introduces duplicate native `sqlite3_*` symbols with `libsql-ffi`. Retain both authenticated HTTPS remote-libSQL functionality and local persistence while designing an independently tested single patched SQLite provider. This update alone is not merge clearance.
+### Patched WASM/TLS dependencies and HTTPS-only remote libSQL — 2026-11-12
+- **Patched the Wasmtime 48.x/Cranelift toolchain and affected cryptography, certificate-root, and compression dependencies**, removing the November RustSec advisories without disabling the audit gate.
+- **Remote libSQL uses a platform-native HTTPS connector rather than the affected legacy Rustls dependency chain.** HTTPS and libsql:// endpoints are supported; plaintext HTTP endpoints now fail closed. Native CA trust stores must be maintained by deployments.
+- **The security branch passed cargo audit, focused SQLite/transport regressions, full-feature checks, and four-platform release builds.** Live authenticated Turso connectivity remains an operational smoke-test requirement before promoting remote-libSQL workloads.
+
 ### Per-priority scheduler runnable backlog diagnostics — 2026-11-20
 - **Expose approximate queued High, Normal, and Low runnable task counts** in the existing scheduler metrics snapshot, including global injector and worker-local queues, without adding counters to scheduling hot paths.
 - **Regression tests cover mixed priority queues, dequeues, and metrics-counter reset.** Queue depths are sampled non-atomically for diagnostics only; they are not admission, fairness, or backpressure guarantees.
+
 
 ### NUL0 TCP partial-frame recovery across read timeouts — 2026-11-10
 - **Preserve bytes already consumed from NUL0 frame prefixes and payloads when socket reads return `WouldBlock`, `TimedOut`, or `Interrupted`.** Retry from the unconsumed offset rather than restarting `read_exact` with a fresh buffer, preventing frame misalignment and lost actor packets.

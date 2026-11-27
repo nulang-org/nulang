@@ -220,6 +220,24 @@ impl CacheShardInbox {
         true
     }
 
+    /// Redirect-only durable reactors reject transparent queue ingress:
+    /// no path may bypass the journal or trust a sender's process clock.
+    #[cfg(all(unix, feature = "cache-server"))]
+    pub(super) fn reject_pending(&mut self, max_commands: usize) -> usize {
+        let mut count = 0;
+        while count < max_commands {
+            let Ok(request) = self.receiver.try_recv() else {
+                break;
+            };
+            drop(request.reply);
+            if let Some(waker) = request.reply_wake {
+                waker.wake();
+            }
+            count += 1;
+        }
+        count
+    }
+
     pub fn drain(&mut self, store: &mut CacheStore, max_commands: usize) -> usize {
         let mut processed = 0;
         while processed < max_commands && self.try_process_one(store) {
@@ -299,6 +317,94 @@ impl CacheDispatcher {
         waker: Arc<dyn CacheDispatchWake>,
     ) -> Result<(), CacheDispatchConfigError> {
         self.channels.install_waker(shard, waker)
+    }
+
+    /// Conservative maximum encoded reply size for the redirect-only reactor.
+    /// Uses the same clock and placement as dispatch; no mutation or value copying.
+    #[cfg(feature = "cache-server")]
+    pub(crate) fn redirect_reply_bound(
+        &self,
+        store: &CacheStore,
+        command: super::resp::RespCommand<'_>,
+        now_ms: u64,
+    ) -> usize {
+        let name = command.name();
+        if name.eq_ignore_ascii_case(b"CLUSTER") {
+            // Both topology encodings have fewer than 512 fixed bytes per
+            // range (including node metadata); endpoint text is variable.
+            if command.argc() == 1
+                && command.args().next().is_some_and(|sub| {
+                    sub.eq_ignore_ascii_case(b"SLOTS") || sub.eq_ignore_ascii_case(b"SHARDS")
+                })
+            {
+                return self
+                    .placement
+                    .slot_ranges()
+                    .iter()
+                    .fold(128usize, |sum, range| {
+                        let host = self
+                            .endpoints
+                            .get(range.owner)
+                            .map_or(0, |e| e.host().len());
+                        sum.saturating_add(512).saturating_add(host)
+                    });
+            }
+            return 128;
+        }
+        if let RespCommandSlot::Slot(slot) = command_slot(command) {
+            if let Some(owner) = self.placement.owner_for_slot(slot) {
+                if owner.node_id != self.local_node_id || owner.shard != self.local_shard {
+                    return self
+                        .endpoints
+                        .get(owner)
+                        .map_or(128, |endpoint| endpoint.target().len().saturating_add(32));
+                }
+            }
+            if name.eq_ignore_ascii_case(b"GET") || name.eq_ignore_ascii_case(b"MGET") {
+                return command.args().fold(32usize, |sum, key| {
+                    sum.saturating_add(store.reply_value_bound(key, now_ms))
+                });
+            }
+        }
+        if name.eq_ignore_ascii_case(b"PING") && command.argc() == 1 {
+            return command.args().next().unwrap().len().saturating_add(32);
+        }
+        128
+    }
+
+    /// Handle routing and topology only. False means the command belongs to
+    /// the caller's shard and must be executed through its selected backend.
+    #[cfg(all(unix, feature = "cache-server"))]
+    pub(super) fn redirect_only(
+        &self,
+        command: super::resp::RespCommand<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<bool, CacheDispatchError> {
+        debug_assert_eq!(self.routing_mode, CacheRoutingMode::Redirect);
+        if let Some(result) =
+            execute_cluster_command(command, &self.placement, &self.endpoints, out)
+        {
+            return result.map(|_| true).map_err(
+                |CacheClusterCommandError::MissingEndpoint(owner)| {
+                    CacheDispatchError::MissingEndpoint(owner)
+                },
+            );
+        }
+        if let RespCommandSlot::Slot(slot) = command_slot(command) {
+            let owner = self
+                .placement
+                .owner_for_slot(slot)
+                .ok_or(CacheDispatchError::UnknownSlot(slot))?;
+            if owner.node_id != self.local_node_id || owner.shard != self.local_shard {
+                let endpoint = self
+                    .endpoints
+                    .get(owner)
+                    .ok_or(CacheDispatchError::MissingEndpoint(owner))?;
+                write_moved(out, slot, endpoint.target());
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn dispatch_frame(

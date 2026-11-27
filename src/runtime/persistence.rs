@@ -13,6 +13,9 @@ use crate::durable_effect::DurableEffectId;
 use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
 use crate::vm::Value;
 
+#[cfg(feature = "sqlite")]
+use super::sqlite_compat as libsql;
+
 use tracing::warn;
 
 /// How a state field is persisted / replicated.
@@ -679,17 +682,31 @@ pub trait PersistenceStore: Send + Sync {
     /// Load the latest snapshot for an actor, if any.
     fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot>;
 
+    /// Fail-closed recovery read. Existing backends retain compatibility;
+    /// SQLite overrides this to distinguish corrupt/oversized data from no row.
+    fn load_snapshot_checked(&self, actor_id: u64) -> io::Result<Option<ActorSnapshot>> {
+        Ok(self.load_snapshot(actor_id))
+    }
+
     /// Append a message to the actor's journal.
     fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> io::Result<()>;
 
     /// Read all journal entries for an actor in order.
     fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry>;
 
+    fn read_journal_checked(&self, actor_id: u64) -> io::Result<Vec<JournalEntry>> {
+        Ok(self.read_journal(actor_id))
+    }
+
     /// Append a workflow event to the actor's event journal.
     fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()>;
 
     /// Read all workflow events for an actor in order.
     fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent>;
+
+    fn read_workflow_events_checked(&self, actor_id: u64) -> io::Result<Vec<WorkflowEvent>> {
+        Ok(self.read_workflow_events(actor_id))
+    }
 
     /// Append a `TimerSet` workflow event.
     fn append_timer_set(
@@ -809,6 +826,10 @@ pub trait PersistenceStore: Send + Sync {
 
     /// Read all event-sourcing entries for an actor in order.
     fn read_events(&self, actor_id: u64) -> Vec<EventEntry>;
+
+    fn read_events_checked(&self, actor_id: u64) -> io::Result<Vec<EventEntry>> {
+        Ok(self.read_events(actor_id))
+    }
 
     /// Highest sequence number known for the actor.
     fn latest_sequence(&self, actor_id: u64) -> u64;
@@ -1364,16 +1385,48 @@ impl LibsqlStore {
         Self::new(":memory:")
     }
 
+    /// Build the HTTPS-only transport for remote libSQL, using the platform
+    /// trust store and normal certificate and hostname verification.
+    ///
+    /// Use a custom connector rather than libSQL's vulnerable older Rustls
+    /// dependency chain. Native TLS initialization failures return io::Error,
+    /// not a panic. Plaintext HTTP is rejected by the connector.
+    fn https_connector() -> io::Result<hyper_tls::HttpsConnector<hyper::client::HttpConnector>> {
+        let tls = native_tls::TlsConnector::new().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("remote libSQL TLS initialization failed: {error}"),
+            )
+        })?;
+        let mut http = hyper::client::HttpConnector::new();
+        http.enforce_http(false);
+        let mut connector =
+            hyper_tls::HttpsConnector::from((http, tokio_native_tls::TlsConnector::from(tls)));
+        connector.https_only(true);
+        Ok(connector)
+    }
+
     /// Connect to a remote Turso database.
     ///
     /// Journal pragmas (`journal_mode`, `synchronous`) are deliberately
     /// skipped: a Turso server manages its own journal and durability
     /// policy.
     pub fn new_remote(url: &str, auth_token: &str) -> io::Result<Self> {
+        // Reject insecure or unsupported schemes before allocating the Tokio
+        // runtime or constructing the transport. The libsql scheme is an
+        // HTTPS alias normalized by the upstream Hrana client.
+        if !url.starts_with("https://") && !url.starts_with("libsql://") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "remote libSQL requires an HTTPS or libsql:// endpoint",
+            ));
+        }
         let rt =
             tokio::runtime::Runtime::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let connector = Self::https_connector()?;
         let db = rt.block_on(async {
-            libsql::Builder::new_remote(url.to_string(), auth_token.to_string())
+            ::libsql::Builder::new_remote(url.to_string(), auth_token.to_string())
+                .connector(connector)
                 .build()
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
@@ -1382,7 +1435,7 @@ impl LibsqlStore {
             .connect()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         let store = LibsqlStore {
-            conn: std::sync::Mutex::new(conn),
+            conn: std::sync::Mutex::new(libsql::Connection::remote(conn)),
             rt,
             path: PathBuf::from(url),
         };
@@ -1457,36 +1510,113 @@ impl LibsqlStore {
             )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-            // Durable activation fencing was added after the original snapshot schema.
-            // Legacy rows represent the initial activation and therefore default to 1.
-            let _ = conn
-                .execute(
-                    "ALTER TABLE snapshots ADD COLUMN activation_epoch INTEGER NOT NULL DEFAULT 1",
+            // `CREATE TABLE IF NOT EXISTS` accepts an existing SQLite view,
+            // and PRAGMA table_info reports that view's columns. Do not treat
+            // a read-only view with all expected names as a durable table.
+            let mut objects = conn
+                .query(
+                    "SELECT type FROM sqlite_master WHERE name = 'snapshots' COLLATE NOCASE LIMIT 1",
                     (),
                 )
-                .await;
-            // Migrate databases created before the waiting_signal column existed.
-            let _ = conn
-                .execute("ALTER TABLE snapshots ADD COLUMN waiting_signal TEXT", ())
-                .await;
-            // Migrate databases created before the crdt_snapshot column existed.
-            let _ = conn
-                .execute("ALTER TABLE snapshots ADD COLUMN crdt_snapshot TEXT", ())
-                .await;
-            // Migrate databases created before the crdt_field_map column existed.
-            let _ = conn
-                .execute("ALTER TABLE snapshots ADD COLUMN crdt_field_map TEXT", ())
-                .await;
-            // Durable schema identity was added after the original persistence
-            // schema. Legacy rows remain NULL and follow the explicit legacy policy.
-            let _ = conn
-                .execute("ALTER TABLE snapshots ADD COLUMN schema_name TEXT", ())
-                .await;
-            // Authority was added after the original persistence schema. Old rows
-            // remain NULL and therefore restore with empty (deny-by-default) authority.
-            let _ = conn
-                .execute("ALTER TABLE snapshots ADD COLUMN authority_tokens TEXT", ())
-                .await;
+                .await
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("unable to inspect snapshots object type: {e}"),
+                    )
+                })?;
+            let object_type: String = objects
+                .next()
+                .await
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("unable to read snapshots object type: {e}"),
+                    )
+                })?
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "snapshots table is missing")
+                })?
+                .get(0)
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid snapshots object type: {e}"),
+                    )
+                })?;
+            drop(objects);
+            if object_type != "table" {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("snapshots must be a writable table, found {object_type}"),
+                ));
+            }
+            // Inspect the existing schema once. A failed migration must never be
+            // silently treated as a usable durable store. In particular,
+            // duplicate-column errors are expected for upgraded databases,
+            // but read-only, incompatible or corrupt schemas are not.
+            let mut columns = std::collections::HashSet::new();
+            let mut rows = conn
+                .query("PRAGMA table_info(snapshots)", ())
+                .await
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("unable to inspect snapshots schema: {e}"),
+                    )
+                })?;
+            while let Some(row) = rows.next().await.map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("unable to read snapshots schema: {e}"),
+                )
+            })? {
+                let column: String = row.get(1).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("invalid snapshots schema column: {e}"),
+                    )
+                })?;
+                // SQLite column identifiers are case-insensitive. Normalize
+                // before comparing against the canonical schema so a legacy
+                // uppercased column is not mistaken for a missing column.
+                columns.insert(column.to_ascii_lowercase());
+            }
+            drop(rows);
+            // Required columns cannot be added safely to an existing store:
+            // silently accepting such a schema would defer corruption or
+            // missing-data errors until the first durable actor write.
+            for required in ["actor_id", "sequence", "state"] {
+                if !columns.contains(required) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("snapshots table is missing required column {required}"),
+                    ));
+                }
+            }
+            // Legacy snapshots omit some optional columns. Only add genuinely
+            // missing columns and propagate every real migration failure.
+            for (name, definition) in [
+                (
+                    "activation_epoch",
+                    "activation_epoch INTEGER NOT NULL DEFAULT 1",
+                ),
+                ("waiting_signal", "waiting_signal TEXT"),
+                ("crdt_snapshot", "crdt_snapshot TEXT"),
+                ("crdt_field_map", "crdt_field_map TEXT"),
+                ("schema_name", "schema_name TEXT"),
+                ("authority_tokens", "authority_tokens TEXT"),
+            ] {
+                if !columns.contains(name) {
+                    let sql = format!("ALTER TABLE snapshots ADD COLUMN {definition}");
+                    conn.execute(&sql, ()).await.map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("failed to migrate snapshots.{name}: {e}"),
+                        )
+                    })?;
+                }
+            }
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS journal (
                     actor_id INTEGER NOT NULL,
@@ -1710,31 +1840,26 @@ impl PersistenceStore for LibsqlStore {
     ) -> io::Result<Option<DurableEffectPersistenceRecord>> {
         let conn = self.conn();
         self.rt.block_on(async {
-            let mut rows = conn
-                .query(
-                    "SELECT record FROM durable_effect_records
-                     WHERE actor_id = ?1
-                     ORDER BY sequence DESC, ordinal DESC",
-                    libsql::params![actor_id as i64],
-                )
-                .await
-                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
-
-            while let Some(row) = rows
-                .next()
-                .await
-                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
-            {
-                let json: String = row.get(0).map_err(|error| {
-                    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
-                })?;
-                let record = DurableEffectPersistenceRecord::from_json(json.as_bytes())
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                if record.effect().spec().id == effect_id {
-                    return Ok(Some(record));
-                }
-            }
-            Ok(None)
+            let mut found = None;
+            conn.query_each_until(
+                "SELECT record FROM durable_effect_records
+                 WHERE actor_id = ?1
+                 ORDER BY sequence DESC, ordinal DESC",
+                libsql::params![actor_id as i64],
+                |row| {
+                    let json: String = row.get(0)?;
+                    let record = DurableEffectPersistenceRecord::from_json(json.as_bytes())
+                        .map_err(|error| error.to_string())?;
+                    if record.effect().spec().id == effect_id {
+                        found = Some(record);
+                        return Ok(false);
+                    }
+                    Ok(true)
+                },
+            )
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            Ok(found)
         })
     }
 
@@ -2131,57 +2256,66 @@ impl PersistenceStore for LibsqlStore {
     }
 
     fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        self.load_snapshot_checked(actor_id)
+            .unwrap_or_else(|error| {
+                warn!(
+                    "nulang-persist: snapshot read for actor {} failed: {}",
+                    actor_id, error
+                );
+                None
+            })
+    }
+
+    fn load_snapshot_checked(&self, actor_id: u64) -> io::Result<Option<ActorSnapshot>> {
         let conn = self.conn();
         self.rt.block_on(async {
-            let mut rows = conn
-                .query(
-                    "SELECT sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens FROM snapshots WHERE actor_id = ?1",
-                    libsql::params![actor_id as i64],
-                )
-                .await
-                .ok()?;
-            let row = rows.next().await.ok()??;
-            let sequence: i64 = row.get(0).ok()?;
-            let activation_epoch: i64 = row.get(1).ok()?;
-            let state_json: String = row.get(2).ok()?;
-            let waiting_signal: Option<String> = row.get(3).ok()?;
-            let crdt_json: Option<String> = row.get(4).ok()?;
-            let crdt_field_map_json: Option<String> = row.get(5).ok()?;
-            let schema_name: Option<String> = row.get(6).ok()?;
-            let authority_json: Option<String> = row.get(7).ok()?;
-            let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> = match crdt_json {
-                Some(j) => serde_json::from_str(&j).ok()?,
-                None => None,
-            };
-            let crdt_field_map: Option<HashMap<String, u64>> = match crdt_field_map_json {
-                Some(j) => serde_json::from_str(&j).ok()?,
-                None => None,
-            };
-            let authority_tokens: BTreeSet<String> = match authority_json {
-                Some(json) => match serde_json::from_str(&json) {
-                    Ok(tokens) => tokens,
-                    Err(err) => {
-                        warn!(
-                            "nulang-persist: invalid authority metadata for actor {}: {}",
-                            actor_id, err
-                        );
-                        return None;
-                    }
+            let mut snapshot = None;
+            conn.query_each_until(
+                "SELECT sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens
+                 FROM snapshots WHERE actor_id = ?1",
+                libsql::params![actor_id as i64],
+                |row| {
+                    let sequence: i64 = row.get(0)?;
+                    let activation_epoch: i64 = row.get(1)?;
+                    let state_json: String = row.get(2)?;
+                    let waiting_signal: Option<String> = row.get(3)?;
+                    let crdt_json: Option<String> = row.get(4)?;
+                    let crdt_field_map_json: Option<String> = row.get(5)?;
+                    let schema_name: Option<String> = row.get(6)?;
+                    let authority_json: Option<String> = row.get(7)?;
+                    // The stored JSON may itself be the literal null.
+                    // Deserialize as Option<T>, not T wrapped in an outer Option:
+                    // serde_json::from_str::<Vec<_>>("null") is an error.
+                    let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> = match crdt_json {
+                        Some(json) => serde_json::from_str(&json).map_err(|e| e.to_string())?,
+                        None => None,
+                    };
+                    let crdt_field_map: Option<HashMap<String, u64>> = match crdt_field_map_json {
+                        Some(json) => serde_json::from_str(&json).map_err(|e| e.to_string())?,
+                        None => None,
+                    };
+                    let authority_tokens = authority_json
+                        .map(|json| serde_json::from_str(&json).map_err(|e| e.to_string()))
+                        .transpose()?
+                        .unwrap_or_default();
+                    let state = serde_json::from_str(&state_json).map_err(|e| e.to_string())?;
+                    snapshot = Some(ActorSnapshot {
+                        actor_id,
+                        sequence: u64::try_from(sequence).map_err(|e| e.to_string())?,
+                        activation_epoch: u64::try_from(activation_epoch).map_err(|e| e.to_string())?,
+                        state,
+                        waiting_signal,
+                        crdt_snapshot,
+                        crdt_field_map,
+                        schema_name,
+                        authority_tokens,
+                    });
+                    Ok(false)
                 },
-                None => BTreeSet::new(),
-            };
-            let state: HashMap<String, PersistedValue> = serde_json::from_str(&state_json).ok()?;
-            Some(ActorSnapshot {
-                actor_id,
-                sequence: sequence as u64,
-                activation_epoch: activation_epoch as u64,
-                state,
-                waiting_signal,
-                crdt_snapshot,
-                crdt_field_map,
-                schema_name,
-                authority_tokens,
-            })
+            )
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            Ok(snapshot)
         })
     }
 
@@ -2198,51 +2332,41 @@ impl PersistenceStore for LibsqlStore {
     }
 
     fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
+        self.read_journal_checked(actor_id).unwrap_or_else(|error| {
+            warn!(
+                "nulang-persist: journal read for actor {} failed: {}",
+                actor_id, error
+            );
+            Vec::new()
+        })
+    }
+
+    fn read_journal_checked(&self, actor_id: u64) -> io::Result<Vec<JournalEntry>> {
         let conn = self.conn();
         self.rt.block_on(async {
-            let mut rows = match conn
-                .query(
-                    "SELECT sequence, behavior_id, payload FROM journal
-                 WHERE actor_id = ?1 ORDER BY sequence ASC",
-                    libsql::params![actor_id as i64],
-                )
-                .await
-            {
-                Ok(r) => r,
-                Err(_) => return Vec::new(),
-            };
             let mut entries = Vec::new();
-            loop {
-                match rows.next().await {
-                    Ok(Some(row)) => {
-                        let seq: i64 = match row.get(0) {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-                        let bid: i64 = match row.get(1) {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-                        let payload_json: String = match row.get(2) {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-                        let payload: Vec<PersistedValue> = match serde_json::from_str(&payload_json)
-                        {
-                            Ok(p) => p,
-                            Err(_) => continue,
-                        };
-                        entries.push(JournalEntry {
-                            sequence: seq as u64,
-                            behavior_id: bid as u16,
-                            payload,
-                        });
-                    }
-                    Ok(None) => break,
-                    Err(_) => break,
-                }
-            }
-            entries
+            conn.query_each(
+                "SELECT sequence, behavior_id, payload FROM journal
+                 WHERE actor_id = ?1 ORDER BY sequence ASC",
+                libsql::params![actor_id as i64],
+                |row| {
+                    let sequence: i64 = row.get(0)?;
+                    let behavior: i64 = row.get(1)?;
+                    let payload_json: String = row.get(2)?;
+                    let payload = serde_json::from_str(&payload_json).map_err(|e| e.to_string())?;
+                    let sequence = u64::try_from(sequence).map_err(|e| e.to_string())?;
+                    let behavior_id = u16::try_from(behavior).map_err(|e| e.to_string())?;
+                    entries.push(JournalEntry {
+                        sequence,
+                        behavior_id,
+                        payload,
+                    });
+                    Ok(())
+                },
+            )
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            Ok(entries)
         })
     }
 
@@ -2262,60 +2386,37 @@ impl PersistenceStore for LibsqlStore {
     }
 
     fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
+        self.read_workflow_events_checked(actor_id)
+            .unwrap_or_else(|error| {
+                warn!(
+                    "nulang-persist: workflow event read for actor {} failed: {}",
+                    actor_id, error
+                );
+                Vec::new()
+            })
+    }
+
+    fn read_workflow_events_checked(&self, actor_id: u64) -> io::Result<Vec<WorkflowEvent>> {
         let conn = self.conn();
         self.rt.block_on(async {
             let mut events = Vec::new();
-
-            if let Ok(mut rows) = conn
-                .query(
-                    "SELECT event FROM workflow_events
-                     WHERE actor_id = ?1 ORDER BY sequence ASC",
-                    libsql::params![actor_id as i64],
-                )
+            for sql in [
+                "SELECT event FROM workflow_events
+                 WHERE actor_id = ?1 ORDER BY sequence ASC",
+                "SELECT event FROM durable_workflow_events
+                 WHERE actor_id = ?1 ORDER BY sequence ASC, ordinal ASC",
+            ] {
+                conn.query_each(sql, libsql::params![actor_id as i64], |row| {
+                    let event_json: String = row.get(0)?;
+                    let event = serde_json::from_str(&event_json).map_err(|e| e.to_string())?;
+                    events.push(event);
+                    Ok(())
+                })
                 .await
-            {
-                loop {
-                    match rows.next().await {
-                        Ok(Some(row)) => {
-                            let event_json: String = match row.get(0) {
-                                Ok(value) => value,
-                                Err(_) => continue,
-                            };
-                            if let Ok(event) = serde_json::from_str(&event_json) {
-                                events.push(event);
-                            }
-                        }
-                        Ok(None) | Err(_) => break,
-                    }
-                }
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             }
-
-            if let Ok(mut rows) = conn
-                .query(
-                    "SELECT event FROM durable_workflow_events
-                     WHERE actor_id = ?1 ORDER BY sequence ASC, ordinal ASC",
-                    libsql::params![actor_id as i64],
-                )
-                .await
-            {
-                loop {
-                    match rows.next().await {
-                        Ok(Some(row)) => {
-                            let event_json: String = match row.get(0) {
-                                Ok(value) => value,
-                                Err(_) => continue,
-                            };
-                            if let Ok(event) = serde_json::from_str(&event_json) {
-                                events.push(event);
-                            }
-                        }
-                        Ok(None) | Err(_) => break,
-                    }
-                }
-            }
-
             events.sort_by_key(WorkflowEvent::sequence);
-            events
+            Ok(events)
         })
     }
 
@@ -2334,88 +2435,59 @@ impl PersistenceStore for LibsqlStore {
     }
 
     fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
+        self.read_events_checked(actor_id).unwrap_or_else(|error| {
+            warn!(
+                "nulang-persist: event read for actor {} failed: {}",
+                actor_id, error
+            );
+            Vec::new()
+        })
+    }
+
+    fn read_events_checked(&self, actor_id: u64) -> io::Result<Vec<EventEntry>> {
         let conn = self.conn();
         self.rt.block_on(async {
             let mut entries = Vec::new();
-
-            if let Ok(mut rows) = conn
-                .query(
-                    "SELECT sequence, field_name, event_name, args, value FROM events
-                     WHERE actor_id = ?1 ORDER BY sequence ASC",
-                    libsql::params![actor_id as i64],
-                )
-                .await
-            {
-                loop {
-                    match rows.next().await {
-                        Ok(Some(row)) => {
-                            let sequence: i64 = match row.get(0) {
-                                Ok(value) => value,
-                                Err(_) => continue,
-                            };
-                            let field_name: String = match row.get(1) {
-                                Ok(value) => value,
-                                Err(_) => continue,
-                            };
-                            let event_name: String = match row.get(2) {
-                                Ok(value) => value,
-                                Err(_) => continue,
-                            };
-                            let args_json: String = match row.get(3) {
-                                Ok(value) => value,
-                                Err(_) => continue,
-                            };
-                            let value_json: String = match row.get(4) {
-                                Ok(value) => value,
-                                Err(_) => continue,
-                            };
-                            let args = match serde_json::from_str(&args_json) {
-                                Ok(value) => value,
-                                Err(_) => continue,
-                            };
-                            let value = match serde_json::from_str(&value_json) {
-                                Ok(value) => value,
-                                Err(_) => continue,
-                            };
-                            entries.push(EventEntry {
-                                sequence: sequence as u64,
-                                field_name,
-                                event_name,
-                                args,
-                                value,
-                            });
-                        }
-                        Ok(None) | Err(_) => break,
-                    }
-                }
-            }
-
-            if let Ok(mut rows) = conn
-                .query(
-                    "SELECT event FROM durable_domain_events
-                     WHERE actor_id = ?1 ORDER BY sequence ASC, ordinal ASC",
-                    libsql::params![actor_id as i64],
-                )
-                .await
-            {
-                loop {
-                    match rows.next().await {
-                        Ok(Some(row)) => {
-                            let event_json: String = match row.get(0) {
-                                Ok(value) => value,
-                                Err(_) => continue,
-                            };
-                            if let Ok(event) = serde_json::from_str(&event_json) {
-                                entries.push(event);
-                            }
-                        }
-                        Ok(None) | Err(_) => break,
-                    }
-                }
-            }
-
+            conn.query_each(
+                "SELECT sequence, field_name, event_name, args, value FROM events
+                 WHERE actor_id = ?1 ORDER BY sequence ASC",
+                libsql::params![actor_id as i64],
+                |row| {
+                    let sequence: i64 = row.get(0)?;
+                    let field_name: String = row.get(1)?;
+                    let event_name: String = row.get(2)?;
+                    let args_json: String = row.get(3)?;
+                    let value_json: String = row.get(4)?;
+                    let args = serde_json::from_str(&args_json).map_err(|e| e.to_string())?;
+                    let value = serde_json::from_str(&value_json).map_err(|e| e.to_string())?;
+                    let sequence = u64::try_from(sequence).map_err(|e| e.to_string())?;
+                    entries.push(EventEntry {
+                        sequence,
+                        field_name,
+                        event_name,
+                        args,
+                        value,
+                    });
+                    Ok(())
+                },
+            )
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            conn.query_each(
+                "SELECT event FROM durable_domain_events
+                 WHERE actor_id = ?1 ORDER BY sequence ASC, ordinal ASC",
+                libsql::params![actor_id as i64],
+                |row| {
+                    let event_json: String = row.get(0)?;
+                    let event = serde_json::from_str(&event_json).map_err(|e| e.to_string())?;
+                    entries.push(event);
+                    Ok(())
+                },
+            )
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             entries.sort_by_key(|entry| entry.sequence);
-            entries
+            Ok(entries)
         })
     }
 
@@ -3213,6 +3285,181 @@ impl PersistenceStore for PostgresStore {
         Ok(results)
     }
 }
+#[cfg(all(test, feature = "sqlite"))]
+mod sqlite_streamed_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn test_large_local_event_history_is_complete_and_ordered() {
+        let store = LibsqlStore::new(":memory:").unwrap();
+        {
+            let conn = store.conn();
+            let encoded = serde_json::to_string(&PersistedValue::Int(7)).unwrap();
+            store.rt.block_on(async {
+                conn.execute(
+                    "WITH RECURSIVE n(v) AS (
+                       SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v < 100001
+                     )
+                     INSERT INTO events (actor_id, sequence, field_name, event_name, args, value)
+                     SELECT 42, v, 'count', 'set', '[]', ?1 FROM n",
+                    super::libsql::params![encoded],
+                )
+                .await
+                .unwrap();
+            });
+        }
+        let entries = store.read_events_checked(42).unwrap();
+        assert_eq!(entries.len(), 100_001);
+        assert_eq!(entries.first().unwrap().sequence, 1);
+        assert_eq!(entries.last().unwrap().sequence, 100_001);
+        assert_eq!(entries.last().unwrap().value, PersistedValue::Int(7));
+        assert_eq!(store.read_events(42).len(), entries.len());
+    }
+
+    #[test]
+    fn test_large_local_journal_history_is_complete_and_ordered() {
+        let store = LibsqlStore::new(":memory:").unwrap();
+        {
+            let conn = store.conn();
+            let encoded = serde_json::to_string(&vec![PersistedValue::Int(7)]).unwrap();
+            store.rt.block_on(async {
+                conn.execute(
+                    "WITH RECURSIVE n(v) AS (
+                       SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v < 100001
+                     )
+                     INSERT INTO journal (actor_id, sequence, behavior_id, payload)
+                     SELECT 53, v, 3, ?1 FROM n",
+                    super::libsql::params![encoded],
+                )
+                .await
+                .unwrap();
+            });
+        }
+        let entries = store.read_journal_checked(53).unwrap();
+        assert_eq!(entries.len(), 100_001);
+        assert_eq!(entries.first().unwrap().sequence, 1);
+        assert_eq!(entries.last().unwrap().sequence, 100_001);
+        assert_eq!(entries.last().unwrap().behavior_id, 3);
+        assert_eq!(
+            entries.last().unwrap().payload,
+            vec![PersistedValue::Int(7)]
+        );
+    }
+
+    #[test]
+    fn test_corrupted_journal_and_workflow_rows_are_read_errors() {
+        let store = LibsqlStore::new(":memory:").unwrap();
+        {
+            let conn = store.conn();
+            store.rt.block_on(async {
+                conn.execute(
+                    "INSERT INTO journal (actor_id, sequence, behavior_id, payload)
+                     VALUES (61, 1, 2, 'not-json')",
+                    (),
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO workflow_events (actor_id, sequence, event)
+                     VALUES (61, 1, 'not-json')",
+                    (),
+                )
+                .await
+                .unwrap();
+            });
+        }
+        assert_eq!(
+            store.read_journal_checked(61).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            store.read_workflow_events_checked(61).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn test_corrupted_snapshot_is_not_mistaken_for_missing_actor() {
+        let mut store = LibsqlStore::new(":memory:").unwrap();
+        store
+            .save_snapshot(ActorSnapshot {
+                actor_id: 81,
+                sequence: 1,
+                activation_epoch: INITIAL_ACTIVATION_EPOCH,
+                state: HashMap::new(),
+                waiting_signal: None,
+                crdt_snapshot: None,
+                crdt_field_map: None,
+                schema_name: None,
+                authority_tokens: Default::default(),
+            })
+            .unwrap();
+        let healthy = store.load_snapshot_checked(81).unwrap().unwrap();
+        assert_eq!(healthy.sequence, 1);
+        assert!(healthy.crdt_snapshot.is_none());
+        assert!(healthy.crdt_field_map.is_none());
+        {
+            let conn = store.conn();
+            store.rt.block_on(async {
+                conn.execute("UPDATE snapshots SET state='{' WHERE actor_id=81", ())
+                    .await
+                    .unwrap();
+            });
+        }
+        assert_eq!(
+            store.load_snapshot_checked(81).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let mut runtime = crate::runtime::Runtime::new();
+        runtime.persistence = Box::new(store);
+        assert_eq!(runtime.recover_actor(81), None);
+        assert!(!runtime.actors.contains_key(&81));
+    }
+
+    #[test]
+    fn test_corrupted_event_history_fails_closed_before_recovery_publication() {
+        let mut store = LibsqlStore::new(":memory:").unwrap();
+        store
+            .save_snapshot(ActorSnapshot {
+                actor_id: 71,
+                sequence: 1,
+                activation_epoch: INITIAL_ACTIVATION_EPOCH,
+                state: HashMap::new(),
+                waiting_signal: None,
+                crdt_snapshot: None,
+                crdt_field_map: None,
+                schema_name: None,
+                authority_tokens: Default::default(),
+            })
+            .unwrap();
+        {
+            let conn = store.conn();
+            store.rt.block_on(async {
+                conn.execute(
+                    "INSERT INTO events (actor_id, sequence, field_name, event_name, args, value)
+                     VALUES (71, 2, 'count', 'set', '[]', '{')",
+                    (),
+                )
+                .await
+                .unwrap();
+            });
+        }
+        let err = store.read_events_checked(71).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let mut runtime = crate::runtime::Runtime::new();
+        runtime.persistence = Box::new(store);
+        assert_eq!(
+            runtime.recover_actor(71),
+            None,
+            "bad persisted event is not an empty event history"
+        );
+        assert!(
+            !runtime.actors.contains_key(&71),
+            "failed recovery must not publish the actor"
+        );
+    }
+}
+
 #[cfg(test)]
 mod json_file_store_tests {
     use super::*;
@@ -4163,6 +4410,7 @@ mod durable_transition_tests {
 
 #[cfg(all(test, feature = "sqlite"))]
 mod libsql_atomic_transition_tests {
+    use super::libsql;
     use super::*;
 
     fn snapshot(actor_id: u64, sequence: u64, count: i64) -> ActorSnapshot {
@@ -4229,6 +4477,235 @@ mod libsql_atomic_transition_tests {
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }],
         }
+    }
+
+    // The live smoke is deliberately opt-in, has no production endpoint
+    // defaults, and rejects arbitrary hosts before making any connection.
+    fn disposable_turso_endpoint_allowed(endpoint: &str, opt_in: &str) -> bool {
+        if opt_in != "yes" {
+            return false;
+        }
+        let Ok(uri) = endpoint.parse::<hyper::Uri>() else {
+            return false;
+        };
+        let Some(host) = uri.host() else {
+            return false;
+        };
+        matches!(uri.scheme_str(), Some("https" | "libsql"))
+            && host.starts_with("nulang-smoke-")
+            && host.ends_with(".turso.io")
+            && uri.authority().is_some_and(|a| a.as_str() == host)
+            && (uri.path().is_empty() || uri.path() == "/")
+            && uri.query().is_none()
+    }
+
+    #[test]
+    fn disposable_turso_smoke_guard_fails_closed() {
+        for endpoint in [
+            "http://nulang-smoke-abc.turso.io",
+            "https://prod.turso.io",
+            "https://nulang-smoke-abc.turso.io.evil.example",
+            "https://nulang-smoke-abc.turso.io:443",
+            "https://nulang-smoke-abc.turso.io/path",
+            "https://nulang-smoke-abc.turso.io/?token=secret",
+            "https://nulang-smoke-abc.turso.io@evil.example",
+        ] {
+            assert!(!disposable_turso_endpoint_allowed(endpoint, "yes"));
+        }
+        assert!(!disposable_turso_endpoint_allowed(
+            "https://nulang-smoke-abc.turso.io",
+            ""
+        ));
+        assert!(disposable_turso_endpoint_allowed(
+            "https://nulang-smoke-abc.turso.io",
+            "yes"
+        ));
+        assert!(disposable_turso_endpoint_allowed(
+            "libsql://nulang-smoke-abc.turso.io",
+            "yes"
+        ));
+    }
+
+    // Run precisely the same transaction and durable persistence contract
+    // against the disposable local and live remote stores. Never print
+    // underlying remote errors, which may contain endpoint/token details.
+    fn exercise_disposable_smoke(store: &mut LibsqlStore) {
+        const ACTOR: u64 = 867_5309;
+        assert_eq!(store.latest_sequence(ACTOR), 0, "fresh database required");
+        {
+            let conn = store.conn();
+            store.rt.block_on(async {
+                conn.execute(
+                    "CREATE TABLE nulang_smoke_sql (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+                    (),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("fresh smoke table creation failed"));
+                let tx = conn
+                    .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                    .await
+                    .unwrap_or_else(|_| panic!("start insert transaction failed"));
+                tx.execute(
+                    "INSERT INTO nulang_smoke_sql (id, value) VALUES (?1, ?2)",
+                    libsql::params![1_i64, "first"],
+                )
+                .await
+                .unwrap_or_else(|_| panic!("parameterized insert failed"));
+                tx.execute(
+                    "UPDATE nulang_smoke_sql SET value = ?1 WHERE id = ?2",
+                    libsql::params!["committed", 1_i64],
+                )
+                .await
+                .unwrap_or_else(|_| panic!("parameterized update failed"));
+                tx.commit()
+                    .await
+                    .unwrap_or_else(|_| panic!("commit failed"));
+                let tx = conn
+                    .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                    .await
+                    .unwrap_or_else(|_| panic!("start rollback transaction failed"));
+                tx.execute(
+                    "UPDATE nulang_smoke_sql SET value = ?1 WHERE id = ?2",
+                    libsql::params!["rolled back", 1_i64],
+                )
+                .await
+                .unwrap_or_else(|_| panic!("rollback update failed"));
+                tx.rollback()
+                    .await
+                    .unwrap_or_else(|_| panic!("rollback failed"));
+            });
+        }
+
+        let value = transition(ACTOR, 2, 1);
+        let first = store
+            .commit_transition(value.clone())
+            .unwrap_or_else(|_| panic!("durable transition commit failed"));
+        let retry = store
+            .commit_transition(value)
+            .unwrap_or_else(|_| panic!("durable transition retry failed"));
+        assert_eq!(first, retry, "exact retry must be idempotent");
+        assert!(
+            store.commit_transition(transition(ACTOR, 1, 2)).is_err(),
+            "stale activation must not commit"
+        );
+        verify_disposable_smoke(store);
+    }
+
+    fn verify_disposable_smoke(store: &LibsqlStore) {
+        const ACTOR: u64 = 867_5309;
+        let rows = store
+            .query(
+                "SELECT value FROM nulang_smoke_sql WHERE id = ?1",
+                &[Value::int(1)],
+            )
+            .unwrap_or_else(|_| panic!("parameterized select failed"));
+        assert!(
+            rows == [r#"["committed"]"#],
+            "committed value must survive rollback/reopen"
+        );
+        assert_eq!(store.latest_sequence(ACTOR), 1);
+        assert_eq!(store.load_snapshot(ACTOR).map(|s| s.sequence), Some(1));
+        assert_eq!(store.read_journal(ACTOR).len(), 1);
+        assert_eq!(store.read_workflow_events(ACTOR).len(), 2);
+        assert_eq!(store.read_events(ACTOR).len(), 2);
+    }
+
+    #[test]
+    fn disposable_turso_smoke_contract_on_local_sqlite() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang-smoke-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("test.db");
+        {
+            let mut store = LibsqlStore::new(&path).unwrap();
+            exercise_disposable_smoke(&mut store);
+        }
+        {
+            let store = LibsqlStore::new(&path).unwrap();
+            verify_disposable_smoke(&store);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires explicitly authorized, fresh disposable Turso DB; never production"]
+    fn disposable_turso_smoke_live_https_roundtrip() {
+        let endpoint = std::env::var("NULANG_DISPOSABLE_TURSO_URL").unwrap_or_default();
+        let opt_in = std::env::var("NULANG_DISPOSABLE_TURSO_CONFIRM").unwrap_or_default();
+        assert!(
+            disposable_turso_endpoint_allowed(&endpoint, &opt_in),
+            "requires a fresh nulang-smoke-* Turso hostname and explicit yes confirmation"
+        );
+        let token = std::env::var("NULANG_DISPOSABLE_TURSO_TOKEN").unwrap_or_default();
+        assert!(
+            !token.trim().is_empty(),
+            "disposable database token required"
+        );
+
+        let mut store = LibsqlStore::new_remote(&endpoint, &token)
+            .unwrap_or_else(|_| panic!("authenticated disposable HTTPS connection failed"));
+        assert!(
+            LibsqlStore::new_remote(&endpoint, "nulang-invalid-smoke-token").is_err(),
+            "invalid token was admitted after a valid connection succeeded"
+        );
+        exercise_disposable_smoke(&mut store);
+        drop(store);
+        let reopened = LibsqlStore::new_remote(&endpoint, &token)
+            .unwrap_or_else(|_| panic!("authenticated remote reopen failed"));
+        verify_disposable_smoke(&reopened);
+    }
+
+    #[test]
+    fn local_actor_store_uses_patched_sqlite_engine() {
+        let store = LibsqlStore::in_memory().expect("local actor database opens");
+        let rows = store
+            .query("SELECT sqlite_version()", &[])
+            .expect("read SQLite version");
+        let versions: Vec<String> = serde_json::from_str(&rows[0]).unwrap();
+        let version = &versions[0];
+        let parts: Vec<u32> = version
+            .split('.')
+            .map(|item| item.parse().unwrap())
+            .collect();
+        assert!(
+            parts.as_slice() >= &[3, 54, 0],
+            "outdated SQLite engine: {version}"
+        );
+    }
+
+    #[cfg(feature = "ai-runtime")]
+    #[test]
+    fn actor_and_agent_stores_share_sqlite_engine() {
+        let actor = LibsqlStore::in_memory().unwrap();
+        let actor_versions: Vec<String> =
+            serde_json::from_str(&actor.query("SELECT sqlite_version()", &[]).unwrap()[0]).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "nulang_dual_sqlite_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let agent = nulang_ai_local::SqliteStore::open(&path).unwrap();
+        let conn = rusqlite::Connection::open(agent.db_path()).unwrap();
+        let agent_version: String = conn
+            .query_row("SELECT sqlite_version()", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            actor_versions,
+            vec![agent_version],
+            "two native SQLite engines are forbidden"
+        );
+        drop(conn);
+        drop(agent);
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
@@ -4405,4 +4882,138 @@ mod libsql_atomic_transition_tests {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(store.latest_sequence(42), 1);
     }
+}
+
+// A remote libSQL database must never silently downgrade to a plaintext
+// transport. This connector contract is compiled only when sqlite is enabled.
+#[cfg(all(test, feature = "sqlite"))]
+#[test]
+fn libsql_remote_connector_rejects_plain_http_before_connecting() {
+    use hyper::service::Service;
+
+    let mut connector = LibsqlStore::https_connector().expect("native TLS context");
+    let url: hyper::Uri = "http://127.0.0.1:7777".parse().unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(connector.call(url));
+    assert!(result.is_err(), "remote libSQL must refuse plaintext HTTP");
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+#[test]
+fn libsql_remote_refuses_insecure_scheme_without_exposing_auth_token() {
+    let error = match LibsqlStore::new_remote("http://127.0.0.1:7777", "secret-should-stay-private")
+    {
+        Ok(_) => panic!("plaintext remote connection was admitted"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("HTTPS") || message.contains("https"),
+        "expected HTTPS-only rejection, got {message}"
+    );
+    assert!(!message.contains("secret-should-stay-private"));
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+#[test]
+fn libsql_remote_https_starts_tls_before_any_application_data() {
+    use hyper::service::Service;
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test listener");
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let peer = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut record_header = [0u8; 5];
+                    stream
+                        .read_exact(&mut record_header)
+                        .expect("TLS record header");
+                    return Some(record_header);
+                }
+                Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("unexpected localhost accept error: {error}"),
+            }
+        }
+    });
+
+    let mut connector = LibsqlStore::https_connector().unwrap();
+    let url: hyper::Uri = format!("https://127.0.0.1:{port}/").parse().unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(3), connector.call(url)).await
+    });
+    assert!(
+        result.is_err() || result.unwrap().is_err(),
+        "no TLS server responds"
+    );
+    let record = peer
+        .join()
+        .expect("test peer thread completed")
+        .expect("HTTPS connector should attempt TLS before timing out");
+    assert_eq!(
+        record[0], 0x16,
+        "TLS handshake record, not a plaintext request"
+    );
+    assert_eq!(record[1], 0x03, "TLS protocol version header");
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+#[test]
+fn libsql_remote_libsql_scheme_uses_https_custom_transport() {
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let peer = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut header = [0u8; 5];
+                    stream.read_exact(&mut header).expect("TLS client hello");
+                    return Some(header);
+                }
+                Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("unexpected localhost accept error: {error}"),
+            }
+        }
+    });
+
+    let error =
+        match LibsqlStore::new_remote(&format!("libsql://127.0.0.1:{port}"), "test-auth-token") {
+            Ok(_) => panic!("a mock TLS peer should not be accepted as a libSQL database"),
+            Err(error) => error,
+        };
+    let header = peer
+        .join()
+        .unwrap()
+        .expect("remote libsql scheme should reach TLS peer");
+    assert_eq!(header[0], 0x16, "no plaintext to libsql:// endpoint");
+    assert_eq!(header[1], 0x03, "TLS client handshake");
+    assert!(!error.to_string().contains("test-auth-token"));
 }
