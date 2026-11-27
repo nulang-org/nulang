@@ -471,12 +471,19 @@ impl FileFabricStreamStore {
         limit: usize,
     ) -> io::Result<Vec<FabricStreamRecord>> {
         self.ensure_state(name)?;
-        if limit == 0 {
+        let next_sequence = self
+            .states
+            .get(name)
+            .expect("stream state must exist after ensure_state")
+            .next_sequence;
+        if limit == 0 || start_sequence >= next_sequence {
             return Ok(Vec::new());
         }
 
+        let segments = list_segments(&self.stream_dir(name))?;
+        let first = segment_start_index(&segments, start_sequence);
         let mut result = Vec::with_capacity(limit.min(256));
-        for (base, path) in list_segments(&self.stream_dir(name))? {
+        for (base, path) in segments.into_iter().skip(first) {
             let records = decode_segment(&path, base, false)?;
             for record in records {
                 if record.sequence < start_sequence {
@@ -1623,6 +1630,15 @@ fn list_segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
     Ok(segments)
 }
 
+/// Select the segment containing the requested sequence, or the preceding
+/// segment if the request falls between segment base sequences. Segment bases
+/// are sorted by list_segments(). Avoid decoding unrelated historical segments.
+fn segment_start_index(segments: &[(u64, PathBuf)], start_sequence: u64) -> usize {
+    segments
+        .partition_point(|(base, _)| *base <= start_sequence)
+        .saturating_sub(1)
+}
+
 fn segment_path(dir: &Path, base_sequence: u64) -> PathBuf {
     dir.join(format!("{base_sequence:020}.seg"))
 }
@@ -1829,6 +1845,59 @@ mod tests {
             "nulang-fabric-stream-{label}-{}-{id}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn segment_seek_starts_at_last_base_not_after_requested_sequence() {
+        let segments: Vec<_> = [1_u64, 4, 9]
+            .into_iter()
+            .map(|base| (base, PathBuf::from(format!("{base}.seg"))))
+            .collect();
+        assert_eq!(segment_start_index(&[], 8), 0);
+        assert_eq!(segment_start_index(&segments, 0), 0);
+        assert_eq!(segment_start_index(&segments, 1), 0);
+        assert_eq!(segment_start_index(&segments, 3), 0);
+        assert_eq!(segment_start_index(&segments, 4), 1);
+        assert_eq!(segment_start_index(&segments, 8), 1);
+        assert_eq!(segment_start_index(&segments, 9), 2);
+        assert_eq!(segment_start_index(&segments, 100), 2);
+    }
+
+    #[test]
+    fn segmented_replay_seeks_across_boundaries_and_reopen() {
+        let root = test_dir("seek-read");
+        {
+            let mut store = FileFabricStreamStore::open(&root).unwrap();
+            store
+                .create_stream(
+                    "events",
+                    FabricStreamConfig {
+                        segment_max_bytes: 64,
+                    },
+                )
+                .unwrap();
+
+            for seq in 1..=24 {
+                store
+                    .append("events", format!("message-{seq}").as_bytes())
+                    .unwrap();
+            }
+            assert!(store.stream_info("events").unwrap().segment_count > 10);
+            let records = store.read_from("events", 19, 3).unwrap();
+            assert_eq!(
+                records.iter().map(|r| r.sequence).collect::<Vec<_>>(),
+                vec![19, 20, 21]
+            );
+            assert!(store.read_from("events", 25, 3).unwrap().is_empty());
+        }
+
+        let mut reopened = FileFabricStreamStore::open(&root).unwrap();
+        let records = reopened.read_from("events", 19, 3).unwrap();
+        assert_eq!(
+            records.iter().map(|r| r.sequence).collect::<Vec<_>>(),
+            vec![19, 20, 21]
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

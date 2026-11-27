@@ -6,6 +6,10 @@
 //! picosecond-scale "checkpoint" results.
 
 use std::collections::HashMap;
+use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use nulang::runtime::{FabricStreamConfig, FileFabricStreamStore};
 
 use criterion::{black_box, criterion_group, BatchSize, BenchmarkId, Criterion, Throughput};
 use nulang::runtime::{ActorSnapshot, JournalEntry, MemoryStore, PersistedValue, PersistenceStore};
@@ -142,10 +146,69 @@ fn bench_memory_journal_read(c: &mut Criterion) {
     group.finish();
 }
 
+/// Warm tail reads with increasingly long on-disk segment histories.
+///
+/// This intentionally measures the real segmented Fabric store, including
+/// directory enumeration, sorting, segment IO, checksum validation and record
+/// allocation. Stream creation, fsync-heavy fixture appends and cleanup are
+/// outside Criterion's timed closure. This is not an end-to-end consumer poll.
+fn bench_fabric_tail_read(c: &mut Criterion) {
+    static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
+
+    let mut group = c.benchmark_group("persist/fabric_tail_read");
+    for segments in [8usize, 128, 1_024] {
+        let root = std::env::temp_dir().join(format!(
+            "nulang-fabric-tail-bench-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut store = FileFabricStreamStore::open(&root).expect("open Fabric fixture");
+        store
+            .create_stream(
+                "events",
+                FabricStreamConfig {
+                    segment_max_bytes: 64,
+                },
+            )
+            .expect("create Fabric fixture");
+
+        // A 16-byte payload plus the frame header exceeds half a 64-byte
+        // segment, yielding exactly one durable record per segment.
+        for _ in 0..segments {
+            store
+                .append("events", &[b'x'; 16])
+                .expect("append Fabric fixture");
+        }
+        assert_eq!(store.stream_info("events").unwrap().segment_count, segments);
+        let start_sequence = segments as u64;
+        assert_eq!(
+            store.read_from("events", start_sequence, 1).unwrap()[0].sequence,
+            start_sequence
+        );
+
+        group.bench_with_input(
+            BenchmarkId::from_parameter(segments),
+            &start_sequence,
+            |b, &sequence| {
+                b.iter(|| {
+                    let records = store
+                        .read_from(black_box("events"), black_box(sequence), 1)
+                        .expect("read Fabric tail");
+                    black_box(records);
+                });
+            },
+        );
+        drop(store);
+        fs::remove_dir_all(&root).expect("clean Fabric fixture");
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_memory_store,
     bench_checkpoint_json_encode,
     bench_checkpoint_json_decode,
-    bench_memory_journal_read
+    bench_memory_journal_read,
+    bench_fabric_tail_read
 );
