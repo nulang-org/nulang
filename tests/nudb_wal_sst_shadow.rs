@@ -184,3 +184,127 @@ fn reclaimed_wal_and_foreign_manifest_are_rejected() {
     db.checkpoint().unwrap();
     assert!(db.flush_sst_shadow(&mut m, 1).is_err());
 }
+
+#[test]
+fn verified_shadow_reads_match_every_snapshot_across_intervals() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let mut m = f.manifest();
+    let commits = [
+        vec![put(b"k", b"first"), put(b"k", b"last")],
+        vec![put(b"j", b"")],
+        vec![TabletMutation::Delete { key: b"k".to_vec() }],
+        vec![],
+        vec![put(b"k", b"again")],
+        vec![TabletMutation::Delete { key: b"q".to_vec() }],
+    ];
+    for (i, mutations) in commits.into_iter().enumerate() {
+        db.commit_idempotent(id(i as u8 + 1), mutations).unwrap();
+    }
+    db.flush_sst_shadow(&mut m, 2).unwrap();
+    assert!(db.read_sst_shadow_at(&m, b"k", 3).is_err());
+    while db.flush_sst_shadow(&mut m, 2).unwrap().is_some() {}
+    let before = fs::read(f.0.join("tablet.wal")).unwrap();
+    let manifest_before = fs::read(f.0.join("sst/MANIFEST")).unwrap();
+    let check = |db: &WalBackedTablet, m: &ManifestStore| {
+        for snapshot in 0..=6 {
+            for key in [b"j", b"k", b"q", b"x"] {
+                let got = db.read_sst_shadow_at(m, key, snapshot).unwrap();
+                let want = match (key, snapshot) {
+                    (b"j", 2..=6) => DiskLookup::Value {
+                        sequence: 2,
+                        value: vec![],
+                    },
+                    (b"k", 1..=2) => DiskLookup::Value {
+                        sequence: 1,
+                        value: b"last".to_vec(),
+                    },
+                    (b"k", 3..=4) => DiskLookup::Deleted { sequence: 3 },
+                    (b"k", 5..=6) => DiskLookup::Value {
+                        sequence: 5,
+                        value: b"again".to_vec(),
+                    },
+                    (b"q", 6) => DiskLookup::Deleted { sequence: 6 },
+                    _ => DiskLookup::Missing,
+                };
+                assert_eq!(got, want, "key={key:?} snapshot={snapshot}");
+            }
+        }
+        assert!(db.read_sst_shadow_at(m, b"k", 7).is_err());
+        assert!(db.read_sst_shadow_at(m, b"z", 1).is_err());
+    };
+    check(&db, &m);
+    drop(db);
+    drop(m);
+    let db = f.open();
+    let m = ManifestStore::open(f.0.join("sst"), 7, 3).unwrap();
+    check(&db, &m);
+    assert_eq!(fs::read(f.0.join("tablet.wal")).unwrap(), before);
+    assert_eq!(fs::read(f.0.join("sst/MANIFEST")).unwrap(), manifest_before);
+}
+
+#[test]
+fn shadow_read_rejects_wrong_sequence_even_when_value_matches() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let mut m = f.manifest();
+    db.commit_idempotent(id(1), vec![put(b"k", b"same")])
+        .unwrap();
+    db.commit_idempotent(id(2), vec![]).unwrap();
+    let history = [(2, Some(b"same".as_slice()))];
+    write_immutable_table(
+        f.path(1),
+        SstHeader {
+            generation: 1,
+            min_sequence: 1,
+            max_sequence: 2,
+            key_count: 1,
+            version_count: 1,
+        },
+        [(b"k".as_slice(), history.as_slice())],
+    )
+    .unwrap();
+    m.append(nulang::database::sst_manifest::TableEntry::inspect(f.0.join("sst"), 1).unwrap())
+        .unwrap();
+    assert!(db.read_sst_shadow_at(&m, b"k", 2).is_err());
+    assert_eq!(db.read_at(b"k", 2).unwrap(), Some(b"same".as_slice()));
+}
+
+#[test]
+fn shadow_read_fails_on_corrupt_table_instead_of_falling_back() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let mut m = f.manifest();
+    db.commit_idempotent(id(1), vec![put(b"k", b"old")])
+        .unwrap();
+    db.commit_idempotent(id(2), vec![put(b"k", b"new")])
+        .unwrap();
+    db.flush_sst_shadow(&mut m, 1).unwrap();
+    db.flush_sst_shadow(&mut m, 1).unwrap();
+    let mut bytes = fs::read(f.path(2)).unwrap();
+    bytes[72] ^= 1;
+    fs::write(f.path(2), bytes).unwrap();
+    assert!(db.read_sst_shadow_at(&m, b"k", 2).is_err());
+    assert_eq!(
+        db.read_sst_shadow_at(&m, b"k", 1).unwrap(),
+        DiskLookup::Value {
+            sequence: 1,
+            value: b"old".to_vec()
+        }
+    );
+    assert_eq!(db.read_at(b"k", 2).unwrap(), Some(b"new".as_slice()));
+}
+
+#[test]
+fn shadow_read_refuses_foreign_manifest_and_reclaimed_wal() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let mut m = f.manifest();
+    db.commit_idempotent(id(1), vec![put(b"k", b"v")]).unwrap();
+    db.flush_sst_shadow(&mut m, 1).unwrap();
+    fs::create_dir(f.0.join("foreign")).unwrap();
+    let foreign = ManifestStore::create(f.0.join("foreign"), 8, 3).unwrap();
+    assert!(db.read_sst_shadow_at(&foreign, b"k", 0).is_err());
+    db.checkpoint().unwrap();
+    assert!(db.read_sst_shadow_at(&m, b"k", 1).is_err());
+}
