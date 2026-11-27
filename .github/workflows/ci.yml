@@ -114,6 +114,7 @@ jobs:
           redis-server --version
           cargo test --locked --no-default-features --features cache-server --lib runtime::cache
           cargo test --locked --no-default-features --features cache-server --lib runtime::resp_cache
+          cargo test --locked --no-default-features --features cache-server --bin nulang-fabric --test fabric_standalone
           NULANG_RESP_ORACLE=redis-server cargo run --locked --no-default-features --example resp_cache_oracle
 
       - name: Test doctests
