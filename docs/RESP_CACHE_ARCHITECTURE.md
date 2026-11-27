@@ -502,7 +502,7 @@ a backpressured socket, and injected journal sync failure.
 
 A durable cache now maintains a 48-byte checksummed journal-name.clock
 sidecar under the existing stable journal-name.lock writer lock. The
-sidecar contains the latest persisted Unix-millisecond clock observation.
+sidecar contains a persisted Unix-millisecond floor covering every guarded observation (an exact observation by default).
 At startup, recovery refuses a wall clock earlier than the durable floor.
 Correct the operating-system clock before retrying; never reset the floor
 to make a rollback start succeed. Startup publishes its clock observation
@@ -780,3 +780,33 @@ loopback-only configuration and an incomplete local probe concurrent
 with healthy RESP traffic. Metrics availability under process-wide
 descriptor exhaustion is not guaranteed. No external monitoring
 deployment, latency histogram or production alerting policy is implied.
+
+
+## Opt-in durable clock reservations
+
+Use --clock-reservation-ms 0..1000 in durable standalone mode, or call
+DurableCache::configure_clock_reservation in embedded mode. The default
+zero keeps exact-floor publication. When an observation exceeds the
+durable watermark, publish the observation plus the configured reservation
+(with saturating arithmetic), using the existing atomic file replacement
+and directory synchronization protocol. Subsequent guarded observations
+at or below the watermark need no storage write. Track the last actual
+observation separately; an in-process backwards observation still poisons
+the cache. Reservation does not alter TTL deadlines, monotonic elapsed
+time, WAL framing, or buffered/synchronous acknowledgement policies.
+
+Recovery always refuses wall time below the persisted watermark,
+including a reservation beyond the last actual observation. This can
+delay a restart by up to the configured window relative to the anchored
+clock, even after orderly shutdown. Clock anomalies may cause a longer
+delay. Do not bypass the check or delete the sidecar to recover sooner.
+Changing the policy to zero does not lower a previous persisted
+watermark. Renewal errors poison the cache before a result is returned.
+The existing on-disk format remains unchanged; older cooperating
+exact-floor readers will also refuse a premature restart.
+
+Tests cover renewal boundaries, unchanged sidecar during the reserved
+interval, TTL expiration and non-resurrection, early-restart refusal,
+in-process backwards observations, publication failure and CLI bounds.
+See benchmarks/FABRIC_RESP.md for the follow-up measurement and its
+limitations. Per-command durable WAL synchronization is unchanged.

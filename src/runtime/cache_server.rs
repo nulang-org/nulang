@@ -909,6 +909,24 @@ impl CacheShardServer {
         }
     }
 
+    /// Configure an optional durable clock reservation before polling.
+    #[cfg(unix)]
+    pub fn configure_clock_reservation(&mut self, millis: u64) -> Result<(), CacheServerError> {
+        if self.started {
+            return Err(CacheServerError::InvalidConfig(
+                "clock reservation must be configured before polling",
+            ));
+        }
+        match &mut self.backend {
+            CacheBackend::Memory(_) => Err(CacheServerError::InvalidConfig(
+                "clock reservation requires durable mode",
+            )),
+            CacheBackend::Durable { cache, .. } => cache
+                .configure_clock_reservation(millis)
+                .map_err(CacheServerError::Durability),
+        }
+    }
+
     /// Explicit maintenance checkpoint on the owning reactor thread.
     /// The reactor does not serve commands while the replacement is written.
     #[cfg(unix)]

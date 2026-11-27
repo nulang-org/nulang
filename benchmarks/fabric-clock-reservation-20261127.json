@@ -1,0 +1,705 @@
+{
+  "platform": "Linux-7.1.13-200.fc44.x86_64-x86_64-with-glibc2.43",
+  "cpu_count": 14,
+  "load_average": [
+    2.90625,
+    2.14794921875,
+    1.47998046875
+  ],
+  "binary_sha256": {
+    "fabric": "f43ed8db0a1eb4a10e3913b68a80063ffda02423e7bce67edd1e6ab7415ebe87",
+    "valkey": "5df8b59e0e1e60e50836f8795ca3517781cdfe098de92cabf478ef361047328c"
+  },
+  "valkey_version": "Valkey server v=9.0.6 sha=00000000:0 malloc=jemalloc-5.3.0 bits=64 build=5b870319988f4c3",
+  "journal_directory": "local Btrfs disk; path redacted",
+  "rounds": 3,
+  "value_bytes": 64,
+  "clients": 1,
+  "latency_unit": "batch round trip microseconds",
+  "fabric_clock_reservation_ms": 1000,
+  "expected_cases": 8,
+  "cases": [
+    {
+      "mode": "buffered",
+      "workload": "ttl-get",
+      "pipeline": 1,
+      "samples": {
+        "fabric": [
+          {
+            "commands": 256,
+            "batches": 256,
+            "ops_per_second": 50843.42489254361,
+            "batch_p50_us": 17.745,
+            "batch_p95_us": 24.799,
+            "batch_p99_us": 52.885,
+            "batch_p999_us": 86.152
+          },
+          {
+            "commands": 256,
+            "batches": 256,
+            "ops_per_second": 51503.17861121276,
+            "batch_p50_us": 17.858,
+            "batch_p95_us": 23.528,
+            "batch_p99_us": 34.697,
+            "batch_p999_us": 89.276
+          },
+          {
+            "commands": 256,
+            "batches": 256,
+            "ops_per_second": 53774.33892747501,
+            "batch_p50_us": 17.477,
+            "batch_p95_us": 19.557,
+            "batch_p99_us": 34.505,
+            "batch_p999_us": 80.972
+          }
+        ],
+        "valkey": [
+          {
+            "commands": 256,
+            "batches": 256,
+            "ops_per_second": 50217.64247784833,
+            "batch_p50_us": 19.332,
+            "batch_p95_us": 20.207,
+            "batch_p99_us": 22.397,
+            "batch_p999_us": 25.305
+          },
+          {
+            "commands": 256,
+            "batches": 256,
+            "ops_per_second": 49746.332568224374,
+            "batch_p50_us": 19.219,
+            "batch_p95_us": 21.218,
+            "batch_p99_us": 25.058,
+            "batch_p999_us": 38.825
+          },
+          {
+            "commands": 256,
+            "batches": 256,
+            "ops_per_second": 50030.15489414127,
+            "batch_p50_us": 19.305,
+            "batch_p95_us": 19.965,
+            "batch_p99_us": 23.553,
+            "batch_p999_us": 27.005
+          }
+        ]
+      },
+      "median": {
+        "fabric": {
+          "commands": 256,
+          "batches": 256,
+          "ops_per_second": 51503.17861121276,
+          "batch_p50_us": 17.745,
+          "batch_p95_us": 23.528,
+          "batch_p99_us": 34.697,
+          "batch_p999_us": 86.152
+        },
+        "valkey": {
+          "commands": 256,
+          "batches": 256,
+          "ops_per_second": 50030.15489414127,
+          "batch_p50_us": 19.305,
+          "batch_p95_us": 20.207,
+          "batch_p99_us": 23.553,
+          "batch_p999_us": 27.005
+        }
+      }
+    },
+    {
+      "mode": "buffered",
+      "workload": "ttl-get",
+      "pipeline": 32,
+      "samples": {
+        "fabric": [
+          {
+            "commands": 256,
+            "batches": 8,
+            "ops_per_second": 1072188.4371178234,
+            "batch_p50_us": 26.68,
+            "batch_p95_us": 36.487,
+            "batch_p99_us": 36.487,
+            "batch_p999_us": 36.487
+          },
+          {
+            "commands": 256,
+            "batches": 8,
+            "ops_per_second": 1151861.2007253126,
+            "batch_p50_us": 26.392,
+            "batch_p95_us": 30.564,
+            "batch_p99_us": 30.564,
+            "batch_p999_us": 30.564
+          },
+          {
+            "commands": 256,
+            "batches": 8,
+            "ops_per_second": 1133701.4910831721,
+            "batch_p50_us": 26.526,
+            "batch_p95_us": 30.957,
+            "batch_p99_us": 30.957,
+            "batch_p999_us": 30.957
+          }
+        ],
+        "valkey": [
+          {
+            "commands": 256,
+            "batches": 8,
+            "ops_per_second": 877716.291922953,
+            "batch_p50_us": 34.324,
+            "batch_p95_us": 38.43,
+            "batch_p99_us": 38.43,
+            "batch_p999_us": 38.43
+          },
+          {
+            "commands": 256,
+            "batches": 8,
+            "ops_per_second": 848477.2154038387,
+            "batch_p50_us": 34.74,
+            "batch_p95_us": 45.164,
+            "batch_p99_us": 45.164,
+            "batch_p999_us": 45.164
+          },
+          {
+            "commands": 256,
+            "batches": 8,
+            "ops_per_second": 886049.2241877593,
+            "batch_p50_us": 34.878,
+            "batch_p95_us": 37.962,
+            "batch_p99_us": 37.962,
+            "batch_p999_us": 37.962
+          }
+        ]
+      },
+      "median": {
+        "fabric": {
+          "commands": 256,
+          "batches": 8,
+          "ops_per_second": 1133701.4910831721,
+          "batch_p50_us": 26.526,
+          "batch_p95_us": 30.957,
+          "batch_p99_us": 30.957,
+          "batch_p999_us": 30.957
+        },
+        "valkey": {
+          "commands": 256,
+          "batches": 8,
+          "ops_per_second": 877716.291922953,
+          "batch_p50_us": 34.74,
+          "batch_p95_us": 38.43,
+          "batch_p99_us": 38.43,
+          "batch_p999_us": 38.43
+        }
+      }
+    },
+    {
+      "mode": "buffered",
+      "workload": "ttl-set",
+      "pipeline": 1,
+      "samples": {
+        "fabric": [
+          {
+            "commands": 256,
+            "batches": 256,
+            "ops_per_second": 39802.78342730263,
+            "batch_p50_us": 23.743,
+            "batch_p95_us": 29.633,
+            "batch_p99_us": 36.941,
+            "batch_p999_us": 56.239
+          },
+          {
+            "commands": 256,
+            "batches": 256,
+            "ops_per_second": 36886.91178884087,
+            "batch_p50_us": 24.931,
+            "batch_p95_us": 32.883,
+            "batch_p99_us": 48.46,
+            "batch_p999_us": 104.075
+          },
+          {
+            "commands": 256,
+            "batches": 256,
+            "ops_per_second": 38110.175923122246,
+            "batch_p50_us": 24.433,
+            "batch_p95_us": 30.605,
+            "batch_p99_us": 50.509,
+            "batch_p999_us": 109.363
+          }
+        ],
+        "valkey": [
+          {
+            "commands": 256,
+            "batches": 256,
+            "ops_per_second": 38586.533088931865,
+            "batch_p50_us": 24.737,
+            "batch_p95_us": 28.435,
+            "batch_p99_us": 34.251,
+            "batch_p999_us": 59.84
+          },
+          {
+            "commands": 256,
+            "batches": 256,
+            "ops_per_second": 38435.627905286805,
+            "batch_p50_us": 24.392,
+            "batch_p95_us": 30.993,
+            "batch_p99_us": 43.115,
+            "batch_p999_us": 78.138
+          },
+          {
+            "commands": 256,
+            "batches": 256,
+            "ops_per_second": 36639.9085605282,
+            "batch_p50_us": 25.02,
+            "batch_p95_us": 32.665,
+            "batch_p99_us": 58.057,
+            "batch_p999_us": 118.869
+          }
+        ]
+      },
+      "median": {
+        "fabric": {
+          "commands": 256,
+          "batches": 256,
+          "ops_per_second": 38110.175923122246,
+          "batch_p50_us": 24.433,
+          "batch_p95_us": 30.605,
+          "batch_p99_us": 48.46,
+          "batch_p999_us": 104.075
+        },
+        "valkey": {
+          "commands": 256,
+          "batches": 256,
+          "ops_per_second": 38435.627905286805,
+          "batch_p50_us": 24.737,
+          "batch_p95_us": 30.993,
+          "batch_p99_us": 43.115,
+          "batch_p999_us": 78.138
+        }
+      }
+    },
+    {
+      "mode": "buffered",
+      "workload": "ttl-set",
+      "pipeline": 32,
+      "samples": {
+        "fabric": [
+          {
+            "commands": 256,
+            "batches": 8,
+            "ops_per_second": 176797.89997244437,
+            "batch_p50_us": 175.031,
+            "batch_p95_us": 203.12,
+            "batch_p99_us": 203.12,
+            "batch_p999_us": 203.12
+          },
+          {
+            "commands": 256,
+            "batches": 8,
+            "ops_per_second": 183576.6321289224,
+            "batch_p50_us": 171.256,
+            "batch_p95_us": 180.687,
+            "batch_p99_us": 180.687,
+            "batch_p999_us": 180.687
+          },
+          {
+            "commands": 256,
+            "batches": 8,
+            "ops_per_second": 177936.19041396576,
+            "batch_p50_us": 174.039,
+            "batch_p95_us": 197.945,
+            "batch_p99_us": 197.945,
+            "batch_p999_us": 197.945
+          }
+        ],
+        "valkey": [
+          {
+            "commands": 256,
+            "batches": 8,
+            "ops_per_second": 412036.61975458066,
+            "batch_p50_us": 75.994,
+            "batch_p95_us": 83.326,
+            "batch_p99_us": 83.326,
+            "batch_p999_us": 83.326
+          },
+          {
+            "commands": 256,
+            "batches": 8,
+            "ops_per_second": 412190.5350748384,
+            "batch_p50_us": 75.401,
+            "batch_p95_us": 82.441,
+            "batch_p99_us": 82.441,
+            "batch_p999_us": 82.441
+          },
+          {
+            "commands": 256,
+            "batches": 8,
+            "ops_per_second": 398631.57255483913,
+            "batch_p50_us": 77.448,
+            "batch_p95_us": 89.37,
+            "batch_p99_us": 89.37,
+            "batch_p999_us": 89.37
+          }
+        ]
+      },
+      "median": {
+        "fabric": {
+          "commands": 256,
+          "batches": 8,
+          "ops_per_second": 177936.19041396576,
+          "batch_p50_us": 174.039,
+          "batch_p95_us": 197.945,
+          "batch_p99_us": 197.945,
+          "batch_p999_us": 197.945
+        },
+        "valkey": {
+          "commands": 256,
+          "batches": 8,
+          "ops_per_second": 412036.61975458066,
+          "batch_p50_us": 75.994,
+          "batch_p95_us": 83.326,
+          "batch_p99_us": 83.326,
+          "batch_p999_us": 83.326
+        }
+      }
+    },
+    {
+      "mode": "sync",
+      "workload": "ttl-get",
+      "pipeline": 1,
+      "samples": {
+        "fabric": [
+          {
+            "commands": 256,
+            "batches": 256,
+            "ops_per_second": 54700.00147433598,
+            "batch_p50_us": 17.626,
+            "batch_p95_us": 18.332,
+            "batch_p99_us": 22.176,
+            "batch_p999_us": 30.145
+          },
+          {
+            "commands": 256,
+            "batches": 256,
+            "ops_per_second": 54766.84406702862,
+            "batch_p50_us": 17.654,
+            "batch_p95_us": 18.852,
+            "batch_p99_us": 22.037,
+            "batch_p999_us": 27.164
+          },
+          {
+            "commands": 256,
+            "batches": 256,
+            "ops_per_second": 51519.61740244127,
+            "batch_p50_us": 17.86,
+            "batch_p95_us": 23.468,
+            "batch_p99_us": 42.189,
+            "batch_p999_us": 73.844
+          }
+        ],
+        "valkey": [
+          {
+            "commands": 256,
+            "batches": 256,
+            "ops_per_second": 43218.45833343885,
+            "batch_p50_us": 19.757,
+            "batch_p95_us": 31.349,
+            "batch_p99_us": 86.317,
+            "batch_p999_us": 305.443
+          },
+          {
+            "commands": 256,
+            "batches": 256,
+            "ops_per_second": 49067.85451764479,
+            "batch_p50_us": 19.544,
+            "batch_p95_us": 21.149,
+            "batch_p99_us": 34.693,
+            "batch_p999_us": 38.702
+          },
+          {
+            "commands": 256,
+            "batches": 256,
+            "ops_per_second": 48673.65247658579,
+            "batch_p50_us": 19.303,
+            "batch_p95_us": 23.072,
+            "batch_p99_us": 32.297,
+            "batch_p999_us": 57.281
+          }
+        ]
+      },
+      "median": {
+        "fabric": {
+          "commands": 256,
+          "batches": 256,
+          "ops_per_second": 54700.00147433598,
+          "batch_p50_us": 17.654,
+          "batch_p95_us": 18.852,
+          "batch_p99_us": 22.176,
+          "batch_p999_us": 30.145
+        },
+        "valkey": {
+          "commands": 256,
+          "batches": 256,
+          "ops_per_second": 48673.65247658579,
+          "batch_p50_us": 19.544,
+          "batch_p95_us": 23.072,
+          "batch_p99_us": 34.693,
+          "batch_p999_us": 57.281
+        }
+      }
+    },
+    {
+      "mode": "sync",
+      "workload": "ttl-get",
+      "pipeline": 32,
+      "samples": {
+        "fabric": [
+          {
+            "commands": 256,
+            "batches": 8,
+            "ops_per_second": 1130053.2361016695,
+            "batch_p50_us": 26.509,
+            "batch_p95_us": 30.409,
+            "batch_p99_us": 30.409,
+            "batch_p999_us": 30.409
+          },
+          {
+            "commands": 256,
+            "batches": 8,
+            "ops_per_second": 1144932.33271018,
+            "batch_p50_us": 26.479,
+            "batch_p95_us": 31.124,
+            "batch_p99_us": 31.124,
+            "batch_p999_us": 31.124
+          },
+          {
+            "commands": 256,
+            "batches": 8,
+            "ops_per_second": 1148522.847080464,
+            "batch_p50_us": 26.352,
+            "batch_p95_us": 30.94,
+            "batch_p99_us": 30.94,
+            "batch_p999_us": 30.94
+          }
+        ],
+        "valkey": [
+          {
+            "commands": 256,
+            "batches": 8,
+            "ops_per_second": 914680.9871408715,
+            "batch_p50_us": 33.317,
+            "batch_p95_us": 37.54,
+            "batch_p99_us": 37.54,
+            "batch_p999_us": 37.54
+          },
+          {
+            "commands": 256,
+            "batches": 8,
+            "ops_per_second": 884604.0878384215,
+            "batch_p50_us": 34.223,
+            "batch_p95_us": 39.434,
+            "batch_p99_us": 39.434,
+            "batch_p999_us": 39.434
+          },
+          {
+            "commands": 256,
+            "batches": 8,
+            "ops_per_second": 878767.8027715513,
+            "batch_p50_us": 34.484,
+            "batch_p95_us": 39.93,
+            "batch_p99_us": 39.93,
+            "batch_p999_us": 39.93
+          }
+        ]
+      },
+      "median": {
+        "fabric": {
+          "commands": 256,
+          "batches": 8,
+          "ops_per_second": 1144932.33271018,
+          "batch_p50_us": 26.479,
+          "batch_p95_us": 30.94,
+          "batch_p99_us": 30.94,
+          "batch_p999_us": 30.94
+        },
+        "valkey": {
+          "commands": 256,
+          "batches": 8,
+          "ops_per_second": 884604.0878384215,
+          "batch_p50_us": 34.223,
+          "batch_p95_us": 39.434,
+          "batch_p99_us": 39.434,
+          "batch_p999_us": 39.434
+        }
+      }
+    },
+    {
+      "mode": "sync",
+      "workload": "ttl-set",
+      "pipeline": 1,
+      "samples": {
+        "fabric": [
+          {
+            "commands": 256,
+            "batches": 256,
+            "ops_per_second": 237.17019426618953,
+            "batch_p50_us": 3607.441,
+            "batch_p95_us": 4309.33,
+            "batch_p99_us": 23498.52,
+            "batch_p999_us": 27283.495
+          },
+          {
+            "commands": 256,
+            "batches": 256,
+            "ops_per_second": 247.8784857446075,
+            "batch_p50_us": 3964.011,
+            "batch_p95_us": 4992.801,
+            "batch_p99_us": 6049.411,
+            "batch_p999_us": 11556.56
+          },
+          {
+            "commands": 256,
+            "batches": 256,
+            "ops_per_second": 247.75846648820965,
+            "batch_p50_us": 3804.962,
+            "batch_p95_us": 4676.643,
+            "batch_p99_us": 11836.072,
+            "batch_p999_us": 20554.562
+          }
+        ],
+        "valkey": [
+          {
+            "commands": 256,
+            "batches": 256,
+            "ops_per_second": 254.69554112873342,
+            "batch_p50_us": 3884.438,
+            "batch_p95_us": 4280.875,
+            "batch_p99_us": 5466.471,
+            "batch_p999_us": 18987.762
+          },
+          {
+            "commands": 256,
+            "batches": 256,
+            "ops_per_second": 227.59157085955007,
+            "batch_p50_us": 3721.352,
+            "batch_p95_us": 4256.038,
+            "batch_p99_us": 21825.749,
+            "batch_p999_us": 25289.181
+          },
+          {
+            "commands": 256,
+            "batches": 256,
+            "ops_per_second": 235.91143412202965,
+            "batch_p50_us": 3822.24,
+            "batch_p95_us": 4406.495,
+            "batch_p99_us": 23972.774,
+            "batch_p999_us": 44310.075
+          }
+        ]
+      },
+      "median": {
+        "fabric": {
+          "commands": 256,
+          "batches": 256,
+          "ops_per_second": 247.75846648820965,
+          "batch_p50_us": 3804.962,
+          "batch_p95_us": 4676.643,
+          "batch_p99_us": 11836.072,
+          "batch_p999_us": 20554.562
+        },
+        "valkey": {
+          "commands": 256,
+          "batches": 256,
+          "ops_per_second": 235.91143412202965,
+          "batch_p50_us": 3822.24,
+          "batch_p95_us": 4280.875,
+          "batch_p99_us": 21825.749,
+          "batch_p999_us": 25289.181
+        }
+      }
+    },
+    {
+      "mode": "sync",
+      "workload": "ttl-set",
+      "pipeline": 32,
+      "samples": {
+        "fabric": [
+          {
+            "commands": 256,
+            "batches": 8,
+            "ops_per_second": 159.33590844808657,
+            "batch_p50_us": 145822.193,
+            "batch_p95_us": 303277.813,
+            "batch_p99_us": 303277.813,
+            "batch_p999_us": 303277.813
+          },
+          {
+            "commands": 256,
+            "batches": 8,
+            "ops_per_second": 263.22182885136544,
+            "batch_p50_us": 122956.094,
+            "batch_p95_us": 130857.94,
+            "batch_p99_us": 130857.94,
+            "batch_p999_us": 130857.94
+          },
+          {
+            "commands": 256,
+            "batches": 8,
+            "ops_per_second": 273.181681836899,
+            "batch_p50_us": 116158.729,
+            "batch_p95_us": 126635.793,
+            "batch_p99_us": 126635.793,
+            "batch_p999_us": 126635.793
+          }
+        ],
+        "valkey": [
+          {
+            "commands": 256,
+            "batches": 8,
+            "ops_per_second": 7885.819737430542,
+            "batch_p50_us": 4001.67,
+            "batch_p95_us": 4354.391,
+            "batch_p99_us": 4354.391,
+            "batch_p999_us": 4354.391
+          },
+          {
+            "commands": 256,
+            "batches": 8,
+            "ops_per_second": 5142.624462058379,
+            "batch_p50_us": 4310.827,
+            "batch_p95_us": 18561.792,
+            "batch_p99_us": 18561.792,
+            "batch_p999_us": 18561.792
+          },
+          {
+            "commands": 256,
+            "batches": 8,
+            "ops_per_second": 8105.382895596747,
+            "batch_p50_us": 3836.503,
+            "batch_p95_us": 4520.791,
+            "batch_p99_us": 4520.791,
+            "batch_p999_us": 4520.791
+          }
+        ]
+      },
+      "median": {
+        "fabric": {
+          "commands": 256,
+          "batches": 8,
+          "ops_per_second": 263.22182885136544,
+          "batch_p50_us": 122956.094,
+          "batch_p95_us": 130857.94,
+          "batch_p99_us": 130857.94,
+          "batch_p999_us": 130857.94
+        },
+        "valkey": {
+          "commands": 256,
+          "batches": 8,
+          "ops_per_second": 7885.819737430542,
+          "batch_p50_us": 4001.67,
+          "batch_p95_us": 4520.791,
+          "batch_p99_us": 4520.791,
+          "batch_p999_us": 4520.791
+        }
+      }
+    }
+  ],
+  "source": "clock reservation candidate on 9d27f51bb; optimized focused harness, audited dependency versions",
+  "cpu_model": "Intel Core Ultra 5 135U"
+}

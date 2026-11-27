@@ -10,7 +10,7 @@ mod unix {
             CacheOperationalSnapshot, CacheServerClock, CacheServerConfig, CacheShardServer,
             TLS_RESERVATION_BYTES,
         },
-        cache_wal::{WalLimits, WalSync},
+        cache_wal::{WalLimits, WalSync, MAX_CLOCK_RESERVATION_MS},
     };
     use std::{collections::HashSet, io::Write, net::SocketAddr, path::PathBuf};
 
@@ -19,6 +19,7 @@ mod unix {
     --max-entries N --max-arena-bytes N --max-connections N --max-connections-per-peer N
     --max-connection-bytes N --max-input-bytes N --max-output-bytes N --max-pipeline-depth N
     --max-record-bytes N --max-journal-bytes N
+    --clock-reservation-ms 0..1000 (default 0; may delay restart)
     --checkpoint-percent 0..99 (default 70; 0 disables)
     --checkpoint-min-savings-percent 1..99 (default 10)
     --checkpoint-retry-ms N (default 5000)
@@ -46,6 +47,7 @@ Durable modes require a private journal path. Memory mode is the default.";
         wal: WalLimits,
         checkpoint: AutomaticCheckpointConfig,
         shutdown_drain_ms: u64,
+        clock_reservation_ms: u64,
         metrics_bind: Option<SocketAddr>,
         tls_ca: Option<PathBuf>,
         tls_cert: Option<PathBuf>,
@@ -74,6 +76,7 @@ Durable modes require a private journal path. Memory mode is the default.";
                 wal: WalLimits::default(),
                 checkpoint: AutomaticCheckpointConfig::default(),
                 shutdown_drain_ms: 5000,
+                clock_reservation_ms: 0,
                 metrics_bind: None,
                 tls_ca: None,
                 tls_cert: None,
@@ -147,6 +150,13 @@ Durable modes require a private journal path. Memory mode is the default.";
                         }
                     }
 
+                    "--clock-reservation-ms" => {
+                        config.clock_reservation_ms =
+                            value.parse().map_err(|_| "invalid clock reservation")?;
+                        if config.clock_reservation_ms > MAX_CLOCK_RESERVATION_MS {
+                            return Err("clock reservation exceeds 1000 ms".into());
+                        }
+                    }
                     "--metrics-bind" => {
                         let address: SocketAddr = value
                             .parse()
@@ -179,6 +189,9 @@ Durable modes require a private journal path. Memory mode is the default.";
             }
             if (config.mode == Mode::Memory) != config.journal.is_none() {
                 return Err("a journal path is required exactly in buffered or sync mode".into());
+            }
+            if config.mode == Mode::Memory && seen.contains("--clock-reservation-ms") {
+                return Err("clock reservation requires durable mode".into());
             }
             if config.mode == Mode::Memory
                 && (seen.contains("--max-record-bytes") || seen.contains("--max-journal-bytes"))
@@ -273,6 +286,11 @@ Durable modes require a private journal path. Memory mode is the default.";
             if let Some(tls) = tls {
                 server
                     .enable_mutual_tls(tls)
+                    .map_err(|e| format!("{e:?}"))?;
+            }
+            if self.mode != Mode::Memory {
+                server
+                    .configure_clock_reservation(self.clock_reservation_ms)
                     .map_err(|e| format!("{e:?}"))?;
             }
             if self.mode != Mode::Memory && self.checkpoint.trigger_percent != 0 {
@@ -816,6 +834,34 @@ Durable modes require a private journal path. Memory mode is the default.";
             assert!(parse(&["--metrics-bind", "0.0.0.0:9090"]).is_err());
             assert!(parse(&["--metrics-bind", "127.0.0.1:0"]).is_err());
             assert!(parse(&["--metrics-bind", "[::1]:9090"]).is_ok());
+        }
+
+        #[test]
+        fn clock_reservation_is_bounded_opt_in_and_durable_only() {
+            assert_eq!(parse(&[]).unwrap().clock_reservation_ms, 0);
+            assert!(parse(&["--clock-reservation-ms", "250"]).is_err());
+            assert!(parse(&[
+                "--mode",
+                "sync",
+                "--journal",
+                "cache.wal",
+                "--clock-reservation-ms",
+                "1001"
+            ])
+            .is_err());
+            assert_eq!(
+                parse(&[
+                    "--mode",
+                    "sync",
+                    "--journal",
+                    "cache.wal",
+                    "--clock-reservation-ms",
+                    "1000"
+                ])
+                .unwrap()
+                .clock_reservation_ms,
+                1000
+            );
         }
 
         #[test]

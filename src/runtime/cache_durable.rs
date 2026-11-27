@@ -331,6 +331,14 @@ impl DurableCache {
             poisoned: false,
         })
     }
+    /// Opt-in future floor reservation. Existing durable floors never shrink;
+    /// reopening before the persisted reservation ends fails closed.
+    pub fn configure_clock_reservation(&mut self, millis: u64) -> Result<(), DurableError> {
+        self.healthy()?;
+        self.clock.configure_reservation(millis)?;
+        Ok(())
+    }
+
     fn anchored_unix(&self, now_ms: u64) -> Result<u64, DurableError> {
         let elapsed = now_ms
             .checked_sub(self.anchor.monotonic_ms)
@@ -1137,5 +1145,70 @@ mod tests {
         assert_eq!(recovered.get(b"ttl", 0).unwrap(), None);
         drop(recovered);
         assert!(try_open(&tmp, 1050).is_err());
+    }
+
+    #[test]
+    fn clock_reservation_covers_observations_without_rewriting_floor() {
+        let tmp = Temp::new();
+        let mut cache = tmp.open(time(0, 1000));
+        cache.configure_clock_reservation(250).unwrap();
+        cache
+            .set_bytes(b"k", b"v", Some(500), time(10, 1010))
+            .unwrap();
+        let path = tmp.0.join("cache.wal.clock");
+        let original = std::fs::read(&path).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(original[8..16].try_into().unwrap()),
+            1260
+        );
+        assert_eq!(cache.ttl(b"k", 100).unwrap(), CacheTtl::RemainingMs(410));
+        assert_eq!(cache.ttl(b"k", 260).unwrap(), CacheTtl::RemainingMs(250));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(
+            cache.get(b"k", 261).unwrap(),
+            Some(CacheValueView::Bytes(b"v"))
+        );
+        let renewed = std::fs::read(&path).unwrap();
+        assert_eq!(u64::from_le_bytes(renewed[8..16].try_into().unwrap()), 1511);
+        drop(cache);
+        assert!(try_open(&tmp, 1510).is_err());
+        assert_eq!(try_open(&tmp, 1511).unwrap().get(b"k", 0).unwrap(), None);
+    }
+
+    #[test]
+    fn reserved_floor_does_not_permit_in_process_regression() {
+        let tmp = Temp::new();
+        let mut cache = tmp.open(time(0, 1000));
+        cache.configure_clock_reservation(250).unwrap();
+        cache
+            .set_bytes(b"k", b"v", Some(1000), time(10, 1010))
+            .unwrap();
+        assert_eq!(cache.ttl(b"k", 100).unwrap(), CacheTtl::RemainingMs(910));
+        assert!(cache.ttl(b"k", 99).is_err());
+        assert!(cache.is_poisoned());
+    }
+
+    #[test]
+    fn reserved_floor_survives_expiry_and_fails_closed_at_renewal() {
+        let tmp = Temp::new();
+        let mut cache = tmp.open(time(0, 1000));
+        cache.configure_clock_reservation(250).unwrap();
+        cache
+            .set_bytes(b"k", b"v", Some(10), time(10, 1010))
+            .unwrap();
+        assert_eq!(cache.get(b"k", 21).unwrap(), None);
+        drop(cache);
+        assert!(try_open(&tmp, 1021).is_err());
+        let mut cache = try_open(&tmp, 1260).unwrap();
+        assert_eq!(cache.get(b"k", 0).unwrap(), None);
+        cache.configure_clock_reservation(250).unwrap();
+        cache
+            .set_bytes(b"live", b"v", Some(1000), time(1, 1261))
+            .unwrap();
+        let path = tmp.0.join("cache.wal.clock");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(cache.get(b"live", 252).is_err());
+        assert!(cache.is_poisoned());
     }
 }
