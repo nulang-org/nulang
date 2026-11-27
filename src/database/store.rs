@@ -358,6 +358,27 @@ impl WalBackedTablet {
         self.tablet.read_latest(key)
     }
 
+    /// Materialize a bounded, verified shadow interval from the complete WAL.
+    /// This never changes the WAL, checkpoint, receipts, or visible tablet state.
+    #[cfg(unix)]
+    pub fn flush_sst_shadow(
+        &self,
+        manifest: &mut super::sst_manifest::ManifestStore,
+        max_records: usize,
+    ) -> std::io::Result<Option<super::sst_manifest::TableEntry>> {
+        if self.recovery_required
+            || self.wal.is_poisoned()
+            || self.oldest_retained_snapshot() != 0
+            || self.wal.base_sequence() != 0
+            || self.wal.last_sequence() != self.current_sequence()
+        {
+            return Err(std::io::Error::other(
+                "shadow flush requires recovered complete unpruned WAL",
+            ));
+        }
+        super::wal_sst_shadow::flush(&self.wal, self.descriptor(), manifest, max_records)
+    }
+
     /// Atomically publish a checkpoint without reclaiming the WAL.
     ///
     /// This is a valid crash state and is intentionally public so operators can
