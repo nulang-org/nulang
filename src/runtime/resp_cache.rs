@@ -277,8 +277,9 @@ fn execute_incr(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, o
     let key = command.args().next().expect("validated argument");
     match store.increment(key, 1, now_ms) {
         Ok(value) => write_integer(out, value),
-        Err(CacheIncrementError::NotInteger | CacheIncrementError::Overflow) => {
-            write_error(out, ERR_INTEGER)
+        Err(CacheIncrementError::NotInteger) => write_error(out, ERR_INTEGER),
+        Err(CacheIncrementError::Overflow) => {
+            write_error(out, b"ERR increment or decrement would overflow")
         }
     }
 }
@@ -323,7 +324,8 @@ fn execute_ttl(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, ou
     let ttl = match store.ttl(key, now_ms) {
         CacheTtl::Missing => -2,
         CacheTtl::Persistent => -1,
-        CacheTtl::RemainingMs(ms) => (ms / 1_000) as i64,
+        // Redis rounds to the nearest second. Divide first to avoid overflow.
+        CacheTtl::RemainingMs(ms) => (ms / 1_000 + u64::from(ms % 1_000 >= 500)) as i64,
     };
     write_integer(out, ttl);
 }
