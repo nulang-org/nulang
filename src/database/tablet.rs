@@ -969,6 +969,8 @@ mod recovered_snapshot_lookup_tests {
             descriptor,
             TabletSnapshotState {
                 current_sequence: 3072,
+                oldest_retained_snapshot: None,
+                receipts: Vec::new(),
                 rows: vec![TabletSnapshotRow {
                     key: b"key".to_vec(),
                     versions: versions.clone(),
