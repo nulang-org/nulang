@@ -98,6 +98,12 @@ impl Manifest {
             entries: Vec::new(),
         })
     }
+    pub fn tablet_id(&self) -> u64 {
+        self.tablet_id
+    }
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
     pub fn entries(&self) -> &[TableEntry] {
         &self.entries
     }
@@ -329,6 +335,22 @@ impl ManifestStore {
     }
     pub fn requires_reopen(&self) -> bool {
         self.requires_reopen
+    }
+    pub(crate) fn directory(&self) -> &Path {
+        &self.dir
+    }
+    pub(crate) fn open_verified_table(&self, entry: &TableEntry) -> io::Result<IndexedSst> {
+        let path = table_path(&self.dir, entry.generation);
+        reject_alias(&path)?;
+        let table = IndexedSst::open(path)?;
+        if table.generation() != entry.generation
+            || table.sequence_interval() != entry.sequence_interval()
+            || table.file_bytes() != entry.file_bytes
+            || table.checksum() != entry.checksum
+        {
+            return Err(invalid("manifest table identity mismatch"));
+        }
+        Ok(table)
     }
     pub fn append(&mut self, entry: TableEntry) -> io::Result<()> {
         self.append_with_hook(entry, |_| Ok(()))

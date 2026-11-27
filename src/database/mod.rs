@@ -12,6 +12,8 @@ pub mod sst_manifest;
 pub mod store;
 pub mod tablet;
 pub mod wal;
+#[cfg(unix)]
+mod wal_sst_shadow;
 
 #[cfg(test)]
 mod interruption;
