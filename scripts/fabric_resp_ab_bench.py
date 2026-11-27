@@ -91,7 +91,7 @@ def free_port() -> int:
 
 
 @contextmanager
-def server(binary: Path, engine: str, mode: str, root: Path):
+def server(binary: Path, engine: str, mode: str, root: Path, clock_reservation_ms: int = 0):
     with tempfile.TemporaryDirectory(prefix=f"{engine}-{mode}-", dir=root) as tmp:
         path = Path(tmp)
         port = free_port()
@@ -99,6 +99,8 @@ def server(binary: Path, engine: str, mode: str, root: Path):
             command = [str(binary), "--bind", f"127.0.0.1:{port}", "--mode", mode]
             if mode != "memory":
                 command += ["--journal", str(path / "cache.wal"), "--checkpoint-percent", "0"]
+                if clock_reservation_ms:
+                    command += ["--clock-reservation-ms", str(clock_reservation_ms)]
         else:
             command = [str(binary), "--bind", "127.0.0.1", "--port", str(port),
                        "--save", "", "--appendonly", "no" if mode == "memory" else "yes",
@@ -151,10 +153,15 @@ def main() -> None:
     p.add_argument("--rounds", type=int, default=3)
     p.add_argument("--memory-commands", type=int, default=4096)
     p.add_argument("--durable-commands", type=int, default=256)
+    p.add_argument("--fabric-clock-reservation-ms", type=int, default=0, choices=range(1001), metavar="0..1000")
+    p.add_argument("--mode", action="append", choices=("memory", "buffered", "sync"))
+    p.add_argument("--workload", action="append", choices=("get", "set", "ttl-get", "ttl-set"))
     args = p.parse_args()
     if args.rounds <= 0 or any(n <= 0 or n % 32 for n in (args.memory_commands, args.durable_commands)):
         p.error("rounds must be positive and command counts positive multiples of 32")
     binaries = {"fabric": args.fabric.resolve(), "valkey": args.valkey.resolve()}
+    modes = args.mode or ["memory", "buffered", "sync"]
+    workloads = args.workload or ["get", "set", "ttl-get", "ttl-set"]
     report = {
         "platform": platform.platform(), "cpu_count": os.cpu_count(),
         "load_average": os.getloadavg(),
@@ -162,17 +169,19 @@ def main() -> None:
         "valkey_version": subprocess.check_output([str(binaries["valkey"]), "--version"], text=True).strip(),
         "journal_directory": str(args.journal_dir.resolve()), "rounds": args.rounds,
         "value_bytes": len(VALUE), "clients": 1, "latency_unit": "batch round trip microseconds",
+        "fabric_clock_reservation_ms": args.fabric_clock_reservation_ms,
+        "expected_cases": len(modes) * len(workloads) * 2,
         "cases": [],
     }
-    for mode in ("memory", "buffered", "sync"):
+    for mode in modes:
         commands = args.memory_commands if mode == "memory" else args.durable_commands
-        for name in ("get", "set", "ttl-get", "ttl-set"):
+        for name in workloads:
             for depth in (1, 32):
                 samples = {engine: [] for engine in binaries}
                 for n in range(args.rounds):
                     order = ("fabric", "valkey") if n % 2 == 0 else ("valkey", "fabric")
                     for engine in order:
-                        with server(binaries[engine], engine, mode, args.journal_dir) as sock:
+                        with server(binaries[engine], engine, mode, args.journal_dir, args.fabric_clock_reservation_ms) as sock:
                             samples[engine].append(measure(sock, name, depth, commands))
                 case = {"mode": mode, "workload": name, "pipeline": depth,
                         "samples": samples, "median": {e: summarize(s) for e, s in samples.items()}}

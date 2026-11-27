@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Fabric durable clock reservation — 2026-11-27
+- **Add opt-in 0–1000 ms durable clock reservations**, preserving persisted observation coverage and fail-closed rollback behavior while avoiding repeated sidecar synchronization within the window. Exact mode remains default; reserved mode may delay restart. Add comparative TTL benchmark evidence without changing dependencies or mutation acknowledgement semantics.
+
 ### Fabric operational observability — 2026-11-27
 - **Expose shard-local operational snapshots and an opt-in loopback metrics/health listener**, with bounded request handling, stale-snapshot failure, connection/admission counters, cache and journal gauges and automatic checkpoint progress. No new dependencies.
 

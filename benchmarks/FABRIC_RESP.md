@@ -17,7 +17,7 @@ The script uses private temporary directories and loopback listeners only,
 starts fresh processes for every sample, verifies every response, warms up
 each workload, alternates engine order, and records raw per-round summaries
 and binary SHA-256 hashes. Failed responses abort the run. An output with
-fewer than 24 cases is incomplete. The test contract can be checked with:
+fewer than 24 cases is incomplete for the default matrix; selected --mode/--workload runs declare expected_cases. The test contract can be checked with:
 
     python3 -m unittest discover -s scripts/tests -p test_fabric_resp_ab_bench.py
 
@@ -87,3 +87,34 @@ The raw initial baseline is recorded in fabric-resp-baseline-20261127.json.
 | sync | ttl-set | 32 | 212 | 20,329 |
 
 The measured memory path is competitive on this narrow workload; the durable TTL floor and per-command sync path dominate the slow cases. These are candidates for profiling, not established causal attribution. The benchmark is intentionally not a CI performance gate.
+
+
+## Clock reservation follow-up
+
+The optional clock-reservation policy persists an upper watermark before
+serving covered observations. With --fabric-clock-reservation-ms 1000,
+Fabric can reuse that watermark for up to one second of observed time
+while preserving the fail-closed restart rule. Zero (the default) retains
+exact-floor publication. Restart may be refused until the wall clock
+reaches the watermark, even after orderly shutdown. No durability claim
+is relaxed to obtain these results.
+
+The follow-up used the same host, workload, three rounds, and optimized
+focused harness methodology, with --mode buffered --mode sync
+--workload ttl-get --workload ttl-set --fabric-clock-reservation-ms 1000.
+It is a separate run, not a paired exact-versus-reserved trial. Disk load
+and Valkey throughput varied between runs. Small samples do not support
+tail-latency claims. Raw results: fabric-clock-reservation-20261127.json.
+
+| Mode | Workload | Pipeline | Prior exact Fabric ops/s | Reserved Fabric ops/s | Follow-up Valkey ops/s |
+|---|---|---:|---:|---:|---:|
+| buffered | ttl-get | 1 | 688 | 51,503 | 50,030 |
+| buffered | ttl-get | 32 | 509 | 1,133,701 | 877,716 |
+| buffered | ttl-set | 1 | 166 | 38,110 | 38,436 |
+| buffered | ttl-set | 32 | 297 | 177,936 | 412,037 |
+| sync | ttl-get | 1 | 102 | 54,700 | 48,674 |
+| sync | ttl-get | 32 | 282 | 1,144,932 | 884,604 |
+| sync | ttl-set | 1 | 60 | 248 | 236 |
+| sync | ttl-set | 32 | 212 | 263 | 7,886 |
+
+TTL GET and buffered TTL SET improve substantially; synchronous SET still pays per-mutation WAL synchronization. Group commit is the next bottleneck to address. No production capacity claim.

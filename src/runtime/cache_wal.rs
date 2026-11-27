@@ -101,7 +101,12 @@ pub struct CheckpointReport {
 pub(super) struct ClockFloor {
     path: PathBuf,
     unix_ms: u64,
+    observed_ms: u64,
+    reservation_ms: u64,
 }
+
+/// Maximum opt-in advance reservation; bounds additional restart delay.
+pub const MAX_CLOCK_RESERVATION_MS: u64 = 1000;
 
 const CLOCK_MAGIC: &[u8; 8] = b"NLCLK001";
 
@@ -160,6 +165,8 @@ impl ClockFloor {
         let mut clock = Self {
             path,
             unix_ms: previous.unwrap_or(0),
+            observed_ms: now,
+            reservation_ms: 0,
         };
         if previous.is_none() || previous != Some(now) {
             clock.publish(now)?;
@@ -174,13 +181,27 @@ impl ClockFloor {
         Ok(clock)
     }
 
+    pub(super) fn configure_reservation(&mut self, millis: u64) -> io::Result<()> {
+        if millis > MAX_CLOCK_RESERVATION_MS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "clock reservation exceeds maximum",
+            ));
+        }
+        self.reservation_ms = millis;
+        Ok(())
+    }
+
     pub(super) fn advance(&mut self, now: u64) -> io::Result<()> {
-        if now < self.unix_ms {
+        if now < self.observed_ms {
             return Err(invalid("cache clock moved backwards"));
         }
-        if now != self.unix_ms {
-            self.publish(now)?;
+        if now > self.unix_ms {
+            // A persisted upper watermark covers every acknowledged
+            // observation. Recovery still refuses any wall time below it.
+            self.publish(now.saturating_add(self.reservation_ms))?;
         }
+        self.observed_ms = now;
         Ok(())
     }
 
