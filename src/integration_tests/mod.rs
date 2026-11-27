@@ -4,6 +4,11 @@
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature = "ai-runtime", feature = "sqlite", unix))]
+    mod llm_hard_kill;
+    #[cfg(all(feature = "ai-runtime", feature = "sqlite", unix))]
+    mod llm_provider_commit_hard_kill;
+
     use crate::bytecode::OpCode;
     use crate::lexer::Lexer;
     use crate::parser::Parser;

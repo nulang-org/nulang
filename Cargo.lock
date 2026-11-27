@@ -2428,6 +2428,7 @@ name = "nulang"
 version = "0.1.0"
 dependencies = [
  "ariadne",
+ "async-trait",
  "blake3",
  "borsh",
  "cranelift",
