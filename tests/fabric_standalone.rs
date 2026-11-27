@@ -240,6 +240,12 @@ fn mutual_tls_requires_trusted_client_certificate() {
             cert_path.to_str().unwrap(),
             "--tls-key",
             key_path.to_str().unwrap(),
+            "--max-input-bytes",
+            "262144",
+            "--max-output-bytes",
+            "524288",
+            "--max-connections",
+            "8",
         ],
     );
     let mut roots = RootCertStore::empty();
@@ -297,15 +303,14 @@ fn mutual_tls_requires_trusted_client_certificate() {
         .write_all(SET)
         .and_then(|_| untrusted.read_exact(&mut [0; 5]))
         .is_err());
-    let mut allowed = connect(
-        ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_client_auth_cert(
-                vec![client_cert.der().clone()],
-                PrivatePkcs8KeyDer::from(client_key.serialize_der()).into(),
-            )
-            .unwrap(),
-    );
+    let trusted = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(
+            vec![client_cert.der().clone()],
+            PrivatePkcs8KeyDer::from(client_key.serialize_der()).into(),
+        )
+        .unwrap();
+    let mut allowed = connect(trusted.clone());
     allowed.write_all(GET).unwrap();
     let mut result = [0; 5];
     allowed.read_exact(&mut result).unwrap();
@@ -332,4 +337,51 @@ fn mutual_tls_requires_trusted_client_certificate() {
     let mut actual = vec![0; expected.len()];
     allowed.read_exact(&mut actual).unwrap();
     assert_eq!(actual, expected);
+
+    // A single MGET would amplify this 128 KiB value into >512 KiB.
+    let mut amplified = connect(trusted.clone());
+    amplified
+        .write_all(b"*6\r\n$4\r\nMGET\r\n$1\r\nk\r\n$1\r\nk\r\n$1\r\nk\r\n$1\r\nk\r\n$1\r\nk\r\n")
+        .unwrap();
+    match amplified.read(&mut [0; 1]) {
+        Ok(0) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+            ) => {}
+        other => panic!("amplified response was not rejected: {other:?}"),
+    }
+
+    // A >256 KiB SET must not mutate the store, even with a valid certificate.
+    let mut oversized = connect(trusted.clone());
+    let mut large_set = b"*3\r\n$3\r\nSET\r\n$8\r\nrejected\r\n$307200\r\n".to_vec();
+    large_set.extend(std::iter::repeat_n(b'x', 307200));
+    large_set.extend_from_slice(b"\r\n");
+    let result = oversized
+        .write_all(&large_set)
+        .and_then(|_| oversized.read(&mut [0; 1]));
+    match result {
+        Ok(0) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+            ) => {}
+        other => panic!("oversized request was not rejected: {other:?}"),
+    }
+    let mut healthy = connect(trusted);
+    healthy
+        .write_all(b"*2\r\n$3\r\nGET\r\n$8\r\nrejected\r\n")
+        .unwrap();
+    let mut miss = [0; 5];
+    healthy.read_exact(&mut miss).unwrap();
+    assert_eq!(&miss, b"$-1\r\n");
+    // Existing authenticated client still works after both failures.
+    allowed.write_all(b"*1\r\n$4\r\nPING\r\n").unwrap();
+    let mut pong = [0; 7];
+    allowed.read_exact(&mut pong).unwrap();
+    assert_eq!(&pong, b"+PONG\r\n");
 }

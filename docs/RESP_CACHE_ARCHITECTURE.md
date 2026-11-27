@@ -584,3 +584,37 @@ Full locked-workspace CI, exact security-baseline integration, WAN load
 and adversarial handshake/resource qualification remain required before
 production remote exposure. Embedded users must explicitly enable mutual
 TLS before polling; the existing low-level plaintext bind API is unchanged.
+
+
+## Adversarial transport admission qualification
+
+The standalone --max-pipeline-depth option defaults to 1024. The reactor
+preflights the number of complete RESP commands in each buffered read
+batch before execution, closing an over-limit or malformed batch before
+executing its commands. An incomplete trailing frame does not count
+until complete. This is a per-buffered-batch limit, not an atomic
+transaction or a count of all commands a client has ever sent; TCP/TLS
+fragmentation can separate batches and earlier accepted batches remain
+committed. The preflight adds a bounded parsing pass.
+
+The reactor now caps its poll timeout by the earliest pending TLS
+handshake deadline, independently of the expiration-sweep interval.
+Stalled handshakes occupy connection slots until disconnected or timed
+out; timed-out and excess connections release admission and buffer
+reservations. The deadline is checked in the reactor, not an independent
+preemptive timer during synchronous work.
+
+Response serialization is checked against the pre-reserved capacity and
+estimated reply size in release builds. A violated estimate closes that
+connection before an uncharged vector can remain in the buffer pool.
+This is defense in depth, not a guarantee against a transient allocation
+if an estimator is wrong; an already executed mutation may have committed.
+
+The loopback tests qualify stalled handshake reclamation, configured
+connection admission, exact-depth and fragmented pipeline handling,
+authenticated 300 KiB input rejection under a 256 KiB cap, and MGET
+amplification rejection under a 512 KiB output cap. A separate existing
+authenticated client remains usable after both oversized request and reply
+failures. Continuous accept floods, per-peer quotas, aggregate TLS memory,
+slow authenticated readers, workload fairness, WAN and long-running load
+tests still require independent qualification.

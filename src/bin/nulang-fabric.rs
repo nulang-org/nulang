@@ -16,7 +16,7 @@ mod unix {
     const HELP: &str =
         "nulang-fabric [--bind 127.0.0.1:6380] [--mode memory|buffered|sync] [--journal PATH]
     --max-entries N --max-arena-bytes N --max-connections N
-    --max-connection-bytes N --max-input-bytes N --max-output-bytes N
+    --max-connection-bytes N --max-input-bytes N --max-output-bytes N --max-pipeline-depth N
     --max-record-bytes N --max-journal-bytes N
     --checkpoint-percent 0..99 (default 70; 0 disables)
     --checkpoint-min-savings-percent 1..99 (default 10)
@@ -106,6 +106,9 @@ Durable modes require a private journal path. Memory mode is the default.";
                     }
                     "--max-entries" => config.cache.max_entries = positive(&value, &flag)?,
                     "--max-arena-bytes" => config.cache.max_arena_bytes = positive(&value, &flag)?,
+                    "--max-pipeline-depth" => {
+                        config.server.max_pipeline_depth = positive(&value, &flag)?
+                    }
                     "--max-connections" => config.server.max_connections = positive(&value, &flag)?,
                     "--max-connection-bytes" => {
                         config.server.max_total_connection_bytes = positive(&value, &flag)?

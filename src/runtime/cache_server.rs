@@ -972,13 +972,17 @@ impl CacheShardServer {
     }
 
     fn poll_timeout(&self, requested: Option<Duration>) -> Option<Duration> {
-        let until_expiry = self
-            .next_expiry_sweep
-            .saturating_duration_since(Instant::now());
-        match requested {
-            Some(requested) => Some(requested.min(until_expiry)),
-            None => Some(until_expiry),
+        let now = Instant::now();
+        let mut deadline = self.next_expiry_sweep.saturating_duration_since(now);
+        if self.mutual_tls.is_some() {
+            for connection in self.connections.values().filter(|c| c.handshake_pending()) {
+                deadline = deadline.min(
+                    TLS_HANDSHAKE_TIMEOUT
+                        .saturating_sub(now.saturating_duration_since(connection.accepted_at)),
+                );
+            }
         }
+        Some(requested.map_or(deadline, |requested| requested.min(deadline)))
     }
 
     fn sweep_expired_if_due(&mut self) -> Result<(), CacheServerError> {
@@ -1181,6 +1185,26 @@ impl CacheShardServer {
     }
 
     fn process_input(&mut self, connection: &mut CacheConnection) -> Result<(), ConnectionAction> {
+        // Bound the number of complete commands in a buffered read batch
+        // before executing any of that batch. A partial trailing frame is
+        // retained for a later read, not counted as a complete command.
+        let mut remaining = &connection.input[connection.input_start..];
+        let mut depth = 0;
+        while !remaining.is_empty() {
+            if self.shutdown.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let Some((_, consumed)) =
+                parse_command(remaining).map_err(|_| ConnectionAction::Close)?
+            else {
+                break;
+            };
+            if depth == self.config.max_pipeline_depth {
+                return Err(ConnectionAction::Close);
+            }
+            depth += 1;
+            remaining = &remaining[consumed..];
+        }
         loop {
             if self.shutdown.load(Ordering::Acquire) {
                 return Ok(());
@@ -1226,6 +1250,7 @@ impl CacheShardServer {
                     self.config.max_output_buffer,
                 )
                 .map_err(|_| ConnectionAction::Close)?;
+            let reserved_capacity = connection.output.capacity();
             match &mut self.backend {
                 CacheBackend::Memory(store) => {
                     let outcome = self
@@ -1259,7 +1284,13 @@ impl CacheShardServer {
                     }
                 }
             }
-            debug_assert!(connection.output.len() <= required);
+            // Fail closed before releasing a lease if a response estimator
+            // regresses. Never let an uncharged allocation escape this drive.
+            if connection.output.len() > required
+                || connection.output.capacity() > reserved_capacity
+            {
+                return Err(ConnectionAction::Close);
+            }
             connection.input_start += consumed;
             // Check between pipelined commands as well as between poll cycles.
             #[cfg(unix)]
@@ -2248,5 +2279,115 @@ mod tests {
             Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
             other => panic!("unexpected reply after poisoned clock: {other:?}"),
         }
+    }
+
+    #[test]
+    fn overdepth_pipeline_is_rejected_before_mutation() {
+        let mut server = build_server();
+        server.config.max_pipeline_depth = 2;
+        let mut client = StdTcpStream::connect(server.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let set = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n";
+        client
+            .write_all(
+                &[
+                    set.as_slice(),
+                    b"*1\r\n$4\r\nPING\r\n",
+                    b"*1\r\n$4\r\nPING\r\n",
+                ]
+                .concat(),
+            )
+            .unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        assert!(server.store_mut().unwrap().get(b"k", 0).is_none());
+        assert_eq!(server.connection_count(), 0);
+        assert_eq!(server.buffer_budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn tls_stalled_handshakes_bound_poll_timeout_and_release_admission() {
+        let mut server = build_server();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        server
+            .enable_mutual_tls(
+                CacheMutualTls::from_pem(
+                    cert.cert.pem().as_bytes(),
+                    cert.cert.pem().as_bytes(),
+                    cert.signing_key.serialize_pem().as_bytes(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        server.config.max_connections = 2;
+        let addr = server.local_addr().unwrap();
+        let _first = StdTcpStream::connect(addr).unwrap();
+        let _second = StdTcpStream::connect(addr).unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+            if server.connection_count() == 2 {
+                break;
+            }
+        }
+        assert_eq!(server.connection_count(), 2);
+        let mut excess = StdTcpStream::connect(addr).unwrap();
+        excess
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        match excess.read(&mut [0]) {
+            Ok(0) => {}
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+            other => panic!("excess TLS connection not closed: {other:?}"),
+        }
+        assert_eq!(server.connection_count(), 2);
+        for connection in server.connections.values_mut() {
+            connection.accepted_at = Instant::now() - TLS_HANDSHAKE_TIMEOUT;
+        }
+        server.next_expiry_sweep = Instant::now() + Duration::from_secs(60);
+        assert_eq!(server.poll_timeout(None), Some(Duration::ZERO));
+        server.poll_once(Some(Duration::ZERO)).unwrap();
+        assert_eq!(server.connection_count(), 0);
+        assert_eq!(server.buffer_budget.used_bytes(), 0);
+        let _replacement = StdTcpStream::connect(addr).unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+            if server.connection_count() == 1 {
+                break;
+            }
+        }
+        assert_eq!(server.connection_count(), 1);
+    }
+
+    #[test]
+    fn pipeline_limit_allows_exact_depth_and_partial_trailing_frame() {
+        let mut server = build_server();
+        server.config.max_pipeline_depth = 2;
+        let mut client = StdTcpStream::connect(server.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        client
+            .write_all(b"*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPI")
+            .unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        let mut responses = [0; 14];
+        client.read_exact(&mut responses).unwrap();
+        assert_eq!(&responses, b"+PONG\r\n+PONG\r\n");
+        client.write_all(b"NG\r\n").unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        let mut response = [0; 7];
+        client.read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"+PONG\r\n");
+        assert_eq!(server.buffer_budget.used_bytes(), 0);
     }
 }
