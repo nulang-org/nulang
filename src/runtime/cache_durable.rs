@@ -449,6 +449,22 @@ impl DurableCache {
         self.healthy()?;
         Ok(self.store.get(key, now_ms))
     }
+    pub fn exists(&mut self, key: &[u8], now_ms: u64) -> Result<bool, DurableError> {
+        self.healthy()?;
+        Ok(self.store.exists(key, now_ms))
+    }
+
+    #[cfg(feature = "cache-server")]
+    pub(super) fn store_for_sizing(&self) -> Result<&CacheStore, DurableError> {
+        self.healthy()?;
+        Ok(&self.store)
+    }
+
+    #[cfg(all(test, feature = "cache-server"))]
+    pub(super) fn fail_next_append(&mut self) {
+        self.wal.fail_next_append = true;
+    }
+
     pub fn ttl(&mut self, key: &[u8], now_ms: u64) -> Result<CacheTtl, DurableError> {
         self.healthy()?;
         Ok(self.store.ttl(key, now_ms))

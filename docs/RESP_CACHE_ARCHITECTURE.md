@@ -272,7 +272,7 @@ distributions install Valkey under both binary names.
 ## Write-ahead journal substrate (Unix)
 
 CacheWal is the framing and recovery primitive used by the native
-DurableCache coordinator, not yet wired to the live RESP reactor. It uses a distinct eight-byte NLCWAL02 format
+DurableCache coordinator, now also used by the optional durable RESP reactor. It uses a distinct eight-byte NLCWAL02 format
 identifier, complemented u32 payload length, contiguous u64 sequence, and
 BLAKE3 checksum of the entire record header and payload. Each record contains
 one opaque logical mutation or batch; callers must validate and encode that
@@ -297,7 +297,7 @@ Record/file admission failures happen before I/O and do not poison the handle.
 Use a trusted private journal directory; advisory locks do not protect against
 non-cooperating writers or external file replacement. The journal itself does not interpret mutations. The native coordinator below
 supplies mutation encoding, TTL translation and a write-before-publication
-boundary. Snapshot/rotation, live RESP integration, replication and physical
+boundary. Snapshot/rotation, replication and physical
 power-loss qualification remain pending.
 
 
@@ -334,6 +334,40 @@ assume an error means their mutation will never be replayed.
 This first implementation prioritizes correctness over copy minimization:
 EXPIRE records duplicate the value and may be conservatively rejected by
 arena or journal limits; mutation encoding allocates bounded scratch space.
-The live RESP reactor remains memory-only. Server-wide fail-stop behavior,
-group commit, snapshots/rotation, time-regression handling and physical
-crash qualification remain separate tasks.
+The reactor integration below provides optional durability and shard-wide
+fail-stop behavior. Group commit, snapshots/rotation, cross-restart clock
+regression handling and physical crash qualification remain separate tasks.
+
+
+## Optional durable RESP reactor (Unix)
+
+The existing CacheShardServer::bind and bind_with_budget APIs select memory
+mode. CacheShardServer::bind_durable and bind_durable_with_budget select a
+private journal via CacheDurableConfig (path, cache limits, WAL limits,
+WalSync::Buffered or WalSync::Data). Recovery completes before the listener
+binds. This is an embedded reactor API; there is no new standalone CLI or
+deployment configuration in this change.
+
+The shared RESP executor statically dispatches the memory and durable
+backends, using the same command validation and response encoding. The
+durable reactor routes topology and MOVED responses before local execution,
+reserves bounded response capacity, then executes each local command through
+DurableCache. Direct store/store_mut accessors now return Option and expose
+only the memory backend. Transparent cross-shard inbox requests are rejected
+in durable mode rather than allowed to bypass persistence. This mode remains
+redirect-only and Unix-only.
+
+A shard anchors its Unix clock at recovery and advances it with monotonic
+time, avoiding in-process wall-clock adjustments. Wall-clock rollback
+between restarts remains unresolved. An ambiguous append failure prevents
+further responses from the affected command, closes all existing shard
+connections, deregisters the listener and returns DurableShardPoisoned;
+subsequent poll/run calls reject service. The owning application must drop
+and recover the shard before serving again. Non-poisoning admission and
+journal-capacity failures return a RESP error without shutting down the
+shard. The outcome of a write whose acknowledgement was lost is ambiguous.
+
+Synchronized journal writes block the owning reactor; there is no group
+commit, snapshot/rotation or production power-loss qualification yet.
+This mode is opt-in. Benchmark the memory and journal modes separately
+before selecting a deployment policy.
