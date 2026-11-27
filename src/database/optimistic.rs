@@ -32,6 +32,12 @@ impl OptimisticTabletWrite {
     pub fn mutations(&self) -> &[TabletMutation] {
         &self.mutations
     }
+
+    pub(crate) fn read_input_bytes(&self) -> usize {
+        self.read_keys.iter().fold(0usize, |total, key| {
+            total.saturating_add(1).saturating_add(key.len())
+        })
+    }
 }
 
 /// Snapshot-scoped point transaction that automatically records every
@@ -236,6 +242,18 @@ impl MemoryTablet {
         &self,
         proposed: OptimisticTabletWrite,
     ) -> Result<TabletWrite, TabletError> {
+        self.rebase_optimistic_write_after(proposed, self.current_sequence(), |_| None)
+    }
+
+    /// Validate against both the committed state and earlier staged group
+    /// writes, without cloning or publishing the tablet. The owner supplies
+    /// the virtual tail and latest sequence for keys staged in this group.
+    pub(crate) fn rebase_optimistic_write_after(
+        &self,
+        proposed: OptimisticTabletWrite,
+        tail: u64,
+        staged_sequence: impl Fn(&[u8]) -> Option<u64>,
+    ) -> Result<TabletWrite, TabletError> {
         self.validate_optimistic_identity(&proposed)?;
         self.validate_snapshot(proposed.snapshot_sequence)?;
         let OptimisticTabletWrite {
@@ -254,7 +272,9 @@ impl MemoryTablet {
             if !range.contains(key) {
                 return Err(TabletError::KeyOutsideTabletRange);
             }
-            if let Some(committed) = self.latest_key_write_sequence(key) {
+            if let Some(committed) =
+                staged_sequence(key).or_else(|| self.latest_key_write_sequence(key))
+            {
                 if committed > snapshot_sequence {
                     return Err(TabletError::OptimisticConflict {
                         key: key.to_vec(),
@@ -264,13 +284,7 @@ impl MemoryTablet {
                 }
             }
         }
-        TabletWrite::prepare(
-            self.descriptor(),
-            ownership_epoch,
-            self.current_sequence(),
-            self.current_sequence(),
-            mutations,
-        )
+        TabletWrite::prepare(self.descriptor(), ownership_epoch, tail, tail, mutations)
     }
 
     /// In-memory prototype; the WAL-backed equivalent provides durability.
