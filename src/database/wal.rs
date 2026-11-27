@@ -248,18 +248,24 @@ pub struct FileWal {
 
 impl FileWal {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WalError> {
-        Self::open_with_mode(path.as_ref(), false, None)
+        Self::open_with_mode(path.as_ref(), false, None, false)
     }
 
     #[cfg(unix)]
     pub(super) fn open_existing(path: &Path, binding: SealBinding) -> Result<Self, WalError> {
-        Self::open_with_mode(path, true, Some(binding))
+        Self::open_with_mode(path, true, Some(binding), false)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn open_existing_bound(path: &Path, binding: SealBinding) -> Result<Self, WalError> {
+        Self::open_with_mode(path, true, Some(binding), true)
     }
 
     fn open_with_mode(
         requested_path: &Path,
         require_existing: bool,
         binding: Option<SealBinding>,
+        require_bound: bool,
     ) -> Result<Self, WalError> {
         let parent = requested_path
             .parent()
@@ -295,13 +301,14 @@ impl FileWal {
                 return Err(WalError::InvalidHeader);
             }
         }
-        Self::open_locked(path, Arc::new(lock), binding)
+        Self::open_locked(path, Arc::new(lock), binding, require_bound)
     }
 
     fn open_locked(
         path: PathBuf,
         writer_lock: Arc<File>,
         binding: Option<SealBinding>,
+        require_bound: bool,
     ) -> Result<Self, WalError> {
         // The caller already holds the stable sidecar lock. This path is also
         // used after WAL reclamation, so it must not try to lock a second time.
@@ -350,6 +357,9 @@ impl FileWal {
                     BOUND_HEADER_BYTES,
                 )
             } else {
+                if require_bound {
+                    return Err(WalError::SealBindingMismatch);
+                }
                 let (base, id, epoch) = decode_wal_header(&wal_header)?;
                 (base, id, epoch, None, WAL_HEADER_BYTES)
             };
@@ -744,7 +754,12 @@ impl FileWal {
             super::interruption::StorageInterruptionPoint::WalReclaimAfterDirectorySync,
         )?;
 
-        *self = Self::open_locked(self.path.clone(), Arc::clone(&self.writer_lock), None)?;
+        *self = Self::open_locked(
+            self.path.clone(),
+            Arc::clone(&self.writer_lock),
+            None,
+            false,
+        )?;
         Ok(())
     }
 
@@ -838,6 +853,7 @@ impl FileWal {
             self.path.clone(),
             Arc::clone(&self.writer_lock),
             Some(binding),
+            true,
         )?;
         if reopened.seal_binding != Some(binding) || !reopened.records.is_empty() {
             return Err(WalError::SealBindingMismatch);

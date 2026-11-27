@@ -8,6 +8,8 @@ pub mod checkpoint;
 #[cfg(unix)]
 pub mod generation_registry;
 pub mod indexed_sst;
+#[cfg(unix)]
+pub mod managed_storage;
 pub mod optimistic;
 #[cfg(unix)]
 mod sealed_backup;

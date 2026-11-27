@@ -961,3 +961,103 @@ fn registry_rotation_publication_failure_fences_handle_and_recovers_references()
         fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[cfg(all(test, unix))]
+#[test]
+fn managed_rotation_recovers_both_sides_of_wal_rename_and_registry_reservation() {
+    use super::generation_registry::{GenerationRegistry, GenerationStatus};
+    use super::managed_storage::ManagedTablet;
+    use super::sst_manifest::ManifestStore;
+    use super::tablet::TransactionId;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    for point in [
+        StorageInterruptionPoint::RegistryBeforeRename,
+        StorageInterruptionPoint::RegistryAfterRename,
+        StorageInterruptionPoint::WalReclaimAfterReplacementSync,
+        StorageInterruptionPoint::WalReclaimAfterRename,
+        StorageInterruptionPoint::WalReclaimAfterDirectorySync,
+    ] {
+        let dir = std::env::temp_dir().join(format!(
+            "nudb-managed-fault-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).unwrap();
+        let old_dir = dir.join("old");
+        let next_dir = dir.join("next");
+        let reg_dir = dir.join("registry");
+        fs::create_dir(&old_dir).unwrap();
+        fs::create_dir(&next_dir).unwrap();
+        fs::create_dir(&reg_dir).unwrap();
+        let path = dir.join("tablet.wal");
+        let desc = TabletDescriptor::new(
+            TabletId::new(97).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        let mut db = WalBackedTablet::open(desc.clone(), &path).unwrap();
+        let receipt = db
+            .commit_idempotent(TransactionId::new([1; 16]), vec![])
+            .unwrap();
+        let mut old = ManifestStore::create(&old_dir, 97, 7).unwrap();
+        db.flush_sst_shadow(&mut old, 1).unwrap();
+        db.seal_sst_recovery(&mut old).unwrap();
+        db.reclaim_to_sealed_sst(&old).unwrap();
+        let registry = GenerationRegistry::create(&reg_dir, 97, 7).unwrap();
+        let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+        managed
+            .commit_idempotent(TransactionId::new([2; 16]), vec![])
+            .unwrap();
+        let next = ManifestStore::create(&next_dir, 97, 7).unwrap();
+        let result = with_interruption(point, || managed.rotate(next, 1));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("injected NulangDB storage interruption"));
+        assert!(managed
+            .commit_idempotent(TransactionId::new([3; 16]), vec![])
+            .is_err());
+        assert!(managed.read_at(b"k", 2).is_err());
+        drop(managed);
+        let (current, other) = if matches!(
+            point,
+            StorageInterruptionPoint::WalReclaimAfterRename
+                | StorageInterruptionPoint::WalReclaimAfterDirectorySync
+        ) {
+            (&next_dir, &old_dir)
+        } else {
+            (&old_dir, &next_dir)
+        };
+        let registry = GenerationRegistry::open(&reg_dir, 97, 7).unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(ManagedTablet::open(desc.clone(), &path, other, registry).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let registry = GenerationRegistry::open(&reg_dir, 97, 7).unwrap();
+        let mut managed = ManagedTablet::open(desc.clone(), &path, current, registry).unwrap();
+        assert_eq!(managed.current_sequence(), 2);
+        assert_eq!(
+            managed
+                .commit_idempotent(TransactionId::new([1; 16]), vec![])
+                .unwrap(),
+            receipt
+        );
+        let other = ManifestStore::open(other, 97, 7).unwrap();
+        let expected = if point == StorageInterruptionPoint::RegistryBeforeRename {
+            GenerationStatus::Unknown
+        } else {
+            GenerationStatus::Unreferenced
+        };
+        assert_eq!(managed.generation_status(&other).unwrap(), expected);
+        assert_eq!(
+            managed
+                .commit_idempotent(TransactionId::new([3; 16]), vec![])
+                .unwrap()
+                .sequence(),
+            3
+        );
+        drop(managed);
+        drop(other);
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
