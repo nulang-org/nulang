@@ -519,24 +519,31 @@ impl MirCodegen {
         func: &mir::Function,
         effect_sites: &[MirEffectSite],
     ) -> NuResult<usize> {
+        // Validate capacities before allocating registers or narrowing indexes.
+        let spilled_threshold = FUNC_VALUE_REG as usize - LOCAL_BASE as usize;
+        let spill_count = func.locals.len().saturating_sub(spilled_threshold);
+        if spill_count > usize::from(u16::MAX) + 1 {
+            return Err(compile_err(
+                format!(
+                    "function '{}' requires {spill_count} spill slots; maximum is 65536",
+                    func.name
+                ),
+                Span::default(),
+            ));
+        }
+        check_capture_count(func.captures.len())?;
         // Isolate this function's bytecode so block offsets are relative to
         // the function start while still allowing forward jump resolution.
         let mut saved_instructions = Vec::new();
         std::mem::swap(&mut saved_instructions, &mut self.module.instructions);
         let function_start = saved_instructions.len();
         self.current_function_base = function_start;
-        // Build the spill map: locals whose id exceeds the register file
-        // get a slot in the frame's spill vector.  Inline spilling via
-        // local_reg / local_dst / spill_write_done emits SpillLoad/SpillStore
-        // during codegen — no capacity limit, no wrapping ambiguity.
+        // Inline spill instructions carry a 16-bit slot index. Use a
+        // wide iterator so the last valid slot does not overflow a counter.
         self.spill_map.clear();
-        let spilled_threshold = FUNC_VALUE_REG as u32 - LOCAL_BASE;
-        let mut next_spill_slot: u16 = 0;
-        for i in 0..func.locals.len() as u32 {
-            if i >= spilled_threshold {
-                self.spill_map.insert(i, next_spill_slot);
-                next_spill_slot += 1;
-            }
+        for i in spilled_threshold..func.locals.len() {
+            self.spill_map
+                .insert(i as u32, (i - spilled_threshold) as u16);
         }
         if func.params.len() > MAX_STAGED_ARGS {
             // Mirrors stage_args's call-site limit: the prologue below reads
@@ -1053,6 +1060,8 @@ impl MirCodegen {
                 ));
             }
             mir::RValue::Closure { func, captures } => {
+                check_reference_index(*func, "closure function")?;
+                check_capture_count(captures.len())?;
                 self.emit(Instruction::new3(
                     OpCode::Closure,
                     ((*func >> 8) & 0xFF) as u8,
@@ -1067,6 +1076,12 @@ impl MirCodegen {
                 self.restore_dst(dst, safe);
             }
             mir::RValue::Tuple(elems) => {
+                if elems.len() > usize::from(u8::MAX) {
+                    return Err(compile_err(
+                        "tuple arity exceeds 255 bytecode slots",
+                        Span::default(),
+                    ));
+                }
                 self.emit(Instruction::new2(OpCode::TupleMk, elems.len() as u8, dst));
                 let safe = self.protect_dst(dst);
                 for (i, e) in elems.iter().enumerate() {
@@ -1083,7 +1098,7 @@ impl MirCodegen {
                     max_field_id = max_field_id.max(fid);
                     field_ids.push(fid);
                 }
-                let slot_count = max_field_id.saturating_add(1);
+                let slot_count = max_field_id + 1;
                 self.emit(Instruction::new2(OpCode::RecMk, slot_count, dst));
                 let safe = self.protect_dst(dst);
                 for ((_, e), fid) in fields.iter().zip(field_ids) {
@@ -1223,6 +1238,7 @@ impl MirCodegen {
                 self.emit(Instruction::new0(OpCode::ReceiveCommit));
             }
             mir::RValue::FFICall { idx, args } => {
+                check_reference_index(*idx, "foreign function")?;
                 self.stage_args(args)?;
                 self.emit(Instruction::new3(
                     OpCode::FFICall,
@@ -1258,6 +1274,7 @@ impl MirCodegen {
                 target_node,
                 capabilities,
             } => {
+                check_reference_index(*behavior_idx, "spawn behavior")?;
                 if let Some(node) = target_node {
                     if !capabilities.is_empty() {
                         return Err(compile_err(
@@ -1333,6 +1350,7 @@ impl MirCodegen {
                 args,
                 remote,
             } => {
+                check_reference_index(*behavior_idx, "send behavior")?;
                 let _ractor = self.local_reg(*actor);
                 self.emit(Instruction::new2(OpCode::Move, _ractor, FUNC_VALUE_REG));
                 self.stage_args(args)?;
@@ -1353,6 +1371,7 @@ impl MirCodegen {
                 remote,
                 timeout_ms,
             } => {
+                check_reference_index(*behavior_idx, "ask behavior")?;
                 let _ractor = self.local_reg(*actor);
                 self.emit(Instruction::new2(OpCode::Move, _ractor, FUNC_VALUE_REG));
                 self.stage_args(args)?;
@@ -1477,19 +1496,16 @@ impl MirCodegen {
         if let Some(&id) = self.field_map.get(name) {
             return Ok(id);
         }
-        if self.field_map.len() > u8::MAX as usize {
-            // Mirrors the stable compiler's field_id: the 256th distinct
-            // field name has no free id left (a single byte encodes it), so
-            // this is an honest error instead of silently aliasing two
-            // unrelated fields onto the same slot.
+        // RecMk encodes the slot count, not the maximum field index.
+        // A 256th field would need 256 slots, which cannot be represented.
+        if self.field_map.len() >= usize::from(u8::MAX) {
             return Err(compile_err(format!(
-                "module has more than {} distinct record/tuple field names (limit for the current u8 field-id encoding); '{}' has no id left to assign",
-                u8::MAX as usize + 1,
+                "module exceeds 255 distinct record field names (bytecode record slot limit); '{}' has no representable slot",
                 name
             ), Span::default()));
         }
         let id = self.next_field_id;
-        self.next_field_id = self.next_field_id.saturating_add(1);
+        self.next_field_id += 1;
         self.field_map.insert(name.to_string(), id);
         Ok(id)
     }
@@ -2258,6 +2274,26 @@ fn rvalue_reads(rv: &mir::RValue, out: &mut HashSet<mir::LocalId>) {
             }
         }
     }
+}
+
+fn check_capture_count(count: usize) -> NuResult<()> {
+    if count > usize::from(u8::MAX) + 1 {
+        return Err(compile_err(
+            "closure captures exceed 256 bytecode slots",
+            Span::default(),
+        ));
+    }
+    Ok(())
+}
+
+fn check_reference_index(index: usize, kind: &str) -> NuResult<()> {
+    if index > usize::from(u16::MAX) {
+        return Err(compile_err(
+            format!("{kind} index {index} exceeds 16-bit bytecode range"),
+            Span::default(),
+        ));
+    }
+    Ok(())
 }
 
 fn checked_jump_offset(target: usize, source: usize, function: &str) -> NuResult<i16> {
@@ -3234,24 +3270,240 @@ mod tests {
     }
 
     #[test]
-    fn test_mir_codegen_field_id_errors_past_256_distinct_field_names() {
-        // Mirrors the same regression in the stable compiler: the 257th
-        // distinct record field name has no free u8 id, and must be an
-        // honest error rather than silently aliasing onto an existing id.
-        //
-        // Each field name lives in its own top-level function's own tiny
-        // record literal, not a single 257-field record — a single record
-        // (or a chain of 257 `let`s) hits MIR's unrelated per-function local
-        // count cap first, which would mask the field_id check this test is
-        // actually targeting.
-        let fns: Vec<String> = (0..257)
+    fn test_mir_codegen_capacity_tuple_count() {
+        for count in [255, 256] {
+            let mut cg = MirCodegen::new("tuple_capacity");
+            let result = cg.compile_rvalue(16, &mir::RValue::Tuple(vec![mir::LocalId(0); count]));
+            if count == 255 {
+                assert!(result.is_ok());
+                assert_eq!(cg.module.instructions[0].op1, 255);
+            } else {
+                assert!(matches!(result, Err(NuError::VMError { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn test_mir_codegen_capacity_record_slots() {
+        let mut cg = MirCodegen::new("record_capacity");
+        for i in 0..255 {
+            cg.compile_rvalue(
+                16,
+                &mir::RValue::Record(vec![(format!("f{i}"), mir::LocalId(0))]),
+            )
+            .unwrap();
+        }
+        let last = cg
+            .module
+            .instructions
+            .iter()
+            .rev()
+            .find(|ins| ins.opcode == OpCode::RecMk)
+            .unwrap();
+        assert_eq!(last.op1, 255);
+        let result = cg.compile_rvalue(
+            16,
+            &mir::RValue::Record(vec![("overflow".into(), mir::LocalId(0))]),
+        );
+        assert!(matches!(result, Err(NuError::VMError { .. })));
+    }
+
+    #[test]
+    fn test_mir_codegen_capacity_capture_slots() {
+        for count in [256, 257] {
+            let mut cg = MirCodegen::new("closure_capacity");
+            let result = cg.compile_rvalue(
+                16,
+                &mir::RValue::Closure {
+                    func: 0,
+                    captures: vec![mir::LocalId(0); count],
+                },
+            );
+            if count == 256 {
+                assert!(result.is_ok());
+                let last = cg
+                    .module
+                    .instructions
+                    .iter()
+                    .rev()
+                    .find(|ins| ins.opcode == OpCode::CapStore)
+                    .unwrap();
+                assert_eq!(last.op2, 255);
+            } else {
+                assert!(matches!(result, Err(NuError::VMError { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn test_mir_codegen_capacity_capture_prologue() {
+        for count in [256, 257] {
+            let mut b = mir::FunctionBuilder::new("capture_prologue", Some(Type::int()));
+            for i in 0..count {
+                b.add_capture(format!("c{i}"), Type::int());
+            }
+            b.terminate(mir::Terminator::Return(Some(mir::LocalId(0))));
+            let mut cg = MirCodegen::new("capture_prologue");
+            let result = cg.compile_function(&b.build(), &[]);
+            if count == 256 {
+                assert!(result.is_ok());
+                let last = cg
+                    .module
+                    .instructions
+                    .iter()
+                    .rev()
+                    .find(|ins| ins.opcode == OpCode::CapLoad)
+                    .unwrap();
+                assert_eq!(last.op1, 255);
+            } else {
+                assert!(matches!(result, Err(NuError::VMError { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn test_mir_codegen_capacity_spill_slots() {
+        for count in [65536, 65537] {
+            let mut b = mir::FunctionBuilder::new("spill_capacity", Some(Type::int()));
+            let mut last = mir::LocalId(0);
+            for _ in 0..(FUNC_VALUE_REG as usize - LOCAL_BASE as usize + count) {
+                last = b.add_temp(Type::int());
+            }
+            b.assign(last, mir::RValue::Const(Constant::Int(42)));
+            b.terminate(mir::Terminator::Return(Some(last)));
+            let mut cg = MirCodegen::new("spill_capacity");
+            let result = cg.compile_function(&b.build(), &[]);
+            if count == 65536 {
+                assert!(result.is_ok());
+                assert_eq!(cg.spill_map.get(&last.0), Some(&u16::MAX));
+                assert!(cg
+                    .module
+                    .instructions
+                    .iter()
+                    .any(|ins| ins.opcode == OpCode::SpillStore
+                        && ins.op2 == 255
+                        && ins.op3 == 255));
+            } else {
+                assert!(matches!(result, Err(NuError::VMError { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn test_mir_codegen_capacity_reference_indices() {
+        for idx in [65535, 65536] {
+            for (rv, opcode, offset_operand) in [
+                (
+                    mir::RValue::Closure {
+                        func: idx,
+                        captures: vec![],
+                    },
+                    OpCode::Closure,
+                    false,
+                ),
+                (
+                    mir::RValue::FFICall { idx, args: vec![] },
+                    OpCode::FFICall,
+                    false,
+                ),
+                (
+                    mir::RValue::Spawn {
+                        behavior_idx: idx,
+                        init: vec![],
+                        target_node: None,
+                        capabilities: vec![],
+                    },
+                    OpCode::Spawn,
+                    false,
+                ),
+                (
+                    mir::RValue::Spawn {
+                        behavior_idx: idx,
+                        init: vec![],
+                        target_node: Some(mir::LocalId(0)),
+                        capabilities: vec![],
+                    },
+                    OpCode::RSpawn,
+                    true,
+                ),
+                (
+                    mir::RValue::Send {
+                        actor: mir::LocalId(0),
+                        behavior_idx: idx,
+                        args: vec![],
+                        remote: false,
+                    },
+                    OpCode::Send,
+                    true,
+                ),
+                (
+                    mir::RValue::Send {
+                        actor: mir::LocalId(0),
+                        behavior_idx: idx,
+                        args: vec![],
+                        remote: true,
+                    },
+                    OpCode::RSend,
+                    true,
+                ),
+                (
+                    mir::RValue::Ask {
+                        actor: mir::LocalId(0),
+                        behavior_idx: idx,
+                        args: vec![],
+                        remote: false,
+                        timeout_ms: None,
+                    },
+                    OpCode::Ask,
+                    true,
+                ),
+                (
+                    mir::RValue::Ask {
+                        actor: mir::LocalId(0),
+                        behavior_idx: idx,
+                        args: vec![],
+                        remote: true,
+                        timeout_ms: None,
+                    },
+                    OpCode::RAsk,
+                    true,
+                ),
+            ] {
+                let mut cg = MirCodegen::new("reference_capacity");
+                let result = cg.compile_rvalue(16, &rv);
+                if idx == 65535 {
+                    assert!(result.is_ok(), "{rv:?}");
+                    let ins = cg
+                        .module
+                        .instructions
+                        .iter()
+                        .find(|ins| ins.opcode == opcode)
+                        .unwrap();
+                    if offset_operand {
+                        assert_eq!((ins.op2, ins.op3), (255, 255));
+                    } else {
+                        assert_eq!(ins.imm16(), u16::MAX);
+                    }
+                } else {
+                    assert!(matches!(result, Err(NuError::VMError { .. })), "{rv:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_mir_codegen_field_id_errors_past_255_distinct_field_names() {
+        // A one-byte record slot count cannot describe 256 slots even
+        // though a one-byte index could encode 255. Test distinct fields
+        // across separate functions to isolate the module-wide limit.
+        let fns: Vec<String> = (0..256)
             .map(|i| format!("fn g{i}() -> Int {{ {{ f{i}: {i} }}.f{i} }}"))
             .collect();
         let source = format!("{}\ng0()", fns.join("\n"));
         let result = compile_mir_source(&source);
         assert!(
-            result.is_err(),
-            "the 257th distinct field name should be an honest error, not silent aliasing"
+            matches!(result, Err(NuError::VMError { ref msg, .. }) if msg.contains("255 distinct record field names")),
+            "the 256th distinct field must fail instead of allocating too few slots"
         );
     }
 
