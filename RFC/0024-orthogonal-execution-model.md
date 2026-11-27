@@ -364,3 +364,9 @@ fixtures exclude file/stream creation and cleanup from measured time.
 Fabric replay measures a 16-record batch at the head and tail of a warm
 128-record multi-segment log. Record storage device and filesystem details,
 and distinguish these microbenchmarks from end-to-end latency distributions.
+
+For a functional smoke (not a latency/throughput measurement), run
+`python3 scripts/infrastructure_bench_smoke.py --storage-root /path/to/existing/dir`.
+The wrapper verifies all 13 expected Criterion case IDs complete successfully
+and rejects leftover fixtures. The existing PR Build & Test job runs it before
+merge; the main-only performance regression gate remains unchanged.
