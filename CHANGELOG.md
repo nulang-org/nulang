@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Automatic Fabric checkpoint maintenance — 2026-11-27
+- **Schedule durable journal compaction at configurable utilization thresholds**, with live-snapshot size preflight, ineffective/error retry cooldown, reactor maintenance counters, and default-on standalone durable operation. Verify 100 pipelined writes through a 1 KiB journal and process restart.
+
 ### Standalone Fabric server — 2026-11-27
 - **Add a feature-gated Unix-only single-shard RESP executable** with loopback-only binding, explicit memory/buffered/synchronized journal modes, validated memory/journal limits and process-level restart regressions.
 

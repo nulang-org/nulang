@@ -101,3 +101,43 @@ fn journal_modes_recover_after_process_kill() {
         request(address, GET, b"$5\r\nvalue\r\n");
     }
 }
+
+#[test]
+fn automatic_checkpoint_keeps_small_journal_writable_across_restart() {
+    let temp = Temp(std::env::temp_dir().join(format!(
+            "nulang-fabric-auto-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )));
+    std::fs::create_dir(&temp.0).unwrap();
+    let path = temp.0.join("auto.wal");
+    let args = [
+        "--mode",
+        "sync",
+        "--journal",
+        path.to_str().unwrap(),
+        "--max-journal-bytes",
+        "1024",
+        "--max-record-bytes",
+        "256",
+        "--checkpoint-percent",
+        "70",
+    ];
+    let address = port();
+    let server = Server::start(address, &args);
+    let mut pipeline = Vec::new();
+    let mut expected = Vec::new();
+    for _ in 0..100 {
+        pipeline.extend_from_slice(SET);
+        expected.extend_from_slice(b"+OK\r\n");
+    }
+    request(address, &pipeline, &expected);
+    assert!(std::fs::metadata(&path).unwrap().len() <= 1024);
+    assert_eq!(&std::fs::read(&path).unwrap()[..8], b"NLCWAL03");
+    drop(server);
+    let _server = Server::start(address, &args);
+    request(address, GET, b"$5\r\nvalue\r\n");
+}

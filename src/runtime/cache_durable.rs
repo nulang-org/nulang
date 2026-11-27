@@ -339,6 +339,31 @@ impl DurableCache {
         Ok(report)
     }
 
+    /// Retained on-disk journal length and configured limit.
+    pub fn journal_usage(&self) -> (u64, u64) {
+        (self.wal.journal_bytes(), self.limits.max_file_bytes)
+    }
+
+    /// Size of the compacted live-entry snapshot, excluding expired entries.
+    /// No value is copied and no file is created during this preflight.
+    pub fn estimated_checkpoint_bytes(&self, now_ms: u64) -> u64 {
+        self.store.checkpoint_entries(now_ms).fold(
+            CacheWal::checkpoint_header_bytes(),
+            |total, (key, value, ttl)| {
+                // Version, opcode, key length, key, value and TTL presence.
+                let value_bytes = match value {
+                    CacheValueView::Bytes(bytes) => 4u64.saturating_add(bytes.len() as u64),
+                    CacheValueView::Integer(_) => 8,
+                };
+                let payload = 7u64
+                    .saturating_add(key.len() as u64)
+                    .saturating_add(value_bytes)
+                    .saturating_add(if ttl.is_some() { 8 } else { 0 });
+                total.saturating_add(CacheWal::framed_record_bytes(payload))
+            },
+        )
+    }
+
     pub fn is_poisoned(&self) -> bool {
         self.poisoned || self.wal.is_poisoned()
     }
@@ -778,7 +803,9 @@ mod tests {
         cache.delete_many(&[b"gone"], time(100, 1100)).unwrap();
         let before = std::fs::metadata(tmp.path()).unwrap().len();
         let sequence = cache.last_sequence();
+        let estimated = cache.estimated_checkpoint_bytes(200);
         let report = cache.checkpoint(time(200, 1200)).unwrap();
+        assert_eq!(estimated, report.after_bytes);
         assert_eq!(report.entries, 2);
         assert!(report.after_bytes < before / 10);
         assert!(cache.last_sequence() >= sequence);
