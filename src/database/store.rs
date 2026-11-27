@@ -71,6 +71,48 @@ impl WalBackedTablet {
         })
     }
 
+    /// Explicitly recover a live in-memory tablet from a sealed SST prefix
+    /// plus the complete existing WAL. Verify every overlapping mutation and
+    /// receipt before replaying the tail. Refuses existing checkpoints and
+    /// compacted WALs: their retention or lineage cannot yet be reconciled
+    /// with the seal. Does not enable SST-based WAL reclamation.
+    #[cfg(unix)]
+    pub fn open_from_sealed_sst(
+        descriptor: TabletDescriptor,
+        wal_path: impl AsRef<Path>,
+        manifest_dir: impl AsRef<Path>,
+    ) -> std::io::Result<Self> {
+        use std::io;
+        let invalid = |reason: &'static str| io::Error::new(io::ErrorKind::InvalidData, reason);
+        let wal = FileWal::open_existing(wal_path.as_ref())
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let checkpoint_path = checkpoint::checkpoint_path_for_wal(wal.path());
+        match std::fs::symlink_metadata(&checkpoint_path) {
+            Ok(_) => return Err(invalid("existing checkpoint requires normal recovery")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let manifest = super::sst_manifest::ManifestStore::open(
+            manifest_dir,
+            descriptor.id().get(),
+            descriptor.ownership_epoch(),
+        )?;
+        if manifest.current().recovery_descriptor() != Some(&descriptor) {
+            return Err(invalid("sealed recovery descriptor mismatch"));
+        }
+        super::wal_sst_shadow::verify_prefix(&wal, &descriptor, &manifest)?;
+        let mut tablet = manifest.restore_memory_tablet()?;
+        wal.replay_after_checkpoint(&mut tablet)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        Ok(Self {
+            tablet,
+            wal,
+            checkpoint_path,
+            snapshot_pins: BTreeMap::new(),
+            recovery_required: false,
+        })
+    }
+
     pub fn descriptor(&self) -> &TabletDescriptor {
         self.tablet.descriptor()
     }
@@ -356,6 +398,53 @@ impl WalBackedTablet {
     /// Latest committed in-memory value; unaffected by history pruning.
     pub fn read_latest(&self, key: &[u8]) -> Option<&[u8]> {
         self.tablet.read_latest(key)
+    }
+
+    /// Materialize a bounded, verified shadow interval from the complete WAL.
+    /// This never changes the WAL, checkpoint, receipts, or visible tablet state.
+    #[cfg(unix)]
+    pub fn flush_sst_shadow(
+        &self,
+        manifest: &mut super::sst_manifest::ManifestStore,
+        max_records: usize,
+    ) -> std::io::Result<Option<super::sst_manifest::TableEntry>> {
+        if self.recovery_required
+            || self.wal.is_poisoned()
+            || self.oldest_retained_snapshot() != 0
+            || self.wal.base_sequence() != 0
+            || self.wal.last_sequence() != self.current_sequence()
+        {
+            return Err(std::io::Error::other(
+                "shadow flush requires recovered complete unpruned WAL",
+            ));
+        }
+        super::wal_sst_shadow::flush(&self.wal, self.descriptor(), manifest, max_records)
+    }
+
+    /// Seal an independently readable snapshot of the complete, verified WAL
+    /// prefix. This does not enable live disk-backed writes or WAL reclamation.
+    #[cfg(unix)]
+    pub fn seal_sst_recovery(
+        &self,
+        manifest: &mut super::sst_manifest::ManifestStore,
+    ) -> std::io::Result<()> {
+        if manifest.current().durable_sequence() != self.current_sequence() {
+            return Err(std::io::Error::other(
+                "shadow manifest must cover entire committed WAL",
+            ));
+        }
+        // No pending records: the shadow path verifies every referenced table
+        // and rejects incomplete/pruned/poisoned history without publishing.
+        if self.flush_sst_shadow(manifest, 1)?.is_some() {
+            return Err(std::io::Error::other("unexpected shadow publication"));
+        }
+        let meta = super::sst_recovery_meta::RecoveryMeta::new(
+            self.descriptor().clone(),
+            self.oldest_retained_snapshot(),
+            self.current_sequence(),
+            self.tablet.receipts(),
+        )?;
+        manifest.seal(meta)
     }
 
     /// Atomically publish a checkpoint without reclaiming the WAL.

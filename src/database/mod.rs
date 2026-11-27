@@ -5,10 +5,17 @@
 //! inner storage and query loops remain ordinary local computation.
 
 pub mod checkpoint;
+pub mod indexed_sst;
 pub mod optimistic;
+#[cfg(unix)]
+pub mod sst_manifest;
+#[cfg(unix)]
+mod sst_recovery_meta;
 pub mod store;
 pub mod tablet;
 pub mod wal;
+#[cfg(unix)]
+mod wal_sst_shadow;
 
 #[cfg(test)]
 mod interruption;
