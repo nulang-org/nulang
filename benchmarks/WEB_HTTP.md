@@ -40,3 +40,28 @@ python3 -m unittest discover -s scripts/tests -p 'test_web_http_bench.py' -v
 The tests use an independent local Python HTTP fixture and verify harness accounting, conditional GET handling, and CLI validation. Passing them does **not** establish a Nulang Rust build or a production throughput baseline.
 
 Benchmarks are opt-in and do not alter existing CI gates, compiler, browser, or runtime behavior.
+
+
+## SSE idle connection lifecycle
+
+All three experimental SSE endpoints (legacy room, public revisioned UI,
+verified/scoped UI) check pending TCP errors on their existing 100 ms channel
+wait timeout. Idle responses send their existing SSE comment frame after two
+seconds without a successful write (formerly 15 seconds). Active updates
+already probe the write side, so no additional heartbeat is needed while
+updates keep flowing. The scoped membership recheck remains once per second
+and before every patch.
+
+The tradeoff is more comment traffic on otherwise idle streams (up to one
+comment per two seconds rather than 15). The room and global connection caps,
+write timeout and slow-subscriber backlog policy are unchanged. A request-side
+TCP half-close is not treated as a disconnect: the peer may still read events.
+A silent network black hole or blocked write remains governed by TCP and the
+configured write timeout, not a hard two-second cleanup guarantee.
+
+To verify clean-close capacity recovery, run the real TCP tests:
+```sh
+cargo test --locked --no-default-features --features tcp --test web_sse_bounds --test web_verified_tenant_http
+```
+The tests saturate both limits, close a fully read stream, and require
+successful readmission within six seconds with no further room broadcasts.

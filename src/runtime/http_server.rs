@@ -635,24 +635,14 @@ impl HttpServerState {
         slots: Arc<ConnectionSlots>,
     ) {
         let handler_module = Arc::new(handler_module);
+        let rejections = OverloadRejections::new();
         loop {
             match listener.accept(&shutdown) {
-                Ok(Some(mut stream)) => {
+                Ok(Some(stream)) => {
                     let lease = match slots.try_acquire_socket(&stream) {
                         Ok(Some(lease)) => lease,
                         Ok(None) => {
-                            let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
-                            Self::write_response(
-                                &mut stream,
-                                &HttpResponse {
-                                    status: 503,
-                                    headers: vec![
-                                        ("Content-Type".into(), "text/plain".into()),
-                                        ("Retry-After".into(), "1".into()),
-                                    ],
-                                    body: b"Server at connection capacity".to_vec(),
-                                },
-                            );
+                            rejections.reject(stream);
                             continue;
                         }
                         Err(error) => {
@@ -1938,13 +1928,96 @@ impl Drop for ConnectionLease {
     }
 }
 
+/// Separate, small budget for rejecting overloaded connections. No user
+/// handler or request parser runs here. If the rejection budget is also full,
+/// close immediately rather than queue sockets or block the accept loop.
+struct OverloadRejections {
+    slots: Arc<ConnectionSlots>,
+}
+
+impl OverloadRejections {
+    const MAX_CONNECTIONS: usize = 8;
+    const WRITE_TIMEOUT: Duration = Duration::from_millis(200);
+    const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+    const MAX_DRAIN_BYTES: usize = 64 * 1024;
+
+    fn new() -> Self {
+        Self {
+            slots: Arc::new(ConnectionSlots::new(Self::MAX_CONNECTIONS)),
+        }
+    }
+
+    fn reject(&self, mut stream: TcpStream) {
+        let Ok(Some(lease)) = self.slots.try_acquire_socket(&stream) else {
+            return;
+        };
+        // Failed thread creation drops the closure, socket and lease.
+        let _ = std::thread::Builder::new()
+            .name("nulang-http-overload".into())
+            .spawn(move || {
+                let _lease = lease;
+                Self::respond(&mut stream);
+            });
+    }
+
+    fn respond(stream: &mut TcpStream) {
+        if stream.set_write_timeout(Some(Self::WRITE_TIMEOUT)).is_err() {
+            return;
+        }
+        HttpServerState::write_response(
+            stream,
+            &HttpResponse {
+                status: 503,
+                headers: vec![
+                    ("Content-Type".into(), "text/plain".into()),
+                    ("Retry-After".into(), "1".into()),
+                ],
+                body: b"Server at connection capacity".to_vec(),
+            },
+        );
+        // A close with unread input can reset the connection and discard
+        // the response. Half-close the write side so the peer sees EOF, then
+        // discard input under a single elapsed deadline and byte budget.
+        // Do not parse, allocate a body, or wait indefinitely for a peer FIN.
+        if stream.shutdown(Shutdown::Write).is_err() {
+            return;
+        }
+        let mut reader = RequestDeadlineReader {
+            stream,
+            deadline: Instant::now() + Self::DRAIN_TIMEOUT,
+        };
+        let mut remaining = Self::MAX_DRAIN_BYTES;
+        let mut buffer = [0u8; 4096];
+        while remaining > 0 {
+            let len = remaining.min(buffer.len());
+            match reader.read(&mut buffer[..len]) {
+                Ok(0) => break,
+                Ok(n) => remaining -= n,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+impl Drop for OverloadRejections {
+    fn drop(&mut self) {
+        // The accept loop owns this pool. No new leases are possible now;
+        // interrupt rejected peers before joining the listener.
+        self.slots.interrupt_active();
+        let _ = self.slots.wait_for_drain(Self::DRAIN_TIMEOUT);
+    }
+}
+
 /// Host-level HTTP limits, validated before a Web listener binds.
 ///
 /// Defaults preserve the existing development server behavior. This is a
 /// runtime-host configuration surface, not a new language or Web DSL feature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WebServerOptions {
-    /// Maximum simultaneous connections, including long-lived SSE streams.
+    /// Maximum admitted connections, including long-lived SSE streams.
+    /// Up to eight separate overload-response connections may also exist;
+    /// they cannot dispatch application code and are drained under fixed limits.
     pub max_concurrent_connections: usize,
     /// Total time allowed to receive one HTTP request's headers and body.
     /// The budget does not reset when more bytes arrive.
@@ -2128,6 +2201,13 @@ impl Drop for WebDevServer {
 
 impl WebDevServer {
     const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+    // Existing channel waits also provide a cheap check for pending TCP errors.
+    // Probe an idle write side more often than the former 15-second heartbeat
+    // so a closed peer does not retain a room and connection lease for long.
+    const SSE_IDLE_TICK: Duration = Duration::from_millis(100);
+    const SSE_IDLE_HEARTBEAT: Duration = Duration::from_secs(2);
+    const LEGACY_SSE_COMMENT: &'static [u8] = b": keep-alive\n\n";
+    const UI_SSE_COMMENT: &'static [u8] = b": heartbeat\n\n";
     const SSE_PATH_PREFIX: &'static str = "/__nulang/sse/";
     const UI_SSE_PATH_PREFIX: &'static str = "/__nulang/ui-sse/";
     const SCOPED_UI_SSE_PATH_PREFIX: &'static str = "/__nulang/scoped-ui-sse/";
@@ -2485,24 +2565,14 @@ impl WebDevServer {
         // Route tables contain compiled modules; share them rather than
         // cloning the full vector for every incoming connection.
         let routes = Arc::new(routes);
+        let rejections = OverloadRejections::new();
         loop {
             match listener.accept(&shutdown) {
-                Ok(Some(mut stream)) => {
+                Ok(Some(stream)) => {
                     let lease = match slots.try_acquire_socket(&stream) {
                         Ok(Some(lease)) => lease,
                         Ok(None) => {
-                            let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
-                            HttpServerState::write_response(
-                                &mut stream,
-                                &HttpResponse {
-                                    status: 503,
-                                    headers: vec![
-                                        ("Content-Type".into(), "text/plain".into()),
-                                        ("Retry-After".into(), "1".into()),
-                                    ],
-                                    body: b"Server at connection capacity".to_vec(),
-                                },
-                            );
+                            rejections.reject(stream);
                             continue;
                         }
                         Err(error) => {
@@ -2879,7 +2949,7 @@ impl WebDevServer {
             if shutdown.load(Ordering::Relaxed) {
                 break;
             }
-            match subscription.rx.recv_timeout(Duration::from_millis(100)) {
+            match subscription.rx.recv_timeout(Self::SSE_IDLE_TICK) {
                 Ok(msg) => {
                     if Self::write_sse_event(stream, &msg).is_err() {
                         break;
@@ -2887,14 +2957,8 @@ impl WebDevServer {
                     last_write = Instant::now();
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    // Test the TCP connection even when the room is idle.
-                    // Otherwise abandoned EventSource subscriptions can hold
-                    // room slots indefinitely without further broadcasts.
-                    if last_write.elapsed() >= Duration::from_secs(15) {
-                        if Self::write_sse_keepalive(stream).is_err() {
-                            break;
-                        }
-                        last_write = Instant::now();
+                    if !Self::check_idle_sse(stream, &mut last_write, Self::LEGACY_SSE_COMMENT) {
+                        break;
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -2902,8 +2966,27 @@ impl WebDevServer {
         }
     }
 
-    fn write_sse_keepalive<W: Write>(stream: &mut W) -> std::io::Result<()> {
-        stream.write_all(b": keep-alive\n\n")?;
+    /// A pending socket error (e.g. RST) is terminal even without a broadcast.
+    /// An ordinary FIN may mean only that the client closed its request half,
+    /// so do not use read EOF as evidence that it stopped reading. Instead
+    /// send a comment on the write side of an idle stream. The existing write
+    /// timeout still applies; a network black hole is not detectable within a
+    /// guaranteed wall-clock bound by application heartbeats alone.
+    fn check_idle_sse(stream: &mut TcpStream, last_write: &mut Instant, comment: &[u8]) -> bool {
+        if !matches!(stream.take_error(), Ok(None)) {
+            return false;
+        }
+        if last_write.elapsed() >= Self::SSE_IDLE_HEARTBEAT {
+            if Self::write_sse_comment(stream, comment).is_err() {
+                return false;
+            }
+            *last_write = Instant::now();
+        }
+        true
+    }
+
+    fn write_sse_comment<W: Write>(stream: &mut W, comment: &[u8]) -> std::io::Result<()> {
+        stream.write_all(comment)?;
         stream.flush()
     }
 
@@ -2943,9 +3026,9 @@ impl WebDevServer {
             return;
         }
         let mut last_check = Instant::now();
-        let mut last_heartbeat = Instant::now();
+        let mut last_write = Instant::now();
         while !shutdown.load(Ordering::Relaxed) {
-            match subscriber.rx.recv_timeout(Duration::from_millis(100)) {
+            let idle = match subscriber.rx.recv_timeout(Self::SSE_IDLE_TICK) {
                 Ok(patch) => {
                     // Verify current membership before writing any next update.
                     if !(verify)(request, app, room)
@@ -2954,21 +3037,20 @@ impl WebDevServer {
                         break;
                     }
                     last_check = Instant::now();
+                    last_write = last_check;
+                    false
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => true,
+            };
             if last_check.elapsed() >= Duration::from_secs(1) {
                 if !(verify)(request, app, room) {
                     break;
                 }
                 last_check = Instant::now();
             }
-            if last_heartbeat.elapsed() >= Duration::from_secs(15) {
-                if stream.write_all(b": heartbeat\n\n").is_err() {
-                    break;
-                }
-                last_heartbeat = Instant::now();
+            if idle && !Self::check_idle_sse(stream, &mut last_write, Self::UI_SSE_COMMENT) {
+                break;
             }
         }
     }
@@ -2993,22 +3075,21 @@ impl WebDevServer {
         if Self::write_ui_sse_event(stream, &snapshot).is_err() {
             return;
         }
-        let mut last_heartbeat = Instant::now();
+        let mut last_write = Instant::now();
         while !shutdown.load(Ordering::Relaxed) {
-            match rx.recv_timeout(Duration::from_millis(100)) {
+            match rx.recv_timeout(Self::SSE_IDLE_TICK) {
                 Ok(patch) => {
                     if Self::write_ui_sse_event(stream, &patch).is_err() {
                         break;
                     }
+                    last_write = Instant::now();
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            }
-            if last_heartbeat.elapsed() >= Duration::from_secs(15) {
-                if stream.write_all(b": heartbeat\n\n").is_err() {
-                    break;
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if !Self::check_idle_sse(stream, &mut last_write, Self::UI_SSE_COMMENT) {
+                        break;
+                    }
                 }
-                last_heartbeat = Instant::now();
             }
         }
     }
@@ -4071,6 +4152,57 @@ mod tests {
     }
 
     #[test]
+    fn test_overload_rejection_budget_never_queues_excess_sockets() {
+        let rejections = OverloadRejections::new();
+        let held: Vec<_> = (0..OverloadRejections::MAX_CONNECTIONS)
+            .map(|_| rejections.slots.try_acquire().unwrap())
+            .collect();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        rejections.reject(socket);
+        let mut byte = [0u8; 1];
+        let result = peer.read(&mut byte);
+        assert!(
+            matches!(result, Ok(0))
+                || matches!(result, Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset),
+            "a full rejection budget must close rather than queue: {result:?}"
+        );
+        assert_eq!(
+            rejections.slots.active.load(Ordering::Acquire),
+            OverloadRejections::MAX_CONNECTIONS
+        );
+        drop(held);
+        assert!(rejections.slots.wait_for_drain(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn test_overload_rejection_drain_deadline_cannot_be_extended_by_trickle() {
+        let rejections = OverloadRejections::new();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        peer.set_write_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        rejections.reject(socket);
+        let mut response = String::new();
+        peer.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 503 "));
+        // A continuously trickling peer must not retain a rejection worker
+        // by repeatedly resetting the socket's per-read timeout.
+        let started = Instant::now();
+        while rejections.slots.active.load(Ordering::Acquire) != 0
+            && started.elapsed() < Duration::from_secs(2)
+        {
+            let _ = peer.write_all(b"x");
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        assert_eq!(rejections.slots.active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn test_web_connection_slots_enforce_limit_and_release_on_drop() {
         let slots = Arc::new(ConnectionSlots::new(2));
         let first = slots.try_acquire().expect("first worker capacity");
@@ -4605,8 +4737,11 @@ mod tests {
     #[test]
     fn test_sse_heartbeat_is_a_comment_and_not_an_application_message() {
         let mut wire = Vec::new();
-        WebDevServer::write_sse_keepalive(&mut wire).unwrap();
+        WebDevServer::write_sse_comment(&mut wire, WebDevServer::LEGACY_SSE_COMMENT).unwrap();
         assert_eq!(wire.as_slice(), b": keep-alive\n\n");
+        wire.clear();
+        WebDevServer::write_sse_comment(&mut wire, WebDevServer::UI_SSE_COMMENT).unwrap();
+        assert_eq!(wire.as_slice(), b": heartbeat\n\n");
     }
 
     #[test]

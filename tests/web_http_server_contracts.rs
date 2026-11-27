@@ -604,3 +604,33 @@ fn turbo_stdlib_helpers_typecheck_with_import_resolution() {
         .check_module(&ast)
         .expect("typecheck imported Turbo helpers");
 }
+
+#[test]
+fn standalone_overload_preserves_fragmented_request_response() {
+    let (module, function_index) =
+        compile_handler("fn echo(body: String) -> String { \"ok\" }", "echo");
+    let server = HttpServerState::bind(0, module, function_index).unwrap();
+    // The standalone host's configured cap is 64. Keep those connections
+    // occupied by unfinished headers without running any application code.
+    let mut occupied = Vec::new();
+    for _ in 0..64 {
+        let mut peer = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        peer.write_all(b"GET / HTTP/1.1\r\n").unwrap();
+        occupied.push(peer);
+    }
+    let mut peer = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    peer.write_all(b"GET / HTTP/1.1\r\n").unwrap();
+    std::thread::sleep(Duration::from_millis(80));
+    peer.write_all(b"Host: localhost\r\n\r\n").unwrap();
+    peer.shutdown(Shutdown::Write).unwrap();
+    let mut response = String::new();
+    peer.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 503 "), "{response:?}");
+    assert!(response.contains("Retry-After: 1\r\n"), "{response:?}");
+    assert!(
+        response.ends_with("Server at connection capacity"),
+        "{response:?}"
+    );
+    drop(occupied);
+}
