@@ -6,8 +6,8 @@ mod unix {
         cache_dispatch::{CacheDispatchChannels, CacheDispatcher},
         cache_routing::CacheSlotMap,
         cache_server::{
-            AutomaticCheckpointConfig, CacheDurableConfig, CacheServerClock, CacheServerConfig,
-            CacheShardServer,
+            AutomaticCheckpointConfig, CacheDurableConfig, CacheMutualTls, CacheServerClock,
+            CacheServerConfig, CacheShardServer,
         },
         cache_wal::{WalLimits, WalSync},
     };
@@ -22,8 +22,9 @@ mod unix {
     --checkpoint-min-savings-percent 1..99 (default 10)
     --checkpoint-retry-ms N (default 5000)
     --shutdown-drain-ms 0..60000 (default 5000)
+    --tls-ca PATH --tls-cert PATH --tls-key PATH (all required for mutual TLS)
 
-Loopback-only, single-shard RESP server. No authentication or TLS.
+Single-shard RESP server. Plaintext is loopback-only; remote binds require mutual TLS.
 Durable modes require a private journal path. Memory mode is the default.";
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +44,9 @@ Durable modes require a private journal path. Memory mode is the default.";
         wal: WalLimits,
         checkpoint: AutomaticCheckpointConfig,
         shutdown_drain_ms: u64,
+        tls_ca: Option<PathBuf>,
+        tls_cert: Option<PathBuf>,
+        tls_key: Option<PathBuf>,
     }
 
     fn positive<T: std::str::FromStr + PartialEq + Default>(
@@ -67,6 +71,9 @@ Durable modes require a private journal path. Memory mode is the default.";
                 wal: WalLimits::default(),
                 checkpoint: AutomaticCheckpointConfig::default(),
                 shutdown_drain_ms: 5000,
+                tls_ca: None,
+                tls_cert: None,
+                tls_key: None,
             };
             let mut seen = HashSet::new();
             let mut args = args.into_iter();
@@ -130,11 +137,21 @@ Durable modes require a private journal path. Memory mode is the default.";
                         }
                     }
 
+                    "--tls-ca" => config.tls_ca = Some(PathBuf::from(value)),
+                    "--tls-cert" => config.tls_cert = Some(PathBuf::from(value)),
+                    "--tls-key" => config.tls_key = Some(PathBuf::from(value)),
                     _ => return Err(format!("unknown option {flag}")),
                 }
             }
-            if !config.bind.ip().is_loopback() || config.bind.port() == 0 {
-                return Err("bind must be a loopback address with a nonzero port; authentication and TLS are not implemented".into());
+            let tls_count = [&config.tls_ca, &config.tls_cert, &config.tls_key]
+                .iter()
+                .filter(|p| p.is_some())
+                .count();
+            if tls_count != 0 && tls_count != 3 {
+                return Err("all three TLS paths are required".into());
+            }
+            if config.bind.port() == 0 || (!config.bind.ip().is_loopback() && tls_count != 3) {
+                return Err("non-loopback bind requires mutual TLS and a nonzero port".into());
             }
             if (config.mode == Mode::Memory) != config.journal.is_none() {
                 return Err("a journal path is required exactly in buffered or sync mode".into());
@@ -164,6 +181,30 @@ Durable modes require a private journal path. Memory mode is the default.";
         }
 
         fn bind(self) -> Result<CacheShardServer, String> {
+            // Parse and validate all security material before binding.
+            let tls = match (&self.tls_ca, &self.tls_cert, &self.tls_key) {
+                (Some(ca), Some(cert), Some(key)) => {
+                    fn read(path: &std::path::Path) -> Result<Vec<u8>, String> {
+                        use std::io::Read;
+                        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+                        let mut bytes = Vec::new();
+                        file.take(1024 * 1024 + 1)
+                            .read_to_end(&mut bytes)
+                            .map_err(|e| e.to_string())?;
+                        if bytes.len() > 1024 * 1024 {
+                            return Err("TLS PEM exceeds 1 MiB".into());
+                        }
+                        Ok(bytes)
+                    }
+                    Some(
+                        CacheMutualTls::from_pem(&read(ca)?, &read(cert)?, &read(key)?)
+                            .map_err(|e| e.to_string())?,
+                    )
+                }
+                (None, None, None) => None,
+                _ => return Err("incomplete mutual TLS configuration".into()),
+            };
+
             let placement = CacheSlotMap::new_local(1, 1).map_err(|e| format!("{e:?}"))?;
             let owner = placement.owner_for_slot(0).ok_or("missing local owner")?;
             let (channels, mut inboxes) =
@@ -205,6 +246,11 @@ Durable modes require a private journal path. Memory mode is the default.";
                 ),
             }
             .map_err(|e| format!("bind/recovery failed: {e:?}"))?;
+            if let Some(tls) = tls {
+                server
+                    .enable_mutual_tls(tls)
+                    .map_err(|e| format!("{e:?}"))?;
+            }
             if self.mode != Mode::Memory && self.checkpoint.trigger_percent != 0 {
                 server
                     .enable_automatic_checkpoint(self.checkpoint)
@@ -376,6 +422,34 @@ Durable modes require a private journal path. Memory mode is the default.";
                 60000
             );
             assert!(parse(&["--shutdown-drain-ms", "60001"]).is_err());
+        }
+
+        #[test]
+        fn remote_binds_require_complete_mutual_tls_configuration() {
+            assert!(parse(&["--bind", "0.0.0.0:6380"]).is_err());
+            assert!(parse(&["--tls-cert", "server.pem"]).is_err());
+            assert!(parse(&[
+                "--bind",
+                "0.0.0.0:6380",
+                "--tls-ca",
+                "ca.pem",
+                "--tls-cert",
+                "server.pem",
+                "--tls-key",
+                "server.key"
+            ])
+            .is_ok());
+            assert!(parse(&[
+                "--tls-ca",
+                "missing-ca",
+                "--tls-cert",
+                "missing-cert",
+                "--tls-key",
+                "missing-key"
+            ])
+            .unwrap()
+            .bind()
+            .is_err());
         }
 
         #[test]

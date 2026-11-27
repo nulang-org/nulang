@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Fabric mutual TLS authentication — 2026-11-27
+- **Add explicit mutual TLS using existing Rustls and private CA material** with mandatory client certificates, no early data or session resumption, bounded connection count and handshake deadline, nonblocking encrypted reactor I/O, and encrypted output draining. Standalone remote binds require complete TLS configuration; plaintext remains loopback-only. Qualify against the audited dependency baseline before remote deployment.
+
 ### Durable TTL clock regression guard — 2026-11-27
 - **Fail closed on recovery behind a persisted clock observation**, using a checksummed independently synchronized clock sidecar and stable-lock initialization marker; guard TTL observations and expiry sweeps without consuming journal capacity. Propagate fallible RESP reads and stop the shard on clock publication failure. Check the graceful drain deadline between socket writes.
 
