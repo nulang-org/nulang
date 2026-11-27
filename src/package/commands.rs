@@ -85,6 +85,18 @@ pub fn run(args: &[String]) -> NuResult<()> {
             }
             cmd_new_styled(path_arg, template, style)
         }
+        Some("generate") => match args.get(1).map(String::as_str) {
+            Some("resource") if args.len() == 3 => {
+                crate::package::resource::generate_resource(&package_root()?, &args[2])
+            }
+            Some("model") => {
+                crate::package::model_generator::run(&args[1..], &package_root()?).map(|_| ())
+            }
+            _ => Err(NuError::PackageError {
+                msg: "usage: nula generate resource <PascalCaseName> OR nula generate model <PascalCaseName> --field name:Type [--field ...] [--read-only-views]".into(),
+                span: Span::default(),
+            }),
+        },
         Some("init") => cmd_init(),
         Some("build") => {
             let web = args.get(1).map(String::as_str) == Some("--web");
@@ -276,7 +288,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
 
         Some(other) => Err(NuError::PackageError {
             msg: format!(
-                "unknown nula subcommand '{}' (expected new, init, build, build-wasm, test, run, add, remove, publish, deploy, watch, doc, list, or clean)",
+                "unknown nula subcommand '{}' (expected new, init, generate, build, build-wasm, test, run, add, remove, publish, deploy, watch, doc, list, or clean)",
                 other
             ),
             span: Span::default(),
@@ -297,6 +309,10 @@ fn print_usage() {
     println!("  new   <path> [--template <name>] [--style syntyr]");
     println!("                Scaffold a new package directory");
     println!("                Templates: default, cli, lib, full, distributed, ai-agent, web");
+    println!(
+        "  generate resource <PascalCaseName>  Add GET-only resource routes to a web template"
+    );
+    println!("  generate model <PascalCaseName> --field name:Type [...]  Create typed model and deny-all policy hooks (add --read-only-views for HTML helpers)");
     println!("  init          Scaffold a new package in the current directory");
     println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
     println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
@@ -750,7 +766,7 @@ fn home() {
             delete_todo(form_value("id"))
         } else {}
     } else {}
-    document(
+    document_lang("en",
         head([
             title("Nulang Todo"),
             el("link", [("rel", text("stylesheet")), ("href", text("style.css"))], [])
@@ -766,9 +782,14 @@ fn home() {
     )
 }
 
+// nula:resources:handlers-start
+// nula:resources:handlers-end
+
 app "todos" {
     route "GET" "/" -> home
     route "POST" "/" -> home
+    // nula:resources:routes-start
+    // nula:resources:routes-end
 }
 "#,
             ),
@@ -1673,98 +1694,24 @@ fn cmd_dev(port_override: Option<u16>) -> NuResult<()> {
         &entry_str,
     ])?;
 
-    if runtime_routes.is_empty() {
+    let static_only = runtime_routes.is_empty();
+    let server = if static_only {
         cmd_build_web()?;
-        let output_dir = root.join(&manifest.web.output_dir);
-        let addr = format!("127.0.0.1:{}", port);
-        let listener = std::net::TcpListener::bind(&addr).map_err(|e| NuError::PackageError {
-            msg: format!("cannot bind dev server to {}: {}", addr, e),
-            span: Span::default(),
-        })?;
-        println!("Serving static files at http://{}/", addr);
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    let root = output_dir.clone();
-                    std::thread::spawn(move || {
-                        serve_static_file(stream, &root);
-                    });
-                }
-                Err(e) => eprintln!("connection error: {}", e),
-            }
-        }
-        Ok(())
+        WebDevServer::bind_static_site(port, output_dir)
     } else {
-        let server = WebDevServer::bind_runtime(
-            port,
-            Some(static_dir),
-            Some(output_dir.clone()),
-            runtime_routes,
-        )
-        .map_err(|e| NuError::PackageError {
-            msg: format!("cannot bind dev server: {}", e),
-            span: Span::default(),
-        })?;
-        let actual_port = server.port;
-        println!("Dev server listening on http://127.0.0.1:{}/", actual_port);
-        loop {
-            std::thread::park();
-        }
+        WebDevServer::bind_runtime(port, Some(static_dir), Some(output_dir), runtime_routes)
     }
-}
-
-fn serve_static_file(mut stream: std::net::TcpStream, root: &Path) {
-    use std::io::{BufRead, BufReader, Write};
-    let mut reader = BufReader::new(&stream);
-    let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
-        return;
+    .map_err(|e| NuError::PackageError {
+        msg: format!("cannot bind dev server: {}", e),
+        span: Span::default(),
+    })?;
+    if static_only {
+        println!("Serving static files at http://127.0.0.1:{}/", server.port);
+    } else {
+        println!("Dev server listening on http://127.0.0.1:{}/", server.port);
     }
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    let path = parts.get(1).unwrap_or(&"/").trim_start_matches('/');
-    let file_path = if path.is_empty() {
-        root.join("index.html")
-    } else {
-        root.join(path)
-    };
-    let (status, content_type, body) = if file_path.is_file() {
-        match std::fs::read(&file_path) {
-            Ok(data) => ("200 OK", guess_content_type(&file_path), data),
-            Err(_) => (
-                "404 Not Found",
-                "text/plain; charset=utf-8",
-                b"Not found".to_vec(),
-            ),
-        }
-    } else {
-        (
-            "404 Not Found",
-            "text/plain; charset=utf-8",
-            b"Not found".to_vec(),
-        )
-    };
-    let response = format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        status,
-        content_type,
-        body.len()
-    );
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.write_all(&body);
-}
-
-fn guess_content_type(path: &Path) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("html") | Some("htm") => "text/html; charset=utf-8",
-        Some("css") => "text/css; charset=utf-8",
-        Some("js") => "application/javascript; charset=utf-8",
-        Some("json") => "application/json; charset=utf-8",
-        Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("svg") => "image/svg+xml",
-        Some("ico") => "image/x-icon",
-        Some("wasm") => "application/wasm",
-        _ => "application/octet-stream",
+    loop {
+        std::thread::park();
     }
 }
 
@@ -2257,6 +2204,28 @@ struct DeployResponse {
     status: String,
 }
 
+/// Reject the development-only KV session example during a production deploy,
+/// including a dry run. Local compilation remains available for experimentation.
+fn validate_deploy_security(root: &Path, manifest: &Manifest) -> NuResult<()> {
+    let demo_dependency = manifest
+        .dependencies
+        .keys()
+        .any(|name| name == "nulang-auth" || name == "@nulang/auth");
+    let demo_import = crate::web::ir::source_tree_uses_development_auth(&root.join("src"))
+        .map_err(|err| NuError::PackageError {
+            msg: format!("cannot verify Web sources for production deploy: {err}"),
+            span: Span::default(),
+        })?;
+
+    if demo_dependency || demo_import {
+        return Err(NuError::PackageError {
+            msg: "@nulang/auth is development-only: arbitrary login(user) and ephemeral sessions are not verified production authentication, even with secure random tokens. Replace it with verified authentication and server-side authorization before deploying.".to_string(),
+            span: Span::default(),
+        });
+    }
+    Ok(())
+}
+
 /// `nula deploy [--wasm] [--url <url>] [--token <token>] [--adapter <kind>] [--dry-run]`
 /// — build and deploy the current package to Nulang Cloud or another adapter.
 #[cfg(feature = "ureq")]
@@ -2281,6 +2250,9 @@ fn cmd_deploy(
     })?;
     let name = manifest.package.name.clone();
     let version = manifest.package.version.clone();
+
+    // Bundled auth permits arbitrary demo logins and stores ephemeral sessions.
+    validate_deploy_security(&root, &manifest)?;
 
     // Build the web output so dist/ contains the IR and static assets.
     cmd_build_web()?;
@@ -2673,6 +2645,187 @@ fn cmd_remove(name: Option<&str>) -> NuResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_deploy_rejects_development_auth_import_and_dependency() {
+        let dir =
+            std::env::temp_dir().join(format!("nulang_dev_auth_deploy_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        scaffold_package(&dir, "demo-auth", "web").expect("web scaffold");
+        let manifest = Manifest::load(&dir).unwrap();
+        assert!(validate_deploy_security(&dir, &manifest).is_ok());
+
+        let main = dir.join("src/main.nula");
+        let original = std::fs::read_to_string(&main).unwrap();
+        std::fs::write(&main, format!("import @nulang/auth\n{original}")).unwrap();
+        let err = validate_deploy_security(&dir, &manifest)
+            .expect_err("deploy must reject demo auth regardless of configured cloud secrets");
+        assert!(err.to_string().contains("development-only"));
+        // The actual deploy command must refuse before compiling or sending
+        // artifacts, including dry-run previews.
+        #[cfg(feature = "ureq")]
+        {
+            let _guard = ChangeDir::new(&dir);
+            let result = cmd_deploy(
+                false,
+                None,
+                None,
+                crate::web::adapters::AdapterKind::NulangCloud,
+                true,
+            );
+            assert!(result.unwrap_err().to_string().contains("development-only"));
+        }
+        std::fs::write(&main, original).unwrap();
+
+        let path = dir.join("Nulang.toml");
+        let source = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            source.replacen(
+                "[dependencies]\n",
+                "[dependencies]\nnulang-auth = \"0.1.0\"\n",
+                1,
+            ),
+        )
+        .unwrap();
+        let manifest = Manifest::load(&dir).unwrap();
+        assert!(validate_deploy_security(&dir, &manifest).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_generate_model_and_resource_keep_independent_outputs() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_resource_model_and_routes_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        scaffold_package(&dir, "resource-app", "web").unwrap();
+        let _guard = ChangeDir::new(&dir);
+
+        let model_args: Vec<String> = [
+            "generate",
+            "model",
+            "BlogPost",
+            "--field",
+            "title:String",
+            "--field",
+            "published:Bool",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        run(&model_args).expect("typed-model generator should coexist with read-only routes");
+        let model_path = dir.join("src/resources/blog_post.nula");
+        let model = std::fs::read_to_string(&model_path).unwrap();
+        assert!(model.contains("pub type BlogPost = {"));
+        assert!(model.contains("pub type BlogPostInput = {"));
+        assert!(model.contains("can_read_blog_post"));
+        assert!(model.contains("-> Bool { false }"));
+
+        let resource_args: Vec<String> = ["generate", "resource", "BlogPost"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        run(&resource_args).expect("GET-only routes should remain independently available");
+        let routes = std::fs::read_to_string(dir.join("src/main.nula")).unwrap();
+        assert!(routes.contains(r#"route "GET" "/blog_posts" -> blog_posts_index"#));
+        assert_eq!(std::fs::read_to_string(&model_path).unwrap(), model);
+
+        assert!(
+            run(&model_args).is_err(),
+            "never overwrite an existing model"
+        );
+        assert!(
+            run(&resource_args).is_err(),
+            "never duplicate existing routes"
+        );
+        assert_eq!(std::fs::read_to_string(&model_path).unwrap(), model);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/main.nula")).unwrap(),
+            routes
+        );
+
+        let invalid: Vec<String> = [
+            "generate",
+            "model",
+            "BlogPost",
+            "--field",
+            "tenant_id:String",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert!(
+            run(&invalid).is_err(),
+            "reserved tenant_id must be rejected"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_generate_web_resource_adds_compiler_visible_routes() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_web_resource_generated_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        scaffold_package(&dir, "resource-app", "web").unwrap();
+
+        crate::package::resource::generate_resource(&dir, "BlogPost").unwrap();
+        let main = std::fs::read_to_string(dir.join("src/main.nula")).unwrap();
+        assert!(main.contains("fn blog_posts_index() -> Html"));
+        assert!(main.contains("fn blog_posts_new() -> Html"));
+        assert!(main.contains(r#"route "GET" "/blog_posts" -> blog_posts_index"#));
+        assert!(main.contains(r#"route "GET" "/blog_posts/new" -> blog_posts_new"#));
+
+        let compilation =
+            crate::web::validation::compile_validated_contracts_from_tree(&dir.join("src"))
+                .expect("generated routes must share the compiler contract");
+        assert!(compilation.routes.iter().any(|r| r.path == "/blog_posts"));
+        assert!(compilation
+            .routes
+            .iter()
+            .any(|r| r.path == "/blog_posts/new"));
+
+        let snapshot = main;
+        let error = crate::package::resource::generate_resource(&dir, "BlogPost")
+            .expect_err("duplicate resource must not overwrite code");
+        assert!(error.to_string().contains("already"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/main.nula")).unwrap(),
+            snapshot
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_generate_web_resource_rejects_unsafe_input_without_mutation() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_web_resource_validation_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        scaffold_package(&dir, "resource-app", "web").unwrap();
+        let original = std::fs::read_to_string(dir.join("src/main.nula")).unwrap();
+
+        for invalid in ["", "../foo", "project;", "3Projects", "hello world"] {
+            assert!(crate::package::resource::generate_resource(&dir, invalid).is_err());
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/main.nula")).unwrap(),
+            original
+        );
+
+        // Refuse to rewrite web apps that don't contain the managed extension points.
+        std::fs::write(dir.join("src/main.nula"), "app \"minimal\" {}").unwrap();
+        assert!(crate::package::resource::generate_resource(&dir, "Project").is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/main.nula")).unwrap(),
+            "app \"minimal\" {}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_manifest_language_pin() {

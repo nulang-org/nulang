@@ -21,6 +21,7 @@ when:
         - "**/*.rs"
         - "**/Cargo.toml"
         - "Cargo.lock"
+        - "**/Cargo.lock"
         - "build.rs"
         - "scripts/**"
         - ".woodpecker/**"
@@ -31,6 +32,7 @@ when:
         - "**/*.rs"
         - "**/Cargo.toml"
         - "Cargo.lock"
+        - "**/Cargo.lock"
         - "build.rs"
         - "scripts/**"
         - ".woodpecker/**"
@@ -58,6 +60,9 @@ steps:
       - cargo fmt --all -- --check
       - cargo check --all-targets --no-default-features
       - cargo check --all-targets
+      - cargo check --locked --no-default-features --features release-cli --bin nulang
+      - rustup target add wasm32-unknown-unknown
+      - cargo check --locked --manifest-path crates/nulang-playground/Cargo.toml --target wasm32-unknown-unknown
       - cargo clippy --all-targets --no-default-features -- -D clippy::correctness
       - cargo test --no-default-features
       - cargo test

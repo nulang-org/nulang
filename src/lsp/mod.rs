@@ -1823,7 +1823,8 @@ impl NulangLanguageServer {
         };
 
         // Parse
-        let ast = match Parser::new(tokens).parse_module() {
+        let mut parser = Parser::new(tokens);
+        let ast = match parser.parse_module() {
             Ok(a) => a,
             Err(e) => {
                 diagnostics.extend(nu_error_to_diagnostic(e));
@@ -1836,6 +1837,40 @@ impl NulangLanguageServer {
                 };
             }
         };
+
+        // Parser warnings share the CLI's stable codes and source spans.
+        for warning in parser.take_warnings() {
+            let position = |offset: u32, line: usize, column: usize| {
+                let end = offset as usize;
+                let start = end.saturating_sub(column.saturating_sub(1));
+                let utf16 = source
+                    .get(start..end)
+                    .map_or(0, |prefix| prefix.encode_utf16().count());
+                Position::new(line.saturating_sub(1) as u32, utf16 as u32)
+            };
+            diagnostics.push(Diagnostic {
+                range: Range::new(
+                    position(
+                        warning.span.start,
+                        warning.span.line(),
+                        warning.span.column(),
+                    ),
+                    position(
+                        warning.span.end,
+                        warning.span.end_line(),
+                        warning.span.end_column(),
+                    ),
+                ),
+                severity: Some(DiagnosticSeverity::WARNING),
+                code: Some(NumberOrString::String(warning.code.to_owned())),
+                source: Some("nulang".into()),
+                message: match warning.help {
+                    Some(help) => format!("{}\n{help}", warning.msg),
+                    None => warning.msg,
+                },
+                ..Default::default()
+            });
+        }
 
         // Type check — collect all errors so we surface every problem,
         // not just the first. Downstream effect/capability checks still
@@ -3936,6 +3971,21 @@ mod lsp_tests {
             result.ast.is_some(),
             "successful diagnostics must retain the parsed AST for DocumentState"
         );
+    }
+
+    #[test]
+    fn test_diagnostics_reports_source_positioned_html_warning() {
+        let source =
+            "fn page() {\n    let label = \"Olá😀\"\n    perform Web.html(\"img\", [], [])\n}";
+        let result = NulangLanguageServer::compute_diagnostics(source);
+        let warning = result
+            .diagnostics
+            .iter()
+            .find(|d| d.code == Some(NumberOrString::String("W0202".into())))
+            .expect("compiler HTML warning");
+        assert_eq!(warning.severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(warning.range.start, Position::new(2, 4));
+        assert!(warning.message.contains("alt attribute"));
     }
 
     #[test]

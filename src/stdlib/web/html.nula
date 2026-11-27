@@ -42,7 +42,14 @@ pub fn title(s: String) -> Html {
     el("title", [], [text(s)])
 }
 
-/// Produce a complete `<html>` document from a head and body.
+/// Produce a complete HTML document without assuming a content language.
+/// Prefer `document_lang` when rendering a page with a known language.
 pub fn document(page_head: Html, page_body: Html) -> Html {
     el("html", [], [page_head, page_body])
+}
+
+/// Produce a complete HTML document with an explicit BCP 47 language tag.
+/// Supply the actual language of the page (e.g. "en" or "pt-BR").
+pub fn document_lang(lang: String, page_head: Html, page_body: Html) -> Html {
+    el("html", [("lang", text(lang))], [page_head, page_body])
 }

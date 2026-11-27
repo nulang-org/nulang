@@ -1,0 +1,10 @@
+import stdlib::web::html
+import stdlib::web::frames
+
+fn main() {
+    let content = perform Web.text("Tea & toast")
+    let simple = frame("activities", [content])
+    let lazy = lazy_frame("recent", "/recent")
+    perform IO.print(simple)
+    perform IO.print(lazy)
+}

@@ -150,7 +150,12 @@ fn home() {
     ])
 }
 
+// nula:resources:handlers-start
+// nula:resources:handlers-end
+
 app "todos" {
     route "GET" "/" -> home
     route "POST" "/" -> home
+    // nula:resources:routes-start
+    // nula:resources:routes-end
 }

@@ -128,6 +128,7 @@ fn required_host_authority(
             path: string_arg(0)?,
         },
         ("Realtime", Some("broadcast")) => other("Realtime", "Broadcast", Some(string_arg(0)?)),
+        ("Realtime", Some("patch")) => other("Realtime", "Patch", Some(string_arg(0)?)),
         ("Env", Some("get")) => AuthorityGrant::EnvRead {
             name: string_arg(0)?,
         },
@@ -386,6 +387,14 @@ pub(crate) fn perform_web_builtin(
             None => crate::vm::Value::nil(),
         }
     }
+    // These Web host operations are declared as returning String.
+    // Nil stringifies to "nil", making missing auth values appear nonempty.
+    fn string_or_empty(
+        callbacks: &mut dyn crate::vm::ActorVmCallbacks,
+        value: Option<String>,
+    ) -> crate::vm::Value {
+        callbacks.alloc_string(value.as_deref().unwrap_or(""))
+    }
     match op_name {
         Some("html") => {
             let tag = resolve(constants, *regs.first()?);
@@ -416,6 +425,18 @@ pub(crate) fn perform_web_builtin(
             let s = resolve(constants, *regs.first()?);
             Some(callbacks.alloc_string(&s))
         }
+        Some("turbo_stream") => {
+            let action = resolve(constants, *regs.first()?);
+            let target = resolve(constants, *regs.get(1)?);
+            let content = resolve(constants, *regs.get(2)?);
+            match crate::web::turbo::render_stream(&action, &target, &content) {
+                Some(stream) => {
+                    crate::runtime::http_server::mark_turbo_stream_response();
+                    Some(callbacks.alloc_string(&stream))
+                }
+                None => Some(crate::vm::Value::nil()),
+            }
+        }
         Some("route") => Some(crate::vm::Value::unit()),
         Some("redirect") => {
             let url = resolve(constants, *regs.first()?);
@@ -434,28 +455,37 @@ pub(crate) fn perform_web_builtin(
         }
         Some("param") => {
             let name = resolve(constants, *regs.first()?);
-            crate::runtime::http_server::current_request_param(&name)
-                .map(|s| callbacks.alloc_string(&s))
-                .or(Some(crate::vm::Value::nil()))
+            Some(string_or_empty(
+                callbacks,
+                crate::runtime::http_server::current_request_param(&name),
+            ))
         }
         Some("header") => {
             let name = resolve(constants, *regs.first()?);
-            crate::runtime::http_server::current_request_header(&name)
-                .map(|s| callbacks.alloc_string(&s))
-                .or(Some(crate::vm::Value::nil()))
+            Some(string_or_empty(
+                callbacks,
+                crate::runtime::http_server::current_request_header(&name),
+            ))
         }
+        Some("verified_tenant_id") => Some(string_or_empty(
+            callbacks,
+            crate::runtime::http_server::current_verified_tenant_id(),
+        )),
         Some("cookie") => {
             let name = resolve(constants, *regs.first()?);
-            crate::runtime::http_server::current_request_cookie(&name)
-                .map(|s| callbacks.alloc_string(&s))
-                .or(Some(crate::vm::Value::nil()))
+            Some(string_or_empty(
+                callbacks,
+                crate::runtime::http_server::current_request_cookie(&name),
+            ))
         }
-        Some("read_body") => crate::runtime::http_server::current_request_body()
-            .map(|b| callbacks.alloc_string(&String::from_utf8_lossy(&b)))
-            .or(Some(crate::vm::Value::nil())),
-        Some("method") => crate::runtime::http_server::current_request_method()
-            .map(|s| callbacks.alloc_string(&s))
-            .or(Some(crate::vm::Value::nil())),
+        Some("read_body") => {
+            let body = crate::runtime::http_server::current_request_body().unwrap_or_default();
+            Some(callbacks.alloc_string(&String::from_utf8_lossy(&body)))
+        }
+        Some("method") => Some(string_or_empty(
+            callbacks,
+            crate::runtime::http_server::current_request_method(),
+        )),
         Some("form") => {
             let pairs = crate::runtime::http_server::current_request_body()
                 .map(|b| crate::runtime::http_server::parse_form_urlencoded(&b))
@@ -470,15 +500,17 @@ pub(crate) fn perform_web_builtin(
         }
         Some("form_value") => {
             let name = resolve(constants, *regs.first()?);
-            crate::runtime::http_server::form_value(&name)
-                .map(|s| callbacks.alloc_string(&s))
-                .or(Some(crate::vm::Value::nil()))
+            Some(string_or_empty(
+                callbacks,
+                crate::runtime::http_server::form_value(&name),
+            ))
         }
         Some("kv_get") => {
             let key = resolve(constants, *regs.first()?);
-            crate::runtime::http_server::kv_get(&key)
-                .map(|s| callbacks.alloc_string(&s))
-                .or(Some(crate::vm::Value::nil()))
+            Some(string_or_empty(
+                callbacks,
+                crate::runtime::http_server::kv_get(&key),
+            ))
         }
         Some("kv_set") => {
             let key = resolve(constants, *regs.first()?);
@@ -500,6 +532,10 @@ pub(crate) fn perform_web_builtin(
                 tuples.push(alloc_tuple(callbacks, k_val, v_val));
             }
             Some(alloc_array(callbacks, tuples))
+        }
+        Some("secure_token") => {
+            let token = crate::runtime::http_server::secure_session_token().unwrap_or_default();
+            Some(callbacks.alloc_string(&token))
         }
         Some("set_cookie") => {
             let name = resolve(constants, *regs.first()?);
@@ -534,6 +570,14 @@ pub(crate) fn perform_realtime_builtin(
             let message = resolve(constants, *regs.get(1)?);
             crate::runtime::http_server::realtime_broadcast(&room, &message);
             Some(crate::vm::Value::unit())
+        }
+        Some("patch") => {
+            let room = resolve(constants, *regs.first()?);
+            let target = resolve(constants, *regs.get(1)?);
+            let html = resolve(constants, *regs.get(2)?);
+            Some(crate::vm::Value::bool(
+                crate::runtime::http_server::ui_stream_publish(&room, &target, &html),
+            ))
         }
         _ => None,
     }
@@ -2745,6 +2789,16 @@ mod host_authority_tests {
                 argument: Some("orders".into()),
             })
         );
+
+        let (constants, regs) = string_args(&["tasks", "#items", "<div>hi</div>"]);
+        assert_eq!(
+            required_host_authority("Realtime", Some("patch"), &constants, &regs).unwrap(),
+            Some(AuthorityGrant::Other {
+                namespace: "Realtime".into(),
+                operation: "Patch".into(),
+                argument: Some("tasks".into()),
+            })
+        );
     }
 
     #[test]
@@ -3046,5 +3100,51 @@ mod host_authority_tests {
         assert!(
             authorize_actor_host_effect(&rt, None, "FS", Some("read"), &constants, &regs,).is_ok()
         );
+    }
+}
+
+#[cfg(test)]
+mod web_missing_string_tests {
+    use super::{perform_web_builtin, RuntimeVmCallbacks};
+    use crate::bytecode::Constant;
+    use crate::runtime::http_server::{
+        with_request_context, HttpMethod, HttpRequest, RequestContext,
+    };
+    use crate::runtime::Runtime;
+    use crate::vm::{resolve_value_string, Value};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    #[test]
+    fn missing_web_string_values_are_not_nil() {
+        let ctx = RequestContext {
+            request: HttpRequest {
+                method: HttpMethod::Get,
+                path: "/".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+        with_request_context(ctx, || {
+            let rt = Rc::new(RefCell::new(Runtime::new()));
+            let mut callback = RuntimeVmCallbacks::new(rt);
+            let constants = vec![Constant::String("missing-session".into())];
+            let args = [Value::string(0)];
+            for operation in ["cookie", "kv_get", "form_value", "header", "param"] {
+                let value = perform_web_builtin(&mut callback, Some(operation), &constants, &args)
+                    .expect("Web host must handle a typed String operation");
+                assert!(
+                    !value.is_nil(),
+                    "{operation} returned Nil for a declared String"
+                );
+                assert_eq!(
+                    resolve_value_string(&constants, value),
+                    "",
+                    "{operation} must return an empty String for a missing value"
+                );
+            }
+        });
     }
 }

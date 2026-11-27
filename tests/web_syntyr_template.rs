@@ -88,6 +88,7 @@ fn test_web_syntyr_scaffold_and_build_are_self_contained() {
     run_nula(&app, &["build", "--web"]);
 
     let html = std::fs::read_to_string(app.join("dist/index.html")).unwrap();
+    assert!(html.starts_with("<!doctype html>"));
     for required in [
         "lang=\"en\"",
         "data-syn-theme=\"studio\"",
@@ -106,6 +107,13 @@ fn test_web_syntyr_scaffold_and_build_are_self_contained() {
     for (file, bytes) in assets {
         assert_eq!(std::fs::read(app.join("dist").join(file)).unwrap(), *bytes);
     }
+
+    // Both scaffold variants must support the same resource generator.
+    run_nula(&app, &["generate", "resource", "Project"]);
+    run_nula(&app, &["build", "--web"]);
+    let source = std::fs::read_to_string(app.join("src/main.nula")).unwrap();
+    assert!(source.contains("route \"GET\" \"/projects\" -> projects_index"));
+    assert!(source.contains("route \"GET\" \"/projects/new\" -> projects_new"));
 
     // The regular web template must remain independent of Syntyr.
     run_nula(&temp.0, &["new", "plain", "--template", "web"]);

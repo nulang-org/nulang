@@ -102,11 +102,16 @@ by `render_warning`/`format_warning` (src/diagnostic.rs) with a
 | Range   | Category                                  |
 |---------|-------------------------------------------|
 | `W01xx` | Deprecations                              |
+| `W02xx` | Web markup and accessibility              |
 
 | Code    | Meaning                                   | Replacement (RFC)        |
 |---------|-------------------------------------------|--------------------------|
 | `W0101` | Deprecated `catch` expression (all forms) | `match` on `Ok`/`Error`, `?` under `T ! E` (RFC 0015) |
 | `W0102` | Deprecated `fail` expression              | `return Error(...)` under `T ! E` (RFC 0015) |
+| `W0201` | HTML root missing a known nonempty language | `lang` / `document_lang` |
+| `W0202` | Image missing `alt` or image button with empty `alt`          | Description or decorative empty alt (not for image buttons) |
+| `W0203` | Empty button/link without a local accessible name | Visible text or accessible name |
+| `W0204` | Void HTML element has children            | Empty children / self-closing syntax |
 
 See `docs/MIGRATION_RFC_0015.md` for the `catch`/`fail` migration guide.
 

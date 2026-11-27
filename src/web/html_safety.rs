@@ -19,6 +19,13 @@ pub(crate) fn render_element(
         return None;
     }
 
+    let void_element = is_void_element(tag);
+    // Void elements cannot contain children or have an end tag in HTML.
+    // Validate before output rather than silently dropping content.
+    if void_element && !children.is_empty() {
+        return None;
+    }
+
     // Validate all attributes before constructing any output.
     for (name, value) in attrs {
         if !safe_identifier(name) || dangerous_attribute(name) {
@@ -30,6 +37,10 @@ pub(crate) fn render_element(
     }
 
     let mut html = String::new();
+    // An explicit html root is a document, not an ordinary fragment.
+    if tag.eq_ignore_ascii_case("html") {
+        html.push_str("<!doctype html>");
+    }
     html.push('<');
     html.push_str(tag);
     for (name, value) in attrs {
@@ -40,6 +51,9 @@ pub(crate) fn render_element(
         html.push('"');
     }
     html.push('>');
+    if void_element {
+        return Some(html);
+    }
     for child in children {
         html.push_str(child);
     }
@@ -47,6 +61,26 @@ pub(crate) fn render_element(
     html.push_str(tag);
     html.push('>');
     Some(html)
+}
+
+pub(crate) fn is_void_element(tag: &str) -> bool {
+    matches!(
+        tag.to_ascii_lowercase().as_str(),
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
 }
 
 fn safe_identifier(name: &str) -> bool {
@@ -244,5 +278,43 @@ mod tests {
             &[]
         )
         .is_some());
+    }
+
+    #[test]
+    fn void_elements_have_no_end_tag_or_children() {
+        for tag in [
+            "area", "br", "col", "hr", "img", "input", "link", "meta", "source", "track", "wbr",
+            "BR",
+        ] {
+            assert_eq!(render_element(tag, &[], &[]), Some(format!("<{tag}>")));
+            assert!(render_element(tag, &[], &["unexpected".into()]).is_none());
+        }
+        assert_eq!(
+            render_element("div", &[], &[]).as_deref(),
+            Some("<div></div>")
+        );
+        assert!(render_element("base", &[], &[]).is_none());
+    }
+
+    #[test]
+    fn html_document_has_doctype_but_fragments_do_not() {
+        let html = render_element(
+            "html",
+            &attrs(&[("lang", "pt-BR")]),
+            &["<head></head><body></body>".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            html,
+            "<!doctype html><html lang=\"pt-BR\"><head></head><body></body></html>"
+        );
+        assert_eq!(
+            render_element("HTML", &[], &[]).as_deref(),
+            Some("<!doctype html><HTML></HTML>")
+        );
+        assert_eq!(
+            render_element("p", &[], &["hello".into()]).as_deref(),
+            Some("<p>hello</p>")
+        );
     }
 }

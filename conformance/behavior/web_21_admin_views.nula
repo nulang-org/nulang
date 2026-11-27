@@ -1,0 +1,5 @@
+import stdlib::web::admin
+
+fn show() {
+    readonly_table(["Title"], [["Hello"]])
+}

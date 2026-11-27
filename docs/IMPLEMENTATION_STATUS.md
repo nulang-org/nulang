@@ -116,7 +116,7 @@ Current backends:
 |---|---|
 | `MemoryStore` | Always available; test/ephemeral durable state |
 | `JsonFileStore` | Always available; file-backed development/debugging |
-| `LibsqlStore` | `sqlite` feature; libSQL/SQLite and remote libSQL/Turso path |
+| `LibsqlStore` | `sqlite` feature; one patched local SQLite provider; remote Turso uses HTTPS-only Hrana with platform CA/hostname validation in the security integration candidate; live disposable qualification remains required |
 | `RocksDbStore` | Optional `rocksdb` feature |
 | `PostgresStore` | Optional `postgres` feature |
 
