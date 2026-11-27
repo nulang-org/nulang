@@ -451,6 +451,30 @@ impl ManifestStore {
                 .expect("manifest checksum"),
         })
     }
+    /// Revalidate and synchronize the seal before allowing the full WAL to
+    /// be discarded. The stable manifest lock remains held by this handle.
+    /// Directory ancestors must already be durable and operator-controlled.
+    pub(super) fn sync_for_wal_binding(&self) -> io::Result<super::wal::SealBinding> {
+        let binding = self.wal_binding()?;
+        for entry in &self.manifest.entries {
+            self.open_verified_table(entry)?.sync_file()?;
+        }
+        let path = self.dir.join("MANIFEST");
+        reject_alias(&path)?;
+        let file = File::open(path)?;
+        let mut bytes = Vec::new();
+        (&file).take(MAX_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes != self.manifest.encode() {
+            return Err(invalid("sealed manifest changed before WAL binding"));
+        }
+        file.sync_all()?;
+        File::open(&self.dir)?.sync_all()?;
+        if let Some(parent) = self.dir.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(binding)
+    }
+
     fn recovery_meta(&self) -> io::Result<&RecoveryMeta> {
         if self.requires_reopen {
             return Err(io::Error::other("manifest publication requires reopen"));

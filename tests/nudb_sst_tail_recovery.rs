@@ -412,3 +412,105 @@ fn bound_header_without_tail_recovers_at_sealed_sequence() {
     let db = recover(&f).unwrap();
     assert_eq!(db.read_latest(b"k"), Some(b"fresh".as_slice()));
 }
+
+#[test]
+fn explicit_reclaim_publishes_bound_header_and_recovers_receipts() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let first = db
+        .commit_idempotent(id(1), vec![put(b"first"), put(b"last")])
+        .unwrap();
+    db.commit_idempotent(id(2), vec![TabletMutation::Delete { key: b"k".to_vec() }])
+        .unwrap();
+    db.commit_idempotent(id(3), vec![]).unwrap();
+    let manifest = seal(&f, &db);
+    let path = f.0.join("tablet.wal");
+    db.reclaim_to_sealed_sst(&manifest).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    assert_eq!(bytes.len(), 96);
+    assert_eq!(&bytes[..8], b"NUDBWAL4");
+    assert!(WalBackedTablet::open(f.descriptor(), &path).is_err());
+    assert!(ManifestStore::open(f.0.join("sst"), 7, 3).is_err());
+    assert_eq!(
+        db.commit_idempotent(id(1), vec![put(b"first"), put(b"last")])
+            .unwrap(),
+        first
+    );
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(db.read_at(b"k", 1).unwrap(), Some(b"last".as_slice()));
+    assert_eq!(db.read_at(b"k", 3).unwrap(), None);
+    assert!(db.checkpoint().is_err());
+    assert!(db.reclaim_to_sealed_sst(&manifest).is_err());
+    db.commit_idempotent(id(4), vec![put(b"tail")]).unwrap();
+    drop(db);
+    drop(manifest);
+    assert!(WalBackedTablet::open(f.descriptor(), &path).is_err());
+    let mut db = recover(&f).unwrap();
+    assert_eq!(db.current_sequence(), 4);
+    assert_eq!(db.read_latest(b"k"), Some(b"tail".as_slice()));
+    assert_eq!(
+        db.commit_idempotent(id(1), vec![put(b"first"), put(b"last")])
+            .unwrap(),
+        first
+    );
+}
+
+#[test]
+fn reclaim_rejects_stale_seal_checkpoint_and_foreign_receipts_without_mutation() {
+    for scenario in 0..3 {
+        let f = Fixture::new();
+        let mut db = f.open();
+        db.commit_idempotent(id(1), vec![put(b"v")]).unwrap();
+        let other = Fixture::new();
+        let m = if scenario == 2 {
+            let mut foreign = other.open();
+            foreign.commit_idempotent(id(9), vec![put(b"v")]).unwrap();
+            seal(&other, &foreign)
+        } else {
+            seal(&f, &db)
+        };
+        if scenario == 0 {
+            db.commit_idempotent(id(2), vec![put(b"tail")]).unwrap();
+        }
+        if scenario == 1 {
+            db.publish_checkpoint().unwrap();
+        }
+        let path = f.0.join("tablet.wal");
+        let before = fs::read(&path).unwrap();
+        assert!(db.reclaim_to_sealed_sst(&m).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        db.commit_idempotent(id(3), vec![put(b"still writable")])
+            .unwrap();
+    }
+}
+
+#[test]
+fn reclaim_revalidates_sealed_manifest_on_disk_before_discarding_wal() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"v")]).unwrap();
+    let m = seal(&f, &db);
+    let manifest_path = f.0.join("sst/MANIFEST");
+    let mut corrupt = fs::read(&manifest_path).unwrap();
+    corrupt[12] ^= 1;
+    fs::write(&manifest_path, corrupt).unwrap();
+    let path = f.0.join("tablet.wal");
+    let before = fs::read(&path).unwrap();
+    assert!(db.reclaim_to_sealed_sst(&m).is_err());
+    assert_eq!(fs::read(&path).unwrap(), before);
+    db.commit_idempotent(id(2), vec![put(b"still writable")])
+        .unwrap();
+}
+
+#[test]
+fn empty_seal_does_not_reclaim_empty_wal() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let mut manifest = f.manifest();
+    db.seal_sst_recovery(&mut manifest).unwrap();
+    let path = f.0.join("tablet.wal");
+    let before = fs::read(&path).unwrap();
+    assert!(db.reclaim_to_sealed_sst(&manifest).is_err());
+    assert_eq!(fs::read(&path).unwrap(), before);
+    db.commit_idempotent(id(1), vec![]).unwrap();
+}
