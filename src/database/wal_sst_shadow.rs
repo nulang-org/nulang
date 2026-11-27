@@ -190,3 +190,74 @@ pub(super) fn flush(
     manifest.append(entry.clone())?;
     Ok(Some(entry))
 }
+
+/// Qualification path: only one SST index at a time. Read newest eligible
+/// interval first; a tombstone terminates the search just like a value.
+/// Independently derive the exact visible mutation from the full WAL.
+pub(super) fn read_verified(
+    wal: &FileWal,
+    descriptor: &TabletDescriptor,
+    manifest: &ManifestStore,
+    key: &[u8],
+    snapshot: u64,
+    live: Option<&[u8]>,
+) -> io::Result<DiskLookup> {
+    if manifest.requires_reopen()
+        || manifest.current().tablet_id() != descriptor.id().get()
+        || manifest.current().epoch() != descriptor.ownership_epoch()
+        || manifest.current().durable_sequence() > wal.last_sequence()
+        || snapshot > manifest.current().durable_sequence()
+    {
+        return Err(invalid(
+            "shadow manifest identity, recovery, or snapshot mismatch",
+        ));
+    }
+    let end = usize::try_from(snapshot).map_err(|_| invalid("shadow snapshot overflow"))?;
+    let prefix = wal
+        .records()
+        .get(..end)
+        .ok_or_else(|| invalid("shadow snapshot outside complete WAL"))?;
+    let expected = prefix.iter().rev().find_map(|record| {
+        record
+            .mutations()
+            .iter()
+            .rev()
+            .find(|m| m.key() == key)
+            .map(|m| (record.sequence(), m))
+    });
+    let mut actual = DiskLookup::Missing;
+    for entry in manifest.current().entries().iter().rev() {
+        if entry.sequence_interval().0 > snapshot {
+            continue;
+        }
+        let mut table = manifest.open_verified_table(entry)?;
+        let candidate = table.read_at(key, snapshot)?;
+        if candidate != DiskLookup::Missing {
+            actual = candidate;
+            break;
+        }
+    }
+    let matches = match (&actual, expected) {
+        (DiskLookup::Missing, None) => live.is_none(),
+        (DiskLookup::Deleted { sequence }, Some((expected_seq, TabletMutation::Delete { .. }))) => {
+            *sequence == expected_seq && live.is_none()
+        }
+        (
+            DiskLookup::Value { sequence, value },
+            Some((
+                expected_seq,
+                TabletMutation::Put {
+                    value: expected_value,
+                    ..
+                },
+            )),
+        ) => *sequence == expected_seq && value == expected_value && live == Some(value.as_slice()),
+        _ => false,
+    };
+    if !matches {
+        return Err(invalid(
+            "shadow point read disagrees with WAL or live tablet",
+        ));
+    }
+    Ok(actual)
+}
