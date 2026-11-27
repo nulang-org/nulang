@@ -20,10 +20,22 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from cross_runtime_order import counterbalanced_runtime_order
+
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "benchmarks" / "cross_runtime"
 BUILD = ROOT / "target" / "cross-runtime"
-BENCHMARKS = ("counting", "ping_pong", "thread_ring", "fork_join")
+# The matched fixtures have fixed logical message counts. A consistent but
+# incorrect count in one runtime would otherwise skew cross-language throughput.
+MESSAGE_COUNTS = {
+    "counting": 200_000,
+    "ping_pong": 40_001,
+    "thread_ring": 20_000,
+    "fork_join": 100_000,
+}
+BENCHMARKS = tuple(MESSAGE_COUNTS)
+# The standalone Nulang runner also emits its own non-comparative workload.
+NULANG_ONLY_MESSAGE_COUNTS = {"skynet": 1_110}
 RECORD_RE = re.compile(
     r"\[cross-bench\]\s+runtime=(?P<runtime>[a-z0-9_-]+)\s+"
     r"benchmark=(?P<benchmark>[a-z0-9_-]+)\s+"
@@ -73,17 +85,40 @@ def maybe_version(command: list[str]) -> str | None:
 
 def parse_records(output: str, expected_runtime: str) -> dict[str, dict[str, int]]:
     records: dict[str, dict[str, int]] = {}
-    for match in RECORD_RE.finditer(output):
+    seen: set[str] = set()
+    for line in output.splitlines():
+        line = line.strip()
+        if not line.startswith("[cross-bench]"):
+            continue
+        match = RECORD_RE.fullmatch(line)
+        if match is None:
+            raise RuntimeError(f"{expected_runtime}: malformed benchmark record: {line!r}")
+
         runtime = match.group("runtime")
         if runtime != expected_runtime:
-            continue
+            raise RuntimeError(
+                f"{expected_runtime}: unexpected runtime {runtime!r} in benchmark record"
+            )
         name = match.group("benchmark")
-        if name not in BENCHMARKS:
-            continue
-        records[name] = {
-            "messages": int(match.group("messages")),
-            "elapsed_ns": int(match.group("elapsed_ns")),
-        }
+        expected_count = MESSAGE_COUNTS.get(name)
+        if expected_count is None and runtime == "nulang":
+            expected_count = NULANG_ONLY_MESSAGE_COUNTS.get(name)
+        if expected_count is None:
+            raise RuntimeError(f"{runtime}: unexpected benchmark {name!r}")
+        if name in seen:
+            raise RuntimeError(f"{runtime}/{name}: duplicate benchmark record")
+        seen.add(name)
+
+        messages = int(match.group("messages"))
+        elapsed_ns = int(match.group("elapsed_ns"))
+        if messages != expected_count:
+            raise RuntimeError(
+                f"{runtime}/{name}: expected message count {expected_count}, got {messages}"
+            )
+        if elapsed_ns <= 0:
+            raise RuntimeError(f"{runtime}/{name}: elapsed_ns must be positive")
+        if name in MESSAGE_COUNTS:
+            records[name] = {"messages": messages, "elapsed_ns": elapsed_ns}
 
     missing = [name for name in BENCHMARKS if name not in records]
     if missing:
@@ -296,7 +331,7 @@ def print_table(summary: dict[str, dict[str, dict[str, float | int]]]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--runs", type=int, default=5, help="measured runs per runtime")
+    parser.add_argument("--runs", type=int, default=8, help="measured runs per runtime")
     parser.add_argument("--warmup", type=int, default=1, help="discarded warm-up runs")
     parser.add_argument(
         "--runtimes",
@@ -320,6 +355,8 @@ def main() -> int:
         parser.error("--runs must be >= 1 and --warmup must be >= 0")
 
     selected = [item.strip() for item in args.runtimes.split(",") if item.strip()]
+    if not selected or len(selected) != len(set(selected)):
+        parser.error("--runtimes must select at least one runtime without duplicates")
     unknown = sorted(set(selected) - {"nulang", "rust", "go", "erlang"})
     if unknown:
         parser.error(f"unknown runtimes: {', '.join(unknown)}")
@@ -346,11 +383,17 @@ def main() -> int:
     # Cycle across runtimes per sample rather than exhausting one runtime at a
     # time. This reduces simple thermal/load drift bias within a host run.
     total_rounds = args.warmup + args.runs
+    measured_execution_orders: list[list[str]] = []
     for round_idx in range(total_rounds):
         measured = round_idx >= args.warmup
         phase = "sample" if measured else "warmup"
         index = round_idx - args.warmup + 1 if measured else round_idx + 1
-        for runtime in selected:
+        runtime_order = counterbalanced_runtime_order(
+            selected, round_idx - args.warmup if measured else round_idx
+        )
+        if measured:
+            measured_execution_orders.append(runtime_order)
+        for runtime in runtime_order:
             print(f"[{phase} {index}] {runtime}", flush=True)
             output = command_output(
                 commands[runtime],
@@ -369,6 +412,7 @@ def main() -> int:
         "methodology": "standard-runtime Savina-style messaging baselines",
         "warmup_runs": args.warmup,
         "measured_runs": args.runs,
+        "measured_execution_orders": measured_execution_orders,
         "environment": environment_metadata(args.cpu_mode, cpu_affinity),
         "samples": samples,
         "summary": summary,
