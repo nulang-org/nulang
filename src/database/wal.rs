@@ -161,8 +161,16 @@ pub struct FileWal {
 }
 
 impl FileWal {
+    /// Open a canonical lowercase `.wal` filename in a trusted local directory.
+    /// Other extensions are rejected before filesystem mutation; existing
+    /// noncanonical WAL/checkpoint pairs require verified offline migration.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WalError> {
         let requested_path = path.as_ref();
+        // Reserve a disjoint filename namespace for WALs, checkpoints and
+        // lock/temp sidecars. Arbitrary extensions can map to one checkpoint.
+        if requested_path.extension() != Some(std::ffi::OsStr::new("wal")) {
+            return Err(WalError::InvalidWalExtension);
+        }
         let parent = requested_path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -828,6 +836,7 @@ pub enum WalError {
     InvalidHeader,
     WriterLocked,
     AliasedWalPath,
+    InvalidWalExtension,
     WalHeaderChecksumMismatch,
     InvalidFrameHeader {
         offset: u64,
@@ -907,6 +916,9 @@ impl fmt::Display for WalError {
         match self {
             Self::Io { message, .. } => write!(f, "WAL I/O error: {message}"),
             Self::InvalidHeader => f.write_str("invalid NuDB WAL header"),
+            Self::InvalidWalExtension => {
+                f.write_str("NuDB WAL path must end in .wal; noncanonical legacy paths require offline migration")
+            }
             Self::WriterLocked => f.write_str("NuDB WAL already has an exclusive writer"),
             Self::AliasedWalPath => {
                 f.write_str("NuDB WAL or lock path must not be a symlink or hardlink")

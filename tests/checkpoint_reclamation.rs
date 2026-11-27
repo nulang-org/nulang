@@ -2,9 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use nulang::database::store::WalBackedTablet;
+use nulang::database::store::{WalBackedError, WalBackedTablet};
 use nulang::database::tablet::{KeyRange, TabletDescriptor, TabletId, TabletMutation};
-use nulang::database::wal::FileWal;
+use nulang::database::wal::{FileWal, WalError};
 
 static NEXT_TEST: AtomicU64 = AtomicU64::new(1);
 
@@ -260,4 +260,66 @@ fn duplicate_key_mutations_recover_as_one_mvcc_version_per_commit() {
 
     let _ = fs::remove_file(&wal_path);
     let _ = fs::remove_file(&checkpoint);
+}
+
+#[test]
+fn noncanonical_wal_names_cannot_overwrite_another_checkpoint() {
+    let canonical = temp_wal("namespace");
+    let alternate = canonical.with_extension("other");
+    let checkpoint = checkpoint_path(&canonical);
+    let mut first = WalBackedTablet::open(descriptor(), &canonical).unwrap();
+    commit_put(&mut first, b"k", b"first");
+    first.checkpoint().unwrap();
+    let before = fs::read(&checkpoint).unwrap();
+
+    // These names have the same legacy checkpoint path. Admission must
+    // fail before creating the alternate WAL or replacing the checkpoint.
+    assert_eq!(
+        WalBackedTablet::open(descriptor(), &alternate).unwrap_err(),
+        WalBackedError::Wal(WalError::InvalidWalExtension)
+    );
+    assert_eq!(
+        FileWal::open(&alternate).unwrap_err(),
+        WalError::InvalidWalExtension
+    );
+    assert!(!alternate.exists());
+    assert_eq!(fs::read(&checkpoint).unwrap(), before);
+    drop(first);
+    let reopened = WalBackedTablet::open(descriptor(), &canonical).unwrap();
+    assert_eq!(reopened.read_latest(b"k"), Some(&b"first"[..]));
+    drop(reopened);
+    fs::remove_file(&canonical).unwrap();
+    fs::remove_file(&checkpoint).unwrap();
+    let mut lock = canonical.into_os_string();
+    lock.push(".lock");
+    fs::remove_file(PathBuf::from(lock)).unwrap();
+}
+
+#[test]
+fn alternate_names_are_rejected_before_any_checkpoint_exists() {
+    let canonical = temp_wal("fresh_namespace");
+    let mut first = WalBackedTablet::open(descriptor(), &canonical).unwrap();
+    for extension in ["other", "checkpoint", "wal.lock", "WAL", ""] {
+        let alternate = canonical.with_extension(extension);
+        let before = fs::read(&canonical).unwrap();
+        let existed = alternate.exists();
+        assert_eq!(
+            WalBackedTablet::open(descriptor(), &alternate).unwrap_err(),
+            WalBackedError::Wal(WalError::InvalidWalExtension)
+        );
+        assert_eq!(fs::read(&canonical).unwrap(), before);
+        // No new file, and no removal of an existing lock or case alias.
+        assert_eq!(alternate.exists(), existed);
+    }
+    commit_put(&mut first, b"k", b"only-writer");
+    first.checkpoint().unwrap();
+    drop(first);
+    let reopened = WalBackedTablet::open(descriptor(), &canonical).unwrap();
+    assert_eq!(reopened.read_latest(b"k"), Some(&b"only-writer"[..]));
+    drop(reopened);
+    fs::remove_file(checkpoint_path(&canonical)).unwrap();
+    fs::remove_file(&canonical).unwrap();
+    let mut lock = canonical.into_os_string();
+    lock.push(".lock");
+    fs::remove_file(PathBuf::from(lock)).unwrap();
 }
