@@ -91,7 +91,7 @@ pub fn command_slot(command: RespCommand<'_>) -> RespCommandSlot {
     }
 
     if name.eq_ignore_ascii_case(b"MSET") {
-        return if command.argc() == 0 || command.argc() % 2 != 0 {
+        return if command.argc() == 0 || !command.argc().is_multiple_of(2) {
             RespCommandSlot::Unkeyed
         } else {
             route_key_value_args(command.args())
@@ -351,7 +351,7 @@ fn execute_mget(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, o
 }
 
 fn execute_mset(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
-    if command.argc() == 0 || command.argc() % 2 != 0 {
+    if command.argc() == 0 || !command.argc().is_multiple_of(2) {
         wrong_arity(out, b"mset");
         return;
     }
@@ -598,7 +598,7 @@ mod tests {
             run(&mut store, &cmd(&[b"SET", b"a", &large]), 0),
             b"+OK\r\n"
         );
-        assert!(run(&mut store, &cmd(&[b"SET", b"a", &vec![b'y'; 33]]), 0).starts_with(b"-OOM "));
+        assert!(run(&mut store, &cmd(&[b"SET", b"a", &[b'y'; 33]]), 0).starts_with(b"-OOM "));
         assert_eq!(store.get(b"a", 0), Some(CacheValueView::Bytes(&large)));
         assert_eq!(store.len(), 1);
         assert_eq!(store.memory_stats().arena_reserved_bytes, 32);
