@@ -25,6 +25,7 @@ pub(crate) enum StorageInterruptionPoint {
     WalReclaimAfterReplacementSync,
     WalReclaimAfterRename,
     WalReclaimAfterDirectorySync,
+    BackupBeforeCompletion,
 }
 
 thread_local! {
@@ -718,4 +719,57 @@ fn successor_rotation_interruption_selects_exact_bound_generation() {
         drop(db);
         fs::remove_dir_all(dir).unwrap();
     }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn interrupted_backup_never_publishes_completion_and_live_wal_remains_writable() {
+    use super::sst_manifest::ManifestStore;
+    use super::tablet::TransactionId;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "nudb-backup-fault-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&dir).unwrap();
+    let sst = dir.join("sst");
+    fs::create_dir(&sst).unwrap();
+    let path = dir.join("tablet.wal");
+    let desc = TabletDescriptor::new(
+        TabletId::new(97).unwrap(),
+        KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+        7,
+    )
+    .unwrap();
+    let mut db = WalBackedTablet::open(desc.clone(), &path).unwrap();
+    db.commit_idempotent(TransactionId::new([1; 16]), vec![])
+        .unwrap();
+    let mut m = ManifestStore::create(&sst, 97, 7).unwrap();
+    db.flush_sst_shadow(&mut m, 1).unwrap();
+    db.seal_sst_recovery(&mut m).unwrap();
+    db.reclaim_to_sealed_sst(&m).unwrap();
+    db.commit_idempotent(TransactionId::new([2; 16]), vec![])
+        .unwrap();
+    let before = fs::read(&path).unwrap();
+    let backup = dir.join("backup");
+    let result = with_interruption(StorageInterruptionPoint::BackupBeforeCompletion, || {
+        db.backup_sealed(&m, &backup)
+    });
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("injected NulangDB storage interruption"));
+    assert!(!backup.join("COMPLETE").exists());
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(WalBackedTablet::restore_sealed_backup(desc, &backup, dir.join("restore")).is_err());
+    assert_eq!(
+        db.commit_idempotent(TransactionId::new([3; 16]), vec![])
+            .unwrap()
+            .sequence(),
+        3
+    );
+    drop(db);
+    drop(m);
+    fs::remove_dir_all(dir).unwrap();
 }

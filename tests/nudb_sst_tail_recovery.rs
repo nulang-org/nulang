@@ -691,3 +691,143 @@ fn successor_preparation_preserves_original_binding_and_stale_successor_is_rejec
     assert_eq!(fs::read(&wal).unwrap(), before);
     db.commit_idempotent(id(4), vec![]).unwrap();
 }
+
+#[test]
+fn backup_restores_independent_bound_snapshot_with_tail_and_receipts() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let r1 = db.commit_idempotent(id(1), vec![put(b"old")]).unwrap();
+    db.commit_idempotent(id(2), vec![put(b"anchor")]).unwrap();
+    let mut m = f.manifest();
+    db.flush_sst_shadow(&mut m, 2).unwrap();
+    db.seal_sst_recovery_at_floor(&mut m, 2).unwrap();
+    db.reclaim_to_sealed_sst(&m).unwrap();
+    db.commit_idempotent(id(3), vec![TabletMutation::Delete { key: b"k".to_vec() }])
+        .unwrap();
+    db.commit_idempotent(id(4), vec![put(b"tail")]).unwrap();
+    let backup = f.0.join("backup");
+    let restore = f.0.join("restored");
+    let live_wal = f.0.join("tablet.wal");
+    let before = fs::read(&live_wal).unwrap();
+    db.backup_sealed(&m, &backup).unwrap();
+    assert_eq!(fs::read(&live_wal).unwrap(), before);
+    assert!(db.backup_sealed(&m, &backup).is_err());
+    db.commit_idempotent(id(5), vec![put(b"later")]).unwrap();
+    let mut recovered =
+        WalBackedTablet::restore_sealed_backup(f.descriptor(), &backup, &restore).unwrap();
+    assert_eq!(recovered.current_sequence(), 4);
+    assert_eq!(recovered.oldest_retained_snapshot(), 2);
+    assert!(recovered.read_at(b"k", 1).is_err());
+    assert_eq!(
+        recovered.read_at(b"k", 2).unwrap(),
+        Some(b"anchor".as_slice())
+    );
+    assert_eq!(recovered.read_at(b"k", 3).unwrap(), None);
+    assert_eq!(recovered.read_latest(b"k"), Some(b"tail".as_slice()));
+    assert_eq!(
+        recovered
+            .commit_idempotent(id(1), vec![put(b"old")])
+            .unwrap(),
+        r1
+    );
+    recovered
+        .commit_idempotent(id(5), vec![put(b"restored")])
+        .unwrap();
+    assert_eq!(db.read_latest(b"k"), Some(b"later".as_slice()));
+    drop(recovered);
+    let second = f.0.join("restored-again");
+    let recovered =
+        WalBackedTablet::restore_sealed_backup(f.descriptor(), &backup, &second).unwrap();
+    assert_eq!(recovered.current_sequence(), 4);
+    assert_eq!(recovered.read_latest(b"k"), Some(b"tail".as_slice()));
+}
+
+#[test]
+fn backup_restore_rejects_missing_completion_and_wal_truncation_without_repair() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let m = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&m).unwrap();
+    db.commit_idempotent(id(2), vec![put(b"tail")]).unwrap();
+    let backup = f.0.join("backup");
+    db.backup_sealed(&m, &backup).unwrap();
+    let marker = backup.join("COMPLETE");
+    let complete = fs::read(&marker).unwrap();
+    fs::remove_file(&marker).unwrap();
+    assert!(
+        WalBackedTablet::restore_sealed_backup(f.descriptor(), &backup, f.0.join("missing"))
+            .is_err()
+    );
+    fs::write(&marker, complete).unwrap();
+    let path = backup.join("tablet.wal");
+    let full = fs::read(&path).unwrap();
+    for (i, damaged) in [full[..full.len() - 1].to_vec(), full[..96].to_vec(), {
+        let mut v = full.clone();
+        v[100] ^= 1;
+        v
+    }]
+    .into_iter()
+    .enumerate()
+    {
+        fs::write(&path, &damaged).unwrap();
+        assert!(WalBackedTablet::restore_sealed_backup(
+            f.descriptor(),
+            &backup,
+            f.0.join(format!("bad-{i}"))
+        )
+        .is_err());
+        assert_eq!(fs::read(&path).unwrap(), damaged);
+    }
+    fs::write(&path, full).unwrap();
+    assert!(
+        WalBackedTablet::restore_sealed_backup(f.descriptor(), &backup, f.0.join("good")).is_ok()
+    );
+}
+
+#[test]
+fn backup_rejects_wrong_generation_corrupt_seal_and_marker() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let first = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&first).unwrap();
+    db.commit_idempotent(id(2), vec![put(b"tail")]).unwrap();
+    let next_path = f.0.join("next");
+    fs::create_dir(&next_path).unwrap();
+    let mut next = ManifestStore::create(&next_path, 7, 3).unwrap();
+    db.prepare_sst_successor(&first, &mut next, 1).unwrap();
+    db.reclaim_to_sst_successor(&first, &next).unwrap();
+    let wrong = f.0.join("wrong");
+    assert!(db.backup_sealed(&first, &wrong).is_err());
+    assert!(!wrong.exists());
+    let backup = f.0.join("backup");
+    db.backup_sealed(&next, &backup).unwrap();
+    let marker = backup.join("COMPLETE");
+    let complete = fs::read(&marker).unwrap();
+    let mut bad = complete.clone();
+    bad[32] ^= 1;
+    fs::write(&marker, bad).unwrap();
+    assert!(WalBackedTablet::restore_sealed_backup(
+        f.descriptor(),
+        &backup,
+        f.0.join("bad-marker")
+    )
+    .is_err());
+    fs::write(&marker, complete).unwrap();
+    let table = backup.join("sst/nudb-sst-00000000000000000001.sst");
+    let original = fs::read(&table).unwrap();
+    let mut bad = original.clone();
+    bad[55] ^= 1;
+    fs::write(&table, &bad).unwrap();
+    assert!(
+        WalBackedTablet::restore_sealed_backup(f.descriptor(), &backup, f.0.join("bad-table"))
+            .is_err()
+    );
+    assert_eq!(fs::read(&table).unwrap(), bad);
+    fs::write(&table, original).unwrap();
+    let restored =
+        WalBackedTablet::restore_sealed_backup(f.descriptor(), &backup, f.0.join("good")).unwrap();
+    assert_eq!(restored.current_sequence(), 2);
+    assert_eq!(restored.oldest_retained_snapshot(), 1);
+}
