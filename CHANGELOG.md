@@ -1,4 +1,7 @@
 # Nulang Changelog
+### RESP cache journal substrate — 2026-11-27
+- **Add a bounded, single-writer, checksummed WAL primitive** with streaming recovery, torn-tail repair, corruption rejection, buffered/synced acknowledgement and fail-stop append poisoning. Reuse BLAKE3; live RESP persistence integration remains pending.
+
 ### Idle RESP connection buffer reclamation — 2026-11-27
 - **Release drained input/output vector allocations and their shared budget charges without disconnecting clients.** Preserve partial frames and unsent replies; verify live-data saturation, disconnect recovery, repeated reclamation and multiple idle TCP connections.
 
