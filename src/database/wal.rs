@@ -6,7 +6,7 @@
 //! file := wal_header record*
 //! wal_header := "NUDBWAL3" base_sequence:u64 tablet_id:u64 ownership_epoch:u64 header_blake3:[u8; 32]
 //! bound_header := "NUDBWAL4" base_sequence:u64 tablet_id:u64 ownership_epoch:u64 sealed_manifest_blake3:[u8; 32] header_blake3:[u8; 32]
-//! WAL4 is currently accepted only by explicit sealed recovery; no production writer emits it.
+//! WAL4 is emitted only by explicit sealed reclamation and accepted only by explicit sealed recovery.
 //! record := frame_header payload:[u8; payload_len] payload_blake3:[u8; 32]
 //! frame_header := "NREC" frame_version:u16 payload_len:u32 header_blake3:[u8; 32]
 //! ```
@@ -661,6 +661,104 @@ impl FileWal {
         )?;
 
         *self = Self::open_locked(self.path.clone(), Arc::clone(&self.writer_lock), None)?;
+        Ok(())
+    }
+
+    /// Replace a complete WAL with an empty bound successor. Caller holds
+    /// the matching manifest lock and has verified and synced its contents.
+    #[cfg(unix)]
+    pub(super) fn reclaim_to_binding(&mut self, binding: SealBinding) -> Result<(), WalError> {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        if self.poisoned {
+            return Err(WalError::Poisoned);
+        }
+        if self.is_seal_bound()
+            || self.base_sequence != 0
+            || binding.sequence == 0
+            || binding.sequence != self.last_sequence()
+            || self.tablet_id != Some(binding.tablet_id)
+            || self
+                .latest_ownership_epoch
+                .is_none_or(|epoch| epoch > binding.epoch)
+        {
+            return Err(WalError::SealBindingMismatch);
+        }
+
+        self.poisoned = true;
+        // Exclusive staging creation; abandoned stages are never adopted.
+        // Do not truncate a preexisting path or follow a staging symlink.
+        struct Stage(Option<PathBuf>);
+        impl Drop for Stage {
+            fn drop(&mut self) {
+                if let Some(path) = &self.0 {
+                    let _ = fs::remove_file(path);
+                }
+            }
+        }
+        let parent = self.path.parent().ok_or(WalError::AliasedWalPath)?;
+        let mut staged = None;
+        for _ in 0..64 {
+            let path = parent.join(format!(
+                ".nudb-bound-{}-{}.tmp",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(file) => {
+                    staged = Some((Stage(Some(path)), file));
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let (mut stage, mut replacement) = staged.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "bound WAL staging collision limit",
+            )
+        })?;
+        let prefix = binding.prefix();
+        replacement.write_all(&prefix)?;
+        replacement.write_all(blake3::hash(&prefix).as_bytes())?;
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::WalReclaimAfterReplacementWrite,
+        )?;
+        replacement.sync_all()?;
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::WalReclaimAfterReplacementSync,
+        )?;
+        drop(replacement);
+        fs::rename(stage.0.as_ref().expect("staged bound WAL"), &self.path)?;
+        stage.0 = None;
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::WalReclaimAfterRename,
+        )?;
+        sync_parent_directory(&self.path)?;
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::WalReclaimAfterDirectorySync,
+        )?;
+        // Retain the original stable writer lock across the inode replacement.
+        let reopened = Self::open_locked(
+            self.path.clone(),
+            Arc::clone(&self.writer_lock),
+            Some(binding),
+        )?;
+        if reopened.seal_binding != Some(binding) || !reopened.records.is_empty() {
+            return Err(WalError::SealBindingMismatch);
+        }
+        *self = reopened;
         Ok(())
     }
 

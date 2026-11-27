@@ -75,8 +75,8 @@ impl WalBackedTablet {
     /// plus the complete existing WAL. Verify every overlapping mutation and
     /// receipt before replaying the tail. Refuses existing checkpoints and
     /// unbound compacted WALs. A version-four header must bind exactly to
-    /// the sealed manifest before tail repair. No production writer emits
-    /// such a header yet; legacy checkpoint/reclamation is disabled for it.
+    /// the sealed manifest before tail repair. Only explicit sealed cutover
+    /// emits this header; legacy checkpoint/reclamation is disabled for it.
     #[cfg(unix)]
     pub fn open_from_sealed_sst(
         descriptor: TabletDescriptor,
@@ -450,6 +450,59 @@ impl WalBackedTablet {
             self.tablet.receipts(),
         )?;
         manifest.seal(meta)
+    }
+
+    /// Explicit, one-time cutover from a complete WAL3 to a sealed WAL4.
+    /// The seal must cover the entire committed history, including receipts.
+    /// Keep the immutable manifest and all its tables for the life of this
+    /// WAL. After cutover, reopen only with open_from_sealed_sst. A failed
+    /// replacement requires reopening; no legacy checkpoint or retention
+    /// reclamation is supported for bound WALs. Trusted local Unix storage.
+    #[cfg(unix)]
+    pub fn reclaim_to_sealed_sst(
+        &mut self,
+        manifest: &super::sst_manifest::ManifestStore,
+    ) -> std::io::Result<()> {
+        use std::io;
+        let invalid = |reason: &'static str| io::Error::new(io::ErrorKind::InvalidData, reason);
+        if self.recovery_required
+            || self.wal.is_poisoned()
+            || self.wal.is_seal_bound()
+            || self.wal.base_sequence() != 0
+            || self.oldest_retained_snapshot() != 0
+            || self.current_sequence() == 0
+            || self.current_sequence() != self.wal.last_sequence()
+            || manifest.current().durable_sequence() != self.current_sequence()
+            || manifest.current().recovery_descriptor() != Some(self.descriptor())
+        {
+            return Err(invalid(
+                "reclaim requires matching complete nonempty unpruned WAL and seal",
+            ));
+        }
+        match std::fs::symlink_metadata(&self.checkpoint_path) {
+            Ok(_) => return Err(invalid("existing checkpoint prevents sealed WAL cutover")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        // Independently validate all SST versions and receipt correspondence,
+        // then check the complete restored logical state against the live tablet.
+        super::wal_sst_shadow::verify_prefix(&self.wal, self.descriptor(), manifest)?;
+        let mut restored = manifest.restore_memory_tablet()?;
+        self.wal
+            .replay_after_checkpoint(&mut restored)
+            .map_err(io::Error::other)?;
+        if restored.snapshot_state() != self.tablet.snapshot_state() {
+            return Err(invalid("sealed recovery state disagrees with live tablet"));
+        }
+        drop(restored);
+        // Re-establish durability even if a previous seal publication was
+        // interrupted after rename but before its directory sync.
+        let binding = manifest.sync_for_wal_binding()?;
+        if let Err(error) = self.wal.reclaim_to_binding(binding) {
+            self.recovery_required = true;
+            return Err(io::Error::other(error));
+        }
+        Ok(())
     }
 
     /// Diagnostic point read against the published shadow SST prefix.
