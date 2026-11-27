@@ -326,6 +326,22 @@ impl CacheWal {
         self.poisoned
     }
 
+    /// Synchronize all acknowledged buffered appends. An uncertain sync
+    /// poisons the journal just like a failed synchronized append.
+    pub fn synchronize(&mut self) -> io::Result<()> {
+        self.synchronize_with(File::sync_data)
+    }
+
+    fn synchronize_with(&mut self, sync: impl FnOnce(&File) -> io::Result<()>) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::other("cache WAL poisoned"));
+        }
+        self.poisoned = true;
+        sync(&self.file)?;
+        self.poisoned = false;
+        Ok(())
+    }
+
     pub fn append(&mut self, payload: &[u8], sync: WalSync) -> io::Result<u64> {
         #[cfg(all(test, feature = "cache-server"))]
         if std::mem::take(&mut self.fail_next_append) {
@@ -728,5 +744,21 @@ mod tests {
         assert!(!wal.is_poisoned());
         assert_eq!(std::fs::read(&path).unwrap(), original);
         assert_eq!(wal.last_sequence(), 1);
+    }
+
+    #[test]
+    fn final_sync_failure_poisoning_prevents_further_appends() {
+        let temp = Temp::new();
+        let path = temp.file();
+        let mut wal = CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).unwrap();
+        wal.append(b"buffered", WalSync::Buffered).unwrap();
+        wal.synchronize().unwrap();
+        assert!(!wal.is_poisoned());
+        assert!(wal
+            .synchronize_with(|_| Err(io::Error::other("injected sync failure")))
+            .is_err());
+        assert!(wal.is_poisoned());
+        assert!(wal.append(b"unsafe", WalSync::Buffered).is_err());
+        assert!(wal.synchronize().is_err());
     }
 }

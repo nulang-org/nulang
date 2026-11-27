@@ -364,6 +364,13 @@ impl DurableCache {
         )
     }
 
+    /// Flush acknowledged buffered journal writes before orderly shutdown.
+    pub fn synchronize(&mut self) -> Result<(), DurableError> {
+        self.healthy()?;
+        self.wal.synchronize()?;
+        Ok(())
+    }
+
     pub fn is_poisoned(&self) -> bool {
         self.poisoned || self.wal.is_poisoned()
     }

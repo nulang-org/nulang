@@ -435,7 +435,7 @@ The server exits nonzero on configuration, recovery, or reactor failure.
 Process-level tests kill the child without graceful shutdown and verify that
 memory mode loses its contents while both journal modes recover acknowledged
 writes after a process-only failure. This does not establish power-loss
-survival for buffered writes. Graceful signal handling, multi-shard configuration, authentication/TLS and production
+survival for buffered writes. Multi-shard configuration, authentication/TLS and production
 performance testing remain pending.
 
 
@@ -466,3 +466,33 @@ size estimate is a linear scan and compaction blocks the reactor. No
 background compaction, independent backup, or exported CLI metrics yet.
 A process-level regression verifies 100 pipelined writes through a 1 KiB
 journal and recovery after killing and restarting the server.
+
+
+## Graceful shutdown
+
+The standalone Unix executable blocks SIGTERM and SIGINT before journal
+recovery and uses a dedicated sigwait thread to request reactor shutdown.
+No asynchronous signal handler performs allocation, locking or I/O. Once
+the reactor observes shutdown it stops accepting connections, reading input
+and executing further commands. It closes the listener, discards unexecuted
+input, and attempts to deliver already encoded replies until the configured
+network drain deadline. Slow clients and their buffer reservations are then
+released. Durable modes explicitly synchronize the journal after draining;
+sync failure poisons the journal and returns a nonzero exit status.
+
+The default drain is 5000 ms; --shutdown-drain-ms accepts 0 through 60000
+(0 discards pending replies immediately). Embedded owners can use
+CacheShardServerControl::shutdown with run() or run_with_shutdown_timeout.
+Callers driving poll_once themselves must arrange their own final run/drain
+and release the server owner to release the journal lock.
+
+The timeout bounds network draining, not an in-progress mutation,
+checkpoint, or disk synchronization syscall. An external service manager
+must allow sufficient termination time for storage. A second termination
+signal is not a forced-abort mechanism; SIGKILL remains abrupt termination.
+A client that loses its response must treat the mutation outcome as
+ambiguous. Buffered acknowledgements before a successful final sync still
+do not guarantee power-loss durability. The process tests verify successful
+SIGTERM and SIGINT exits with incomplete input and journal reopening;
+reactor tests cover pending replies, discarded commands, a zero deadline,
+a backpressured socket, and injected journal sync failure.
