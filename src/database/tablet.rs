@@ -251,6 +251,21 @@ pub(crate) struct VersionedValue {
     pub(crate) value: Option<Vec<u8>>,
 }
 
+/// Find the most recent committed value visible at a requested snapshot.
+/// Most current-state reads take the constant-time latest-version path;
+/// older snapshots use binary search over monotonically ordered versions.
+/// If legacy data retains duplicate sequences, the last value wins.
+fn visible_version_at(versions: &[VersionedValue], snapshot: u64) -> Option<&VersionedValue> {
+    let latest = versions.last()?;
+    if latest.sequence <= snapshot {
+        return Some(latest);
+    }
+    let first_newer = versions.partition_point(|version| version.sequence <= snapshot);
+    first_newer
+        .checked_sub(1)
+        .and_then(|index| versions.get(index))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TabletSnapshotRow {
     pub(crate) key: Vec<u8>,
@@ -513,11 +528,7 @@ impl MemoryTablet {
         }
 
         Ok(self.rows.get(key).and_then(|versions| {
-            versions
-                .iter()
-                .rev()
-                .find(|version| version.sequence <= snapshot)
-                .and_then(|version| version.value.as_deref())
+            visible_version_at(versions, snapshot).and_then(|version| version.value.as_deref())
         }))
     }
 
@@ -633,3 +644,139 @@ impl fmt::Display for TabletError {
 }
 
 impl std::error::Error for TabletError {}
+
+#[cfg(test)]
+mod snapshot_binary_lookup_tests {
+    use super::{visible_version_at, VersionedValue};
+
+    #[test]
+    fn sparse_versions_and_tombstones_preserve_snapshot_semantics() {
+        let versions = vec![
+            VersionedValue {
+                sequence: 2,
+                value: Some(b"first".to_vec()),
+            },
+            VersionedValue {
+                sequence: 9,
+                value: None,
+            },
+            VersionedValue {
+                sequence: 25,
+                value: Some(b"restored".to_vec()),
+            },
+        ];
+        for (snapshot, expected) in [
+            (0, None),
+            (1, None),
+            (2, Some(&b"first"[..])),
+            (8, Some(&b"first"[..])),
+            (9, None),
+            (24, None),
+            (25, Some(&b"restored"[..])),
+            (u64::MAX, Some(&b"restored"[..])),
+        ] {
+            assert_eq!(
+                visible_version_at(&versions, snapshot).and_then(|v| v.value.as_deref()),
+                expected,
+                "snapshot {snapshot}",
+            );
+        }
+        assert!(visible_version_at(&[], 25).is_none());
+    }
+
+    #[test]
+    fn long_sparse_history_matches_linear_reference_without_copying() {
+        let versions: Vec<_> = (1u64..=4096)
+            .map(|sequence| VersionedValue {
+                sequence: sequence * 3,
+                value: Some(sequence.to_le_bytes().to_vec()),
+            })
+            .collect();
+        for snapshot in (0u64..=4096 * 3 + 1).step_by(17) {
+            let expected = versions.iter().rev().find(|v| v.sequence <= snapshot);
+            let actual = visible_version_at(&versions, snapshot);
+            assert_eq!(actual, expected, "snapshot {snapshot}");
+            if let (Some(a), Some(e)) = (actual, expected) {
+                assert!(
+                    std::ptr::eq(a, e),
+                    "lookup must borrow the existing version"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_duplicate_sequence_uses_last_version() {
+        let versions = vec![
+            VersionedValue {
+                sequence: 1,
+                value: Some(b"a".to_vec()),
+            },
+            VersionedValue {
+                sequence: 1,
+                value: None,
+            },
+            VersionedValue {
+                sequence: 3,
+                value: Some(b"new".to_vec()),
+            },
+        ];
+        assert!(visible_version_at(&versions, 1).unwrap().value.is_none());
+        assert!(visible_version_at(&versions, 2).unwrap().value.is_none());
+        assert_eq!(
+            visible_version_at(&versions, 3).unwrap().value.as_deref(),
+            Some(&b"new"[..])
+        );
+    }
+}
+
+#[cfg(test)]
+mod recovered_snapshot_lookup_tests {
+    use super::*;
+
+    #[test]
+    fn recovered_duplicate_and_sparse_history_matches_last_write_oracle() {
+        let descriptor = TabletDescriptor::new(
+            TabletId::new(1).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            1,
+        )
+        .unwrap();
+        let mut versions = Vec::new();
+        for sequence in (3_u64..=3072).step_by(3) {
+            versions.push(VersionedValue {
+                sequence,
+                value: Some(sequence.to_le_bytes().to_vec()),
+            });
+            if sequence % 9 == 0 {
+                versions.push(VersionedValue {
+                    sequence,
+                    value: None,
+                });
+            }
+        }
+        let tablet = MemoryTablet::restore_snapshot(
+            descriptor,
+            TabletSnapshotState {
+                current_sequence: 3072,
+                rows: vec![TabletSnapshotRow {
+                    key: b"key".to_vec(),
+                    versions: versions.clone(),
+                }],
+            },
+        )
+        .unwrap();
+        for snapshot in 0..=3072 {
+            let expected = versions
+                .iter()
+                .rev()
+                .find(|version| version.sequence <= snapshot)
+                .and_then(|version| version.value.as_deref());
+            assert_eq!(tablet.read_at(b"key", snapshot).unwrap(), expected);
+        }
+        assert!(matches!(
+            tablet.read_at(b"key", 3073),
+            Err(TabletError::SnapshotAhead { .. })
+        ));
+    }
+}
