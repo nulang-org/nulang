@@ -214,3 +214,70 @@ fn unsealed_manifest_and_changed_range_are_rejected() {
             .is_err()
     );
 }
+
+#[test]
+fn checkpoint_and_sealed_tail_recovery_preserve_equivalent_history_and_receipts() {
+    use nulang::database::indexed_sst::DiskLookup;
+    let a = Fixture::new();
+    let b = Fixture::new();
+    let mut disk = a.open();
+    let mut checkpoint = b.open();
+    let mutations = [
+        vec![put(b"first"), put(b"last")],
+        vec![],
+        vec![TabletMutation::Delete { key: b"k".to_vec() }],
+        vec![put(b"")],
+        vec![put(b"tail")],
+    ];
+    let mut receipts = Vec::new();
+    for (i, writes) in mutations.iter().enumerate() {
+        let tx = id(i as u8 + 1);
+        let r = disk.commit_idempotent(tx, writes.clone()).unwrap();
+        assert_eq!(checkpoint.commit_idempotent(tx, writes.clone()).unwrap(), r);
+        receipts.push(r);
+        if i == 2 {
+            drop(seal(&a, &disk));
+            checkpoint.checkpoint().unwrap();
+        }
+    }
+    drop(disk);
+    drop(checkpoint);
+    let before = fs::read(a.0.join("tablet.wal")).unwrap();
+    let mut disk = recover(&a).unwrap();
+    let mut checkpoint = b.open();
+    let manifest = ManifestStore::open(a.0.join("sst"), 7, 3).unwrap();
+    for snapshot in 0..=5 {
+        for key in [b"k", b"x"] {
+            assert_eq!(
+                disk.read_at(key, snapshot).unwrap(),
+                checkpoint.read_at(key, snapshot).unwrap()
+            );
+        }
+    }
+    assert_eq!(
+        disk.read_sst_shadow_at(&manifest, b"k", 2).unwrap(),
+        DiskLookup::Value {
+            sequence: 1,
+            value: b"last".to_vec()
+        }
+    );
+    assert_eq!(
+        disk.read_sst_shadow_at(&manifest, b"k", 3).unwrap(),
+        DiskLookup::Deleted { sequence: 3 }
+    );
+    assert!(disk.read_sst_shadow_at(&manifest, b"k", 4).is_err());
+    for (i, writes) in mutations.iter().enumerate() {
+        let tx = id(i as u8 + 1);
+        assert_eq!(
+            disk.commit_idempotent(tx, writes.clone()).unwrap(),
+            receipts[i]
+        );
+        assert_eq!(
+            checkpoint.commit_idempotent(tx, writes.clone()).unwrap(),
+            receipts[i]
+        );
+    }
+    assert_eq!(fs::read(a.0.join("tablet.wal")).unwrap(), before);
+    assert_eq!(disk.current_sequence(), 5);
+    assert_eq!(checkpoint.current_sequence(), 5);
+}
