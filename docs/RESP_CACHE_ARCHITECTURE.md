@@ -618,3 +618,41 @@ authenticated client remains usable after both oversized request and reply
 failures. Continuous accept floods, per-peer quotas, aggregate TLS memory,
 slow authenticated readers, workload fairness, WAN and long-running load
 tests still require independent qualification.
+
+
+## Cooperative reactor fairness
+
+Each ready token receives at most one turn per reactor poll iteration.
+The listener handles at most 32 accept attempts per turn (including
+rejected connections and transient accept errors). Each connection gets
+up to 32 read operations, 32 RESP commands and 32 write-loop steps per
+turn. Plain socket I/O uses at most 16 KiB per application chunk; TLS
+work also counts plaintext-reader and encrypted-read operations, and
+encrypted writes are driven through Rustls. These are internal quanta,
+not externally configurable bandwidth or CPU guarantees.
+
+When a quantum is exhausted, an explicit token-keyed continuation is
+coalesced with any kernel readiness for the next iteration. A deferred
+turn uses a zero poll timeout so edge-triggered sockets do not require
+a new network event to resume. A socket blocked on I/O waits for
+readiness rather than spinning; a quantum exhausted immediately before
+WouldBlock may require one extra probe. The same scheme reschedules a
+full shard-inbox batch. Closed connections and shutdown clear deferred
+work. The command preflight is performed once per bounded buffered read
+batch; previously validated commands finish before more input is read.
+Per-connection reply order is preserved; cross-client ordering is
+intentionally unspecified. Pipeline depth remains a per-batch admission
+limit, not a transaction or session-wide limit.
+
+Regressions verify that a 40-connection burst admits only 32 on its
+first turn then resumes, that an 80-command pipeline yields after 32
+commands and another client receives PONG before it finishes, and that
+a 768 KiB reply and an encrypted 96-command pipeline resume without a
+new client request.
+
+This is cooperative fairness, not strict latency isolation. Parsing
+preflight, individual commands (including large MGETs), TLS cryptography,
+synchronous journal/clock writes, checkpointing, and a large ready set
+can still consume significant wall time. Sustained connection-flood
+availability, per-peer quotas, FD exhaustion, aggregate TLS memory and
+WAN tail-latency benchmarks are separate gates.
