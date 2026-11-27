@@ -457,6 +457,11 @@ impl FileWal {
         self.seal_binding.is_some()
     }
 
+    #[cfg(unix)]
+    pub(super) fn matches_seal(&self, binding: SealBinding) -> bool {
+        self.seal_binding == Some(binding)
+    }
+
     pub fn base_sequence(&self) -> u64 {
         self.base_sequence
     }
@@ -664,7 +669,7 @@ impl FileWal {
         Ok(())
     }
 
-    /// Replace a complete WAL with an empty bound successor. Caller holds
+    /// Replace a complete or already bound WAL with an empty bound successor. Caller holds
     /// the matching manifest lock and has verified and synced its contents.
     #[cfg(unix)]
     pub(super) fn reclaim_to_binding(&mut self, binding: SealBinding) -> Result<(), WalError> {
@@ -674,8 +679,8 @@ impl FileWal {
         if self.poisoned {
             return Err(WalError::Poisoned);
         }
-        if self.is_seal_bound()
-            || self.base_sequence != 0
+        if binding.sequence <= self.base_sequence
+            || (!self.is_seal_bound() && self.base_sequence != 0)
             || binding.sequence == 0
             || binding.sequence != self.last_sequence()
             || self.tablet_id != Some(binding.tablet_id)

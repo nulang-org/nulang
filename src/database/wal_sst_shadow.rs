@@ -211,6 +211,100 @@ pub(super) fn flush(
     Ok(Some(entry))
 }
 
+/// Append the complete bound WAL tail in bounded immutable intervals.
+pub(super) fn append_bound_tail(wal: &FileWal, next: &mut ManifestStore) -> io::Result<()> {
+    if !wal.is_seal_bound() || next.current().durable_sequence() != wal.base_sequence() {
+        return Err(invalid("successor prefix is not at bound WAL base"));
+    }
+    let mut pending = wal.records();
+    while !pending.is_empty() {
+        let mut count = pending.len().min(MAX_RECORDS);
+        while count > 0 && !admitted(&pending[..count]) {
+            count -= 1;
+        }
+        if count == 0 {
+            return Err(invalid("single WAL record exceeds successor admission"));
+        }
+        let batch = &pending[..count];
+        let rows = rows_for(batch)?;
+        let generation = next.current().entries().len() as u64 + 1;
+        let path = next
+            .directory()
+            .join(format!("nudb-sst-{generation:020}.sst"));
+        let header = SstHeader {
+            generation,
+            min_sequence: batch[0].sequence(),
+            max_sequence: batch[count - 1].sequence(),
+            key_count: rows.len() as u64,
+            version_count: rows.values().map(|v| v.len() as u64).sum(),
+        };
+        write_immutable_table(
+            &path,
+            header,
+            rows.iter().map(|(&key, history)| (key, history.as_slice())),
+        )?;
+        let entry = TableEntry::inspect(next.directory(), generation)?;
+        verify(
+            &mut next.open_verified_table(&entry)?,
+            generation,
+            batch,
+            &rows,
+        )?;
+        next.append(entry)?;
+        pending = &pending[count..];
+    }
+    Ok(())
+}
+
+/// Validate the exact copied prefix and every retained tail mutation.
+pub(super) fn verify_successor(
+    wal: &FileWal,
+    previous: &ManifestStore,
+    next: &ManifestStore,
+) -> io::Result<()> {
+    let prefix = previous.current().entries();
+    let entries = next.current().entries();
+    if previous.requires_reopen()
+        || next.requires_reopen()
+        || !entries.starts_with(prefix)
+        || previous.current().durable_sequence() != wal.base_sequence()
+        || next.current().durable_sequence() != wal.last_sequence()
+        || entries.len() <= prefix.len()
+    {
+        return Err(invalid("successor prefix or tail mismatch"));
+    }
+    for entry in prefix {
+        previous.open_verified_table(entry)?;
+        next.open_verified_table(entry)?;
+    }
+    for entry in &entries[prefix.len()..] {
+        let (min, max) = entry.sequence_interval();
+        let start = usize::try_from(
+            min.checked_sub(wal.base_sequence())
+                .and_then(|v| v.checked_sub(1))
+                .ok_or_else(|| invalid("successor interval before base"))?,
+        )
+        .map_err(|_| invalid("successor interval overflow"))?;
+        let end = usize::try_from(
+            max.checked_sub(wal.base_sequence())
+                .ok_or_else(|| invalid("successor interval before base"))?,
+        )
+        .map_err(|_| invalid("successor interval overflow"))?;
+        let batch = wal
+            .records()
+            .get(start..end)
+            .ok_or_else(|| invalid("successor interval outside tail"))?;
+        let rows = rows_for(batch)?;
+        verify(
+            &mut next.open_verified_table(entry)?,
+            entry.generation(),
+            batch,
+            &rows,
+        )?;
+    }
+    Ok(())
+}
+
 /// Qualification path: only one SST index at a time. Read newest eligible
 /// interval first; a tombstone terminates the search just like a value.
 /// Independently derive the exact visible mutation from the full WAL.

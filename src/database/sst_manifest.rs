@@ -531,6 +531,28 @@ impl ManifestStore {
         self.manifest = next;
         Ok(())
     }
+    /// Start an independent generation with exact copies of the bound
+    /// prefix. Never modify the previous generation or overwrite a file.
+    pub(super) fn copy_prefix_into(&self, next: &mut Self) -> io::Result<()> {
+        if self.requires_reopen
+            || next.requires_reopen
+            || !self.manifest.is_recovery_sealed()
+            || next.manifest.is_recovery_sealed()
+            || !next.manifest.entries.is_empty()
+            || self.dir == next.dir
+            || self.manifest.tablet_id != next.manifest.tablet_id
+            || self.manifest.epoch != next.manifest.epoch
+        {
+            return Err(invalid("successor requires independent empty manifest"));
+        }
+        for entry in &self.manifest.entries {
+            self.open_verified_table(entry)?
+                .copy_to(&table_path(&next.dir, entry.generation))?;
+            next.append(entry.clone())?;
+        }
+        Ok(())
+    }
+
     pub fn append(&mut self, entry: TableEntry) -> io::Result<()> {
         self.append_with_hook(entry, |_| Ok(()))
     }

@@ -545,6 +545,112 @@ impl WalBackedTablet {
         Ok(())
     }
 
+    /// Prepare a sealed successor in a separate, empty operator-provided
+    /// directory. The previous seal and WAL remain authoritative and intact.
+    /// Failure may leave an incomplete inactive directory: use a new one.
+    #[cfg(unix)]
+    pub fn prepare_sst_successor(
+        &self,
+        previous: &super::sst_manifest::ManifestStore,
+        next: &mut super::sst_manifest::ManifestStore,
+        floor: u64,
+    ) -> std::io::Result<()> {
+        self.validate_successor_base(previous, floor)?;
+        let meta = super::sst_recovery_meta::RecoveryMeta::new(
+            self.descriptor().clone(),
+            floor,
+            self.current_sequence(),
+            self.tablet.receipts(),
+        )?;
+        previous.copy_prefix_into(next)?;
+        super::wal_sst_shadow::append_bound_tail(&self.wal, next)?;
+        super::wal_sst_shadow::verify_successor(&self.wal, previous, next)?;
+        next.seal(meta)
+    }
+
+    #[cfg(unix)]
+    fn validate_successor_base(
+        &self,
+        previous: &super::sst_manifest::ManifestStore,
+        floor: u64,
+    ) -> std::io::Result<()> {
+        use std::io;
+        if self.recovery_required
+            || self.wal.is_poisoned()
+            || !self.wal.matches_seal(previous.wal_binding()?)
+            || previous.current().recovery_descriptor() != Some(self.descriptor())
+            || previous.current().recovery_floor() != Some(self.oldest_retained_snapshot())
+            || self.current_sequence() != self.wal.last_sequence()
+            || self.current_sequence() <= self.wal.base_sequence()
+            || floor > self.safe_retention_floor()
+        {
+            return Err(io::Error::other(
+                "invalid successor base, tail or pinned floor",
+            ));
+        }
+        self.tablet
+            .validate_snapshot(floor)
+            .map_err(io::Error::other)?;
+        match std::fs::symlink_metadata(&self.checkpoint_path) {
+            Ok(_) => Err(io::Error::other(
+                "existing checkpoint prevents successor cutover",
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Atomically rotate a bound WAL to a verified successor seal. Retain both
+    /// seal directories until recovery and external backup policy allow retirement.
+    /// After interruption try the known old and new directories; only the
+    /// exact WAL binding is accepted. No automatic discovery or deletion.
+    #[cfg(unix)]
+    pub fn reclaim_to_sst_successor(
+        &mut self,
+        previous: &super::sst_manifest::ManifestStore,
+        next: &super::sst_manifest::ManifestStore,
+    ) -> std::io::Result<()> {
+        use std::io;
+        let floor = next
+            .current()
+            .recovery_floor()
+            .ok_or_else(|| io::Error::other("successor not sealed"))?;
+        self.validate_successor_base(previous, floor)?;
+        if next.current().recovery_descriptor() != Some(self.descriptor())
+            || next.directory() == previous.directory()
+        {
+            return Err(io::Error::other(
+                "invalid successor descriptor or directory",
+            ));
+        }
+        super::wal_sst_shadow::verify_successor(&self.wal, previous, next)?;
+        let mut restored = next.restore_memory_tablet()?;
+        self.wal
+            .replay_after_checkpoint(&mut restored)
+            .map_err(io::Error::other)?;
+        let mut expected = self.tablet.clone();
+        expected
+            .prune_history_before(floor)
+            .map_err(io::Error::other)?;
+        if restored.snapshot_state() != expected.snapshot_state() {
+            return Err(io::Error::other(
+                "successor state disagrees with live tablet",
+            ));
+        }
+        drop(expected);
+        // Revalidate both physical generations before changing the binding.
+        if !self.wal.matches_seal(previous.sync_for_wal_binding()?) {
+            return Err(io::Error::other("previous seal binding mismatch"));
+        }
+        let binding = next.sync_for_wal_binding()?;
+        if let Err(error) = self.wal.reclaim_to_binding(binding) {
+            self.recovery_required = true;
+            return Err(io::Error::other(error));
+        }
+        self.tablet = restored;
+        Ok(())
+    }
+
     /// Diagnostic point read against the published shadow SST prefix.
     /// No fallback or authoritative read routing. Compare both the exact
     /// WAL mutation (including sequence and tombstone) and the live tablet.

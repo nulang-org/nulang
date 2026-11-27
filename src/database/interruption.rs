@@ -615,3 +615,107 @@ fn nonzero_seal_floor_cutover_is_atomic_with_wal_binding() {
         fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[cfg(all(test, unix))]
+#[test]
+fn successor_rotation_interruption_selects_exact_bound_generation() {
+    use super::sst_manifest::ManifestStore;
+    use super::tablet::TransactionId;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    for point in [
+        StorageInterruptionPoint::WalReclaimAfterReplacementWrite,
+        StorageInterruptionPoint::WalReclaimAfterReplacementSync,
+        StorageInterruptionPoint::WalReclaimAfterRename,
+        StorageInterruptionPoint::WalReclaimAfterDirectorySync,
+    ] {
+        let dir = std::env::temp_dir().join(format!(
+            "nudb-successor-fault-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).unwrap();
+        let old_dir = dir.join("old");
+        let new_dir = dir.join("new");
+        fs::create_dir(&old_dir).unwrap();
+        fs::create_dir(&new_dir).unwrap();
+        let path = dir.join("tablet.wal");
+        let desc = TabletDescriptor::new(
+            TabletId::new(97).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        let mut db = WalBackedTablet::open(desc.clone(), &path).unwrap();
+        let first = vec![TabletMutation::Put {
+            key: b"k".to_vec(),
+            value: b"first".to_vec(),
+        }];
+        let receipt = db
+            .commit_idempotent(TransactionId::new([1; 16]), first.clone())
+            .unwrap();
+        let mut old = ManifestStore::create(&old_dir, 97, 7).unwrap();
+        db.flush_sst_shadow(&mut old, 1).unwrap();
+        db.seal_sst_recovery_at_floor(&mut old, 1).unwrap();
+        db.reclaim_to_sealed_sst(&old).unwrap();
+        db.commit_idempotent(
+            TransactionId::new([2; 16]),
+            vec![TabletMutation::Put {
+                key: b"k".to_vec(),
+                value: b"tail".to_vec(),
+            }],
+        )
+        .unwrap();
+        let mut next = ManifestStore::create(&new_dir, 97, 7).unwrap();
+        db.prepare_sst_successor(&old, &mut next, 2).unwrap();
+        let before = fs::read(&path).unwrap();
+        let old_manifest = fs::read(old_dir.join("MANIFEST")).unwrap();
+        let result = with_interruption(point, || db.reclaim_to_sst_successor(&old, &next));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("injected NulangDB storage interruption"));
+        assert!(db
+            .commit_idempotent(TransactionId::new([3; 16]), vec![])
+            .is_err());
+        assert!(db.read_at(b"k", 2).is_err());
+        drop(db);
+        drop(old);
+        drop(next);
+        assert_eq!(fs::read(old_dir.join("MANIFEST")).unwrap(), old_manifest);
+        let pre_rename = matches!(
+            point,
+            StorageInterruptionPoint::WalReclaimAfterReplacementWrite
+                | StorageInterruptionPoint::WalReclaimAfterReplacementSync
+        );
+        let (right, wrong, floor) = if pre_rename {
+            assert_eq!(fs::read(&path).unwrap(), before);
+            (&old_dir, &new_dir, 1)
+        } else {
+            assert_eq!(fs::metadata(&path).unwrap().len(), 96);
+            (&new_dir, &old_dir, 2)
+        };
+        let bytes = fs::read(&path).unwrap();
+        assert!(WalBackedTablet::open_from_sealed_sst(desc.clone(), &path, wrong).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        let mut db = WalBackedTablet::open_from_sealed_sst(desc.clone(), &path, right).unwrap();
+        assert_eq!(db.oldest_retained_snapshot(), floor);
+        assert_eq!(db.current_sequence(), 2);
+        assert_eq!(db.read_at(b"k", 2).unwrap(), Some(b"tail".as_slice()));
+        assert_eq!(
+            db.commit_idempotent(TransactionId::new([1; 16]), first)
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(
+            db.commit_idempotent(TransactionId::new([3; 16]), vec![])
+                .unwrap()
+                .sequence(),
+            3
+        );
+        drop(db);
+        let db = WalBackedTablet::open_from_sealed_sst(desc, &path, right).unwrap();
+        assert_eq!(db.current_sequence(), 3);
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
