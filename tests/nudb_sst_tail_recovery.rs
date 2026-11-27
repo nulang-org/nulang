@@ -1034,3 +1034,28 @@ fn registry_rejects_wrong_identity_duplicate_reference_and_corruption() {
     assert!(GenerationRegistry::open(&dir, 7, 3).is_err());
     assert!(GenerationRegistry::create(&dir, 7, 3).is_err());
 }
+
+#[test]
+fn sealed_recovery_rejects_noncanonical_wal_name_before_lock_creation() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"original")]).unwrap();
+    let manifest = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&manifest).unwrap();
+    drop(manifest);
+    drop(db);
+    let path = f.0.join("tablet.wal");
+    let alternate = f.0.join("tablet.other");
+    let original = fs::read(&path).unwrap();
+    fs::copy(&path, &alternate).unwrap();
+    assert!(
+        WalBackedTablet::open_from_sealed_sst(f.descriptor(), &alternate, f.0.join("sst")).is_err()
+    );
+    assert!(!f.0.join("tablet.other.lock").exists());
+    assert_eq!(fs::read(&alternate).unwrap(), original);
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(
+        recover(&f).unwrap().read_latest(b"k"),
+        Some(b"original".as_slice())
+    );
+}
