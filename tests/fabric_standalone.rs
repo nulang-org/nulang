@@ -600,3 +600,41 @@ fn durable_metrics_include_journal_and_automatic_checkpoint_progress() {
         std::thread::sleep(Duration::from_millis(25));
     }
 }
+
+// All acknowledged grouped writes must survive an abrupt process stop.
+#[test]
+fn grouped_sync_pipeline_recovers_after_process_kill() {
+    let temp = Temp(std::env::temp_dir().join(format!(
+            "nulang-fabric-group-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )));
+    std::fs::create_dir(&temp.0).unwrap();
+    let journal = temp.0.join("cache.wal");
+    let address = port();
+    let args = [
+        "--mode",
+        "sync",
+        "--journal",
+        journal.to_str().unwrap(),
+        "--group-commit",
+        "1",
+    ];
+    let server = Server::start(address, &args);
+    let mut client = TcpStream::connect(address).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let pipeline = b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n".repeat(64);
+    client.write_all(&pipeline).unwrap();
+    let expected: String = (1..=64).map(|n| format!(":{n}\r\n")).collect();
+    let mut reply = vec![0; expected.len()];
+    client.read_exact(&mut reply).unwrap();
+    assert_eq!(reply, expected.as_bytes());
+    drop(server);
+    let _recovered = Server::start(address, &args);
+    request(address, GET, b"$2\r\n64\r\n");
+}

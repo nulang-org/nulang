@@ -51,6 +51,8 @@ pub struct CacheWal {
     poisoned: bool,
     #[cfg(all(test, feature = "cache-server"))]
     pub(super) fail_next_append: bool,
+    #[cfg(all(test, feature = "cache-server"))]
+    pub(super) fail_next_sync: bool,
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -372,6 +374,8 @@ impl CacheWal {
             poisoned: false,
             #[cfg(all(test, feature = "cache-server"))]
             fail_next_append: false,
+            #[cfg(all(test, feature = "cache-server"))]
+            fail_next_sync: false,
         })
     }
 
@@ -435,6 +439,8 @@ impl CacheWal {
             poisoned: false,
             #[cfg(all(test, feature = "cache-server"))]
             fail_next_append: false,
+            #[cfg(all(test, feature = "cache-server"))]
+            fail_next_sync: false,
         };
         populate(&mut replacement)?;
         if replacement.poisoned || replacement.last_sequence != expected {
@@ -479,6 +485,10 @@ impl CacheWal {
     /// Synchronize all acknowledged buffered appends. An uncertain sync
     /// poisons the journal just like a failed synchronized append.
     pub fn synchronize(&mut self) -> io::Result<()> {
+        #[cfg(all(test, feature = "cache-server"))]
+        if std::mem::take(&mut self.fail_next_sync) {
+            return self.synchronize_with(|_| Err(io::Error::other("injected group sync failure")));
+        }
         self.synchronize_with(File::sync_data)
     }
 

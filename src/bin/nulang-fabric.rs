@@ -19,6 +19,7 @@ mod unix {
     --max-entries N --max-arena-bytes N --max-connections N --max-connections-per-peer N
     --max-connection-bytes N --max-input-bytes N --max-output-bytes N --max-pipeline-depth N
     --max-record-bytes N --max-journal-bytes N
+    --group-commit 0|1 (default 0; sync mode only)
     --clock-reservation-ms 0..1000 (default 0; may delay restart)
     --checkpoint-percent 0..99 (default 70; 0 disables)
     --checkpoint-min-savings-percent 1..99 (default 10)
@@ -47,6 +48,7 @@ Durable modes require a private journal path. Memory mode is the default.";
         wal: WalLimits,
         checkpoint: AutomaticCheckpointConfig,
         shutdown_drain_ms: u64,
+        group_commit: bool,
         clock_reservation_ms: u64,
         metrics_bind: Option<SocketAddr>,
         tls_ca: Option<PathBuf>,
@@ -76,6 +78,7 @@ Durable modes require a private journal path. Memory mode is the default.";
                 wal: WalLimits::default(),
                 checkpoint: AutomaticCheckpointConfig::default(),
                 shutdown_drain_ms: 5000,
+                group_commit: false,
                 clock_reservation_ms: 0,
                 metrics_bind: None,
                 tls_ca: None,
@@ -150,6 +153,13 @@ Durable modes require a private journal path. Memory mode is the default.";
                         }
                     }
 
+                    "--group-commit" => {
+                        config.group_commit = match value.as_str() {
+                            "0" => false,
+                            "1" => true,
+                            _ => return Err("group commit must be 0 or 1".into()),
+                        };
+                    }
                     "--clock-reservation-ms" => {
                         config.clock_reservation_ms =
                             value.parse().map_err(|_| "invalid clock reservation")?;
@@ -189,6 +199,9 @@ Durable modes require a private journal path. Memory mode is the default.";
             }
             if (config.mode == Mode::Memory) != config.journal.is_none() {
                 return Err("a journal path is required exactly in buffered or sync mode".into());
+            }
+            if config.mode != Mode::Sync && seen.contains("--group-commit") {
+                return Err("group commit requires sync mode".into());
             }
             if config.mode == Mode::Memory && seen.contains("--clock-reservation-ms") {
                 return Err("clock reservation requires durable mode".into());
@@ -287,6 +300,9 @@ Durable modes require a private journal path. Memory mode is the default.";
                 server
                     .enable_mutual_tls(tls)
                     .map_err(|e| format!("{e:?}"))?;
+            }
+            if self.group_commit {
+                server.enable_group_commit().map_err(|e| format!("{e:?}"))?;
             }
             if self.mode != Mode::Memory {
                 server
@@ -400,6 +416,8 @@ Durable modes require a private journal path. Memory mode is the default.";
             gauge!("tls_handshake_timeouts_total", c.handshake_timeouts);
             gauge!("commands_dispatched_total", c.commands_dispatched);
             gauge!("polls_completed_total", c.polls_completed);
+            gauge!("wal_groups_synced_total", c.wal_groups_synced);
+            gauge!("wal_group_records_synced_total", c.wal_group_records_synced);
             gauge!("tls_reserved_bytes", sample.tls_reserved_bytes);
             gauge!(
                 "connection_budget_used_bytes",
@@ -861,6 +879,42 @@ Durable modes require a private journal path. Memory mode is the default.";
                 .unwrap()
                 .clock_reservation_ms,
                 1000
+            );
+        }
+
+        #[test]
+        fn group_commit_is_opt_in_and_sync_only() {
+            assert!(!parse(&[]).unwrap().group_commit);
+            assert!(parse(&["--group-commit", "1"]).is_err());
+            assert!(parse(&[
+                "--mode",
+                "buffered",
+                "--journal",
+                "cache.wal",
+                "--group-commit",
+                "1"
+            ])
+            .is_err());
+            assert!(parse(&[
+                "--mode",
+                "sync",
+                "--journal",
+                "cache.wal",
+                "--group-commit",
+                "2"
+            ])
+            .is_err());
+            assert!(
+                parse(&[
+                    "--mode",
+                    "sync",
+                    "--journal",
+                    "cache.wal",
+                    "--group-commit",
+                    "1"
+                ])
+                .unwrap()
+                .group_commit
             );
         }
 

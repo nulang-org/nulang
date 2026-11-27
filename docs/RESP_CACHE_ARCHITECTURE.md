@@ -810,3 +810,43 @@ interval, TTL expiration and non-resurrection, early-restart refusal,
 in-process backwards observations, publication failure and CLI bounds.
 See benchmarks/FABRIC_RESP.md for the follow-up measurement and its
 limitations. Per-command durable WAL synchronization is unchanged.
+
+
+## Bounded synchronous WAL group commit
+
+Standalone --group-commit 1 enables batching in sync mode only; default
+0 preserves the existing per-record data synchronization policy. The
+embedded reactor may enable it before polling with enable_group_commit.
+Each connection turn runs at most the existing 32-command quantum.
+Mutations append checksummed records in order, and their effects become
+visible to subsequent commands in that same turn. No other connection
+can execute during that turn. Replies remain in the charged RESP output
+buffer. If any records appended, sync the WAL once before any response
+from that turn can reach plaintext or TLS transport. A read-only group
+does not sync. Clock-floor publication remains independently guarded.
+
+The group is an acknowledgement barrier, not an atomic transaction:
+complete records may survive even when a client received no reply.
+An ambiguous append or synchronization error leaves the shard poisoned,
+discards pending output, and closes all clients. A recoverable size or
+admission error does not roll back successful earlier records; those
+records are still synced before the next connection can observe them.
+An open group at a reactor boundary is a fail-stop condition.
+No asynchronous timer, cross-client batching or relaxed durability is
+introduced. Native DurableCache mutations retain their ordinary sync
+policy outside the reactor's internal group scope.
+
+Automatic checkpointing runs between groups rather than between each
+record in grouped mode. A small journal can therefore reject additional
+mutations before checkpoint reclamation; provision capacity accordingly.
+The existing input, output, pipeline, journal and peer limits apply.
+Sync and checkpoint operations still block the shard. Actual power-loss
+behavior depends on storage guarantees and remains unqualified.
+
+Metrics include fabric_wal_groups_synced_total and
+fabric_wal_group_records_synced_total, counting successfully synced
+nonempty groups and records respectively. They do not attest to client
+receipt. Tests cover two groups for 64 ordered mutations, read-only
+behavior, sync failure with dependent reads withheld, partial append
+failure, nonpoisoning journal-full prefix, and abrupt process recovery.
+See benchmarks/FABRIC_RESP.md for the small comparative baseline.
