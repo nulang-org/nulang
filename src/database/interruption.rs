@@ -26,6 +26,8 @@ pub(crate) enum StorageInterruptionPoint {
     WalReclaimAfterRename,
     WalReclaimAfterDirectorySync,
     BackupBeforeCompletion,
+    QuarantineBeforeRename,
+    QuarantineAfterRename,
 }
 
 thread_local! {
@@ -772,4 +774,88 @@ fn interrupted_backup_never_publishes_completion_and_live_wal_remains_writable()
     drop(db);
     drop(m);
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn interrupted_quarantine_preserves_both_active_recovery_and_obsolete_seal() {
+    use super::sst_manifest::ManifestStore;
+    use super::tablet::TransactionId;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    for point in [
+        StorageInterruptionPoint::QuarantineBeforeRename,
+        StorageInterruptionPoint::QuarantineAfterRename,
+    ] {
+        let dir = std::env::temp_dir().join(format!(
+            "nudb-quarantine-fault-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).unwrap();
+        let old_dir = dir.join("old");
+        let new_dir = dir.join("new");
+        fs::create_dir(&old_dir).unwrap();
+        fs::create_dir(&new_dir).unwrap();
+        let path = dir.join("tablet.wal");
+        let desc = TabletDescriptor::new(
+            TabletId::new(97).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        let mut db = WalBackedTablet::open(desc.clone(), &path).unwrap();
+        db.commit_idempotent(TransactionId::new([1; 16]), vec![])
+            .unwrap();
+        let mut old = ManifestStore::create(&old_dir, 97, 7).unwrap();
+        db.flush_sst_shadow(&mut old, 1).unwrap();
+        db.seal_sst_recovery(&mut old).unwrap();
+        db.reclaim_to_sealed_sst(&old).unwrap();
+        db.commit_idempotent(TransactionId::new([2; 16]), vec![])
+            .unwrap();
+        let mut new = ManifestStore::create(&new_dir, 97, 7).unwrap();
+        db.prepare_sst_successor(&old, &mut new, 1).unwrap();
+        db.reclaim_to_sst_successor(&old, &new).unwrap();
+        let backup = dir.join("backup");
+        db.backup_sealed(&new, &backup).unwrap();
+        let target = dir.join("quarantine");
+        let before = fs::read(&path).unwrap();
+        let result = with_interruption(point, || {
+            db.quarantine_obsolete_sst(&new, old, &backup, &target)
+        });
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("injected NulangDB storage interruption"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let retained = if point == StorageInterruptionPoint::QuarantineBeforeRename {
+            assert!(!target.exists());
+            &old_dir
+        } else {
+            assert!(!old_dir.exists());
+            &target
+        };
+        assert_eq!(
+            ManifestStore::open(retained, 97, 7)
+                .unwrap()
+                .current()
+                .durable_sequence(),
+            1
+        );
+        assert_eq!(
+            db.commit_idempotent(TransactionId::new([3; 16]), vec![])
+                .unwrap()
+                .sequence(),
+            3
+        );
+        drop(db);
+        drop(new);
+        let db = WalBackedTablet::open_from_sealed_sst(desc.clone(), &path, &new_dir).unwrap();
+        assert_eq!(db.current_sequence(), 3);
+        let restored =
+            WalBackedTablet::restore_sealed_backup(desc, &backup, dir.join("restored")).unwrap();
+        assert_eq!(restored.current_sequence(), 2);
+        drop(db);
+        drop(restored);
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

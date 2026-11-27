@@ -567,6 +567,91 @@ impl ManifestStore {
         Ok(actual)
     }
 
+    /// Only a strict older, exact physical prefix with matching historical
+    /// receipts is eligible for quarantine; unrelated seals are not garbage.
+    pub(super) fn verify_obsolete_prefix(&self, active: &Self) -> io::Result<()> {
+        let old = self.recovery_meta()?;
+        let new = active.recovery_meta()?;
+        if old.descriptor != new.descriptor
+            || old.floor > new.floor
+            || self.manifest.durable_sequence() >= active.manifest.durable_sequence()
+            || !active.manifest.entries.starts_with(&self.manifest.entries)
+            || old
+                .receipts
+                .iter()
+                .any(|(id, receipt)| new.receipts.get(id) != Some(receipt))
+        {
+            return Err(invalid("obsolete seal is not an exact older prefix"));
+        }
+        self.sync_for_wal_binding()?;
+        Ok(())
+    }
+
+    /// Move the dedicated directory while retaining its stable lock. Never
+    /// unlink files, recursively traverse, or move a directory with extra data.
+    /// Caller coordinates the trusted parent namespace and all external users.
+    pub(super) fn quarantine(self, destination: &Path) -> io::Result<()> {
+        let parent = self
+            .dir
+            .parent()
+            .ok_or_else(|| invalid("generation has no parent"))?;
+        let name = destination
+            .file_name()
+            .ok_or_else(|| invalid("invalid quarantine name"))?;
+        let dest_parent = destination
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .canonicalize()?;
+        if dest_parent != parent {
+            return Err(invalid("quarantine must be a fresh sibling directory"));
+        }
+        let target = dest_parent.join(name);
+        match fs::symlink_metadata(&target) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "quarantine destination exists",
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let mut expected = std::collections::BTreeSet::new();
+        expected.insert(std::ffi::OsString::from("MANIFEST"));
+        expected.insert(std::ffi::OsString::from("MANIFEST.lock"));
+        for entry in &self.manifest.entries {
+            expected.insert(
+                table_path(&self.dir, entry.generation)
+                    .file_name()
+                    .expect("table name")
+                    .to_os_string(),
+            );
+        }
+        for entry in fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            if !expected.remove(&entry.file_name()) {
+                return Err(invalid("unexpected file in obsolete generation"));
+            }
+            reject_alias(&entry.path())?;
+        }
+        if !expected.is_empty() {
+            return Err(invalid("missing obsolete generation file"));
+        }
+        File::open(parent)?.sync_all()?;
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::QuarantineBeforeRename,
+        )?;
+        fs::rename(&self.dir, &target)?;
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::QuarantineAfterRename,
+        )?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+
     pub fn append(&mut self, entry: TableEntry) -> io::Result<()> {
         self.append_with_hook(entry, |_| Ok(()))
     }
