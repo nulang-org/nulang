@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,17 +20,136 @@ use mio::{Events, Interest, Poll, Token, Waker};
 use super::cache::CacheStore;
 use super::cache_cluster::CacheRoutingMode;
 use super::cache_dispatch::{
-    CacheDispatchConfigError, CacheDispatchWake, CacheDispatcher, CacheShardInbox,
+    CacheDispatchConfigError, CacheDispatchOutcome, CacheDispatchWake, CacheDispatcher,
+    CacheShardInbox,
 };
-use super::cache_pipeline::{CachePipelineError, CacheResponsePipeline};
+use super::resp::parse_command;
+#[cfg(unix)]
+use super::{
+    cache::CacheLimits,
+    cache_durable::{CacheTime, DurableCache, DurableError},
+    cache_wal::{WalLimits, WalSync},
+};
+#[cfg(unix)]
+use std::{
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 const LISTENER_TOKEN: Token = Token(0);
 const WAKE_TOKEN: Token = Token(1);
 const FIRST_CONNECTION_TOKEN: usize = 2;
 
+/// Shared limit on retained connection input/output vector capacity.
+/// Clone this budget into multiple shard reactors to share one process allowance.
+#[derive(Debug, Clone)]
+pub struct CacheBufferBudget {
+    inner: Arc<BufferBudgetInner>,
+}
+#[derive(Debug)]
+struct BufferBudgetInner {
+    limit: usize,
+    used: AtomicUsize,
+}
+impl CacheBufferBudget {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            inner: Arc::new(BufferBudgetInner {
+                limit,
+                used: AtomicUsize::new(0),
+            }),
+        }
+    }
+    pub fn used_bytes(&self) -> usize {
+        self.inner.used.load(Ordering::Acquire)
+    }
+    fn acquire(&self, amount: usize) -> bool {
+        self.inner
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(amount)
+                    .filter(|next| *next <= self.inner.limit)
+            })
+            .is_ok()
+    }
+    fn lease(&self) -> BufferLease {
+        BufferLease {
+            budget: self.clone(),
+            charged: 0,
+        }
+    }
+}
+struct BufferLease {
+    budget: CacheBufferBudget,
+    charged: usize,
+}
+impl BufferLease {
+    fn reserve(&mut self, buffer: &mut Vec<u8>, required: usize, max: usize) -> io::Result<()> {
+        let denied = || {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "cache connection buffer budget exceeded",
+            )
+        };
+        if required > max {
+            return Err(denied());
+        }
+        let old = buffer.capacity();
+        if required <= old {
+            return Ok(());
+        }
+        let preferred = required.max(old.saturating_mul(2)).max(4096).min(max);
+        let target = if self.budget.acquire(preferred - old) {
+            preferred
+        } else if self.budget.acquire(required - old) {
+            required
+        } else {
+            return Err(denied());
+        };
+        self.charged += target - old;
+        if buffer.try_reserve_exact(target - buffer.len()).is_err() {
+            return Err(denied());
+        }
+        // Vec may report more capacity than requested. Fail closed if the
+        // allocator's additional capacity cannot be charged.
+        let extra = buffer.capacity().saturating_sub(target);
+        if extra != 0 {
+            if !self.budget.acquire(extra) {
+                return Err(denied());
+            }
+            self.charged += extra;
+        }
+        Ok(())
+    }
+
+    /// Release a drained vector's allocation before returning its charge.
+    /// Never discard bytes still needed by the parser or socket writer.
+    fn release_empty(&mut self, buffer: &mut Vec<u8>) {
+        if !buffer.is_empty() {
+            return;
+        }
+        let capacity = buffer.capacity();
+        if capacity == 0 {
+            return;
+        }
+        drop(std::mem::take(buffer));
+        self.charged -= capacity;
+        self.budget.inner.used.fetch_sub(capacity, Ordering::AcqRel);
+    }
+}
+impl Drop for BufferLease {
+    fn drop(&mut self) {
+        self.budget
+            .inner
+            .used
+            .fetch_sub(self.charged, Ordering::AcqRel);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CacheServerConfig {
     pub max_connections: usize,
+    pub max_total_connection_bytes: usize,
     pub max_input_buffer: usize,
     pub max_output_buffer: usize,
     pub max_pipeline_depth: usize,
@@ -44,6 +163,7 @@ impl Default for CacheServerConfig {
     fn default() -> Self {
         Self {
             max_connections: 16_384,
+            max_total_connection_bytes: 256 * 1024 * 1024,
             max_input_buffer: 1024 * 1024,
             max_output_buffer: 8 * 1024 * 1024,
             max_pipeline_depth: 1024,
@@ -60,6 +180,10 @@ pub enum CacheServerError {
     Io(io::Error),
     DispatchConfig(CacheDispatchConfigError),
     RedirectModeRequired,
+    #[cfg(unix)]
+    Durability(DurableError),
+    #[cfg(unix)]
+    DurableShardPoisoned,
     InvalidConfig(&'static str),
 }
 
@@ -132,19 +256,19 @@ struct CacheConnection {
     input_start: usize,
     output: Vec<u8>,
     output_start: usize,
-    pipeline: CacheResponsePipeline,
+    lease: BufferLease,
     writable_interest: bool,
 }
 
 impl CacheConnection {
-    fn new(stream: TcpStream, max_pipeline_depth: usize) -> Self {
+    fn new(stream: TcpStream, lease: BufferLease) -> Self {
         Self {
             stream,
-            input: Vec::with_capacity(4096),
+            input: Vec::new(),
             input_start: 0,
-            output: Vec::with_capacity(4096),
+            output: Vec::new(),
             output_start: 0,
-            pipeline: CacheResponsePipeline::new(max_pipeline_depth),
+            lease,
             writable_interest: false,
         }
     }
@@ -191,6 +315,39 @@ struct ReadyEvent {
     write_closed: bool,
 }
 
+/// Explicit durable mode configuration. Memory mode remains the default bind API.
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub struct CacheDurableConfig {
+    pub path: PathBuf,
+    pub cache_limits: CacheLimits,
+    pub wal_limits: WalLimits,
+    pub sync: WalSync,
+}
+
+enum CacheBackend {
+    Memory(CacheStore),
+    #[cfg(unix)]
+    Durable {
+        cache: DurableCache,
+        anchor: CacheTime,
+    },
+}
+
+#[cfg(unix)]
+fn durable_clock(anchor: CacheTime, now: u64) -> Result<CacheTime, DurableError> {
+    let elapsed = now
+        .checked_sub(anchor.monotonic_ms)
+        .ok_or(DurableError::InvalidTime)?;
+    Ok(CacheTime {
+        monotonic_ms: now,
+        unix_ms: anchor
+            .unix_ms
+            .checked_add(elapsed)
+            .ok_or(DurableError::InvalidTime)?,
+    })
+}
+
 /// One physical cache shard and its network reactor.
 ///
 /// CacheShardServer requires redirect routing. A client that reaches the wrong
@@ -203,10 +360,11 @@ pub struct CacheShardServer {
     listener: TcpListener,
     dispatcher: CacheDispatcher,
     inbox: CacheShardInbox,
-    store: CacheStore,
+    backend: CacheBackend,
     connections: HashMap<Token, CacheConnection>,
     next_connection_token: usize,
     config: CacheServerConfig,
+    buffer_budget: CacheBufferBudget,
     clock: CacheServerClock,
     shutdown: Arc<AtomicBool>,
     waker: Arc<Waker>,
@@ -222,7 +380,103 @@ impl CacheShardServer {
         config: CacheServerConfig,
         clock: CacheServerClock,
     ) -> Result<Self, CacheServerError> {
+        let budget = CacheBufferBudget::new(config.max_total_connection_bytes);
+        Self::bind_with_budget(bind_addr, dispatcher, inbox, store, config, clock, budget)
+    }
+
+    /// Bind a shard using a budget shared by all participating reactors.
+    pub fn bind_with_budget(
+        bind_addr: SocketAddr,
+        dispatcher: CacheDispatcher,
+        inbox: CacheShardInbox,
+        store: CacheStore,
+        config: CacheServerConfig,
+        clock: CacheServerClock,
+        buffer_budget: CacheBufferBudget,
+    ) -> Result<Self, CacheServerError> {
+        Self::bind_backend(
+            bind_addr,
+            dispatcher,
+            inbox,
+            CacheBackend::Memory(store),
+            config,
+            clock,
+            buffer_budget,
+        )
+    }
+
+    /// Recover a private journal before accepting any network traffic.
+    #[cfg(unix)]
+    pub fn bind_durable(
+        bind_addr: SocketAddr,
+        dispatcher: CacheDispatcher,
+        inbox: CacheShardInbox,
+        durability: CacheDurableConfig,
+        config: CacheServerConfig,
+        clock: CacheServerClock,
+    ) -> Result<Self, CacheServerError> {
+        let budget = CacheBufferBudget::new(config.max_total_connection_bytes);
+        Self::bind_durable_with_budget(
+            bind_addr, dispatcher, inbox, durability, config, clock, budget,
+        )
+    }
+
+    #[cfg(unix)]
+    pub fn bind_durable_with_budget(
+        bind_addr: SocketAddr,
+        dispatcher: CacheDispatcher,
+        inbox: CacheShardInbox,
+        durability: CacheDurableConfig,
+        config: CacheServerConfig,
+        clock: CacheServerClock,
+        buffer_budget: CacheBufferBudget,
+    ) -> Result<Self, CacheServerError> {
         validate_config(&config)?;
+        if dispatcher.routing_mode() != CacheRoutingMode::Redirect {
+            return Err(CacheServerError::RedirectModeRequired);
+        }
+        let anchor = CacheTime {
+            monotonic_ms: clock.now_ms(),
+            unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+                .ok_or(CacheServerError::Durability(DurableError::InvalidTime))?,
+        };
+        let cache = DurableCache::open(
+            durability.path,
+            durability.cache_limits,
+            durability.wal_limits,
+            durability.sync,
+            anchor,
+        )
+        .map_err(CacheServerError::Durability)?;
+        Self::bind_backend(
+            bind_addr,
+            dispatcher,
+            inbox,
+            CacheBackend::Durable { cache, anchor },
+            config,
+            clock,
+            buffer_budget,
+        )
+    }
+
+    fn bind_backend(
+        bind_addr: SocketAddr,
+        dispatcher: CacheDispatcher,
+        inbox: CacheShardInbox,
+        backend: CacheBackend,
+        config: CacheServerConfig,
+        clock: CacheServerClock,
+        buffer_budget: CacheBufferBudget,
+    ) -> Result<Self, CacheServerError> {
+        validate_config(&config)?;
+        if buffer_budget.inner.limit == 0 {
+            return Err(CacheServerError::InvalidConfig(
+                "shared connection byte budget must be non-zero",
+            ));
+        }
         if dispatcher.routing_mode() != CacheRoutingMode::Redirect {
             return Err(CacheServerError::RedirectModeRequired);
         }
@@ -253,10 +507,11 @@ impl CacheShardServer {
             listener,
             dispatcher,
             inbox,
-            store,
+            backend,
             connections: HashMap::new(),
             next_connection_token: FIRST_CONNECTION_TOKEN,
             config,
+            buffer_budget,
             clock,
             shutdown,
             waker,
@@ -279,15 +534,60 @@ impl CacheShardServer {
         self.connections.len()
     }
 
-    pub fn store(&self) -> &CacheStore {
-        &self.store
+    /// Direct native access is memory-mode only; durable mutations must be journaled.
+    pub fn store(&self) -> Option<&CacheStore> {
+        match &self.backend {
+            CacheBackend::Memory(store) => Some(store),
+            #[cfg(unix)]
+            CacheBackend::Durable { .. } => None,
+        }
     }
 
-    pub fn store_mut(&mut self) -> &mut CacheStore {
-        &mut self.store
+    pub fn store_mut(&mut self) -> Option<&mut CacheStore> {
+        match &mut self.backend {
+            CacheBackend::Memory(store) => Some(store),
+            #[cfg(unix)]
+            CacheBackend::Durable { .. } => None,
+        }
+    }
+
+    /// Explicit maintenance checkpoint on the owning reactor thread.
+    /// The reactor does not serve commands while the replacement is written.
+    #[cfg(unix)]
+    pub fn checkpoint(&mut self) -> Result<super::cache_wal::CheckpointReport, CacheServerError> {
+        self.ensure_healthy()?;
+        let now = self.clock.now_ms();
+        let result = match &mut self.backend {
+            CacheBackend::Memory(_) => {
+                return Err(CacheServerError::InvalidConfig(
+                    "checkpoint requires durable mode",
+                ))
+            }
+            CacheBackend::Durable { cache, anchor } => {
+                let time = durable_clock(*anchor, now).map_err(CacheServerError::Durability)?;
+                cache.checkpoint(time).map_err(CacheServerError::Durability)
+            }
+        };
+        // Ambiguous publication must stop the entire shard, not just writes.
+        self.ensure_healthy()?;
+        result
+    }
+
+    fn ensure_healthy(&mut self) -> Result<(), CacheServerError> {
+        #[cfg(unix)]
+        if matches!(&self.backend, CacheBackend::Durable { cache, .. } if cache.is_poisoned()) {
+            for (_, mut connection) in self.connections.drain() {
+                let _ = self.poll.registry().deregister(&mut connection.stream);
+            }
+            let _ = self.poll.registry().deregister(&mut self.listener);
+            self.shutdown.store(true, Ordering::Release);
+            return Err(CacheServerError::DurableShardPoisoned);
+        }
+        Ok(())
     }
 
     pub fn run(&mut self) -> Result<(), CacheServerError> {
+        self.ensure_healthy()?;
         while !self.shutdown.load(Ordering::Acquire) {
             self.poll_once(None)?;
         }
@@ -297,6 +597,7 @@ impl CacheShardServer {
     /// Drive one reactor iteration. A caller-supplied timeout is capped by the
     /// next expiration sweep deadline so TTL reclamation progresses while idle.
     pub fn poll_once(&mut self, timeout: Option<Duration>) -> Result<(), CacheServerError> {
+        self.ensure_healthy()?;
         let timeout = self.poll_timeout(timeout);
         self.poll.poll(&mut self.events, timeout)?;
 
@@ -319,9 +620,10 @@ impl CacheShardServer {
                 WAKE_TOKEN => self.handle_wake()?,
                 token => self.connection_ready(token, event)?,
             }
+            self.ensure_healthy()?;
         }
 
-        self.sweep_expired_if_due();
+        self.sweep_expired_if_due()?;
         Ok(())
     }
 
@@ -335,15 +637,27 @@ impl CacheShardServer {
         }
     }
 
-    fn sweep_expired_if_due(&mut self) {
+    fn sweep_expired_if_due(&mut self) -> Result<(), CacheServerError> {
         let now = Instant::now();
         if now < self.next_expiry_sweep {
-            return;
+            return Ok(());
         }
 
-        self.store
-            .purge_expired(self.clock.now_ms(), self.config.max_expiry_items_per_sweep);
+        let now_ms = self.clock.now_ms();
+        let budget = self.config.max_expiry_items_per_sweep;
+        match &mut self.backend {
+            CacheBackend::Memory(store) => {
+                store.purge_expired(now_ms, budget);
+            }
+            #[cfg(unix)]
+            CacheBackend::Durable { cache, .. } => {
+                cache
+                    .purge_expired(now_ms, budget)
+                    .map_err(CacheServerError::Durability)?;
+            }
+        }
         self.next_expiry_sweep = now + self.config.expiry_sweep_interval;
+        Ok(())
     }
 
     fn accept_ready(&mut self) -> Result<(), CacheServerError> {
@@ -362,7 +676,7 @@ impl CacheShardServer {
                         .register(&mut stream, token, Interest::READABLE)?;
                     self.connections.insert(
                         token,
-                        CacheConnection::new(stream, self.config.max_pipeline_depth),
+                        CacheConnection::new(stream, self.buffer_budget.lease()),
                     );
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
@@ -373,8 +687,19 @@ impl CacheShardServer {
     }
 
     fn handle_wake(&mut self) -> Result<(), CacheServerError> {
-        self.inbox
-            .drain(&mut self.store, self.config.max_inbox_batch);
+        match &mut self.backend {
+            CacheBackend::Memory(store) => {
+                self.inbox.drain(store, self.config.max_inbox_batch);
+            }
+            #[cfg(unix)]
+            CacheBackend::Durable { .. } => {
+                if self.inbox.reject_pending(self.config.max_inbox_batch)
+                    == self.config.max_inbox_batch
+                {
+                    self.waker.wake()?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -419,14 +744,6 @@ impl CacheShardServer {
         readable: bool,
         writable: bool,
     ) -> Result<(), ConnectionAction> {
-        if connection
-            .pipeline
-            .drain_ready(&mut connection.output)
-            .is_err()
-        {
-            return Err(ConnectionAction::Close);
-        }
-
         if readable && self.read_connection(connection).is_err() {
             return Err(ConnectionAction::Close);
         }
@@ -445,6 +762,11 @@ impl CacheShardServer {
             return Err(ConnectionAction::Close);
         }
 
+        // A quiescent connection must not keep its high-water allocation
+        // charged indefinitely. Incomplete frames and unsent replies retain
+        // their reservations until they drain or the connection closes.
+        connection.lease.release_empty(&mut connection.input);
+        connection.lease.release_empty(&mut connection.output);
         Ok(())
     }
 
@@ -473,6 +795,20 @@ impl CacheShardServer {
                             "cache input buffer limit exceeded",
                         ));
                     }
+                    // Compact consumed bytes before reserving the next extent.
+                    if connection.input_start != 0 {
+                        connection.input.copy_within(connection.input_start.., 0);
+                        connection
+                            .input
+                            .truncate(connection.input.len() - connection.input_start);
+                        connection.input_start = 0;
+                    }
+                    let required = connection.input.len().saturating_add(read);
+                    connection.lease.reserve(
+                        &mut connection.input,
+                        required,
+                        self.config.max_input_buffer,
+                    )?;
                     connection.input.extend_from_slice(&scratch[..read]);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
@@ -481,42 +817,84 @@ impl CacheShardServer {
         }
     }
 
-    fn process_input(
-        &mut self,
-        connection: &mut CacheConnection,
-    ) -> Result<(), CachePipelineError> {
+    fn process_input(&mut self, connection: &mut CacheConnection) -> Result<(), ConnectionAction> {
         loop {
             if connection.input_start == connection.input.len() {
                 connection.compact_input();
                 return Ok(());
             }
-
             let input = &connection.input[connection.input_start..];
-            let Some(submit) = connection.pipeline.submit_frame(
-                &self.dispatcher,
-                &mut self.store,
-                input,
-                self.clock.now_ms(),
-                &mut connection.output,
-            )?
+            let Some((command, consumed)) =
+                parse_command(input).map_err(|_| ConnectionAction::Close)?
             else {
                 connection.compact_input();
                 return Ok(());
             };
-
-            if submit.remote.is_some() {
-                return Err(CachePipelineError::Dispatch(
-                    super::cache_dispatch::CacheDispatchError::QueueDisconnected(
-                        self.dispatcher.local_shard(),
-                    ),
-                ));
+            let now = self.clock.now_ms();
+            let sizing_store = match &self.backend {
+                CacheBackend::Memory(store) => store,
+                #[cfg(unix)]
+                CacheBackend::Durable { cache, .. } => cache
+                    .store_for_sizing()
+                    .map_err(|_| ConnectionAction::Close)?,
+            };
+            let bound = self
+                .dispatcher
+                .redirect_reply_bound(sizing_store, command, now);
+            // The redirect-only server never queues asynchronous replies.
+            // Compact already sent bytes and reserve before executing, avoiding
+            // the response pipeline's second copy and large MGET amplification.
+            if connection.output_start != 0 {
+                connection.output.copy_within(connection.output_start.., 0);
+                connection
+                    .output
+                    .truncate(connection.output.len() - connection.output_start);
+                connection.output_start = 0;
             }
-
-            connection.input_start += submit.consumed;
-            if connection.pending_output() > self.config.max_output_buffer {
-                connection.compact_input();
-                return Ok(());
+            let required = connection.output.len().saturating_add(bound);
+            connection
+                .lease
+                .reserve(
+                    &mut connection.output,
+                    required,
+                    self.config.max_output_buffer,
+                )
+                .map_err(|_| ConnectionAction::Close)?;
+            match &mut self.backend {
+                CacheBackend::Memory(store) => {
+                    let outcome = self
+                        .dispatcher
+                        .dispatch_frame(store, input, now, &mut connection.output)
+                        .map_err(|_| ConnectionAction::Close)?;
+                    match outcome {
+                        Some(CacheDispatchOutcome::Executed { consumed: actual })
+                        | Some(CacheDispatchOutcome::Redirected {
+                            consumed: actual, ..
+                        }) if actual == consumed => {}
+                        _ => return Err(ConnectionAction::Close),
+                    }
+                }
+                #[cfg(unix)]
+                CacheBackend::Durable { cache, anchor } => {
+                    if !self
+                        .dispatcher
+                        .redirect_only(command, &mut connection.output)
+                        .map_err(|_| ConnectionAction::Close)?
+                    {
+                        let time =
+                            durable_clock(*anchor, now).map_err(|_| ConnectionAction::Close)?;
+                        super::resp_cache::execute_durable_command(
+                            cache,
+                            command,
+                            time,
+                            &mut connection.output,
+                        )
+                        .map_err(|_| ConnectionAction::Close)?;
+                    }
+                }
             }
+            debug_assert!(connection.output.len() <= required);
+            connection.input_start += consumed;
         }
     }
 
@@ -594,6 +972,11 @@ enum ConnectionAction {
 }
 
 fn validate_config(config: &CacheServerConfig) -> Result<(), CacheServerError> {
+    if config.max_total_connection_bytes == 0 {
+        return Err(CacheServerError::InvalidConfig(
+            "max_total_connection_bytes must be non-zero",
+        ));
+    }
     if config.max_connections == 0 {
         return Err(CacheServerError::InvalidConfig(
             "max_connections must be non-zero",
@@ -711,13 +1094,17 @@ mod tests {
     fn idle_reactor_purges_expired_values() {
         let mut server = build_server();
         let now = server.clock.now_ms();
-        server.store_mut().set_bytes(b"ttl", b"value", Some(1), now);
+        server
+            .store_mut()
+            .unwrap()
+            .set_bytes(b"ttl", b"value", Some(1), now)
+            .unwrap();
 
         std::thread::sleep(Duration::from_millis(3));
         server.poll_once(Some(Duration::from_millis(1))).unwrap();
 
         let now = server.clock.now_ms();
-        assert!(server.store_mut().get(b"ttl", now).is_none());
+        assert!(server.store_mut().unwrap().get(b"ttl", now).is_none());
     }
 
     #[test]
@@ -739,5 +1126,430 @@ mod tests {
             result,
             Err(CacheServerError::RedirectModeRequired)
         ));
+    }
+
+    #[test]
+    fn shared_buffer_budget_rejects_growth_and_recovers_on_drop() {
+        let budget = CacheBufferBudget::new(64);
+        let mut a = budget.lease();
+        let mut b = budget.lease();
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        a.reserve(&mut first, 40, 64).unwrap();
+        assert!(b.reserve(&mut second, 40, 64).is_err());
+        assert_eq!(second.capacity(), 0);
+        assert_eq!(budget.used_bytes(), first.capacity());
+        drop(first);
+        drop(a);
+        b.reserve(&mut second, 40, 64).unwrap();
+        assert_eq!(budget.used_bytes(), second.capacity());
+    }
+
+    #[test]
+    fn repeated_large_mget_is_rejected_before_reply_allocation() {
+        let mut server = build_server();
+        server.config.max_output_buffer = 256;
+        server
+            .store_mut()
+            .unwrap()
+            .set_bytes(b"k", &[b'x'; 120], None, 0)
+            .unwrap();
+        let mut client = StdTcpStream::connect(server.local_addr().unwrap()).unwrap();
+        client
+            .write_all(b"*4\r\n$4\r\nMGET\r\n$1\r\nk\r\n$1\r\nk\r\n$1\r\nk\r\n")
+            .unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        assert_eq!(server.connection_count(), 0);
+        assert_eq!(server.buffer_budget.used_bytes(), 0);
+        assert!(server.store_mut().unwrap().exists(b"k", 0));
+    }
+
+    #[test]
+    fn network_clients_share_budget_and_disconnect_releases_capacity() {
+        let mut server = build_server();
+        server.config.max_input_buffer = 256;
+        server.config.max_output_buffer = 256;
+        server.buffer_budget = CacheBufferBudget::new(512);
+        let addr = server.local_addr().unwrap();
+        let ping = b"*1\r\n$4\r\nPING\r\n";
+
+        // Incomplete frames are live data and must retain their charges.
+        let mut first = StdTcpStream::connect(addr).unwrap();
+        first
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        first.write_all(&ping[..5]).unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        assert_eq!(server.buffer_budget.used_bytes(), 256);
+
+        let mut second = StdTcpStream::connect(addr).unwrap();
+        second.write_all(&ping[..5]).unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        assert_eq!(server.connection_count(), 2);
+        assert_eq!(server.buffer_budget.used_bytes(), 512);
+
+        let mut third = StdTcpStream::connect(addr).unwrap();
+        third.write_all(ping).unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        assert_eq!(server.connection_count(), 2);
+        assert_eq!(server.buffer_budget.used_bytes(), 512);
+
+        drop(second);
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        assert_eq!(server.connection_count(), 1);
+        assert_eq!(server.buffer_budget.used_bytes(), 256);
+
+        first.write_all(&ping[5..]).unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        let mut response = [0; 7];
+        first.read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"+PONG\r\n");
+        assert_eq!(server.connection_count(), 1);
+        assert_eq!(server.buffer_budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn test_idle_clients_release_capacity_without_disconnecting() {
+        let mut server = build_server();
+        server.config.max_input_buffer = 256;
+        server.config.max_output_buffer = 256;
+        server.buffer_budget = CacheBufferBudget::new(512);
+        let addr = server.local_addr().unwrap();
+        let ping = b"*1\r\n$4\r\nPING\r\n";
+        let mut clients = Vec::new();
+        for _ in 0..4 {
+            let mut client = StdTcpStream::connect(addr).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            client.write_all(ping).unwrap();
+            for _ in 0..8 {
+                server.poll_once(Some(Duration::from_millis(5))).unwrap();
+            }
+            let mut response = [0; 7];
+            client.read_exact(&mut response).unwrap();
+            assert_eq!(&response, b"+PONG\r\n");
+            assert_eq!(server.buffer_budget.used_bytes(), 0);
+            clients.push(client);
+        }
+        assert_eq!(server.connection_count(), 4);
+        clients[0].write_all(ping).unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        let mut response = [0; 7];
+        clients[0].read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"+PONG\r\n");
+        assert_eq!(server.buffer_budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn test_release_empty_is_idempotent_and_preserves_live_bytes() {
+        let budget = CacheBufferBudget::new(128);
+        let mut lease = budget.lease();
+        let mut input = Vec::new();
+        let mut output = Vec::new();
+        lease.reserve(&mut input, 32, 64).unwrap();
+        lease.reserve(&mut output, 32, 64).unwrap();
+        output.extend_from_slice(b"unsent");
+        lease.release_empty(&mut output);
+        assert_eq!(&output, b"unsent");
+        assert_eq!(budget.used_bytes(), 128);
+        lease.release_empty(&mut input);
+        lease.release_empty(&mut input);
+        assert_eq!(input.capacity(), 0);
+        assert_eq!(budget.used_bytes(), 64);
+        output.clear();
+        lease.release_empty(&mut output);
+        assert_eq!(budget.used_bytes(), 0);
+        lease.reserve(&mut input, 32, 64).unwrap();
+        assert_eq!(budget.used_bytes(), 64);
+        drop(input);
+        drop(output);
+        drop(lease);
+        assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[cfg(unix)]
+    struct DurableTestDir(PathBuf);
+    #[cfg(unix)]
+    impl DurableTestDir {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "nulang-durable-reactor-{}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for DurableTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    #[cfg(unix)]
+    fn build_durable_server(
+        path: &std::path::Path,
+        sync: WalSync,
+        limits: WalLimits,
+    ) -> CacheShardServer {
+        let placement = CacheSlotMap::new_local(1, 1).unwrap();
+        let owner = placement.owner_for_slot(0).unwrap();
+        let (channels, mut inboxes) = CacheDispatchChannels::new(1, 32).unwrap();
+        let mut endpoints = CacheEndpointMap::new();
+        endpoints.insert(owner, CacheAdvertisedEndpoint::new("127.0.0.1", 7000));
+        let dispatcher = CacheDispatcher::new(1, 0, placement, channels)
+            .unwrap()
+            .with_cluster_redirects(endpoints);
+        CacheShardServer::bind_durable(
+            "127.0.0.1:0".parse().unwrap(),
+            dispatcher,
+            inboxes.remove(0),
+            CacheDurableConfig {
+                path: path.to_path_buf(),
+                cache_limits: CacheLimits::default(),
+                wal_limits: limits,
+                sync,
+            },
+            CacheServerConfig::default(),
+            CacheServerClock::new(),
+        )
+        .unwrap()
+    }
+    #[cfg(unix)]
+    fn connect_client(server: &CacheShardServer) -> StdTcpStream {
+        let client = StdTcpStream::connect(server.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        client
+    }
+    #[cfg(unix)]
+    fn roundtrip(
+        server: &mut CacheShardServer,
+        client: &mut StdTcpStream,
+        request: &[u8],
+        expected: &[u8],
+    ) {
+        client.write_all(request).unwrap();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        let mut response = vec![0; expected.len()];
+        client.read_exact(&mut response).unwrap();
+        assert_eq!(response, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_durable_reactor_restarts_and_preserves_mutations() {
+        let tmp = DurableTestDir::new();
+        for mode in [
+            super::super::cache_wal::WalSync::Buffered,
+            super::super::cache_wal::WalSync::Data,
+        ] {
+            let journal = tmp.0.join(format!("{mode:?}.wal"));
+            {
+                let mut server = build_durable_server(
+                    &journal,
+                    mode,
+                    super::super::cache_wal::WalLimits::default(),
+                );
+                assert!(server.store_mut().is_none());
+                let mut client = connect_client(&server);
+                roundtrip(&mut server, &mut client, b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$2\r\n41\r\n*2\r\n$4\r\nINCR\r\n$3\r\nkey\r\n*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n", b"+OK\r\n:42\r\n$2\r\n42\r\n");
+            }
+            let mut server = build_durable_server(
+                &journal,
+                mode,
+                super::super::cache_wal::WalLimits::default(),
+            );
+            let mut client = connect_client(&server);
+            roundtrip(
+                &mut server,
+                &mut client,
+                b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n",
+                b"$2\r\n42\r\n",
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_durable_reactor_poison_closes_every_client_and_recovers() {
+        let tmp = DurableTestDir::new();
+        let journal = tmp.0.join("failure.wal");
+        let mut server = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        let mut first = connect_client(&server);
+        let mut second = connect_client(&server);
+        roundtrip(
+            &mut server,
+            &mut first,
+            b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$3\r\nold\r\n",
+            b"+OK\r\n",
+        );
+        roundtrip(
+            &mut server,
+            &mut second,
+            b"*1\r\n$4\r\nPING\r\n",
+            b"+PONG\r\n",
+        );
+        assert_eq!(server.connection_count(), 2);
+        if let CacheBackend::Durable { cache, .. } = &mut server.backend {
+            cache.fail_next_append();
+        }
+        first
+            .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$3\r\nnew\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+            .unwrap();
+        let mut failed = false;
+        for _ in 0..8 {
+            match server.poll_once(Some(Duration::from_millis(5))) {
+                Err(CacheServerError::DurableShardPoisoned) => {
+                    failed = true;
+                    break;
+                }
+                other => other.unwrap(),
+            }
+        }
+        assert!(failed);
+        assert_eq!(server.connection_count(), 0);
+        assert_eq!(server.buffer_budget.used_bytes(), 0);
+        assert!(matches!(
+            server.poll_once(Some(Duration::ZERO)),
+            Err(CacheServerError::DurableShardPoisoned)
+        ));
+        for client in [&mut first, &mut second] {
+            let mut byte = [0];
+            match client.read(&mut byte) {
+                Ok(0) => {}
+                Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+                other => panic!("poisoned shard served data or remained open: {other:?}"),
+            }
+        }
+        drop(server);
+        let mut recovered = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        let mut client = connect_client(&recovered);
+        roundtrip(
+            &mut recovered,
+            &mut client,
+            b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
+            b"$3\r\nold\r\n",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_durable_reactor_limit_error_does_not_poison_or_mutate() {
+        let tmp = DurableTestDir::new();
+        let journal = tmp.0.join("limit.wal");
+        let mut server = build_durable_server(
+            &journal,
+            WalSync::Data,
+            WalLimits {
+                max_record_bytes: 128,
+                max_file_bytes: 96,
+            },
+        );
+        let mut client = connect_client(&server);
+        roundtrip(
+            &mut server,
+            &mut client,
+            b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n",
+            b"+OK\r\n",
+        );
+        roundtrip(
+            &mut server,
+            &mut client,
+            b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$3\r\nnew\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
+            b"-ERR cache persistence unavailable\r\n$1\r\nv\r\n",
+        );
+        assert_eq!(server.connection_count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_durable_reactor_batches_and_ttl_recovery() {
+        let tmp = DurableTestDir::new();
+        let journal = tmp.0.join("batch.wal");
+        let mut server = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        let mut client = connect_client(&server);
+        roundtrip(&mut server, &mut client,
+            b"*5\r\n$4\r\nMSET\r\n$4\r\na{t}\r\n$1\r\nx\r\n$4\r\nb{t}\r\n$1\r\ny\r\n*3\r\n$4\r\nMGET\r\n$4\r\na{t}\r\n$4\r\nb{t}\r\n*3\r\n$6\r\nEXPIRE\r\n$4\r\na{t}\r\n$2\r\n60\r\n*2\r\n$3\r\nDEL\r\n$4\r\nb{t}\r\n",
+            b"+OK\r\n*2\r\n$1\r\nx\r\n$1\r\ny\r\n:1\r\n:1\r\n");
+        roundtrip(
+            &mut server,
+            &mut client,
+            b"*3\r\n$6\r\nEXISTS\r\n$4\r\na{t}\r\n$4\r\nb{t}\r\n",
+            b":1\r\n",
+        );
+        drop(server);
+        let mut recovered = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        let mut client = connect_client(&recovered);
+        roundtrip(
+            &mut recovered,
+            &mut client,
+            b"*3\r\n$4\r\nMGET\r\n$4\r\na{t}\r\n$4\r\nb{t}\r\n",
+            b"*2\r\n$1\r\nx\r\n$-1\r\n",
+        );
+        if let CacheBackend::Durable { cache, .. } = &mut recovered.backend {
+            assert!(
+                matches!(cache.ttl(b"a{t}", recovered.clock.now_ms()).unwrap(), super::super::cache::CacheTtl::RemainingMs(ms) if ms > 0 && ms <= 60_000)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_durable_reactor_checkpoint_recovers_and_resumes_tcp_service() {
+        let tmp = DurableTestDir::new();
+        let journal = tmp.0.join("checkpoint.wal");
+        let mut server = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        let mut client = connect_client(&server);
+        for _ in 0..4 {
+            roundtrip(
+                &mut server,
+                &mut client,
+                b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n",
+                b"+OK\r\n",
+            );
+        }
+        let report = server.checkpoint().unwrap();
+        assert_eq!(report.entries, 1);
+        assert!(report.after_bytes < report.before_bytes);
+        roundtrip(
+            &mut server,
+            &mut client,
+            b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$3\r\nnew\r\n",
+            b"+OK\r\n",
+        );
+        drop(server);
+        let mut recovered = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        let mut client = connect_client(&recovered);
+        roundtrip(
+            &mut recovered,
+            &mut client,
+            b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
+            b"$3\r\nnew\r\n",
+        );
     }
 }

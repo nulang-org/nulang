@@ -1,4 +1,37 @@
 # Nulang Changelog
+### Fabric durability integration qualification — 2026-11-27
+- **Exercise memory and durable RESP parity across 768 deterministic operations and 21 checkpoint/reopen cycles**, and explicitly run the feature-gated RESP suite in CI. The complete durability stack targets main without dependency changes.
+
+### Atomic durable cache checkpoints — 2026-11-27
+- **Compact durable cache history using an atomically published, checksummed checkpoint journal** with a mandatory snapshot prefix, monotonic sequence continuation, stable writer lock, preserved TTLs, and fail-stop on ambiguous publication. Explicit native and reactor maintenance APIs reclaim journal capacity without cloning live values.
+
+### Optional durable RESP reactor — 2026-11-27
+- **Integrate memory, buffered journal and synchronized journal backends** with shared RESP validation, restart recovery, bounded response allocation, and shard-wide fail-stop after ambiguous journal failure. Durable mode is Unix-only and opt-in; direct store access is memory-only.
+
+### Native durable RESP cache mutation coordinator — 2026-11-27
+- **Journal native cache mutations before live publication**, including typed after-images, atomic batches, absolute TTL recovery, admission preflight and fail-stop reads/writes following ambiguous persistence failure. Live RESP reactor integration remains pending.
+
+### RESP cache journal substrate — 2026-11-27
+- **Add a bounded, single-writer, checksummed WAL primitive** with streaming recovery, torn-tail repair, corruption rejection, buffered/synced acknowledgement and fail-stop append poisoning. Reuse BLAKE3; live RESP persistence integration remains pending.
+
+### Idle RESP connection buffer reclamation — 2026-11-27
+- **Release drained input/output vector allocations and their shared budget charges without disconnecting clients.** Preserve partial frames and unsent replies; verify live-data saturation, disconnect recovery, repeated reclamation and multiple idle TCP connections.
+
+### RESP cache reference-server parity — 2026-11-27
+- **Match canonical integer validation, overflow responses and nearest-second TTL rounding** for the supported RESP subset. Always-on regressions and an explicit reference-server example avoid ignored tests.
+
+### Shared RESP reactor buffer admission — 2026-11-27
+- **Reserve retained connection vector capacity before growth**, with a shared optional cross-reactor byte budget and RAII release. Preflight conservative reply size before execution and avoid a synchronous response scratch copy. Close on budget exhaustion; this is not a full-process RSS cap.
+
+### RESP cache admission limits — 2026-11-27
+- **Bound physical entries and initialized arena extent per shard**, with fallible cache writes and RESP OOM errors. Preflight whole MSET batches before mutation; expose estimated retained allocation capacity separately. Default limits are one million entries and 256 MiB of arena extent; these are not process RSS caps.
+
+### Cancellable RESP expiration records — 2026-11-27
+- **Unlink prior TTL records in constant time** on refresh, persistent overwrite, deletion and lazy expiry using slot-indexed FIFO handles. Preserve bounded sweeps and safe slot reuse. Metadata capacity remains tied to the slot high-water mark; this is not a total memory cap.
+
+### Bounded RESP cache expiration sweeps — 2026-11-27
+- **Bound inspected expiration candidates per sweep**, including stale and future records. Preserve partially drained buckets across clock advances and rotate between eligible buckets; zero budget does no work. This does not yet cap total TTL metadata or wall-clock latency.
+
 ### Per-priority scheduler runnable backlog diagnostics — 2026-11-20
 - **Expose approximate queued High, Normal, and Low runnable task counts** in the existing scheduler metrics snapshot, including global injector and worker-local queues, without adding counters to scheduling hot paths.
 - **Regression tests cover mixed priority queues, dequeues, and metrics-counter reset.** Queue depths are sampled non-atomically for diagnostics only; they are not admission, fairness, or backpressure guarantees.
