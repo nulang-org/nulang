@@ -14,7 +14,9 @@ fn bench_get_hit_inline(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
 
     let mut store = CacheStore::new();
-    store.set_bytes(b"tenant:{42}:profile", b"small-value", None, 0);
+    store
+        .set_bytes(b"tenant:{42}:profile", b"small-value", None, 0)
+        .unwrap();
 
     group.bench_function("direct", |b| {
         b.iter(|| {
@@ -33,12 +35,14 @@ fn bench_set_inline_churn(c: &mut Criterion) {
     let mut store = CacheStore::new();
     group.bench_function("same_key", |b| {
         b.iter(|| {
-            store.set_bytes(
-                black_box(b"tenant:{42}:counter"),
-                black_box(b"1234567890"),
-                None,
-                0,
-            );
+            store
+                .set_bytes(
+                    black_box(b"tenant:{42}:counter"),
+                    black_box(b"1234567890"),
+                    None,
+                    0,
+                )
+                .unwrap();
         });
     });
     group.finish();
@@ -50,11 +54,13 @@ fn bench_set_large_reuse(c: &mut Criterion) {
 
     let value = vec![7u8; 256];
     let mut store = CacheStore::new();
-    store.set_bytes(b"blob", &value, None, 0);
+    store.set_bytes(b"blob", &value, None, 0).unwrap();
 
     group.bench_function("same_key", |b| {
         b.iter(|| {
-            store.set_bytes(black_box(b"blob"), black_box(&value), None, 0);
+            store
+                .set_bytes(black_box(b"blob"), black_box(&value), None, 0)
+                .unwrap();
         });
     });
     group.finish();
@@ -66,7 +72,9 @@ fn bench_resp_get_execute(c: &mut Criterion) {
 
     let frame = b"*2\r\n$3\r\nGET\r\n$19\r\ntenant:{42}:profile\r\n";
     let mut store = CacheStore::new();
-    store.set_bytes(b"tenant:{42}:profile", b"small-value", None, 0);
+    store
+        .set_bytes(b"tenant:{42}:profile", b"small-value", None, 0)
+        .unwrap();
     let mut out = Vec::with_capacity(64);
 
     group.bench_function("parse_and_execute", |b| {
@@ -88,7 +96,9 @@ fn bench_resp_get_dispatch_same_shard(c: &mut Criterion) {
 
     let frame = b"*2\r\n$3\r\nGET\r\n$19\r\ntenant:{42}:profile\r\n";
     let mut store = CacheStore::new();
-    store.set_bytes(b"tenant:{42}:profile", b"small-value", None, 0);
+    store
+        .set_bytes(b"tenant:{42}:profile", b"small-value", None, 0)
+        .unwrap();
     let placement = CacheSlotMap::new_local(1, 1).unwrap();
     let (channels, _inboxes) = CacheDispatchChannels::new(1, 8).unwrap();
     let dispatcher = CacheDispatcher::new(1, 0, placement, channels).unwrap();
