@@ -1,10 +1,10 @@
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nulang::database::store::{WalBackedError, WalBackedTablet};
 use nulang::database::tablet::{KeyRange, TabletDescriptor, TabletId, TabletMutation};
@@ -54,44 +54,76 @@ fn commit_put(tablet: &mut WalBackedTablet, key: &[u8], value: &[u8]) {
     tablet.commit(write).unwrap();
 }
 
-fn spawn_until_ack(wal_path: &Path, action: &str) -> (std::process::Child, String) {
+// Own every subprocess until it is explicitly reaped, including unwinding.
+struct FixtureChild(Child);
+
+impl Drop for FixtureChild {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+fn wait_for_ack(child: &mut Child, path: &Path, timeout: Duration) -> io::Result<String> {
+    let started = Instant::now();
+    let result = (|| loop {
+        match fs::read_to_string(path) {
+            Ok(value) if value.starts_with("ACK ") => return Ok(value),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid fixture acknowledgement",
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if let Some(status) = child.try_wait()? {
+            return Err(io::Error::other(format!(
+                "fixture exited before acknowledgement: {status}"
+            )));
+        }
+        if started.elapsed() >= timeout {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "fixture did not publish a durability acknowledgement",
+            ));
+        }
+        thread::sleep(Duration::from_millis(5).min(timeout.saturating_sub(started.elapsed())));
+    })();
+    if result.is_err() {
+        // Always wait, even if kill races with natural exit.
+        let _ = child.kill();
+        child.wait()?;
+    }
+    result
+}
+
+fn spawn_until_ack(wal_path: &Path, action: &str) -> (FixtureChild, String) {
     let ack_path = ack_path(wal_path);
     let _ = fs::remove_file(&ack_path);
 
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "crash_fixture_child", "--ignored", "--nocapture"])
-        .env("NULANG_NUDB_CRASH_CHILD_WAL", wal_path)
-        .env("NULANG_NUDB_CRASH_CHILD_ACK", &ack_path)
-        .env("NULANG_NUDB_CRASH_CHILD_ACTION", action)
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
-
-    let mut ack = None;
-    for _ in 0..1_000 {
-        if let Ok(value) = fs::read_to_string(&ack_path) {
-            ack = Some(value);
-            break;
-        }
-        if let Some(status) = child.try_wait().unwrap() {
-            panic!("crash fixture exited before acknowledgement: {status}");
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-
-    let ack = ack.expect("fixture did not publish a durability acknowledgement");
-    assert!(
-        ack.starts_with("ACK "),
-        "fixture must acknowledge only after its durability boundary, got {ack:?}"
+    let mut child = FixtureChild(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "crash_fixture_child", "--ignored", "--nocapture"])
+            .env("NULANG_NUDB_CRASH_CHILD_WAL", wal_path)
+            .env("NULANG_NUDB_CRASH_CHILD_ACK", &ack_path)
+            .env("NULANG_NUDB_CRASH_CHILD_ACTION", action)
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
     );
+    let ack = wait_for_ack(&mut child.0, &ack_path, Duration::from_secs(5)).unwrap();
     (child, ack)
 }
 
 fn run_until_ack_then_kill(wal_path: &Path, action: &str) -> String {
     let (mut child, ack) = spawn_until_ack(wal_path, action);
-    child.kill().unwrap();
-    let status = child.wait().unwrap();
+    child.0.kill().unwrap();
+    let status = child.0.wait().unwrap();
     assert!(!status.success(), "fixture unexpectedly exited gracefully");
     ack
 }
@@ -111,6 +143,9 @@ fn crash_fixture_child() {
     // exclusion fixture. Other crash fixtures still drop it before ACK.
     let mut _held_writer = None;
     let acknowledgement = match action.as_str() {
+        "never-ack" => loop {
+            std::thread::park();
+        },
         "hold-lock" => {
             let mut writer = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
             commit_put(&mut writer, b"k", b"from-child");
@@ -235,8 +270,8 @@ fn competing_process_cannot_write_until_checkpoint_owner_exits() {
     let competing = WalBackedTablet::open(descriptor(), &wal_path);
 
     // Reap the parked child even if the assertion fails (RED test safety).
-    child.kill().unwrap();
-    assert!(!child.wait().unwrap().success());
+    child.0.kill().unwrap();
+    assert!(!child.0.wait().unwrap().success());
     assert_eq!(ack.trim(), "ACK WRITER_LOCK 1");
     assert_eq!(
         competing.unwrap_err(),
@@ -248,5 +283,32 @@ fn competing_process_cannot_write_until_checkpoint_owner_exits() {
     assert_eq!(writer.current_sequence(), 1);
     assert_eq!(writer.read_latest(b"k"), Some(&b"from-child"[..]));
     drop(writer);
+    cleanup(&wal_path);
+}
+
+#[test]
+fn acknowledgement_timeout_reaps_the_child() {
+    let wal_path = temp_wal("ack_timeout");
+    let ack = ack_path(&wal_path);
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "crash_fixture_child", "--ignored", "--nocapture"])
+        .env("NULANG_NUDB_CRASH_CHILD_WAL", &wal_path)
+        .env("NULANG_NUDB_CRASH_CHILD_ACK", &ack)
+        .env("NULANG_NUDB_CRASH_CHILD_ACTION", "never-ack")
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let result = wait_for_ack(&mut child, &ack, Duration::ZERO);
+    let status = child.try_wait().unwrap();
+    // Defensive cleanup even if the regression fails.
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(result.is_err());
+    assert!(
+        status.is_some(),
+        "timed-out child must be killed and reaped"
+    );
     cleanup(&wal_path);
 }
