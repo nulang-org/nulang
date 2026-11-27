@@ -133,3 +133,55 @@ That and the static c4 regression require further design/measurement.
 
 These measurements cover HTTP and SSE, not browser interaction metrics,
 WCAG conformance, real network clients, TLS, or multi-process scaling.
+
+## Single-write request logging A/B (2026-11-27, review candidate)
+
+A separate, isolated patch preformats one request record and calls
+`eprint!` once, replacing the `eprintln!` call whose formatting fragments
+produced multiple stderr writes. Request-log contents, stderr destination,
+response behavior, connection limits and runtime dependencies remain
+unchanged. The change does not attempt to sanitize previously logged query
+parameters; existing logging privacy/security policy still needs review.
+
+Control is the exact release-cli binary SHA-256
+`bb4255653b57f321635e593d3c551caf7003257b4baaea7460baf7a6b5a188c7`;
+candidate binary SHA-256
+`bcbeb53f33cc8e1ff671598a5380116becdb7a8dec4aaf4a245841eb42312696`.
+Same disjoint CPU affinities, fixtures, load client and hardware as above.
+
+Five paired, alternating 1,500-request trials per endpoint/concurrency,
+120,000 requests with zero failures; all 126,400 warmup+measurement
+request-log records matched the expected line text and counts for
+each variant (ordering was nondeterministic). The baseline
+vs candidate medians were: static c1 5,340/5,791 req/s, static c4
+19,841/19,559, static c16 27,831/32,866, static c32 28,625/32,016;
+dynamic c1 4,314/4,639, dynamic c4 18,393/19,069, dynamic c16
+21,426/22,386, dynamic c32 22,094/20,773. The dynamic c32 result
+regressed in this shorter experiment. Under separate strace -f -c
+500-request dynamic trials, `write` syscall counts fell from 3,198
+to 698, including startup; `clone3` remained 512. Do not infer
+syscall timing from traced execution. Raw report SHA-256:
+`a16380181a97d0c2edae153e7f716be3e55614eabc0f52487d1a4a23c4b75e07`.
+Host load averages were 1.55/2.56/3.26 before and 1.18/2.41/3.20 after.
+
+To resolve the high-concurrency ambiguity, the same experiment was
+extended to five paired 10,000-request trials for the four workloads
+below (400,000 requests, zero failures). The baseline vs candidate
+throughput and p95 are medians across five trials, not aggregated
+percentiles:
+
+| Endpoint | Concurrency | Base req/s | Log req/s | Base p95 ms | Log p95 ms | Base CPU us/req | Log CPU us/req |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Static | 4 | 20408 | 20270 | .276 | .288 | 150 | 140 |
+| Static | 16 | 30885 | 32423 | .767 | .705 | 169 | 156 |
+| Static | 32 | 30274 | 31776 | 1.392 | 1.291 | 175 | 160 |
+| Dynamic | 32 | 23440 | 24240 | 1.908 | 1.616 | 243 | 219 |
+
+Raw longer-run report SHA-256:
+`2ae5f7aa386330029a873ef7a855cde81b7984a6b43660a38ff0ab2453b6d751`.
+Interpret the ~5% high-concurrency gains conservatively, since this is
+one shared development host, not a production workload. Static c4
+throughput was ~0.7% lower, p95 ~0.012 ms higher. No new logging
+configuration, suppression, queue, thread pool or security policy is
+introduced. This patch remains separate from the worker-reuse
+prototype and requires exact-head CI plus independent review.
