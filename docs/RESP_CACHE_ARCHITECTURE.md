@@ -412,3 +412,28 @@ expiration, invalid integers, duplicate keys, cross-slot rejection and binary
 values. CI runs both the cache and RESP module test suites with cache-server
 enabled. This is deterministic logical qualification, not a physical crash or
 power-loss test.
+
+## Standalone Unix server
+
+Build and start the feature-gated single-shard executable:
+
+```sh
+cargo build --release --locked --no-default-features --features cache-server --bin nulang-fabric
+./target/release/nulang-fabric --help
+./target/release/nulang-fabric --bind 127.0.0.1:6380 --mode memory
+# Use an existing private directory for persistent data.
+./target/release/nulang-fabric --bind 127.0.0.1:6380 --mode sync --journal /path/to/private/cache.wal
+```
+
+Adjust the binary path if CARGO_TARGET_DIR overrides the default. The server
+requires a numeric loopback address and nonzero port. No authentication or
+TLS is implemented, so do not expose it through a proxy or tunnel to
+untrusted clients. Other local users may connect. Durable modes require an
+explicit journal path. READY is printed only after recovery and binding.
+The server exits nonzero on configuration, recovery, or reactor failure.
+Process-level tests kill the child without graceful shutdown and verify that
+memory mode loses its contents while both journal modes recover acknowledged
+writes after a process-only failure. This does not establish power-loss
+survival for buffered writes. Graceful signal handling, automatic checkpoint
+scheduling, multi-shard configuration, authentication/TLS and production
+performance testing remain pending.

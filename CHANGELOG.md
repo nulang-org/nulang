@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Standalone Fabric server — 2026-11-27
+- **Add a feature-gated Unix-only single-shard RESP executable** with loopback-only binding, explicit memory/buffered/synchronized journal modes, validated memory/journal limits and process-level restart regressions.
+
 ### Fabric durability integration qualification — 2026-11-27
 - **Exercise memory and durable RESP parity across 768 deterministic operations and 21 checkpoint/reopen cycles**, and explicitly run the feature-gated RESP suite in CI. The complete durability stack targets main without dependency changes.
 
