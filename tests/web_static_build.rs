@@ -1797,3 +1797,28 @@ fn indexed_content_is_opt_in_and_rejects_unknown_bundles() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("unknown indexed content bundle"));
     assert_eq!(site.read("dist/articles/a/index.html"), prior);
 }
+
+#[test]
+fn indexed_content_does_not_duplicate_record_payload_constants() {
+    let site = content_site();
+    let body = "Unique long-form content payload for deduplication.";
+    markdown_file(
+        &site,
+        "content/articles/a.md",
+        &format!("+++\nslug = \"a\"\ntitle = \"A\"\n+++\n{body}\n"),
+    );
+    site.source(INDEXED_CONTENT_APP);
+    enable_content_index(&site, "[\"articles\"]");
+    success(site.build());
+    let artifact = nulang::bytecode::CodeModule::from_nbc(&site.read(".nula/build.nbc")).unwrap();
+    let payloads = artifact
+        .module
+        .constants
+        .iter()
+        .filter(|c| matches!(c, nulang::bytecode::Constant::String(s) if s.contains(body)))
+        .count();
+    assert_eq!(
+        payloads, 2,
+        "one original Markdown payload and one HTML payload"
+    );
+}

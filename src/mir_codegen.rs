@@ -74,6 +74,8 @@ struct JumpPatch {
 
 pub struct MirCodegen {
     module: CodeModule,
+    // Compile-time literal interning only; runtime string IDs and NBC format remain unchanged.
+    string_literals: FxHashMap<String, usize>,
     /// Module-wide record field ids, mirroring the stable compiler's layout.
     field_map: FxHashMap<String, u8>,
     next_field_id: u8,
@@ -107,6 +109,7 @@ impl MirCodegen {
     pub fn new(module_name: impl Into<String>) -> Self {
         MirCodegen {
             module: CodeModule::new(module_name),
+            string_literals: FxHashMap::default(),
             field_map: FxHashMap::default(),
             next_field_id: 0,
             state_field_constants: FxHashMap::default(),
@@ -1485,7 +1488,17 @@ impl MirCodegen {
             Constant::Int(2) => self.emit(Instruction::new1(OpCode::Const2, dst)),
             Constant::Int(-1) => self.emit(Instruction::new1(OpCode::ConstM1, dst)),
             _ => {
-                let idx = self.module.add_constant(c.clone());
+                let idx = if let Constant::String(value) = c {
+                    if let Some(&idx) = self.string_literals.get(value) {
+                        idx
+                    } else {
+                        let idx = self.module.add_constant(c.clone());
+                        self.string_literals.insert(value.clone(), idx);
+                        idx
+                    }
+                } else {
+                    self.module.add_constant(c.clone())
+                };
                 self.emit(Instruction::new3(
                     OpCode::ConstU,
                     ((idx >> 8) & 0xFF) as u8,
