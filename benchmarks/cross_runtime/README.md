@@ -31,6 +31,20 @@ records exact nanosecond timings from each runtime and reports the median for
 every workload. The JSON also records OS/CPU counts, git SHA, toolchain
 versions, and the CPU topology used for measurement.
 
+Every warm-up and measured run must emit exactly one valid record for each
+matched workload, with the logical message count in the table above and a
+positive elapsed duration. Duplicate, malformed, foreign-runtime, unexpected
+workload, and mismatched-count records fail the run before a report is written.
+The standalone Nulang runner also emits `skynet` (1,110 logical messages);
+that Nulang-only record is validated when present but excluded from comparison.
+Empty or duplicate runtime selections are rejected before building fixtures.
+
+Run the parser/evidence regression suite without compiling any runtime:
+
+```bash
+python3 -m unittest discover -s scripts/tests -p test_cross_runtime_evidence.py
+```
+
 ## CPU-topology rule
 
 `--cpu-mode single` is the default and is the mode intended for cross-runtime
