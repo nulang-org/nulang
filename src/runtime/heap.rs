@@ -1881,40 +1881,40 @@ fn test_zero_payload_free_preserves_neighbor() {
 
 #[test]
 fn test_heap_pool_reuse_across_heaps() {
-    // Create and drop several heaps; the pool should reuse blocks.
-    let ptrs: Vec<*mut u8> = (0..4)
-        .map(|_| {
-            let heap = ActorHeap::new(64 * 1024);
-            let base = heap.base;
-            std::mem::forget(heap); // don't drop — we'll check the pool
-            base
-        })
-        .collect();
+    // A fresh thread isolates the thread-local pool from other heap tests.
+    std::thread::spawn(|| {
+        let materialize = || {
+            let mut heap = ActorHeap::new(64 * 1024);
+            heap.alloc(8, TypeTag::Raw)
+                .expect("materialize the primary bump block");
+            assert!(!heap.base.is_null());
+            heap
+        };
 
-    // Drop the heaps to return blocks to the pool.
-    for &base in &ptrs {
-        HEAP_POOL.with(|pool| {
-            pool.borrow_mut().release(base, 64 * 1024);
-        });
-    }
+        // Keep the original heaps alive until all four blocks are distinct.
+        let heaps: Vec<_> = (0..4).map(|_| materialize()).collect();
+        let bases: Vec<_> = heaps.iter().map(|heap| heap.base).collect();
+        drop(heaps); // Return real blocks through the normal Drop path.
+        HEAP_POOL.with(|pool| assert_eq!(pool.borrow().len(), 4));
 
-    // Now allocate new heaps — they should get pooled blocks.
-    let mut reused = 0;
-    for _ in 0..4 {
-        let heap = ActorHeap::new(64 * 1024);
-        if ptrs.contains(&heap.base) {
-            reused += 1;
+        // Keep replacements alive as well: each pooled block may be reused once.
+        let replacements: Vec<_> = (0..4).map(|_| materialize()).collect();
+        HEAP_POOL.with(|pool| assert!(pool.borrow().is_empty()));
+        for heap in &replacements {
+            assert!(bases.contains(&heap.base), "expected a recycled block");
         }
-        // Don't return to pool during test cleanup.
-        let base = heap.base;
-        let size = heap.total_size;
-        std::mem::forget(heap);
-        // Deallocate manually so we don't pollute the pool for other tests.
-        let layout =
-            std::alloc::Layout::from_size_align(size, crate::runtime::heap::ALIGN).unwrap();
-        unsafe {
-            std::alloc::dealloc(base, layout);
+        for base in &bases {
+            assert_eq!(
+                replacements
+                    .iter()
+                    .filter(|heap| heap.base == *base)
+                    .count(),
+                1,
+                "each original block must be reused exactly once"
+            );
         }
-    }
-    assert!(reused > 0, "pool should have reused at least one block");
+        // Normal heap and thread-local pool destruction own all deallocation.
+    })
+    .join()
+    .expect("heap pool reuse test thread failed");
 }
