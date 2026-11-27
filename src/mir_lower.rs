@@ -32,6 +32,15 @@ fn compile_err(msg: impl Into<String>, span: Span) -> NuError {
     }
 }
 
+fn tuple_pattern_index(index: usize) -> NuResult<u8> {
+    u8::try_from(index).map_err(|_| {
+        compile_err(
+            format!("tuple pattern position {index} exceeds 255"),
+            Span::default(),
+        )
+    })
+}
+
 /// Serialize the replay-relevant shape of RFC 0008 migration contracts into
 /// actor metadata. Migration bodies remain compiler IR, but runtime/tooling
 /// must at least retain the version topology and event surface instead of
@@ -492,12 +501,19 @@ impl ModuleCtx {
 
     /// Selective receive still resolves against the current actor's local arm
     /// names; keep that legacy resolver separate from send/ask nominal identity.
-    fn receive_behavior_idx(&self, behavior: &str) -> usize {
+    fn receive_behavior_idx(&self, behavior: &str) -> NuResult<u16> {
         let suffix = format!(".{}", behavior);
-        self.behavior_names
+        let idx = self
+            .behavior_names
             .iter()
             .position(|name| name == behavior || name.ends_with(&suffix))
-            .unwrap_or(self.behaviors.len())
+            .unwrap_or(self.behaviors.len());
+        u16::try_from(idx).map_err(|_| {
+            compile_err(
+                format!("receive behavior '{behavior}' index {idx} exceeds 65535"),
+                Span::default(),
+            )
+        })
     }
 
     fn fresh_lambda_name(&mut self) -> String {
@@ -1802,8 +1818,8 @@ impl<'c> FnLowerer<'c> {
         }
         let behavior_ids: Vec<u16> = arms
             .iter()
-            .map(|(name, _, _, _)| self.ctx.receive_behavior_idx(name) as u16)
-            .collect();
+            .map(|(name, _, _, _)| self.ctx.receive_behavior_idx(name))
+            .collect::<NuResult<_>>()?;
         let max_params = arms.iter().map(|(_, p, _, _)| p.len()).max().unwrap_or(0);
         let timeout = match after {
             Some((ms_body, _)) => {
@@ -1870,20 +1886,18 @@ impl<'c> FnLowerer<'c> {
             });
             self.b.switch_to(arm_bb);
             // Bind pattern variables to payload temps first (guards reference
-            // them). The pattern_test calls above already verified the
-            // structural match; bind_pattern binds the variables for use in
-            // the guard and arm body.
+            // them). The following pattern tests verify the structural match.
             self.push_scope();
             for (pat, &temp) in patterns.iter().zip(payload_temps.iter()) {
-                self.bind_pattern(pat, temp);
+                self.bind_pattern(pat, temp)?;
             }
             // Test payload patterns. Each pattern slot is tested against its
             // corresponding payload temp. All must pass.
             let pat_tests: Vec<mir::LocalId> = patterns
                 .iter()
                 .enumerate()
-                .map(|(j, pat)| self.pattern_test(pat, payload_temps[j]).unwrap())
-                .collect();
+                .map(|(j, pat)| self.pattern_test(pat, payload_temps[j]))
+                .collect::<NuResult<_>>()?;
             let pass_bb = self.b.create_block();
             // AND all pattern tests + guard into a single bool.
             let mut acc = if pat_tests.is_empty() {
@@ -1968,7 +1982,7 @@ impl<'c> FnLowerer<'c> {
                 // its guard fails the match is non-exhaustive and takes the
                 // error path below.
                 self.push_scope();
-                self.bind_pattern(pat, sid);
+                self.bind_pattern(pat, sid)?;
                 self.lower_body_into(arm_body, dst, join)?;
                 self.pop_scope();
             } else {
@@ -1982,7 +1996,7 @@ impl<'c> FnLowerer<'c> {
                 });
                 self.b.switch_to(arm_bb);
                 self.push_scope();
-                self.bind_pattern(pat, sid);
+                self.bind_pattern(pat, sid)?;
                 if let Some(guard_body) = guard {
                     // The pattern matched: evaluate the guard with the
                     // pattern's bindings in scope, then branch to the arm
@@ -2123,7 +2137,7 @@ impl<'c> FnLowerer<'c> {
                             elem,
                             mir::RValue::LoadFieldPos {
                                 obj: sid,
-                                index: i as u8,
+                                index: tuple_pattern_index(i)?,
                             },
                         );
                         let t = self.pattern_test(sub, elem)?;
@@ -2188,12 +2202,12 @@ impl<'c> FnLowerer<'c> {
         Ok(dst)
     }
 
-    fn bind_pattern(&mut self, pat: &Pattern, sid: mir::LocalId) {
+    fn bind_pattern(&mut self, pat: &Pattern, sid: mir::LocalId) -> NuResult<()> {
         match pat {
             Pattern::Var(name) => self.bind(name, sid),
             Pattern::Alias(name, inner) => {
                 self.bind(name, sid);
-                self.bind_pattern(inner, sid);
+                self.bind_pattern(inner, sid)?;
             }
             Pattern::Variant(_, Some(inner)) => {
                 // Payload-carrying variants are `{ ctor, payload }` records
@@ -2210,7 +2224,7 @@ impl<'c> FnLowerer<'c> {
                         field: "payload".to_string(),
                     },
                 );
-                self.bind_pattern(inner, payload);
+                self.bind_pattern(inner, payload)?;
             }
             Pattern::Tuple(pats) => {
                 // Bind each element sub-pattern to its positional field
@@ -2222,10 +2236,10 @@ impl<'c> FnLowerer<'c> {
                         elem,
                         mir::RValue::LoadFieldPos {
                             obj: sid,
-                            index: i as u8,
+                            index: tuple_pattern_index(i)?,
                         },
                     );
-                    self.bind_pattern(sub, elem);
+                    self.bind_pattern(sub, elem)?;
                 }
             }
             Pattern::Record(fields) => {
@@ -2240,11 +2254,12 @@ impl<'c> FnLowerer<'c> {
                             field: field.clone(),
                         },
                     );
-                    self.bind_pattern(sub, v);
+                    self.bind_pattern(sub, v)?;
                 }
             }
             _ => {}
         }
+        Ok(())
     }
 
     fn lower_for(
@@ -3502,6 +3517,71 @@ mod tests {
             "desugar must perform Actor.monitor: {:?}",
             main.blocks
         );
+    }
+
+    #[test]
+    fn test_receive_behavior_index_capacity() {
+        let mut ctx = ModuleCtx::new("receive-capacity");
+        for i in 0..usize::from(u16::MAX) {
+            ctx.reserve_behavior(format!("Actor.behavior{i}"));
+        }
+        ctx.reserve_behavior("Actor.Last".into());
+        let mut lowerer = FnLowerer::new(&mut ctx, "receive", None);
+        let dst = lowerer.b.add_temp(Type::unit());
+        let arms = |name: &str| {
+            vec![(
+                name.to_string(),
+                vec![],
+                None,
+                Box::new(hir::Body::default()),
+            )]
+        };
+        assert!(lowerer.lower_receive(dst, &arms("Last"), &None).is_ok());
+        let mut lowerer = FnLowerer::new(&mut ctx, "receive", None);
+        let dst = lowerer.b.add_temp(Type::unit());
+        let err = lowerer
+            .lower_receive(dst, &arms("Unknown"), &None)
+            .unwrap_err();
+        assert!(err.to_string().contains("receive behavior"), "{err}");
+        ctx.reserve_behavior("Actor.Overflow".into());
+        let mut lowerer = FnLowerer::new(&mut ctx, "receive", None);
+        let dst = lowerer.b.add_temp(Type::unit());
+        let after = Some((
+            Box::new(hir::Body::default()),
+            Box::new(hir::Body::default()),
+        ));
+        let err = lowerer
+            .lower_receive(dst, &arms("Overflow"), &after)
+            .unwrap_err();
+        assert!(err.to_string().contains("receive behavior"), "{err}");
+    }
+
+    #[test]
+    fn test_tuple_pattern_position_capacity() {
+        let mut ctx = ModuleCtx::new("tuple-capacity");
+        let mut lowerer = FnLowerer::new(&mut ctx, "pattern", None);
+        let sid = lowerer.b.add_temp(Type::unit());
+        let max_pattern = Pattern::Tuple(vec![Pattern::Wild; usize::from(u8::MAX) + 1]);
+        assert!(lowerer.pattern_test(&max_pattern, sid).is_ok());
+        let overflow = Pattern::Tuple(vec![Pattern::Wild; usize::from(u8::MAX) + 2]);
+        let err = lowerer.pattern_test(&overflow, sid).unwrap_err();
+        assert!(err.to_string().contains("tuple pattern"), "{err}");
+    }
+
+    #[test]
+    fn test_receive_rejects_oversize_nested_tuple_pattern() {
+        let mut ctx = ModuleCtx::new("receive-pattern-capacity");
+        let mut lowerer = FnLowerer::new(&mut ctx, "receive", None);
+        let dst = lowerer.b.add_temp(Type::unit());
+        let overflow = Pattern::Tuple(vec![Pattern::Wild; usize::from(u8::MAX) + 2]);
+        let arms = vec![(
+            "Msg".to_string(),
+            vec![Pattern::Tuple(vec![overflow])],
+            None,
+            Box::new(hir::Body::default()),
+        )];
+        let err = lowerer.lower_receive(dst, &arms, &None).unwrap_err();
+        assert!(err.to_string().contains("tuple pattern"), "{err}");
     }
 
     #[test]
