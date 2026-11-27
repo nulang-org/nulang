@@ -576,6 +576,41 @@ fn durable_clock(anchor: CacheTime, now: u64) -> Result<CacheTime, DurableError>
     })
 }
 
+/// Shard-local counters; command counts include dispatched error/redirect
+/// replies, not a guarantee that a mutation committed or a reply arrived.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CacheOperationalCounters {
+    pub accepted: u64,
+    pub rejected_limit: u64,
+    pub rejected_peer: u64,
+    pub rejected_tls_budget: u64,
+    pub accept_resource_errors: u64,
+    pub connection_errors: u64,
+    pub handshake_timeouts: u64,
+    pub commands_dispatched: u64,
+    pub polls_completed: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CacheOperationalSnapshot {
+    pub healthy: bool,
+    pub ready: bool,
+    pub connections: usize,
+    pub tls_reserved_bytes: usize,
+    pub connection_budget_used_bytes: usize,
+    pub connection_budget_limit_bytes: usize,
+    pub cache: super::cache::CacheMemoryStats,
+    pub cache_stats: super::cache::CacheStats,
+    pub counters: CacheOperationalCounters,
+    pub durable: bool,
+    pub journal_bytes: u64,
+    pub journal_limit_bytes: u64,
+    pub checkpoint_completed: u64,
+    pub checkpoint_failed: u64,
+    pub checkpoint_skipped: u64,
+    pub checkpoint_reclaimed_bytes: u64,
+}
+
 /// One physical cache shard and its network reactor.
 ///
 /// CacheShardServer requires redirect routing. A client that reaches the wrong
@@ -601,6 +636,7 @@ pub struct CacheShardServer {
     next_expiry_sweep: Instant,
     mutual_tls: Option<CacheMutualTls>,
     started: bool,
+    counters: CacheOperationalCounters,
     #[cfg(unix)]
     automatic_checkpoint: Option<AutomaticCheckpoint>,
 }
@@ -754,6 +790,7 @@ impl CacheShardServer {
             next_expiry_sweep,
             mutual_tls: None,
             started: false,
+            counters: CacheOperationalCounters::default(),
             #[cfg(unix)]
             automatic_checkpoint: None,
         })
@@ -802,6 +839,57 @@ impl CacheShardServer {
 
     pub fn connection_count(&self) -> usize {
         self.connections.len()
+    }
+
+    /// Read only on the owning reactor. Shared connection budget gauges
+    /// are process-wide when multiple shards share that budget.
+    pub fn operational_snapshot(&self) -> CacheOperationalSnapshot {
+        let (store, durable, poisoned, journal_bytes, journal_limit_bytes) = match &self.backend {
+            CacheBackend::Memory(store) => (store, false, false, 0, 0),
+            #[cfg(unix)]
+            CacheBackend::Durable { cache, .. } => {
+                let (used, limit) = cache.journal_usage();
+                (
+                    cache.operational_store(),
+                    true,
+                    cache.is_poisoned(),
+                    used,
+                    limit,
+                )
+            }
+        };
+        #[cfg(unix)]
+        let (completed, failed, skipped, reclaimed) =
+            self.automatic_checkpoint_stats().map_or((0, 0, 0, 0), |s| {
+                (
+                    s.completed,
+                    s.failed,
+                    s.skipped_ineffective,
+                    s.reclaimed_bytes,
+                )
+            });
+        #[cfg(not(unix))]
+        let (completed, failed, skipped, reclaimed) = (0, 0, 0, 0);
+        let healthy =
+            !poisoned && self.listener.is_some() && !self.shutdown.load(Ordering::Acquire);
+        CacheOperationalSnapshot {
+            healthy,
+            ready: healthy && self.accept_retry_at.is_none(),
+            connections: self.connection_count(),
+            tls_reserved_bytes: self.tls_reserved_bytes(),
+            connection_budget_used_bytes: self.buffer_budget.used_bytes(),
+            connection_budget_limit_bytes: self.buffer_budget.limit_bytes(),
+            cache: store.memory_stats(),
+            cache_stats: store.stats(),
+            counters: self.counters,
+            durable,
+            journal_bytes,
+            journal_limit_bytes,
+            checkpoint_completed: completed,
+            checkpoint_failed: failed,
+            checkpoint_skipped: skipped,
+            checkpoint_reclaimed_bytes: reclaimed,
+        }
     }
 
     /// Direct native access is memory-mode only; durable mutations must be journaled.
@@ -943,16 +1031,59 @@ impl CacheShardServer {
     /// until the deadline, then synchronize the durable journal. No new
     /// commands execute during the drain, even on existing connections.
     pub fn run_with_shutdown_timeout(&mut self, timeout: Duration) -> Result<(), CacheServerError> {
-        self.ensure_healthy()?;
-        while !self.shutdown.load(Ordering::Acquire) {
-            match self.poll_once(None) {
-                Err(CacheServerError::Io(error)) if error.kind() == io::ErrorKind::Interrupted => {
-                    continue
+        self.run_loop(timeout, None)
+    }
+
+    /// Publish periodic snapshots without taking a lock on every command.
+    /// The observer must be nonblocking and must not run untrusted code.
+    pub fn run_observed(
+        &mut self,
+        timeout: Duration,
+        mut observer: impl FnMut(CacheOperationalSnapshot),
+    ) -> Result<(), CacheServerError> {
+        self.run_loop(timeout, Some(&mut observer))
+    }
+
+    fn run_loop(
+        &mut self,
+        timeout: Duration,
+        mut observer: Option<&mut dyn FnMut(CacheOperationalSnapshot)>,
+    ) -> Result<(), CacheServerError> {
+        const INTERVAL: Duration = Duration::from_millis(250);
+        let mut next = Instant::now();
+        let result = (|| {
+            self.ensure_healthy()?;
+            while !self.shutdown.load(Ordering::Acquire) {
+                if let Some(publish) = observer.as_deref_mut() {
+                    if Instant::now() >= next {
+                        publish(self.operational_snapshot());
+                        next = Instant::now() + INTERVAL;
+                    }
                 }
-                other => other?,
+                let wait = observer
+                    .as_ref()
+                    .map(|_| next.saturating_duration_since(Instant::now()));
+                match self.poll_once(wait) {
+                    Err(CacheServerError::Io(error))
+                        if error.kind() == io::ErrorKind::Interrupted =>
+                    {
+                        continue
+                    }
+                    other => other?,
+                }
             }
+            if let Some(publish) = observer.as_deref_mut() {
+                publish(self.operational_snapshot());
+            }
+            self.finish_shutdown(timeout)
+        })();
+        if let Some(publish) = observer {
+            let mut snapshot = self.operational_snapshot();
+            snapshot.healthy = false;
+            snapshot.ready = false;
+            publish(snapshot);
         }
-        self.finish_shutdown(timeout)
+        result
     }
 
     fn close_listener(&mut self) {
@@ -1065,6 +1196,8 @@ impl CacheShardServer {
                 .map(|(token, _)| *token)
                 .collect();
             for token in expired {
+                self.counters.handshake_timeouts =
+                    self.counters.handshake_timeouts.saturating_add(1);
                 self.close_connection(token);
             }
         }
@@ -1113,6 +1246,7 @@ impl CacheShardServer {
         if !self.shutdown.load(Ordering::Acquire) {
             self.sweep_expired_if_due()?;
         }
+        self.counters.polls_completed = self.counters.polls_completed.saturating_add(1);
         Ok(())
     }
 
@@ -1176,6 +1310,8 @@ impl CacheShardServer {
                         || (self.mutual_tls.is_some()
                             && self.connections.len() >= TLS_CONNECTION_LIMIT)
                     {
+                        self.counters.rejected_limit =
+                            self.counters.rejected_limit.saturating_add(1);
                         drop(stream);
                         continue;
                     }
@@ -1187,6 +1323,7 @@ impl CacheShardServer {
                         .buffer_budget
                         .admit_peer(peer.ip(), self.config.max_connections_per_peer)
                     else {
+                        self.counters.rejected_peer = self.counters.rejected_peer.saturating_add(1);
                         continue;
                     };
                     let token = self.allocate_connection_token();
@@ -1197,6 +1334,8 @@ impl CacheShardServer {
                         // peer that never sends a ClientHello. The same lease
                         // holds RESP allocations and releases on every close.
                         if !connection.lease.reserve_tls() {
+                            self.counters.rejected_tls_budget =
+                                self.counters.rejected_tls_budget.saturating_add(1);
                             continue;
                         }
                         let mut session = rustls::ServerConnection::new(tls.config.clone())
@@ -1210,6 +1349,7 @@ impl CacheShardServer {
                         Interest::READABLE,
                     )?;
                     self.connections.insert(token, connection);
+                    self.counters.accepted = self.counters.accepted.saturating_add(1);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                 Err(error)
@@ -1223,6 +1363,8 @@ impl CacheShardServer {
                     continue
                 }
                 Err(error) if is_accept_resource_exhaustion(&error) => {
+                    self.counters.accept_resource_errors =
+                        self.counters.accept_resource_errors.saturating_add(1);
                     // Remove listener readiness during backoff to avoid a
                     // tight loop when the backlog is nonempty and accept
                     // cannot allocate a descriptor. Existing sockets remain.
@@ -1301,6 +1443,7 @@ impl CacheShardServer {
                 }
             }
             Err(ConnectionAction::Close) => {
+                self.counters.connection_errors = self.counters.connection_errors.saturating_add(1);
                 let _ = self.poll.registry().deregister(&mut connection.stream);
             }
         }
@@ -1509,6 +1652,7 @@ impl CacheShardServer {
             {
                 return Err(ConnectionAction::Close);
             }
+            self.counters.commands_dispatched = self.counters.commands_dispatched.saturating_add(1);
             connection.input_start += consumed;
             connection.commands_remaining -= 1;
             // Check between pipelined commands as well as between poll cycles.

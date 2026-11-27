@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Fabric operational observability — 2026-11-27
+- **Expose shard-local operational snapshots and an opt-in loopback metrics/health listener**, with bounded request handling, stale-snapshot failure, connection/admission counters, cache and journal gauges and automatic checkpoint progress. No new dependencies.
+
 ### Fabric peer and descriptor admission — 2026-11-27
 - **Bound concurrent source-IP admission across shared-budget shards**, normalize mapped IPv4 identities, reclaim peer leases on all connection-close paths, and retry resource-exhausted accepts after a bounded listener backoff. Qualify real Linux descriptor saturation while preserving established client service.
 

@@ -726,3 +726,57 @@ unchanged. This protects the accept path, not all descriptor-dependent
 operations: durable clock publication, journal/checkpoint I/O or poll
 registration failures may still cause errors or fail-stop. No claim
 of sustained distributed-flood resistance or Windows qualification.
+
+
+## Operational metrics and health
+
+The standalone process optionally exposes a separate loopback HTTP
+listener using --metrics-bind 127.0.0.1:9090 (IPv6 loopback is also
+supported). It is disabled by default. The endpoint is intentionally
+local and unauthenticated; any local process can read aggregate
+statistics. Do not publish it to an untrusted network through a proxy.
+A monitoring agent on the host can scrape GET /metrics, which returns
+Prometheus-compatible text exposition with fabric_ metric names.
+GET /healthz and GET /readyz return 200 when healthy/ready, or 503
+otherwise. Unknown paths return 404. There is no command or key access
+through this interface, and no high-cardinality peer, key or client labels.
+
+The owning reactor publishes an immutable numeric snapshot every
+250 ms when observation is enabled. A dedicated listener thread
+copies the sample under a short mutex, never dispatches commands,
+and handles one request at a time with a 1024-byte request-header cap
+and 250 ms combined I/O deadline. Publication uses try_lock so a
+scrape cannot block the data reactor. A sample older than two seconds
+is stale; both health probes fail closed and fabric_snapshot_fresh
+is zero. Readiness is false during listener resource-exhaustion
+backoff, poison or shutdown. A healthy snapshot only attests to
+recent reactor progress, not ability to persist the next mutation;
+a full journal or long synchronous checkpoint can affect availability.
+Long checkpoints can make a healthy process appear stale. Tune
+external probe failure thresholds accordingly; avoid restart loops.
+
+Metrics include active and accepted connections, rejected connections
+by limit/peer/TLS budget, listener resource errors, connection-drive
+errors, handshake timeouts, dispatched commands, completed poll
+iterations, shared connection-budget used/limit bytes, TLS reservations,
+physical cache entries, arena and approximate retained capacity,
+store hits/misses/expirations, durable mode, journal usage/limit and
+automatic checkpoint completion/failure/skips/reclaimed bytes.
+The command count includes dispatched error/redirect responses and
+does not attest to client receipt or mutation commitment. It excludes
+native direct store access and inbox dispatch. Store counters may
+include internal lookups and replay; physical entries may include
+expired entries pending removal. Automatic checkpoint counters do
+not include explicit manual checkpoints. Counters reset on restart.
+Shared budget gauges are process-wide when the same budget is
+shared by multiple reactors; do not sum them across those shards.
+TLS charges and cache capacity estimates are not measured RSS.
+Embedded users can obtain operational_snapshot on the owning
+thread, or use run_observed with a trusted nonblocking callback.
+
+Qualification covers real memory-mode commands and peer rejection,
+durable checkpoint progress, stale and degraded probe responses,
+loopback-only configuration and an incomplete local probe concurrent
+with healthy RESP traffic. Metrics availability under process-wide
+descriptor exhaustion is not guaranteed. No external monitoring
+deployment, latency histogram or production alerting policy is implied.
