@@ -9,9 +9,9 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use mio::net::{TcpListener, TcpStream};
@@ -40,6 +40,7 @@ const LISTENER_TOKEN: Token = Token(0);
 const WAKE_TOKEN: Token = Token(1);
 const FIRST_CONNECTION_TOKEN: usize = 2;
 const ACCEPT_QUANTUM: usize = 32;
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 const COMMAND_QUANTUM: usize = 32;
 const READ_QUANTUM: usize = 32;
 const WRITE_QUANTUM: usize = 32;
@@ -55,6 +56,7 @@ pub struct CacheBufferBudget {
 struct BufferBudgetInner {
     limit: usize,
     used: AtomicUsize,
+    peers: Mutex<HashMap<IpAddr, usize>>,
 }
 impl CacheBufferBudget {
     pub fn new(limit: usize) -> Self {
@@ -62,6 +64,7 @@ impl CacheBufferBudget {
             inner: Arc::new(BufferBudgetInner {
                 limit,
                 used: AtomicUsize::new(0),
+                peers: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -83,6 +86,23 @@ impl CacheBufferBudget {
             })
             .is_ok()
     }
+    fn admit_peer(&self, address: IpAddr, limit: usize) -> Option<PeerLease> {
+        if limit == 0 {
+            return None;
+        }
+        let address = address.to_canonical();
+        let mut peers = self.inner.peers.lock().ok()?;
+        let count = peers.entry(address).or_default();
+        if *count >= limit {
+            return None;
+        }
+        *count += 1;
+        Some(PeerLease {
+            budget: self.clone(),
+            address,
+        })
+    }
+
     fn lease(&self) -> BufferLease {
         BufferLease {
             budget: self.clone(),
@@ -90,6 +110,28 @@ impl CacheBufferBudget {
         }
     }
 }
+struct PeerLease {
+    budget: CacheBufferBudget,
+    address: IpAddr,
+}
+
+impl Drop for PeerLease {
+    fn drop(&mut self) {
+        let mut peers = self
+            .budget
+            .inner
+            .peers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = peers.get_mut(&self.address) {
+            *count -= 1;
+            if *count == 0 {
+                peers.remove(&self.address);
+            }
+        }
+    }
+}
+
 struct BufferLease {
     budget: CacheBufferBudget,
     charged: usize,
@@ -168,6 +210,8 @@ impl Drop for BufferLease {
 #[derive(Debug, Clone)]
 pub struct CacheServerConfig {
     pub max_connections: usize,
+    /// Concurrent connections from one canonical source IP across shared-budget shards.
+    pub max_connections_per_peer: usize,
     pub max_total_connection_bytes: usize,
     pub max_input_buffer: usize,
     pub max_output_buffer: usize,
@@ -182,6 +226,7 @@ impl Default for CacheServerConfig {
     fn default() -> Self {
         Self {
             max_connections: 16_384,
+            max_connections_per_peer: 64,
             max_total_connection_bytes: 256 * 1024 * 1024,
             max_input_buffer: 1024 * 1024,
             max_output_buffer: 8 * 1024 * 1024,
@@ -329,12 +374,13 @@ struct CacheConnection {
     writable_interest: bool,
     tls: Option<Box<rustls::ServerConnection>>,
     lease: BufferLease,
+    _peer: PeerLease,
     accepted_at: Instant,
     commands_remaining: usize,
 }
 
 impl CacheConnection {
-    fn new(stream: TcpStream, lease: BufferLease) -> Self {
+    fn new(stream: TcpStream, lease: BufferLease, peer: PeerLease) -> Self {
         Self {
             stream,
             input: Vec::new(),
@@ -342,6 +388,7 @@ impl CacheConnection {
             output: Vec::new(),
             output_start: 0,
             lease,
+            _peer: peer,
             writable_interest: false,
             tls: None,
             accepted_at: Instant::now(),
@@ -540,6 +587,7 @@ pub struct CacheShardServer {
     ready: Vec<ReadyEvent>,
     deferred: HashMap<Token, ReadyEvent>,
     listener: Option<TcpListener>,
+    accept_retry_at: Option<Instant>,
     dispatcher: CacheDispatcher,
     inbox: CacheShardInbox,
     backend: CacheBackend,
@@ -692,6 +740,7 @@ impl CacheShardServer {
             deferred: HashMap::new(),
             poll,
             listener: Some(listener),
+            accept_retry_at: None,
             dispatcher,
             inbox,
             backend,
@@ -907,6 +956,7 @@ impl CacheShardServer {
     }
 
     fn close_listener(&mut self) {
+        self.accept_retry_at = None;
         if let Some(mut listener) = self.listener.take() {
             let _ = self.poll.registry().deregister(&mut listener);
         }
@@ -1018,6 +1068,15 @@ impl CacheShardServer {
                 self.close_connection(token);
             }
         }
+        if self.accept_retry_at.is_some_and(|at| Instant::now() >= at) {
+            self.accept_retry_at = None;
+            if let Some(listener) = &mut self.listener {
+                self.poll
+                    .registry()
+                    .register(listener, LISTENER_TOKEN, Interest::READABLE)?;
+                self.defer(ReadyEvent::continuation(LISTENER_TOKEN, true, false));
+            }
+        }
         // Coalesce kernel readiness and deferred work. Each token gets
         // at most one turn per iteration, even if both sources report it.
         self.ready.clear();
@@ -1063,6 +1122,9 @@ impl CacheShardServer {
         }
         let now = Instant::now();
         let mut deadline = self.next_expiry_sweep.saturating_duration_since(now);
+        if let Some(at) = self.accept_retry_at {
+            deadline = deadline.min(at.saturating_duration_since(now));
+        }
         if self.mutual_tls.is_some() {
             for connection in self.connections.values().filter(|c| c.handshake_pending()) {
                 deadline = deadline.min(
@@ -1098,6 +1160,9 @@ impl CacheShardServer {
     }
 
     fn accept_ready(&mut self) -> Result<(), CacheServerError> {
+        if self.accept_retry_at.is_some() {
+            return Ok(());
+        }
         for _ in 0..ACCEPT_QUANTUM {
             if self.shutdown.load(Ordering::Acquire) {
                 return Ok(());
@@ -1106,7 +1171,7 @@ impl CacheShardServer {
                 return Ok(());
             };
             match listener.accept() {
-                Ok((stream, _peer)) => {
+                Ok((stream, peer)) => {
                     if self.connections.len() >= self.config.max_connections
                         || (self.mutual_tls.is_some()
                             && self.connections.len() >= TLS_CONNECTION_LIMIT)
@@ -1118,8 +1183,15 @@ impl CacheShardServer {
                     if stream.set_nodelay(true).is_err() {
                         continue;
                     }
+                    let Some(peer) = self
+                        .buffer_budget
+                        .admit_peer(peer.ip(), self.config.max_connections_per_peer)
+                    else {
+                        continue;
+                    };
                     let token = self.allocate_connection_token();
-                    let mut connection = CacheConnection::new(stream, self.buffer_budget.lease());
+                    let mut connection =
+                        CacheConnection::new(stream, self.buffer_budget.lease(), peer);
                     if let Some(tls) = &self.mutual_tls {
                         // Charge before constructing Rustls state, even for a
                         // peer that never sends a ClientHello. The same lease
@@ -1149,6 +1221,17 @@ impl CacheShardServer {
                     ) =>
                 {
                     continue
+                }
+                Err(error) if is_accept_resource_exhaustion(&error) => {
+                    // Remove listener readiness during backoff to avoid a
+                    // tight loop when the backlog is nonempty and accept
+                    // cannot allocate a descriptor. Existing sockets remain.
+                    if let Some(listener) = &mut self.listener {
+                        self.poll.registry().deregister(listener)?;
+                    }
+                    self.accept_retry_at = Some(Instant::now() + ACCEPT_BACKOFF);
+                    self.deferred.remove(&LISTENER_TOKEN);
+                    return Ok(());
                 }
                 Err(error) => return Err(CacheServerError::Io(error)),
             }
@@ -1551,10 +1634,35 @@ enum ConnectionAction {
     Close,
 }
 
+fn is_accept_resource_exhaustion(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(
+            error.raw_os_error(),
+            Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+        )
+    }
+    #[cfg(windows)]
+    {
+        // WSAEMFILE, WSAENOBUFS.
+        matches!(error.raw_os_error(), Some(10024 | 10055))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 fn validate_config(config: &CacheServerConfig) -> Result<(), CacheServerError> {
     if config.max_total_connection_bytes == 0 {
         return Err(CacheServerError::InvalidConfig(
             "max_total_connection_bytes must be non-zero",
+        ));
+    }
+    if config.max_connections_per_peer == 0 {
+        return Err(CacheServerError::InvalidConfig(
+            "max_connections_per_peer must be non-zero",
         ));
     }
     if config.max_connections == 0 {
@@ -2687,6 +2795,17 @@ mod tests {
             other => panic!("budget-denied connection not closed: {other:?}"),
         }
         assert_eq!(budget.used_bytes(), RESERVE);
+        assert_eq!(
+            budget
+                .inner
+                .peers
+                .lock()
+                .unwrap()
+                .values()
+                .copied()
+                .sum::<usize>(),
+            1
+        );
 
         drop(stalled);
         for _ in 0..8 {
@@ -2726,6 +2845,7 @@ mod tests {
         second.control().shutdown();
         second.run_with_shutdown_timeout(Duration::ZERO).unwrap();
         assert_eq!(budget.used_bytes(), 0);
+        assert!(budget.inner.peers.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2799,5 +2919,83 @@ mod tests {
         ));
         assert_eq!(server.buffer_budget.used_bytes(), 0);
         assert!(server.mutual_tls.is_none());
+    }
+
+    #[test]
+    fn peer_quota_is_shared_across_reactors_and_reclaimed_after_disconnect() {
+        let budget = CacheBufferBudget::new(1024 * 1024);
+        let mut first = build_server();
+        let mut second = build_server();
+        first.buffer_budget = budget.clone();
+        second.buffer_budget = budget.clone();
+        first.config.max_connections_per_peer = 1;
+        second.config.max_connections_per_peer = 1;
+        let mut established = StdTcpStream::connect(first.local_addr().unwrap()).unwrap();
+        established
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        for _ in 0..8 {
+            first.poll_once(Some(Duration::from_millis(5))).unwrap();
+            if first.connection_count() == 1 {
+                break;
+            }
+        }
+        assert_eq!(first.connection_count(), 1);
+        let mut denied = StdTcpStream::connect(second.local_addr().unwrap()).unwrap();
+        denied
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        for _ in 0..8 {
+            second.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        assert_eq!(second.connection_count(), 0);
+        match denied.read(&mut [0; 1]) {
+            Ok(0) => {}
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+            other => panic!("over-quota peer not closed: {other:?}"),
+        }
+        established.write_all(b"*1\r\n$4\r\nPING\r\n").unwrap();
+        for _ in 0..8 {
+            first.poll_once(Some(Duration::from_millis(5))).unwrap();
+        }
+        let mut pong = [0; 7];
+        established.read_exact(&mut pong).unwrap();
+        assert_eq!(&pong, b"+PONG\r\n");
+        drop(established);
+        for _ in 0..8 {
+            first.poll_once(Some(Duration::from_millis(5))).unwrap();
+            if first.connection_count() == 0 {
+                break;
+            }
+        }
+        assert!(budget.inner.peers.lock().unwrap().is_empty());
+        let _replacement = StdTcpStream::connect(second.local_addr().unwrap()).unwrap();
+        for _ in 0..8 {
+            second.poll_once(Some(Duration::from_millis(5))).unwrap();
+            if second.connection_count() == 1 {
+                break;
+            }
+        }
+        assert_eq!(second.connection_count(), 1);
+        second.control().shutdown();
+        second.run_with_shutdown_timeout(Duration::ZERO).unwrap();
+        assert!(budget.inner.peers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn peer_identity_normalizes_mapped_ipv4_and_keeps_distinct_ips_independent() {
+        let budget = CacheBufferBudget::new(1024);
+        let ip = "192.0.2.1".parse().unwrap();
+        let mapped = "::ffff:192.0.2.1".parse().unwrap();
+        let other = "192.0.2.2".parse().unwrap();
+        let lease = budget.admit_peer(ip, 1).unwrap();
+        assert!(budget.admit_peer(mapped, 1).is_none());
+        let different = budget.admit_peer(other, 1).unwrap();
+        assert_eq!(budget.inner.peers.lock().unwrap().len(), 2);
+        drop(lease);
+        let replacement = budget.admit_peer(mapped, 1).unwrap();
+        drop(different);
+        drop(replacement);
+        assert!(budget.inner.peers.lock().unwrap().is_empty());
     }
 }

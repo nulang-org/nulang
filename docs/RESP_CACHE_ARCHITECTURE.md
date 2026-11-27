@@ -696,3 +696,33 @@ attempts competing for three slots, invalid handshakes, timeout,
 disconnect, zero-deadline shutdown, insufficient configuration and idle
 vector reclamation. Actual TLS allocator profiling, per-peer limits and
 file descriptor exhaustion remain separate qualification tasks.
+
+
+## Per-peer admission and descriptor exhaustion
+
+The default concurrent connection cap per canonical source IP is 64,
+configurable with --max-connections-per-peer (positive integer). The
+peer lease is acquired before TLS session creation, shared across
+reactors using the same CacheBufferBudget, and retained until the
+connection is destroyed. IPv4-mapped IPv6 addresses normalize to the
+same identity as native IPv4. Zero-count peer entries are removed.
+Configure identical peer limits on all reactors sharing a budget;
+a reactor with a higher limit otherwise admits more connections under
+its own threshold. This is a concurrent source-IP quota, not a rate
+limit or authenticated-user identity limit. NATs and trusted reverse
+proxies aggregate clients behind their source address; IPv6 address
+rotation and distributed sources can evade individual quotas.
+
+If accept encounters EMFILE, ENFILE, ENOBUFS, or ENOMEM on Unix (or
+WSAEMFILE/WSAENOBUFS on Windows), the reactor temporarily deregisters
+the listener for 100 ms, then re-registers and explicitly retries
+acceptance. The poll deadline includes this retry time, so recovery
+does not depend on a new edge. Existing connections remain registered
+and service continues where possible. Linux subprocess regression
+sets RLIMIT_NOFILE to 32, saturates the child descriptor table,
+checks PING on an established connection, and verifies new admission
+after descriptors become available. The parent process limit is
+unchanged. This protects the accept path, not all descriptor-dependent
+operations: durable clock publication, journal/checkpoint I/O or poll
+registration failures may still cause errors or fail-stop. No claim
+of sustained distributed-flood resistance or Windows qualification.
