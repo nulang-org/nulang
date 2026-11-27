@@ -500,6 +500,25 @@ impl MemoryTablet {
         self.current_sequence = sequence;
     }
 
+    /// Exact MVCC version, distinguishing a tombstone from no version.
+    pub(crate) fn exact_version_at(&self, key: &[u8], sequence: u64) -> Option<Option<&[u8]>> {
+        let versions = self.rows.get(key)?;
+        let index = versions
+            .binary_search_by_key(&sequence, |version| version.sequence)
+            .ok()?;
+        Some(versions[index].value.as_deref())
+    }
+
+    /// Number of retained versions newer than the WAL's durable base.
+    pub(crate) fn version_count_after(&self, sequence: u64) -> usize {
+        self.rows
+            .values()
+            .map(|versions| {
+                versions.len() - versions.partition_point(|version| version.sequence <= sequence)
+            })
+            .sum()
+    }
+
     /// Read one key at an already committed snapshot sequence.
     pub fn read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, TabletError> {
         if snapshot > self.current_sequence {
