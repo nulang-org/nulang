@@ -649,6 +649,14 @@ impl MemoryTablet {
         self.current_sequence = sequence;
     }
 
+    /// Latest committed mutation sequence, including retained tombstones.
+    pub(crate) fn latest_key_write_sequence(&self, key: &[u8]) -> Option<u64> {
+        self.rows
+            .get(key)
+            .and_then(|versions| versions.last())
+            .map(|version| version.sequence)
+    }
+
     /// Prune a candidate state; the durable coordinator enforces snapshot pins.
     pub(crate) fn prune_history_before(&mut self, floor: u64) -> Result<(), TabletError> {
         if floor < self.oldest_retained_snapshot {
@@ -765,6 +773,15 @@ pub enum TabletError {
     },
     RecoveryRequired,
     InvalidSnapshotHistory,
+    OptimisticConflict {
+        key: Vec<u8>,
+        snapshot: u64,
+        committed: u64,
+    },
+    TooManyOptimisticReadKeys {
+        requested: usize,
+        limit: usize,
+    },
     InvalidReceiptHistory,
     DuplicateTransactionId(TransactionId),
     KeyOutsideTabletRange,
@@ -830,6 +847,8 @@ impl fmt::Display for TabletError {
             Self::SnapshotPinned { requested, oldest_pinned } => write!(f,
                 "retention floor {requested} exceeds active snapshot {oldest_pinned}"),
             Self::RecoveryRequired => f.write_str("tablet recovery required before further snapshot reads or writes"),
+            Self::OptimisticConflict { key, snapshot, committed } => write!(f, "point key {key:?} changed at sequence {committed} after snapshot {snapshot}"),
+            Self::TooManyOptimisticReadKeys { requested, limit } => write!(f, "optimistic read set contains {requested} keys; limit is {limit}"),
             Self::InvalidReceiptHistory => f.write_str("invalid transaction receipt history"),
             Self::DuplicateTransactionId(id) => write!(f, "transaction ID {id:?} already committed"),
             Self::InvalidSnapshotHistory => {
