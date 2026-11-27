@@ -583,6 +583,62 @@ impl FileWal {
         }
 
         let checkpoint_sequence = tablet.current_sequence();
+        // Validate overlapping retained MVCC history independently of receipt
+        // identity. Pruning may remove versions at/below the floor, retaining
+        // only the latest live anchor per key; a final delete removes it.
+        let floor = tablet.oldest_retained_snapshot();
+        let mut anchors = std::collections::BTreeMap::new();
+        let mut matched_versions = 0;
+        for record in self
+            .records
+            .iter()
+            .take_while(|r| r.sequence <= checkpoint_sequence)
+        {
+            let mut final_values = std::collections::BTreeMap::new();
+            for mutation in &record.mutations {
+                let key = mutation.key();
+                if !tablet.descriptor().range().contains(key) {
+                    return Err(WalError::ReplayRejected {
+                        sequence: record.sequence,
+                        reason: "checkpoint overlap contains out-of-range WAL mutation".into(),
+                    });
+                }
+                let value = match mutation {
+                    TabletMutation::Put { value, .. } => Some(value.as_slice()),
+                    TabletMutation::Delete { .. } => None,
+                };
+                final_values.insert(key, value);
+            }
+            for (key, value) in final_values {
+                if record.sequence <= floor {
+                    anchors.insert(key, (record.sequence, value));
+                } else {
+                    if tablet.exact_version_at(key, record.sequence) != Some(value) {
+                        return Err(WalError::ReplayRejected {
+                            sequence: record.sequence,
+                            reason: "checkpoint MVCC version does not match WAL".into(),
+                        });
+                    }
+                    matched_versions += 1;
+                }
+            }
+        }
+        for (key, (sequence, value)) in anchors {
+            let expected = value.map(|value| (sequence, Some(value)));
+            if tablet.floor_anchor(key, floor) != expected {
+                return Err(WalError::ReplayRejected {
+                    sequence,
+                    reason: "checkpoint retention anchor does not match WAL".into(),
+                });
+            }
+            matched_versions += usize::from(value.is_some());
+        }
+        if matched_versions != tablet.version_count_after(self.base_sequence) {
+            return Err(WalError::ReplayRejected {
+                sequence: checkpoint_sequence,
+                reason: "checkpoint has unmatched MVCC versions".into(),
+            });
+        }
         // Check every overlapping receipt against the independently checksummed
         // WAL record, and reject extra checkpoint receipts in that interval.
         let mut overlap_receipts = 0;
