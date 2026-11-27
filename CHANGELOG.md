@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Fabric durability integration qualification — 2026-11-27
+- **Exercise memory and durable RESP parity across 768 deterministic operations and 21 checkpoint/reopen cycles**, and explicitly run the feature-gated RESP suite in CI. The complete durability stack targets main without dependency changes.
+
 ### Atomic durable cache checkpoints — 2026-11-27
 - **Compact durable cache history using an atomically published, checksummed checkpoint journal** with a mandatory snapshot prefix, monotonic sequence continuation, stable writer lock, preserved TTLs, and fail-stop on ambiguous publication. Explicit native and reactor maintenance APIs reclaim journal capacity without cloning live values.
 

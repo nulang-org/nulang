@@ -828,4 +828,116 @@ mod tests {
         );
         assert_eq!(store.get(b"a{t}", 0), Some(CacheValueView::Bytes(b"y")));
     }
+
+    #[cfg(all(unix, feature = "cache-server"))]
+    #[test]
+    fn test_durable_and_memory_resp_parity_across_checkpoints_and_restarts() {
+        use super::super::cache::{CacheLimits, CacheStore};
+        use super::super::cache_wal::{WalLimits, WalSync};
+        use std::path::PathBuf;
+        struct Temp(PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let tmp = Temp(std::env::temp_dir().join(format!(
+                "nulang-parity-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )));
+        std::fs::create_dir(&tmp.0).unwrap();
+        let path = tmp.0.join("journal");
+        let keys = [b"a{t}".as_slice(), b"b{t}", b"c{t}", b"d{t}"];
+        let values = [
+            b"0".as_slice(),
+            b"41",
+            b"-1",
+            b"+1",
+            b"01",
+            b"9223372036854775807",
+            b"\0\xff",
+            b"",
+        ];
+        for (i, seed) in [1u64, 42, 0xdeadbeef].into_iter().enumerate() {
+            let path = path.with_extension(format!("{i}.wal"));
+            let mut memory = CacheStore::new();
+            let mut state = seed;
+            let mut anchor = 0u64;
+            let open = |absolute: u64| {
+                DurableCache::open(
+                    &path,
+                    CacheLimits::default(),
+                    WalLimits::default(),
+                    WalSync::Buffered,
+                    CacheTime {
+                        monotonic_ms: 0,
+                        unix_ms: 1_000_000 + absolute,
+                    },
+                )
+                .unwrap()
+            };
+            let mut durable = open(0);
+            for step in 0..256u64 {
+                let now = step * 53;
+                if step != 0 && step % 32 == 0 {
+                    durable
+                        .checkpoint(CacheTime {
+                            monotonic_ms: now - anchor,
+                            unix_ms: 1_000_000 + now,
+                        })
+                        .unwrap();
+                    drop(durable);
+                    durable = open(now);
+                    anchor = now;
+                }
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let key = keys[(state >> 8) as usize % keys.len()];
+                let other = keys[(state >> 16) as usize % keys.len()];
+                let value = values[(state >> 24) as usize % values.len()];
+                let parts: &[&[u8]] = match state % 14 {
+                    0 => &[b"SET", key, value],
+                    1 => &[b"SET", key, value, b"PX", b"200"],
+                    2 => &[b"GET", key],
+                    3 => &[b"INCR", key],
+                    4 => &[b"DEL", key, other],
+                    5 => &[b"EXPIRE", key, b"1"],
+                    6 => &[b"EXPIRE", key, b"0"],
+                    7 => &[b"TTL", key],
+                    8 => &[b"MSET", key, value, other, b"42"],
+                    9 => &[b"MGET", key, other],
+                    10 => &[b"EXISTS", key, other],
+                    11 => &[b"SET", key, value, b"PX", b"0"],
+                    12 => &[b"MSET", key, value, b"unrelated", b"no"],
+                    _ => &[b"PING", value],
+                };
+                let mut wire = format!("*{}\r\n", parts.len()).into_bytes();
+                for part in parts {
+                    wire.extend_from_slice(format!("${}\r\n", part.len()).as_bytes());
+                    wire.extend_from_slice(part);
+                    wire.extend_from_slice(b"\r\n");
+                }
+                let expected = run(&mut memory, &wire, now);
+                let (cmd, consumed) = parse_command(&wire).unwrap().unwrap();
+                assert_eq!(consumed, wire.len());
+                let mut actual = Vec::new();
+                execute_durable_command(
+                    &mut durable,
+                    cmd,
+                    CacheTime {
+                        monotonic_ms: now - anchor,
+                        unix_ms: 1_000_000 + now,
+                    },
+                    &mut actual,
+                )
+                .unwrap();
+                assert_eq!(actual, expected, "seed {seed}, step {step}, args {parts:?}");
+            }
+        }
+    }
 }

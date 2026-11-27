@@ -405,3 +405,10 @@ record limits. The old journal is preserved in that case. There is no
 automatic checkpoint schedule, background compaction, orphan-temp cleanup
 after process termination, or independent snapshot backup. Physical
 power-loss qualification and throughput/latency benchmarks remain pending.
+
+The integrated feature-gated RESP test compares raw memory and durable replies
+across 768 deterministic commands and 21 checkpoint/reopen cycles, including
+expiration, invalid integers, duplicate keys, cross-slot rejection and binary
+values. CI runs both the cache and RESP module test suites with cache-server
+enabled. This is deterministic logical qualification, not a physical crash or
+power-loss test.
