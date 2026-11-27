@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Bounded RESP cache expiration sweeps — 2026-11-27
+- **Bound inspected expiration candidates per sweep**, including stale and future records. Preserve partially drained buckets across clock advances and rotate between eligible buckets; zero budget does no work. This does not yet cap total TTL metadata or wall-clock latency.
+
 ### Per-priority scheduler runnable backlog diagnostics — 2026-11-20
 - **Expose approximate queued High, Normal, and Low runnable task counts** in the existing scheduler metrics snapshot, including global injector and worker-local queues, without adding counters to scheduling hot paths.
 - **Regression tests cover mixed priority queues, dequeues, and metrics-counter reset.** Queue depths are sampled non-atomically for diagnostics only; they are not admission, fairness, or backpressure guarantees.
