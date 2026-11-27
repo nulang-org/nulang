@@ -247,6 +247,25 @@ impl IndexedSst {
         self.key_bytes
     }
 
+    /// Copy the already validated immutable file without sharing its inode.
+    /// The destination is an inactive generation; callers verify its digest
+    /// and publish its manifest reference only after successful sync.
+    #[cfg(unix)]
+    pub(super) fn copy_to(&mut self, path: &std::path::Path) -> io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        let count = io::copy(&mut (&mut self.file).take(self.file_bytes + 1), &mut out)?;
+        if count != self.file_bytes {
+            return Err(invalid("immutable SST changed during copy"));
+        }
+        out.sync_all()
+    }
+
     /// Materialize a single table into the existing MVCC representation.
     /// Used only by the guarded in-memory recovery candidate.
     #[cfg(unix)]

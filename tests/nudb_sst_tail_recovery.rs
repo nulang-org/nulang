@@ -607,3 +607,87 @@ fn nonzero_floor_format_rejects_zero_future_and_version_downgrade() {
         Some(1)
     );
 }
+
+#[test]
+fn successor_seals_repeat_reclamation_without_losing_history_or_receipts() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let old = db.commit_idempotent(id(1), vec![put(b"old")]).unwrap();
+    db.commit_idempotent(id(2), vec![put(b"anchor")]).unwrap();
+    let mut first = f.manifest();
+    db.flush_sst_shadow(&mut first, 2).unwrap();
+    db.seal_sst_recovery_at_floor(&mut first, 1).unwrap();
+    db.reclaim_to_sealed_sst(&first).unwrap();
+    let mut previous = first;
+    for cycle in 0..2u8 {
+        let base = db.current_sequence();
+        let tx = 3 + cycle * 2;
+        db.commit_idempotent(id(tx), vec![TabletMutation::Delete { key: b"k".to_vec() }])
+            .unwrap();
+        db.commit_idempotent(id(tx + 1), vec![put(b"new")]).unwrap();
+        let path = f.0.join(format!("successor-{cycle}"));
+        fs::create_dir(&path).unwrap();
+        let mut next = ManifestStore::create(&path, 7, 3).unwrap();
+        let wal = f.0.join("tablet.wal");
+        let before = fs::read(&wal).unwrap();
+        let pin = db.pin_snapshot(base - 1).unwrap();
+        assert!(db
+            .prepare_sst_successor(&previous, &mut next, base)
+            .is_err());
+        drop(pin);
+        db.prepare_sst_successor(&previous, &mut next, base)
+            .unwrap();
+        assert_eq!(fs::read(&wal).unwrap(), before);
+        assert_eq!(
+            db.oldest_retained_snapshot(),
+            previous.current().recovery_floor().unwrap()
+        );
+        assert_eq!(next.current().recovery_floor(), Some(base));
+        assert_eq!(next.recovered_read_at(b"k", base + 1).unwrap(), None);
+        let pin = db.pin_snapshot(base - 1).unwrap();
+        assert!(db.reclaim_to_sst_successor(&previous, &next).is_err());
+        drop(pin);
+        db.reclaim_to_sst_successor(&previous, &next).unwrap();
+        assert_eq!(fs::metadata(&wal).unwrap().len(), 96);
+        assert_eq!(db.oldest_retained_snapshot(), base);
+        assert_eq!(db.commit_idempotent(id(1), vec![put(b"old")]).unwrap(), old);
+        drop(previous);
+        drop(db);
+        drop(next);
+        db = WalBackedTablet::open_from_sealed_sst(f.descriptor(), &wal, &path).unwrap();
+        assert_eq!(db.current_sequence(), base + 2);
+        assert!(db.read_at(b"k", base - 1).is_err());
+        assert_eq!(db.read_at(b"k", base + 1).unwrap(), None);
+        assert_eq!(db.read_latest(b"k"), Some(b"new".as_slice()));
+        previous = ManifestStore::open(&path, 7, 3).unwrap();
+    }
+}
+
+#[test]
+fn successor_preparation_preserves_original_binding_and_stale_successor_is_rejected() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let first = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&first).unwrap();
+    db.commit_idempotent(id(2), vec![put(b"tail")]).unwrap();
+    let next_path = f.0.join("next");
+    fs::create_dir(&next_path).unwrap();
+    let mut next = ManifestStore::create(&next_path, 7, 3).unwrap();
+    db.prepare_sst_successor(&first, &mut next, 0).unwrap();
+    drop(db);
+    drop(first);
+    drop(next);
+    let wal = f.0.join("tablet.wal");
+    let before = fs::read(&wal).unwrap();
+    assert!(WalBackedTablet::open_from_sealed_sst(f.descriptor(), &wal, &next_path).is_err());
+    assert_eq!(fs::read(&wal).unwrap(), before);
+    let mut db = recover(&f).unwrap();
+    let first = ManifestStore::open(f.0.join("sst"), 7, 3).unwrap();
+    let next = ManifestStore::open(&next_path, 7, 3).unwrap();
+    db.commit_idempotent(id(3), vec![]).unwrap();
+    let before = fs::read(&wal).unwrap();
+    assert!(db.reclaim_to_sst_successor(&first, &next).is_err());
+    assert_eq!(fs::read(&wal).unwrap(), before);
+    db.commit_idempotent(id(4), vec![]).unwrap();
+}
