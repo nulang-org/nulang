@@ -447,6 +447,37 @@ impl WalBackedTablet {
         manifest.seal(meta)
     }
 
+    /// Diagnostic point read against the published shadow SST prefix.
+    /// No fallback or authoritative read routing. Compare both the exact
+    /// WAL mutation (including sequence and tombstone) and the live tablet.
+    #[cfg(unix)]
+    pub fn read_sst_shadow_at(
+        &self,
+        manifest: &super::sst_manifest::ManifestStore,
+        key: &[u8],
+        snapshot: u64,
+    ) -> std::io::Result<super::indexed_sst::DiskLookup> {
+        if self.recovery_required
+            || self.wal.is_poisoned()
+            || self.oldest_retained_snapshot() != 0
+            || self.wal.base_sequence() != 0
+            || self.wal.last_sequence() != self.current_sequence()
+        {
+            return Err(std::io::Error::other(
+                "shadow read requires recovered complete unpruned WAL",
+            ));
+        }
+        let live = self.read_at(key, snapshot).map_err(std::io::Error::other)?;
+        super::wal_sst_shadow::read_verified(
+            &self.wal,
+            self.descriptor(),
+            manifest,
+            key,
+            snapshot,
+            live,
+        )
+    }
+
     /// Atomically publish a checkpoint without reclaiming the WAL.
     ///
     /// This is a valid crash state and is intentionally public so operators can
