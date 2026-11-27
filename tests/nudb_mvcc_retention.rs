@@ -257,3 +257,76 @@ fn pruning_keeps_anchor_and_reinsert_history_but_removes_obsolete_versions() {
     drop(tablet);
     cleanup(&path);
 }
+
+#[test]
+fn retained_overlap_checks_floor_anchors_and_post_floor_versions() {
+    let path = temp_wal("retained_overlap");
+    let checkpoint = path.with_extension("checkpoint");
+    let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
+    commit(&mut tablet, vec![put(b"k", b"old"), put(b"gone", b"old")]);
+    commit(&mut tablet, vec![put(b"k", b"anchor"), delete(b"gone")]);
+    commit(&mut tablet, vec![put(b"m", b"floor")]);
+    commit(
+        &mut tablet,
+        vec![put(b"k", b"latest"), put(b"gone", b"new")],
+    );
+    let full = fs::read(&path).unwrap();
+    tablet.reclaim_history_before(3).unwrap();
+    drop(tablet);
+    // Recreate the crash state after the pruned checkpoint is published
+    // but before the old WAL is replaced.
+    fs::write(&path, &full).unwrap();
+    let good = fs::read(&checkpoint).unwrap();
+    let tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
+    assert_eq!(tablet.read_at(b"k", 3).unwrap(), Some(&b"anchor"[..]));
+    assert_eq!(tablet.read_at(b"gone", 3).unwrap(), None);
+    drop(tablet);
+    let len = u32::from_le_bytes(good[8..12].try_into().unwrap()) as usize;
+    let original: serde_json::Value = serde_json::from_slice(&good[12..12 + len]).unwrap();
+    for variant in 0..4 {
+        let mut disk = original.clone();
+        let rows = disk["state"]["rows"].as_array_mut().unwrap();
+        match variant {
+            0 => {
+                let row = rows
+                    .iter_mut()
+                    .find(|r| r["key"] == serde_json::json!(b"k"))
+                    .unwrap();
+                row["versions"][0]["value"] = serde_json::json!(b"wrong");
+            }
+            1 => {
+                let row = rows
+                    .iter_mut()
+                    .find(|r| r["key"] == serde_json::json!(b"k"))
+                    .unwrap();
+                row["versions"][1]["value"] = serde_json::json!(b"wrong");
+            }
+            2 => {
+                let row = rows
+                    .iter_mut()
+                    .find(|r| r["key"] == serde_json::json!(b"gone"))
+                    .unwrap();
+                row["versions"]
+                    .as_array_mut()
+                    .unwrap()
+                    .insert(0, serde_json::json!({"sequence":1,"value":[1]}));
+            }
+            _ => {
+                rows.push(serde_json::json!({"key":[120],"versions":[{"sequence":3,"value":[1]}]}));
+            }
+        }
+        let payload = serde_json::to_vec(&disk).unwrap();
+        let mut bytes = good[..8].to_vec();
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(blake3::hash(&payload).as_bytes());
+        fs::write(&checkpoint, &bytes).unwrap();
+        assert!(
+            WalBackedTablet::open(descriptor(), &path).is_err(),
+            "variant {variant} accepted"
+        );
+        assert_eq!(fs::read(&path).unwrap(), full);
+        assert_eq!(fs::read(&checkpoint).unwrap(), bytes);
+    }
+    cleanup(&path);
+}
