@@ -107,14 +107,17 @@ fn interval(records: &[WalRecord], min: u64, max: u64) -> io::Result<&[WalRecord
         .ok_or_else(|| invalid("manifest interval outside complete WAL"))
 }
 
-pub(super) fn flush(
+/// Audit the entire overlapping complete WAL prefix without publishing.
+pub(super) fn verify_prefix(
     wal: &FileWal,
     descriptor: &TabletDescriptor,
-    manifest: &mut ManifestStore,
-    max_records: usize,
-) -> io::Result<Option<TableEntry>> {
-    if !(1..=MAX_RECORDS).contains(&max_records) {
-        return Err(invalid("shadow record limit must be between 1 and 64"));
+    manifest: &ManifestStore,
+) -> io::Result<()> {
+    if wal.is_poisoned()
+        || wal.base_sequence() != 0
+        || manifest.current().durable_sequence() > wal.last_sequence()
+    {
+        return Err(invalid("manifest requires a complete overlapping WAL"));
     }
     if manifest.requires_reopen()
         || manifest.current().tablet_id() != descriptor.id().get()
@@ -132,6 +135,20 @@ pub(super) fn flush(
         let mut table = manifest.open_verified_table(entry)?;
         verify(&mut table, entry.generation(), batch, &rows)?;
     }
+    Ok(())
+}
+
+pub(super) fn flush(
+    wal: &FileWal,
+    descriptor: &TabletDescriptor,
+    manifest: &mut ManifestStore,
+    max_records: usize,
+) -> io::Result<Option<TableEntry>> {
+    if !(1..=MAX_RECORDS).contains(&max_records) {
+        return Err(invalid("shadow record limit must be between 1 and 64"));
+    }
+    verify_prefix(wal, descriptor, manifest)?;
+    let records = wal.records();
     let start = usize::try_from(manifest.current().durable_sequence())
         .map_err(|_| invalid("manifest sequence overflow"))?;
     let pending = records

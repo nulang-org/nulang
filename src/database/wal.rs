@@ -224,12 +224,22 @@ pub struct FileWal {
 
 impl FileWal {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WalError> {
-        let requested_path = path.as_ref();
+        Self::open_with_mode(path.as_ref(), false)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn open_existing(path: &Path) -> Result<Self, WalError> {
+        Self::open_with_mode(path, true)
+    }
+
+    fn open_with_mode(requested_path: &Path, require_existing: bool) -> Result<Self, WalError> {
         let parent = requested_path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent)?;
+        if !require_existing {
+            fs::create_dir_all(parent)?;
+        }
 
         // Canonicalize the parent so lexical aliases share a lock, while
         // refusing symlink/hardlink aliases to the WAL or its lock file.
@@ -251,6 +261,12 @@ impl FileWal {
             std::fs::TryLockError::WouldBlock => WalError::WriterLocked,
             std::fs::TryLockError::Error(error) => WalError::from(error),
         })?;
+        if require_existing {
+            let metadata = fs::symlink_metadata(&path)?;
+            if !metadata.is_file() || metadata.len() < WAL_HEADER_BYTES as u64 {
+                return Err(WalError::InvalidHeader);
+            }
+        }
         Self::open_locked(path, Arc::new(lock))
     }
 

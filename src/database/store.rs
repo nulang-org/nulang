@@ -71,6 +71,48 @@ impl WalBackedTablet {
         })
     }
 
+    /// Explicitly recover a live in-memory tablet from a sealed SST prefix
+    /// plus the complete existing WAL. Verify every overlapping mutation and
+    /// receipt before replaying the tail. Refuses existing checkpoints and
+    /// compacted WALs: their retention or lineage cannot yet be reconciled
+    /// with the seal. Does not enable SST-based WAL reclamation.
+    #[cfg(unix)]
+    pub fn open_from_sealed_sst(
+        descriptor: TabletDescriptor,
+        wal_path: impl AsRef<Path>,
+        manifest_dir: impl AsRef<Path>,
+    ) -> std::io::Result<Self> {
+        use std::io;
+        let invalid = |reason: &'static str| io::Error::new(io::ErrorKind::InvalidData, reason);
+        let wal = FileWal::open_existing(wal_path.as_ref())
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let checkpoint_path = checkpoint::checkpoint_path_for_wal(wal.path());
+        match std::fs::symlink_metadata(&checkpoint_path) {
+            Ok(_) => return Err(invalid("existing checkpoint requires normal recovery")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let manifest = super::sst_manifest::ManifestStore::open(
+            manifest_dir,
+            descriptor.id().get(),
+            descriptor.ownership_epoch(),
+        )?;
+        if manifest.current().recovery_descriptor() != Some(&descriptor) {
+            return Err(invalid("sealed recovery descriptor mismatch"));
+        }
+        super::wal_sst_shadow::verify_prefix(&wal, &descriptor, &manifest)?;
+        let mut tablet = manifest.restore_memory_tablet()?;
+        wal.replay_after_checkpoint(&mut tablet)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        Ok(Self {
+            tablet,
+            wal,
+            checkpoint_path,
+            snapshot_pins: BTreeMap::new(),
+            recovery_required: false,
+        })
+    }
+
     pub fn descriptor(&self) -> &TabletDescriptor {
         self.tablet.descriptor()
     }
