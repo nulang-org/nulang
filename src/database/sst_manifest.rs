@@ -3,9 +3,12 @@
 //! One cooperative writer owns the directory; the manifest, not directory
 //! discovery, selects authoritative tables. This is a Unix-only primitive
 //! in a trusted local directory. No WAL reclamation, snapshot-floor,
-//! receipt persistence, compaction, or live tablet integration is implied.
+//! compaction, or live tablet integration is implied. A v2 sealed manifest
+//! additionally records a read-only recovery snapshot.
 
-use super::indexed_sst::IndexedSst;
+use super::indexed_sst::{DiskLookup, IndexedSst};
+use super::sst_recovery_meta::{RecoveryMeta, MAX_META_BYTES};
+use super::tablet::{TabletDescriptor, TransactionId, TransactionReceipt};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::MetadataExt;
@@ -16,7 +19,7 @@ const MAGIC: &[u8; 8] = b"NUDBMAN1";
 const MAX_ENTRIES: usize = 1024;
 const HEADER_BYTES: usize = 34;
 const ENTRY_BYTES: usize = 64;
-const MAX_BYTES: usize = HEADER_BYTES + ENTRY_BYTES * MAX_ENTRIES + 32;
+const MAX_BYTES: usize = HEADER_BYTES + ENTRY_BYTES * MAX_ENTRIES + MAX_META_BYTES + 32;
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 fn invalid(reason: &'static str) -> io::Error {
@@ -86,6 +89,7 @@ pub struct Manifest {
     tablet_id: u64,
     epoch: u64,
     entries: Vec<TableEntry>,
+    recovery: Option<RecoveryMeta>,
 }
 impl Manifest {
     pub fn empty(tablet_id: u64, epoch: u64) -> io::Result<Self> {
@@ -96,6 +100,7 @@ impl Manifest {
             tablet_id,
             epoch,
             entries: Vec::new(),
+            recovery: None,
         })
     }
     pub fn tablet_id(&self) -> u64 {
@@ -110,7 +115,19 @@ impl Manifest {
     pub fn durable_sequence(&self) -> u64 {
         self.entries.last().map_or(0, |e| e.max_sequence)
     }
+    pub fn is_recovery_sealed(&self) -> bool {
+        self.recovery.is_some()
+    }
+    pub fn recovery_descriptor(&self) -> Option<&TabletDescriptor> {
+        self.recovery.as_ref().map(|meta| &meta.descriptor)
+    }
+    pub fn recovery_floor(&self) -> Option<u64> {
+        self.recovery.as_ref().map(|meta| meta.floor)
+    }
     fn push(&mut self, entry: TableEntry) -> io::Result<()> {
+        if self.recovery.is_some() {
+            return Err(invalid("sealed manifest cannot append"));
+        }
         if self.entries.len() >= MAX_ENTRIES {
             return Err(invalid("manifest entry limit exceeded"));
         }
@@ -133,7 +150,8 @@ impl Manifest {
     fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(HEADER_BYTES + ENTRY_BYTES * self.entries.len() + 32);
         bytes.extend_from_slice(MAGIC);
-        bytes.extend_from_slice(&1u16.to_le_bytes());
+        let version: u16 = if self.recovery.is_some() { 2 } else { 1 };
+        bytes.extend_from_slice(&version.to_le_bytes());
         for n in [self.tablet_id, self.epoch, self.entries.len() as u64] {
             bytes.extend_from_slice(&n.to_le_bytes());
         }
@@ -143,17 +161,20 @@ impl Manifest {
             }
             bytes.extend_from_slice(&e.checksum);
         }
+        if let Some(meta) = &self.recovery {
+            meta.encode(&mut bytes);
+        }
         let hash = blake3::hash(&bytes);
         bytes.extend_from_slice(hash.as_bytes());
         bytes
     }
     fn decode(bytes: &[u8]) -> io::Result<Self> {
-        if bytes.len() < HEADER_BYTES + 32
-            || bytes.len() > MAX_BYTES
-            || &bytes[..8] != MAGIC
-            || bytes[8..10] != 1u16.to_le_bytes()
-        {
+        if bytes.len() < HEADER_BYTES + 32 || bytes.len() > MAX_BYTES || &bytes[..8] != MAGIC {
             return Err(invalid("unsupported or malformed manifest"));
+        }
+        let version = u16::from_le_bytes(bytes[8..10].try_into().expect("fixed version"));
+        if !matches!(version, 1 | 2) {
+            return Err(invalid("unsupported manifest version"));
         }
         let (body, hash) = bytes.split_at(bytes.len() - 32);
         if blake3::hash(body).as_bytes() != hash {
@@ -167,11 +188,15 @@ impl Manifest {
             )
         };
         let count = read(body, 26);
-        if count > MAX_ENTRIES as u64 || body.len() != HEADER_BYTES + ENTRY_BYTES * count as usize {
+        if count > MAX_ENTRIES as u64 {
+            return Err(invalid("manifest count limit"));
+        }
+        let end = HEADER_BYTES + ENTRY_BYTES * count as usize;
+        if body.len() < end || (version == 1 && body.len() != end) {
             return Err(invalid("manifest count or length mismatch"));
         }
         let mut manifest = Self::empty(read(body, 10), read(body, 18))?;
-        for record in body[HEADER_BYTES..].chunks_exact(ENTRY_BYTES) {
+        for record in body[HEADER_BYTES..end].chunks_exact(ENTRY_BYTES) {
             manifest.push(TableEntry {
                 generation: read(record, 0),
                 min_sequence: read(record, 8),
@@ -179,6 +204,14 @@ impl Manifest {
                 file_bytes: read(record, 24),
                 checksum: record[32..64].try_into().expect("fixed checksum"),
             })?;
+        }
+        if version == 2 {
+            manifest.recovery = Some(RecoveryMeta::decode(
+                &body[end..],
+                manifest.tablet_id,
+                manifest.epoch,
+                manifest.durable_sequence(),
+            )?);
         }
         Ok(manifest)
     }
@@ -317,17 +350,16 @@ impl ManifestStore {
         if manifest.tablet_id != tablet_id || manifest.epoch != epoch {
             return Err(invalid("manifest tablet identity or epoch mismatch"));
         }
-        for entry in &manifest.entries {
-            if TableEntry::inspect(&dir, entry.generation)? != *entry {
-                return Err(invalid("manifest table identity mismatch"));
-            }
-        }
-        Ok(Self {
+        let store = Self {
             dir,
             _lock: lock,
             manifest,
             requires_reopen: false,
-        })
+        };
+        for entry in &store.manifest.entries {
+            store.open_verified_table(entry)?;
+        }
+        Ok(store)
     }
     /// Last acknowledged manifest, not authoritative after an ambiguous error.
     pub fn current(&self) -> &Manifest {
@@ -350,7 +382,78 @@ impl ManifestStore {
         {
             return Err(invalid("manifest table identity mismatch"));
         }
+        if let Some(descriptor) = self.manifest.recovery_descriptor() {
+            if !table.keys_within(descriptor.range()) {
+                return Err(invalid("SST outside sealed key range"));
+            }
+        }
         Ok(table)
+    }
+    /// Reads only a sealed, immutable recovery snapshot, never the live WAL tail.
+    pub fn recovered_read_at(&self, key: &[u8], snapshot: u64) -> io::Result<Option<Vec<u8>>> {
+        let meta = self.recovery_meta()?;
+        if snapshot < meta.floor
+            || snapshot > self.manifest.durable_sequence()
+            || !meta.descriptor.range().contains(key)
+        {
+            return Err(invalid("snapshot or key outside sealed recovery state"));
+        }
+        for entry in self.manifest.entries.iter().rev() {
+            if entry.min_sequence > snapshot {
+                continue;
+            }
+            match self.open_verified_table(entry)?.read_at(key, snapshot)? {
+                DiskLookup::Missing => {}
+                DiskLookup::Deleted { .. } => return Ok(None),
+                DiskLookup::Value { value, .. } => return Ok(Some(value)),
+            }
+        }
+        Ok(None)
+    }
+    pub fn recovered_receipt(&self, id: TransactionId) -> io::Result<Option<TransactionReceipt>> {
+        Ok(self.recovery_meta()?.receipts.get(&id).copied())
+    }
+    fn recovery_meta(&self) -> io::Result<&RecoveryMeta> {
+        if self.requires_reopen {
+            return Err(io::Error::other("manifest publication requires reopen"));
+        }
+        self.manifest
+            .recovery
+            .as_ref()
+            .ok_or_else(|| invalid("manifest is not recovery sealed"))
+    }
+    pub(super) fn seal(&mut self, meta: RecoveryMeta) -> io::Result<()> {
+        self.seal_with_hook(meta, |_| Ok(()))
+    }
+    fn seal_with_hook(
+        &mut self,
+        meta: RecoveryMeta,
+        hook: impl FnMut(Phase) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if self.requires_reopen {
+            return Err(io::Error::other("manifest publication requires reopen"));
+        }
+        if meta.descriptor.id().get() != self.manifest.tablet_id
+            || meta.descriptor.ownership_epoch() != self.manifest.epoch
+        {
+            return Err(invalid("recovery metadata identity mismatch"));
+        }
+        meta.validate(self.manifest.durable_sequence())?;
+        if let Some(existing) = &self.manifest.recovery {
+            return if existing == &meta {
+                Ok(())
+            } else {
+                Err(invalid("sealed metadata is immutable"))
+            };
+        }
+        let mut next = self.manifest.clone();
+        next.recovery = Some(meta);
+        if let Err(error) = publish(&self.dir, &next, false, hook) {
+            self.requires_reopen = true;
+            return Err(error);
+        }
+        self.manifest = next;
+        Ok(())
     }
     pub fn append(&mut self, entry: TableEntry) -> io::Result<()> {
         self.append_with_hook(entry, |_| Ok(()))
@@ -429,6 +532,57 @@ mod tests {
                 reopened.append(entry).unwrap();
             }
             assert_eq!(reopened.current().durable_sequence(), 2);
+            drop(reopened);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod seal_tests {
+    use super::*;
+    use crate::database::tablet::{KeyRange, TabletId};
+    #[test]
+    fn seal_interruption_preserves_unsealed_or_complete_metadata() {
+        for point in [
+            Phase::Write,
+            Phase::FileSync,
+            Phase::Rename,
+            Phase::DirectorySync,
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "nudb-seal-fault-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&dir).unwrap();
+            let mut store = ManifestStore::create(&dir, 7, 3).unwrap();
+            let descriptor = TabletDescriptor::new(
+                TabletId::new(7).unwrap(),
+                KeyRange::new(b"a".to_vec(), None).unwrap(),
+                3,
+            )
+            .unwrap();
+            let meta = RecoveryMeta::new(descriptor.clone(), 0, 0, std::iter::empty()).unwrap();
+            assert!(store
+                .seal_with_hook(meta.clone(), |phase| if phase == point {
+                    Err(io::Error::other("injected seal interruption"))
+                } else {
+                    Ok(())
+                })
+                .is_err());
+            assert!(store.requires_reopen());
+            assert!(store.recovered_read_at(b"a", 0).is_err());
+            assert!(store.seal(meta.clone()).is_err());
+            drop(store);
+            let mut reopened = ManifestStore::open(&dir, 7, 3).unwrap();
+            if matches!(point, Phase::Write | Phase::FileSync) {
+                assert!(!reopened.current().is_recovery_sealed());
+                reopened.seal(meta).unwrap();
+            }
+            assert_eq!(reopened.current().recovery_descriptor(), Some(&descriptor));
+            assert_eq!(reopened.current().recovery_floor(), Some(0));
+            assert_eq!(reopened.recovered_read_at(b"a", 0).unwrap(), None);
             drop(reopened);
             fs::remove_dir_all(dir).unwrap();
         }
