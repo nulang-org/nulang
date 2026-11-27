@@ -1,12 +1,12 @@
 //! Single-owner native durable cache. Mutation records contain after-images
 //! with absolute Unix deadlines, never process-relative timestamps.
-//! The network reactor remains memory-only until it adopts this owner.
+//! Optional durable reactors use this owner; memory mode bypasses it.
 
 use super::cache::{
     parse_cache_integer, CacheAdmissionError, CacheIncrementError, CacheLimits, CacheStore,
     CacheTtl, CacheValueView,
 };
-use super::cache_wal::{CacheWal, WalLimits, WalSync};
+use super::cache_wal::{CacheWal, CheckpointReport, WalLimits, WalSync};
 use std::io;
 use std::path::Path;
 
@@ -317,6 +317,28 @@ impl DurableCache {
             poisoned: false,
         })
     }
+    /// Publish a complete snapshot as the new journal prefix, then continue
+    /// appending to it. One entry is encoded at a time; no whole-cache clone.
+    pub fn checkpoint(&mut self, time: CacheTime) -> Result<CheckpointReport, DurableError> {
+        self.healthy()?;
+        let entries = self.store.checkpoint_entries(time.monotonic_ms).count() as u64;
+        let store = &self.store;
+        let max_record = self.limits.max_record_bytes;
+        let report = self.wal.rotate(entries, |replacement| {
+            for (key, value, ttl) in store.checkpoint_entries(time.monotonic_ms) {
+                let deadline = absolute(ttl, time).map_err(io::Error::other)?;
+                let record = match value {
+                    CacheValueView::Bytes(bytes) => Mutation::Bytes(key, bytes, deadline),
+                    CacheValueView::Integer(value) => Mutation::Integer(key, value, deadline),
+                };
+                let payload = encode(&record, max_record)?;
+                replacement.append(&payload, WalSync::Buffered)?;
+            }
+            Ok(())
+        })?;
+        Ok(report)
+    }
+
     pub fn is_poisoned(&self) -> bool {
         self.poisoned || self.wal.is_poisoned()
     }
@@ -732,5 +754,89 @@ mod tests {
             Some(CacheValueView::Bytes(b"+1"))
         );
         assert_eq!(std::fs::read(tmp.path()).unwrap(), original);
+    }
+
+    #[test]
+    fn test_checkpoint_reclaims_history_and_preserves_typed_live_values() {
+        let tmp = Temp::new();
+        let mut cache = tmp.open(time(0, 1000));
+        for n in 0..100 {
+            cache
+                .set_bytes(b"hot", n.to_string().as_bytes(), None, time(n, 1000 + n))
+                .unwrap();
+        }
+        cache
+            .set_bytes(b"n", b"41", Some(1000), time(100, 1100))
+            .unwrap();
+        cache.increment(b"n", 1, time(100, 1100)).unwrap();
+        cache
+            .set_bytes(b"expired", b"old", Some(1), time(100, 1100))
+            .unwrap();
+        cache
+            .set_bytes(b"gone", b"old", None, time(100, 1100))
+            .unwrap();
+        cache.delete_many(&[b"gone"], time(100, 1100)).unwrap();
+        let before = std::fs::metadata(tmp.path()).unwrap().len();
+        let sequence = cache.last_sequence();
+        let report = cache.checkpoint(time(200, 1200)).unwrap();
+        assert_eq!(report.entries, 2);
+        assert!(report.after_bytes < before / 10);
+        assert!(cache.last_sequence() >= sequence);
+        cache
+            .set_bytes(b"later", b"yes", None, time(201, 1201))
+            .unwrap();
+        drop(cache);
+        let mut recovered = tmp.open(time(0, 1300));
+        assert_eq!(
+            recovered.get(b"hot", 0).unwrap(),
+            Some(CacheValueView::Bytes(b"99"))
+        );
+        assert_eq!(
+            recovered.get(b"n", 0).unwrap(),
+            Some(CacheValueView::Integer(42))
+        );
+        assert_eq!(recovered.ttl(b"n", 0).unwrap(), CacheTtl::RemainingMs(800));
+        assert_eq!(
+            recovered.get(b"later", 0).unwrap(),
+            Some(CacheValueView::Bytes(b"yes"))
+        );
+        assert_eq!(recovered.get(b"expired", 0).unwrap(), None);
+        assert_eq!(recovered.get(b"gone", 0).unwrap(), None);
+    }
+
+    #[test]
+    fn test_checkpoint_recovers_capacity_after_journal_fills() {
+        let tmp = Temp::new();
+        let limits = WalLimits {
+            max_record_bytes: 128,
+            max_file_bytes: 240,
+        };
+        let mut cache = DurableCache::open(
+            tmp.path(),
+            CacheLimits::default(),
+            limits,
+            WalSync::Data,
+            time(0, 100),
+        )
+        .unwrap();
+        for _ in 0..3 {
+            cache.set_bytes(b"k", b"v", None, time(0, 100)).unwrap();
+        }
+        assert!(cache.set_bytes(b"k", b"more", None, time(0, 100)).is_err());
+        cache.checkpoint(time(0, 100)).unwrap();
+        cache.set_bytes(b"k", b"more", None, time(0, 100)).unwrap();
+        drop(cache);
+        let mut recovered = DurableCache::open(
+            tmp.path(),
+            CacheLimits::default(),
+            limits,
+            WalSync::Data,
+            time(0, 100),
+        )
+        .unwrap();
+        assert_eq!(
+            recovered.get(b"k", 0).unwrap(),
+            Some(CacheValueView::Bytes(b"more"))
+        );
     }
 }

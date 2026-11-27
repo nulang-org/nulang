@@ -2,14 +2,18 @@
 //!
 //! Each opaque payload is one atomic logical record. The caller must validate
 //! and encode mutations before appending, and must not publish recovered state
-//! until open succeeds. No cache mutation path is wired to this module yet.
+//! until open succeeds. Compaction publishes a complete checkpoint journal atomically.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAGIC: &[u8; 8] = b"NLCWAL02";
 const HEADER_BYTES: usize = MAGIC.len();
+const CHECKPOINT_MAGIC: &[u8; 8] = b"NLCWAL03";
+const CHECKPOINT_HEADER_BYTES: usize = 8 + 8 + 8 + 32;
+
 const RECORD_HEADER_BYTES: usize = 16;
 const CHECKSUM_BYTES: usize = 32;
 
@@ -39,6 +43,8 @@ pub enum WalSync {
 #[derive(Debug)]
 pub struct CacheWal {
     file: File,
+    path: PathBuf,
+    lock: File,
     limits: WalLimits,
     last_sequence: u64,
     valid_len: u64,
@@ -56,6 +62,36 @@ fn checksum(header: &[u8; RECORD_HEADER_BYTES], payload: &[u8]) -> [u8; CHECKSUM
     hasher.update(header);
     hasher.update(payload);
     *hasher.finalize().as_bytes()
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+fn checkpoint_header(base: u64, count: u64) -> [u8; CHECKPOINT_HEADER_BYTES] {
+    let mut header = [0; CHECKPOINT_HEADER_BYTES];
+    header[..8].copy_from_slice(CHECKPOINT_MAGIC);
+    header[8..16].copy_from_slice(&base.to_le_bytes());
+    header[16..24].copy_from_slice(&count.to_le_bytes());
+    let digest = blake3::hash(&header[..24]);
+    header[24..].copy_from_slice(digest.as_bytes());
+    header
+}
+
+struct TemporaryJournal(PathBuf);
+impl Drop for TemporaryJournal {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointReport {
+    pub entries: u64,
+    pub before_bytes: u64,
+    pub after_bytes: u64,
 }
 
 impl CacheWal {
@@ -78,6 +114,17 @@ impl CacheWal {
             ));
         }
         let path = path.as_ref();
+        // Stable advisory lock survives journal inode replacement. Never
+        // unlink this sidecar while any cooperating writer may be active.
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)?;
+        lock.try_lock().map_err(io::Error::other)?;
         let (mut file, created) = match OpenOptions::new()
             .read(true)
             .write(true)
@@ -97,11 +144,7 @@ impl CacheWal {
         }
         // Sync the directory entry as well as the journal contents, including
         // a retry after an earlier failed creation sync.
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        File::open(parent)?.sync_all()?;
+        File::open(parent_dir(path))?.sync_all()?;
         let length = file.metadata()?.len();
         if length < HEADER_BYTES as u64 || length > limits.max_file_bytes {
             return Err(invalid("cache WAL file length outside limits"));
@@ -109,12 +152,22 @@ impl CacheWal {
         file.seek(SeekFrom::Start(0))?;
         let mut magic = [0; HEADER_BYTES];
         file.read_exact(&mut magic)?;
-        if &magic != MAGIC {
+        let (mut position, mut last_sequence, mut required_records) = if &magic == MAGIC {
+            (HEADER_BYTES as u64, 0u64, 0u64)
+        } else if &magic == CHECKPOINT_MAGIC {
+            let mut rest = [0; CHECKPOINT_HEADER_BYTES - HEADER_BYTES];
+            file.read_exact(&mut rest)?;
+            let base = u64::from_le_bytes(rest[..8].try_into().unwrap());
+            let count = u64::from_le_bytes(rest[8..16].try_into().unwrap());
+            if rest[16..] != checkpoint_header(base, count)[24..]
+                || base.checked_add(count).is_none()
+            {
+                return Err(invalid("invalid cache checkpoint header"));
+            }
+            (CHECKPOINT_HEADER_BYTES as u64, base, count)
+        } else {
             return Err(invalid("unsupported cache WAL magic/version"));
-        }
-
-        let mut position = HEADER_BYTES as u64;
-        let mut last_sequence = 0u64;
+        };
         let mut payload = Vec::new();
         while length - position >= RECORD_HEADER_BYTES as u64 {
             let mut header = [0; RECORD_HEADER_BYTES];
@@ -146,8 +199,14 @@ impl CacheWal {
             on_record(seq, &payload)?;
             position += total;
             last_sequence = seq;
+            required_records = required_records.saturating_sub(1);
         }
 
+        // A checkpoint is a complete required prefix. Never treat missing
+        // snapshot entries as a repairable torn append.
+        if required_records != 0 {
+            return Err(invalid("incomplete cache checkpoint"));
+        }
         if position != length {
             file.set_len(position)?;
             file.sync_all()?;
@@ -155,6 +214,8 @@ impl CacheWal {
         file.seek(SeekFrom::Start(position))?;
         Ok(Self {
             file,
+            path: path.to_path_buf(),
+            lock,
             limits,
             last_sequence,
             valid_len: position,
@@ -162,6 +223,88 @@ impl CacheWal {
             #[cfg(all(test, feature = "cache-server"))]
             fail_next_append: false,
         })
+    }
+
+    /// Write a complete checkpoint to a private sibling file, sync it, then
+    /// atomically replace the old journal. The stable sidecar lock remains
+    /// held across replacement. The callback may only append snapshot records.
+    pub(super) fn rotate(
+        &mut self,
+        entries: u64,
+        populate: impl FnOnce(&mut CacheWal) -> io::Result<()>,
+    ) -> io::Result<CheckpointReport> {
+        self.rotate_with(entries, populate, |_| Ok(()))
+    }
+
+    fn rotate_with(
+        &mut self,
+        entries: u64,
+        populate: impl FnOnce(&mut CacheWal) -> io::Result<()>,
+        boundary: impl Fn(bool) -> io::Result<()>,
+    ) -> io::Result<CheckpointReport> {
+        if self.poisoned {
+            return Err(io::Error::other("cache WAL poisoned"));
+        }
+        if self.limits.max_file_bytes < CHECKPOINT_HEADER_BYTES as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "checkpoint header exceeds WAL limit",
+            ));
+        }
+        let expected = self
+            .last_sequence
+            .checked_add(entries)
+            .ok_or_else(|| invalid("checkpoint sequence exhausted"))?;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = parent_dir(&self.path);
+        let directory = File::open(parent)?;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let temp_path = parent.join(format!(
+            ".nulang-checkpoint-{}-{nonce}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        let temp = TemporaryJournal(temp_path);
+        file.try_lock().map_err(io::Error::other)?;
+        file.write_all(&checkpoint_header(self.last_sequence, entries))?;
+        let mut replacement = CacheWal {
+            file,
+            path: self.path.clone(),
+            lock: self.lock.try_clone()?,
+            limits: self.limits,
+            last_sequence: self.last_sequence,
+            valid_len: CHECKPOINT_HEADER_BYTES as u64,
+            poisoned: false,
+            #[cfg(all(test, feature = "cache-server"))]
+            fail_next_append: false,
+        };
+        populate(&mut replacement)?;
+        if replacement.poisoned || replacement.last_sequence != expected {
+            return Err(invalid("checkpoint entry count mismatch"));
+        }
+        replacement.file.sync_all()?;
+        boundary(false)?;
+        let report = CheckpointReport {
+            entries,
+            before_bytes: self.valid_len,
+            after_bytes: replacement.valid_len,
+        };
+        // From here on failure is ambiguous, so the original handle must
+        // never resume appending to a potentially unlinked inode.
+        self.poisoned = true;
+        std::fs::rename(&temp.0, &self.path)?;
+        boundary(true)?;
+        directory.sync_all()?;
+        *self = replacement;
+        Ok(report)
     }
 
     pub fn last_sequence(&self) -> u64 {
@@ -449,5 +592,129 @@ mod tests {
         })
         .is_err());
         assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn test_checkpoint_publication_boundaries_and_stable_lock() {
+        let temp = Temp::new();
+        let path = temp.file();
+        let mut wal = CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).unwrap();
+        wal.append(b"old", WalSync::Data).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let before = wal.rotate_with(
+            1,
+            |new| {
+                new.append(b"snapshot", WalSync::Buffered)?;
+                Ok(())
+            },
+            |published| {
+                if !published {
+                    Err(io::Error::other("injected failure before rename"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(before.is_err());
+        assert!(!wal.is_poisoned());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        wal.append(b"continued", WalSync::Data).unwrap();
+        let after = wal.rotate_with(
+            1,
+            |new| {
+                new.append(b"snapshot", WalSync::Buffered)?;
+                Ok(())
+            },
+            |published| {
+                if published {
+                    Err(io::Error::other("injected failure after rename"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(after.is_err());
+        assert!(wal.is_poisoned());
+        assert!(wal.append(b"unsafe", WalSync::Data).is_err());
+        assert!(CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).is_err());
+        drop(wal);
+        let mut records = Vec::new();
+        let mut recovered = CacheWal::open(&path, WalLimits::default(), |seq, payload| {
+            records.push((seq, payload.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(records, [(3, b"snapshot".to_vec())]);
+        assert_eq!(recovered.append(b"new", WalSync::Data).unwrap(), 4);
+    }
+
+    #[test]
+    fn test_checkpoint_required_prefix_is_not_repaired_as_torn_tail() {
+        let temp = Temp::new();
+        let path = temp.file();
+        let mut wal = CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).unwrap();
+        wal.rotate(2, |new| {
+            new.append(b"one", WalSync::Buffered)?;
+            new.append(b"two", WalSync::Buffered)?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).is_err());
+        let snapshot = std::fs::read(&path).unwrap();
+        wal.append(b"later", WalSync::Data).unwrap();
+        let extended = std::fs::read(&path).unwrap();
+        drop(wal);
+        for cut in 0..snapshot.len() {
+            std::fs::write(&path, &snapshot[..cut]).unwrap();
+            assert!(
+                CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).is_err(),
+                "cut {cut}"
+            );
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), cut as u64);
+        }
+        for cut in snapshot.len()..extended.len() {
+            std::fs::write(&path, &extended[..cut]).unwrap();
+            let mut seen = Vec::new();
+            let recovered = CacheWal::open(&path, WalLimits::default(), |seq, _| {
+                seen.push(seq);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(seen, [1, 2]);
+            assert_eq!(recovered.last_sequence(), 2);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().len(),
+                snapshot.len() as u64
+            );
+        }
+    }
+
+    #[test]
+    fn test_checkpoint_count_or_capacity_mismatch_preserves_original() {
+        let temp = Temp::new();
+        let path = temp.file();
+        let limits = WalLimits {
+            max_record_bytes: 8,
+            max_file_bytes: 120,
+        };
+        let mut wal = CacheWal::open(&path, limits, |_, _| Ok(())).unwrap();
+        wal.append(b"old", WalSync::Data).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        assert!(wal
+            .rotate(2, |new| {
+                new.append(b"first", WalSync::Buffered)?;
+                Ok(())
+            })
+            .is_err());
+        assert!(wal
+            .rotate(2, |new| {
+                new.append(b"first", WalSync::Buffered)?;
+                new.append(b"second", WalSync::Buffered)?;
+                Ok(())
+            })
+            .is_err());
+        assert!(!wal.is_poisoned());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(wal.last_sequence(), 1);
     }
 }

@@ -946,6 +946,28 @@ impl CacheStore {
         expired
     }
 
+    /// Iterate live entries without copying values or mutating the cache.
+    #[cfg(unix)]
+    pub(super) fn checkpoint_entries(
+        &self,
+        now_ms: u64,
+    ) -> impl Iterator<Item = (&[u8], CacheValueView<'_>, Option<u64>)> + '_ {
+        self.slots.iter().filter_map(move |slot| {
+            let entry = slot.entry.as_ref()?;
+            if entry
+                .expires_at_ms
+                .is_some_and(|deadline| deadline <= now_ms)
+            {
+                return None;
+            }
+            Some((
+                entry.key.as_slice(&self.arena),
+                entry.value.view(&self.arena),
+                entry.expires_at_ms.map(|deadline| deadline - now_ms),
+            ))
+        })
+    }
+
     pub fn len(&self) -> usize {
         self.index_len
     }

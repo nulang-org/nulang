@@ -297,8 +297,7 @@ Record/file admission failures happen before I/O and do not poison the handle.
 Use a trusted private journal directory; advisory locks do not protect against
 non-cooperating writers or external file replacement. The journal itself does not interpret mutations. The native coordinator below
 supplies mutation encoding, TTL translation and a write-before-publication
-boundary. Snapshot/rotation, replication and physical
-power-loss qualification remain pending.
+boundary. Replication and physical power-loss qualification remain pending.
 
 
 ## Native durable mutation coordinator (Unix)
@@ -322,7 +321,7 @@ Callers must supply coherent monotonic/Unix clock pairs. Wall-clock rollback
 can extend or resurrect expired values; clock regression policy is not yet
 enforced. Recovery may fail closed if historical replay or arena fragmentation
 exceeds admission limits, even when the final logical data set would fit.
-There is no snapshot or rotation yet.
+Explicit checkpoints can now compact historical replay as described below.
 
 Rejected admission/size/disk-limit requests leave logical data and the
 journal unchanged (read-side lazy expiry and counters may still advance).
@@ -335,7 +334,7 @@ This first implementation prioritizes correctness over copy minimization:
 EXPIRE records duplicate the value and may be conservatively rejected by
 arena or journal limits; mutation encoding allocates bounded scratch space.
 The reactor integration below provides optional durability and shard-wide
-fail-stop behavior. Group commit, snapshots/rotation, cross-restart clock
+fail-stop behavior. Group commit, cross-restart clock
 regression handling and physical crash qualification remain separate tasks.
 
 
@@ -368,6 +367,41 @@ journal-capacity failures return a RESP error without shutting down the
 shard. The outcome of a write whose acknowledgement was lost is ambiguous.
 
 Synchronized journal writes block the owning reactor; there is no group
-commit, snapshot/rotation or production power-loss qualification yet.
+commit or production power-loss qualification yet.
 This mode is opt-in. Benchmark the memory and journal modes separately
 before selecting a deployment policy.
+
+
+## Atomic checkpoint and journal rotation (Unix)
+
+DurableCache::checkpoint and CacheShardServer::checkpoint explicitly compact
+the journal on the owning thread. The cache enumerates live entries with
+borrowed keys and typed values, omits expired/deleted entries, and preserves
+absolute deadlines. It writes one bounded after-image per live entry to a
+private sibling journal, without cloning the complete data set. The replacement
+uses NLCWAL03: a checksummed header declares a base sequence and the required
+snapshot-record count. Existing NLCWAL02 journals remain readable; checkpoint
+records consume sequence numbers and subsequent writes continue monotonically.
+
+Publication orders complete replacement writes, replacement file sync,
+atomic rename over the existing journal, then parent-directory sync. The
+original file is untouched before rename. A stable path-based advisory
+sidecar lock remains held across inode replacement; never delete the
+sidecar while any writer may be active. Use one canonical journal path in a
+trusted directory and do not mix older binaries with this format. Failures
+before rename preserve the old journal; failures from the rename attempt
+onward poison the handle, and the reactor stops serving the shard.
+
+Recovery requires every declared checkpoint record to be present and valid.
+A missing or damaged checkpoint is rejected, not treated as a repairable
+torn append. Only a subsequent physically incomplete record may be truncated.
+Recovery stages the complete cache privately as before. The checkpoint
+report exposes live entry count and before/after journal byte lengths.
+
+Checkpointing is synchronous and explicit; it blocks the reactor and needs
+temporary disk space for both files. A checkpoint may fail if the compact
+state (including per-entry framing overhead) exceeds configured journal or
+record limits. The old journal is preserved in that case. There is no
+automatic checkpoint schedule, background compaction, orphan-temp cleanup
+after process termination, or independent snapshot backup. Physical
+power-loss qualification and throughput/latency benchmarks remain pending.
