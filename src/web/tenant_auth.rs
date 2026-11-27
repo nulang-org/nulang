@@ -119,6 +119,8 @@ impl TenantAuthGuard {
         for (method, path) in &protected_routes {
             if !path.starts_with('/')
                 || path.starts_with("/__nulang/sse/")
+                || path.starts_with("/__nulang/ui-sse/")
+                || path.starts_with("/__nulang/scoped-ui-sse/")
                 || !seen.insert((method.as_str(), path.as_str()))
             {
                 return Err("invalid or duplicate protected route".into());

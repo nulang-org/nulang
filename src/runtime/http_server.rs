@@ -8,7 +8,7 @@
 use rand_core::{OsRng, RngCore};
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
@@ -1213,6 +1213,340 @@ fn realtime_subscribe(room: &str) -> Result<RealtimeSubscription, RealtimeLimitE
 }
 
 // ---------------------------------------------------------------------------
+// Revisioned HTML-over-SSE stream (separate from legacy broadcast).
+// Room state contains a bounded snapshot, not an unbounded event log.
+// ---------------------------------------------------------------------------
+
+const UI_STREAM_MAX_ROOMS: usize = 32;
+const UI_STREAM_MAX_TARGETS: usize = 32;
+const UI_STREAM_MAX_LISTENERS: usize = 8;
+const UI_STREAM_MAX_HTML_BYTES: usize = 64 * 1024;
+const UI_STREAM_MAX_SNAPSHOT_BYTES: usize = 256 * 1024;
+const UI_STREAM_MAX_TARGET_BYTES: usize = 128;
+const UI_STREAM_CHANNEL_DEPTH: usize = 8;
+
+#[derive(Debug)]
+struct UiStreamRoom {
+    revision: u64,
+    elements: BTreeMap<String, String>,
+    // A disconnected or overflowing sender loses its queue, not its lease.
+    // Only the subscriber's Drop releases capacity.
+    listeners: Vec<(
+        u64,
+        Option<SyncSender<nulang_ui_protocol::UiHtmlStreamMessage>>,
+    )>,
+}
+
+impl UiStreamRoom {
+    fn publish(
+        &mut self,
+        document_id: nulang_ui_protocol::DocumentId,
+        element: nulang_ui_protocol::UiHtmlElement,
+    ) -> bool {
+        use nulang_ui_protocol::{Revision, UiHtmlStreamMessage};
+        if !self.elements.contains_key(&element.target)
+            && self.elements.len() >= UI_STREAM_MAX_TARGETS
+        {
+            return false;
+        }
+        let existing_bytes = self.elements.values().map(String::len).sum::<usize>();
+        let replaced_bytes = self.elements.get(&element.target).map_or(0, String::len);
+        if existing_bytes - replaced_bytes + element.html.len() > UI_STREAM_MAX_SNAPSHOT_BYTES {
+            return false;
+        }
+        let Some(next) = self.revision.checked_add(1) else {
+            return false;
+        };
+        let patch = UiHtmlStreamMessage::patch(
+            document_id,
+            Revision(self.revision),
+            Revision(next),
+            element.clone(),
+        );
+        self.revision = next;
+        self.elements.insert(element.target, element.html);
+        for (_, sender) in &mut self.listeners {
+            if sender
+                .as_ref()
+                .is_some_and(|tx| tx.try_send(patch.clone()).is_err())
+            {
+                *sender = None;
+            }
+        }
+        true
+    }
+}
+
+struct UiStreamSubscriber {
+    room: String,
+    id: u64,
+    rx: Receiver<nulang_ui_protocol::UiHtmlStreamMessage>,
+}
+
+impl UiStreamSubscriber {
+    fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<nulang_ui_protocol::UiHtmlStreamMessage, std::sync::mpsc::RecvTimeoutError> {
+        self.rx.recv_timeout(timeout)
+    }
+
+    #[cfg(test)]
+    fn try_recv(
+        &self,
+    ) -> Result<nulang_ui_protocol::UiHtmlStreamMessage, std::sync::mpsc::TryRecvError> {
+        self.rx.try_recv()
+    }
+}
+
+impl Drop for UiStreamSubscriber {
+    fn drop(&mut self) {
+        if let Some(entry) = ui_stream_rooms().lock().unwrap().get_mut(&self.room) {
+            entry.listeners.retain(|(id, _)| *id != self.id);
+        }
+    }
+}
+
+static UI_STREAM_LISTENER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+static UI_STREAM_ROOMS: OnceLock<Mutex<HashMap<String, UiStreamRoom>>> = OnceLock::new();
+
+fn ui_stream_rooms() -> &'static Mutex<HashMap<String, UiStreamRoom>> {
+    UI_STREAM_ROOMS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Publish one target update, returning false if room, selector, or bounded
+/// storage cannot admit it. A full queue disconnects the sender; the stream
+/// retains its slot until its subscriber guard exits.
+pub fn ui_stream_publish(room: &str, target: &str, html: &str) -> bool {
+    use nulang_ui_protocol::{DocumentId, Revision, UiHtmlElement, UiHtmlStreamMessage};
+    if room.is_empty()
+        || room.len() > 128
+        || !room
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+        || target.len() > UI_STREAM_MAX_TARGET_BYTES
+        || html.len() > UI_STREAM_MAX_HTML_BYTES
+    {
+        return false;
+    }
+    let element = UiHtmlElement {
+        target: target.into(),
+        html: html.into(),
+    };
+    if UiHtmlStreamMessage::patch(
+        DocumentId::from(room),
+        Revision(0),
+        Revision(1),
+        element.clone(),
+    )
+    .validate()
+    .is_err()
+    {
+        return false;
+    }
+    let mut rooms = ui_stream_rooms().lock().unwrap();
+    if !rooms.contains_key(room) && rooms.len() >= UI_STREAM_MAX_ROOMS {
+        return false;
+    }
+    let entry = rooms
+        .entry(room.to_string())
+        .or_insert_with(|| UiStreamRoom {
+            revision: 0,
+            elements: BTreeMap::new(),
+            listeners: Vec::new(),
+        });
+    entry.publish(DocumentId::from(room), element)
+}
+
+fn ui_stream_subscribe(
+    room: &str,
+) -> Option<(nulang_ui_protocol::UiHtmlStreamMessage, UiStreamSubscriber)> {
+    use nulang_ui_protocol::{DocumentId, Revision, UiHtmlElement, UiHtmlStreamMessage};
+    if room.is_empty()
+        || room.len() > 128
+        || !room
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+    {
+        return None;
+    }
+    let mut rooms = ui_stream_rooms().lock().unwrap();
+    if !rooms.contains_key(room) && rooms.len() >= UI_STREAM_MAX_ROOMS {
+        return None;
+    }
+    let entry = rooms
+        .entry(room.to_string())
+        .or_insert_with(|| UiStreamRoom {
+            revision: 0,
+            elements: BTreeMap::new(),
+            listeners: Vec::new(),
+        });
+    if entry.listeners.len() >= UI_STREAM_MAX_LISTENERS {
+        return None;
+    }
+    let snapshot = UiHtmlStreamMessage::snapshot(
+        DocumentId::from(room),
+        Revision(entry.revision),
+        entry
+            .elements
+            .iter()
+            .map(|(target, html)| UiHtmlElement {
+                target: target.clone(),
+                html: html.clone(),
+            })
+            .collect(),
+    );
+    let (tx, rx) = sync_channel(UI_STREAM_CHANNEL_DEPTH);
+    let id = UI_STREAM_LISTENER_ID.fetch_add(1, Ordering::Relaxed);
+    entry.listeners.push((id, Some(tx)));
+    Some((
+        snapshot,
+        UiStreamSubscriber {
+            room: room.to_string(),
+            id,
+            rx,
+        },
+    ))
+}
+
+// Authenticated application streams have a separate per-server registry.
+// Only a trusted host may supply the authorizer and publishing handle.
+pub type ScopedUiRoomAuthorizer =
+    Arc<dyn Fn(&VerifiedTenant, &str) -> bool + Send + Sync + 'static>;
+
+type UiStreamAuthorizer = Arc<dyn Fn(&HttpRequest, &str, &str) -> bool + Send + Sync + 'static>;
+
+#[derive(Default)]
+struct ScopedUiStreams {
+    rooms: Mutex<HashMap<(String, String), UiStreamRoom>>,
+}
+
+impl std::fmt::Debug for ScopedUiStreams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopedUiStreams").finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ScopedUiPublisher {
+    streams: Arc<ScopedUiStreams>,
+}
+
+impl ScopedUiPublisher {
+    /// Publish already escaped HTML to a private room. This handle is
+    /// privileged: callers must independently authorize publishing.
+    pub fn publish(&self, app: &str, room: &str, target: &str, html: &str) -> bool {
+        use nulang_ui_protocol::{DocumentId, Revision, UiHtmlElement, UiHtmlStreamMessage};
+        if !valid_scoped_ui_id(app)
+            || !valid_scoped_ui_id(room)
+            || target.len() > UI_STREAM_MAX_TARGET_BYTES
+            || html.len() > UI_STREAM_MAX_HTML_BYTES
+        {
+            return false;
+        }
+        let document_id = DocumentId::from(format!("{app}/{room}"));
+        let element = UiHtmlElement {
+            target: target.to_string(),
+            html: html.to_string(),
+        };
+        if UiHtmlStreamMessage::patch(
+            document_id.clone(),
+            Revision(0),
+            Revision(1),
+            element.clone(),
+        )
+        .validate()
+        .is_err()
+        {
+            return false;
+        }
+        let mut rooms = self.streams.rooms.lock().unwrap();
+        let key = (app.to_string(), room.to_string());
+        if !rooms.contains_key(&key) && rooms.len() >= UI_STREAM_MAX_ROOMS {
+            return false;
+        }
+        let entry = rooms.entry(key).or_insert_with(|| UiStreamRoom {
+            revision: 0,
+            elements: BTreeMap::new(),
+            listeners: Vec::new(),
+        });
+        entry.publish(document_id, element)
+    }
+}
+
+fn valid_scoped_ui_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 48
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+}
+
+struct ScopedUiSubscriber {
+    key: (String, String),
+    id: u64,
+    rx: Receiver<nulang_ui_protocol::UiHtmlStreamMessage>,
+    streams: Arc<ScopedUiStreams>,
+}
+
+impl Drop for ScopedUiSubscriber {
+    fn drop(&mut self) {
+        if let Some(room) = self.streams.rooms.lock().unwrap().get_mut(&self.key) {
+            room.listeners.retain(|(id, _)| *id != self.id);
+        }
+    }
+}
+
+fn subscribe_scoped_ui(
+    streams: Arc<ScopedUiStreams>,
+    app: &str,
+    room: &str,
+) -> Option<(nulang_ui_protocol::UiHtmlStreamMessage, ScopedUiSubscriber)> {
+    use nulang_ui_protocol::{DocumentId, Revision, UiHtmlElement, UiHtmlStreamMessage};
+    if !valid_scoped_ui_id(app) || !valid_scoped_ui_id(room) {
+        return None;
+    }
+    let key = (app.to_owned(), room.to_owned());
+    let mut rooms = streams.rooms.lock().unwrap();
+    if !rooms.contains_key(&key) && rooms.len() >= UI_STREAM_MAX_ROOMS {
+        return None;
+    }
+    let entry = rooms.entry(key.clone()).or_insert_with(|| UiStreamRoom {
+        revision: 0,
+        elements: BTreeMap::new(),
+        listeners: Vec::new(),
+    });
+    if entry.listeners.len() >= UI_STREAM_MAX_LISTENERS {
+        return None;
+    }
+    let snapshot = UiHtmlStreamMessage::snapshot(
+        DocumentId::from(format!("{app}/{room}")),
+        Revision(entry.revision),
+        entry
+            .elements
+            .iter()
+            .map(|(target, html)| UiHtmlElement {
+                target: target.clone(),
+                html: html.clone(),
+            })
+            .collect(),
+    );
+    let (tx, rx) = sync_channel(UI_STREAM_CHANNEL_DEPTH);
+    let id = UI_STREAM_LISTENER_ID.fetch_add(1, Ordering::Relaxed);
+    entry.listeners.push((id, Some(tx)));
+    Some((
+        snapshot,
+        ScopedUiSubscriber {
+            key,
+            id,
+            rx,
+            streams: Arc::clone(&streams),
+        },
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Middleware
 // ---------------------------------------------------------------------------
 
@@ -1372,6 +1706,17 @@ fn sse_request_rejection(
         ],
         body: b"Forbidden: invalid SSE request origin".to_vec(),
     })
+}
+
+fn ui_sse_denied() -> HttpResponse {
+    HttpResponse {
+        status: 403,
+        headers: vec![
+            ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+            ("Cache-Control".into(), "no-store".into()),
+        ],
+        body: b"UI stream access denied".to_vec(),
+    }
 }
 
 fn invalid_ui_action_response(captured: &HttpRequestBindingInputs) -> Option<HttpResponse> {
@@ -1645,6 +1990,7 @@ fn configured_web_public_origin() -> std::io::Result<Option<String>> {
 #[derive(Debug)]
 pub struct WebDevServer {
     pub port: u16,
+    scoped_streams: Arc<ScopedUiStreams>,
     shutdown_flag: Arc<AtomicBool>,
     connection_slots: Arc<ConnectionSlots>,
     listener_thread: Option<std::thread::JoinHandle<()>>,
@@ -1677,6 +2023,48 @@ impl Drop for WebDevServer {
 impl WebDevServer {
     const MAX_CONCURRENT_CONNECTIONS: usize = 64;
     const SSE_PATH_PREFIX: &'static str = "/__nulang/sse/";
+    const UI_SSE_PATH_PREFIX: &'static str = "/__nulang/ui-sse/";
+    const SCOPED_UI_SSE_PATH_PREFIX: &'static str = "/__nulang/scoped-ui-sse/";
+
+    /// Privileged host publisher. The caller must authorize each write.
+    pub fn scoped_ui_publisher(&self) -> ScopedUiPublisher {
+        ScopedUiPublisher {
+            streams: Arc::clone(&self.scoped_streams),
+        }
+    }
+
+    /// Same tenant session and form admission as ordinary HTTP routes.
+    /// The first stream path component must equal the verified tenant ID.
+    /// The additional room policy must fail closed on backend errors.
+    pub fn bind_runtime_with_tenant_guard_and_ui_authorizer(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        guarded_forms: Vec<GuardedFormRoute>,
+        tenant_guard: TenantAuthGuard,
+        room_policy: ScopedUiRoomAuthorizer,
+        options: WebServerOptions,
+    ) -> std::io::Result<Self> {
+        let guard = tenant_guard.clone();
+        let authorize: UiStreamAuthorizer = Arc::new(move |request, app, room| {
+            guard.resolve(&request.headers).is_some_and(|principal| {
+                principal.tenant_id() == app && room_policy(&principal, room)
+            })
+        });
+        Self::bind_runtime_guarded_configured(
+            port,
+            static_dir,
+            output_dir,
+            routes,
+            guarded_forms,
+            configured_web_public_origin()?,
+            Some(tenant_guard),
+            options,
+            false,
+            Some(authorize),
+        )
+    }
 
     pub fn bind(
         port: u16,
@@ -1724,6 +2112,7 @@ impl WebDevServer {
             None,
             WebServerOptions::default(),
             true,
+            None,
         )
     }
 
@@ -1745,6 +2134,7 @@ impl WebDevServer {
             None,
             options,
             false,
+            None,
         )
     }
 
@@ -1810,6 +2200,7 @@ impl WebDevServer {
             Some(tenant_guard),
             options,
             false,
+            None,
         )
     }
 
@@ -1833,6 +2224,7 @@ impl WebDevServer {
             None,
             WebServerOptions::default(),
             false,
+            None,
         )
     }
 
@@ -1857,6 +2249,7 @@ impl WebDevServer {
             None,
             options,
             false,
+            None,
         )
     }
 
@@ -1870,6 +2263,7 @@ impl WebDevServer {
         tenant_guard: Option<TenantAuthGuard>,
         options: WebServerOptions,
         static_only: bool,
+        authorizer: Option<UiStreamAuthorizer>,
     ) -> std::io::Result<Self> {
         options.validate()?;
         if let Some(origin) = public_origin.as_deref() {
@@ -1931,6 +2325,8 @@ impl WebDevServer {
         let form_guards = Arc::new(form_guards);
         let guards_clone = Arc::clone(&form_guards);
         let tenant_guard = tenant_guard.map(Arc::new);
+        let scoped_streams = Arc::new(ScopedUiStreams::default());
+        let listener_streams = Arc::clone(&scoped_streams);
         let static_dir_clone = static_dir.clone();
         let output_dir_clone = output_dir.clone();
 
@@ -1949,11 +2345,14 @@ impl WebDevServer {
                     slots_for_listener,
                     options,
                     static_only,
+                    listener_streams,
+                    authorizer,
                 );
             })?;
 
         Ok(WebDevServer {
             port: actual_port,
+            scoped_streams,
             shutdown_flag: shutdown,
             connection_slots,
             listener_thread: Some(handle),
@@ -1972,6 +2371,8 @@ impl WebDevServer {
         slots: Arc<ConnectionSlots>,
         options: WebServerOptions,
         static_only: bool,
+        scoped_streams: Arc<ScopedUiStreams>,
+        authorizer: Option<UiStreamAuthorizer>,
     ) {
         listener.set_nonblocking(true).ok();
         // Route tables contain compiled modules; share them rather than
@@ -2019,6 +2420,8 @@ impl WebDevServer {
                     let public_origin = public_origin.clone();
                     let form_guards = Arc::clone(&form_guards);
                     let tenant_guard = tenant_guard.clone();
+                    let scoped_streams = Arc::clone(&scoped_streams);
+                    let authorizer = authorizer.clone();
                     let shutdown = Arc::clone(&shutdown);
                     // A failed spawn drops the closure and lease, returning capacity.
                     if let Err(error) = std::thread::Builder::new()
@@ -2035,6 +2438,8 @@ impl WebDevServer {
                                 tenant_guard,
                                 shutdown,
                                 static_only,
+                                scoped_streams,
+                                authorizer,
                             );
                         })
                     {
@@ -2059,6 +2464,8 @@ impl WebDevServer {
         tenant_guard: Option<Arc<TenantAuthGuard>>,
         shutdown: Arc<AtomicBool>,
         static_only: bool,
+        scoped_streams: Arc<ScopedUiStreams>,
+        authorizer: Option<UiStreamAuthorizer>,
     ) {
         let request = match read_tcp_http_request(&mut stream) {
             Ok(Some(request)) => request,
@@ -2097,7 +2504,50 @@ impl WebDevServer {
         let path = request.path.clone();
 
         let mut protected_response = false;
-        let mut response = if !static_only && path.starts_with(Self::SSE_PATH_PREFIX) {
+        let mut response = if !static_only
+            && (path.starts_with(Self::SCOPED_UI_SSE_PATH_PREFIX)
+                || path.starts_with(Self::UI_SSE_PATH_PREFIX))
+        {
+            if let Some(rejection) =
+                sse_request_rejection(&request, stream.local_addr().ok(), public_origin.as_deref())
+            {
+                rejection
+            } else if public_origin.is_some()
+                || !stream
+                    .peer_addr()
+                    .ok()
+                    .is_some_and(|peer| peer.ip().is_loopback())
+            {
+                ui_sse_denied()
+            } else if let Some(suffix) = path.strip_prefix(Self::SCOPED_UI_SSE_PATH_PREFIX) {
+                let scope = suffix
+                    .split_once('/')
+                    .filter(|(app, room)| valid_scoped_ui_id(app) && valid_scoped_ui_id(room));
+                if let Some(((app, room), verify)) = scope
+                    .zip(authorizer.as_ref())
+                    .filter(|((app, room), verify)| verify(&request, app, room))
+                {
+                    Self::serve_scoped_ui_sse(
+                        scoped_streams,
+                        app,
+                        room,
+                        &request,
+                        verify,
+                        &mut stream,
+                        Arc::clone(&shutdown),
+                    );
+                    return;
+                } else {
+                    ui_sse_denied()
+                }
+            } else {
+                let room = path
+                    .strip_prefix(Self::UI_SSE_PATH_PREFIX)
+                    .expect("public UI path");
+                Self::serve_ui_sse(room, &mut stream, Arc::clone(&shutdown));
+                return;
+            }
+        } else if !static_only && path.starts_with(Self::SSE_PATH_PREFIX) {
             if let Some(rejection) =
                 sse_request_rejection(&request, stream.local_addr().ok(), public_origin.as_deref())
             {
@@ -2350,6 +2800,128 @@ impl WebDevServer {
     fn write_sse_keepalive<W: Write>(stream: &mut W) -> std::io::Result<()> {
         stream.write_all(b": keep-alive\n\n")?;
         stream.flush()
+    }
+
+    fn serve_scoped_ui_sse(
+        streams: Arc<ScopedUiStreams>,
+        app: &str,
+        room: &str,
+        request: &HttpRequest,
+        verify: &UiStreamAuthorizer,
+        stream: &mut TcpStream,
+        shutdown: Arc<AtomicBool>,
+    ) {
+        let Some((snapshot, subscriber)) = subscribe_scoped_ui(streams, app, room) else {
+            HttpServerState::write_response(
+                stream,
+                &HttpResponse {
+                    status: 503,
+                    headers: vec![
+                        ("Content-Type".into(), "text/plain".into()),
+                        ("Cache-Control".into(), "no-store".into()),
+                    ],
+                    body: b"Scoped UI stream capacity exhausted".to_vec(),
+                },
+            );
+            return;
+        };
+        if !(verify)(request, app, room) {
+            HttpServerState::write_response(stream, &ui_sse_denied());
+            return;
+        }
+        if stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store, no-transform\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n"
+        ).is_err() {
+            return;
+        }
+        if !(verify)(request, app, room) || Self::write_ui_sse_event(stream, &snapshot).is_err() {
+            return;
+        }
+        let mut last_check = Instant::now();
+        let mut last_heartbeat = Instant::now();
+        while !shutdown.load(Ordering::Relaxed) {
+            match subscriber.rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(patch) => {
+                    // Verify current membership before writing any next update.
+                    if !(verify)(request, app, room)
+                        || Self::write_ui_sse_event(stream, &patch).is_err()
+                    {
+                        break;
+                    }
+                    last_check = Instant::now();
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if last_check.elapsed() >= Duration::from_secs(1) {
+                if !(verify)(request, app, room) {
+                    break;
+                }
+                last_check = Instant::now();
+            }
+            if last_heartbeat.elapsed() >= Duration::from_secs(15) {
+                if stream.write_all(b": heartbeat\n\n").is_err() {
+                    break;
+                }
+                last_heartbeat = Instant::now();
+            }
+        }
+    }
+
+    fn serve_ui_sse(room: &str, stream: &mut TcpStream, shutdown: Arc<AtomicBool>) {
+        let Some((snapshot, rx)) = ui_stream_subscribe(room) else {
+            HttpServerState::write_response(
+                stream,
+                &HttpResponse {
+                    status: 503,
+                    headers: vec![("Content-Type".into(), "text/plain".into())],
+                    body: b"UI stream capacity exhausted or invalid room".to_vec(),
+                },
+            );
+            return;
+        };
+        if stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache, no-transform\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n"
+        ).is_err() {
+            return;
+        }
+        if Self::write_ui_sse_event(stream, &snapshot).is_err() {
+            return;
+        }
+        let mut last_heartbeat = Instant::now();
+        while !shutdown.load(Ordering::Relaxed) {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(patch) => {
+                    if Self::write_ui_sse_event(stream, &patch).is_err() {
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if last_heartbeat.elapsed() >= Duration::from_secs(15) {
+                if stream.write_all(b": heartbeat\n\n").is_err() {
+                    break;
+                }
+                last_heartbeat = Instant::now();
+            }
+        }
+    }
+
+    fn write_ui_sse_event<W: Write>(
+        writer: &mut W,
+        msg: &nulang_ui_protocol::UiHtmlStreamMessage,
+    ) -> std::io::Result<()> {
+        let event = match msg {
+            nulang_ui_protocol::UiHtmlStreamMessage::Snapshot { .. } => "nulang-ui-snapshot",
+            nulang_ui_protocol::UiHtmlStreamMessage::Patch { .. } => "nulang-ui-patch",
+        };
+        let json = serde_json::to_string(msg).map_err(std::io::Error::other)?;
+        write!(
+            writer,
+            "event: {event}\nid: {}\ndata: {json}\n\n",
+            msg.revision().0
+        )
     }
 
     fn write_sse_event(stream: &mut TcpStream, msg: &str) -> std::io::Result<()> {
@@ -3491,6 +4063,257 @@ mod tests {
         let names: Vec<&str> = response.headers.iter().map(|(k, _)| k.as_str()).collect();
         assert!(names.contains(&"X-Content-Type-Options"));
         assert!(names.contains(&"X-Frame-Options"));
+    }
+
+    fn sse_tcp_connect(
+        port: u16,
+        room: &str,
+        extra_headers: &str,
+    ) -> std::io::BufReader<TcpStream> {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        write!(
+            stream,
+            "GET /__nulang/ui-sse/{room} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: text/event-stream\r\n{extra_headers}\r\n"
+        ).unwrap();
+        std::io::BufReader::new(stream)
+    }
+
+    fn sse_tcp_frame(reader: &mut impl std::io::BufRead) -> String {
+        let mut frame = String::new();
+        for _ in 0..128 {
+            let mut line = String::new();
+            let count = reader.read_line(&mut line).unwrap();
+            assert!(count > 0, "SSE stream closed unexpectedly");
+            if line == "\r\n" || line == "\n" {
+                return frame;
+            }
+            frame.push_str(&line);
+        }
+        panic!("SSE frame exceeded the configured line limit");
+    }
+
+    #[test]
+    fn ui_stream_tcp_snapshot_patch_and_reconnect() {
+        let room = format!("tcp-ui-{}", std::process::id());
+        assert!(ui_stream_publish(
+            &room,
+            "#status",
+            "<p id=\"status\">one</p>"
+        ));
+        let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
+        let mut first = sse_tcp_connect(server.port, &room, "");
+        let headers = sse_tcp_frame(&mut first);
+        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"), "{headers}");
+        assert!(
+            headers.contains("Content-Type: text/event-stream"),
+            "{headers}"
+        );
+        assert!(
+            headers.contains("X-Content-Type-Options: nosniff"),
+            "{headers}"
+        );
+
+        let snapshot = sse_tcp_frame(&mut first);
+        assert!(snapshot.contains("event: nulang-ui-snapshot"), "{snapshot}");
+        assert!(snapshot.contains("id: 1"), "{snapshot}");
+        assert!(snapshot.contains(r#""revision":"1""#), "{snapshot}");
+
+        assert!(ui_stream_publish(
+            &room,
+            "#status",
+            "<p id=\"status\">two</p>"
+        ));
+        let patch = sse_tcp_frame(&mut first);
+        assert!(patch.contains("event: nulang-ui-patch"), "{patch}");
+        assert!(patch.contains("id: 2"), "{patch}");
+        assert!(patch.contains(r#""base_revision":"1""#), "{patch}");
+        assert!(patch.contains("two"), "{patch}");
+
+        drop(first);
+        let mut reconnect = sse_tcp_connect(server.port, &room, "Last-Event-ID: 1\r\n");
+        assert!(sse_tcp_frame(&mut reconnect).starts_with("HTTP/1.1 200 OK"));
+        let latest = sse_tcp_frame(&mut reconnect);
+        assert!(latest.contains("event: nulang-ui-snapshot"), "{latest}");
+        assert!(latest.contains("id: 2"), "{latest}");
+        assert!(latest.contains("two"), "{latest}");
+        drop(reconnect);
+        drop(server);
+    }
+
+    #[test]
+    fn ui_stream_tcp_rejects_cross_origin_before_subscribing() {
+        let room = format!("tcp-origin-{}", std::process::id());
+        let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
+        let mut cross_site = sse_tcp_connect(
+            server.port,
+            &room,
+            "Origin: https://evil.example\r\nSec-Fetch-Site: cross-site\r\n",
+        );
+        let headers = sse_tcp_frame(&mut cross_site);
+        assert!(headers.starts_with("HTTP/1.1 403 Forbidden"), "{headers}");
+        let count = ui_stream_rooms()
+            .lock()
+            .unwrap()
+            .get(&room)
+            .map(|room| room.listeners.len())
+            .unwrap_or(0);
+        assert_eq!(count, 0, "rejected origins must never subscribe");
+        drop(cross_site);
+        drop(server);
+    }
+
+    #[test]
+    fn ui_stream_tcp_allows_same_origin_and_rejects_cross_site_fetch() {
+        let room = format!("tcp-guard-{}", std::process::id());
+        let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
+        let headers = format!(
+            "Origin: http://127.0.0.1:{}\r\nSec-Fetch-Site: same-origin\r\n",
+            server.port
+        );
+        let mut trusted = sse_tcp_connect(server.port, &room, &headers);
+        assert!(sse_tcp_frame(&mut trusted).starts_with("HTTP/1.1 200 OK"));
+        assert!(sse_tcp_frame(&mut trusted).contains("event: nulang-ui-snapshot"));
+        drop(trusted);
+
+        let mut cross_site = sse_tcp_connect(server.port, &room, "Sec-Fetch-Site: cross-site\r\n");
+        let headers = sse_tcp_frame(&mut cross_site);
+        assert!(headers.starts_with("HTTP/1.1 403 Forbidden"), "{headers}");
+        drop(cross_site);
+
+        let mut rebinding = sse_tcp_connect(server.port, &room, "Host: attacker.example\r\n");
+        let headers = sse_tcp_frame(&mut rebinding);
+        assert!(headers.starts_with("HTTP/1.1 400 Bad Request"), "{headers}");
+        drop(rebinding);
+        drop(server);
+    }
+
+    #[test]
+    fn ui_stream_starts_with_snapshot_and_revises_patches() {
+        let room = format!("ui-stream-replay-{}", std::process::id());
+        assert!(ui_stream_publish(&room, "#count", "<b id=\"count\">1</b>"));
+        let (snapshot, rx) = ui_stream_subscribe(&room).expect("subscription admitted");
+        assert_eq!(snapshot.revision(), nulang_ui_protocol::Revision(1));
+        assert!(matches!(
+            snapshot,
+            nulang_ui_protocol::UiHtmlStreamMessage::Snapshot { .. }
+        ));
+        assert!(ui_stream_publish(&room, "#count", "<b id=\"count\">2</b>"));
+        let patch = rx.try_recv().unwrap();
+        assert!(matches!(
+            patch,
+            nulang_ui_protocol::UiHtmlStreamMessage::Patch { .. }
+        ));
+        assert_eq!(patch.revision(), nulang_ui_protocol::Revision(2));
+        assert!(patch.validate().is_ok());
+
+        let (snapshot, _rx) = ui_stream_subscribe(&room).unwrap();
+        assert_eq!(snapshot.revision(), nulang_ui_protocol::Revision(2));
+    }
+
+    #[test]
+    fn ui_stream_bounds_and_drops_slow_subscribers() {
+        let room = format!("ui-stream-bounds-{}", std::process::id());
+        let (_snapshot, rx) = ui_stream_subscribe(&room).unwrap();
+        assert!(!ui_stream_publish(&room, "body", "invalid selector"));
+        assert!(!ui_stream_publish(&room, "#count", &"x".repeat(65537)));
+        for n in 0..32 {
+            assert!(ui_stream_publish(&room, &format!("#item-{n}"), "ok"));
+        }
+        assert!(!ui_stream_publish(&room, "#item-overflow", "ok"));
+        for _ in 0..32 {
+            assert!(ui_stream_publish(&room, "#item-0", "ok"));
+        }
+        let mut received = 0;
+        while rx.try_recv().is_ok() {
+            received += 1;
+        }
+        assert!(
+            received <= UI_STREAM_CHANNEL_DEPTH,
+            "queue must stay bounded"
+        );
+    }
+
+    #[test]
+    fn ui_stream_sse_wire_frame_includes_typed_snapshot_and_revision() {
+        let snapshot = nulang_ui_protocol::UiHtmlStreamMessage::snapshot(
+            nulang_ui_protocol::DocumentId::from("room"),
+            nulang_ui_protocol::Revision(42),
+            vec![nulang_ui_protocol::UiHtmlElement {
+                target: "#items".into(),
+                html: "<b>hi\nthere</b>".into(),
+            }],
+        );
+        let mut output = Vec::new();
+        WebDevServer::write_ui_sse_event(&mut output, &snapshot).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.starts_with("event: nulang-ui-snapshot\nid: 42\ndata: "));
+        assert!(text.ends_with("\n\n"));
+        assert!(text.contains("\"nulang-ui-html/1\""));
+        assert!(text.contains("\"revision\":\"42\""));
+    }
+
+    #[test]
+    fn ui_stream_unsubscribes_on_drop() {
+        let room = format!("ui-stream-disconnect-{}", std::process::id());
+        let (snapshot, receiver) = ui_stream_subscribe(&room).unwrap();
+        assert_eq!(snapshot.revision(), nulang_ui_protocol::Revision(0));
+        assert_eq!(ui_stream_rooms().lock().unwrap()[&room].listeners.len(), 1);
+        drop(receiver);
+        assert_eq!(ui_stream_rooms().lock().unwrap()[&room].listeners.len(), 0);
+    }
+
+    #[test]
+    fn ui_stream_slow_queue_keeps_slot_until_guard_drops() {
+        let room = "typed-retained-slot-regression";
+        let active: Vec<_> = (0..UI_STREAM_MAX_LISTENERS)
+            .map(|_| ui_stream_subscribe(room).unwrap())
+            .collect();
+        for _ in 0..=UI_STREAM_CHANNEL_DEPTH {
+            assert!(ui_stream_publish(room, "#target", "<p>update</p>"));
+        }
+        assert!(ui_stream_subscribe(room).is_none());
+        drop(active);
+        assert!(ui_stream_subscribe(room).is_some());
+    }
+
+    #[test]
+    fn scoped_ui_stream_slow_queue_keeps_slot_until_guard_drops() {
+        let streams = Arc::new(ScopedUiStreams::default());
+        let publisher = ScopedUiPublisher {
+            streams: Arc::clone(&streams),
+        };
+        let active: Vec<_> = (0..UI_STREAM_MAX_LISTENERS)
+            .map(|_| subscribe_scoped_ui(Arc::clone(&streams), "a", "room").unwrap())
+            .collect();
+        for _ in 0..=UI_STREAM_CHANNEL_DEPTH {
+            assert!(publisher.publish("a", "room", "#target", "<p>update</p>"));
+        }
+        assert!(subscribe_scoped_ui(Arc::clone(&streams), "a", "room").is_none());
+        drop(active);
+        assert!(subscribe_scoped_ui(streams, "a", "room").is_some());
+    }
+
+    #[test]
+    fn scoped_ui_stream_snapshot_has_aggregate_byte_budget() {
+        let streams = Arc::new(ScopedUiStreams::default());
+        let publisher = ScopedUiPublisher {
+            streams: Arc::clone(&streams),
+        };
+        let large = "x".repeat(64 * 1024);
+        for i in 0..4 {
+            assert!(publisher.publish("a", "room", &format!("#target-{i}"), &large));
+        }
+        assert!(!publisher.publish("a", "room", "#overflow", "x"));
+        assert!(publisher.publish("a", "room", "#target-0", "smaller"));
+        assert!(publisher.publish("a", "room", "#overflow", "x"));
+        assert!(!publisher.publish("a", "room", &format!("#{}", "x".repeat(128)), "x"));
+        assert!(!format!("{publisher:?}").contains("smaller"));
     }
 
     #[test]

@@ -322,3 +322,144 @@ fn tenant_admission_and_custom_host_options_share_one_startup_gate() {
         "{anonymous}"
     );
 }
+
+// Private SSE must reuse the verified session boundary, not a caller tenant ID.
+#[test]
+fn scoped_ui_sse_uses_verified_tenant_and_room_policy() {
+    use nulang::runtime::{ScopedUiRoomAuthorizer, WebServerOptions};
+    use nulang::web::runtime_bindings::RuntimeWebRoute;
+    use std::io::{BufRead, BufReader};
+
+    let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let control = Arc::clone(&active);
+    let policy: ScopedUiRoomAuthorizer = Arc::new(move |principal, room| {
+        control.load(std::sync::atomic::Ordering::SeqCst)
+            && principal.subject_id() == "user-a"
+            && room == "invoices"
+    });
+    let server = WebDevServer::bind_runtime_with_tenant_guard_and_ui_authorizer(
+        0,
+        None,
+        None,
+        vec![RuntimeWebRoute {
+            route: route("/secure"),
+            plan: None,
+        }],
+        vec![],
+        guard(),
+        Arc::clone(&policy),
+        WebServerOptions::default(),
+    )
+    .unwrap();
+    let publisher = server.scoped_ui_publisher();
+    assert!(publisher.publish(
+        "tenant-a",
+        "invoices",
+        "#status",
+        "<p id=\"status\">private-a</p>"
+    ));
+    assert!(publisher.publish(
+        "tenant-b",
+        "invoices",
+        "#status",
+        "<p id=\"status\">private-b</p>"
+    ));
+
+    let connect = |port: u16, method: &str, path: &str, headers: &str| {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        write!(
+            stream,
+            "{method} {path} HTTP/1.1\r\nHost: localhost:{}\r\n{headers}\r\n",
+            port
+        )
+        .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut status = String::new();
+        reader.read_line(&mut status).unwrap();
+        (status, reader)
+    };
+    let a = format!("Cookie: __Host-nulang_tenant={SESSION_A}\r\n");
+    let b = format!("Cookie: __Host-nulang_tenant={SESSION_B}\r\n");
+    let duplicate = format!("{a}{b}");
+    let forged = format!("{b}X-Tenant-Id: tenant-a\r\n");
+    let cross = format!("{a}Sec-Fetch-Site: cross-site\r\n");
+    let foreign_ref = format!("{a}Referer: https://evil.example/\r\n");
+    let path = "/__nulang/scoped-ui-sse/tenant-a/invoices";
+    for (url, headers) in [
+        (path, ""),
+        (path, &b),
+        (path, &duplicate),
+        (path, &forged),
+        (path, &cross),
+        (path, &foreign_ref),
+        ("/__nulang/scoped-ui-sse/tenant-a/other", &a),
+        ("/__nulang/scoped-ui-sse/tenant-b/invoices", &a),
+    ] {
+        assert!(
+            connect(server.port, "GET", url, headers)
+                .0
+                .starts_with("HTTP/1.1 403 "),
+            "{url}"
+        );
+    }
+    assert!(connect(server.port, "HEAD", path, &a)
+        .0
+        .starts_with("HTTP/1.1 405 "));
+    let (status, mut reader) = connect(server.port, "GET", path, &a);
+    assert_eq!(status, "HTTP/1.1 200 OK\r\n");
+    let mut wire = String::new();
+    loop {
+        let mut line = String::new();
+        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+        wire.push_str(&line);
+        if line.starts_with("data: ") {
+            break;
+        }
+    }
+    assert!(wire.contains("Cache-Control: no-store"));
+    assert!(wire.contains("private-a"));
+    assert!(!wire.contains("private-b"));
+    // A different server and the public typed registry never see private state.
+    let second = WebDevServer::bind_runtime_with_tenant_guard_and_ui_authorizer(
+        0,
+        None,
+        None,
+        vec![RuntimeWebRoute {
+            route: route("/secure"),
+            plan: None,
+        }],
+        vec![],
+        guard(),
+        policy,
+        WebServerOptions::default(),
+    )
+    .unwrap();
+    let (status, mut other) = connect(second.port, "GET", path, &a);
+    assert!(status.starts_with("HTTP/1.1 200 "));
+    let read_snapshot = |reader: &mut BufReader<TcpStream>| loop {
+        let mut line = String::new();
+        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+        if line.starts_with("data: ") {
+            return line;
+        }
+    };
+    assert!(read_snapshot(&mut other).contains(r#""elements":[]"#));
+    let (status, mut public) = connect(server.port, "GET", "/__nulang/ui-sse/invoices", "");
+    assert!(status.starts_with("HTTP/1.1 200 "));
+    assert!(read_snapshot(&mut public).contains(r#""elements":[]"#));
+    let denied = WebDevServer::bind(0, None, None, vec![]).unwrap();
+    assert!(connect(denied.port, "GET", path, &a)
+        .0
+        .starts_with("HTTP/1.1 403 "));
+    // Drain the blank line after the initial snapshot, then revoke membership
+    // before publishing. No further patch may be delivered.
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    active.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(publisher.publish("tenant-a", "invoices", "#status", "<p>must-not-leak</p>"));
+    line.clear();
+    assert_eq!(reader.read_line(&mut line).unwrap(), 0, "{line}");
+}
