@@ -271,8 +271,8 @@ distributions install Valkey under both binary names.
 
 ## Write-ahead journal substrate (Unix)
 
-CacheWal is a standalone framing and recovery primitive, not yet wired to
-the cache command executor. It uses a distinct eight-byte NLCWAL02 format
+CacheWal is the framing and recovery primitive used by the native
+DurableCache coordinator, not yet wired to the live RESP reactor. It uses a distinct eight-byte NLCWAL02 format
 identifier, complemented u32 payload length, contiguous u64 sequence, and
 BLAKE3 checksum of the entire record header and payload. Each record contains
 one opaque logical mutation or batch; callers must validate and encode that
@@ -295,8 +295,45 @@ sync is ambiguous: a complete unacknowledged record may replay after reopen.
 Record/file admission failures happen before I/O and do not poison the handle.
 
 Use a trusted private journal directory; advisory locks do not protect against
-non-cooperating writers or external file replacement. No snapshot/rotation,
-mutation encoding, wall-clock TTL translation, live cache integration,
-replication or process/power-loss qualification is provided by this primitive.
-The next layer must establish a single mutation/acknowledgement boundary and
-fail-stop serving semantics before enabling persistent RESP traffic.
+non-cooperating writers or external file replacement. The journal itself does not interpret mutations. The native coordinator below
+supplies mutation encoding, TTL translation and a write-before-publication
+boundary. Snapshot/rotation, live RESP integration, replication and physical
+power-loss qualification remain pending.
+
+
+## Native durable mutation coordinator (Unix)
+
+DurableCache owns the CacheStore and CacheWal exclusively, without a mutable
+store escape hatch. Each accepted mutation is encoded, preflighted against
+cache admission limits, appended using the configured acknowledgement mode,
+then applied to the live store. Native set_bytes, set_batch, delete_many,
+increment and expire operations correspond to SET, MSET, DEL, INCR and EXPIRE.
+A batch is one versioned record; duplicate keys retain last-write-wins
+semantics. Decoding rejects malformed/trailing bytes and limits batch item
+counts to 65,536. The journal's record and file limits remain configurable.
+
+SET and INCR records contain complete typed after-images. Expiration updates
+also store a complete after-image so replay can reconstruct a key whose
+earlier deadline passed during downtime. Deadlines are absolute Unix
+milliseconds and are converted to a new monotonic deadline on reopen.
+Recovery stages a fresh store privately, dropping expired after-images and
+applying surviving records in sequence; no partial recovered store is exposed.
+Callers must supply coherent monotonic/Unix clock pairs. Wall-clock rollback
+can extend or resurrect expired values; clock regression policy is not yet
+enforced. Recovery may fail closed if historical replay or arena fragmentation
+exceeds admission limits, even when the final logical data set would fit.
+There is no snapshot or rotation yet.
+
+Rejected admission/size/disk-limit requests leave logical data and the
+journal unchanged (read-side lazy expiry and counters may still advance).
+An ambiguous I/O failure, or failure after a successful append, poisons
+the coordinator and blocks further reads and writes until recovery. A
+complete record may survive an unacknowledged write, so clients cannot
+assume an error means their mutation will never be replayed.
+
+This first implementation prioritizes correctness over copy minimization:
+EXPIRE records duplicate the value and may be conservatively rejected by
+arena or journal limits; mutation encoding allocates bounded scratch space.
+The live RESP reactor remains memory-only. Server-wide fail-stop behavior,
+group commit, snapshots/rotation, time-regression handling and physical
+crash qualification remain separate tasks.
