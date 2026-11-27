@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Native durable RESP cache mutation coordinator — 2026-11-27
+- **Journal native cache mutations before live publication**, including typed after-images, atomic batches, absolute TTL recovery, admission preflight and fail-stop reads/writes following ambiguous persistence failure. Live RESP reactor integration remains pending.
+
 ### RESP cache journal substrate — 2026-11-27
 - **Add a bounded, single-writer, checksummed WAL primitive** with streaming recovery, torn-tail repair, corruption rejection, buffered/synced acknowledgement and fail-stop append poisoning. Reuse BLAKE3; live RESP persistence integration remains pending.
 

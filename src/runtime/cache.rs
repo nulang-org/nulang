@@ -152,6 +152,22 @@ pub enum CacheIncrementError {
     Admission(CacheAdmissionError),
 }
 
+pub(super) fn parse_cache_integer(value: CacheValueView<'_>) -> Result<i64, CacheIncrementError> {
+    match value {
+        CacheValueView::Integer(value) => Ok(value),
+        CacheValueView::Bytes(raw) => {
+            // RESP canonical decimal syntax.
+            if raw != b"0" && !matches!(raw, [b'1'..=b'9', ..] | [b'-', b'1'..=b'9', ..]) {
+                return Err(CacheIncrementError::NotInteger);
+            }
+            std::str::from_utf8(raw)
+                .map_err(|_| CacheIncrementError::NotInteger)?
+                .parse::<i64>()
+                .map_err(|_| CacheIncrementError::NotInteger)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CacheValue {
     Integer(i64),
@@ -672,7 +688,11 @@ impl CacheStore {
         Ok(())
     }
 
-    fn admit_single(&self, key: &[u8], value_len: usize) -> Result<(), CacheAdmissionError> {
+    pub(super) fn admit_single(
+        &self,
+        key: &[u8],
+        value_len: usize,
+    ) -> Result<(), CacheAdmissionError> {
         let new_key = self.find_slot(key, Self::hash(key)).is_none();
         self.admit_entries(usize::from(new_key))?;
         if value_len <= INLINE_BYTES && (!new_key || key.len() <= INLINE_BYTES) {
@@ -711,6 +731,14 @@ impl CacheStore {
         pairs: &[(&[u8], &[u8])],
         now_ms: u64,
     ) -> Result<(), CacheAdmissionError> {
+        self.admit_batch(pairs)?;
+        for &(key, value) in pairs {
+            self.set_bytes_admitted(key, value, None, now_ms);
+        }
+        Ok(())
+    }
+
+    pub(super) fn admit_batch(&self, pairs: &[(&[u8], &[u8])]) -> Result<(), CacheAdmissionError> {
         let mut new_keys = HashSet::new();
         let mut free = std::array::from_fn(|i| self.arena.free[i].len());
         let mut extent = self.arena.bytes.len();
@@ -720,9 +748,6 @@ impl CacheStore {
                 self.admit_entries(new_keys.len())?;
                 self.admit_block(key.len(), &mut free, &mut extent)?;
             }
-        }
-        for &(key, value) in pairs {
-            self.set_bytes_admitted(key, value, None, now_ms);
         }
         Ok(())
     }
@@ -852,20 +877,7 @@ impl CacheStore {
             .expect("live slot vanished")
             .value;
 
-        let base = match current {
-            CacheValue::Integer(value) => value,
-            CacheValue::Bytes(bytes) => {
-                let raw = bytes.as_slice(&self.arena);
-                // RESP integer values must use canonical decimal syntax: no
-                // leading plus, leading zeros, or negative zero.
-                if raw != b"0" && !matches!(raw, [b'1'..=b'9', ..] | [b'-', b'1'..=b'9', ..]) {
-                    return Err(CacheIncrementError::NotInteger);
-                }
-                let text = std::str::from_utf8(raw).map_err(|_| CacheIncrementError::NotInteger)?;
-                text.parse::<i64>()
-                    .map_err(|_| CacheIncrementError::NotInteger)?
-            }
-        };
+        let base = parse_cache_integer(current.view(&self.arena))?;
 
         let next = base
             .checked_add(delta)

@@ -179,7 +179,7 @@ impl CacheWal {
         })
     }
 
-    fn append_with(
+    pub(super) fn append_with(
         &mut self,
         payload: &[u8],
         sync: WalSync,
