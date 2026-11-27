@@ -220,6 +220,84 @@ impl WalBackedTablet {
         Ok(receipt)
     }
 
+    /// Commit a FIFO group of point-key optimistic transactions through one
+    /// WAL durability barrier. Preflight rejects the entire group on any
+    /// admission or conflict error, including conflicts with earlier new
+    /// group members. Matching durable retries do not stage new mutations.
+    /// A failed WAL append may leave a complete prefix; reopen and retry
+    /// the original IDs and payloads. No crash-level group atomicity is promised.
+    pub fn commit_optimistic_batch_idempotent(
+        &mut self,
+        entries: Vec<(TransactionId, OptimisticTabletWrite)>,
+    ) -> Result<Vec<TransactionReceipt>, WalBackedError> {
+        self.require_recovered()?;
+        if self.wal.is_poisoned() {
+            return Err(WalError::Poisoned.into());
+        }
+        if entries.len() > MAX_GROUP_COMMIT_RECORDS {
+            return Err(WalError::BatchTooLarge {
+                records: entries.len(),
+                bytes: 0,
+            }
+            .into());
+        }
+        // Include read keys even on retry-only requests, before hashing or
+        // allocating staging state. The WAL enforces encoded-frame limits.
+        let input_bytes = entries.iter().fold(
+            group_input_bytes(entries.iter().map(|(_, write)| write.mutations())),
+            |total, (_, write)| total.saturating_add(write.read_input_bytes()),
+        );
+        if input_bytes > MAX_GROUP_COMMIT_BYTES {
+            return Err(WalError::BatchTooLarge {
+                records: entries.len(),
+                bytes: input_bytes,
+            }
+            .into());
+        }
+        let mut seen = HashSet::with_capacity(entries.len());
+        let mut ids = Vec::with_capacity(entries.len());
+        let mut pending = Vec::new();
+        let mut staged = BTreeMap::<Vec<u8>, u64>::new();
+        let mut tail = self.tablet.current_sequence();
+        for (id, proposed) in entries {
+            if !seen.insert(id) {
+                return Err(WalBackedError::DuplicateBatchId(id));
+            }
+            ids.push(id);
+            self.tablet.validate_optimistic_identity(&proposed)?;
+            let digest = transaction_digest(proposed.mutations());
+            if let Some(receipt) = self.tablet.transaction_receipt(id) {
+                if receipt.digest() != digest {
+                    return Err(WalBackedError::IdempotencyConflict(id));
+                }
+                continue;
+            }
+            let write = self
+                .tablet
+                .rebase_optimistic_write_after(proposed, tail, |key| staged.get(key).copied())?
+                .with_identity(TransactionIdentity { id, digest });
+            tail = write.sequence();
+            for mutation in write.mutations() {
+                staged.insert(mutation.key().to_vec(), tail);
+            }
+            pending.push(write);
+        }
+        if !pending.is_empty() {
+            self.wal.append_batch(&pending)?;
+            for write in pending {
+                self.tablet.publish_validated(write);
+            }
+        }
+        Ok(ids
+            .into_iter()
+            .map(|id| {
+                self.tablet
+                    .transaction_receipt(id)
+                    .expect("durable optimistic group must publish every receipt")
+            })
+            .collect())
+    }
+
     /// Commit once per tablet-scoped caller ID and exact ordered payload.
     /// After ambiguous I/O, reopen and retry with the original ID and payload.
     /// Receipts are never evicted by MVCC history reclamation.

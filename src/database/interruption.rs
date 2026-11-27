@@ -200,6 +200,63 @@ mod tests {
     }
 
     #[test]
+    fn optimistic_group_recovers_prefix_and_retries_without_duplicate_writes() {
+        use super::super::tablet::TransactionId;
+        for (point, recovered_sequence) in [
+            (StorageInterruptionPoint::WalGroupAfterFirstFrame, 1),
+            (StorageInterruptionPoint::WalGroupAfterSecondHeader, 1),
+            (StorageInterruptionPoint::WalGroupAfterSync, 3),
+        ] {
+            let path = temp_wal("optimistic_group");
+            let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
+            let entries: Vec<_> = (1u8..=3)
+                .map(|n| {
+                    let proposed = tablet
+                        .prepare_optimistic_write(
+                            7,
+                            0,
+                            vec![],
+                            vec![TabletMutation::Put {
+                                key: vec![b'a' + n],
+                                value: vec![n],
+                            }],
+                        )
+                        .unwrap();
+                    (TransactionId::new([n; 16]), proposed)
+                })
+                .collect();
+            assert!(with_interruption(point, || {
+                tablet.commit_optimistic_batch_idempotent(entries.clone())
+            })
+            .is_err());
+            assert_eq!(tablet.current_sequence(), 0);
+            assert_eq!(
+                tablet
+                    .commit_optimistic_batch_idempotent(entries.clone())
+                    .unwrap_err(),
+                WalBackedError::Wal(WalError::Poisoned)
+            );
+            drop(tablet);
+            let mut reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
+            assert_eq!(reopened.current_sequence(), recovered_sequence);
+            let receipts = reopened
+                .commit_optimistic_batch_idempotent(entries)
+                .unwrap();
+            assert_eq!(
+                receipts.iter().map(|r| r.sequence()).collect::<Vec<_>>(),
+                vec![1, 2, 3]
+            );
+            assert_eq!(reopened.current_sequence(), 3);
+            for n in 1u8..=3 {
+                assert_eq!(reopened.read_latest(&[b'a' + n]), Some(&[n][..]));
+            }
+            drop(reopened);
+            cleanup(&path);
+            let _ = fs::remove_file(appended(&path, ".lock"));
+        }
+    }
+
+    #[test]
     fn wal_append_interruption_matrix_recovers_a_valid_prefix_and_can_continue() {
         for (point, expected_sequence) in [
             (StorageInterruptionPoint::WalAfterHeader, 0),
