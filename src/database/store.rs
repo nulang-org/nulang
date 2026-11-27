@@ -16,7 +16,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
 use super::checkpoint::{self, CheckpointError};
-use super::tablet::{MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite};
+use super::tablet::{
+    transaction_digest, MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite,
+    TransactionId, TransactionIdentity, TransactionReceipt,
+};
 use super::wal::{FileWal, WalError};
 
 /// In-process snapshot retention guard. Valid only for the lifetime of
@@ -116,6 +119,42 @@ impl WalBackedTablet {
         }
         self.tablet
             .prepare_write(presented_epoch, expected_previous_sequence, mutations)
+    }
+
+    /// Commit once per tablet-scoped caller ID and exact ordered payload.
+    /// After ambiguous I/O, reopen and retry with the original ID and payload.
+    /// Receipts are never evicted by MVCC history reclamation.
+    pub fn commit_idempotent(
+        &mut self,
+        id: TransactionId,
+        mutations: Vec<TabletMutation>,
+    ) -> Result<TransactionReceipt, WalBackedError> {
+        self.require_recovered()?;
+        if self.wal.is_poisoned() {
+            return Err(WalError::Poisoned.into());
+        }
+        let digest = transaction_digest(&mutations);
+        if let Some(receipt) = self.tablet.transaction_receipt(id) {
+            if receipt.digest() != digest {
+                return Err(WalBackedError::IdempotencyConflict(id));
+            }
+            return Ok(receipt);
+        }
+        let write = self
+            .tablet
+            .prepare_write(
+                self.tablet.descriptor().ownership_epoch(),
+                self.current_sequence(),
+                mutations,
+            )?
+            .with_identity(TransactionIdentity { id, digest });
+        let sequence = self.commit(write)?;
+        let receipt = self
+            .tablet
+            .transaction_receipt(id)
+            .expect("validated commit publishes receipt");
+        debug_assert_eq!(receipt.sequence(), sequence);
+        Ok(receipt)
     }
 
     /// Durably commit one write before making it visible to readers.
@@ -218,6 +257,7 @@ pub enum WalBackedError {
     Tablet(TabletError),
     Wal(WalError),
     Checkpoint(CheckpointError),
+    IdempotencyConflict(TransactionId),
 }
 
 impl From<TabletError> for WalBackedError {
@@ -244,6 +284,9 @@ impl fmt::Display for WalBackedError {
             Self::Tablet(error) => write!(f, "tablet commit rejected: {error}"),
             Self::Wal(error) => write!(f, "tablet WAL failure: {error}"),
             Self::Checkpoint(error) => write!(f, "tablet checkpoint failure: {error}"),
+            Self::IdempotencyConflict(id) => {
+                write!(f, "transaction ID {id:?} reused with different mutations")
+            }
         }
     }
 }
