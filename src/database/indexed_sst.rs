@@ -236,6 +236,10 @@ impl IndexedSst {
     pub fn sequence_interval(&self) -> (u64, u64) {
         (self.min_sequence, self.max_sequence)
     }
+    #[cfg(unix)]
+    pub(crate) fn keys_within(&self, range: &super::tablet::KeyRange) -> bool {
+        self.rows.keys().all(|key| range.contains(key))
+    }
     pub fn indexed_versions(&self) -> usize {
         self.version_count
     }

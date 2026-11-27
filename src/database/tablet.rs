@@ -198,6 +198,10 @@ impl TransactionId {
     pub fn new(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
+    #[cfg(unix)]
+    pub(crate) fn bytes(self) -> [u8; 16] {
+        self.0
+    }
 }
 
 /// Durable receipt retained through WAL replay and checkpoint reclamation.
@@ -209,6 +213,14 @@ pub struct TransactionReceipt {
 }
 
 impl TransactionReceipt {
+    #[cfg(unix)]
+    pub(crate) fn from_parts(id: TransactionId, sequence: u64, digest: [u8; 32]) -> Self {
+        Self {
+            id,
+            sequence,
+            digest,
+        }
+    }
     pub fn id(self) -> TransactionId {
         self.id
     }
@@ -473,6 +485,10 @@ impl MemoryTablet {
 
     pub(crate) fn transaction_receipt(&self, id: TransactionId) -> Option<TransactionReceipt> {
         self.receipts.get(&id).copied()
+    }
+    #[cfg(unix)]
+    pub(crate) fn receipts(&self) -> impl ExactSizeIterator<Item = TransactionReceipt> + '_ {
+        self.receipts.values().copied()
     }
     pub(crate) fn has_receipts(&self) -> bool {
         !self.receipts.is_empty()

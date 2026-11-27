@@ -9,6 +9,8 @@ pub mod indexed_sst;
 pub mod optimistic;
 #[cfg(unix)]
 pub mod sst_manifest;
+#[cfg(unix)]
+mod sst_recovery_meta;
 pub mod store;
 pub mod tablet;
 pub mod wal;

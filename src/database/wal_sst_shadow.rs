@@ -140,6 +140,9 @@ pub(super) fn flush(
     if pending.is_empty() {
         return Ok(None);
     }
+    if manifest.current().is_recovery_sealed() {
+        return Err(invalid("sealed manifest cannot extend"));
+    }
     let generation = manifest.current().entries().len() as u64 + 1;
     let dir = manifest.directory();
     let path = dir.join(format!("nudb-sst-{generation:020}.sst"));

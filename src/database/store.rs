@@ -379,6 +379,32 @@ impl WalBackedTablet {
         super::wal_sst_shadow::flush(&self.wal, self.descriptor(), manifest, max_records)
     }
 
+    /// Seal an independently readable snapshot of the complete, verified WAL
+    /// prefix. This does not enable live disk-backed writes or WAL reclamation.
+    #[cfg(unix)]
+    pub fn seal_sst_recovery(
+        &self,
+        manifest: &mut super::sst_manifest::ManifestStore,
+    ) -> std::io::Result<()> {
+        if manifest.current().durable_sequence() != self.current_sequence() {
+            return Err(std::io::Error::other(
+                "shadow manifest must cover entire committed WAL",
+            ));
+        }
+        // No pending records: the shadow path verifies every referenced table
+        // and rejects incomplete/pruned/poisoned history without publishing.
+        if self.flush_sst_shadow(manifest, 1)?.is_some() {
+            return Err(std::io::Error::other("unexpected shadow publication"));
+        }
+        let meta = super::sst_recovery_meta::RecoveryMeta::new(
+            self.descriptor().clone(),
+            self.oldest_retained_snapshot(),
+            self.current_sequence(),
+            self.tablet.receipts(),
+        )?;
+        manifest.seal(meta)
+    }
+
     /// Atomically publish a checkpoint without reclaiming the WAL.
     ///
     /// This is a valid crash state and is intentionally public so operators can
