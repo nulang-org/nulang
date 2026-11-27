@@ -574,6 +574,14 @@ impl StdLib {
                     description: "Wrap a raw string as an Html value without escaping.",
                 },
                 BuiltinOp {
+                    name: "Web.turbo_stream",
+                    effect: "Web",
+                    op: "turbo_stream",
+                    signature: "turbo_stream(action: String, target: String, content: Html) -> Html",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Render a safe Turbo Stream HTML action and select the Turbo Stream response MIME type for the current Web request.",
+                },
+                BuiltinOp {
                     name: "Web.redirect",
                     effect: "Web",
                     op: "redirect",
@@ -614,12 +622,28 @@ impl StdLib {
                     description: "Get a request header from the current HTTP request.",
                 },
                 BuiltinOp {
+                    name: "Web.verified_tenant_id",
+                    effect: "Web",
+                    op: "verified_tenant_id",
+                    signature: "verified_tenant_id() -> String",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Return the tenant id verified by a trusted server session resolver, or empty outside a protected request.",
+                },
+                BuiltinOp {
                     name: "Web.cookie",
                     effect: "Web",
                     op: "cookie",
                     signature: "cookie(name: String) -> String",
                     implemented_in: ImplSite::RuntimeHost,
                     description: "Get a cookie value from the current HTTP request by name.",
+                },
+                BuiltinOp {
+                    name: "Web.secure_token",
+                    effect: "Web",
+                    op: "secure_token",
+                    signature: "secure_token() -> String",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Create a 256-bit cryptographically secure session token, or empty on entropy failure.",
                 },
                 BuiltinOp {
                     name: "Web.set_cookie",
@@ -644,6 +668,14 @@ impl StdLib {
                     signature: "broadcast(room: String, message: String) -> Unit",
                     implemented_in: ImplSite::RuntimeHost,
                     description: "Broadcast a message to all subscribers of a realtime room.",
+                },
+                BuiltinOp {
+                    name: "Realtime.patch",
+                    effect: "Realtime",
+                    op: "patch",
+                    signature: "patch(room: String, target: String, html: Html) -> Bool",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Publish bounded, revisioned HTML patches to a realtime room.",
                 },
                 BuiltinOp {
                     name: "Actor.link",

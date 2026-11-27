@@ -1,0 +1,10 @@
+{
+  "name": "nulang-hotwire-browser-tests",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Isolated browser E2E dependencies; not part of the Nulang runtime",
+  "dependencies": {
+    "@hotwired/turbo": "8.0.23",
+    "playwright": "1.61.1"
+  }
+}

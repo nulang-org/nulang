@@ -70,7 +70,7 @@ fn chat() -> Html {
         }
         redirect("/chat/" + room)
     } else {
-        document(
+        document_lang("en",
             head([title("Chat: " + room)]),
             body([
                 el("h1", [], [text("Chat: " + room)]),

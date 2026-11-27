@@ -39,6 +39,11 @@ pub mod actor_protocol;
 pub mod effect_checker;
 #[path = "../../../src/prelude_source.rs"]
 pub mod prelude_source;
+// Parser dependencies must be shared as well: diagnostics are portable,
+// but the runtime HTTP host is not part of the browser compiler.
+#[path = "../../../src/stdlib_path.rs"]
+mod stdlib_path;
+mod web;
 #[path = "../../../src/parser.rs"]
 pub mod parser;
 #[path = "../../../src/parallel_analysis.rs"]
