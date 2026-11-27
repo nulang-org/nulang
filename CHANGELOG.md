@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Fabric adversarial transport admission — 2026-11-27
+- **Enforce buffered pipeline depth before command execution**, cap reactor polling by the earliest TLS handshake deadline, and fail closed on unexpected response-buffer growth. Add deterministic connection admission/deadline regressions and authenticated oversized request and amplified-response qualification.
+
 ### Fabric mutual TLS authentication — 2026-11-27
 - **Add explicit mutual TLS using existing Rustls and private CA material** with mandatory client certificates, no early data or session resumption, bounded connection count and handshake deadline, nonblocking encrypted reactor I/O, and encrypted output draining. Standalone remote binds require complete TLS configuration; plaintext remains loopback-only. Qualify against the audited dependency baseline before remote deployment.
 
