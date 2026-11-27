@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Cancellable RESP expiration records — 2026-11-27
+- **Unlink prior TTL records in constant time** on refresh, persistent overwrite, deletion and lazy expiry using slot-indexed FIFO handles. Preserve bounded sweeps and safe slot reuse. Metadata capacity remains tied to the slot high-water mark; this is not a total memory cap.
+
 ### Bounded RESP cache expiration sweeps — 2026-11-27
 - **Bound inspected expiration candidates per sweep**, including stale and future records. Preserve partially drained buckets across clock advances and rotate between eligible buckets; zero budget does no work. This does not yet cap total TTL metadata or wall-clock latency.
 
