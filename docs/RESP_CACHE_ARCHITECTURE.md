@@ -267,3 +267,36 @@ standalone reference servers permit cross-slot commands. This is a kernel
 compatibility gate, not a claim of complete Redis command, network, persistence,
 or cluster compatibility. Verify executable versions independently; some
 distributions install Valkey under both binary names.
+
+
+## Write-ahead journal substrate (Unix)
+
+CacheWal is a standalone framing and recovery primitive, not yet wired to
+the cache command executor. It uses a distinct eight-byte NLCWAL02 format
+identifier, complemented u32 payload length, contiguous u64 sequence, and
+BLAKE3 checksum of the entire record header and payload. Each record contains
+one opaque logical mutation or batch; callers must validate and encode that
+payload and apply it atomically. Earlier experimental NLCWAL01 files are
+not accepted. The existing BLAKE3 dependency is reused.
+
+Defaults limit one record to 8 MiB and the journal to 1 GiB, configurable
+with WalLimits. Opening takes an exclusive advisory file lock, syncs the
+directory entry, and streams one record at a time through a borrowed
+payload callback. The caller must recover into private staging state and
+publish only after successful open; callback side effects cannot be rolled
+back. A physically incomplete final record is truncated and synced. A
+bad complete header, checksum, sequence, or file size fails closed without
+truncation. An incomplete file header is rejected rather than reinitialized.
+
+Buffered append acknowledges OS writes; Data append additionally syncs file
+data before acknowledging. An I/O error or unwind during append poisons
+the handle and prohibits further appends until a fresh recovery. A failed
+sync is ambiguous: a complete unacknowledged record may replay after reopen.
+Record/file admission failures happen before I/O and do not poison the handle.
+
+Use a trusted private journal directory; advisory locks do not protect against
+non-cooperating writers or external file replacement. No snapshot/rotation,
+mutation encoding, wall-clock TTL translation, live cache integration,
+replication or process/power-loss qualification is provided by this primitive.
+The next layer must establish a single mutation/acknowledgement boundary and
+fail-stop serving semantics before enabling persistent RESP traffic.
