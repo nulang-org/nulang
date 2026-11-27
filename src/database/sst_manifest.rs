@@ -553,6 +553,20 @@ impl ManifestStore {
         Ok(())
     }
 
+    /// Copy an exact sealed recovery generation into a fresh directory.
+    pub(super) fn copy_seal_into(&self, dir: &Path) -> io::Result<super::wal::SealBinding> {
+        let expected = self.sync_for_wal_binding()?;
+        super::sealed_backup::new_directory(dir)?;
+        let mut next = Self::create(dir, self.manifest.tablet_id, self.manifest.epoch)?;
+        self.copy_prefix_into(&mut next)?;
+        next.seal(self.recovery_meta()?.clone())?;
+        let actual = next.sync_for_wal_binding()?;
+        if actual != expected {
+            return Err(invalid("copied seal identity mismatch"));
+        }
+        Ok(actual)
+    }
+
     pub fn append(&mut self, entry: TableEntry) -> io::Result<()> {
         self.append_with_hook(entry, |_| Ok(()))
     }

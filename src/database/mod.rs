@@ -8,6 +8,8 @@ pub mod checkpoint;
 pub mod indexed_sst;
 pub mod optimistic;
 #[cfg(unix)]
+mod sealed_backup;
+#[cfg(unix)]
 pub mod sst_manifest;
 #[cfg(unix)]
 mod sst_recovery_meta;

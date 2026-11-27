@@ -651,6 +651,134 @@ impl WalBackedTablet {
         Ok(())
     }
 
+    /// Export a point-in-time local backup while this handle owns the WAL
+    /// writer lock and the caller owns the active manifest lock. Only a
+    /// fresh destination is accepted; never reuse an interrupted directory.
+    /// No concurrent writes during this synchronous operation.
+    #[cfg(unix)]
+    pub fn backup_sealed(
+        &self,
+        manifest: &super::sst_manifest::ManifestStore,
+        destination: impl AsRef<Path>,
+    ) -> std::io::Result<()> {
+        use super::sealed_backup::{self, Completion};
+        use std::io;
+        let binding = manifest.wal_binding()?;
+        if self.recovery_required
+            || self.wal.is_poisoned()
+            || !self.wal.matches_seal(binding)
+            || manifest.current().recovery_descriptor() != Some(self.descriptor())
+            || manifest.current().recovery_floor() != Some(self.oldest_retained_snapshot())
+            || self.current_sequence() != self.wal.last_sequence()
+        {
+            return Err(io::Error::other(
+                "backup requires active recovered sealed binding",
+            ));
+        }
+        match std::fs::symlink_metadata(&self.checkpoint_path) {
+            Ok(_) => return Err(io::Error::other("legacy checkpoint prevents sealed backup")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let destination = destination.as_ref();
+        sealed_backup::new_directory(destination)?;
+        let seal_dir = destination.join("sst");
+        let copied = manifest.copy_seal_into(&seal_dir)?;
+        if copied != binding {
+            return Err(io::Error::other("backup seal changed"));
+        }
+        let wal_len = self
+            .wal
+            .records()
+            .len()
+            .checked_sub(1)
+            .and_then(|i| self.wal.record_end_offset(i))
+            .unwrap_or(96);
+        let wal_path = destination.join("tablet.wal");
+        let wal_digest = sealed_backup::copy_wal(self.wal.path(), &wal_path, wal_len)?;
+        // Reopen the independent copy, not the source. Require exact live
+        // logical state and ensure recovery did not truncate any bytes.
+        let recovered =
+            Self::open_from_sealed_sst(self.descriptor().clone(), &wal_path, &seal_dir)?;
+        if recovered.tablet.snapshot_state() != self.tablet.snapshot_state()
+            || std::fs::metadata(&wal_path)?.len() != wal_len
+        {
+            return Err(io::Error::other("backup recovery disagrees with source"));
+        }
+        drop(recovered);
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::BackupBeforeCompletion,
+        )?;
+        Completion {
+            sequence: self.current_sequence(),
+            floor: self.oldest_retained_snapshot(),
+            wal_len,
+            wal_digest,
+            seal_digest: binding.digest,
+        }
+        .publish(destination)
+    }
+
+    /// Restore a completed backup into a fresh, independent directory.
+    /// Verify the exact WAL length and digest before any recovery parser can
+    /// repair a torn tail. Never write to the archived WAL or overwrite a
+    /// previous restore. The caller must not promote a failed destination.
+    #[cfg(unix)]
+    pub fn restore_sealed_backup(
+        descriptor: TabletDescriptor,
+        backup: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> std::io::Result<Self> {
+        use super::sealed_backup::{self, Completion};
+        use std::io;
+        let backup = backup.as_ref();
+        let destination = destination.as_ref();
+        let completion = Completion::read(backup)?;
+        let manifest = super::sst_manifest::ManifestStore::open(
+            backup.join("sst"),
+            descriptor.id().get(),
+            descriptor.ownership_epoch(),
+        )?;
+        let binding = manifest.wal_binding()?;
+        if binding.digest != completion.seal_digest
+            || manifest.current().recovery_descriptor() != Some(&descriptor)
+            || manifest.current().recovery_floor() != Some(completion.floor)
+            || binding.sequence > completion.sequence
+        {
+            return Err(io::Error::other(
+                "backup seal does not match completion marker",
+            ));
+        }
+        sealed_backup::new_directory(destination)?;
+        let seal_dir = destination.join("sst");
+        manifest.copy_seal_into(&seal_dir)?;
+        let wal_path = destination.join("tablet.wal");
+        if sealed_backup::copy_wal(&backup.join("tablet.wal"), &wal_path, completion.wal_len)?
+            != completion.wal_digest
+        {
+            return Err(io::Error::other("backup WAL digest mismatch"));
+        }
+        let restored = Self::open_from_sealed_sst(descriptor, &wal_path, &seal_dir)?;
+        if !restored.wal.matches_seal(binding)
+            || restored.current_sequence() != completion.sequence
+            || restored.oldest_retained_snapshot() != completion.floor
+            || std::fs::metadata(&wal_path)?.len() != completion.wal_len
+        {
+            return Err(io::Error::other(
+                "restored state disagrees with backup completion",
+            ));
+        }
+        sealed_backup::sync_directory(destination)?;
+        sealed_backup::sync_directory(
+            destination
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new(".")),
+        )?;
+        Ok(restored)
+    }
+
     /// Diagnostic point read against the published shadow SST prefix.
     /// No fallback or authoritative read routing. Compare both the exact
     /// WAL mutation (including sequence and tombstone) and the live tablet.
