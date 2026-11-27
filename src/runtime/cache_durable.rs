@@ -294,6 +294,8 @@ pub struct DurableCache {
     anchor: CacheTime,
     limits: WalLimits,
     sync: WalSync,
+    #[cfg(feature = "cache-server")]
+    group_start: Option<u64>,
     poisoned: bool,
 }
 
@@ -328,6 +330,8 @@ impl DurableCache {
             anchor: time,
             limits,
             sync,
+            #[cfg(feature = "cache-server")]
+            group_start: None,
             poisoned: false,
         })
     }
@@ -461,6 +465,46 @@ impl DurableCache {
             Ok(())
         }
     }
+    // Only the owning network reactor may use this scope. No replies,
+    // checkpoints, other connections, or external state access until finish.
+    #[cfg(feature = "cache-server")]
+    pub(super) fn supports_group_commit(&self) -> bool {
+        self.sync == WalSync::Data
+    }
+
+    #[cfg(feature = "cache-server")]
+    pub(super) fn group_open(&self) -> bool {
+        self.group_start.is_some()
+    }
+
+    #[cfg(feature = "cache-server")]
+    pub(super) fn begin_group(&mut self) -> Result<(), DurableError> {
+        self.healthy()?;
+        if !self.supports_group_commit() || self.group_open() {
+            self.poisoned = true;
+            return Err(DurableError::Poisoned);
+        }
+        self.group_start = Some(self.wal.last_sequence());
+        Ok(())
+    }
+
+    #[cfg(feature = "cache-server")]
+    pub(super) fn finish_group(&mut self) -> Result<u64, DurableError> {
+        self.healthy()?;
+        let start = self.group_start.ok_or(DurableError::Poisoned)?;
+        let records = self.wal.last_sequence() - start;
+        if records != 0 {
+            self.wal.synchronize()?;
+        }
+        self.group_start = None;
+        Ok(records)
+    }
+
+    #[cfg(all(test, feature = "cache-server"))]
+    pub(super) fn fail_next_group_sync(&mut self) {
+        self.wal.fail_next_sync = true;
+    }
+
     fn commit(&mut self, payload: &[u8], time: CacheTime) -> Result<usize, DurableError> {
         self.commit_with(payload, time, |wal, payload, sync| {
             wal.append(payload, sync)
@@ -478,7 +522,15 @@ impl DurableCache {
         record.preflight(&self.store, time)?;
         // Poison before the append so unwinding cannot expose uncertain state.
         self.poisoned = true;
-        if let Err(error) = append(&mut self.wal, payload, self.sync) {
+        #[cfg(feature = "cache-server")]
+        let sync = if self.group_open() {
+            WalSync::Buffered
+        } else {
+            self.sync
+        };
+        #[cfg(not(feature = "cache-server"))]
+        let sync = self.sync;
+        if let Err(error) = append(&mut self.wal, payload, sync) {
             self.poisoned = self.wal.is_poisoned();
             return Err(error.into());
         }

@@ -118,3 +118,23 @@ tail-latency claims. Raw results: fabric-clock-reservation-20261127.json.
 | sync | ttl-set | 32 | 212 | 263 | 7,886 |
 
 TTL GET and buffered TTL SET improve substantially; synchronous SET still pays per-mutation WAL synchronization. Group commit is the next bottleneck to address. No production capacity claim.
+
+
+## Bounded synchronous group commit follow-up
+
+With --fabric-group-commit and --fabric-clock-reservation-ms 1000, the
+synchronous reactor coalesces at most one 32-command connection turn
+into one WAL data synchronization. The entire turn is withheld from
+the socket until the WAL boundary succeeds. This is not a transaction
+and does not change recovery of individual complete records. No artificial
+waiting interval is introduced. The raw follow-up is in
+fabric-group-commit-20261127.json.
+
+| Workload | Pipeline | Prior Fabric ops/s | Grouped Fabric ops/s | Follow-up Valkey ops/s |
+|---|---:|---:|---:|---:|
+| set | 1 | 178 | 1,037 | 1,060 |
+| set | 32 | 843 | 27,184 | 31,298 |
+| ttl-set | 1 | 248 | 1,307 | 1,301 |
+| ttl-set | 32 | 263 | 35,052 | 38,845 |
+
+Separate runs on the same Fedora host, not a controlled paired before/after trial. Three repeats per case, optimized focused harness, real Btrfs disk, small hot-key workload. For non-TTL SET the prior baseline used exact clock mode; plain SET does not need clock publication. No full-workspace release binary, concurrency, power-loss or reliable p99 claim. Grouped mode is opt-in and only applies to synchronous WAL records within one connection turn; no cross-client batching.

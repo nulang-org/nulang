@@ -91,7 +91,7 @@ def free_port() -> int:
 
 
 @contextmanager
-def server(binary: Path, engine: str, mode: str, root: Path, clock_reservation_ms: int = 0):
+def server(binary: Path, engine: str, mode: str, root: Path, clock_reservation_ms: int = 0, group_commit: bool = False):
     with tempfile.TemporaryDirectory(prefix=f"{engine}-{mode}-", dir=root) as tmp:
         path = Path(tmp)
         port = free_port()
@@ -101,6 +101,8 @@ def server(binary: Path, engine: str, mode: str, root: Path, clock_reservation_m
                 command += ["--journal", str(path / "cache.wal"), "--checkpoint-percent", "0"]
                 if clock_reservation_ms:
                     command += ["--clock-reservation-ms", str(clock_reservation_ms)]
+                if mode == "sync" and group_commit:
+                    command += ["--group-commit", "1"]
         else:
             command = [str(binary), "--bind", "127.0.0.1", "--port", str(port),
                        "--save", "", "--appendonly", "no" if mode == "memory" else "yes",
@@ -154,6 +156,7 @@ def main() -> None:
     p.add_argument("--memory-commands", type=int, default=4096)
     p.add_argument("--durable-commands", type=int, default=256)
     p.add_argument("--fabric-clock-reservation-ms", type=int, default=0, choices=range(1001), metavar="0..1000")
+    p.add_argument("--fabric-group-commit", action="store_true")
     p.add_argument("--mode", action="append", choices=("memory", "buffered", "sync"))
     p.add_argument("--workload", action="append", choices=("get", "set", "ttl-get", "ttl-set"))
     args = p.parse_args()
@@ -170,6 +173,7 @@ def main() -> None:
         "journal_directory": str(args.journal_dir.resolve()), "rounds": args.rounds,
         "value_bytes": len(VALUE), "clients": 1, "latency_unit": "batch round trip microseconds",
         "fabric_clock_reservation_ms": args.fabric_clock_reservation_ms,
+        "fabric_group_commit": args.fabric_group_commit,
         "expected_cases": len(modes) * len(workloads) * 2,
         "cases": [],
     }
@@ -181,7 +185,7 @@ def main() -> None:
                 for n in range(args.rounds):
                     order = ("fabric", "valkey") if n % 2 == 0 else ("valkey", "fabric")
                     for engine in order:
-                        with server(binaries[engine], engine, mode, args.journal_dir, args.fabric_clock_reservation_ms) as sock:
+                        with server(binaries[engine], engine, mode, args.journal_dir, args.fabric_clock_reservation_ms, args.fabric_group_commit) as sock:
                             samples[engine].append(measure(sock, name, depth, commands))
                 case = {"mode": mode, "workload": name, "pipeline": depth,
                         "samples": samples, "median": {e: summarize(s) for e, s in samples.items()}}

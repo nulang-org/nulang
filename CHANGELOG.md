@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Fabric bounded synchronous group commit — 2026-11-27
+- **Add opt-in synchronous WAL group commit within each bounded connection turn**, holding responses until the WAL is synced, preserving ordered mutation visibility and fail-stop on uncertain writes. Expose group counters and benchmark evidence; no new dependencies.
+
 ### Fabric durable clock reservation — 2026-11-27
 - **Add opt-in 0–1000 ms durable clock reservations**, preserving persisted observation coverage and fail-closed rollback behavior while avoiding repeated sidecar synchronization within the window. Exact mode remains default; reserved mode may delay restart. Add comparative TTL benchmark evidence without changing dependencies or mutation acknowledgement semantics.
 

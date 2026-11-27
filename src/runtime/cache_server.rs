@@ -589,6 +589,8 @@ pub struct CacheOperationalCounters {
     pub handshake_timeouts: u64,
     pub commands_dispatched: u64,
     pub polls_completed: u64,
+    pub wal_groups_synced: u64,
+    pub wal_group_records_synced: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -636,6 +638,8 @@ pub struct CacheShardServer {
     next_expiry_sweep: Instant,
     mutual_tls: Option<CacheMutualTls>,
     started: bool,
+    #[cfg(unix)]
+    group_commit: bool,
     counters: CacheOperationalCounters,
     #[cfg(unix)]
     automatic_checkpoint: Option<AutomaticCheckpoint>,
@@ -790,6 +794,8 @@ impl CacheShardServer {
             next_expiry_sweep,
             mutual_tls: None,
             started: false,
+            #[cfg(unix)]
+            group_commit: false,
             counters: CacheOperationalCounters::default(),
             #[cfg(unix)]
             automatic_checkpoint: None,
@@ -852,7 +858,7 @@ impl CacheShardServer {
                 (
                     cache.operational_store(),
                     true,
-                    cache.is_poisoned(),
+                    cache.is_poisoned() || cache.group_open(),
                     used,
                     limit,
                 )
@@ -925,6 +931,20 @@ impl CacheShardServer {
                 .configure_clock_reservation(millis)
                 .map_err(CacheServerError::Durability),
         }
+    }
+
+    /// Opt-in synchronous WAL batching within a single connection turn.
+    #[cfg(unix)]
+    pub fn enable_group_commit(&mut self) -> Result<(), CacheServerError> {
+        if self.started
+            || !matches!(&self.backend, CacheBackend::Durable { cache, .. } if cache.supports_group_commit())
+        {
+            return Err(CacheServerError::InvalidConfig(
+                "group commit requires synchronous durable mode before polling",
+            ));
+        }
+        self.group_commit = true;
+        Ok(())
     }
 
     /// Explicit maintenance checkpoint on the owning reactor thread.
@@ -1029,7 +1049,8 @@ impl CacheShardServer {
 
     fn ensure_healthy(&mut self) -> Result<(), CacheServerError> {
         #[cfg(unix)]
-        if matches!(&self.backend, CacheBackend::Durable { cache, .. } if cache.is_poisoned()) {
+        if matches!(&self.backend, CacheBackend::Durable { cache, .. } if cache.is_poisoned() || cache.group_open())
+        {
             for (_, mut connection) in self.connections.drain() {
                 let _ = self.poll.registry().deregister(&mut connection.stream);
             }
@@ -1565,6 +1586,41 @@ impl CacheShardServer {
     }
 
     fn process_input(&mut self, connection: &mut CacheConnection) -> Result<(), ConnectionAction> {
+        #[cfg(unix)]
+        if self.group_commit {
+            let CacheBackend::Durable { cache, .. } = &mut self.backend else {
+                return Err(ConnectionAction::Close);
+            };
+            cache.begin_group().map_err(|_| ConnectionAction::Close)?;
+            let result = self.process_input_inner(connection);
+            // Even a non-fatal connection close may follow successful
+            // mutations. Commit them before any later connection can see them.
+            // A failed append/sync leaves the group open/poisoned; the
+            // reactor then closes all clients before flushing any reply.
+            let CacheBackend::Durable { cache, .. } = &mut self.backend else {
+                return Err(ConnectionAction::Close);
+            };
+            let records = cache.finish_group().map_err(|_| ConnectionAction::Close)?;
+            if records != 0 {
+                self.counters.wal_groups_synced = self.counters.wal_groups_synced.saturating_add(1);
+                self.counters.wal_group_records_synced = self
+                    .counters
+                    .wal_group_records_synced
+                    .saturating_add(records);
+            }
+            if !self.shutdown.load(Ordering::Acquire) {
+                self.maybe_checkpoint(self.clock.now_ms())
+                    .map_err(|_| ConnectionAction::Close)?;
+            }
+            return result;
+        }
+        self.process_input_inner(connection)
+    }
+
+    fn process_input_inner(
+        &mut self,
+        connection: &mut CacheConnection,
+    ) -> Result<(), ConnectionAction> {
         // Bound the number of complete commands in a buffered read batch
         // before executing any of that batch. A partial trailing frame is
         // retained for a later read, not counted as a complete command.
@@ -1673,9 +1729,9 @@ impl CacheShardServer {
             self.counters.commands_dispatched = self.counters.commands_dispatched.saturating_add(1);
             connection.input_start += consumed;
             connection.commands_remaining -= 1;
-            // Check between pipelined commands as well as between poll cycles.
+            // Group commit defers maintenance until after synchronization.
             #[cfg(unix)]
-            if !self.shutdown.load(Ordering::Acquire) {
+            if !self.group_commit && !self.shutdown.load(Ordering::Acquire) {
                 self.maybe_checkpoint(self.clock.now_ms())
                     .map_err(|_| ConnectionAction::Close)?;
             }
@@ -3159,5 +3215,163 @@ mod tests {
         drop(different);
         drop(replacement);
         assert!(budget.inner.peers.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_commit_preserves_order_and_reduces_sync_boundaries() {
+        let tmp = DurableTestDir::new();
+        let journal = tmp.0.join("group.wal");
+        let mut server = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        server.enable_group_commit().unwrap();
+        let mut client = connect_client(&server);
+        let wire = b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n".repeat(64);
+        let expected: String = (1..=64).map(|n| format!(":{n}\r\n")).collect();
+        roundtrip(&mut server, &mut client, &wire, expected.as_bytes());
+        let snapshot = server.operational_snapshot();
+        assert_eq!(snapshot.counters.wal_groups_synced, 2);
+        assert_eq!(snapshot.counters.wal_group_records_synced, 64);
+        roundtrip(
+            &mut server,
+            &mut client,
+            b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
+            b"$2\r\n64\r\n",
+        );
+        assert_eq!(server.operational_snapshot().counters.wal_groups_synced, 2);
+        drop(server);
+        let mut recovered = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        let mut client = connect_client(&recovered);
+        roundtrip(
+            &mut recovered,
+            &mut client,
+            b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
+            b"$2\r\n64\r\n",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_sync_failure_withholds_every_reply_and_stops_shard() {
+        let tmp = DurableTestDir::new();
+        let journal = tmp.0.join("group-failure.wal");
+        let mut server = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        server.enable_group_commit().unwrap();
+        let mut client = connect_client(&server);
+        let mut other = connect_client(&server);
+        roundtrip(
+            &mut server,
+            &mut other,
+            b"*1\r\n$4\r\nPING\r\n",
+            b"+PONG\r\n",
+        );
+        if let CacheBackend::Durable { cache, .. } = &mut server.backend {
+            cache.fail_next_group_sync();
+        }
+        client
+            .write_all(b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+            .unwrap();
+        let mut failed = false;
+        for _ in 0..8 {
+            match server.poll_once(Some(Duration::from_millis(5))) {
+                Err(CacheServerError::DurableShardPoisoned) => {
+                    failed = true;
+                    break;
+                }
+                other => other.unwrap(),
+            }
+        }
+        assert!(failed);
+        assert_eq!(server.connection_count(), 0);
+        assert_eq!(server.buffer_budget.used_bytes(), 0);
+        for stream in [&mut client, &mut other] {
+            match stream.read(&mut [0; 1]) {
+                Ok(0) => {}
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+                result => panic!("uncertain group exposed response: {result:?}"),
+            }
+        }
+        assert_eq!(server.operational_snapshot().counters.wal_groups_synced, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_commit_syncs_successful_prefix_even_if_later_record_exceeds_limit() {
+        let tmp = DurableTestDir::new();
+        let journal = tmp.0.join("group-limit.wal");
+        let limits = WalLimits {
+            max_record_bytes: 128,
+            max_file_bytes: 96,
+        };
+        let mut server = build_durable_server(&journal, WalSync::Data, limits);
+        server.enable_group_commit().unwrap();
+        let mut client = connect_client(&server);
+        roundtrip(&mut server, &mut client,
+            b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$3\r\nnew\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
+            b"+OK\r\n-ERR cache persistence unavailable\r\n$1\r\nv\r\n");
+        assert_eq!(
+            server
+                .operational_snapshot()
+                .counters
+                .wal_group_records_synced,
+            1
+        );
+        assert!(server.operational_snapshot().healthy);
+        drop(server);
+        let mut recovered = build_durable_server(&journal, WalSync::Data, limits);
+        let mut client = connect_client(&recovered);
+        roundtrip(
+            &mut recovered,
+            &mut client,
+            b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
+            b"$1\r\nv\r\n",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_append_failure_never_releases_pending_replies() {
+        let tmp = DurableTestDir::new();
+        let journal = tmp.0.join("group-append-failure.wal");
+        let mut server = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        server.enable_group_commit().unwrap();
+        let mut client = connect_client(&server);
+        roundtrip(
+            &mut server,
+            &mut client,
+            b"*1\r\n$4\r\nPING\r\n",
+            b"+PONG\r\n",
+        );
+        if let CacheBackend::Durable { cache, .. } = &mut server.backend {
+            cache.fail_next_append();
+        }
+        client
+            .write_all(b"*1\r\n$4\r\nPING\r\n*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n")
+            .unwrap();
+        let mut failed = false;
+        for _ in 0..8 {
+            match server.poll_once(Some(Duration::from_millis(5))) {
+                Err(CacheServerError::DurableShardPoisoned) => {
+                    failed = true;
+                    break;
+                }
+                other => other.unwrap(),
+            }
+        }
+        assert!(failed);
+        assert_eq!(server.connection_count(), 0);
+        match client.read(&mut [0; 1]) {
+            Ok(0) => {}
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+            other => panic!("unexpected reply from failed group: {other:?}"),
+        }
+        drop(server);
+        let mut recovered = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        let mut client = connect_client(&recovered);
+        roundtrip(
+            &mut recovered,
+            &mut client,
+            b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
+            b"$-1\r\n",
+        );
     }
 }
