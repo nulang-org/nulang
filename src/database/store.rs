@@ -75,8 +75,8 @@ impl WalBackedTablet {
     /// plus the complete existing WAL. Verify every overlapping mutation and
     /// receipt before replaying the tail. Refuses existing checkpoints and
     /// unbound compacted WALs. A version-four header must bind exactly to
-    /// the sealed manifest before tail repair. No production writer emits
-    /// such a header yet; legacy checkpoint/reclamation is disabled for it.
+    /// the sealed manifest before tail repair. Only explicit sealed cutover
+    /// emits this header; legacy checkpoint/reclamation is disabled for it.
     #[cfg(unix)]
     pub fn open_from_sealed_sst(
         descriptor: TabletDescriptor,
