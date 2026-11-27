@@ -349,3 +349,18 @@ nudb/memory_prepare_commit) measures local work without mailbox or disk
 overhead. Existing cache and actor groups serve as separate baselines. This
 qualification slice neither implements parallel language par nor changes
 production storage or actor scheduling semantics.
+
+### Opt-in local durability baseline
+
+Set NULANG_BENCH_STORAGE_DIR to an existing directory on the filesystem being
+measured. Run the nudb/durable_prepare_commit, fabric/durable_local_append and
+fabric/local_replay Criterion groups separately; no storage fixture is created
+by the default benchmark run. The operator must verify the directory is on
+the intended persistent filesystem, not tmpfs or a memory-backed mount.
+
+The first two groups measure one acknowledged local write at 64 and 4096
+payload bytes; neither implies replicated/quorum durability. Fresh bounded
+fixtures exclude file/stream creation and cleanup from measured time.
+Fabric replay measures a 16-record batch at the head and tail of a warm
+128-record multi-segment log. Record storage device and filesystem details,
+and distinguish these microbenchmarks from end-to-end latency distributions.
