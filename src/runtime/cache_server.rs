@@ -325,6 +325,42 @@ pub struct CacheDurableConfig {
     pub sync: WalSync,
 }
 
+/// Automatic maintenance is opt-in for embedded reactors.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+pub struct AutomaticCheckpointConfig {
+    pub trigger_percent: u8,
+    pub min_savings_percent: u8,
+    pub retry_cooldown_ms: u64,
+}
+
+#[cfg(unix)]
+impl Default for AutomaticCheckpointConfig {
+    fn default() -> Self {
+        Self {
+            trigger_percent: 70,
+            min_savings_percent: 10,
+            retry_cooldown_ms: 5000,
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AutomaticCheckpointStats {
+    pub completed: u64,
+    pub skipped_ineffective: u64,
+    pub failed: u64,
+    pub reclaimed_bytes: u64,
+}
+
+#[cfg(unix)]
+struct AutomaticCheckpoint {
+    config: AutomaticCheckpointConfig,
+    next_attempt_ms: u64,
+    stats: AutomaticCheckpointStats,
+}
+
 enum CacheBackend {
     Memory(CacheStore),
     #[cfg(unix)]
@@ -369,6 +405,8 @@ pub struct CacheShardServer {
     shutdown: Arc<AtomicBool>,
     waker: Arc<Waker>,
     next_expiry_sweep: Instant,
+    #[cfg(unix)]
+    automatic_checkpoint: Option<AutomaticCheckpoint>,
 }
 
 impl CacheShardServer {
@@ -516,6 +554,8 @@ impl CacheShardServer {
             shutdown,
             waker,
             next_expiry_sweep,
+            #[cfg(unix)]
+            automatic_checkpoint: None,
         })
     }
 
@@ -573,6 +613,84 @@ impl CacheShardServer {
         result
     }
 
+    /// Enable synchronous checkpoint maintenance for a durable shard.
+    #[cfg(unix)]
+    pub fn enable_automatic_checkpoint(
+        &mut self,
+        config: AutomaticCheckpointConfig,
+    ) -> Result<(), CacheServerError> {
+        if !(1..=99).contains(&config.trigger_percent)
+            || !(1..=99).contains(&config.min_savings_percent)
+            || config.retry_cooldown_ms == 0
+        {
+            return Err(CacheServerError::InvalidConfig(
+                "invalid automatic checkpoint policy",
+            ));
+        }
+        if !matches!(&self.backend, CacheBackend::Durable { .. }) {
+            return Err(CacheServerError::InvalidConfig(
+                "automatic checkpoint requires durable mode",
+            ));
+        }
+        self.automatic_checkpoint = Some(AutomaticCheckpoint {
+            config,
+            next_attempt_ms: 0,
+            stats: AutomaticCheckpointStats::default(),
+        });
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub fn automatic_checkpoint_stats(&self) -> Option<AutomaticCheckpointStats> {
+        self.automatic_checkpoint
+            .as_ref()
+            .map(|policy| policy.stats)
+    }
+
+    #[cfg(unix)]
+    fn maybe_checkpoint(&mut self, now_ms: u64) -> Result<(), CacheServerError> {
+        let Some(policy) = &mut self.automatic_checkpoint else {
+            return Ok(());
+        };
+        if now_ms < policy.next_attempt_ms {
+            return Ok(());
+        }
+        let CacheBackend::Durable { cache, anchor } = &mut self.backend else {
+            return Ok(());
+        };
+        let (used, limit) = cache.journal_usage();
+        if u128::from(used) * 100 < u128::from(limit) * u128::from(policy.config.trigger_percent) {
+            return Ok(());
+        }
+        let compacted = cache.estimated_checkpoint_bytes(now_ms);
+        let savings = used.saturating_sub(compacted);
+        if compacted >= used
+            || u128::from(savings) * 100
+                < u128::from(used) * u128::from(policy.config.min_savings_percent)
+        {
+            policy.stats.skipped_ineffective = policy.stats.skipped_ineffective.saturating_add(1);
+            policy.next_attempt_ms = now_ms.saturating_add(policy.config.retry_cooldown_ms);
+            return Ok(());
+        }
+        let time = durable_clock(*anchor, now_ms).map_err(CacheServerError::Durability)?;
+        match cache.checkpoint(time) {
+            Ok(report) => {
+                policy.stats.completed = policy.stats.completed.saturating_add(1);
+                policy.stats.reclaimed_bytes = policy
+                    .stats
+                    .reclaimed_bytes
+                    .saturating_add(report.before_bytes.saturating_sub(report.after_bytes));
+            }
+            Err(_) => {
+                policy.stats.failed = policy.stats.failed.saturating_add(1);
+                policy.next_attempt_ms = now_ms.saturating_add(policy.config.retry_cooldown_ms);
+            }
+        }
+        // Non-poisoning maintenance failures retain the old journal and retry
+        // after a cooldown. Ambiguous publication is always fail-stop.
+        self.ensure_healthy()
+    }
+
     fn ensure_healthy(&mut self) -> Result<(), CacheServerError> {
         #[cfg(unix)]
         if matches!(&self.backend, CacheBackend::Durable { cache, .. } if cache.is_poisoned()) {
@@ -598,6 +716,8 @@ impl CacheShardServer {
     /// next expiration sweep deadline so TTL reclamation progresses while idle.
     pub fn poll_once(&mut self, timeout: Option<Duration>) -> Result<(), CacheServerError> {
         self.ensure_healthy()?;
+        #[cfg(unix)]
+        self.maybe_checkpoint(self.clock.now_ms())?;
         let timeout = self.poll_timeout(timeout);
         self.poll.poll(&mut self.events, timeout)?;
 
@@ -895,6 +1015,10 @@ impl CacheShardServer {
             }
             debug_assert!(connection.output.len() <= required);
             connection.input_start += consumed;
+            // Check between pipelined commands as well as between poll cycles.
+            #[cfg(unix)]
+            self.maybe_checkpoint(self.clock.now_ms())
+                .map_err(|_| ConnectionAction::Close)?;
         }
     }
 
@@ -1550,6 +1674,113 @@ mod tests {
             &mut client,
             b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
             b"$3\r\nnew\r\n",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_checkpoint_skips_ineffective_snapshot_and_honors_retry_cooldown() {
+        let tmp = DurableTestDir::new();
+        let journal = tmp.0.join("ineffective.wal");
+        let mut server = build_durable_server(
+            &journal,
+            WalSync::Data,
+            WalLimits {
+                max_record_bytes: 128,
+                max_file_bytes: 512,
+            },
+        );
+        let mut client = connect_client(&server);
+        for key in *b"abcd" {
+            let mut wire = b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\nv\r\n".to_vec();
+            let index = wire.iter().position(|&byte| byte == b'a').unwrap();
+            wire[index] = key;
+            roundtrip(&mut server, &mut client, &wire, b"+OK\r\n");
+        }
+        let old = std::fs::read(&journal).unwrap();
+        server
+            .enable_automatic_checkpoint(AutomaticCheckpointConfig {
+                trigger_percent: 40,
+                min_savings_percent: 10,
+                retry_cooldown_ms: 5000,
+            })
+            .unwrap();
+        let now = server.clock.now_ms();
+        server.maybe_checkpoint(now).unwrap();
+        assert_eq!(
+            server
+                .automatic_checkpoint_stats()
+                .unwrap()
+                .skipped_ineffective,
+            1
+        );
+        server.maybe_checkpoint(now + 4999).unwrap();
+        assert_eq!(
+            server
+                .automatic_checkpoint_stats()
+                .unwrap()
+                .skipped_ineffective,
+            1
+        );
+        server.maybe_checkpoint(now + 5000).unwrap();
+        let stats = server.automatic_checkpoint_stats().unwrap();
+        assert_eq!(stats.skipped_ineffective, 2);
+        assert_eq!(stats.completed, 0);
+        assert_eq!(std::fs::read(&journal).unwrap(), old);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_checkpoint_retries_prepublication_failure_without_poisoning() {
+        let tmp = DurableTestDir::new();
+        let parent = tmp.0.join("journal");
+        let moved = tmp.0.join("moved");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("cache.wal");
+        let mut server = build_durable_server(
+            &path,
+            WalSync::Data,
+            WalLimits {
+                max_record_bytes: 128,
+                max_file_bytes: 512,
+            },
+        );
+        let mut client = connect_client(&server);
+        for _ in 0..5 {
+            roundtrip(
+                &mut server,
+                &mut client,
+                b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n",
+                b"+OK\r\n",
+            );
+        }
+        let old = std::fs::read(&path).unwrap();
+        server
+            .enable_automatic_checkpoint(AutomaticCheckpointConfig {
+                trigger_percent: 40,
+                min_savings_percent: 10,
+                retry_cooldown_ms: 5000,
+            })
+            .unwrap();
+        // Simulate an inaccessible destination before the replacement is created.
+        std::fs::rename(&parent, &moved).unwrap();
+        let now = server.clock.now_ms();
+        server.maybe_checkpoint(now).unwrap();
+        assert_eq!(server.automatic_checkpoint_stats().unwrap().failed, 1);
+        assert_eq!(std::fs::read(moved.join("cache.wal")).unwrap(), old);
+        std::fs::rename(&moved, &parent).unwrap();
+        server.maybe_checkpoint(now + 4999).unwrap();
+        assert_eq!(server.automatic_checkpoint_stats().unwrap().completed, 0);
+        server.maybe_checkpoint(now + 5000).unwrap();
+        let stats = server.automatic_checkpoint_stats().unwrap();
+        assert_eq!(stats.completed, 1);
+        assert_eq!(stats.failed, 1);
+        assert!(stats.reclaimed_bytes > 0);
+        roundtrip(
+            &mut server,
+            &mut client,
+            b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
+            b"$1\r\nv\r\n",
         );
     }
 }

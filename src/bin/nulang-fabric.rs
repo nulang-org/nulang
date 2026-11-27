@@ -5,7 +5,10 @@ mod unix {
         cache_cluster::{CacheAdvertisedEndpoint, CacheEndpointMap},
         cache_dispatch::{CacheDispatchChannels, CacheDispatcher},
         cache_routing::CacheSlotMap,
-        cache_server::{CacheDurableConfig, CacheServerClock, CacheServerConfig, CacheShardServer},
+        cache_server::{
+            AutomaticCheckpointConfig, CacheDurableConfig, CacheServerClock, CacheServerConfig,
+            CacheShardServer,
+        },
         cache_wal::{WalLimits, WalSync},
     };
     use std::{collections::HashSet, io::Write, net::SocketAddr, path::PathBuf};
@@ -15,6 +18,9 @@ mod unix {
     --max-entries N --max-arena-bytes N --max-connections N
     --max-connection-bytes N --max-input-bytes N --max-output-bytes N
     --max-record-bytes N --max-journal-bytes N
+    --checkpoint-percent 0..99 (default 70; 0 disables)
+    --checkpoint-min-savings-percent 1..99 (default 10)
+    --checkpoint-retry-ms N (default 5000)
 
 Loopback-only, single-shard RESP server. No authentication or TLS.
 Durable modes require a private journal path. Memory mode is the default.";
@@ -34,6 +40,7 @@ Durable modes require a private journal path. Memory mode is the default.";
         cache: CacheLimits,
         server: CacheServerConfig,
         wal: WalLimits,
+        checkpoint: AutomaticCheckpointConfig,
     }
 
     fn positive<T: std::str::FromStr + PartialEq + Default>(
@@ -56,6 +63,7 @@ Durable modes require a private journal path. Memory mode is the default.";
                 cache: CacheLimits::default(),
                 server: CacheServerConfig::default(),
                 wal: WalLimits::default(),
+                checkpoint: AutomaticCheckpointConfig::default(),
             };
             let mut seen = HashSet::new();
             let mut args = args.into_iter();
@@ -100,6 +108,17 @@ Durable modes require a private journal path. Memory mode is the default.";
                     }
                     "--max-record-bytes" => config.wal.max_record_bytes = positive(&value, &flag)?,
                     "--max-journal-bytes" => config.wal.max_file_bytes = positive(&value, &flag)?,
+                    "--checkpoint-percent" => {
+                        config.checkpoint.trigger_percent =
+                            value.parse().map_err(|_| "invalid checkpoint percent")?
+                    }
+                    "--checkpoint-min-savings-percent" => {
+                        config.checkpoint.min_savings_percent = positive(&value, &flag)?
+                    }
+                    "--checkpoint-retry-ms" => {
+                        config.checkpoint.retry_cooldown_ms = positive(&value, &flag)?
+                    }
+
                     _ => return Err(format!("unknown option {flag}")),
                 }
             }
@@ -116,6 +135,19 @@ Durable modes require a private journal path. Memory mode is the default.";
             }
             if config.wal.max_record_bytes > u32::MAX as usize || config.wal.max_file_bytes < 56 {
                 return Err("invalid journal limits".into());
+            }
+            if config.checkpoint.trigger_percent > 99
+                || !(1..=99).contains(&config.checkpoint.min_savings_percent)
+            {
+                return Err(
+                    "checkpoint percentages must be below 100 (minimum savings must be positive)"
+                        .into(),
+                );
+            }
+            if config.mode == Mode::Memory
+                && seen.iter().any(|flag| flag.starts_with("--checkpoint-"))
+            {
+                return Err("checkpoint options require durable mode".into());
             }
             Ok(config)
         }
@@ -134,7 +166,7 @@ Durable modes require a private journal path. Memory mode is the default.";
                 .map_err(|e| format!("{e:?}"))?
                 .with_cluster_redirects(endpoints);
             let clock = CacheServerClock::new();
-            match self.mode {
+            let mut server = match self.mode {
                 Mode::Memory => CacheShardServer::bind(
                     self.bind,
                     dispatcher,
@@ -161,7 +193,13 @@ Durable modes require a private journal path. Memory mode is the default.";
                     clock,
                 ),
             }
-            .map_err(|e| format!("bind/recovery failed: {e:?}"))
+            .map_err(|e| format!("bind/recovery failed: {e:?}"))?;
+            if self.mode != Mode::Memory && self.checkpoint.trigger_percent != 0 {
+                server
+                    .enable_automatic_checkpoint(self.checkpoint)
+                    .map_err(|e| format!("{e:?}"))?;
+            }
+            Ok(server)
         }
     }
 
@@ -216,6 +254,51 @@ Durable modes require a private journal path. Memory mode is the default.";
             assert_eq!(sync.mode, Mode::Sync);
             assert_eq!(sync.cache.max_entries, 200);
             assert_eq!(sync.cache.max_arena_bytes, 4096);
+        }
+
+        #[test]
+        fn checkpoint_options_are_durable_only_and_validated() {
+            let config = parse(&["--mode", "buffered", "--journal", "cache.wal"]).unwrap();
+            assert_eq!(config.checkpoint.trigger_percent, 70);
+            let disabled = parse(&[
+                "--mode",
+                "sync",
+                "--journal",
+                "cache.wal",
+                "--checkpoint-percent",
+                "0",
+            ])
+            .unwrap();
+            assert_eq!(disabled.checkpoint.trigger_percent, 0);
+            for args in [
+                vec!["--checkpoint-percent", "70"],
+                vec![
+                    "--mode",
+                    "sync",
+                    "--journal",
+                    "cache.wal",
+                    "--checkpoint-percent",
+                    "100",
+                ],
+                vec![
+                    "--mode",
+                    "sync",
+                    "--journal",
+                    "cache.wal",
+                    "--checkpoint-min-savings-percent",
+                    "0",
+                ],
+                vec![
+                    "--mode",
+                    "sync",
+                    "--journal",
+                    "cache.wal",
+                    "--checkpoint-retry-ms",
+                    "0",
+                ],
+            ] {
+                assert!(parse(&args).is_err(), "{args:?}");
+            }
         }
 
         #[test]

@@ -398,11 +398,12 @@ torn append. Only a subsequent physically incomplete record may be truncated.
 Recovery stages the complete cache privately as before. The checkpoint
 report exposes live entry count and before/after journal byte lengths.
 
-Checkpointing is synchronous and explicit; it blocks the reactor and needs
+Checkpointing is synchronous, whether explicit or automatically scheduled;
+it blocks the reactor and needs
 temporary disk space for both files. A checkpoint may fail if the compact
 state (including per-entry framing overhead) exceeds configured journal or
 record limits. The old journal is preserved in that case. There is no
-automatic checkpoint schedule, background compaction, orphan-temp cleanup
+background compaction, orphan-temp cleanup
 after process termination, or independent snapshot backup. Physical
 power-loss qualification and throughput/latency benchmarks remain pending.
 
@@ -434,6 +435,34 @@ The server exits nonzero on configuration, recovery, or reactor failure.
 Process-level tests kill the child without graceful shutdown and verify that
 memory mode loses its contents while both journal modes recover acknowledged
 writes after a process-only failure. This does not establish power-loss
-survival for buffered writes. Graceful signal handling, automatic checkpoint
-scheduling, multi-shard configuration, authentication/TLS and production
+survival for buffered writes. Graceful signal handling, multi-shard configuration, authentication/TLS and production
 performance testing remain pending.
+
+
+## Automatic checkpoint maintenance
+
+Standalone durable modes enable automatic maintenance by default. Embedded
+reactors explicitly opt in via enable_automatic_checkpoint. The scheduler
+checks journal utilization between poll cycles and individual pipelined
+commands. At 70% of the journal limit, it estimates the compacted live
+snapshot size without copying entries or creating a replacement file.
+It checkpoints only if at least 10% of the current journal can be reclaimed.
+Ineffective snapshots or non-poisoning checkpoint errors trigger a five-second
+monotonic cooldown. Ambiguous publication still poisons the journal and
+stops the shard. Completed/skipped/failed maintenance and reclaimed bytes
+are exposed through automatic_checkpoint_stats on the embedded reactor.
+
+Standalone flags: --checkpoint-percent 0..99 (0 disables; default 70),
+--checkpoint-min-savings-percent 1..99 (default 10), and
+--checkpoint-retry-ms (positive milliseconds; default 5000). These options
+are invalid in memory mode. Example:
+
+    nulang-fabric --mode sync --journal /path/to/private/cache.wal --checkpoint-percent 60
+
+Automatic maintenance is not a guarantee that every write fits: a large
+individual mutation, a nearly full live data set, a cooldown, or insufficient
+temporary disk space can still cause journal-limit errors. The live-entry
+size estimate is a linear scan and compaction blocks the reactor. No
+background compaction, independent backup, or exported CLI metrics yet.
+A process-level regression verifies 100 pipelined writes through a 1 KiB
+journal and recovery after killing and restarting the server.

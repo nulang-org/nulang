@@ -307,6 +307,18 @@ impl CacheWal {
         Ok(report)
     }
 
+    pub(super) fn journal_bytes(&self) -> u64 {
+        self.valid_len
+    }
+
+    pub(super) fn checkpoint_header_bytes() -> u64 {
+        CHECKPOINT_HEADER_BYTES as u64
+    }
+
+    pub(super) fn framed_record_bytes(payload_bytes: u64) -> u64 {
+        payload_bytes.saturating_add((RECORD_HEADER_BYTES + CHECKSUM_BYTES) as u64)
+    }
+
     pub fn last_sequence(&self) -> u64 {
         self.last_sequence
     }
