@@ -156,3 +156,127 @@ fn invalid_tables_fail_closed_even_with_recomputed_checksum() {
     fs::write(f.path(), bytes).unwrap();
     assert!(IndexedSst::open(f.path()).is_err());
 }
+
+#[cfg(unix)]
+#[test]
+fn streaming_writer_matches_independent_encoding_and_roundtrips() {
+    use nulang::database::indexed_sst::{write_immutable_table, SstHeader};
+    let f = Fixture::new();
+    let rows: Vec<Row<'_>> = vec![
+        (b"a", vec![(2, Some(b"first")), (4, None), (7, Some(b""))]),
+        (b"b", vec![(9, Some(b"second"))]),
+    ];
+    let header = SstHeader {
+        generation: 1,
+        min_sequence: 1,
+        max_sequence: 10,
+        key_count: 2,
+        version_count: 4,
+    };
+    write_immutable_table(
+        f.path(),
+        header,
+        rows.iter().map(|(k, v)| (*k, v.as_slice())),
+    )
+    .unwrap();
+    assert_eq!(fs::read(f.path()).unwrap(), encode(&rows));
+    let mut table = IndexedSst::open(f.path()).unwrap();
+    assert_eq!(
+        table.read_at(b"a", 5).unwrap(),
+        DiskLookup::Deleted { sequence: 4 }
+    );
+    assert_eq!(
+        table.read_at(b"b", 10).unwrap(),
+        DiskLookup::Value {
+            sequence: 9,
+            value: b"second".to_vec()
+        }
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn writer_rejects_invalid_input_without_publication_or_staging_leak() {
+    use nulang::database::indexed_sst::{write_immutable_table, SstHeader};
+    let f = Fixture::new();
+    let header = SstHeader {
+        generation: 1,
+        min_sequence: 1,
+        max_sequence: 10,
+        key_count: 2,
+        version_count: 2,
+    };
+    for rows in [
+        vec![
+            (b"b".as_slice(), vec![(2, None)]),
+            (b"a".as_slice(), vec![(3, None)]),
+        ],
+        vec![(b"a".as_slice(), vec![(2, None), (2, None)])],
+        vec![(b"a".as_slice(), vec![(2, None)])],
+        vec![
+            (b"a".as_slice(), vec![(2, None)]),
+            (b"b".as_slice(), vec![(11, None)]),
+        ],
+    ] {
+        assert!(write_immutable_table(
+            f.path(),
+            header,
+            rows.iter().map(|(k, v)| (*k, v.as_slice()))
+        )
+        .is_err());
+        assert!(!f.path().exists());
+        assert_eq!(fs::read_dir(&f.0).unwrap().count(), 0);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn writer_never_overwrites_existing_table_and_handles_metadata_only() {
+    use nulang::database::indexed_sst::{write_immutable_table, SstHeader};
+    let f = Fixture::new();
+    let header = SstHeader {
+        generation: 1,
+        min_sequence: 1,
+        max_sequence: 10,
+        key_count: 0,
+        version_count: 0,
+    };
+    write_immutable_table(f.path(), header, std::iter::empty()).unwrap();
+    assert_eq!(fs::read(f.path()).unwrap(), encode(&[]));
+    let original = fs::read(f.path()).unwrap();
+    let other = SstHeader {
+        generation: 2,
+        ..header
+    };
+    assert_eq!(
+        write_immutable_table(f.path(), other, std::iter::empty())
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(fs::read(f.path()).unwrap(), original);
+    assert_eq!(fs::read_dir(&f.0).unwrap().count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn writer_streams_large_value_and_reader_reopens() {
+    use nulang::database::indexed_sst::{write_immutable_table, SstHeader};
+    let f = Fixture::new();
+    let value = vec![23; 4 * 1024 * 1024];
+    let versions = [(2, Some(value.as_slice()))];
+    let header = SstHeader {
+        generation: 1,
+        min_sequence: 1,
+        max_sequence: 10,
+        key_count: 1,
+        version_count: 1,
+    };
+    write_immutable_table(f.path(), header, [(b"a".as_slice(), versions.as_slice())]).unwrap();
+    let mut table = IndexedSst::open(f.path()).unwrap();
+    assert_eq!(table.indexed_key_bytes(), 1);
+    assert_eq!(
+        table.read_at(b"a", 2).unwrap(),
+        DiskLookup::Value { sequence: 2, value }
+    );
+}
