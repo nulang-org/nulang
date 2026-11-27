@@ -78,14 +78,12 @@ tls = []
 ffi = ["dep:libloading", "dep:libffi"]
 # Raw TCP networking: the distributed-actor TCP transport, the HTTP server
 # (`Http.serve`), the metrics server, the package registry server, and the
-# DAP debug server. Uses only `std::net`; disabling it removes those servers
-# (their entry points return errors) while keeping the wire protocol, packet
-# types, and the in-memory deterministic transport.
-tcp = []
-# Dedicated RESP cache reactor. Kept separate from the existing std-only TCP
-# surfaces so embedders do not pay for an OS readiness reactor unless they
-# actually serve the cache protocol.
-cache-server = ["tcp", "dep:mio"]
+# DAP debug server. HTTP listeners use Mio for OS readiness notification.
+# Disabling TCP removes the language-level server entry points while keeping
+# the wire protocol, packet types, and in-memory deterministic transport.
+tcp = ["dep:mio"]
+# Dedicated RESP cache reactor, using the same readiness dependency as TCP.
+cache-server = ["tcp"]
 # Synchronous HTTP client for `Http.get`/`Http.post` builtin effects, the
 # package registry client, and `nula deploy`. Disable for a minimal build
 # without the `ureq` dependency.

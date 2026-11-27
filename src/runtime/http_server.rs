@@ -1,4 +1,4 @@
-//! Experimental HTTP/1.1 server built on std::net::TcpListener with httparse.
+//! Experimental HTTP/1.1 server with OS-ready TCP listeners and httparse.
 //!
 //! Accepted connections run on bounded worker threads; handler dispatch uses
 //! a standalone VM per request. Connections close after one HTTP request.
@@ -431,6 +431,109 @@ fn read_http_request<R: Read>(reader: &mut R) -> Result<Option<HttpRequest>, Htt
     }))
 }
 
+/// Shutdown notification is independent of the public listening socket.
+#[derive(Debug)]
+struct ListenerWake {
+    #[cfg(feature = "tcp")]
+    waker: mio::Waker,
+}
+
+impl ListenerWake {
+    fn wake(&self) {
+        #[cfg(feature = "tcp")]
+        if let Err(error) = self.waker.wake() {
+            eprintln!("failed to wake HTTP listener for shutdown: {error}");
+        }
+    }
+}
+
+/// Wait for OS readiness only when the accept queue is empty. The no-TCP
+/// profile retains the std-only listener for direct host API use.
+struct HttpListener {
+    #[cfg(feature = "tcp")]
+    listener: mio::net::TcpListener,
+    #[cfg(not(feature = "tcp"))]
+    listener: TcpListener,
+    #[cfg(feature = "tcp")]
+    poll: mio::Poll,
+    #[cfg(feature = "tcp")]
+    events: mio::Events,
+}
+
+impl HttpListener {
+    fn new(listener: TcpListener) -> std::io::Result<(Self, ListenerWake)> {
+        listener.set_nonblocking(true)?;
+        #[cfg(feature = "tcp")]
+        {
+            let mut listener = mio::net::TcpListener::from_std(listener);
+            let poll = mio::Poll::new()?;
+            poll.registry()
+                .register(&mut listener, mio::Token(0), mio::Interest::READABLE)?;
+            let waker = mio::Waker::new(poll.registry(), mio::Token(1))?;
+            Ok((
+                Self {
+                    listener,
+                    poll,
+                    events: mio::Events::with_capacity(8),
+                },
+                ListenerWake { waker },
+            ))
+        }
+        #[cfg(not(feature = "tcp"))]
+        Ok((Self { listener }, ListenerWake {}))
+    }
+
+    fn accept(&mut self, shutdown: &AtomicBool) -> std::io::Result<Option<TcpStream>> {
+        use std::io::ErrorKind;
+        loop {
+            if shutdown.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    #[cfg(feature = "tcp")]
+                    let stream: TcpStream = stream.into();
+                    if shutdown.load(Ordering::Acquire) {
+                        return Ok(None);
+                    }
+                    // Mio accepts nonblocking sockets. Workers require blocking
+                    // I/O with their existing read/write deadlines.
+                    if let Err(error) = stream.set_nonblocking(false) {
+                        eprintln!("failed to configure accepted HTTP socket: {error}");
+                        continue;
+                    }
+                    return Ok(Some(stream));
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::Interrupted | ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    // Drain accept until WouldBlock, including after spurious or
+                    // coalesced readiness events. The timeout is a shutdown
+                    // watchdog if notifying the waker fails, not a request tick.
+                    #[cfg(feature = "tcp")]
+                    match self
+                        .poll
+                        .poll(&mut self.events, Some(Duration::from_secs(1)))
+                    {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                        Err(error) => return Err(error),
+                    }
+                    #[cfg(not(feature = "tcp"))]
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
 /// Manages the background HTTP listener thread.
 /// Stored on Runtime; `HttpServerState::bind()` spawns the thread.
 pub struct HttpServerState {
@@ -440,8 +543,9 @@ pub struct HttpServerState {
     pub handler_module: CodeModule,
     /// Function table index of the handler function within handler_module.
     pub handler_func_idx: usize,
-    /// True while the server is running; set to false to signal shutdown.
+    /// Set to true to signal shutdown.
     shutdown_flag: Arc<AtomicBool>,
+    listener_wake: ListenerWake,
     /// Bounded worker admission and handles for orderly connection shutdown.
     connection_slots: Arc<ConnectionSlots>,
     /// Listener thread handle.
@@ -462,6 +566,7 @@ impl std::fmt::Debug for HttpServerState {
 impl Drop for HttpServerState {
     fn drop(&mut self) {
         self.shutdown_flag.store(true, Ordering::Release);
+        self.listener_wake.wake();
         if let Some(handle) = self.listener_thread.take() {
             let _ = handle.join();
         }
@@ -492,6 +597,7 @@ impl HttpServerState {
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(("0.0.0.0", port))?;
         let actual_port = listener.local_addr()?.port();
+        let (listener, listener_wake) = HttpListener::new(listener)?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
         let connection_slots = Arc::new(ConnectionSlots::new(Self::MAX_CONCURRENT_CONNECTIONS));
@@ -515,26 +621,23 @@ impl HttpServerState {
             handler_module,
             handler_func_idx,
             shutdown_flag: shutdown,
+            listener_wake,
             connection_slots,
             listener_thread: Some(handle),
         })
     }
 
     fn listener_loop(
-        listener: TcpListener,
+        mut listener: HttpListener,
         handler_module: CodeModule,
         handler_func_idx: usize,
         shutdown: Arc<AtomicBool>,
         slots: Arc<ConnectionSlots>,
     ) {
-        listener.set_nonblocking(true).ok();
         let handler_module = Arc::new(handler_module);
         loop {
-            if shutdown.load(Ordering::Relaxed) {
-                break;
-            }
-            match listener.accept() {
-                Ok((mut stream, _)) => {
+            match listener.accept(&shutdown) {
+                Ok(Some(mut stream)) => {
                     let lease = match slots.try_acquire_socket(&stream) {
                         Ok(Some(lease)) => lease,
                         Ok(None) => {
@@ -569,10 +672,11 @@ impl HttpServerState {
                         eprintln!("failed to spawn HTTP connection worker: {error}");
                     }
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(10));
+                Ok(None) => break,
+                Err(error) => {
+                    eprintln!("HTTP listener stopped: {error}");
+                    break;
                 }
-                Err(_) => break,
             }
         }
     }
@@ -1992,6 +2096,7 @@ pub struct WebDevServer {
     pub port: u16,
     scoped_streams: Arc<ScopedUiStreams>,
     shutdown_flag: Arc<AtomicBool>,
+    listener_wake: ListenerWake,
     connection_slots: Arc<ConnectionSlots>,
     listener_thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -1999,6 +2104,7 @@ pub struct WebDevServer {
 impl Drop for WebDevServer {
     fn drop(&mut self) {
         self.shutdown_flag.store(true, Ordering::Release);
+        self.listener_wake.wake();
         if let Some(handle) = self.listener_thread.take() {
             let _ = handle.join();
         }
@@ -2317,6 +2423,7 @@ impl WebDevServer {
         let bind_host = if static_only { "127.0.0.1" } else { "0.0.0.0" };
         let listener = TcpListener::bind((bind_host, port))?;
         let actual_port = listener.local_addr()?.port();
+        let (listener, listener_wake) = HttpListener::new(listener)?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
         let connection_slots = Arc::new(ConnectionSlots::new(options.max_concurrent_connections));
@@ -2354,13 +2461,14 @@ impl WebDevServer {
             port: actual_port,
             scoped_streams,
             shutdown_flag: shutdown,
+            listener_wake,
             connection_slots,
             listener_thread: Some(handle),
         })
     }
 
     fn listener_loop(
-        listener: TcpListener,
+        mut listener: HttpListener,
         static_dir: Option<PathBuf>,
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
@@ -2374,16 +2482,12 @@ impl WebDevServer {
         scoped_streams: Arc<ScopedUiStreams>,
         authorizer: Option<UiStreamAuthorizer>,
     ) {
-        listener.set_nonblocking(true).ok();
         // Route tables contain compiled modules; share them rather than
         // cloning the full vector for every incoming connection.
         let routes = Arc::new(routes);
         loop {
-            if shutdown.load(Ordering::Relaxed) {
-                break;
-            }
-            match listener.accept() {
-                Ok((mut stream, _)) => {
+            match listener.accept(&shutdown) {
+                Ok(Some(mut stream)) => {
                     let lease = match slots.try_acquire_socket(&stream) {
                         Ok(Some(lease)) => lease,
                         Ok(None) => {
@@ -2446,10 +2550,11 @@ impl WebDevServer {
                         eprintln!("failed to spawn web connection worker: {error}");
                     }
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(10));
+                Ok(None) => break,
+                Err(error) => {
+                    eprintln!("HTTP listener stopped: {error}");
+                    break;
                 }
-                Err(_) => break,
             }
         }
     }
@@ -3004,6 +3109,103 @@ fn guess_content_type(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_http_listener_accepts_bursts_and_preserves_blocking_io() {
+        let socket = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = socket.local_addr().unwrap();
+        let (mut listener, wake) = HttpListener::new(socket).unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            while let Some(mut stream) = listener.accept(&worker_shutdown).unwrap() {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                // Signal before the client sends, so a nonblocking socket
+                // would immediately fail the read rather than wait for data.
+                accepted_tx.send(()).unwrap();
+                let mut value = [0];
+                stream.read_exact(&mut value).unwrap();
+                stream.write_all(&value).unwrap();
+            }
+            finished_tx.send(()).unwrap();
+        });
+        for _ in 0..2 {
+            let mut clients: Vec<_> = (0..16)
+                .map(|_| {
+                    let client = TcpStream::connect(address).unwrap();
+                    client
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    client
+                })
+                .collect();
+            // TCP acceptance order is not guaranteed across platforms; feed
+            // every client only after the first accepted socket is waiting.
+            accepted_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            for (i, client) in clients.iter_mut().enumerate() {
+                client.write_all(&[i as u8]).unwrap();
+            }
+            for (i, client) in clients.iter_mut().enumerate() {
+                let mut value = [0];
+                client.read_exact(&mut value).unwrap();
+                assert_eq!(value[0], i as u8);
+            }
+            for _ in 1..clients.len() {
+                accepted_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            }
+            // Allow the accept queue to empty between bursts.
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        shutdown.store(true, Ordering::Release);
+        wake.wake();
+        finished_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_http_listener_waker_notifies_poll_without_a_connection() {
+        let socket = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let (mut listener, wake) = HttpListener::new(socket).unwrap();
+        wake.wake();
+        listener
+            .poll
+            .poll(&mut listener.events, Some(Duration::from_secs(3)))
+            .unwrap();
+        assert!(listener
+            .events
+            .iter()
+            .any(|event| event.token() == mio::Token(1)));
+    }
+
+    #[test]
+    fn test_http_server_drop_releases_idle_listeners() {
+        let standalone = HttpServerState::bind(0, CodeModule::new("idle"), 0).unwrap();
+        let web = WebDevServer::bind_runtime(0, None, None, vec![]).unwrap();
+        let standalone_port = standalone.port;
+        let web_port = web.port;
+        std::thread::sleep(Duration::from_millis(20));
+        drop(standalone);
+        drop(web);
+        let _standalone_socket = TcpListener::bind(("0.0.0.0", standalone_port)).unwrap();
+        let _web_socket = TcpListener::bind(("0.0.0.0", web_port)).unwrap();
+    }
+
+    #[test]
+    fn test_http_listener_shutdown_does_not_accept_queued_connection() {
+        let socket = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = socket.local_addr().unwrap();
+        let (mut listener, wake) = HttpListener::new(socket).unwrap();
+        let _client = TcpStream::connect(address).unwrap();
+        let shutdown = AtomicBool::new(true);
+        wake.wake();
+        assert!(listener.accept(&shutdown).unwrap().is_none());
+    }
 
     fn response_wire_for_test(response: HttpResponse) -> String {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
