@@ -437,6 +437,20 @@ impl ManifestStore {
     pub fn recovered_receipt(&self, id: TransactionId) -> io::Result<Option<TransactionReceipt>> {
         Ok(self.recovery_meta()?.receipts.get(&id).copied())
     }
+    /// Canonical sealed manifest identity; includes descriptor, receipts, floor,
+    /// and every referenced immutable table digest. Not an authentication tag.
+    pub(super) fn wal_binding(&self) -> io::Result<super::wal::SealBinding> {
+        let meta = self.recovery_meta()?;
+        let bytes = self.manifest.encode();
+        Ok(super::wal::SealBinding {
+            sequence: self.manifest.durable_sequence(),
+            tablet_id: meta.descriptor.id(),
+            epoch: meta.descriptor.ownership_epoch(),
+            digest: bytes[bytes.len() - 32..]
+                .try_into()
+                .expect("manifest checksum"),
+        })
+    }
     fn recovery_meta(&self) -> io::Result<&RecoveryMeta> {
         if self.requires_reopen {
             return Err(io::Error::other("manifest publication requires reopen"));

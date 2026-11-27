@@ -281,3 +281,134 @@ fn checkpoint_and_sealed_tail_recovery_preserve_equivalent_history_and_receipts(
     assert_eq!(disk.current_sequence(), 5);
     assert_eq!(checkpoint.current_sequence(), 5);
 }
+
+// Independent on-disk fixture: no production writer or reclamation API.
+fn bound_fixture(f: &Fixture, db: &mut WalBackedTablet) -> Vec<u8> {
+    db.commit_idempotent(id(1), vec![put(b"sealed")]).unwrap();
+    drop(seal(f, db));
+    let prefix_len = fs::metadata(f.0.join("tablet.wal")).unwrap().len() as usize;
+    db.commit_idempotent(id(2), vec![put(b"tail")]).unwrap();
+    let full = fs::read(f.0.join("tablet.wal")).unwrap();
+    let manifest = fs::read(f.0.join("sst/MANIFEST")).unwrap();
+    let mut bound = b"NUDBWAL4".to_vec();
+    for n in [1u64, 7, 3] {
+        bound.extend_from_slice(&n.to_le_bytes());
+    }
+    bound.extend_from_slice(&manifest[manifest.len() - 32..]);
+    let checksum = blake3::hash(&bound);
+    bound.extend_from_slice(checksum.as_bytes());
+    bound.extend_from_slice(&full[prefix_len..]);
+    bound
+}
+
+#[test]
+fn bound_wal_recovers_only_with_exact_seal_and_preserves_receipts() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let bytes = bound_fixture(&f, &mut db);
+    drop(db);
+    let path = f.0.join("tablet.wal");
+    fs::write(&path, &bytes).unwrap();
+    assert!(WalBackedTablet::open(f.descriptor(), &path).is_err());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    let mut db = recover(&f).unwrap();
+    assert_eq!(db.current_sequence(), 2);
+    assert_eq!(db.read_at(b"k", 1).unwrap(), Some(b"sealed".as_slice()));
+    assert_eq!(db.read_latest(b"k"), Some(b"tail".as_slice()));
+    assert_eq!(
+        db.commit_idempotent(id(1), vec![put(b"sealed")])
+            .unwrap()
+            .sequence(),
+        1
+    );
+    assert_eq!(
+        db.commit_idempotent(id(2), vec![put(b"tail")])
+            .unwrap()
+            .sequence(),
+        2
+    );
+    assert!(db.commit_idempotent(id(1), vec![put(b"wrong")]).is_err());
+    assert!(db.publish_checkpoint().is_err());
+    assert!(db.checkpoint().is_err());
+    assert!(db.reclaim_history_before(1).is_err());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert!(!f.0.join("tablet.checkpoint").exists());
+    db.commit_idempotent(id(3), vec![put(b"new")]).unwrap();
+    drop(db);
+    let db = recover(&f).unwrap();
+    assert_eq!(db.current_sequence(), 3);
+    assert_eq!(db.read_latest(b"k"), Some(b"new".as_slice()));
+}
+
+#[test]
+fn mismatched_bound_headers_reject_before_tail_repair() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let bytes = bound_fixture(&f, &mut db);
+    drop(db);
+    let path = f.0.join("tablet.wal");
+    for offset in [8, 16, 24, 32] {
+        let mut wrong = bytes.clone();
+        wrong[offset] ^= 1;
+        let hash = blake3::hash(&wrong[..64]);
+        wrong[64..96].copy_from_slice(hash.as_bytes());
+        wrong.extend_from_slice(b"partial");
+        fs::write(&path, &wrong).unwrap();
+        assert!(recover(&f).is_err(), "offset {offset}");
+        assert_eq!(fs::read(&path).unwrap(), wrong);
+    }
+    let mut wrong = bytes.clone();
+    wrong[64] ^= 1;
+    fs::write(&path, &wrong).unwrap();
+    assert!(recover(&f).is_err());
+    assert_eq!(fs::read(&path).unwrap(), wrong);
+    let mut torn = bytes.clone();
+    torn.extend_from_slice(b"partial");
+    fs::write(&path, &torn).unwrap();
+    let db = recover(&f).unwrap();
+    assert_eq!(db.current_sequence(), 2);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn valid_but_different_seal_with_same_identity_cannot_open_bound_wal() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let mut bytes = bound_fixture(&f, &mut db);
+    drop(db);
+    bytes.extend_from_slice(b"partial");
+    let path = f.0.join("tablet.wal");
+    fs::write(&path, &bytes).unwrap();
+    let other = Fixture::new();
+    let mut db = other.open();
+    // Same value, sequence, tablet and epoch; different durable receipt.
+    db.commit_idempotent(id(9), vec![put(b"sealed")]).unwrap();
+    drop(seal(&other, &db));
+    drop(db);
+    assert!(
+        WalBackedTablet::open_from_sealed_sst(f.descriptor(), &path, other.0.join("sst")).is_err()
+    );
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn bound_header_without_tail_recovers_at_sealed_sequence() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let bytes = bound_fixture(&f, &mut db);
+    drop(db);
+    let path = f.0.join("tablet.wal");
+    fs::write(&path, &bytes[..96]).unwrap();
+    let mut db = recover(&f).unwrap();
+    assert_eq!(db.current_sequence(), 1);
+    assert_eq!(db.read_latest(b"k"), Some(b"sealed".as_slice()));
+    assert_eq!(
+        db.commit_idempotent(id(2), vec![put(b"fresh")])
+            .unwrap()
+            .sequence(),
+        2
+    );
+    drop(db);
+    let db = recover(&f).unwrap();
+    assert_eq!(db.read_latest(b"k"), Some(b"fresh".as_slice()));
+}

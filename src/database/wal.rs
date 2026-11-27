@@ -5,6 +5,8 @@
 //! ```text
 //! file := wal_header record*
 //! wal_header := "NUDBWAL3" base_sequence:u64 tablet_id:u64 ownership_epoch:u64 header_blake3:[u8; 32]
+//! bound_header := "NUDBWAL4" base_sequence:u64 tablet_id:u64 ownership_epoch:u64 sealed_manifest_blake3:[u8; 32] header_blake3:[u8; 32]
+//! WAL4 is currently accepted only by explicit sealed recovery; no production writer emits it.
 //! record := frame_header payload:[u8; payload_len] payload_blake3:[u8; 32]
 //! frame_header := "NREC" frame_version:u16 payload_len:u32 header_blake3:[u8; 32]
 //! ```
@@ -27,6 +29,27 @@ use super::tablet::{
 };
 
 const WAL_MAGIC: &[u8; 8] = b"NUDBWAL3";
+const BOUND_WAL_MAGIC: &[u8; 8] = b"NUDBWAL4";
+const BOUND_HEADER_BYTES: usize = 96;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SealBinding {
+    pub(super) sequence: u64,
+    pub(super) tablet_id: TabletId,
+    pub(super) epoch: u64,
+    pub(super) digest: [u8; 32],
+}
+impl SealBinding {
+    fn prefix(&self) -> [u8; 64] {
+        let mut bytes = [0; 64];
+        bytes[..8].copy_from_slice(BOUND_WAL_MAGIC);
+        bytes[8..16].copy_from_slice(&self.sequence.to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.tablet_id.get().to_le_bytes());
+        bytes[24..32].copy_from_slice(&self.epoch.to_le_bytes());
+        bytes[32..].copy_from_slice(&self.digest);
+        bytes
+    }
+}
 const WAL_HEADER_PREFIX_BYTES: usize = 8 + 8 + 8 + 8;
 const WAL_HEADER_BYTES: usize = WAL_HEADER_PREFIX_BYTES + 32;
 const WAL_FRAME_MAGIC: &[u8; 4] = b"NREC";
@@ -215,6 +238,7 @@ pub struct FileWal {
     records: Vec<WalRecord>,
     record_end_offsets: Vec<u64>,
     base_sequence: u64,
+    seal_binding: Option<SealBinding>,
     tablet_id: Option<TabletId>,
     latest_ownership_epoch: Option<u64>,
     poisoned: bool,
@@ -224,15 +248,19 @@ pub struct FileWal {
 
 impl FileWal {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WalError> {
-        Self::open_with_mode(path.as_ref(), false)
+        Self::open_with_mode(path.as_ref(), false, None)
     }
 
     #[cfg(unix)]
-    pub(super) fn open_existing(path: &Path) -> Result<Self, WalError> {
-        Self::open_with_mode(path, true)
+    pub(super) fn open_existing(path: &Path, binding: SealBinding) -> Result<Self, WalError> {
+        Self::open_with_mode(path, true, Some(binding))
     }
 
-    fn open_with_mode(requested_path: &Path, require_existing: bool) -> Result<Self, WalError> {
+    fn open_with_mode(
+        requested_path: &Path,
+        require_existing: bool,
+        binding: Option<SealBinding>,
+    ) -> Result<Self, WalError> {
         let parent = requested_path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -267,10 +295,14 @@ impl FileWal {
                 return Err(WalError::InvalidHeader);
             }
         }
-        Self::open_locked(path, Arc::new(lock))
+        Self::open_locked(path, Arc::new(lock), binding)
     }
 
-    fn open_locked(path: PathBuf, writer_lock: Arc<File>) -> Result<Self, WalError> {
+    fn open_locked(
+        path: PathBuf,
+        writer_lock: Arc<File>,
+        binding: Option<SealBinding>,
+    ) -> Result<Self, WalError> {
         // The caller already holds the stable sidecar lock. This path is also
         // used after WAL reclamation, so it must not try to lock a second time.
         let file_existed = path.exists();
@@ -295,10 +327,34 @@ impl FileWal {
         if read_up_to(&mut file, &mut wal_header)? != WAL_HEADER_BYTES {
             return Err(WalError::InvalidHeader);
         }
-        let (base_sequence, mut tablet_id, mut latest_ownership_epoch) =
-            decode_wal_header(&wal_header)?;
+        let (base_sequence, mut tablet_id, mut latest_ownership_epoch, seal_binding, header_len) =
+            if &wal_header[..8] == BOUND_WAL_MAGIC {
+                // Require exact expected identity before inspecting or repairing any tail.
+                let expected = binding.ok_or(WalError::SealBindingMismatch)?;
+                let mut checksum = [0; 32];
+                if read_up_to(&mut file, &mut checksum)? != checksum.len() {
+                    return Err(WalError::InvalidHeader);
+                }
+                if blake3::hash(&wal_header).as_bytes() != &checksum {
+                    return Err(WalError::WalHeaderChecksumMismatch);
+                }
+                if expected.sequence == 0 || expected.epoch == 0 || wal_header != expected.prefix()
+                {
+                    return Err(WalError::SealBindingMismatch);
+                }
+                (
+                    expected.sequence,
+                    Some(expected.tablet_id),
+                    Some(expected.epoch),
+                    Some(expected),
+                    BOUND_HEADER_BYTES,
+                )
+            } else {
+                let (base, id, epoch) = decode_wal_header(&wal_header)?;
+                (base, id, epoch, None, WAL_HEADER_BYTES)
+            };
 
-        file.seek(SeekFrom::Start(WAL_HEADER_BYTES as u64))?;
+        file.seek(SeekFrom::Start(header_len as u64))?;
 
         let mut records = Vec::new();
         let mut record_end_offsets = Vec::new();
@@ -376,6 +432,7 @@ impl FileWal {
             records,
             record_end_offsets,
             base_sequence,
+            seal_binding,
             tablet_id,
             latest_ownership_epoch,
             poisoned: false,
@@ -394,6 +451,10 @@ impl FileWal {
 
     pub fn records(&self) -> &[WalRecord] {
         &self.records
+    }
+
+    pub(super) fn is_seal_bound(&self) -> bool {
+        self.seal_binding.is_some()
     }
 
     pub fn base_sequence(&self) -> u64 {
@@ -546,6 +607,9 @@ impl FileWal {
     /// checkpoints are taken at the current committed sequence, so no retained
     /// post-checkpoint records need to be copied during the rewrite.
     pub fn reclaim_through(&mut self, base_sequence: u64) -> Result<(), WalError> {
+        if self.is_seal_bound() {
+            return Err(WalError::SealBindingMismatch);
+        }
         if self.poisoned {
             return Err(WalError::Poisoned);
         }
@@ -596,7 +660,7 @@ impl FileWal {
             super::interruption::StorageInterruptionPoint::WalReclaimAfterDirectorySync,
         )?;
 
-        *self = Self::open_locked(self.path.clone(), Arc::clone(&self.writer_lock))?;
+        *self = Self::open_locked(self.path.clone(), Arc::clone(&self.writer_lock), None)?;
         Ok(())
     }
 
@@ -1081,6 +1145,7 @@ pub enum WalError {
         message: String,
     },
     InvalidHeader,
+    SealBindingMismatch,
     WriterLocked,
     AliasedWalPath,
     WalHeaderChecksumMismatch,
@@ -1166,6 +1231,7 @@ impl fmt::Display for WalError {
         match self {
             Self::Io { message, .. } => write!(f, "WAL I/O error: {message}"),
             Self::InvalidHeader => f.write_str("invalid NuDB WAL header"),
+            Self::SealBindingMismatch => f.write_str("bound WAL requires matching sealed manifest; legacy reclamation is disabled"),
             Self::WriterLocked => f.write_str("NuDB WAL already has an exclusive writer"),
             Self::AliasedWalPath => {
                 f.write_str("NuDB WAL or lock path must not be a symlink or hardlink")
