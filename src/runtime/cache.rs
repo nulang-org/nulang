@@ -676,13 +676,17 @@ impl S3Fifo {
         if demand.entries > EVICTION_SCAN_LIMIT {
             return None;
         }
+        // Fix the target at the start of this plan: detached candidates
+        // are still resident until the complete plan succeeds.
+        let resident = self.small.len + self.main.len;
+        let small_target = self.small_target.min((resident / 10).max(1));
         let mut victims = Vec::with_capacity(demand.entries.max(1));
         let mut skipped = Vec::new();
         for _ in 0..EVICTION_SCAN_LIMIT {
             if demand.satisfied() {
                 break;
             }
-            let slot = if self.small.len >= self.small_target || self.main.len == 0 {
+            let slot = if self.small.len >= small_target || self.main.len == 0 {
                 self.small.head
             } else {
                 self.main.head
@@ -2184,6 +2188,41 @@ mod tests {
                 end += size;
             }
             assert_eq!(end, cache.arena.bytes.len());
+        }
+    }
+
+    #[test]
+    fn s3fifo_arena_pressure_preserves_hot_set_with_loose_entry_limit() {
+        let mut cache = CacheStore::with_s3fifo(CacheLimits {
+            max_entries: 1024,
+            max_arena_bytes: 8192,
+        });
+        // 128 physical blocks, rather than the configured 1024 entries.
+        for key in 0..128u64 {
+            cache
+                .set_bytes(&key.to_le_bytes(), &[7; 64], None, 0)
+                .unwrap();
+        }
+        for round in 0..10u64 {
+            for key in 0..32u64 {
+                assert!(
+                    cache.get(&key.to_le_bytes(), 0).is_some(),
+                    "lost hot key {key} at round {round}"
+                );
+                assert!(cache.get(&key.to_le_bytes(), 0).is_some());
+            }
+            for key in 0..512u64 {
+                cache
+                    .set_bytes(
+                        &(10_000 + round * 512 + key).to_le_bytes(),
+                        &[8; 64],
+                        None,
+                        0,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(cache.len(), 128);
+            assert_eq!(cache.memory_stats().arena_reserved_bytes, 8192);
         }
     }
 }

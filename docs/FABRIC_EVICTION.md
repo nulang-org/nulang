@@ -11,7 +11,7 @@ evictions are recorded in the journal, so this policy must not be used
 as a durable key-value database or for correctness-critical cache keys.
 
 This is an entry-count S3-FIFO adaptation: a small probationary FIFO
-(target max(1, floor(capacity/10))), a main second-chance FIFO, and a
+(target max(1, floor(resident_count/10)) at plan start, capped by the configured entry target), a main second-chance FIFO, and a
 bounded ghost FIFO containing only 64-bit key fingerprints. A successful
 GET (including MGET element reads) increments a saturating 2-bit frequency.
 Writes, TTL and existence queries do not count as GETs. On entry or arena pressure,
@@ -126,3 +126,34 @@ hit rate. These results do not establish universal hit-rate improvement
 or equal total memory consumption. Dynamic/byte-aware queue sizing,
 compaction or alternative arena layout, and larger real-world traces
 remain separate design questions. No default change is warranted.
+
+
+## Resident-adaptive probation
+
+The probation target is fixed for each victim plan at the smaller of
+the original configured target and max(1, floor(resident_count/10)).
+Resident count is captured before detaching any candidate. This handles
+arena-limited occupancy without a scan of resident entries, adaptive
+history, additional per-key metadata or a new tuning parameter. At the
+configured entry limit the target is unchanged. The 4096-node scan and
+atomic admission rules are unchanged.
+
+A deterministic regression exercises 32 hot keys among 128 resident
+64-byte values, with a loose 1024-entry limit and an 8 KiB arena.
+The previous static target lost hot key zero during the first scan;
+the adaptive target retains every hot key over ten 512-key scans.
+The same 12 mixed/uniform-value traces, compiled in an independent
+cache-only build target with pinned Rust 1.95, gave:
+
+| Arena | Values | Static hit rate | Adaptive hit rate |
+|---:|---|---:|---:|
+| 8 KiB | 64 B | 18.47% | 54.46% |
+| 8 KiB | mixed | 4.25% | 28.82% |
+| 32 KiB | 64 B | 59.86% | 59.86% |
+| 32 KiB | mixed | 59.83% | 59.83% |
+
+Zero rejected misses in the 1.2 million references for both variants.
+All 18 inline reference traces retain identical hit and eviction
+counts. Raw results: benchmarks/fabric-arena-adaptive-20261128.csv.
+This is a count-based occupancy adjustment, not a byte-weighted
+policy, guarantee of scan resistance, or equal-memory comparison.
