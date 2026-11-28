@@ -233,3 +233,87 @@ per client. Repeat with a full release executable, dedicated hardware,
 longer workload and storage fault qualification before default adoption.
 The candidate remains opt-in. No direct Valkey comparison is implied by
 this same-Fabric experiment.
+
+## Shared-key and larger-keyspace GET qualification
+
+The independent-client benchmark repeats one key per connection. Use the
+following memory-only supplement to measure shared hot-key pressure, uniform
+random access, and a 90% single-hot-key / 10% uniform-cold workload:
+
+    python3 scripts/fabric_resp_keyspace_bench.py \
+      --fabric target/release/nulang-fabric \
+      --valkey /usr/bin/valkey-server \
+      --journal-dir /path/to/local/disk \
+      --output /tmp/fabric-keyspace.json \
+      --keys 4096 --clients 8 --commands 8192 --pipeline 32 --rounds 3
+
+Repeat with --keys 65536 and --pipeline 1 to investigate working-set and
+pipelining effects. Each sample uses a fresh server and a preloaded shared
+dataset with distinct 64-byte values, deterministic per-client traces,
+synchronized starts, bounded client/key/command counts, and byte-exact
+ordered reply validation. A round uses the same seed for both engines.
+Reports contain per-round throughput, pooled batch RTT percentiles, observed
+key-zero request count, distinct requested key count, and executable hashes.
+No partial matrix is written on workload failure. The warmup and preload are
+excluded from timing; throughput includes Python batch construction and
+client scheduling, while batch RTT excludes batch construction. This is a
+single-node closed-loop GET experiment, not a multicore shard-scaling,
+open-loop, write-contention, eviction or production-capacity test.
+
+Contract tests:
+
+    python3 -m unittest discover -s scripts/tests -p 'test_fabric_resp*bench.py'
+
+### Optional process efficiency telemetry (Linux)
+
+Add `--process-metrics` to the keyspace command to capture each server's
+process CPU time and resident memory from /proc. Each raw round and scalar
+median includes idle RSS (after readiness and control connection), RSS after
+preloading all keys, signed preload RSS delta divided by key count, post-run
+RSS, lifetime peak RSS (VmHWM), CPU seconds during the measured worker
+interval, and CPU nanoseconds per validated GET. CPU snapshots bracket the
+synchronized start and completed workers, so teardown can contribute a small
+amount; warmup and preload are excluded from CPU time. The report records the
+kernel CPU accounting tick rate. Use long enough samples that many CPU ticks
+are observed: zero or one tick cannot establish a precise per-operation cost.
+RSS is page-granular and includes the process/runtime, shared mappings and
+allocator slack; the preload delta is an approximate resident cost, not
+allocated bytes per entry. Peak RSS includes setup and warmup. These are not
+hardware cycle counters or allocation counts. Telemetry reads occur outside
+the measured per-batch round trips. The option fails rather than silently
+reporting fabricated values if the requested Linux process data is unavailable.
+
+### Focused large-keyspace observation (2026-11-27)
+
+Raw report: fabric-resp-keyspace-20261127.json. A locked Cargo full-release
+build with two jobs timed out at 100 seconds; dependencies completed but the
+full binary did not. The fallback compiled an optimized rlib named nulang
+with a wrapper exposing the ten unmodified runtime cache/RESP modules listed
+in the report under runtime, then compiled the unmodified
+src/bin/nulang-fabric.rs against it. Both rustc invocations used edition
+2021, opt-level 3, eight codegen units and the exact locked Cargo release
+dependency rlibs; the library enabled cache-server. This is NOT the
+full-release LTO build. Source and lock hashes, executable hashes, and
+compiler version are recorded. All eighteen samples ran successfully.
+
+65,536 preloaded keys, 64-byte values, 8 clients, 16,384 measured GETs per
+client, pipeline 32, three alternating-order rounds per engine; process
+telemetry enabled. Median results:
+
+| Distribution | Fabric ops/s | Valkey ops/s | Fabric batch p99 ms | Valkey batch p99 ms | Fabric CPU ns/GET | Valkey CPU ns/GET |
+|---|---:|---:|---:|---:|---:|---:|
+| Shared | 466,822 | 470,717 | 1.440 | 1.400 | 687 | 839 |
+| Uniform | 471,211 | 474,491 | 1.447 | 1.409 | 1,144 | 916 |
+| Hot90 | 479,944 | 474,376 | 1.414 | 1.418 | 763 | 839 |
+
+All throughput differences are within about 1.2%; client-side Python
+batch construction and scheduling may dominate. Total post-preload RSS
+was about 14.3 MiB for Fabric and 20.6–20.8 MiB for Valkey, but the
+incremental preload RSS delta was about 178 B/key for Fabric versus
+141–143 B/key for Valkey. Lower absolute process RSS is therefore not
+evidence of better per-key memory efficiency. CPU accounting is coarse
+and the uniform case motivates profiling of hash/index/arena locality;
+it does not prove a specific bottleneck. The host was shared, no full
+release or competing engines beyond Valkey were tested, and closed-loop
+batch p99 is not per-command service latency. Do not use these results
+as a regression gate or production capacity estimate.

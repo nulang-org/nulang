@@ -91,7 +91,7 @@ def free_port() -> int:
 
 
 @contextmanager
-def server(binary: Path, engine: str, mode: str, root: Path, clock_reservation_ms: int = 0, group_commit: bool = False, cross_client_group_commit: bool = False):
+def server(binary: Path, engine: str, mode: str, root: Path, clock_reservation_ms: int = 0, group_commit: bool = False, cross_client_group_commit: bool = False, on_ready=None):
     with tempfile.TemporaryDirectory(prefix=f"{engine}-{mode}-", dir=root) as tmp:
         path = Path(tmp)
         port = free_port()
@@ -128,6 +128,8 @@ def server(binary: Path, engine: str, mode: str, root: Path, clock_reservation_m
                         time.sleep(.02)
                 with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
                     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    if on_ready is not None:
+                        on_ready(proc.pid)
                     yield sock
             finally:
                 if proc.poll() is None:
