@@ -1149,3 +1149,98 @@ fn durable_enrollment_interruption_reopens_only_consistent_state() {
         fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[cfg(all(test, unix))]
+#[test]
+fn wal5_enrollment_migration_recovers_exact_tail_at_every_replacement_boundary() {
+    use super::generation_registry::GenerationRegistry;
+    use super::managed_storage::ManagedTablet;
+    use super::sst_manifest::ManifestStore;
+    use super::tablet::TransactionId;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    for point in [
+        StorageInterruptionPoint::WalReclaimAfterReplacementWrite,
+        StorageInterruptionPoint::WalReclaimAfterReplacementSync,
+        StorageInterruptionPoint::WalReclaimAfterRename,
+        StorageInterruptionPoint::WalReclaimAfterDirectorySync,
+    ] {
+        let dir = std::env::temp_dir().join(format!(
+            "nudb-wal5-fault-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).unwrap();
+        let sst = dir.join("sst");
+        let reg = dir.join("registry");
+        fs::create_dir(&sst).unwrap();
+        fs::create_dir(&reg).unwrap();
+        let path = dir.join("tablet.wal");
+        let desc = TabletDescriptor::new(
+            TabletId::new(97).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        let mut db = WalBackedTablet::open(desc.clone(), &path).unwrap();
+        let first = db
+            .commit_idempotent(TransactionId::new([1; 16]), vec![])
+            .unwrap();
+        let mut m = ManifestStore::create(&sst, 97, 7).unwrap();
+        db.flush_sst_shadow(&mut m, 1).unwrap();
+        db.seal_sst_recovery(&mut m).unwrap();
+        db.reclaim_to_sealed_sst(&m).unwrap();
+        let mutation = vec![TabletMutation::Put {
+            key: b"k".to_vec(),
+            value: b"tail".to_vec(),
+        }];
+        let tail = db
+            .commit_idempotent(TransactionId::new([2; 16]), mutation.clone())
+            .unwrap();
+        let original = fs::read(&path).unwrap();
+        let registry = GenerationRegistry::create(&reg, 97, 7).unwrap();
+        let result = with_interruption(point, || ManagedTablet::adopt(db, registry, m));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("injected NulangDB storage interruption"));
+        let after = fs::read(&path).unwrap();
+        let replaced = matches!(
+            point,
+            StorageInterruptionPoint::WalReclaimAfterRename
+                | StorageInterruptionPoint::WalReclaimAfterDirectorySync
+        );
+        if replaced {
+            assert_eq!(&after[..8], b"NUDBWAL5");
+            assert_eq!(&after[128..], &original[96..]);
+        } else {
+            assert_eq!(after, original);
+        }
+        assert!(WalBackedTablet::open_from_sealed_sst(desc.clone(), &path, &sst).is_err());
+        let registry = GenerationRegistry::open(&reg, 97, 7).unwrap();
+        let mut managed = ManagedTablet::open(desc.clone(), &path, &sst, registry).unwrap();
+        assert_eq!(&fs::read(&path).unwrap()[..8], b"NUDBWAL5");
+        assert_eq!(managed.current_sequence(), 2);
+        assert_eq!(managed.read_at(b"k", 2).unwrap(), Some(b"tail".as_slice()));
+        assert_eq!(
+            managed
+                .commit_idempotent(TransactionId::new([1; 16]), vec![])
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            managed
+                .commit_idempotent(TransactionId::new([2; 16]), mutation)
+                .unwrap(),
+            tail
+        );
+        assert_eq!(
+            managed
+                .commit_idempotent(TransactionId::new([3; 16]), vec![])
+                .unwrap()
+                .sequence(),
+            3
+        );
+        drop(managed);
+        fs::remove_dir_all(dir).unwrap();
+    }
+}

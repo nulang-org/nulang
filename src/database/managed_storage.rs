@@ -26,7 +26,7 @@ impl ManagedTablet {
     /// must supply the authoritative registry; do not enroll into a new
     /// registry to bypass prior reference tracking.
     pub fn adopt(
-        tablet: WalBackedTablet,
+        mut tablet: WalBackedTablet,
         mut registry: GenerationRegistry,
         active: ManifestStore,
     ) -> io::Result<Self> {
@@ -52,13 +52,14 @@ impl ManagedTablet {
         let active =
             ManifestStore::open(seal, descriptor.id().get(), descriptor.ownership_epoch())?;
         registry.require_registered_wal(wal.as_ref(), active.wal_binding()?)?;
-        let tablet = WalBackedTablet::open_with_sealed_manifest(
+        let mut tablet = WalBackedTablet::open_with_sealed_manifest(
             descriptor,
             wal.as_ref(),
             &active,
             Some(registry.enrollment_identity()?),
         )?;
         tablet.reconcile_generation_wal(&mut registry, &active)?;
+        tablet.enroll_generation_registry(&registry)?;
         Ok(Self {
             tablet,
             registry,
