@@ -16,6 +16,11 @@ impl SidecarLock {
         Ok(Self(file))
     }
 
+    /// Inspect the held inode without exposing or duplicating the descriptor.
+    pub(super) fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        self.0.metadata()
+    }
+
     #[cfg(test)]
     pub(super) fn duplicate_descriptor(&self) -> io::Result<File> {
         self.0.try_clone()
