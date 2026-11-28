@@ -68,22 +68,54 @@ pub enum Invalidation {
     FullRebuild { reason: String },
 }
 
+/// Diagnostic explanation of observed changes. Neither the report nor its
+/// dependency order authorizes skipping checks or reusing artifacts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidationReport {
+    pub invalidation: Invalidation,
+    /// Direct source/import changes, in lexical order.
+    pub changed_modules: Vec<String>,
+    /// Affected modules in dependency-first order in the current graph.
+    /// Empty when unchanged or when a clean compilation is required.
+    pub affected_in_dependency_order: Vec<String>,
+}
+
+impl InvalidationReport {
+    fn full_rebuild(reason: String) -> Self {
+        Self {
+            invalidation: Invalidation::FullRebuild { reason },
+            changed_modules: Vec::new(),
+            affected_in_dependency_order: Vec::new(),
+        }
+    }
+}
+
 /// Compute a conservative invalidation frontier using source changes and both
 /// historical and current dependency edges. The caller must still execute
 /// normal type/effect/capability checking and compare fresh compiler outputs.
 pub fn invalidated_modules(before: &ModuleSnapshot, after: &ModuleSnapshot) -> Invalidation {
+    explain_invalidation(before, after).invalidation
+}
+
+/// Explain direct changes and their transitive impact without changing the
+/// existing conservative invalidation policy.
+pub fn explain_invalidation(before: &ModuleSnapshot, after: &ModuleSnapshot) -> InvalidationReport {
     if before.context_digest != after.context_digest {
-        return Invalidation::FullRebuild {
-            reason: "compilation context changed".into(),
-        };
+        return InvalidationReport::full_rebuild("compilation context changed".into());
     }
-    for (label, snapshot) in [("before", before), ("after", after)] {
-        if let Err(reason) = validate_graph(snapshot) {
-            return Invalidation::FullRebuild {
-                reason: format!("{label} module graph is incomplete or invalid: {reason}"),
-            };
+    if let Err(reason) = validate_graph(before) {
+        return InvalidationReport::full_rebuild(format!(
+            "before module graph is incomplete or invalid: {reason}"
+        ));
+    }
+    let dependency_order = match validate_graph(after) {
+        Ok(order) => order,
+        Err(reason) => {
+            return InvalidationReport::full_rebuild(format!(
+                "after module graph is incomplete or invalid: {reason}"
+            ));
         }
-    }
+    };
 
     // Deletions may invalidate source-level references beyond explicit import
     // edges, especially until symbol-resolution dependencies are complete.
@@ -92,9 +124,7 @@ pub fn invalidated_modules(before: &ModuleSnapshot, after: &ModuleSnapshot) -> I
         .keys()
         .any(|name| !after.modules.contains_key(name))
     {
-        return Invalidation::FullRebuild {
-            reason: "module removed".into(),
-        };
+        return InvalidationReport::full_rebuild("module removed".into());
     }
 
     let mut dirty = BTreeSet::new();
@@ -103,8 +133,13 @@ pub fn invalidated_modules(before: &ModuleSnapshot, after: &ModuleSnapshot) -> I
             dirty.insert(name.clone());
         }
     }
+    let changed_modules = dirty.iter().cloned().collect();
     if dirty.is_empty() {
-        return Invalidation::Unchanged;
+        return InvalidationReport {
+            invalidation: Invalidation::Unchanged,
+            changed_modules,
+            affected_in_dependency_order: Vec::new(),
+        };
     }
 
     // Use both graphs: an import removed from a module is still a change that
@@ -131,12 +166,20 @@ pub fn invalidated_modules(before: &ModuleSnapshot, after: &ModuleSnapshot) -> I
             }
         }
     }
-    Invalidation::Dirty {
-        modules: dirty.into_iter().collect(),
+    let affected_in_dependency_order = dependency_order
+        .into_iter()
+        .filter(|name| dirty.contains(name))
+        .collect();
+    InvalidationReport {
+        invalidation: Invalidation::Dirty {
+            modules: dirty.into_iter().collect(),
+        },
+        changed_modules,
+        affected_in_dependency_order,
     }
 }
 
-fn validate_graph(snapshot: &ModuleSnapshot) -> Result<(), String> {
+fn validate_graph(snapshot: &ModuleSnapshot) -> Result<Vec<String>, String> {
     // Kahn's algorithm avoids unbounded recursive DFS on untrusted module
     // graphs and deterministically rejects cycles or unresolved imports.
     let mut indegrees: BTreeMap<String, usize> = snapshot
@@ -169,9 +212,8 @@ fn validate_graph(snapshot: &ModuleSnapshot) -> Result<(), String> {
         .filter(|(_, degree)| **degree == 0)
         .map(|(name, _)| name.clone())
         .collect();
-    let mut visited = 0;
+    let mut order = Vec::with_capacity(snapshot.modules.len());
     while let Some(name) = ready.pop_first() {
-        visited += 1;
         if let Some(dependents) = reverse.get(&name) {
             for dependent in dependents {
                 let degree = indegrees.get_mut(dependent).expect("validated module");
@@ -181,11 +223,12 @@ fn validate_graph(snapshot: &ModuleSnapshot) -> Result<(), String> {
                 }
             }
         }
+        order.push(name);
     }
-    if visited != snapshot.modules.len() {
+    if order.len() != snapshot.modules.len() {
         return Err("module dependency cycle".into());
     }
-    Ok(())
+    Ok(order)
 }
 
 #[cfg(test)]
@@ -199,6 +242,57 @@ mod tests {
         snapshot.insert("app", b"fn app() { api() }", ["api"]);
         snapshot.insert("unrelated", b"fn unrelated() { 3 }", [] as [&str; 0]);
         snapshot
+    }
+
+    #[test]
+    fn impact_reports_roots_and_dependency_order() {
+        let before = fixture(b"context");
+        let mut after = before.clone();
+        after.insert("core", b"new core", [] as [&str; 0]);
+        let report = explain_invalidation(&before, &after);
+        assert_eq!(report.changed_modules, vec!["core"]);
+        assert_eq!(
+            report.affected_in_dependency_order,
+            vec!["core", "api", "app"]
+        );
+        assert_eq!(report.invalidation, invalidated_modules(&before, &after));
+    }
+
+    #[test]
+    fn impact_explains_multiple_roots_with_deterministic_order() {
+        let before = fixture(b"context");
+        let mut after = before.clone();
+        after.insert("core", b"new core", [] as [&str; 0]);
+        after.insert("unrelated", b"new unrelated", [] as [&str; 0]);
+        let report = explain_invalidation(&before, &after);
+        assert_eq!(report.changed_modules, vec!["core", "unrelated"]);
+        assert_eq!(
+            report.affected_in_dependency_order,
+            vec!["core", "api", "app", "unrelated"]
+        );
+    }
+
+    #[test]
+    fn invalid_graph_never_exposes_partial_execution_plan() {
+        let before = fixture(b"context");
+        let mut after = before.clone();
+        after.insert("core", b"cycle", ["api"]);
+        let report = explain_invalidation(&before, &after);
+        assert!(matches!(
+            report.invalidation,
+            Invalidation::FullRebuild { .. }
+        ));
+        assert!(report.changed_modules.is_empty());
+        assert!(report.affected_in_dependency_order.is_empty());
+    }
+
+    #[test]
+    fn unchanged_graph_has_no_affected_order() {
+        let before = fixture(b"context");
+        let report = explain_invalidation(&before, &before);
+        assert_eq!(report.invalidation, Invalidation::Unchanged);
+        assert!(report.changed_modules.is_empty());
+        assert!(report.affected_in_dependency_order.is_empty());
     }
 
     #[test]
