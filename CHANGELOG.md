@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Fabric sustained workload qualification — 2026-11-27
+- **Add bounded concurrent TTL/checkpoint soak and recovery harness**, exact reply validation, sampled resource budgets and RSS, fixed-memory latency histogram, idle reclamation and acknowledged-state recovery. No production runtime or dependency changes.
+
 ### Fabric deterministic storage fault matrix — 2026-11-27
 - **Add 510 deterministic persisted-image cases** covering torn sectors, reordered records, atomic mutation recovery, required checkpoint prefixes and clock publication; explicitly characterize valid rollback under false-success storage flushes. No production behavior or dependency changes.
 

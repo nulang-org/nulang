@@ -1026,3 +1026,11 @@ protection against a device that lies about persistence. Do not
 promote buffered mode to power-loss durable. Keep the release gate
 for physical power interruption and wider storage-stack fault tests
 separate from the deterministic image tests.
+
+## Bounded sustained workload qualification
+
+See [Fabric sustained workload qualification](FABRIC_SOAK.md) for the
+reply-validated concurrent TTL/checkpoint soak, sampled resource
+limits, bounded batch latency histogram and post-SIGKILL recovery
+verification. This opt-in local test is not a maximum-throughput
+benchmark or a substitute for long-duration production qualification.
