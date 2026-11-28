@@ -668,6 +668,76 @@ impl WalBackedTablet {
         Ok(())
     }
 
+    /// Verify the exact sealed prefix and its retained MVCC history before
+    /// same-sequence rebinding. Compare both base snapshots, then replay the
+    /// unchanged tail independently and compare with the acknowledged state.
+    #[cfg(unix)]
+    fn verify_compaction_binding(
+        &self,
+        previous: &super::sst_manifest::ManifestStore,
+        next: &super::sst_manifest::ManifestStore,
+    ) -> std::io::Result<(super::wal::SealBinding, super::wal::SealBinding)> {
+        use std::io;
+        let old = self.verified_registry_binding(previous)?;
+        let new = next.sync_for_wal_binding()?;
+        if old.sequence != new.sequence
+            || old.digest == new.digest
+            || next.current().recovery_descriptor() != Some(self.descriptor())
+            || next.current().recovery_floor() != previous.current().recovery_floor()
+            || previous.directory().starts_with(next.directory())
+            || next.directory().starts_with(previous.directory())
+            || next.current().entries().len() != 1
+        {
+            return Err(io::Error::other("invalid compacted generation"));
+        }
+        match std::fs::symlink_metadata(&self.checkpoint_path) {
+            Ok(_) => return Err(io::Error::other("legacy checkpoint prevents compaction")),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let mut restored = next.restore_memory_tablet()?;
+        if previous.restore_memory_tablet()?.snapshot_state() != restored.snapshot_state() {
+            return Err(io::Error::other(
+                "compacted base differs from retained prefix",
+            ));
+        }
+        self.wal
+            .replay_after_checkpoint(&mut restored)
+            .map_err(io::Error::other)?;
+        if restored.snapshot_state() != self.tablet.snapshot_state() {
+            return Err(io::Error::other(
+                "compacted base and WAL tail disagree with live state",
+            ));
+        }
+        Ok((old, new))
+    }
+
+    #[cfg(unix)]
+    pub(super) fn reserve_generation_compaction(
+        &self,
+        registry: &mut super::generation_registry::GenerationRegistry,
+        previous: &super::sst_manifest::ManifestStore,
+        next: &super::sst_manifest::ManifestStore,
+    ) -> std::io::Result<()> {
+        let (old, new) = self.verify_compaction_binding(previous, next)?;
+        registry.reserve_compaction(self.wal.path(), old, new)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn rebind_compacted_generation(
+        &mut self,
+        previous: &super::sst_manifest::ManifestStore,
+        next: &super::sst_manifest::ManifestStore,
+    ) -> std::io::Result<()> {
+        let (_, new) = self.verify_compaction_binding(previous, next)?;
+        if let Err(error) = self.wal.rebind_compacted(new) {
+            self.recovery_required = true;
+            return Err(std::io::Error::other(error));
+        }
+        // Retention floor and logical state do not change; retain live pins.
+        Ok(())
+    }
+
     /// Export a point-in-time local backup while this handle owns the WAL
     /// writer lock and the caller owns the active manifest lock. Only a
     /// fresh destination is accepted; never reuse an interrupted directory.

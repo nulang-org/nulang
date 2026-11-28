@@ -183,6 +183,33 @@ impl ManagedTablet {
         Ok(())
     }
 
+    /// Build and atomically bind a compacted sealed prefix at the existing
+    /// floor and base sequence, preserving every acknowledged WAL tail frame.
+    /// Both directories remain intact; physical-prefix retirement does not
+    /// authorize deletion of a replaced compacted generation.
+    pub fn compact(
+        &mut self,
+        mut next: ManifestStore,
+    ) -> io::Result<super::sst_manifest::CompactionStats> {
+        self.ready()?;
+        let stats = self.active.prepare_compacted_shadow(&mut next)?;
+        if self.active.wal_binding()? == next.wal_binding()? {
+            return Err(io::Error::other(
+                "compaction produced identical seal; no cutover needed",
+            ));
+        }
+        self.fenced = true;
+        self.tablet
+            .reserve_generation_compaction(&mut self.registry, &self.active, &next)?;
+        self.tablet
+            .rebind_compacted_generation(&self.active, &next)?;
+        self.active = next;
+        self.tablet
+            .reconcile_generation_wal(&mut self.registry, &self.active)?;
+        self.fenced = false;
+        Ok(stats)
+    }
+
     /// The durable backup reservation precedes all file creation. On failure
     /// it intentionally remains until the operator explicitly releases it.
     pub fn backup(&mut self, id: [u8; 16], destination: impl AsRef<Path>) -> io::Result<()> {

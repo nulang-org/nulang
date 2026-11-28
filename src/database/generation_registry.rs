@@ -629,12 +629,35 @@ impl GenerationRegistry {
         old: SealBinding,
         new: SealBinding,
     ) -> io::Result<()> {
+        if new.sequence <= old.sequence {
+            return Err(invalid("rotation must advance generation"));
+        }
+        self.reserve_binding_change(path, old, new)
+    }
+
+    /// Same-sequence replacement, only after coordinator verifies compaction
+    /// equivalence. Ordinary rotation remains strictly advancing.
+    pub(super) fn reserve_compaction(
+        &mut self,
+        path: &Path,
+        old: SealBinding,
+        new: SealBinding,
+    ) -> io::Result<()> {
+        if new.sequence != old.sequence {
+            return Err(invalid("compaction must preserve base sequence"));
+        }
+        self.reserve_binding_change(path, old, new)
+    }
+
+    fn reserve_binding_change(
+        &mut self,
+        path: &Path,
+        old: SealBinding,
+        new: SealBinding,
+    ) -> io::Result<()> {
         let old_digest = self.digest(old)?;
         let new_digest = self.digest(new)?;
-        if self.state.is_retired(new_digest)
-            || new.sequence <= old.sequence
-            || old_digest == new_digest
-        {
+        if self.state.is_retired(new_digest) || old_digest == new_digest {
             return Err(invalid("rotation must advance generation"));
         }
         let mut next = self.state.clone();
