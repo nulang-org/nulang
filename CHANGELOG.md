@@ -1,4 +1,104 @@
 # Nulang Changelog
+### Fabric coalescing qualification — 2026-11-27
+- **Honor the embedded caller readiness-wait budget across both group collection polls**, including nonblocking callers; qualify wake/shutdown ordering, mutual TLS, acknowledged-state recovery and real file-write failure with coalescing enabled. No dependency or default-setting changes.
+
+### Fabric bounded cross-client coalescing — 2026-11-27
+- **Add opt-in 0–2000 us cross-client collection window** with bounded readiness collection, existing durability barrier and resource limits, metrics and same-binary comparison. Zero-wait default unchanged; no new dependencies.
+
+### Fabric WAL storage comparison — 2026-11-27
+- **Add same-binary disk/tmpfs and synchronous group-commit comparison**, verified recovery per sample, and an asynchronous WAL writer design decision record. No runtime changes or durability downgrade.
+
+### Fabric latency metrics — 2026-11-27
+- **Add opt-in bounded internal latency histograms** for command dispatch, WAL synchronization, clock publication and checkpoints, with cumulative local Prometheus metrics and soak-profile support. No new dependencies.
+
+### Fabric sustained workload qualification — 2026-11-27
+- **Add bounded concurrent TTL/checkpoint soak and recovery harness**, exact reply validation, sampled resource budgets and RSS, fixed-memory latency histogram, idle reclamation and acknowledged-state recovery. No production runtime or dependency changes.
+
+### Fabric deterministic storage fault matrix — 2026-11-27
+- **Add 510 deterministic persisted-image cases** covering torn sectors, reordered records, atomic mutation recovery, required checkpoint prefixes and clock publication; explicitly characterize valid rollback under false-success storage flushes. No production behavior or dependency changes.
+
+### Fabric guest-kernel durability qualification — 2026-11-27
+- **Add disposable QEMU/ext4 guest power-cut and block-device error qualification**, checking acknowledged data, expiration, checkpoint recovery, fail-stop on device I/O failure, and successful post-recovery mutation. No host device access, production runtime changes or new dependencies.
+
+### Fabric filesystem crash qualification — 2026-11-27
+- **Qualify real process crashes at WAL, checkpoint and clock publication boundaries**, plus kernel file-size exhaustion in all synchronous modes. Release owning advisory locks explicitly to prevent inherited descriptors from retaining stale locks while preserving stable-lock ownership across rotation. No new dependencies.
+
+### Fabric storage qualification and hardening — 2026-11-27
+- **Refuse to silently recreate an initialized missing WAL**, create owner-only journal/lock/checkpoint files, reject final-component link aliases and special files, and qualify checkpoint disk-full failure without losing the committed journal. No dependency changes.
+
+### Fabric cross-client group commit — 2026-11-27
+- **Add opt-in bounded cross-client WAL durability groups** across already-ready connection turns, withhold all plaintext and encrypted output until the group sync succeeds, fail-stop on ambiguous errors, and qualify bounds, TLS, process recovery, and paired performance. No new dependencies.
+
+### Fabric bounded synchronous group commit — 2026-11-27
+- **Add opt-in synchronous WAL group commit within each bounded connection turn**, holding responses until the WAL is synced, preserving ordered mutation visibility and fail-stop on uncertain writes. Expose group counters and benchmark evidence; no new dependencies.
+
+### Fabric durable clock reservation — 2026-11-27
+- **Add opt-in 0–1000 ms durable clock reservations**, preserving persisted observation coverage and fail-closed rollback behavior while avoiding repeated sidecar synchronization within the window. Exact mode remains default; reserved mode may delay restart. Add comparative TTL benchmark evidence without changing dependencies or mutation acknowledgement semantics.
+
+### Fabric operational observability — 2026-11-27
+- **Expose shard-local operational snapshots and an opt-in loopback metrics/health listener**, with bounded request handling, stale-snapshot failure, connection/admission counters, cache and journal gauges and automatic checkpoint progress. No new dependencies.
+
+### Fabric peer and descriptor admission — 2026-11-27
+- **Bound concurrent source-IP admission across shared-budget shards**, normalize mapped IPv4 identities, reclaim peer leases on all connection-close paths, and retry resource-exhausted accepts after a bounded listener backoff. Qualify real Linux descriptor saturation while preserving established client service.
+
+### Fabric shared TLS admission budget — 2026-11-27
+- **Charge a fixed 512 KiB modeled reservation per TLS session against the shared connection budget before session creation**, retain it through idle buffer reclamation and release it on every close. Expose per-shard reservation and shared budget limit; reject insufficient TLS configuration. Qualify cross-shard and concurrent admission without adding dependencies.
+
+### Fabric cooperative reactor fairness — 2026-11-27
+- **Bound per-turn listener, connection and inbox work** with explicit deduplicated readiness continuations for edge-triggered I/O, retain preflighted pipeline ordering across command yields, and qualify competing clients, accept bursts and large/ encrypted replies. No dependency changes.
+
+### Fabric adversarial transport admission — 2026-11-27
+- **Enforce buffered pipeline depth before command execution**, cap reactor polling by the earliest TLS handshake deadline, and fail closed on unexpected response-buffer growth. Add deterministic connection admission/deadline regressions and authenticated oversized request and amplified-response qualification.
+
+### Fabric mutual TLS authentication — 2026-11-27
+- **Add explicit mutual TLS using existing Rustls and private CA material** with mandatory client certificates, no early data or session resumption, bounded connection count and handshake deadline, nonblocking encrypted reactor I/O, and encrypted output draining. Standalone remote binds require complete TLS configuration; plaintext remains loopback-only. Qualify against the audited dependency baseline before remote deployment.
+
+### Durable TTL clock regression guard — 2026-11-27
+- **Fail closed on recovery behind a persisted clock observation**, using a checksummed independently synchronized clock sidecar and stable-lock initialization marker; guard TTL observations and expiry sweeps without consuming journal capacity. Propagate fallible RESP reads and stop the shard on clock publication failure. Check the graceful drain deadline between socket writes.
+
+### Fabric graceful shutdown — 2026-11-27
+- **Handle SIGTERM and SIGINT in the standalone Unix server with synchronous signal waiting**, close listener admission, drain encoded replies to a configurable deadline, discard unexecuted input, release connection reservations, and synchronize durable journals before a successful exit. Sync errors poison the journal. Add real process and reactor regressions.
+
+### Automatic Fabric checkpoint maintenance — 2026-11-27
+- **Schedule durable journal compaction at configurable utilization thresholds**, with live-snapshot size preflight, ineffective/error retry cooldown, reactor maintenance counters, and default-on standalone durable operation. Verify 100 pipelined writes through a 1 KiB journal and process restart.
+
+### Standalone Fabric server — 2026-11-27
+- **Add a feature-gated Unix-only single-shard RESP executable** with loopback-only binding, explicit memory/buffered/synchronized journal modes, validated memory/journal limits and process-level restart regressions.
+### Fabric and audited runtime integration — 2026-11-27
+- **Qualify the combined Fabric durability and security integration branches** without weakening dependency auditing, preserving both changelog histories and patched local SQLite and HTTPS-only remote libSQL support.
+
+### Fabric durability integration qualification — 2026-11-27
+- **Exercise memory and durable RESP parity across 768 deterministic operations and 21 checkpoint/reopen cycles**, and explicitly run the feature-gated RESP suite in CI. The complete durability stack targets main without dependency changes.
+
+### Atomic durable cache checkpoints — 2026-11-27
+- **Compact durable cache history using an atomically published, checksummed checkpoint journal** with a mandatory snapshot prefix, monotonic sequence continuation, stable writer lock, preserved TTLs, and fail-stop on ambiguous publication. Explicit native and reactor maintenance APIs reclaim journal capacity without cloning live values.
+
+### Optional durable RESP reactor — 2026-11-27
+- **Integrate memory, buffered journal and synchronized journal backends** with shared RESP validation, restart recovery, bounded response allocation, and shard-wide fail-stop after ambiguous journal failure. Durable mode is Unix-only and opt-in; direct store access is memory-only.
+
+### Native durable RESP cache mutation coordinator — 2026-11-27
+- **Journal native cache mutations before live publication**, including typed after-images, atomic batches, absolute TTL recovery, admission preflight and fail-stop reads/writes following ambiguous persistence failure. Live RESP reactor integration remains pending.
+
+### RESP cache journal substrate — 2026-11-27
+- **Add a bounded, single-writer, checksummed WAL primitive** with streaming recovery, torn-tail repair, corruption rejection, buffered/synced acknowledgement and fail-stop append poisoning. Reuse BLAKE3; live RESP persistence integration remains pending.
+
+### Idle RESP connection buffer reclamation — 2026-11-27
+- **Release drained input/output vector allocations and their shared budget charges without disconnecting clients.** Preserve partial frames and unsent replies; verify live-data saturation, disconnect recovery, repeated reclamation and multiple idle TCP connections.
+
+### RESP cache reference-server parity — 2026-11-27
+- **Match canonical integer validation, overflow responses and nearest-second TTL rounding** for the supported RESP subset. Always-on regressions and an explicit reference-server example avoid ignored tests.
+
+### Shared RESP reactor buffer admission — 2026-11-27
+- **Reserve retained connection vector capacity before growth**, with a shared optional cross-reactor byte budget and RAII release. Preflight conservative reply size before execution and avoid a synchronous response scratch copy. Close on budget exhaustion; this is not a full-process RSS cap.
+
+### RESP cache admission limits — 2026-11-27
+- **Bound physical entries and initialized arena extent per shard**, with fallible cache writes and RESP OOM errors. Preflight whole MSET batches before mutation; expose estimated retained allocation capacity separately. Default limits are one million entries and 256 MiB of arena extent; these are not process RSS caps.
+
+### Cancellable RESP expiration records — 2026-11-27
+- **Unlink prior TTL records in constant time** on refresh, persistent overwrite, deletion and lazy expiry using slot-indexed FIFO handles. Preserve bounded sweeps and safe slot reuse. Metadata capacity remains tied to the slot high-water mark; this is not a total memory cap.
+
+### Bounded RESP cache expiration sweeps — 2026-11-27
+- **Bound inspected expiration candidates per sweep**, including stale and future records. Preserve partially drained buckets across clock advances and rotate between eligible buckets; zero budget does no work. This does not yet cap total TTL metadata or wall-clock latency.
 
 ### Fail-closed SQLite history recovery and trusted streaming — 2026-11-26
 - **Keep untrusted `DB.query` results bounded** while visiting fixed internal actor snapshot, journal, workflow/domain event and durable-effect rows incrementally. Recovery no longer mistakes histories beyond the general 100,000-row/64 MiB adapter buffer budget for absent data.

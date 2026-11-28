@@ -16,10 +16,14 @@ mod blocking_executor;
 pub mod cache;
 pub mod cache_cluster;
 pub mod cache_dispatch;
+#[cfg(unix)]
+pub mod cache_durable;
 pub mod cache_pipeline;
 pub mod cache_routing;
 #[cfg(feature = "cache-server")]
 pub mod cache_server;
+#[cfg(unix)]
+pub mod cache_wal;
 mod foreign_call;
 mod foreign_executor;
 mod gc;
