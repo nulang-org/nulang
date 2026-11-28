@@ -1137,3 +1137,9 @@ exhaustion with the collection window enabled. No durability semantics
 or default collection settings are relaxed. The earlier A/B report
 describes the original collection-window implementation; it is not a
 performance measurement of this follow-up timeout repair.
+
+## Optional memory-cache eviction
+
+See [Fabric eviction](FABRIC_EVICTION.md) for the entry- and arena-pressure S3-FIFO
+policy, size-class admission, atomic MSET behavior and trace
+comparison. Noeviction remains default; durable mode rejects S3-FIFO.

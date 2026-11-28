@@ -402,6 +402,7 @@ pub struct CacheStats {
     pub sets: u64,
     pub deletes: u64,
     pub expirations: u64,
+    pub evictions: u64,
 }
 
 /// Bounds physical entry count and initialized size-class arena extent.
@@ -436,6 +437,310 @@ pub struct CacheMemoryStats {
     pub reusable_slots: usize,
 }
 
+// Conservative allocation demand: count every value allocation and each
+// new key allocation. Replacements within a batch may free extra blocks,
+// but admission never relies on those releases.
+#[derive(Debug, Default)]
+struct ArenaDemand {
+    blocks: [usize; FREE_LIST_COUNT],
+}
+
+impl ArenaDemand {
+    fn add(&mut self, len: usize) -> Result<(), CacheAdmissionError> {
+        if len <= INLINE_BYTES {
+            return Ok(());
+        }
+        if len > (1usize << MAX_ARENA_EXP) {
+            return Err(CacheAdmissionError::ArenaLimit);
+        }
+        let (class, _) = ByteArena::class_for(len);
+        self.blocks[class] = self.blocks[class]
+            .checked_add(1)
+            .ok_or(CacheAdmissionError::ArenaLimit)?;
+        Ok(())
+    }
+
+    fn missing_bytes(&self, free: &[usize; FREE_LIST_COUNT]) -> u128 {
+        self.blocks
+            .iter()
+            .zip(free)
+            .enumerate()
+            .map(|(class, (&need, &have))| {
+                (need.saturating_sub(have) as u128) << (class + MIN_ARENA_EXP)
+            })
+            .sum()
+    }
+}
+
+struct EvictionDemand {
+    entries: usize,
+    arena: ArenaDemand,
+    free: [usize; FREE_LIST_COUNT],
+    headroom: u128,
+}
+
+impl EvictionDemand {
+    fn satisfied(&self) -> bool {
+        self.entries == 0 && self.arena.missing_bytes(&self.free) <= self.headroom
+    }
+
+    fn consider(&mut self, entry: &Entry) -> bool {
+        let key = match entry.key {
+            PackedBytes::Arena(slice) => Some(slice.class as usize),
+            PackedBytes::Inline { .. } => None,
+        };
+        let value = match entry.value {
+            CacheValue::Bytes(PackedBytes::Arena(slice)) => Some(slice.class as usize),
+            _ => None,
+        };
+        // Once entry pressure is satisfied, do not evict a key which
+        // cannot reduce the outstanding arena allocation requirement.
+        if self.entries == 0
+            && ![key, value]
+                .into_iter()
+                .flatten()
+                .any(|class| self.free[class] < self.arena.blocks[class])
+        {
+            return false;
+        }
+        for class in [key, value].into_iter().flatten() {
+            self.free[class] += 1;
+        }
+        self.entries = self.entries.saturating_sub(1);
+        true
+    }
+}
+
+// S3-FIFO with intrusive slot-indexed resident queues.
+// A fingerprint collision affects placement only, never key identity.
+const EVICTION_SCAN_LIMIT: usize = 4096;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum EvictionQueue {
+    #[default]
+    None,
+    Small,
+    Main,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EvictionNode {
+    prev: u32,
+    next: u32,
+    queue: EvictionQueue,
+    frequency: u8,
+}
+
+impl Default for EvictionNode {
+    fn default() -> Self {
+        Self {
+            prev: EMPTY_SLOT,
+            next: EMPTY_SLOT,
+            queue: EvictionQueue::None,
+            frequency: 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Fifo {
+    head: u32,
+    tail: u32,
+    len: usize,
+}
+
+impl Default for Fifo {
+    fn default() -> Self {
+        Self {
+            head: EMPTY_SLOT,
+            tail: EMPTY_SLOT,
+            len: 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct S3Fifo {
+    nodes: Vec<EvictionNode>,
+    small: Fifo,
+    main: Fifo,
+    ghost: VecDeque<u64>,
+    ghost_set: HashSet<u64>,
+    small_target: usize,
+    ghost_limit: usize,
+}
+
+impl S3Fifo {
+    fn new(capacity: usize) -> Self {
+        Self {
+            nodes: Vec::new(),
+            small: Fifo::default(),
+            main: Fifo::default(),
+            ghost: VecDeque::new(),
+            ghost_set: HashSet::new(),
+            small_target: (capacity / 10).max(1),
+            ghost_limit: capacity,
+        }
+    }
+
+    fn queue_mut(&mut self, queue: EvictionQueue) -> &mut Fifo {
+        match queue {
+            EvictionQueue::Small => &mut self.small,
+            EvictionQueue::Main => &mut self.main,
+            EvictionQueue::None => unreachable!("unlinked eviction node"),
+        }
+    }
+
+    fn unlink(&mut self, slot: u32) -> EvictionNode {
+        let node = self.nodes[slot as usize];
+        if node.queue == EvictionQueue::None {
+            return node;
+        }
+        if node.prev != EMPTY_SLOT {
+            self.nodes[node.prev as usize].next = node.next;
+        }
+        if node.next != EMPTY_SLOT {
+            self.nodes[node.next as usize].prev = node.prev;
+        }
+        let queue = self.queue_mut(node.queue);
+        if queue.head == slot {
+            queue.head = node.next;
+        }
+        if queue.tail == slot {
+            queue.tail = node.prev;
+        }
+        queue.len -= 1;
+        self.nodes[slot as usize] = EvictionNode::default();
+        node
+    }
+
+    fn push(&mut self, slot: u32, kind: EvictionQueue, frequency: u8) {
+        debug_assert_eq!(self.nodes[slot as usize].queue, EvictionQueue::None);
+        let tail = self.queue_mut(kind).tail;
+        self.nodes[slot as usize] = EvictionNode {
+            prev: tail,
+            next: EMPTY_SLOT,
+            queue: kind,
+            frequency,
+        };
+        if tail != EMPTY_SLOT {
+            self.nodes[tail as usize].next = slot;
+        }
+        let queue = self.queue_mut(kind);
+        if queue.head == EMPTY_SLOT {
+            queue.head = slot;
+        }
+        queue.tail = slot;
+        queue.len += 1;
+    }
+
+    fn insert(&mut self, slot: u32, hash: u64) {
+        if self.nodes.len() <= slot as usize {
+            self.nodes
+                .resize(slot as usize + 1, EvictionNode::default());
+        }
+        let kind = if self.ghost_set.contains(&hash) {
+            EvictionQueue::Main
+        } else {
+            EvictionQueue::Small
+        };
+        self.push(slot, kind, 0);
+    }
+
+    fn hit(&mut self, slot: u32) {
+        let node = &mut self.nodes[slot as usize];
+        node.frequency = node.frequency.saturating_add(1).min(3);
+    }
+
+    fn remember(&mut self, hash: u64) {
+        if self.ghost_limit == 0 || self.ghost_set.contains(&hash) {
+            return;
+        }
+        if self.ghost.len() == self.ghost_limit {
+            let oldest = self.ghost.pop_front().expect("full ghost");
+            self.ghost_set.remove(&oldest);
+        }
+        self.ghost.push_back(hash);
+        self.ghost_set.insert(hash);
+    }
+
+    // Plan before removing live keys. Protected and selected nodes are
+    // temporarily detached. On failure, restore all nodes; order and
+    // frequencies may change, but data and TTLs do not.
+    fn plan(
+        &mut self,
+        demand: &mut EvictionDemand,
+        protected: &HashSet<u32>,
+        slots: &[EntrySlot],
+    ) -> Option<Vec<(u32, EvictionNode)>> {
+        if demand.entries > EVICTION_SCAN_LIMIT {
+            return None;
+        }
+        // Fix the target at the start of this plan: detached candidates
+        // are still resident until the complete plan succeeds.
+        let resident = self.small.len + self.main.len;
+        let small_target = self.small_target.min((resident / 10).max(1));
+        let mut victims = Vec::with_capacity(demand.entries.max(1));
+        let mut skipped = Vec::new();
+        for _ in 0..EVICTION_SCAN_LIMIT {
+            if demand.satisfied() {
+                break;
+            }
+            let slot = if self.small.len >= small_target || self.main.len == 0 {
+                self.small.head
+            } else {
+                self.main.head
+            };
+            if slot == EMPTY_SLOT {
+                break;
+            }
+            let node = self.unlink(slot);
+            if protected.contains(&slot) {
+                skipped.push((slot, node));
+            } else if node.queue == EvictionQueue::Small && node.frequency > 1 {
+                self.push(slot, EvictionQueue::Main, 0);
+            } else if node.queue == EvictionQueue::Main && node.frequency > 0 {
+                self.push(slot, EvictionQueue::Main, node.frequency - 1);
+            } else if demand.consider(slots[slot as usize].entry.as_ref().expect("live candidate"))
+            {
+                victims.push((slot, node));
+            } else {
+                skipped.push((slot, node));
+            }
+        }
+        for (slot, node) in skipped {
+            self.push(slot, node.queue, node.frequency);
+        }
+        if demand.satisfied() {
+            Some(victims)
+        } else {
+            for (slot, node) in victims {
+                self.push(slot, node.queue, node.frequency);
+            }
+            None
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.nodes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<EvictionNode>()),
+            )
+            .saturating_add(
+                self.ghost
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            )
+            .saturating_add(
+                self.ghost_set
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u64>() + 1),
+            )
+    }
+}
+
 /// Shard-local compact cache storage.
 ///
 /// The owning runtime shard keeps `CacheStore` thread-confined by runtime
@@ -453,6 +758,7 @@ pub struct CacheStore {
     expiry: ExpirationWheel,
     expiry_scratch: Vec<ExpirationRef>,
     stats: CacheStats,
+    eviction: Option<Box<S3Fifo>>,
 }
 
 impl Default for CacheStore {
@@ -478,7 +784,89 @@ impl CacheStore {
             expiry: ExpirationWheel::new(DEFAULT_WHEEL_BUCKETS, DEFAULT_WHEEL_TICK_MS),
             expiry_scratch: Vec::new(),
             stats: CacheStats::default(),
+            eviction: None,
         }
+    }
+
+    /// Memory-only entry and arena-pressure eviction. Durable stores use with_limits.
+    pub fn with_s3fifo(limits: CacheLimits) -> Self {
+        let mut store = Self::with_limits(limits);
+        store.eviction = Some(Box::new(S3Fifo::new(
+            limits.max_entries.min(TOMBSTONE_SLOT as usize),
+        )));
+        store
+    }
+
+    fn evict_for_admission(
+        &mut self,
+        new_entries: usize,
+        arena: ArenaDemand,
+        protected: &HashSet<u32>,
+    ) -> Result<(), CacheAdmissionError> {
+        let capacity = self.limits.max_entries.min(TOMBSTONE_SLOT as usize);
+        let needed = new_entries.saturating_sub(capacity.saturating_sub(self.index_len));
+        if needed > self.index_len.saturating_sub(protected.len()) {
+            return Err(CacheAdmissionError::EntryLimit);
+        }
+        let mut demand = EvictionDemand {
+            entries: needed,
+            arena,
+            free: std::array::from_fn(|i| self.arena.free[i].len()),
+            headroom: self
+                .limits
+                .max_arena_bytes
+                .min(u32::MAX as usize)
+                .saturating_sub(self.arena.bytes.len()) as u128,
+        };
+        if demand.satisfied() {
+            return Ok(());
+        }
+        // Even an empty arena of this size cannot hold the requested blocks.
+        if demand.arena.missing_bytes(&[0; FREE_LIST_COUNT])
+            > self.limits.max_arena_bytes.min(u32::MAX as usize) as u128
+        {
+            return Err(CacheAdmissionError::ArenaLimit);
+        }
+        let victims = self
+            .eviction
+            .as_mut()
+            .and_then(|policy| policy.plan(&mut demand, protected, &self.slots))
+            .ok_or(if demand.entries != 0 {
+                CacheAdmissionError::EntryLimit
+            } else {
+                CacheAdmissionError::ArenaLimit
+            })?;
+        for (slot, node) in victims {
+            if node.queue == EvictionQueue::Small {
+                let hash = self.slots[slot as usize]
+                    .entry
+                    .as_ref()
+                    .expect("live victim")
+                    .hash;
+                self.eviction
+                    .as_mut()
+                    .expect("eviction enabled")
+                    .remember(hash);
+            }
+            assert!(self.remove_slot(slot));
+            self.stats.evictions = self.stats.evictions.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn admit_write(&mut self, key: &[u8], value_len: usize) -> Result<(), CacheAdmissionError> {
+        let admission = self.admit_single(key, value_len);
+        if admission.is_ok() || self.eviction.is_none() {
+            return admission;
+        }
+        let existing = self.find_slot(key, Self::hash(key));
+        let mut arena = ArenaDemand::default();
+        arena.add(value_len)?;
+        if existing.is_none() {
+            arena.add(key.len())?;
+        }
+        let protected = existing.into_iter().collect();
+        self.evict_for_admission(usize::from(existing.is_none()), arena, &protected)
     }
 
     #[inline]
@@ -613,6 +1001,9 @@ impl CacheStore {
             return false;
         };
         self.expiry.cancel(slot_id);
+        if let Some(policy) = &mut self.eviction {
+            policy.unlink(slot_id);
+        }
         self.remove_bucket(entry.hash, slot_id);
         entry.key.release(&mut self.arena);
         entry.value.release(&mut self.arena);
@@ -662,6 +1053,9 @@ impl CacheStore {
         let (slot_id, generation) = self.allocate_slot(entry);
         self.insert_bucket_raw(hash, slot_id);
         self.index_len += 1;
+        if let Some(policy) = &mut self.eviction {
+            policy.insert(slot_id, hash);
+        }
         if let Some(expires_at_ms) = expires_at_ms {
             self.expiry.schedule(
                 ExpirationRef {
@@ -721,6 +1115,15 @@ impl CacheStore {
     ) -> Result<(), CacheAdmissionError> {
         let new_key = self.find_slot(key, Self::hash(key)).is_none();
         self.admit_entries(usize::from(new_key))?;
+        self.admit_single_arena(key, value_len, new_key)
+    }
+
+    fn admit_single_arena(
+        &self,
+        key: &[u8],
+        value_len: usize,
+        new_key: bool,
+    ) -> Result<(), CacheAdmissionError> {
         if value_len <= INLINE_BYTES && (!new_key || key.len() <= INLINE_BYTES) {
             return Ok(());
         }
@@ -740,7 +1143,7 @@ impl CacheStore {
         ttl_ms: Option<u64>,
         now_ms: u64,
     ) -> Result<(), CacheAdmissionError> {
-        self.admit_single(key, value.len())?;
+        self.admit_write(key, value.len())?;
         self.set_bytes_admitted(key, value, ttl_ms, now_ms);
         Ok(())
     }
@@ -757,7 +1160,23 @@ impl CacheStore {
         pairs: &[(&[u8], &[u8])],
         now_ms: u64,
     ) -> Result<(), CacheAdmissionError> {
-        self.admit_batch(pairs)?;
+        let admission = self.admit_batch(pairs);
+        if admission.is_err() && self.eviction.is_some() {
+            let mut new_keys = HashSet::new();
+            let mut protected = HashSet::new();
+            let mut arena = ArenaDemand::default();
+            for &(key, value) in pairs {
+                arena.add(value.len())?;
+                if let Some(slot) = self.find_slot(key, Self::hash(key)) {
+                    protected.insert(slot);
+                } else if new_keys.insert(key) {
+                    arena.add(key.len())?;
+                }
+            }
+            self.evict_for_admission(new_keys.len(), arena, &protected)?;
+        } else {
+            admission?;
+        }
         for &(key, value) in pairs {
             self.set_bytes_admitted(key, value, None, now_ms);
         }
@@ -785,7 +1204,7 @@ impl CacheStore {
         ttl_ms: Option<u64>,
         now_ms: u64,
     ) -> Result<(), CacheAdmissionError> {
-        self.admit_single(key, 0)?;
+        self.admit_write(key, 0)?;
         self.set_value(key, CacheValue::Integer(value), ttl_ms, now_ms);
         Ok(())
     }
@@ -826,6 +1245,9 @@ impl CacheStore {
         };
 
         self.stats.hits += 1;
+        if let Some(policy) = &mut self.eviction {
+            policy.hit(slot_id);
+        }
         let entry = self.slots[slot_id as usize]
             .entry
             .as_ref()
@@ -1038,6 +1460,9 @@ impl CacheStore {
         }
         for list in &self.arena.free {
             bytes = bytes.saturating_add(vec_bytes(list));
+        }
+        if let Some(policy) = &self.eviction {
+            bytes = bytes.saturating_add(policy.retained_bytes());
         }
         bytes
     }
@@ -1381,5 +1806,423 @@ mod tests {
         assert!(store.delete(&long));
         store.set_bytes(&other, &long, None, 0).unwrap();
         assert_eq!(store.memory_stats().arena_reserved_bytes, 64);
+    }
+
+    #[test]
+    fn s3fifo_hot_entries_survive_scan_and_ghost_readmission() {
+        let mut cache = CacheStore::with_s3fifo(CacheLimits {
+            max_entries: 4,
+            max_arena_bytes: 1024,
+        });
+        for key in [b"a", b"b", b"c", b"d"] {
+            cache.set_bytes(key, b"v", None, 0).unwrap();
+        }
+        for _ in 0..3 {
+            assert!(cache.get(b"a", 0).is_some());
+        }
+        cache.set_bytes(b"e", b"v", None, 0).unwrap();
+        assert!(cache.exists(b"a", 0));
+        assert!(!cache.exists(b"b", 0));
+        cache.set_bytes(b"b", b"v", None, 0).unwrap();
+        let slot = cache.find_slot(b"b", CacheStore::hash(b"b")).unwrap();
+        assert_eq!(
+            cache.eviction.as_ref().unwrap().nodes[slot as usize].queue,
+            EvictionQueue::Main
+        );
+        for i in 0..10_000u64 {
+            cache.set_bytes(&i.to_le_bytes(), b"v", None, 0).unwrap();
+            assert_eq!(cache.len(), 4);
+        }
+        let policy = cache.eviction.as_ref().unwrap();
+        assert!(policy.ghost.len() <= 4);
+        assert_eq!(policy.small.len + policy.main.len, cache.len());
+        assert_eq!(policy.nodes.len(), 4);
+    }
+
+    #[test]
+    fn s3fifo_atomic_batch_and_arena_rejection() {
+        let mut cache = CacheStore::with_s3fifo(CacheLimits {
+            max_entries: 3,
+            max_arena_bytes: 32,
+        });
+        for key in [b"a", b"b", b"c"] {
+            cache.set_bytes(key, b"old", None, 0).unwrap();
+        }
+        cache
+            .set_batch(
+                &[
+                    (b"a", b"new"),
+                    (b"d", b"new"),
+                    (b"e", b"new"),
+                    (b"a", b"last"),
+                ],
+                0,
+            )
+            .unwrap();
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.get(b"a", 0), Some(CacheValueView::Bytes(b"last")));
+        assert!(cache.exists(b"d", 0) && cache.exists(b"e", 0));
+        assert_eq!(cache.stats().evictions, 2);
+        assert_eq!(
+            cache.set_bytes(b"f", &[0; 64], None, 0),
+            Err(CacheAdmissionError::ArenaLimit)
+        );
+        assert!(cache
+            .set_batch(
+                &[(b"a", b"bad"), (b"f", b"x"), (b"g", b"x"), (b"h", b"x")],
+                0
+            )
+            .is_err());
+        assert_eq!(cache.stats().evictions, 2);
+        assert_eq!(cache.get(b"a", 0), Some(CacheValueView::Bytes(b"last")));
+        assert!(cache.exists(b"d", 0) && cache.exists(b"e", 0));
+    }
+
+    #[test]
+    fn s3fifo_slot_reuse_and_expiry_unlink() {
+        let mut cache = CacheStore::with_s3fifo(CacheLimits {
+            max_entries: 2,
+            max_arena_bytes: 1024,
+        });
+        for i in 0..1000u64 {
+            cache.set_bytes(b"ttl", b"v", Some(1), i * 10).unwrap();
+            cache.purge_expired(i * 10 + 10, 10);
+            assert!(!cache.exists(b"ttl", i * 10 + 10));
+            cache.set_integer(b"count", 1, None, i * 10).unwrap();
+            assert_eq!(cache.increment(b"count", 1, i * 10), Ok(2));
+            assert!(cache.delete(b"count"));
+            assert!(cache.is_empty());
+        }
+        let policy = cache.eviction.as_ref().unwrap();
+        assert_eq!(policy.small.len + policy.main.len, 0);
+        assert_eq!(policy.nodes.len(), 1);
+        assert_eq!(cache.stats().evictions, 0);
+    }
+
+    #[test]
+    fn s3fifo_bounded_plan_failure_keeps_every_live_key() {
+        let capacity = EVICTION_SCAN_LIMIT + 2;
+        let mut cache = CacheStore::with_s3fifo(CacheLimits {
+            max_entries: capacity,
+            max_arena_bytes: 0,
+        });
+        let keys: Vec<_> = (0..capacity as u64).map(u64::to_le_bytes).collect();
+        for key in &keys {
+            cache.set_bytes(key, b"v", None, 0).unwrap();
+        }
+        let new: Vec<_> = (capacity as u64..2 * capacity as u64)
+            .map(u64::to_le_bytes)
+            .collect();
+        let pairs: Vec<(&[u8], &[u8])> = new
+            .iter()
+            .map(|k| (k.as_slice(), b"x".as_slice()))
+            .collect();
+        assert_eq!(
+            cache.set_batch(&pairs, 0),
+            Err(CacheAdmissionError::EntryLimit)
+        );
+        assert_eq!(cache.stats().evictions, 0);
+        for key in &keys {
+            assert!(cache.exists(key, 0));
+        }
+        assert_eq!(cache.len(), capacity);
+        let policy = cache.eviction.as_ref().unwrap();
+        assert_eq!(policy.small.len + policy.main.len, capacity);
+    }
+
+    #[test]
+    fn s3fifo_evicted_ttl_cannot_expire_reused_slot() {
+        let mut cache = CacheStore::with_s3fifo(CacheLimits {
+            max_entries: 1,
+            max_arena_bytes: 0,
+        });
+        cache.set_bytes(b"ttl", b"v", Some(10), 0).unwrap();
+        cache.set_bytes(b"new", b"v", None, 1).unwrap();
+        assert_eq!(cache.purge_expired(100, 10), 0);
+        assert!(cache.exists(b"new", 100));
+        assert_eq!(cache.stats().evictions, 1);
+        assert_eq!(cache.stats().expirations, 0);
+    }
+
+    #[test]
+    fn s3fifo_scan_exhaustion_restores_protected_and_selected_nodes() {
+        let capacity = EVICTION_SCAN_LIMIT + 2;
+        let mut cache = CacheStore::with_s3fifo(CacheLimits {
+            max_entries: capacity,
+            max_arena_bytes: 0,
+        });
+        let keys: Vec<_> = (0..capacity as u64).map(u64::to_le_bytes).collect();
+        for key in &keys {
+            cache.set_bytes(key, b"old", None, 0).unwrap();
+        }
+        // One early victim, a full scan of protected keys, and a second
+        // eligible victim beyond the scan budget. No partial deletion.
+        let mut batch: Vec<(&[u8], &[u8])> = keys[1..capacity - 1]
+            .iter()
+            .map(|key| (key.as_slice(), b"new".as_slice()))
+            .collect();
+        let first = (capacity as u64).to_le_bytes();
+        let second = (capacity as u64 + 1).to_le_bytes();
+        batch.push((&first, b"new"));
+        batch.push((&second, b"new"));
+        assert_eq!(
+            cache.set_batch(&batch, 0),
+            Err(CacheAdmissionError::EntryLimit)
+        );
+        assert_eq!(cache.stats().evictions, 0);
+        assert_eq!(cache.len(), capacity);
+        for key in &keys {
+            assert_eq!(cache.get(key, 0), Some(CacheValueView::Bytes(b"old")));
+        }
+        let policy = cache.eviction.as_ref().unwrap();
+        assert_eq!(policy.small.len + policy.main.len, capacity);
+        assert!(cache.delete(&keys[0]));
+        cache.set_bytes(&first, b"new", None, 0).unwrap();
+        assert_eq!(cache.len(), capacity);
+    }
+
+    #[test]
+    fn s3fifo_arena_pressure_reuses_matching_blocks_without_entry_pressure() {
+        let mut cache = CacheStore::with_s3fifo(CacheLimits {
+            max_entries: 16,
+            max_arena_bytes: 96,
+        });
+        cache.set_bytes(b"inline", b"v", None, 0).unwrap();
+        cache.set_bytes(b"small", &[1; 32], None, 0).unwrap();
+        cache.set_bytes(b"large", &[2; 64], None, 0).unwrap();
+        cache.set_bytes(b"new", &[3; 64], None, 0).unwrap();
+        assert_eq!(cache.get(b"new", 0), Some(CacheValueView::Bytes(&[3; 64])));
+        assert!(cache.exists(b"inline", 0));
+        assert!(cache.exists(b"small", 0));
+        assert!(!cache.exists(b"large", 0));
+        assert_eq!(cache.stats().evictions, 1);
+        assert_eq!(cache.memory_stats().arena_reserved_bytes, 96);
+    }
+
+    #[test]
+    fn s3fifo_arena_batch_protects_targets_and_counts_keys_and_values() {
+        let mut cache = CacheStore::with_s3fifo(CacheLimits {
+            max_entries: 4,
+            max_arena_bytes: 128,
+        });
+        let long_key = [b'x'; 32];
+        cache.set_bytes(&long_key, &[1; 32], None, 0).unwrap();
+        cache.set_bytes(b"victim", &[2; 64], Some(10), 0).unwrap();
+        cache.set_bytes(b"inline", b"v", None, 0).unwrap();
+        // Target's existing 32-byte key and value cannot be counted as victims.
+        assert!(cache
+            .set_batch(&[(&long_key, &[3; 32]), (b"new", &[4; 64])], 0)
+            .is_err());
+        assert_eq!(cache.stats().evictions, 0);
+        assert_eq!(
+            cache.get(&long_key, 0),
+            Some(CacheValueView::Bytes(&[1; 32]))
+        );
+        assert_eq!(cache.ttl(b"victim", 0), CacheTtl::RemainingMs(10));
+        assert!(cache.exists(b"inline", 0));
+        // The 64-byte block alone can satisfy the new write.
+        cache
+            .set_batch(&[(&long_key, b"ok"), (b"new", &[4; 64])], 0)
+            .unwrap();
+        assert_eq!(cache.get(&long_key, 0), Some(CacheValueView::Bytes(b"ok")));
+        assert_eq!(cache.get(b"new", 0), Some(CacheValueView::Bytes(&[4; 64])));
+        assert_eq!(cache.stats().evictions, 1);
+        assert!(cache.exists(b"inline", 0));
+        assert_eq!(cache.memory_stats().arena_reserved_bytes, 128);
+    }
+
+    #[test]
+    fn s3fifo_arena_fragmentation_failure_does_not_delete_anything() {
+        let mut cache = CacheStore::with_s3fifo(CacheLimits {
+            max_entries: 8,
+            max_arena_bytes: 64,
+        });
+        cache.set_bytes(b"a", &[1; 32], Some(100), 0).unwrap();
+        cache.set_bytes(b"b", &[2; 32], None, 0).unwrap();
+        assert_eq!(
+            cache.set_bytes(b"c", &[3; 64], None, 0),
+            Err(CacheAdmissionError::ArenaLimit)
+        );
+        assert_eq!(cache.stats().evictions, 0);
+        assert_eq!(cache.get(b"a", 0), Some(CacheValueView::Bytes(&[1; 32])));
+        assert_eq!(cache.get(b"b", 0), Some(CacheValueView::Bytes(&[2; 32])));
+        assert_eq!(cache.ttl(b"a", 0), CacheTtl::RemainingMs(100));
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn s3fifo_arena_reuses_both_key_and_value_blocks() {
+        let mut cache = CacheStore::with_s3fifo(CacheLimits {
+            max_entries: 2,
+            max_arena_bytes: 128,
+        });
+        let old = [b'a'; 32];
+        let new = [b'b'; 32];
+        cache.set_bytes(&old, &[1; 64], None, 0).unwrap();
+        cache.set_bytes(b"other", &[2; 32], None, 0).unwrap();
+        cache.set_bytes(&new, &[3; 64], None, 0).unwrap();
+        assert_eq!(cache.get(&new, 0), Some(CacheValueView::Bytes(&[3; 64])));
+        assert!(!cache.exists(&old, 0));
+        assert!(cache.exists(b"other", 0));
+        assert_eq!(cache.stats().evictions, 1);
+        assert_eq!(cache.memory_stats().arena_reserved_bytes, 128);
+        // A replacement must not evict its own key or rely on its old
+        // block being released before the new value is packed.
+        assert_eq!(
+            cache.set_bytes(&new, &[4; 64], None, 0),
+            Err(CacheAdmissionError::ArenaLimit)
+        );
+        assert_eq!(cache.get(&new, 0), Some(CacheValueView::Bytes(&[3; 64])));
+        assert_eq!(cache.stats().evictions, 1);
+    }
+
+    #[test]
+    fn s3fifo_mixed_pressure_randomized_admission_preserves_bounds() {
+        fn snapshot(cache: &CacheStore) -> Vec<(Vec<u8>, Vec<u8>, Option<u64>)> {
+            let mut entries: Vec<_> = cache
+                .slots
+                .iter()
+                .filter_map(|slot| {
+                    let entry = slot.entry.as_ref()?;
+                    let value = match entry.value.view(&cache.arena) {
+                        CacheValueView::Bytes(bytes) => bytes.to_vec(),
+                        CacheValueView::Integer(value) => value.to_le_bytes().to_vec(),
+                    };
+                    Some((
+                        entry.key.as_slice(&cache.arena).to_vec(),
+                        value,
+                        entry.expires_at_ms,
+                    ))
+                })
+                .collect();
+            entries.sort_unstable();
+            entries
+        }
+        let limits = CacheLimits {
+            max_entries: 24,
+            max_arena_bytes: 2048,
+        };
+        let mut cache = CacheStore::with_s3fifo(limits);
+        let mut state = 2026u64;
+        let keys: Vec<Vec<u8>> = (0..48)
+            .map(|i| {
+                let mut key = vec![i; if i % 3 == 0 { 32 } else { 8 }];
+                key[0] = i;
+                key
+            })
+            .collect();
+        let sizes = [1, 23, 32, 64, 128, 256, 1024, 4096];
+        for step in 0..3000u64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let a = &keys[state as usize % keys.len()];
+            let b = &keys[(state >> 8) as usize % keys.len()];
+            let value = vec![step as u8; sizes[(state >> 16) as usize % sizes.len()]];
+            let before = snapshot(&cache);
+            let evictions = cache.stats().evictions;
+            match state % 5 {
+                0 => {
+                    cache.delete(a);
+                }
+                1 => {
+                    cache.get(a, 0);
+                }
+                2 => {
+                    if cache.set_batch(&[(a, &value), (b, b"ok")], 0).is_err() {
+                        assert_eq!(snapshot(&cache), before, "batch failure {step}");
+                        assert_eq!(cache.stats().evictions, evictions);
+                    } else {
+                        assert_eq!(cache.get(b, 0), Some(CacheValueView::Bytes(b"ok")));
+                        if a != b {
+                            assert_eq!(cache.get(a, 0), Some(CacheValueView::Bytes(&value)));
+                        }
+                    }
+                }
+                _ => {
+                    if cache.set_bytes(a, &value, Some(100), 0).is_err() {
+                        assert_eq!(snapshot(&cache), before, "single failure {step}");
+                        assert_eq!(cache.stats().evictions, evictions);
+                    } else {
+                        assert_eq!(cache.get(a, 0), Some(CacheValueView::Bytes(&value)));
+                    }
+                }
+            }
+            assert!(cache.len() <= limits.max_entries);
+            assert!(cache.arena.bytes.len() <= limits.max_arena_bytes);
+            let policy = cache.eviction.as_ref().unwrap();
+            assert_eq!(policy.small.len + policy.main.len, cache.len());
+            // Each live arena block and each free block must be unique,
+            // nonoverlapping, in bounds, and collectively cover the extent.
+            let mut spans = Vec::new();
+            for slot in &cache.slots {
+                if let Some(entry) = &slot.entry {
+                    for packed in [
+                        Some(entry.key),
+                        match entry.value {
+                            CacheValue::Bytes(value) => Some(value),
+                            _ => None,
+                        },
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        if let PackedBytes::Arena(slice) = packed {
+                            spans.push((
+                                slice.offset as usize,
+                                1usize << (slice.class as usize + MIN_ARENA_EXP),
+                            ));
+                        }
+                    }
+                }
+            }
+            for (class, free) in cache.arena.free.iter().enumerate() {
+                for &offset in free {
+                    spans.push((offset as usize, 1usize << (class + MIN_ARENA_EXP)));
+                }
+            }
+            spans.sort_unstable();
+            let mut end = 0;
+            for (offset, size) in spans {
+                assert_eq!(offset, end, "arena overlap or gap at step {step}");
+                end += size;
+            }
+            assert_eq!(end, cache.arena.bytes.len());
+        }
+    }
+
+    #[test]
+    fn s3fifo_arena_pressure_preserves_hot_set_with_loose_entry_limit() {
+        let mut cache = CacheStore::with_s3fifo(CacheLimits {
+            max_entries: 1024,
+            max_arena_bytes: 8192,
+        });
+        // 128 physical blocks, rather than the configured 1024 entries.
+        for key in 0..128u64 {
+            cache
+                .set_bytes(&key.to_le_bytes(), &[7; 64], None, 0)
+                .unwrap();
+        }
+        for round in 0..10u64 {
+            for key in 0..32u64 {
+                assert!(
+                    cache.get(&key.to_le_bytes(), 0).is_some(),
+                    "lost hot key {key} at round {round}"
+                );
+                assert!(cache.get(&key.to_le_bytes(), 0).is_some());
+            }
+            for key in 0..512u64 {
+                cache
+                    .set_bytes(
+                        &(10_000 + round * 512 + key).to_le_bytes(),
+                        &[8; 64],
+                        None,
+                        0,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(cache.len(), 128);
+            assert_eq!(cache.memory_stats().arena_reserved_bytes, 8192);
+        }
     }
 }
