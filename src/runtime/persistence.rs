@@ -3417,6 +3417,53 @@ mod sqlite_streamed_recovery_tests {
     }
 
     #[test]
+    fn test_corrupted_event_history_preserves_live_crdt_manager() {
+        use crate::runtime::CrdtManager;
+        let mut runtime = crate::runtime::Runtime::new();
+        let mut manager = CrdtManager::new(0);
+        let (id, _) = manager.create_gcounter();
+        manager.get_gcounter_mut(id).unwrap().increment_by(3);
+        let stale = manager.snapshot().remove(&id).unwrap();
+        manager.get_gcounter_mut(id).unwrap().increment_by(7);
+        manager.field_map.insert((72, "live".to_string()), id);
+        manager.field_reverse.insert(id, (72, "live".to_string()));
+        let before = manager.snapshot();
+        let fields = manager.field_map.clone();
+        let reverse = manager.field_reverse.clone();
+        runtime.crdt_manager = Some(manager);
+
+        let mut store = LibsqlStore::new(":memory:").unwrap();
+        store
+            .save_snapshot(ActorSnapshot {
+                actor_id: 71,
+                sequence: 1,
+                crdt_snapshot: Some(vec![(id.0, stale.0.to_u8(), stale.1)]),
+                crdt_field_map: Some(HashMap::from([("stale".to_string(), id.0)])),
+                ..ActorSnapshot::default()
+            })
+            .unwrap();
+        {
+            let conn = store.conn();
+            store.rt.block_on(async {
+                conn.execute(
+                    "INSERT INTO events (actor_id, sequence, field_name, event_name, args, value)
+                     VALUES (71, 2, 'count', 'set', '[]', '{')",
+                    (),
+                )
+                .await
+                .unwrap();
+            });
+        }
+        runtime.persistence = Box::new(store);
+        assert_eq!(runtime.recover_actor(71), None);
+        assert!(!runtime.actors.contains_key(&71));
+        let manager = runtime.crdt_manager.as_ref().unwrap();
+        assert_eq!(manager.snapshot(), before);
+        assert_eq!(manager.field_map, fields);
+        assert_eq!(manager.field_reverse, reverse);
+    }
+
+    #[test]
     fn test_corrupted_event_history_fails_closed_before_recovery_publication() {
         let mut store = LibsqlStore::new(":memory:").unwrap();
         store
@@ -4634,10 +4681,16 @@ mod libsql_atomic_transition_tests {
     }
 
     #[test]
-    #[ignore = "requires explicitly authorized, fresh disposable Turso DB; never production"]
     fn disposable_turso_smoke_live_https_roundtrip() {
-        let endpoint = std::env::var("NULANG_DISPOSABLE_TURSO_URL").unwrap_or_default();
         let opt_in = std::env::var("NULANG_DISPOSABLE_TURSO_CONFIRM").unwrap_or_default();
+        // Ordinary discovery never makes a remote connection unless the
+        // operator explicitly configures the disposable smoke. Invalid
+        // nonempty confirmations still fail the existing authorization guard.
+        if opt_in.is_empty() {
+            eprintln!("live disposable Turso smoke not requested");
+            return;
+        }
+        let endpoint = std::env::var("NULANG_DISPOSABLE_TURSO_URL").unwrap_or_default();
         assert!(
             disposable_turso_endpoint_allowed(&endpoint, &opt_in),
             "requires a fresh nulang-smoke-* Turso hostname and explicit yes confirmation"
