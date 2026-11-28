@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Fabric WAL storage comparison — 2026-11-27
+- **Add same-binary disk/tmpfs and synchronous group-commit comparison**, verified recovery per sample, and an asynchronous WAL writer design decision record. No runtime changes or durability downgrade.
+
 ### Fabric latency metrics — 2026-11-27
 - **Add opt-in bounded internal latency histograms** for command dispatch, WAL synchronization, clock publication and checkpoints, with cumulative local Prometheus metrics and soak-profile support. No new dependencies.
 

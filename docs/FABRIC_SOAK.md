@@ -109,3 +109,5 @@ correlation. See RESP_CACHE_ARCHITECTURE.md for exact timing boundaries.
 | checkpoint | 23 | 5000 | 50000 | 50000 | 42607 |
 
 A shared host and nearly full disk were used. Distributions are not paired per request; do not infer exact causal attribution or overhead from the previous run. The observed profile motivates controlled storage-latency experiments before architectural changes.
+
+For a same-binary storage and group-commit comparison, see [WAL writer decision record](FABRIC_WAL_WRITER_DESIGN.md). The soak also accepts --commit-mode connection or cross (default cross).
