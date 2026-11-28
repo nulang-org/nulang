@@ -1,0 +1,2390 @@
+#![cfg(unix)]
+use nulang::database::{
+    sst_manifest::ManifestStore,
+    store::WalBackedTablet,
+    tablet::{KeyRange, TabletDescriptor, TabletId, TabletMutation, TransactionId},
+};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+};
+static NEXT: AtomicU64 = AtomicU64::new(0);
+struct Fixture(PathBuf);
+impl Fixture {
+    fn new() -> Self {
+        let p = std::env::temp_dir().join(format!(
+            "nudb-sealed-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&p).unwrap();
+        fs::create_dir(p.join("sst")).unwrap();
+        Self(p)
+    }
+    fn descriptor(&self) -> TabletDescriptor {
+        TabletDescriptor::new(
+            TabletId::new(7).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            3,
+        )
+        .unwrap()
+    }
+    fn open(&self) -> WalBackedTablet {
+        WalBackedTablet::open(self.descriptor(), self.0.join("tablet.wal")).unwrap()
+    }
+    fn manifest(&self) -> ManifestStore {
+        ManifestStore::create(self.0.join("sst"), 7, 3).unwrap()
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+fn id(n: u8) -> TransactionId {
+    TransactionId::new([n; 16])
+}
+fn put(value: &[u8]) -> TabletMutation {
+    TabletMutation::Put {
+        key: b"k".to_vec(),
+        value: value.to_vec(),
+    }
+}
+
+fn seal(f: &Fixture, db: &WalBackedTablet) -> ManifestStore {
+    let mut manifest = f.manifest();
+    db.flush_sst_shadow(&mut manifest, 64).unwrap();
+    db.seal_sst_recovery(&mut manifest).unwrap();
+    manifest
+}
+fn recover(f: &Fixture) -> std::io::Result<WalBackedTablet> {
+    WalBackedTablet::open_from_sealed_sst(f.descriptor(), f.0.join("tablet.wal"), f.0.join("sst"))
+}
+#[test]
+fn sealed_prefix_and_wal_tail_recover_and_accept_new_writes() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let r1 = db
+        .commit_idempotent(id(1), vec![put(b"before"), put(b"first")])
+        .unwrap();
+    db.commit_idempotent(id(2), vec![]).unwrap();
+    drop(seal(&f, &db));
+    let r3 = db
+        .commit_idempotent(id(3), vec![TabletMutation::Delete { key: b"k".to_vec() }])
+        .unwrap();
+    db.commit_idempotent(id(4), vec![put(b"tail")]).unwrap();
+    drop(db);
+    let bytes = fs::read(f.0.join("tablet.wal")).unwrap();
+    let mut db = recover(&f).unwrap();
+    assert_eq!(db.current_sequence(), 4);
+    assert_eq!(db.read_at(b"k", 1).unwrap(), Some(b"first".as_slice()));
+    assert_eq!(db.read_at(b"k", 2).unwrap(), Some(b"first".as_slice()));
+    assert_eq!(db.read_at(b"k", 3).unwrap(), None);
+    assert_eq!(db.read_latest(b"k"), Some(b"tail".as_slice()));
+    assert_eq!(
+        db.commit_idempotent(id(1), vec![put(b"before"), put(b"first")])
+            .unwrap(),
+        r1
+    );
+    assert_eq!(
+        db.commit_idempotent(id(3), vec![TabletMutation::Delete { key: b"k".to_vec() }])
+            .unwrap(),
+        r3
+    );
+    assert!(db.commit_idempotent(id(1), vec![put(b"conflict")]).is_err());
+    assert_eq!(fs::read(f.0.join("tablet.wal")).unwrap(), bytes);
+    db.commit_idempotent(id(5), vec![put(b"new")]).unwrap();
+    drop(db);
+    let db = recover(&f).unwrap();
+    assert_eq!(db.current_sequence(), 5);
+    assert_eq!(db.read_latest(b"k"), Some(b"new".as_slice()));
+}
+#[test]
+fn wrong_prefix_with_same_tablet_and_sequence_is_rejected() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"original")]).unwrap();
+    drop(seal(&f, &db));
+    drop(db);
+    let other = f.0.join("other.wal");
+    let mut db = WalBackedTablet::open(f.descriptor(), &other).unwrap();
+    db.commit_idempotent(id(1), vec![put(b"different")])
+        .unwrap();
+    drop(db);
+    let bytes = fs::read(&other).unwrap();
+    assert!(
+        WalBackedTablet::open_from_sealed_sst(f.descriptor(), &other, f.0.join("sst")).is_err()
+    );
+    assert_eq!(fs::read(other).unwrap(), bytes);
+}
+#[test]
+fn receipt_mismatch_with_identical_values_is_rejected() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"same")]).unwrap();
+    drop(seal(&f, &db));
+    drop(db);
+    let other = f.0.join("other.wal");
+    let mut db = WalBackedTablet::open(f.descriptor(), &other).unwrap();
+    db.commit_idempotent(id(2), vec![put(b"same")]).unwrap();
+    drop(db);
+    assert!(
+        WalBackedTablet::open_from_sealed_sst(f.descriptor(), &other, f.0.join("sst")).is_err()
+    );
+}
+#[test]
+fn missing_wal_and_existing_checkpoint_are_not_silently_bypassed() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    drop(seal(&f, &db));
+    db.publish_checkpoint().unwrap();
+    drop(db);
+    assert!(recover(&f).is_err());
+    fs::remove_file(f.0.join("tablet.checkpoint")).unwrap();
+    fs::remove_file(f.0.join("tablet.wal")).unwrap();
+    assert!(recover(&f).is_err());
+    assert!(!f.0.join("tablet.wal").exists());
+}
+#[test]
+fn compacted_wal_has_no_seal_binding_and_is_rejected() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    drop(seal(&f, &db));
+    db.checkpoint().unwrap();
+    drop(db);
+    fs::remove_file(f.0.join("tablet.checkpoint")).unwrap();
+    assert!(recover(&f).is_err());
+}
+
+#[test]
+fn torn_tail_recovery_preserves_valid_prefix() {
+    use std::io::Write;
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    drop(seal(&f, &db));
+    db.commit_idempotent(id(2), vec![put(b"tail")]).unwrap();
+    drop(db);
+    let path = f.0.join("tablet.wal");
+    let expected = fs::read(&path).unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"partial")
+        .unwrap();
+    let mut db = recover(&f).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), expected);
+    assert_eq!(db.current_sequence(), 2);
+    assert_eq!(db.read_latest(b"k"), Some(b"tail".as_slice()));
+    assert_eq!(
+        db.commit_idempotent(id(3), vec![put(b"next")])
+            .unwrap()
+            .sequence(),
+        3
+    );
+}
+
+#[test]
+fn unsealed_manifest_and_changed_range_are_rejected() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let mut m = f.manifest();
+    db.flush_sst_shadow(&mut m, 1).unwrap();
+    drop(m);
+    drop(db);
+    assert!(recover(&f).is_err());
+    let db = f.open();
+    let mut m = ManifestStore::open(f.0.join("sst"), 7, 3).unwrap();
+    db.seal_sst_recovery(&mut m).unwrap();
+    drop(m);
+    drop(db);
+    let other = TabletDescriptor::new(
+        TabletId::new(7).unwrap(),
+        KeyRange::new(b"b".to_vec(), Some(b"z".to_vec())).unwrap(),
+        3,
+    )
+    .unwrap();
+    assert!(
+        WalBackedTablet::open_from_sealed_sst(other, f.0.join("tablet.wal"), f.0.join("sst"))
+            .is_err()
+    );
+}
+
+#[test]
+fn checkpoint_and_sealed_tail_recovery_preserve_equivalent_history_and_receipts() {
+    use nulang::database::indexed_sst::DiskLookup;
+    let a = Fixture::new();
+    let b = Fixture::new();
+    let mut disk = a.open();
+    let mut checkpoint = b.open();
+    let mutations = [
+        vec![put(b"first"), put(b"last")],
+        vec![],
+        vec![TabletMutation::Delete { key: b"k".to_vec() }],
+        vec![put(b"")],
+        vec![put(b"tail")],
+    ];
+    let mut receipts = Vec::new();
+    for (i, writes) in mutations.iter().enumerate() {
+        let tx = id(i as u8 + 1);
+        let r = disk.commit_idempotent(tx, writes.clone()).unwrap();
+        assert_eq!(checkpoint.commit_idempotent(tx, writes.clone()).unwrap(), r);
+        receipts.push(r);
+        if i == 2 {
+            drop(seal(&a, &disk));
+            checkpoint.checkpoint().unwrap();
+        }
+    }
+    drop(disk);
+    drop(checkpoint);
+    let before = fs::read(a.0.join("tablet.wal")).unwrap();
+    let mut disk = recover(&a).unwrap();
+    let mut checkpoint = b.open();
+    let manifest = ManifestStore::open(a.0.join("sst"), 7, 3).unwrap();
+    for snapshot in 0..=5 {
+        for key in [b"k", b"x"] {
+            assert_eq!(
+                disk.read_at(key, snapshot).unwrap(),
+                checkpoint.read_at(key, snapshot).unwrap()
+            );
+        }
+    }
+    assert_eq!(
+        disk.read_sst_shadow_at(&manifest, b"k", 2).unwrap(),
+        DiskLookup::Value {
+            sequence: 1,
+            value: b"last".to_vec()
+        }
+    );
+    assert_eq!(
+        disk.read_sst_shadow_at(&manifest, b"k", 3).unwrap(),
+        DiskLookup::Deleted { sequence: 3 }
+    );
+    assert!(disk.read_sst_shadow_at(&manifest, b"k", 4).is_err());
+    for (i, writes) in mutations.iter().enumerate() {
+        let tx = id(i as u8 + 1);
+        assert_eq!(
+            disk.commit_idempotent(tx, writes.clone()).unwrap(),
+            receipts[i]
+        );
+        assert_eq!(
+            checkpoint.commit_idempotent(tx, writes.clone()).unwrap(),
+            receipts[i]
+        );
+    }
+    assert_eq!(fs::read(a.0.join("tablet.wal")).unwrap(), before);
+    assert_eq!(disk.current_sequence(), 5);
+    assert_eq!(checkpoint.current_sequence(), 5);
+}
+
+// Independent on-disk fixture: no production writer or reclamation API.
+fn bound_fixture(f: &Fixture, db: &mut WalBackedTablet) -> Vec<u8> {
+    db.commit_idempotent(id(1), vec![put(b"sealed")]).unwrap();
+    drop(seal(f, db));
+    let prefix_len = fs::metadata(f.0.join("tablet.wal")).unwrap().len() as usize;
+    db.commit_idempotent(id(2), vec![put(b"tail")]).unwrap();
+    let full = fs::read(f.0.join("tablet.wal")).unwrap();
+    let manifest = fs::read(f.0.join("sst/MANIFEST")).unwrap();
+    let mut bound = b"NUDBWAL4".to_vec();
+    for n in [1u64, 7, 3] {
+        bound.extend_from_slice(&n.to_le_bytes());
+    }
+    bound.extend_from_slice(&manifest[manifest.len() - 32..]);
+    let checksum = blake3::hash(&bound);
+    bound.extend_from_slice(checksum.as_bytes());
+    bound.extend_from_slice(&full[prefix_len..]);
+    bound
+}
+
+#[test]
+fn bound_wal_recovers_only_with_exact_seal_and_preserves_receipts() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let bytes = bound_fixture(&f, &mut db);
+    drop(db);
+    let path = f.0.join("tablet.wal");
+    fs::write(&path, &bytes).unwrap();
+    assert!(WalBackedTablet::open(f.descriptor(), &path).is_err());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    let mut db = recover(&f).unwrap();
+    assert_eq!(db.current_sequence(), 2);
+    assert_eq!(db.read_at(b"k", 1).unwrap(), Some(b"sealed".as_slice()));
+    assert_eq!(db.read_latest(b"k"), Some(b"tail".as_slice()));
+    assert_eq!(
+        db.commit_idempotent(id(1), vec![put(b"sealed")])
+            .unwrap()
+            .sequence(),
+        1
+    );
+    assert_eq!(
+        db.commit_idempotent(id(2), vec![put(b"tail")])
+            .unwrap()
+            .sequence(),
+        2
+    );
+    assert!(db.commit_idempotent(id(1), vec![put(b"wrong")]).is_err());
+    assert!(db.publish_checkpoint().is_err());
+    assert!(db.checkpoint().is_err());
+    assert!(db.reclaim_history_before(1).is_err());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert!(!f.0.join("tablet.checkpoint").exists());
+    db.commit_idempotent(id(3), vec![put(b"new")]).unwrap();
+    drop(db);
+    let db = recover(&f).unwrap();
+    assert_eq!(db.current_sequence(), 3);
+    assert_eq!(db.read_latest(b"k"), Some(b"new".as_slice()));
+}
+
+#[test]
+fn mismatched_bound_headers_reject_before_tail_repair() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let bytes = bound_fixture(&f, &mut db);
+    drop(db);
+    let path = f.0.join("tablet.wal");
+    for offset in [8, 16, 24, 32] {
+        let mut wrong = bytes.clone();
+        wrong[offset] ^= 1;
+        let hash = blake3::hash(&wrong[..64]);
+        wrong[64..96].copy_from_slice(hash.as_bytes());
+        wrong.extend_from_slice(b"partial");
+        fs::write(&path, &wrong).unwrap();
+        assert!(recover(&f).is_err(), "offset {offset}");
+        assert_eq!(fs::read(&path).unwrap(), wrong);
+    }
+    let mut wrong = bytes.clone();
+    wrong[64] ^= 1;
+    fs::write(&path, &wrong).unwrap();
+    assert!(recover(&f).is_err());
+    assert_eq!(fs::read(&path).unwrap(), wrong);
+    let mut torn = bytes.clone();
+    torn.extend_from_slice(b"partial");
+    fs::write(&path, &torn).unwrap();
+    let db = recover(&f).unwrap();
+    assert_eq!(db.current_sequence(), 2);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn valid_but_different_seal_with_same_identity_cannot_open_bound_wal() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let mut bytes = bound_fixture(&f, &mut db);
+    drop(db);
+    bytes.extend_from_slice(b"partial");
+    let path = f.0.join("tablet.wal");
+    fs::write(&path, &bytes).unwrap();
+    let other = Fixture::new();
+    let mut db = other.open();
+    // Same value, sequence, tablet and epoch; different durable receipt.
+    db.commit_idempotent(id(9), vec![put(b"sealed")]).unwrap();
+    drop(seal(&other, &db));
+    drop(db);
+    assert!(
+        WalBackedTablet::open_from_sealed_sst(f.descriptor(), &path, other.0.join("sst")).is_err()
+    );
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn bound_header_without_tail_recovers_at_sealed_sequence() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let bytes = bound_fixture(&f, &mut db);
+    drop(db);
+    let path = f.0.join("tablet.wal");
+    fs::write(&path, &bytes[..96]).unwrap();
+    let mut db = recover(&f).unwrap();
+    assert_eq!(db.current_sequence(), 1);
+    assert_eq!(db.read_latest(b"k"), Some(b"sealed".as_slice()));
+    assert_eq!(
+        db.commit_idempotent(id(2), vec![put(b"fresh")])
+            .unwrap()
+            .sequence(),
+        2
+    );
+    drop(db);
+    let db = recover(&f).unwrap();
+    assert_eq!(db.read_latest(b"k"), Some(b"fresh".as_slice()));
+}
+
+#[test]
+fn explicit_reclaim_publishes_bound_header_and_recovers_receipts() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let first = db
+        .commit_idempotent(id(1), vec![put(b"first"), put(b"last")])
+        .unwrap();
+    db.commit_idempotent(id(2), vec![TabletMutation::Delete { key: b"k".to_vec() }])
+        .unwrap();
+    db.commit_idempotent(id(3), vec![]).unwrap();
+    let manifest = seal(&f, &db);
+    let path = f.0.join("tablet.wal");
+    db.reclaim_to_sealed_sst(&manifest).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    assert_eq!(bytes.len(), 96);
+    assert_eq!(&bytes[..8], b"NUDBWAL4");
+    assert!(WalBackedTablet::open(f.descriptor(), &path).is_err());
+    assert!(ManifestStore::open(f.0.join("sst"), 7, 3).is_err());
+    assert_eq!(
+        db.commit_idempotent(id(1), vec![put(b"first"), put(b"last")])
+            .unwrap(),
+        first
+    );
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(db.read_at(b"k", 1).unwrap(), Some(b"last".as_slice()));
+    assert_eq!(db.read_at(b"k", 3).unwrap(), None);
+    assert!(db.checkpoint().is_err());
+    assert!(db.reclaim_to_sealed_sst(&manifest).is_err());
+    db.commit_idempotent(id(4), vec![put(b"tail")]).unwrap();
+    drop(db);
+    drop(manifest);
+    assert!(WalBackedTablet::open(f.descriptor(), &path).is_err());
+    let mut db = recover(&f).unwrap();
+    assert_eq!(db.current_sequence(), 4);
+    assert_eq!(db.read_latest(b"k"), Some(b"tail".as_slice()));
+    assert_eq!(
+        db.commit_idempotent(id(1), vec![put(b"first"), put(b"last")])
+            .unwrap(),
+        first
+    );
+}
+
+#[test]
+fn reclaim_rejects_stale_seal_checkpoint_and_foreign_receipts_without_mutation() {
+    for scenario in 0..3 {
+        let f = Fixture::new();
+        let mut db = f.open();
+        db.commit_idempotent(id(1), vec![put(b"v")]).unwrap();
+        let other = Fixture::new();
+        let m = if scenario == 2 {
+            let mut foreign = other.open();
+            foreign.commit_idempotent(id(9), vec![put(b"v")]).unwrap();
+            seal(&other, &foreign)
+        } else {
+            seal(&f, &db)
+        };
+        if scenario == 0 {
+            db.commit_idempotent(id(2), vec![put(b"tail")]).unwrap();
+        }
+        if scenario == 1 {
+            db.publish_checkpoint().unwrap();
+        }
+        let path = f.0.join("tablet.wal");
+        let before = fs::read(&path).unwrap();
+        assert!(db.reclaim_to_sealed_sst(&m).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        db.commit_idempotent(id(3), vec![put(b"still writable")])
+            .unwrap();
+    }
+}
+
+#[test]
+fn reclaim_revalidates_sealed_manifest_on_disk_before_discarding_wal() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"v")]).unwrap();
+    let m = seal(&f, &db);
+    let manifest_path = f.0.join("sst/MANIFEST");
+    let mut corrupt = fs::read(&manifest_path).unwrap();
+    corrupt[12] ^= 1;
+    fs::write(&manifest_path, corrupt).unwrap();
+    let path = f.0.join("tablet.wal");
+    let before = fs::read(&path).unwrap();
+    assert!(db.reclaim_to_sealed_sst(&m).is_err());
+    assert_eq!(fs::read(&path).unwrap(), before);
+    db.commit_idempotent(id(2), vec![put(b"still writable")])
+        .unwrap();
+}
+
+#[test]
+fn empty_seal_does_not_reclaim_empty_wal() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let mut manifest = f.manifest();
+    db.seal_sst_recovery(&mut manifest).unwrap();
+    let path = f.0.join("tablet.wal");
+    let before = fs::read(&path).unwrap();
+    assert!(db.reclaim_to_sealed_sst(&manifest).is_err());
+    assert_eq!(fs::read(&path).unwrap(), before);
+    db.commit_idempotent(id(1), vec![]).unwrap();
+}
+
+#[test]
+fn sealed_floor_takes_effect_only_on_bound_cutover_and_preserves_receipts() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let r1 = db.commit_idempotent(id(1), vec![put(b"old")]).unwrap();
+    db.commit_idempotent(id(2), vec![put(b"anchor")]).unwrap();
+    db.commit_idempotent(id(3), vec![]).unwrap();
+    db.commit_idempotent(id(4), vec![TabletMutation::Delete { key: b"k".to_vec() }])
+        .unwrap();
+    db.commit_idempotent(id(5), vec![put(b"new")]).unwrap();
+    let mut m = f.manifest();
+    while db.flush_sst_shadow(&mut m, 2).unwrap().is_some() {}
+    let pin = db.pin_snapshot(1).unwrap();
+    assert!(db.seal_sst_recovery_at_floor(&mut m, 3).is_err());
+    assert!(db.seal_sst_recovery_at_floor(&mut m, 6).is_err());
+    assert!(!m.current().is_recovery_sealed());
+    drop(pin);
+    db.seal_sst_recovery_at_floor(&mut m, 3).unwrap();
+    assert_eq!(db.oldest_retained_snapshot(), 0);
+    assert_eq!(m.current().recovery_floor(), Some(3));
+    assert!(m.recovered_read_at(b"k", 2).is_err());
+    assert_eq!(
+        m.recovered_read_at(b"k", 3).unwrap(),
+        Some(b"anchor".to_vec())
+    );
+    assert_eq!(m.recovered_read_at(b"k", 4).unwrap(), None);
+    assert_eq!(m.recovered_receipt(id(1)).unwrap(), Some(r1));
+    let path = f.0.join("tablet.wal");
+    let before = fs::read(&path).unwrap();
+    let pin = db.pin_snapshot(2).unwrap();
+    assert!(db.reclaim_to_sealed_sst(&m).is_err());
+    assert_eq!(fs::read(&path).unwrap(), before);
+    drop(pin);
+    drop(db);
+    drop(m);
+    assert!(recover(&f).is_err());
+    let mut db = f.open();
+    assert_eq!(db.oldest_retained_snapshot(), 0);
+    let m = ManifestStore::open(f.0.join("sst"), 7, 3).unwrap();
+    db.reclaim_to_sealed_sst(&m).unwrap();
+    assert_eq!(db.oldest_retained_snapshot(), 3);
+    assert!(db.read_at(b"k", 2).is_err());
+    assert_eq!(db.read_at(b"k", 3).unwrap(), Some(b"anchor".as_slice()));
+    assert_eq!(db.read_at(b"k", 4).unwrap(), None);
+    assert_eq!(db.commit_idempotent(id(1), vec![put(b"old")]).unwrap(), r1);
+    db.commit_idempotent(id(6), vec![put(b"tail")]).unwrap();
+    drop(db);
+    drop(m);
+    let mut db = recover(&f).unwrap();
+    assert_eq!(db.oldest_retained_snapshot(), 3);
+    assert!(db.read_at(b"k", 2).is_err());
+    assert_eq!(db.read_at(b"k", 3).unwrap(), Some(b"anchor".as_slice()));
+    assert_eq!(db.read_at(b"k", 4).unwrap(), None);
+    assert_eq!(db.read_latest(b"k"), Some(b"tail".as_slice()));
+    assert_eq!(db.commit_idempotent(id(1), vec![put(b"old")]).unwrap(), r1);
+    assert!(db.pin_snapshot(2).is_err());
+}
+
+#[test]
+fn nonzero_floor_format_rejects_zero_future_and_version_downgrade() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"v")]).unwrap();
+    let mut m = f.manifest();
+    db.flush_sst_shadow(&mut m, 1).unwrap();
+    db.seal_sst_recovery_at_floor(&mut m, 1).unwrap();
+    drop(m);
+    drop(db);
+    let p = f.0.join("sst/MANIFEST");
+    let original = fs::read(&p).unwrap();
+    assert_eq!(&original[8..10], &3u16.to_le_bytes());
+    for variant in 0..3 {
+        let mut bytes = original[..original.len() - 32].to_vec();
+        match variant {
+            0 => bytes[98..106].copy_from_slice(&0u64.to_le_bytes()),
+            1 => bytes[98..106].copy_from_slice(&2u64.to_le_bytes()),
+            _ => bytes[8..10].copy_from_slice(&2u16.to_le_bytes()),
+        }
+        let hash = blake3::hash(&bytes);
+        bytes.extend_from_slice(hash.as_bytes());
+        fs::write(&p, &bytes).unwrap();
+        assert!(ManifestStore::open(f.0.join("sst"), 7, 3).is_err());
+    }
+    fs::write(&p, original).unwrap();
+    assert_eq!(
+        ManifestStore::open(f.0.join("sst"), 7, 3)
+            .unwrap()
+            .current()
+            .recovery_floor(),
+        Some(1)
+    );
+}
+
+#[test]
+fn successor_seals_repeat_reclamation_without_losing_history_or_receipts() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let old = db.commit_idempotent(id(1), vec![put(b"old")]).unwrap();
+    db.commit_idempotent(id(2), vec![put(b"anchor")]).unwrap();
+    let mut first = f.manifest();
+    db.flush_sst_shadow(&mut first, 2).unwrap();
+    db.seal_sst_recovery_at_floor(&mut first, 1).unwrap();
+    db.reclaim_to_sealed_sst(&first).unwrap();
+    let mut previous = first;
+    for cycle in 0..2u8 {
+        let base = db.current_sequence();
+        let tx = 3 + cycle * 2;
+        db.commit_idempotent(id(tx), vec![TabletMutation::Delete { key: b"k".to_vec() }])
+            .unwrap();
+        db.commit_idempotent(id(tx + 1), vec![put(b"new")]).unwrap();
+        let path = f.0.join(format!("successor-{cycle}"));
+        fs::create_dir(&path).unwrap();
+        let mut next = ManifestStore::create(&path, 7, 3).unwrap();
+        let wal = f.0.join("tablet.wal");
+        let before = fs::read(&wal).unwrap();
+        let pin = db.pin_snapshot(base - 1).unwrap();
+        assert!(db
+            .prepare_sst_successor(&previous, &mut next, base)
+            .is_err());
+        drop(pin);
+        db.prepare_sst_successor(&previous, &mut next, base)
+            .unwrap();
+        assert_eq!(fs::read(&wal).unwrap(), before);
+        assert_eq!(
+            db.oldest_retained_snapshot(),
+            previous.current().recovery_floor().unwrap()
+        );
+        assert_eq!(next.current().recovery_floor(), Some(base));
+        assert_eq!(next.recovered_read_at(b"k", base + 1).unwrap(), None);
+        let pin = db.pin_snapshot(base - 1).unwrap();
+        assert!(db.reclaim_to_sst_successor(&previous, &next).is_err());
+        drop(pin);
+        db.reclaim_to_sst_successor(&previous, &next).unwrap();
+        assert_eq!(fs::metadata(&wal).unwrap().len(), 96);
+        assert_eq!(db.oldest_retained_snapshot(), base);
+        assert_eq!(db.commit_idempotent(id(1), vec![put(b"old")]).unwrap(), old);
+        drop(previous);
+        drop(db);
+        drop(next);
+        db = WalBackedTablet::open_from_sealed_sst(f.descriptor(), &wal, &path).unwrap();
+        assert_eq!(db.current_sequence(), base + 2);
+        assert!(db.read_at(b"k", base - 1).is_err());
+        assert_eq!(db.read_at(b"k", base + 1).unwrap(), None);
+        assert_eq!(db.read_latest(b"k"), Some(b"new".as_slice()));
+        previous = ManifestStore::open(&path, 7, 3).unwrap();
+    }
+}
+
+#[test]
+fn successor_preparation_preserves_original_binding_and_stale_successor_is_rejected() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let first = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&first).unwrap();
+    db.commit_idempotent(id(2), vec![put(b"tail")]).unwrap();
+    let next_path = f.0.join("next");
+    fs::create_dir(&next_path).unwrap();
+    let mut next = ManifestStore::create(&next_path, 7, 3).unwrap();
+    db.prepare_sst_successor(&first, &mut next, 0).unwrap();
+    drop(db);
+    drop(first);
+    drop(next);
+    let wal = f.0.join("tablet.wal");
+    let before = fs::read(&wal).unwrap();
+    assert!(WalBackedTablet::open_from_sealed_sst(f.descriptor(), &wal, &next_path).is_err());
+    assert_eq!(fs::read(&wal).unwrap(), before);
+    let mut db = recover(&f).unwrap();
+    let first = ManifestStore::open(f.0.join("sst"), 7, 3).unwrap();
+    let next = ManifestStore::open(&next_path, 7, 3).unwrap();
+    db.commit_idempotent(id(3), vec![]).unwrap();
+    let before = fs::read(&wal).unwrap();
+    assert!(db.reclaim_to_sst_successor(&first, &next).is_err());
+    assert_eq!(fs::read(&wal).unwrap(), before);
+    db.commit_idempotent(id(4), vec![]).unwrap();
+}
+
+#[test]
+fn backup_restores_independent_bound_snapshot_with_tail_and_receipts() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let r1 = db.commit_idempotent(id(1), vec![put(b"old")]).unwrap();
+    db.commit_idempotent(id(2), vec![put(b"anchor")]).unwrap();
+    let mut m = f.manifest();
+    db.flush_sst_shadow(&mut m, 2).unwrap();
+    db.seal_sst_recovery_at_floor(&mut m, 2).unwrap();
+    db.reclaim_to_sealed_sst(&m).unwrap();
+    db.commit_idempotent(id(3), vec![TabletMutation::Delete { key: b"k".to_vec() }])
+        .unwrap();
+    db.commit_idempotent(id(4), vec![put(b"tail")]).unwrap();
+    let backup = f.0.join("backup");
+    let restore = f.0.join("restored");
+    let live_wal = f.0.join("tablet.wal");
+    let before = fs::read(&live_wal).unwrap();
+    db.backup_sealed(&m, &backup).unwrap();
+    assert_eq!(fs::read(&live_wal).unwrap(), before);
+    assert!(db.backup_sealed(&m, &backup).is_err());
+    db.commit_idempotent(id(5), vec![put(b"later")]).unwrap();
+    let mut recovered =
+        WalBackedTablet::restore_sealed_backup(f.descriptor(), &backup, &restore).unwrap();
+    assert_eq!(recovered.current_sequence(), 4);
+    assert_eq!(recovered.oldest_retained_snapshot(), 2);
+    assert!(recovered.read_at(b"k", 1).is_err());
+    assert_eq!(
+        recovered.read_at(b"k", 2).unwrap(),
+        Some(b"anchor".as_slice())
+    );
+    assert_eq!(recovered.read_at(b"k", 3).unwrap(), None);
+    assert_eq!(recovered.read_latest(b"k"), Some(b"tail".as_slice()));
+    assert_eq!(
+        recovered
+            .commit_idempotent(id(1), vec![put(b"old")])
+            .unwrap(),
+        r1
+    );
+    recovered
+        .commit_idempotent(id(5), vec![put(b"restored")])
+        .unwrap();
+    assert_eq!(db.read_latest(b"k"), Some(b"later".as_slice()));
+    drop(recovered);
+    let second = f.0.join("restored-again");
+    let recovered =
+        WalBackedTablet::restore_sealed_backup(f.descriptor(), &backup, &second).unwrap();
+    assert_eq!(recovered.current_sequence(), 4);
+    assert_eq!(recovered.read_latest(b"k"), Some(b"tail".as_slice()));
+}
+
+#[test]
+fn backup_restore_rejects_missing_completion_and_wal_truncation_without_repair() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let m = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&m).unwrap();
+    db.commit_idempotent(id(2), vec![put(b"tail")]).unwrap();
+    let backup = f.0.join("backup");
+    db.backup_sealed(&m, &backup).unwrap();
+    let marker = backup.join("COMPLETE");
+    let complete = fs::read(&marker).unwrap();
+    fs::remove_file(&marker).unwrap();
+    assert!(
+        WalBackedTablet::restore_sealed_backup(f.descriptor(), &backup, f.0.join("missing"))
+            .is_err()
+    );
+    fs::write(&marker, complete).unwrap();
+    let path = backup.join("tablet.wal");
+    let full = fs::read(&path).unwrap();
+    for (i, damaged) in [full[..full.len() - 1].to_vec(), full[..96].to_vec(), {
+        let mut v = full.clone();
+        v[100] ^= 1;
+        v
+    }]
+    .into_iter()
+    .enumerate()
+    {
+        fs::write(&path, &damaged).unwrap();
+        assert!(WalBackedTablet::restore_sealed_backup(
+            f.descriptor(),
+            &backup,
+            f.0.join(format!("bad-{i}"))
+        )
+        .is_err());
+        assert_eq!(fs::read(&path).unwrap(), damaged);
+    }
+    fs::write(&path, full).unwrap();
+    assert!(
+        WalBackedTablet::restore_sealed_backup(f.descriptor(), &backup, f.0.join("good")).is_ok()
+    );
+}
+
+#[test]
+fn backup_rejects_wrong_generation_corrupt_seal_and_marker() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let first = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&first).unwrap();
+    db.commit_idempotent(id(2), vec![put(b"tail")]).unwrap();
+    let next_path = f.0.join("next");
+    fs::create_dir(&next_path).unwrap();
+    let mut next = ManifestStore::create(&next_path, 7, 3).unwrap();
+    db.prepare_sst_successor(&first, &mut next, 1).unwrap();
+    db.reclaim_to_sst_successor(&first, &next).unwrap();
+    let wrong = f.0.join("wrong");
+    assert!(db.backup_sealed(&first, &wrong).is_err());
+    assert!(!wrong.exists());
+    let backup = f.0.join("backup");
+    db.backup_sealed(&next, &backup).unwrap();
+    let marker = backup.join("COMPLETE");
+    let complete = fs::read(&marker).unwrap();
+    let mut bad = complete.clone();
+    bad[32] ^= 1;
+    fs::write(&marker, bad).unwrap();
+    assert!(WalBackedTablet::restore_sealed_backup(
+        f.descriptor(),
+        &backup,
+        f.0.join("bad-marker")
+    )
+    .is_err());
+    fs::write(&marker, complete).unwrap();
+    let table = backup.join("sst/nudb-sst-00000000000000000001.sst");
+    let original = fs::read(&table).unwrap();
+    let mut bad = original.clone();
+    bad[55] ^= 1;
+    fs::write(&table, &bad).unwrap();
+    assert!(
+        WalBackedTablet::restore_sealed_backup(f.descriptor(), &backup, f.0.join("bad-table"))
+            .is_err()
+    );
+    assert_eq!(fs::read(&table).unwrap(), bad);
+    fs::write(&table, original).unwrap();
+    let restored =
+        WalBackedTablet::restore_sealed_backup(f.descriptor(), &backup, f.0.join("good")).unwrap();
+    assert_eq!(restored.current_sequence(), 2);
+    assert_eq!(restored.oldest_retained_snapshot(), 1);
+}
+
+#[test]
+fn quarantine_requires_current_backup_and_preserves_live_and_archived_generations() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let receipt = db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let old = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    db.commit_idempotent(id(2), vec![put(b"tail")]).unwrap();
+    let next_dir = f.0.join("next");
+    fs::create_dir(&next_dir).unwrap();
+    let mut next = ManifestStore::create(&next_dir, 7, 3).unwrap();
+    db.prepare_sst_successor(&old, &mut next, 1).unwrap();
+    db.reclaim_to_sst_successor(&old, &next).unwrap();
+    let backup = f.0.join("backup");
+    db.backup_sealed(&next, &backup).unwrap();
+    db.commit_idempotent(id(3), vec![put(b"latest")]).unwrap();
+    let quarantine = f.0.join("quarantine");
+    let old_dir = f.0.join("sst");
+    let live = f.0.join("tablet.wal");
+    let before = fs::read(&live).unwrap();
+    assert!(db
+        .quarantine_obsolete_sst(&next, old, &backup, &quarantine)
+        .is_err());
+    assert!(old_dir.exists());
+    assert!(!quarantine.exists());
+    assert_eq!(fs::read(&live).unwrap(), before);
+    let backup = f.0.join("fresh-backup");
+    db.backup_sealed(&next, &backup).unwrap();
+    let old = ManifestStore::open(&old_dir, 7, 3).unwrap();
+    db.quarantine_obsolete_sst(&next, old, &backup, &quarantine)
+        .unwrap();
+    assert!(!old_dir.exists());
+    assert!(quarantine.join("MANIFEST").exists());
+    assert_eq!(fs::read(&live).unwrap(), before);
+    assert_eq!(
+        db.commit_idempotent(id(1), vec![put(b"first")]).unwrap(),
+        receipt
+    );
+    assert_eq!(db.read_latest(b"k"), Some(b"latest".as_slice()));
+    drop(db);
+    drop(next);
+    let db = WalBackedTablet::open_from_sealed_sst(f.descriptor(), &live, &next_dir).unwrap();
+    assert_eq!(db.current_sequence(), 3);
+    assert_eq!(
+        ManifestStore::open(&quarantine, 7, 3)
+            .unwrap()
+            .recovered_read_at(b"k", 1)
+            .unwrap(),
+        Some(b"first".to_vec())
+    );
+    assert_eq!(
+        WalBackedTablet::restore_sealed_backup(f.descriptor(), &backup, f.0.join("restore"))
+            .unwrap()
+            .current_sequence(),
+        3
+    );
+}
+
+#[test]
+fn quarantine_refuses_corrupt_backup_and_unrelated_files_or_existing_target() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let old = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    db.commit_idempotent(id(2), vec![put(b"tail")]).unwrap();
+    let next_dir = f.0.join("next");
+    fs::create_dir(&next_dir).unwrap();
+    let mut next = ManifestStore::create(&next_dir, 7, 3).unwrap();
+    db.prepare_sst_successor(&old, &mut next, 0).unwrap();
+    db.reclaim_to_sst_successor(&old, &next).unwrap();
+    let backup = f.0.join("backup");
+    db.backup_sealed(&next, &backup).unwrap();
+    let old_dir = f.0.join("sst");
+    let quarantine = f.0.join("quarantine");
+    let file = backup.join("tablet.wal");
+    let valid = fs::read(&file).unwrap();
+    let mut bad = valid.clone();
+    bad[32] ^= 1;
+    fs::write(&file, bad).unwrap();
+    assert!(db
+        .quarantine_obsolete_sst(&next, old, &backup, &quarantine)
+        .is_err());
+    fs::write(&file, valid).unwrap();
+    let unknown = old_dir.join("other-user-data");
+    fs::write(&unknown, b"keep").unwrap();
+    assert!(db
+        .quarantine_obsolete_sst(
+            &next,
+            ManifestStore::open(&old_dir, 7, 3).unwrap(),
+            &backup,
+            &quarantine
+        )
+        .is_err());
+    assert_eq!(fs::read(&unknown).unwrap(), b"keep");
+    fs::remove_file(&unknown).unwrap();
+    fs::create_dir(&quarantine).unwrap();
+    assert!(db
+        .quarantine_obsolete_sst(
+            &next,
+            ManifestStore::open(&old_dir, 7, 3).unwrap(),
+            &backup,
+            &quarantine
+        )
+        .is_err());
+    assert!(old_dir.exists());
+    assert!(quarantine.read_dir().unwrap().next().is_none());
+}
+
+#[test]
+fn durable_registry_keeps_old_and_new_references_until_exact_wal_reconciliation() {
+    use nulang::database::generation_registry::{
+        GenerationRegistry, GenerationStatus, ReferenceKind,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let old = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let registry_dir = f.0.join("registry");
+    fs::create_dir(&registry_dir).unwrap();
+    let mut registry = GenerationRegistry::create(&registry_dir, 7, 3).unwrap();
+    assert_eq!(registry.status(&old).unwrap(), GenerationStatus::Unknown);
+    db.register_generation_wal(&mut registry, &old).unwrap();
+    registry
+        .register_reference(ReferenceKind::Reader, [1; 16], &old)
+        .unwrap();
+    assert_eq!(registry.status(&old).unwrap(), GenerationStatus::Referenced);
+    db.commit_idempotent(id(2), vec![put(b"tail")]).unwrap();
+    let next_dir = f.0.join("next");
+    fs::create_dir(&next_dir).unwrap();
+    let mut next = ManifestStore::create(&next_dir, 7, 3).unwrap();
+    db.prepare_sst_successor(&old, &mut next, 1).unwrap();
+    db.reserve_generation_rotation(&mut registry, &old, &next)
+        .unwrap();
+    assert_eq!(registry.status(&old).unwrap(), GenerationStatus::Referenced);
+    assert_eq!(
+        registry.status(&next).unwrap(),
+        GenerationStatus::Referenced
+    );
+    drop(registry);
+    let mut registry = GenerationRegistry::open(&registry_dir, 7, 3).unwrap();
+    assert_eq!(
+        registry.status(&next).unwrap(),
+        GenerationStatus::Referenced
+    );
+    db.reclaim_to_sst_successor(&old, &next).unwrap();
+    db.reconcile_generation_wal(&mut registry, &next).unwrap();
+    assert_eq!(registry.status(&old).unwrap(), GenerationStatus::Referenced);
+    registry
+        .release_reference(ReferenceKind::Reader, [1; 16], &old)
+        .unwrap();
+    assert_eq!(
+        registry.status(&old).unwrap(),
+        GenerationStatus::Unreferenced
+    );
+    assert_eq!(
+        registry.status(&next).unwrap(),
+        GenerationStatus::Referenced
+    );
+    drop(registry);
+    let registry = GenerationRegistry::open(&registry_dir, 7, 3).unwrap();
+    assert_eq!(
+        registry.status(&old).unwrap(),
+        GenerationStatus::Unreferenced
+    );
+    assert_eq!(
+        registry.status(&next).unwrap(),
+        GenerationStatus::Referenced
+    );
+}
+
+#[test]
+fn registry_rejects_wrong_identity_duplicate_reference_and_corruption() {
+    use nulang::database::generation_registry::{
+        GenerationRegistry, GenerationStatus, ReferenceKind,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let old = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let dir = f.0.join("registry");
+    fs::create_dir(&dir).unwrap();
+    let mut r = GenerationRegistry::create(&dir, 7, 3).unwrap();
+    assert!(GenerationRegistry::open(&dir, 7, 3).is_err());
+    assert!(GenerationRegistry::create(&dir, 7, 3).is_err());
+    r.register_reference(ReferenceKind::Backup, [1; 16], &old)
+        .unwrap();
+    assert!(r
+        .release_reference(ReferenceKind::Reader, [1; 16], &old)
+        .is_err());
+    assert_eq!(r.status(&old).unwrap(), GenerationStatus::Referenced);
+    drop(r);
+    assert!(GenerationRegistry::open(&dir, 7, 4).is_err());
+    let p = dir.join("GENERATIONS");
+    let mut bytes = fs::read(&p).unwrap();
+    bytes[10] ^= 1;
+    fs::write(&p, bytes).unwrap();
+    assert!(GenerationRegistry::open(&dir, 7, 3).is_err());
+    assert!(GenerationRegistry::create(&dir, 7, 3).is_err());
+}
+
+#[test]
+fn managed_rotation_automatically_reconciles_and_quarantine_respects_references() {
+    use nulang::database::generation_registry::{
+        GenerationRegistry, GenerationStatus, ReferenceKind,
+    };
+    use nulang::database::managed_storage::ManagedTablet;
+    let f = Fixture::new();
+    let mut db = f.open();
+    let receipt = db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let old = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let reg_dir = f.0.join("registry");
+    fs::create_dir(&reg_dir).unwrap();
+    let registry = GenerationRegistry::create(&reg_dir, 7, 3).unwrap();
+    let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+    managed
+        .register_reference(ReferenceKind::Reader, [1; 16])
+        .unwrap();
+    managed
+        .commit_idempotent(id(2), vec![put(b"tail")])
+        .unwrap();
+    let next_dir = f.0.join("next");
+    fs::create_dir(&next_dir).unwrap();
+    let next = ManifestStore::create(&next_dir, 7, 3).unwrap();
+    managed.rotate(next, 1).unwrap();
+    let old_dir = f.0.join("sst");
+    let old = ManifestStore::open(&old_dir, 7, 3).unwrap();
+    assert_eq!(
+        managed.generation_status(&old).unwrap(),
+        GenerationStatus::Referenced
+    );
+    let backup = f.0.join("backup");
+    managed.backup([2; 16], &backup).unwrap();
+    let quarantine = f.0.join("quarantine");
+    assert!(managed.quarantine(old, &backup, &quarantine).is_err());
+    let old = ManifestStore::open(&old_dir, 7, 3).unwrap();
+    managed
+        .release_reference(ReferenceKind::Reader, [1; 16], &old)
+        .unwrap();
+    assert_eq!(
+        managed.generation_status(&old).unwrap(),
+        GenerationStatus::Unreferenced
+    );
+    managed.quarantine(old, &backup, &quarantine).unwrap();
+    assert!(!old_dir.exists());
+    assert_eq!(
+        managed
+            .commit_idempotent(id(1), vec![put(b"first")])
+            .unwrap(),
+        receipt
+    );
+    drop(managed);
+    let registry = GenerationRegistry::open(&reg_dir, 7, 3).unwrap();
+    let managed =
+        ManagedTablet::open(f.descriptor(), f.0.join("tablet.wal"), &next_dir, registry).unwrap();
+    assert_eq!(managed.current_sequence(), 2);
+    assert_eq!(managed.read_at(b"k", 2).unwrap(), Some(b"tail".as_slice()));
+}
+
+#[test]
+fn managed_open_requires_registered_wal_and_backup_reserves_reference() {
+    use nulang::database::generation_registry::{
+        GenerationRegistry, GenerationStatus, ReferenceKind,
+    };
+    use nulang::database::managed_storage::ManagedTablet;
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let old = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    drop(db);
+    drop(old);
+    let reg_dir = f.0.join("registry");
+    fs::create_dir(&reg_dir).unwrap();
+    let registry = GenerationRegistry::create(&reg_dir, 7, 3).unwrap();
+    assert!(ManagedTablet::open(
+        f.descriptor(),
+        f.0.join("tablet.wal"),
+        f.0.join("sst"),
+        registry
+    )
+    .is_err());
+    let db = recover(&f).unwrap();
+    let old = ManifestStore::open(f.0.join("sst"), 7, 3).unwrap();
+    let registry = GenerationRegistry::open(&reg_dir, 7, 3).unwrap();
+    let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+    let existing = f.0.join("existing");
+    fs::create_dir(&existing).unwrap();
+    assert!(managed.backup([3; 16], &existing).is_err());
+    managed
+        .commit_idempotent(id(2), vec![put(b"tail")])
+        .unwrap();
+    let next_dir = f.0.join("next");
+    fs::create_dir(&next_dir).unwrap();
+    managed
+        .rotate(ManifestStore::create(&next_dir, 7, 3).unwrap(), 0)
+        .unwrap();
+    let old = ManifestStore::open(f.0.join("sst"), 7, 3).unwrap();
+    assert_eq!(
+        managed.generation_status(&old).unwrap(),
+        GenerationStatus::Referenced
+    );
+    managed
+        .release_reference(ReferenceKind::Backup, [3; 16], &old)
+        .unwrap();
+    assert_eq!(
+        managed.generation_status(&old).unwrap(),
+        GenerationStatus::Unreferenced
+    );
+}
+
+#[test]
+fn unregistered_managed_open_leaves_torn_wal_unchanged() {
+    use nulang::database::{
+        generation_registry::GenerationRegistry, managed_storage::ManagedTablet,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let m = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&m).unwrap();
+    drop(db);
+    drop(m);
+    let wal = f.0.join("tablet.wal");
+    let mut torn = fs::read(&wal).unwrap();
+    torn.extend_from_slice(b"partial");
+    fs::write(&wal, &torn).unwrap();
+    let reg_dir = f.0.join("registry");
+    fs::create_dir(&reg_dir).unwrap();
+    let registry = GenerationRegistry::create(&reg_dir, 7, 3).unwrap();
+    assert!(ManagedTablet::open(f.descriptor(), &wal, f.0.join("sst"), registry).is_err());
+    assert_eq!(fs::read(&wal).unwrap(), torn);
+}
+
+#[test]
+fn sealed_recovery_rejects_noncanonical_wal_name_before_lock_creation() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"original")]).unwrap();
+    let manifest = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&manifest).unwrap();
+    drop(manifest);
+    drop(db);
+    let path = f.0.join("tablet.wal");
+    let alternate = f.0.join("tablet.other");
+    let original = fs::read(&path).unwrap();
+    fs::copy(&path, &alternate).unwrap();
+    assert!(
+        WalBackedTablet::open_from_sealed_sst(f.descriptor(), &alternate, f.0.join("sst")).is_err()
+    );
+    assert!(!f.0.join("tablet.other.lock").exists());
+    assert_eq!(fs::read(&alternate).unwrap(), original);
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(
+        recover(&f).unwrap().read_latest(b"k"),
+        Some(b"original".as_slice())
+    );
+}
+
+#[test]
+fn durable_enrollment_rejects_raw_recovery_and_alternate_registry() {
+    use nulang::database::{
+        generation_registry::GenerationRegistry, managed_storage::ManagedTablet,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let old = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let dir = f.0.join("registry");
+    let other = f.0.join("alternate");
+    fs::create_dir(&dir).unwrap();
+    fs::create_dir(&other).unwrap();
+    let mut alt = GenerationRegistry::create(&other, 7, 3).unwrap();
+    db.register_generation_wal(&mut alt, &old).unwrap();
+    let registry = GenerationRegistry::create(&dir, 7, 3).unwrap();
+    let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+    managed
+        .commit_idempotent(id(2), vec![put(b"tail")])
+        .unwrap();
+    drop(managed);
+    let wal = f.0.join("tablet.wal");
+    let mut torn = fs::read(&wal).unwrap();
+    torn.extend_from_slice(b"partial");
+    fs::write(&wal, &torn).unwrap();
+    assert!(recover(&f).is_err());
+    assert_eq!(fs::read(&wal).unwrap(), torn);
+    assert!(ManagedTablet::open(f.descriptor(), &wal, f.0.join("sst"), alt).is_err());
+    assert_eq!(fs::read(&wal).unwrap(), torn);
+    let registry = GenerationRegistry::open(&dir, 7, 3).unwrap();
+    let managed = ManagedTablet::open(f.descriptor(), &wal, f.0.join("sst"), registry).unwrap();
+    assert_eq!(managed.current_sequence(), 2);
+    assert_eq!(managed.read_at(b"k", 2).unwrap(), Some(b"tail".as_slice()));
+    drop(managed);
+    assert!(recover(&f).is_err());
+}
+
+#[test]
+fn malformed_enrollment_marker_blocks_raw_and_managed_recovery_before_wal_repair() {
+    use nulang::database::{
+        generation_registry::GenerationRegistry, managed_storage::ManagedTablet,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let m = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&m).unwrap();
+    let reg = f.0.join("registry");
+    fs::create_dir(&reg).unwrap();
+    let registry = GenerationRegistry::create(&reg, 7, 3).unwrap();
+    drop(ManagedTablet::adopt(db, registry, m).unwrap());
+    let wal = f.0.join("tablet.wal");
+    let lock = f.0.join("tablet.wal.lock");
+    let original = fs::read(&lock).unwrap();
+    assert_eq!(original.len(), 72);
+    let mut torn = fs::read(&wal).unwrap();
+    torn.extend_from_slice(b"partial");
+    fs::write(&wal, &torn).unwrap();
+    let mut corrupt = original.clone();
+    corrupt[20] ^= 1;
+    for marker in [original[..13].to_vec(), corrupt] {
+        fs::write(&lock, &marker).unwrap();
+        assert!(recover(&f).is_err());
+        let registry = GenerationRegistry::open(&reg, 7, 3).unwrap();
+        assert!(ManagedTablet::open(f.descriptor(), &wal, f.0.join("sst"), registry).is_err());
+        assert_eq!(fs::read(&wal).unwrap(), torn);
+        assert_eq!(fs::read(&lock).unwrap(), marker);
+    }
+    fs::write(&lock, original).unwrap();
+    let registry = GenerationRegistry::open(&reg, 7, 3).unwrap();
+    let managed = ManagedTablet::open(f.descriptor(), &wal, f.0.join("sst"), registry).unwrap();
+    assert_eq!(managed.current_sequence(), 1);
+}
+
+#[test]
+fn wal5_self_identifies_even_if_enrollment_sidecar_is_empty_and_backups_are_portable() {
+    use nulang::database::{
+        generation_registry::GenerationRegistry, managed_storage::ManagedTablet,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    let receipt = db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let old = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    db.commit_idempotent(id(2), vec![put(b"tail")]).unwrap();
+    let wal = f.0.join("tablet.wal");
+    let lock = f.0.join("tablet.wal.lock");
+    let before = fs::read(&wal).unwrap();
+    let reg = f.0.join("registry");
+    fs::create_dir(&reg).unwrap();
+    let registry = GenerationRegistry::create(&reg, 7, 3).unwrap();
+    let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+    let managed_bytes = fs::read(&wal).unwrap();
+    assert_eq!(&managed_bytes[..8], b"NUDBWAL5");
+    assert_eq!(&managed_bytes[128..], &before[96..]);
+    let backup = f.0.join("backup");
+    managed.backup([1; 16], &backup).unwrap();
+    assert_eq!(fs::read(backup.join("tablet.wal")).unwrap(), before);
+    let restored =
+        WalBackedTablet::restore_sealed_backup(f.descriptor(), &backup, f.0.join("restored"))
+            .unwrap();
+    assert_eq!(restored.current_sequence(), 2);
+    drop(restored);
+    drop(managed);
+    let marker = fs::read(&lock).unwrap();
+    fs::write(&lock, []).unwrap();
+    assert!(recover(&f).is_err());
+    assert_eq!(fs::read(&wal).unwrap(), managed_bytes);
+    let registry = GenerationRegistry::open(&reg, 7, 3).unwrap();
+    assert!(ManagedTablet::open(f.descriptor(), &wal, f.0.join("sst"), registry).is_err());
+    fs::write(&lock, marker).unwrap();
+    let registry = GenerationRegistry::open(&reg, 7, 3).unwrap();
+    let mut managed = ManagedTablet::open(f.descriptor(), &wal, f.0.join("sst"), registry).unwrap();
+    assert_eq!(
+        managed
+            .commit_idempotent(id(1), vec![put(b"first")])
+            .unwrap(),
+        receipt
+    );
+    let next = f.0.join("next");
+    fs::create_dir(&next).unwrap();
+    managed
+        .rotate(ManifestStore::create(&next, 7, 3).unwrap(), 1)
+        .unwrap();
+    let bytes = fs::read(&wal).unwrap();
+    assert_eq!(bytes.len(), 128);
+    assert_eq!(&bytes[..8], b"NUDBWAL5");
+    drop(managed);
+    fs::remove_file(&lock).unwrap();
+    assert!(WalBackedTablet::open_from_sealed_sst(f.descriptor(), &wal, &next).is_err());
+    assert_eq!(fs::read(&wal).unwrap(), bytes);
+}
+
+#[test]
+fn wal5_migration_refuses_valid_but_changed_tail_before_replacing_live_wal() {
+    use nulang::database::{
+        generation_registry::GenerationRegistry, managed_storage::ManagedTablet,
+    };
+    let f = Fixture::new();
+    let other = Fixture::new();
+    let mut db = f.open();
+    let mut other_db = other.open();
+    for db in [&mut db, &mut other_db] {
+        db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    }
+    let m = seal(&f, &db);
+    let om = seal(&other, &other_db);
+    db.reclaim_to_sealed_sst(&m).unwrap();
+    other_db.reclaim_to_sealed_sst(&om).unwrap();
+    let write = db.prepare_write(3, 1, vec![put(b"tail")]).unwrap();
+    db.commit(write).unwrap();
+    let write = other_db.prepare_write(3, 1, vec![put(b"tall")]).unwrap();
+    other_db.commit(write).unwrap();
+    let wal = f.0.join("tablet.wal");
+    let other_bytes = fs::read(other.0.join("tablet.wal")).unwrap();
+    // A valid alternate frame with the same sequence and length must not
+    // silently replace the acknowledged logical state during migration.
+    assert_eq!(fs::metadata(&wal).unwrap().len(), other_bytes.len() as u64);
+    fs::write(&wal, &other_bytes).unwrap();
+    let reg = f.0.join("registry");
+    fs::create_dir(&reg).unwrap();
+    let registry = GenerationRegistry::create(&reg, 7, 3).unwrap();
+    assert!(ManagedTablet::adopt(db, registry, m).is_err());
+    assert_eq!(fs::read(&wal).unwrap(), other_bytes);
+}
+
+#[test]
+fn explicit_wal5_sidecar_repair_is_guarded_and_preserves_torn_tail() {
+    use nulang::database::{
+        generation_registry::GenerationRegistry, managed_storage::ManagedTablet,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    let receipt = db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let m = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&m).unwrap();
+    db.commit_idempotent(id(2), vec![put(b"tail")]).unwrap();
+    let reg = f.0.join("registry");
+    let alternate = f.0.join("alternate");
+    fs::create_dir(&reg).unwrap();
+    fs::create_dir(&alternate).unwrap();
+    let mut wrong = GenerationRegistry::create(&alternate, 7, 3).unwrap();
+    db.register_generation_wal(&mut wrong, &m).unwrap();
+    let registry = GenerationRegistry::create(&reg, 7, 3).unwrap();
+    let managed = ManagedTablet::adopt(db, registry, m).unwrap();
+    let wal = f.0.join("tablet.wal");
+    let lock = f.0.join("tablet.wal.lock");
+    let marker = fs::read(&lock).unwrap();
+    let original = fs::read(&wal).unwrap();
+    drop(managed);
+    let mut torn = original.clone();
+    torn.extend_from_slice(b"partial");
+    fs::write(&wal, &torn).unwrap();
+    fs::remove_file(&lock).unwrap();
+    assert!(
+        ManagedTablet::repair_enrollment(f.descriptor(), &wal, f.0.join("sst"), &wrong).is_err()
+    );
+    assert!(!lock.exists());
+    assert_eq!(fs::read(&wal).unwrap(), torn);
+    let registry = GenerationRegistry::open(&reg, 7, 3).unwrap();
+    ManagedTablet::repair_enrollment(f.descriptor(), &wal, f.0.join("sst"), &registry).unwrap();
+    assert_eq!(fs::read(&lock).unwrap(), marker);
+    assert_eq!(fs::read(&wal).unwrap(), torn);
+    let mut corrupt = marker.clone();
+    corrupt[45] ^= 1;
+    for damaged in [vec![], marker[..15].to_vec(), corrupt] {
+        fs::write(&lock, &damaged).unwrap();
+        ManagedTablet::repair_enrollment(f.descriptor(), &wal, f.0.join("sst"), &registry).unwrap();
+        assert_eq!(fs::read(&lock).unwrap(), marker);
+        assert_eq!(fs::read(&wal).unwrap(), torn);
+    }
+    fs::write(&lock, b"unrelated file").unwrap();
+    assert!(
+        ManagedTablet::repair_enrollment(f.descriptor(), &wal, f.0.join("sst"), &registry).is_err()
+    );
+    assert_eq!(fs::read(&lock).unwrap(), b"unrelated file");
+    fs::write(&lock, []).unwrap();
+    let mut damaged = original.clone();
+    damaged[100] ^= 1;
+    fs::write(&wal, &damaged).unwrap();
+    assert!(
+        ManagedTablet::repair_enrollment(f.descriptor(), &wal, f.0.join("sst"), &registry).is_err()
+    );
+    assert!(fs::read(&lock).unwrap().is_empty());
+    fs::write(&wal, &torn).unwrap();
+    ManagedTablet::repair_enrollment(f.descriptor(), &wal, f.0.join("sst"), &registry).unwrap();
+    let mut managed = ManagedTablet::open(f.descriptor(), &wal, f.0.join("sst"), registry).unwrap();
+    assert_eq!(managed.current_sequence(), 2);
+    assert_eq!(
+        managed
+            .commit_idempotent(id(1), vec![put(b"first")])
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(managed.read_at(b"k", 2).unwrap(), Some(b"tail".as_slice()));
+    assert_eq!(fs::read(&wal).unwrap(), original);
+}
+
+#[test]
+fn sidecar_repair_rejects_wal4_conflicting_marker_alias_and_active_lock() {
+    use nulang::database::{
+        generation_registry::GenerationRegistry, managed_storage::ManagedTablet,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let m = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&m).unwrap();
+    let reg = f.0.join("registry");
+    fs::create_dir(&reg).unwrap();
+    let mut registry = GenerationRegistry::create(&reg, 7, 3).unwrap();
+    db.register_generation_wal(&mut registry, &m).unwrap();
+    let wal = f.0.join("tablet.wal");
+    let lock = f.0.join("tablet.wal.lock");
+    let original = fs::read(&wal).unwrap();
+    drop(db);
+    drop(m);
+    assert!(
+        ManagedTablet::repair_enrollment(f.descriptor(), &wal, f.0.join("sst"), &registry).is_err()
+    );
+    assert_eq!(fs::read(&wal).unwrap(), original);
+    assert!(fs::read(&lock).unwrap().is_empty());
+    let db = recover(&f).unwrap();
+    let m = ManifestStore::open(f.0.join("sst"), 7, 3).unwrap();
+    drop(ManagedTablet::adopt(db, registry, m).unwrap());
+    let registry = GenerationRegistry::open(&reg, 7, 3).unwrap();
+    let bytes = fs::read(&wal).unwrap();
+    let marker = fs::read(&lock).unwrap();
+    let mut foreign = marker.clone();
+    foreign[8] ^= 1;
+    let digest = blake3::hash(&foreign[..40]);
+    foreign[40..].copy_from_slice(digest.as_bytes());
+    fs::write(&lock, &foreign).unwrap();
+    assert!(
+        ManagedTablet::repair_enrollment(f.descriptor(), &wal, f.0.join("sst"), &registry).is_err()
+    );
+    assert_eq!(fs::read(&lock).unwrap(), foreign);
+    fs::write(&lock, &marker).unwrap();
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock)
+        .unwrap();
+    held.try_lock().unwrap();
+    assert!(
+        ManagedTablet::repair_enrollment(f.descriptor(), &wal, f.0.join("sst"), &registry).is_err()
+    );
+    held.unlock().unwrap();
+    drop(held);
+    let alias = f.0.join("alias");
+    fs::hard_link(&lock, &alias).unwrap();
+    assert!(
+        ManagedTablet::repair_enrollment(f.descriptor(), &wal, f.0.join("sst"), &registry).is_err()
+    );
+    fs::remove_file(&alias).unwrap();
+    assert_eq!(fs::read(&wal).unwrap(), bytes);
+    assert_eq!(fs::read(&lock).unwrap(), marker);
+}
+
+#[test]
+fn retirement_reservation_survives_reopen_and_blocks_new_references() {
+    use nulang::database::{
+        generation_registry::{GenerationRegistry, GenerationStatus, ReferenceKind},
+        managed_storage::ManagedTablet,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let old = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let reg_dir = f.0.join("registry");
+    fs::create_dir(&reg_dir).unwrap();
+    let registry = GenerationRegistry::create(&reg_dir, 7, 3).unwrap();
+    let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+    managed
+        .register_reference(ReferenceKind::Reader, [1; 16])
+        .unwrap();
+    managed
+        .commit_idempotent(id(2), vec![put(b"tail")])
+        .unwrap();
+    let next_dir = f.0.join("next");
+    fs::create_dir(&next_dir).unwrap();
+    managed
+        .rotate(ManifestStore::create(&next_dir, 7, 3).unwrap(), 1)
+        .unwrap();
+    let old_dir = f.0.join("sst");
+    let old = ManifestStore::open(&old_dir, 7, 3).unwrap();
+    let backup = f.0.join("backup");
+    managed.backup([2; 16], &backup).unwrap();
+    assert!(managed.reserve_retirement(&old, &backup).is_err());
+    managed
+        .release_reference(ReferenceKind::Reader, [1; 16], &old)
+        .unwrap();
+    let quarantine = f.0.join("quarantine");
+    managed.quarantine(old, &backup, &quarantine).unwrap();
+    let obsolete = ManifestStore::open(&quarantine, 7, 3).unwrap();
+    managed
+        .commit_idempotent(id(3), vec![put(b"latest")])
+        .unwrap();
+    assert!(managed.reserve_retirement(&obsolete, &backup).is_err());
+    assert_eq!(
+        managed.generation_status(&obsolete).unwrap(),
+        GenerationStatus::Unreferenced
+    );
+    let fresh = f.0.join("fresh");
+    managed.backup([3; 16], &fresh).unwrap();
+    managed.reserve_retirement(&obsolete, &fresh).unwrap();
+    assert_eq!(
+        managed.generation_status(&obsolete).unwrap(),
+        GenerationStatus::RetirementReserved
+    );
+    assert!(quarantine.join("MANIFEST").exists());
+    drop(managed);
+    let mut registry = GenerationRegistry::open(&reg_dir, 7, 3).unwrap();
+    assert_eq!(
+        registry.status(&obsolete).unwrap(),
+        GenerationStatus::RetirementReserved
+    );
+    assert!(registry
+        .register_reference(ReferenceKind::Reader, [4; 16], &obsolete)
+        .is_err());
+    assert!(registry
+        .register_reference(ReferenceKind::Backup, [5; 16], &obsolete)
+        .is_err());
+    assert_eq!(
+        registry.status(&obsolete).unwrap(),
+        GenerationStatus::RetirementReserved
+    );
+    let mut managed =
+        ManagedTablet::open(f.descriptor(), f.0.join("tablet.wal"), &next_dir, registry).unwrap();
+    managed.reserve_retirement(&obsolete, &fresh).unwrap();
+    assert_eq!(
+        managed.read_at(b"k", 3).unwrap(),
+        Some(b"latest".as_slice())
+    );
+    assert_eq!(
+        managed.generation_status(&obsolete).unwrap(),
+        GenerationStatus::RetirementReserved
+    );
+}
+
+#[test]
+fn retirement_reservation_rejects_different_physical_copy_and_registry_downgrade() {
+    use nulang::database::{
+        generation_registry::{GenerationRegistry, GenerationStatus},
+        managed_storage::ManagedTablet,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let old = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let reg_dir = f.0.join("registry");
+    fs::create_dir(&reg_dir).unwrap();
+    let registry = GenerationRegistry::create(&reg_dir, 7, 3).unwrap();
+    let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+    managed
+        .commit_idempotent(id(2), vec![put(b"tail")])
+        .unwrap();
+    let next = f.0.join("next");
+    fs::create_dir(&next).unwrap();
+    managed
+        .rotate(ManifestStore::create(&next, 7, 3).unwrap(), 0)
+        .unwrap();
+    let backup = f.0.join("backup");
+    managed.backup([1; 16], &backup).unwrap();
+    let quarantine = f.0.join("quarantine");
+    managed
+        .quarantine(
+            ManifestStore::open(f.0.join("sst"), 7, 3).unwrap(),
+            &backup,
+            &quarantine,
+        )
+        .unwrap();
+    let copy = f.0.join("copy");
+    fs::create_dir(&copy).unwrap();
+    for entry in fs::read_dir(&quarantine).unwrap() {
+        let entry = entry.unwrap();
+        fs::copy(entry.path(), copy.join(entry.file_name())).unwrap();
+    }
+    let obsolete = ManifestStore::open(&quarantine, 7, 3).unwrap();
+    let duplicate = ManifestStore::open(&copy, 7, 3).unwrap();
+    let file = reg_dir.join("GENERATIONS");
+    assert_eq!(&fs::read(&file).unwrap()[..8], b"NUDBREG1");
+    managed.reserve_retirement(&obsolete, &backup).unwrap();
+    assert_eq!(
+        managed.generation_status(&duplicate).unwrap(),
+        GenerationStatus::RetirementReserved
+    );
+    let persisted = fs::read(&file).unwrap();
+    assert_eq!(&persisted[..8], b"NUDBREG2");
+    assert!(managed.reserve_retirement(&duplicate, &backup).is_err());
+    assert_eq!(fs::read(&file).unwrap(), persisted);
+    assert!(copy.join("MANIFEST").exists());
+    drop(managed);
+    let mut downgraded = persisted.clone();
+    downgraded[..8].copy_from_slice(b"NUDBREG1");
+    let split = downgraded.len() - 32;
+    let digest = blake3::hash(&downgraded[..split]);
+    downgraded[split..].copy_from_slice(digest.as_bytes());
+    fs::write(&file, &downgraded).unwrap();
+    assert!(GenerationRegistry::open(&reg_dir, 7, 3).is_err());
+    fs::write(&file, &persisted).unwrap();
+    let registry = GenerationRegistry::open(&reg_dir, 7, 3).unwrap();
+    assert_eq!(
+        registry.status(&obsolete).unwrap(),
+        GenerationStatus::RetirementReserved
+    );
+}
+
+#[test]
+fn journaled_deletion_requires_reserved_exact_generation_and_current_backup() {
+    use nulang::database::{
+        generation_registry::{GenerationRegistry, GenerationStatus},
+        managed_storage::ManagedTablet,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    let receipt = db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let old = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let reg = f.0.join("registry");
+    fs::create_dir(&reg).unwrap();
+    let registry = GenerationRegistry::create(&reg, 7, 3).unwrap();
+    let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+    managed
+        .commit_idempotent(id(2), vec![put(b"tail")])
+        .unwrap();
+    let next = f.0.join("next");
+    fs::create_dir(&next).unwrap();
+    managed
+        .rotate(ManifestStore::create(&next, 7, 3).unwrap(), 1)
+        .unwrap();
+    let backup = f.0.join("backup");
+    managed.backup([1; 16], &backup).unwrap();
+    let quarantine = f.0.join("quarantine");
+    managed
+        .quarantine(
+            ManifestStore::open(f.0.join("sst"), 7, 3).unwrap(),
+            &backup,
+            &quarantine,
+        )
+        .unwrap();
+    assert!(managed
+        .delete_reserved_generation(&quarantine, &backup)
+        .is_err());
+    let obsolete = ManifestStore::open(&quarantine, 7, 3).unwrap();
+    managed.reserve_retirement(&obsolete, &backup).unwrap();
+    drop(obsolete);
+    managed
+        .commit_idempotent(id(3), vec![put(b"latest")])
+        .unwrap();
+    assert!(managed
+        .delete_reserved_generation(&quarantine, &backup)
+        .is_err());
+    assert!(quarantine.join("MANIFEST").exists());
+    let fresh = f.0.join("fresh");
+    managed.backup([2; 16], &fresh).unwrap();
+    let extra = quarantine.join("unrelated");
+    fs::write(&extra, b"keep").unwrap();
+    assert!(managed
+        .delete_reserved_generation(&quarantine, &fresh)
+        .is_err());
+    assert_eq!(fs::read(&extra).unwrap(), b"keep");
+    fs::remove_file(&extra).unwrap();
+    managed
+        .delete_reserved_generation(&quarantine, &fresh)
+        .unwrap();
+    assert_eq!(
+        fs::read_dir(&quarantine)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect::<Vec<_>>(),
+        vec![std::ffi::OsString::from("MANIFEST.lock")]
+    );
+    assert_eq!(
+        managed.retirement_status(&quarantine).unwrap(),
+        GenerationStatus::Deleted
+    );
+    assert_eq!(
+        managed
+            .commit_idempotent(id(1), vec![put(b"first")])
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(
+        managed.read_at(b"k", 3).unwrap(),
+        Some(b"latest".as_slice())
+    );
+    drop(managed);
+    let registry = GenerationRegistry::open(&reg, 7, 3).unwrap();
+    let mut managed =
+        ManagedTablet::open(f.descriptor(), f.0.join("tablet.wal"), &next, registry).unwrap();
+    managed
+        .delete_reserved_generation(&quarantine, &fresh)
+        .unwrap();
+    assert_eq!(
+        managed.retirement_status(&quarantine).unwrap(),
+        GenerationStatus::Deleted
+    );
+    let restored =
+        WalBackedTablet::restore_sealed_backup(f.descriptor(), &fresh, f.0.join("restore"))
+            .unwrap();
+    assert_eq!(restored.current_sequence(), 3);
+}
+
+#[test]
+fn compacted_shadow_preserves_retained_history_and_receipts_without_cutover() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let first = db
+        .commit_idempotent(
+            id(1),
+            vec![
+                put(&vec![b'x'; 4096]),
+                TabletMutation::Put {
+                    key: b"d".to_vec(),
+                    value: b"old".to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+    db.commit_idempotent(
+        id(2),
+        vec![
+            put(b"anchor"),
+            TabletMutation::Delete { key: b"d".to_vec() },
+        ],
+    )
+    .unwrap();
+    db.commit_idempotent(
+        id(3),
+        vec![TabletMutation::Put {
+            key: b"e".to_vec(),
+            value: vec![],
+        }],
+    )
+    .unwrap();
+    db.commit_idempotent(id(4), vec![TabletMutation::Delete { key: b"k".to_vec() }])
+        .unwrap();
+    db.commit_idempotent(id(5), vec![put(b"latest")]).unwrap();
+    db.commit_idempotent(id(6), vec![]).unwrap();
+    let mut old = f.manifest();
+    for _ in 0..3 {
+        db.flush_sst_shadow(&mut old, 2).unwrap();
+    }
+    db.seal_sst_recovery_at_floor(&mut old, 3).unwrap();
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let wal = f.0.join("tablet.wal");
+    let before = fs::read(&wal).unwrap();
+    let target = f.0.join("compacted");
+    fs::create_dir(&target).unwrap();
+    let mut next = ManifestStore::create(&target, 7, 3).unwrap();
+    let stats = old.prepare_compacted_shadow(&mut next).unwrap();
+    assert_eq!(stats.input_tables, 3);
+    assert_eq!(stats.output_tables, 1);
+    assert!(stats.output_bytes < stats.input_bytes);
+    assert_eq!(next.current().recovery_floor(), Some(3));
+    assert_eq!(next.current().durable_sequence(), 6);
+    for snapshot in 3..=6 {
+        for key in [b"k".as_slice(), b"d", b"e", b"missing"] {
+            assert_eq!(
+                next.recovered_read_at(key, snapshot).unwrap(),
+                db.read_at(key, snapshot).unwrap().map(|v| v.to_vec())
+            );
+        }
+    }
+    assert!(next.recovered_read_at(b"k", 2).is_err());
+    assert_eq!(next.recovered_receipt(id(1)).unwrap(), Some(first));
+    assert_eq!(fs::read(&wal).unwrap(), before);
+    assert!(old.prepare_compacted_shadow(&mut next).is_err());
+    drop(next);
+    drop(db);
+    drop(old);
+    assert!(WalBackedTablet::open_from_sealed_sst(f.descriptor(), &wal, &target).is_err());
+    assert_eq!(recover(&f).unwrap().current_sequence(), 6);
+}
+
+#[test]
+fn compacted_shadow_handles_empty_retained_state_and_zero_floor() {
+    for floor in [0, 2] {
+        let f = Fixture::new();
+        let mut db = f.open();
+        db.commit_idempotent(id(1), vec![put(b"value")]).unwrap();
+        let deleted = db
+            .commit_idempotent(id(2), vec![TabletMutation::Delete { key: b"k".to_vec() }])
+            .unwrap();
+        let mut old = f.manifest();
+        db.flush_sst_shadow(&mut old, 1).unwrap();
+        db.flush_sst_shadow(&mut old, 1).unwrap();
+        db.seal_sst_recovery_at_floor(&mut old, floor).unwrap();
+        db.reclaim_to_sealed_sst(&old).unwrap();
+        let target = f.0.join("compacted");
+        fs::create_dir(&target).unwrap();
+        let mut next = ManifestStore::create(&target, 7, 3).unwrap();
+        let stats = old.prepare_compacted_shadow(&mut next).unwrap();
+        assert_eq!(stats.input_versions, 2);
+        assert_eq!(stats.output_versions, if floor == 0 { 2 } else { 0 });
+        assert_eq!(next.current().durable_sequence(), 2);
+        for snapshot in floor..=2 {
+            assert_eq!(
+                next.recovered_read_at(b"k", snapshot).unwrap(),
+                db.read_at(b"k", snapshot).unwrap().map(|v| v.to_vec())
+            );
+        }
+        assert_eq!(next.recovered_receipt(id(2)).unwrap(), Some(deleted));
+        drop(next);
+        let reopened = ManifestStore::open(&target, 7, 3).unwrap();
+        assert_eq!(reopened.recovered_read_at(b"k", 2).unwrap(), None);
+    }
+}
+
+#[test]
+fn compacted_shadow_rejects_input_budget_and_nonempty_destination() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    for n in 1..=17 {
+        db.commit_idempotent(id(n), vec![put(&[n])]).unwrap();
+    }
+    let mut old = f.manifest();
+    for _ in 0..17 {
+        db.flush_sst_shadow(&mut old, 1).unwrap();
+    }
+    db.seal_sst_recovery_at_floor(&mut old, 17).unwrap();
+    let target = f.0.join("compacted");
+    fs::create_dir(&target).unwrap();
+    let mut next = ManifestStore::create(&target, 7, 3).unwrap();
+    let before = fs::read(target.join("MANIFEST")).unwrap();
+    assert!(old.prepare_compacted_shadow(&mut next).is_err());
+    assert_eq!(fs::read(target.join("MANIFEST")).unwrap(), before);
+    assert_eq!(fs::read_dir(&target).unwrap().count(), 2);
+    assert!(next.current().entries().is_empty());
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"x")]).unwrap();
+    let old = seal(&f, &db);
+    let target = f.0.join("compacted");
+    fs::create_dir(&target).unwrap();
+    let mut next = ManifestStore::create(&target, 7, 3).unwrap();
+    fs::write(target.join("unrelated"), b"keep").unwrap();
+    assert!(old.prepare_compacted_shadow(&mut next).is_err());
+    assert_eq!(fs::read(target.join("unrelated")).unwrap(), b"keep");
+}
+
+#[test]
+fn managed_compaction_rebinds_same_base_and_preserves_nonempty_wal_tail() {
+    use nulang::database::{
+        generation_registry::{GenerationRegistry, GenerationStatus, ReferenceKind},
+        managed_storage::ManagedTablet,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    let first = db
+        .commit_idempotent(id(1), vec![put(&vec![b'x'; 4096])])
+        .unwrap();
+    db.commit_idempotent(id(2), vec![put(b"anchor")]).unwrap();
+    db.commit_idempotent(id(3), vec![TabletMutation::Delete { key: b"k".to_vec() }])
+        .unwrap();
+    db.commit_idempotent(id(4), vec![put(b"sealed")]).unwrap();
+    let mut old = f.manifest();
+    db.flush_sst_shadow(&mut old, 2).unwrap();
+    db.flush_sst_shadow(&mut old, 2).unwrap();
+    db.seal_sst_recovery_at_floor(&mut old, 2).unwrap();
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let reg = f.0.join("registry");
+    fs::create_dir(&reg).unwrap();
+    let registry = GenerationRegistry::create(&reg, 7, 3).unwrap();
+    let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+    managed
+        .register_reference(ReferenceKind::Reader, [9; 16])
+        .unwrap();
+    let tail = managed
+        .commit_idempotent(id(5), vec![put(b"tail")])
+        .unwrap();
+    let wal = f.0.join("tablet.wal");
+    let before = fs::read(&wal).unwrap();
+    let target = f.0.join("compact");
+    fs::create_dir(&target).unwrap();
+    let stats = managed
+        .compact(ManifestStore::create(&target, 7, 3).unwrap())
+        .unwrap();
+    assert!(stats.output_bytes < stats.input_bytes);
+    let after = fs::read(&wal).unwrap();
+    assert_eq!(&after[..8], b"NUDBWAL5");
+    assert_eq!(&before[128..], &after[128..]);
+    assert_ne!(&before[..128], &after[..128]);
+    assert_eq!(managed.oldest_retained_snapshot(), 2);
+    assert_eq!(
+        managed.read_at(b"k", 2).unwrap(),
+        Some(b"anchor".as_slice())
+    );
+    assert_eq!(managed.read_at(b"k", 3).unwrap(), None);
+    assert_eq!(
+        managed.read_at(b"k", 4).unwrap(),
+        Some(b"sealed".as_slice())
+    );
+    assert_eq!(managed.read_at(b"k", 5).unwrap(), Some(b"tail".as_slice()));
+    let old = ManifestStore::open(f.0.join("sst"), 7, 3).unwrap();
+    assert_eq!(
+        managed.generation_status(&old).unwrap(),
+        GenerationStatus::Referenced
+    );
+    managed
+        .release_reference(ReferenceKind::Reader, [9; 16], &old)
+        .unwrap();
+    assert_eq!(
+        managed.generation_status(&old).unwrap(),
+        GenerationStatus::Unreferenced
+    );
+    drop(old);
+    drop(managed);
+    let registry = GenerationRegistry::open(&reg, 7, 3).unwrap();
+    assert!(ManagedTablet::open(f.descriptor(), &wal, f.0.join("sst"), registry).is_err());
+    let registry = GenerationRegistry::open(&reg, 7, 3).unwrap();
+    let mut managed = ManagedTablet::open(f.descriptor(), &wal, &target, registry).unwrap();
+    assert_eq!(
+        managed
+            .commit_idempotent(id(1), vec![put(&vec![b'x'; 4096])])
+            .unwrap(),
+        first
+    );
+    assert_eq!(
+        managed
+            .commit_idempotent(id(5), vec![put(b"tail")])
+            .unwrap(),
+        tail
+    );
+    let backup = f.0.join("backup");
+    managed.backup([8; 16], &backup).unwrap();
+    let restored =
+        WalBackedTablet::restore_sealed_backup(f.descriptor(), &backup, f.0.join("restored"))
+            .unwrap();
+    assert_eq!(restored.current_sequence(), 5);
+    assert_eq!(restored.read_at(b"k", 5).unwrap(), Some(b"tail".as_slice()));
+}
+
+#[test]
+fn managed_compaction_empty_tail_preserves_pins_and_retires_proven_predecessor() {
+    use nulang::database::{
+        generation_registry::{GenerationRegistry, GenerationStatus},
+        managed_storage::ManagedTablet,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"old")]).unwrap();
+    db.commit_idempotent(id(2), vec![put(b"anchor")]).unwrap();
+    let mut old = f.manifest();
+    db.flush_sst_shadow(&mut old, 1).unwrap();
+    db.flush_sst_shadow(&mut old, 1).unwrap();
+    db.seal_sst_recovery_at_floor(&mut old, 2).unwrap();
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let reg = f.0.join("registry");
+    fs::create_dir(&reg).unwrap();
+    let registry = GenerationRegistry::create(&reg, 7, 3).unwrap();
+    let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+    let pin = managed.pin_snapshot(2).unwrap();
+    let target = f.0.join("compact");
+    fs::create_dir(&target).unwrap();
+    managed
+        .compact(ManifestStore::create(&target, 7, 3).unwrap())
+        .unwrap();
+    assert_eq!(fs::metadata(f.0.join("tablet.wal")).unwrap().len(), 128);
+    let identical = f.0.join("identical");
+    fs::create_dir(&identical).unwrap();
+    assert!(managed
+        .compact(ManifestStore::create(&identical, 7, 3).unwrap())
+        .is_err());
+    assert_eq!(managed.current_sequence(), 2);
+    let backup = f.0.join("backup");
+    managed.backup([8; 16], &backup).unwrap();
+    let old = ManifestStore::open(f.0.join("sst"), 7, 3).unwrap();
+    assert_eq!(
+        managed.generation_status(&old).unwrap(),
+        GenerationStatus::Unreferenced
+    );
+    let quarantine = f.0.join("quarantine");
+    managed.quarantine(old, &backup, &quarantine).unwrap();
+    let obsolete = ManifestStore::open(&quarantine, 7, 3).unwrap();
+    managed.reserve_retirement(&obsolete, &backup).unwrap();
+    drop(obsolete);
+    managed
+        .delete_reserved_generation(&quarantine, &backup)
+        .unwrap();
+    assert_eq!(
+        managed.retirement_status(&quarantine).unwrap(),
+        GenerationStatus::Deleted
+    );
+    assert!(!f.0.join("sst/MANIFEST").exists());
+    managed
+        .commit_idempotent(id(3), vec![put(b"tail")])
+        .unwrap();
+    let blocked = f.0.join("blocked");
+    fs::create_dir(&blocked).unwrap();
+    assert!(managed
+        .rotate(ManifestStore::create(&blocked, 7, 3).unwrap(), 3)
+        .is_err());
+    drop(pin);
+    let successor = f.0.join("successor");
+    fs::create_dir(&successor).unwrap();
+    managed
+        .rotate(ManifestStore::create(&successor, 7, 3).unwrap(), 3)
+        .unwrap();
+    assert_eq!(managed.oldest_retained_snapshot(), 3);
+    assert_eq!(managed.read_at(b"k", 3).unwrap(), Some(b"tail".as_slice()));
+}
+
+#[test]
+fn committed_compaction_lineage_survives_later_rotation_and_reopen() {
+    use nulang::database::{
+        generation_registry::{GenerationRegistry, GenerationStatus, ReferenceKind},
+        managed_storage::ManagedTablet,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    let first = db.commit_idempotent(id(1), vec![put(b"old")]).unwrap();
+    db.commit_idempotent(id(2), vec![put(b"anchor")]).unwrap();
+    let mut old = f.manifest();
+    db.flush_sst_shadow(&mut old, 1).unwrap();
+    db.flush_sst_shadow(&mut old, 1).unwrap();
+    db.seal_sst_recovery_at_floor(&mut old, 2).unwrap();
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let reg = f.0.join("registry");
+    fs::create_dir(&reg).unwrap();
+    let registry = GenerationRegistry::create(&reg, 7, 3).unwrap();
+    let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+    managed
+        .register_reference(ReferenceKind::Reader, [9; 16])
+        .unwrap();
+    let compact = f.0.join("compact");
+    fs::create_dir(&compact).unwrap();
+    managed
+        .compact(ManifestStore::create(&compact, 7, 3).unwrap())
+        .unwrap();
+    managed
+        .commit_idempotent(id(3), vec![put(b"tail")])
+        .unwrap();
+    let successor = f.0.join("successor");
+    fs::create_dir(&successor).unwrap();
+    managed
+        .rotate(ManifestStore::create(&successor, 7, 3).unwrap(), 3)
+        .unwrap();
+    drop(managed);
+    let file = reg.join("GENERATIONS");
+    let original = fs::read(&file).unwrap();
+    assert_eq!(&original[..8], b"NUDBREG4");
+    let mut downgraded = original.clone();
+    downgraded[..8].copy_from_slice(b"NUDBREG3");
+    let split = downgraded.len() - 32;
+    let digest = blake3::hash(&downgraded[..split]);
+    downgraded[split..].copy_from_slice(digest.as_bytes());
+    fs::write(&file, &downgraded).unwrap();
+    assert!(GenerationRegistry::open(&reg, 7, 3).is_err());
+    fs::write(&file, &original).unwrap();
+    let registry = GenerationRegistry::open(&reg, 7, 3).unwrap();
+    let mut managed =
+        ManagedTablet::open(f.descriptor(), f.0.join("tablet.wal"), &successor, registry).unwrap();
+    let old = ManifestStore::open(f.0.join("sst"), 7, 3).unwrap();
+    let backup = f.0.join("backup");
+    managed.backup([8; 16], &backup).unwrap();
+    assert!(managed.reserve_retirement(&old, &backup).is_err());
+    managed
+        .release_reference(ReferenceKind::Reader, [9; 16], &old)
+        .unwrap();
+    let q = f.0.join("quarantine");
+    managed.quarantine(old, &backup, &q).unwrap();
+    let old = ManifestStore::open(&q, 7, 3).unwrap();
+    managed.reserve_retirement(&old, &backup).unwrap();
+    drop(old);
+    managed.delete_reserved_generation(&q, &backup).unwrap();
+    assert_eq!(
+        managed.retirement_status(&q).unwrap(),
+        GenerationStatus::Deleted
+    );
+    assert_eq!(
+        managed.commit_idempotent(id(1), vec![put(b"old")]).unwrap(),
+        first
+    );
+    assert_eq!(managed.read_at(b"k", 3).unwrap(), Some(b"tail".as_slice()));
+    let restored =
+        WalBackedTablet::restore_sealed_backup(f.descriptor(), &backup, f.0.join("restored"))
+            .unwrap();
+    assert_eq!(restored.current_sequence(), 3);
+}
+
+#[test]
+fn multi_output_compaction_splits_at_sequence_boundaries_and_recovers() {
+    use nulang::database::{
+        generation_registry::{GenerationRegistry, GenerationStatus},
+        managed_storage::ManagedTablet,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    let first = db
+        .commit_idempotent(id(1), vec![put(&vec![b'x'; 4096])])
+        .unwrap();
+    for n in 2..=4 {
+        db.commit_idempotent(id(n), vec![put(&[n; 64])]).unwrap();
+    }
+    let mut old = f.manifest();
+    for _ in 0..4 {
+        db.flush_sst_shadow(&mut old, 1).unwrap();
+    }
+    db.seal_sst_recovery_at_floor(&mut old, 2).unwrap();
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let reg = f.0.join("registry");
+    fs::create_dir(&reg).unwrap();
+    let registry = GenerationRegistry::create(&reg, 7, 3).unwrap();
+    let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+    let tail = managed
+        .commit_idempotent(id(5), vec![put(b"tail")])
+        .unwrap();
+    let wal = f.0.join("tablet.wal");
+    let before = fs::read(&wal).unwrap();
+    let rejected = f.0.join("too-small");
+    fs::create_dir(&rejected).unwrap();
+    assert!(managed
+        .compact_with_target(ManifestStore::create(&rejected, 7, 3).unwrap(), 100)
+        .is_err());
+    assert_eq!(fs::read_dir(&rejected).unwrap().count(), 2);
+    assert_eq!(fs::read(&wal).unwrap(), before);
+    let target = f.0.join("compact");
+    fs::create_dir(&target).unwrap();
+    let stats = managed
+        .compact_with_target(ManifestStore::create(&target, 7, 3).unwrap(), 190)
+        .unwrap();
+    assert_eq!(stats.output_tables, 3);
+    assert_eq!(stats.output_versions, 3);
+    assert!(stats.output_bytes < stats.input_bytes);
+    let after = fs::read(&wal).unwrap();
+    assert_eq!(&before[128..], &after[128..]);
+    for n in 2..=4 {
+        assert_eq!(
+            managed.read_at(b"k", n).unwrap(),
+            Some([n as u8; 64].as_slice())
+        );
+    }
+    assert_eq!(managed.read_at(b"k", 5).unwrap(), Some(b"tail".as_slice()));
+    let backup = f.0.join("backup");
+    managed.backup([8; 16], &backup).unwrap();
+    let q = f.0.join("quarantine");
+    managed
+        .quarantine(
+            ManifestStore::open(f.0.join("sst"), 7, 3).unwrap(),
+            &backup,
+            &q,
+        )
+        .unwrap();
+    let old = ManifestStore::open(&q, 7, 3).unwrap();
+    managed.reserve_retirement(&old, &backup).unwrap();
+    drop(old);
+    managed.delete_reserved_generation(&q, &backup).unwrap();
+    assert_eq!(
+        managed.retirement_status(&q).unwrap(),
+        GenerationStatus::Deleted
+    );
+    drop(managed);
+    let m = ManifestStore::open(&target, 7, 3).unwrap();
+    assert_eq!(
+        m.current()
+            .entries()
+            .iter()
+            .map(|e| e.sequence_interval())
+            .collect::<Vec<_>>(),
+        vec![(1, 2), (3, 3), (4, 4)]
+    );
+    for i in 1..=3 {
+        assert!(
+            fs::metadata(target.join(format!("nudb-sst-{i:020}.sst")))
+                .unwrap()
+                .len()
+                <= 190
+        );
+    }
+    drop(m);
+    let registry = GenerationRegistry::open(&reg, 7, 3).unwrap();
+    let mut managed = ManagedTablet::open(f.descriptor(), &wal, &target, registry).unwrap();
+    assert_eq!(
+        managed
+            .commit_idempotent(id(1), vec![put(&vec![b'x'; 4096])])
+            .unwrap(),
+        first
+    );
+    assert_eq!(
+        managed
+            .commit_idempotent(id(5), vec![put(b"tail")])
+            .unwrap(),
+        tail
+    );
+    let restored =
+        WalBackedTablet::restore_sealed_backup(f.descriptor(), &backup, f.0.join("restored"))
+            .unwrap();
+    assert_eq!(restored.current_sequence(), 5);
+}
+
+#[test]
+fn multi_output_compaction_accounts_for_shared_keys_and_whole_sequences() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(&[1; 64])]).unwrap();
+    db.commit_idempotent(id(2), vec![]).unwrap();
+    db.commit_idempotent(id(3), vec![put(&[3; 64])]).unwrap();
+    db.commit_idempotent(
+        id(4),
+        vec![
+            put(&[4; 59]),
+            TabletMutation::Put {
+                key: b"e".to_vec(),
+                value: vec![4; 59],
+            },
+        ],
+    )
+    .unwrap();
+    let old = seal(&f, &db);
+    let rejected = f.0.join("rejected");
+    fs::create_dir(&rejected).unwrap();
+    let mut next = ManifestStore::create(&rejected, 7, 3).unwrap();
+    assert!(old
+        .prepare_compacted_shadow_with_target(&mut next, 243)
+        .is_err());
+    assert!(next.current().entries().is_empty());
+    assert_eq!(fs::read_dir(&rejected).unwrap().count(), 2);
+    let target = f.0.join("target");
+    fs::create_dir(&target).unwrap();
+    let mut next = ManifestStore::create(&target, 7, 3).unwrap();
+    let stats = old
+        .prepare_compacted_shadow_with_target(&mut next, 245)
+        .unwrap();
+    assert_eq!(stats.output_tables, 2);
+    assert_eq!(
+        next.current()
+            .entries()
+            .iter()
+            .map(|e| e.sequence_interval())
+            .collect::<Vec<_>>(),
+        vec![(1, 3), (4, 4)]
+    );
+    assert_eq!(
+        fs::metadata(target.join("nudb-sst-00000000000000000001.sst"))
+            .unwrap()
+            .len(),
+        245
+    );
+    assert_eq!(
+        fs::metadata(target.join("nudb-sst-00000000000000000002.sst"))
+            .unwrap()
+            .len(),
+        244
+    );
+    for snapshot in 0..=4 {
+        for key in [b"k".as_slice(), b"e"] {
+            assert_eq!(
+                next.recovered_read_at(key, snapshot).unwrap(),
+                db.read_at(key, snapshot).unwrap().map(|v| v.to_vec())
+            );
+        }
+    }
+}
+
+#[test]
+fn multi_output_compaction_rejects_excessive_output_count_before_writing() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    for n in 1..=17 {
+        db.commit_idempotent(id(n), vec![put(&[n; 64])]).unwrap();
+    }
+    let old = seal(&f, &db);
+    let target = f.0.join("target");
+    fs::create_dir(&target).unwrap();
+    let mut next = ManifestStore::create(&target, 7, 3).unwrap();
+    assert!(old
+        .prepare_compacted_shadow_with_target(&mut next, 190)
+        .is_err());
+    assert!(next.current().entries().is_empty());
+    assert_eq!(fs::read_dir(&target).unwrap().count(), 2);
+}
+
+#[test]
+fn compaction_budget_rejects_before_output_and_preserves_live_writes() {
+    use nulang::database::{
+        generation_registry::GenerationRegistry, managed_storage::ManagedTablet,
+        storage_admission::CompactionBudget,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"old")]).unwrap();
+    db.commit_idempotent(id(2), vec![put(b"anchor")]).unwrap();
+    let mut old = f.manifest();
+    db.flush_sst_shadow(&mut old, 1).unwrap();
+    db.flush_sst_shadow(&mut old, 1).unwrap();
+    db.seal_sst_recovery_at_floor(&mut old, 2).unwrap();
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let reg = f.0.join("registry");
+    fs::create_dir(&reg).unwrap();
+    let registry = GenerationRegistry::create(&reg, 7, 3).unwrap();
+    let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+    managed
+        .commit_idempotent(id(3), vec![put(b"tail")])
+        .unwrap();
+    let wal = f.0.join("tablet.wal");
+    let before = fs::read(&wal).unwrap();
+    let registry_before = fs::read(reg.join("GENERATIONS")).unwrap();
+    for (n, budget) in [
+        (
+            1,
+            CompactionBudget {
+                max_additional_bytes: 1,
+                min_free_bytes: 0,
+            },
+        ),
+        (
+            2,
+            CompactionBudget {
+                max_additional_bytes: u64::MAX,
+                min_free_bytes: u64::MAX,
+            },
+        ),
+    ] {
+        let target = f.0.join(format!("rejected-{n}"));
+        fs::create_dir(&target).unwrap();
+        let err = managed
+            .compact_with_budget(ManifestStore::create(&target, 7, 3).unwrap(), 4096, budget)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("compaction storage admission"),
+            "{err}"
+        );
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 2);
+        assert_eq!(fs::read(&wal).unwrap(), before);
+        assert_eq!(fs::read(reg.join("GENERATIONS")).unwrap(), registry_before);
+    }
+    assert_eq!(
+        managed.commit_idempotent(id(4), vec![]).unwrap().sequence(),
+        4
+    );
+    let next = f.0.join("admitted");
+    fs::create_dir(&next).unwrap();
+    let stats = managed
+        .compact_with_budget(
+            ManifestStore::create(&next, 7, 3).unwrap(),
+            4096,
+            CompactionBudget {
+                max_additional_bytes: 32 * 1024 * 1024,
+                min_free_bytes: 0,
+            },
+        )
+        .unwrap();
+    assert_eq!(stats.output_versions, 1);
+    assert_eq!(managed.read_at(b"k", 4).unwrap(), Some(b"tail".as_slice()));
+    drop(managed);
+    let registry = GenerationRegistry::open(&reg, 7, 3).unwrap();
+    let managed = ManagedTablet::open(f.descriptor(), &wal, &next, registry).unwrap();
+    assert_eq!(managed.current_sequence(), 4);
+}

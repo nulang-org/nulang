@@ -267,3 +267,109 @@ fn wal_recovery_rejects_a_descriptor_older_than_durable_ownership() {
 
     let _ = fs::remove_file(path);
 }
+
+#[test]
+fn every_partial_second_frame_recovers_exactly_the_acknowledged_prefix() {
+    let path = temp_wal("all_partial_offsets");
+    let _ = fs::remove_file(&path);
+    let (prefix_len, full_len) = {
+        let mut wal = FileWal::open(&path).unwrap();
+        wal.append_write(&write(0, b"k1", b"first")).unwrap();
+        wal.append_write(&write(1, b"k2", b"second")).unwrap();
+        (
+            wal.record_end_offset(0).unwrap(),
+            wal.record_end_offset(1).unwrap(),
+        )
+    };
+    let full = fs::read(&path).unwrap();
+    assert!(full_len > prefix_len);
+    for cut in prefix_len..full_len {
+        fs::write(&path, &full[..cut as usize]).unwrap();
+        let recovered = FileWal::open(&path).unwrap_or_else(|e| panic!("cut={cut}: {e:?}"));
+        assert_eq!(recovered.last_sequence(), 1, "cut={cut}");
+        assert_eq!(recovered.records().len(), 1, "cut={cut}");
+        assert_eq!(fs::metadata(&path).unwrap().len(), prefix_len, "cut={cut}");
+    }
+    fs::write(&path, &full).unwrap();
+    assert_eq!(FileWal::open(&path).unwrap().last_sequence(), 2);
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn checksummed_invalid_record_chain_fails_closed_without_truncation() {
+    let path = temp_wal("semantic_corruption");
+    let _ = fs::remove_file(&path);
+    let second_offset = {
+        let mut wal = FileWal::open(&path).unwrap();
+        wal.append_write(&write(0, b"k1", b"first")).unwrap();
+        wal.append_write(&write(1, b"k2", b"second")).unwrap();
+        wal.record_end_offset(0).unwrap() as usize
+    };
+    let original = fs::read(&path).unwrap();
+    const FRAME_HEADER: usize = 42;
+    let start = second_offset + FRAME_HEADER;
+    let payload_len = u32::from_le_bytes(
+        original[second_offset + 6..second_offset + 10]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let record: serde_json::Value =
+        serde_json::from_slice(&original[start..start + payload_len]).unwrap();
+    for (field, value) in [
+        ("tablet_id", 32),
+        ("ownership_epoch", 3),
+        ("expected_previous_sequence", 0),
+        ("sequence", 9),
+        ("version", 2),
+        ("ownership_epoch", 0),
+        ("tablet_id", 0),
+    ] {
+        let mut modified = record.clone();
+        modified[field] = serde_json::json!(value);
+        let payload = serde_json::to_vec(&modified).unwrap();
+        // Rebuild both checksums so the semantic decoder, not the checksum
+        // gate, must reject the complete invalid frame.
+        let mut header = original[second_offset..start].to_vec();
+        header[6..10].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        let hash = blake3::hash(&header[..10]);
+        header[10..].copy_from_slice(hash.as_bytes());
+        let mut corrupted = original[..second_offset].to_vec();
+        corrupted.extend_from_slice(&header);
+        corrupted.extend_from_slice(&payload);
+        corrupted.extend_from_slice(blake3::hash(&payload).as_bytes());
+        fs::write(&path, &corrupted).unwrap();
+        let error = FileWal::open(&path).unwrap_err();
+        let expected = match (field, value) {
+            ("tablet_id", 32) => matches!(error, WalError::TabletMismatch { .. }),
+            ("ownership_epoch", 3) => matches!(
+                error,
+                WalError::StaleOwnershipEpoch {
+                    durable: 4,
+                    presented: 3
+                }
+            ),
+            ("expected_previous_sequence", 0) => matches!(
+                error,
+                WalError::SequenceMismatch {
+                    committed: 1,
+                    expected_previous: 0
+                }
+            ),
+            ("version", 2) => {
+                matches!(error, WalError::UnsupportedRecordVersion { offset, version: 2 } if offset == second_offset as u64)
+            }
+            _ => {
+                matches!(error, WalError::InvalidRecord { offset, .. } if offset == second_offset as u64)
+            }
+        };
+        assert!(expected, "unexpected error for {field}={value}: {error:?}");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            corrupted,
+            "recovery modified complete corrupt frame: {field}={value}"
+        );
+    }
+    fs::write(&path, &original).unwrap();
+    assert_eq!(FileWal::open(&path).unwrap().last_sequence(), 2);
+    fs::remove_file(path).unwrap();
+}

@@ -5,9 +5,37 @@
 //! inner storage and query loops remain ordinary local computation.
 
 pub mod checkpoint;
+#[cfg(unix)]
+pub mod generation_registry;
+pub mod indexed_sst;
+#[cfg(unix)]
+pub mod managed_storage;
+pub mod optimistic;
+#[cfg(unix)]
+mod retired_files;
+#[cfg(unix)]
+mod sealed_backup;
+#[cfg(unix)]
+mod sidecar_lock;
+#[cfg(unix)]
+pub mod sst_manifest;
+#[cfg(unix)]
+mod sst_recovery_meta;
+#[cfg(unix)]
+pub mod storage_admission;
 pub mod store;
 pub mod tablet;
 pub mod wal;
+#[cfg(unix)]
+mod wal_sst_shadow;
 
 #[cfg(test)]
 mod interruption;
+#[cfg(test)]
+mod model_tests;
+
+#[cfg(test)]
+mod receipt_tests;
+
+#[cfg(test)]
+mod registry_protocol_model;

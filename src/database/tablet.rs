@@ -162,6 +162,94 @@ impl TabletMutation {
     }
 }
 
+/// Stable hash of the exact ordered mutation list, including key/value lengths.
+/// The domain separator prevents reuse of this digest for unrelated records.
+pub(crate) fn transaction_digest(mutations: &[TabletMutation]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"nudb/transaction-mutations/v1");
+    hasher.update(&(mutations.len() as u64).to_le_bytes());
+    for mutation in mutations {
+        match mutation {
+            TabletMutation::Put { key, value } => {
+                hasher.update(&[1]);
+                hasher.update(&(key.len() as u64).to_le_bytes());
+                hasher.update(key);
+                hasher.update(&(value.len() as u64).to_le_bytes());
+                hasher.update(value);
+            }
+            TabletMutation::Delete { key } => {
+                hasher.update(&[2]);
+                hasher.update(&(key.len() as u64).to_le_bytes());
+                hasher.update(key);
+            }
+        }
+    }
+    *hasher.finalize().as_bytes()
+}
+
+/// Caller-provided, stable transaction identifier within a single tablet.
+/// Generate a distinct ID for each logical transaction, and reuse it on retry.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct TransactionId([u8; 16]);
+
+impl TransactionId {
+    pub fn new(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+    #[cfg(unix)]
+    pub(crate) fn bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+/// Durable receipt retained through WAL replay and checkpoint reclamation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TransactionReceipt {
+    id: TransactionId,
+    sequence: u64,
+    digest: [u8; 32],
+}
+
+impl TransactionReceipt {
+    #[cfg(unix)]
+    pub(crate) fn from_parts(id: TransactionId, sequence: u64, digest: [u8; 32]) -> Self {
+        Self {
+            id,
+            sequence,
+            digest,
+        }
+    }
+    pub fn id(self) -> TransactionId {
+        self.id
+    }
+
+    pub fn sequence(self) -> u64 {
+        self.sequence
+    }
+
+    pub(crate) fn digest(self) -> [u8; 32] {
+        self.digest
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TransactionIdentity {
+    pub(crate) id: TransactionId,
+    pub(crate) digest: [u8; 32],
+}
+
+impl TransactionIdentity {
+    fn receipt(self, sequence: u64) -> TransactionReceipt {
+        TransactionReceipt {
+            id: self.id,
+            sequence,
+            digest: self.digest,
+        }
+    }
+}
+
 /// Immutable, prevalidated tablet write descriptor.
 ///
 /// This is not a WAL record or consensus protocol. It is the admission
@@ -175,6 +263,7 @@ pub struct TabletWrite {
     sequence: u64,
     expected_previous_sequence: u64,
     mutations: Vec<TabletMutation>,
+    identity: Option<TransactionIdentity>,
 }
 
 impl TabletWrite {
@@ -220,6 +309,7 @@ impl TabletWrite {
             sequence,
             expected_previous_sequence,
             mutations,
+            identity: None,
         })
     }
 
@@ -242,6 +332,13 @@ impl TabletWrite {
     pub fn mutations(&self) -> &[TabletMutation] {
         &self.mutations
     }
+    pub(crate) fn with_identity(mut self, identity: TransactionIdentity) -> Self {
+        self.identity = Some(identity);
+        self
+    }
+    pub(crate) fn identity(&self) -> Option<TransactionIdentity> {
+        self.identity
+    }
 }
 
 /// One committed value version in the in-memory MVCC prototype.
@@ -249,6 +346,21 @@ impl TabletWrite {
 pub(crate) struct VersionedValue {
     pub(crate) sequence: u64,
     pub(crate) value: Option<Vec<u8>>,
+}
+
+/// Find the most recent committed value visible at a requested snapshot.
+/// Most current-state reads take the constant-time latest-version path;
+/// older snapshots use binary search over monotonically ordered versions.
+/// If legacy data retains duplicate sequences, the last value wins.
+fn visible_version_at(versions: &[VersionedValue], snapshot: u64) -> Option<&VersionedValue> {
+    let latest = versions.last()?;
+    if latest.sequence <= snapshot {
+        return Some(latest);
+    }
+    let first_newer = versions.partition_point(|version| version.sequence <= snapshot);
+    first_newer
+        .checked_sub(1)
+        .and_then(|index| versions.get(index))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -260,7 +372,11 @@ pub(crate) struct TabletSnapshotRow {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TabletSnapshotState {
     pub(crate) current_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) oldest_retained_snapshot: Option<u64>,
     pub(crate) rows: Vec<TabletSnapshotRow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) receipts: Vec<TransactionReceipt>,
 }
 
 /// Minimal single-node MVCC tablet used to prove transaction semantics before
@@ -273,7 +389,9 @@ pub(crate) struct TabletSnapshotState {
 pub struct MemoryTablet {
     descriptor: TabletDescriptor,
     current_sequence: u64,
+    oldest_retained_snapshot: u64,
     rows: BTreeMap<Vec<u8>, Vec<VersionedValue>>,
+    receipts: BTreeMap<TransactionId, TransactionReceipt>,
 }
 
 impl MemoryTablet {
@@ -281,7 +399,9 @@ impl MemoryTablet {
         Self {
             descriptor,
             current_sequence: 0,
+            oldest_retained_snapshot: 0,
             rows: BTreeMap::new(),
+            receipts: BTreeMap::new(),
         }
     }
 
@@ -293,9 +413,15 @@ impl MemoryTablet {
         self.current_sequence
     }
 
+    pub fn oldest_retained_snapshot(&self) -> u64 {
+        self.oldest_retained_snapshot
+    }
+
     pub(crate) fn snapshot_state(&self) -> TabletSnapshotState {
         TabletSnapshotState {
             current_sequence: self.current_sequence,
+            oldest_retained_snapshot: (self.oldest_retained_snapshot != 0)
+                .then_some(self.oldest_retained_snapshot),
             rows: self
                 .rows
                 .iter()
@@ -304,6 +430,7 @@ impl MemoryTablet {
                     versions: versions.clone(),
                 })
                 .collect(),
+            receipts: self.receipts.values().copied().collect(),
         }
     }
 
@@ -311,32 +438,103 @@ impl MemoryTablet {
         descriptor: TabletDescriptor,
         state: TabletSnapshotState,
     ) -> Result<Self, TabletError> {
+        let oldest_retained_snapshot = state.oldest_retained_snapshot.unwrap_or(0);
+        if oldest_retained_snapshot > state.current_sequence {
+            return Err(TabletError::InvalidSnapshotHistory);
+        }
         let mut rows = BTreeMap::new();
         for row in state.rows {
             if !descriptor.range.contains(&row.key) {
                 return Err(TabletError::KeyOutsideTabletRange);
             }
 
+            // Before duplicate-key batches were normalized on commit, v1
+            // checkpoints could contain consecutive versions with identical
+            // sequences. Accept only that historical representation, and
+            // retain its last value (including a tombstone) for each commit.
+            // Zero, future, or decreasing sequences remain invalid.
+            let mut versions = row.versions;
             let mut previous = 0_u64;
-            for version in &row.versions {
+            for version in &versions {
                 if version.sequence == 0
                     || version.sequence > state.current_sequence
-                    || version.sequence <= previous
+                    || version.sequence < previous
                 {
                     return Err(TabletError::InvalidSnapshotHistory);
                 }
                 previous = version.sequence;
             }
-            if rows.insert(row.key, row.versions).is_some() {
+            // dedup_by passes the later item first. Transfer its value into
+            // the retained earlier item without cloning or reallocating.
+            versions.dedup_by(|later, earlier| {
+                if later.sequence != earlier.sequence {
+                    return false;
+                }
+                earlier.value = later.value.take();
+                true
+            });
+            if rows.insert(row.key, versions).is_some() {
                 return Err(TabletError::InvalidSnapshotHistory);
             }
         }
 
+        let mut receipts = BTreeMap::new();
+        let mut sequences = std::collections::BTreeSet::new();
+        for receipt in state.receipts {
+            if receipt.sequence == 0
+                || receipt.sequence > state.current_sequence
+                || !sequences.insert(receipt.sequence)
+                || receipts.insert(receipt.id, receipt).is_some()
+            {
+                return Err(TabletError::InvalidReceiptHistory);
+            }
+        }
         Ok(Self {
             descriptor,
             current_sequence: state.current_sequence,
+            oldest_retained_snapshot,
             rows,
+            receipts,
         })
+    }
+
+    pub(crate) fn transaction_receipt(&self, id: TransactionId) -> Option<TransactionReceipt> {
+        self.receipts.get(&id).copied()
+    }
+    #[cfg(unix)]
+    pub(crate) fn receipts(&self) -> impl ExactSizeIterator<Item = TransactionReceipt> + '_ {
+        self.receipts.values().copied()
+    }
+    pub(crate) fn has_receipts(&self) -> bool {
+        !self.receipts.is_empty()
+    }
+    /// A version at exactly this sequence, including explicit tombstones.
+    pub(crate) fn exact_version_at(&self, key: &[u8], sequence: u64) -> Option<Option<&[u8]>> {
+        let versions = self.rows.get(key)?;
+        let index = versions
+            .binary_search_by_key(&sequence, |version| version.sequence)
+            .ok()?;
+        Some(versions[index].value.as_deref())
+    }
+
+    /// The retained anchor visible at the durable floor, with its original sequence.
+    pub(crate) fn floor_anchor(&self, key: &[u8], floor: u64) -> Option<(u64, Option<&[u8]>)> {
+        let version = visible_version_at(self.rows.get(key)?, floor)?;
+        Some((version.sequence, version.value.as_deref()))
+    }
+
+    pub(crate) fn version_count_after(&self, sequence: u64) -> usize {
+        self.rows
+            .values()
+            .map(|versions| versions.len() - versions.partition_point(|v| v.sequence <= sequence))
+            .sum()
+    }
+
+    pub(crate) fn receipt_count_after(&self, sequence: u64) -> usize {
+        self.receipts
+            .values()
+            .filter(|r| r.sequence > sequence)
+            .count()
     }
 
     pub fn prepare_write(
@@ -374,6 +572,11 @@ impl MemoryTablet {
                 current: self.descriptor.ownership_epoch,
                 presented: write.ownership_epoch,
             });
+        }
+        if let Some(identity) = write.identity {
+            if self.receipts.contains_key(&identity.id) {
+                return Err(TabletError::DuplicateTransactionId(identity.id));
+            }
         }
         if write.expected_previous_sequence != self.current_sequence {
             return Err(TabletError::SequenceMismatch {
@@ -421,6 +624,10 @@ impl MemoryTablet {
     pub(crate) fn publish_validated(&mut self, write: TabletWrite) -> u64 {
         let sequence = write.sequence;
         self.apply_mutations(sequence, write.mutations);
+        if let Some(identity) = write.identity {
+            self.receipts
+                .insert(identity.id, identity.receipt(sequence));
+        }
         sequence
     }
 
@@ -434,7 +641,13 @@ impl MemoryTablet {
         sequence: u64,
         expected_previous_sequence: u64,
         mutations: Vec<TabletMutation>,
+        identity: Option<TransactionIdentity>,
     ) -> Result<(), TabletError> {
+        if let Some(identity) = identity {
+            if self.receipts.contains_key(&identity.id) {
+                return Err(TabletError::DuplicateTransactionId(identity.id));
+            }
+        }
         if expected_previous_sequence != self.current_sequence {
             return Err(TabletError::SequenceMismatch {
                 committed: self.current_sequence,
@@ -459,47 +672,95 @@ impl MemoryTablet {
         }
 
         self.apply_mutations(sequence, mutations);
+        if let Some(identity) = identity {
+            self.receipts
+                .insert(identity.id, identity.receipt(sequence));
+        }
         Ok(())
     }
 
     fn apply_mutations(&mut self, sequence: u64, mutations: Vec<TabletMutation>) {
         for mutation in mutations {
-            match mutation {
-                TabletMutation::Put { key, value } => {
-                    self.rows.entry(key).or_default().push(VersionedValue {
-                        sequence,
-                        value: Some(value),
-                    });
-                }
-                TabletMutation::Delete { key } => {
-                    self.rows.entry(key).or_default().push(VersionedValue {
-                        sequence,
-                        value: None,
-                    });
+            let (key, value) = match mutation {
+                TabletMutation::Put { key, value } => (key, Some(value)),
+                TabletMutation::Delete { key } => (key, None),
+            };
+            let versions = self.rows.entry(key).or_default();
+
+            // A commit has one snapshot sequence, even if its batch updates
+            // the same key repeatedly. Preserve the last mutation's value
+            // without creating duplicate MVCC versions that checkpoint
+            // recovery would reject as invalid history.
+            if let Some(last) = versions.last_mut() {
+                if last.sequence == sequence {
+                    last.value = value;
+                    continue;
                 }
             }
+            versions.push(VersionedValue { sequence, value });
         }
         self.current_sequence = sequence;
     }
 
-    /// Read one key at an already committed snapshot sequence.
-    pub fn read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, TabletError> {
+    /// Latest committed mutation sequence, including retained tombstones.
+    pub(crate) fn latest_key_write_sequence(&self, key: &[u8]) -> Option<u64> {
+        self.rows
+            .get(key)
+            .and_then(|versions| versions.last())
+            .map(|version| version.sequence)
+    }
+
+    /// Prune a candidate state; the durable coordinator enforces snapshot pins.
+    pub(crate) fn prune_history_before(&mut self, floor: u64) -> Result<(), TabletError> {
+        if floor < self.oldest_retained_snapshot {
+            return Err(TabletError::RetentionFloorRegression {
+                requested: floor,
+                oldest_retained: self.oldest_retained_snapshot,
+            });
+        }
+        self.validate_snapshot(floor)?;
+        for versions in self.rows.values_mut() {
+            let boundary = versions.partition_point(|v| v.sequence <= floor);
+            if boundary > 0 {
+                // Keep the visible value at the floor; a tombstone is equivalent
+                // to absence after all preceding values have been discarded.
+                let discard = boundary - usize::from(versions[boundary - 1].value.is_some());
+                if discard > 0 {
+                    versions.drain(..discard);
+                    versions.shrink_to_fit();
+                }
+            }
+        }
+        self.rows.retain(|_, versions| !versions.is_empty());
+        self.oldest_retained_snapshot = floor;
+        Ok(())
+    }
+
+    pub(crate) fn validate_snapshot(&self, snapshot: u64) -> Result<(), TabletError> {
         if snapshot > self.current_sequence {
             return Err(TabletError::SnapshotAhead {
                 committed: self.current_sequence,
                 requested: snapshot,
             });
         }
+        if snapshot < self.oldest_retained_snapshot {
+            return Err(TabletError::SnapshotExpired {
+                requested: snapshot,
+                oldest_retained: self.oldest_retained_snapshot,
+            });
+        }
+        Ok(())
+    }
+
+    /// Read one key at an already committed and retained snapshot sequence.
+    pub fn read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, TabletError> {
+        self.validate_snapshot(snapshot)?;
         if !self.descriptor.range.contains(key) {
             return Err(TabletError::KeyOutsideTabletRange);
         }
 
         Ok(self.rows.get(key).and_then(|versions| {
-            versions
-                .iter()
-                .rev()
-                .find(|version| version.sequence <= snapshot)
-                .and_then(|version| version.value.as_deref())
+            visible_version_at(versions, snapshot).and_then(|version| version.value.as_deref())
         }))
     }
 
@@ -547,7 +808,31 @@ pub enum TabletError {
         committed: u64,
         requested: u64,
     },
+    SnapshotExpired {
+        requested: u64,
+        oldest_retained: u64,
+    },
+    RetentionFloorRegression {
+        requested: u64,
+        oldest_retained: u64,
+    },
+    SnapshotPinned {
+        requested: u64,
+        oldest_pinned: u64,
+    },
+    RecoveryRequired,
     InvalidSnapshotHistory,
+    OptimisticConflict {
+        key: Vec<u8>,
+        snapshot: u64,
+        committed: u64,
+    },
+    TooManyOptimisticReadKeys {
+        requested: usize,
+        limit: usize,
+    },
+    InvalidReceiptHistory,
+    DuplicateTransactionId(TransactionId),
     KeyOutsideTabletRange,
 }
 
@@ -604,6 +889,17 @@ impl fmt::Display for TabletError {
                 f,
                 "snapshot {requested} is ahead of committed tablet sequence {committed}"
             ),
+            Self::SnapshotExpired { requested, oldest_retained } => write!(f,
+                "snapshot {requested} expired; oldest retained snapshot is {oldest_retained}"),
+            Self::RetentionFloorRegression { requested, oldest_retained } => write!(f,
+                "retention floor {requested} is below current floor {oldest_retained}"),
+            Self::SnapshotPinned { requested, oldest_pinned } => write!(f,
+                "retention floor {requested} exceeds active snapshot {oldest_pinned}"),
+            Self::RecoveryRequired => f.write_str("tablet recovery required before further snapshot reads or writes"),
+            Self::OptimisticConflict { key, snapshot, committed } => write!(f, "point key {key:?} changed at sequence {committed} after snapshot {snapshot}"),
+            Self::TooManyOptimisticReadKeys { requested, limit } => write!(f, "optimistic read set contains {requested} keys; limit is {limit}"),
+            Self::InvalidReceiptHistory => f.write_str("invalid transaction receipt history"),
+            Self::DuplicateTransactionId(id) => write!(f, "transaction ID {id:?} already committed"),
             Self::InvalidSnapshotHistory => {
                 f.write_str("tablet snapshot contains invalid MVCC version history")
             }
@@ -615,3 +911,141 @@ impl fmt::Display for TabletError {
 }
 
 impl std::error::Error for TabletError {}
+
+#[cfg(test)]
+mod snapshot_binary_lookup_tests {
+    use super::{visible_version_at, VersionedValue};
+
+    #[test]
+    fn sparse_versions_and_tombstones_preserve_snapshot_semantics() {
+        let versions = vec![
+            VersionedValue {
+                sequence: 2,
+                value: Some(b"first".to_vec()),
+            },
+            VersionedValue {
+                sequence: 9,
+                value: None,
+            },
+            VersionedValue {
+                sequence: 25,
+                value: Some(b"restored".to_vec()),
+            },
+        ];
+        for (snapshot, expected) in [
+            (0, None),
+            (1, None),
+            (2, Some(&b"first"[..])),
+            (8, Some(&b"first"[..])),
+            (9, None),
+            (24, None),
+            (25, Some(&b"restored"[..])),
+            (u64::MAX, Some(&b"restored"[..])),
+        ] {
+            assert_eq!(
+                visible_version_at(&versions, snapshot).and_then(|v| v.value.as_deref()),
+                expected,
+                "snapshot {snapshot}",
+            );
+        }
+        assert!(visible_version_at(&[], 25).is_none());
+    }
+
+    #[test]
+    fn long_sparse_history_matches_linear_reference_without_copying() {
+        let versions: Vec<_> = (1u64..=4096)
+            .map(|sequence| VersionedValue {
+                sequence: sequence * 3,
+                value: Some(sequence.to_le_bytes().to_vec()),
+            })
+            .collect();
+        for snapshot in (0u64..=4096 * 3 + 1).step_by(17) {
+            let expected = versions.iter().rev().find(|v| v.sequence <= snapshot);
+            let actual = visible_version_at(&versions, snapshot);
+            assert_eq!(actual, expected, "snapshot {snapshot}");
+            if let (Some(a), Some(e)) = (actual, expected) {
+                assert!(
+                    std::ptr::eq(a, e),
+                    "lookup must borrow the existing version"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_duplicate_sequence_uses_last_version() {
+        let versions = vec![
+            VersionedValue {
+                sequence: 1,
+                value: Some(b"a".to_vec()),
+            },
+            VersionedValue {
+                sequence: 1,
+                value: None,
+            },
+            VersionedValue {
+                sequence: 3,
+                value: Some(b"new".to_vec()),
+            },
+        ];
+        assert!(visible_version_at(&versions, 1).unwrap().value.is_none());
+        assert!(visible_version_at(&versions, 2).unwrap().value.is_none());
+        assert_eq!(
+            visible_version_at(&versions, 3).unwrap().value.as_deref(),
+            Some(&b"new"[..])
+        );
+    }
+}
+
+#[cfg(test)]
+mod recovered_snapshot_lookup_tests {
+    use super::*;
+
+    #[test]
+    fn recovered_duplicate_and_sparse_history_matches_last_write_oracle() {
+        let descriptor = TabletDescriptor::new(
+            TabletId::new(1).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            1,
+        )
+        .unwrap();
+        let mut versions = Vec::new();
+        for sequence in (3_u64..=3072).step_by(3) {
+            versions.push(VersionedValue {
+                sequence,
+                value: Some(sequence.to_le_bytes().to_vec()),
+            });
+            if sequence % 9 == 0 {
+                versions.push(VersionedValue {
+                    sequence,
+                    value: None,
+                });
+            }
+        }
+        let tablet = MemoryTablet::restore_snapshot(
+            descriptor,
+            TabletSnapshotState {
+                current_sequence: 3072,
+                oldest_retained_snapshot: None,
+                receipts: Vec::new(),
+                rows: vec![TabletSnapshotRow {
+                    key: b"key".to_vec(),
+                    versions: versions.clone(),
+                }],
+            },
+        )
+        .unwrap();
+        for snapshot in 0..=3072 {
+            let expected = versions
+                .iter()
+                .rev()
+                .find(|version| version.sequence <= snapshot)
+                .and_then(|version| version.value.as_deref());
+            assert_eq!(tablet.read_at(b"key", snapshot).unwrap(), expected);
+        }
+        assert!(matches!(
+            tablet.read_at(b"key", 3073),
+            Err(TabletError::SnapshotAhead { .. })
+        ));
+    }
+}
