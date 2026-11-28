@@ -892,3 +892,35 @@ command/byte/time thresholds, real TCP process-kill recovery, and the
 mutual TLS admission/large-response pipeline suite in cross-client mode.
 No new storage format, dependency, worker thread, or timer is required.
 See benchmarks/FABRIC_RESP.md for paired performance evidence.
+
+
+## Storage path and checkpoint failure hardening
+
+New WALs, stable lock files, clock sidecars and checkpoint replacements
+are created with owner-only permissions (0600, subject to umask).
+Existing legacy files retain their existing permissions until replaced;
+audit and restrict them offline before deployment. Final path components
+must be singly linked regular files; no-follow, nonblocking opens reject
+symlinks, hardlinks, FIFOs and other special files. The parent directory
+must remain private and trusted: these checks are not protection against
+concurrent malicious directory replacement, mount aliases, privileged
+writers or modifications to existing open inodes.
+
+If the journal is absent but the stable lock has an initialization
+marker or the clock sidecar exists, startup fails rather than creates
+an empty journal. Existing clock bytes are preserved. A missing lock
+may be recreated as an empty file during a failed open; restore the
+consistent backup of all three files with the process stopped. A
+legacy raw WAL with no durable initialization metadata cannot distinguish
+deletion from first use. Loss or replacement of all metadata remains
+outside this detection guarantee. Do not delete any sidecars to
+bypass recovery checks.
+
+The checkpoint regression injects ENOSPC after writing a partial
+snapshot record, before replacement publication. The original committed
+journal is unchanged, the incomplete temporary file is removed, and
+the original writer remains usable. Existing before/after-rename fault
+tests and torn-tail, checksum, sequence and clock tests remain part of
+qualification. After an ambiguous publication the writer remains
+poisoned until recovery. These are deterministic error injections,
+not physical power-loss or filesystem-level ENOSPC qualification.

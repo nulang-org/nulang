@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Fabric storage qualification and hardening — 2026-11-27
+- **Refuse to silently recreate an initialized missing WAL**, create owner-only journal/lock/checkpoint files, reject final-component link aliases and special files, and qualify checkpoint disk-full failure without losing the committed journal. No dependency changes.
+
 ### Fabric cross-client group commit — 2026-11-27
 - **Add opt-in bounded cross-client WAL durability groups** across already-ready connection turns, withhold all plaintext and encrypted output until the group sync succeeds, fail-stop on ambiguous errors, and qualify bounds, TLS, process recovery, and paired performance. No new dependencies.
 

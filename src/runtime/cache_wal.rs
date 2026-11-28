@@ -6,6 +6,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -57,6 +58,26 @@ pub struct CacheWal {
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+// A cooperating writer requires a single regular inode at each final path
+// component. The parent directory remains a trusted deployment boundary.
+fn private_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    options
+}
+
+fn validate_regular(file: &File) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(invalid(
+            "cache storage must be a singly linked regular file",
+        ));
+    }
+    Ok(())
 }
 
 fn checksum(header: &[u8; RECORD_HEADER_BYTES], payload: &[u8]) -> [u8; CHECKSUM_BYTES] {
@@ -143,8 +164,9 @@ impl ClockFloor {
                 return Err(invalid("invalid cache clock lock marker"));
             }
         }
-        let previous = match File::open(&path) {
+        let previous = match private_options().read(true).open(&path) {
             Ok(mut file) => {
+                validate_regular(&file)?;
                 let mut record = [0; 48];
                 if file.metadata()?.len() != record.len() as u64 {
                     return Err(invalid("invalid cache clock floor length"));
@@ -208,7 +230,6 @@ impl ClockFloor {
     }
 
     fn publish(&mut self, now: u64) -> io::Result<()> {
-        use std::os::unix::fs::OpenOptionsExt;
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let parent = parent_dir(&self.path);
         let directory = File::open(parent)?;
@@ -221,11 +242,7 @@ impl ClockFloor {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)?;
+        let mut file = private_options().write(true).create_new(true).open(&path)?;
         let temp = TemporaryJournal(path);
         file.write_all(&Self::encode(now))?;
         file.sync_all()?;
@@ -269,25 +286,41 @@ impl CacheWal {
         // unlink this sidecar while any cooperating writer may be active.
         let mut lock_path = path.as_os_str().to_os_string();
         lock_path.push(".lock");
-        let mut lock = OpenOptions::new()
+        let mut lock = private_options()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(lock_path)?;
+        validate_regular(&lock)?;
         lock.try_lock().map_err(io::Error::other)?;
-        let (mut file, created) = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)
-        {
-            Ok(file) => (file, true),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                (OpenOptions::new().read(true).write(true).open(path)?, false)
+        let (mut file, created) = match private_options().read(true).write(true).open(path) {
+            Ok(file) => (file, false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // Existing durable metadata is evidence of a prior store.
+                // Never silently replace a lost WAL with an empty journal.
+                if lock.metadata()?.len() != 0 {
+                    return Err(invalid("initialized cache journal is missing"));
+                }
+                match std::fs::symlink_metadata(ClockFloor::path_for(path)) {
+                    Ok(_) => {
+                        return Err(invalid("cache journal missing but clock metadata exists"))
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+                (
+                    private_options()
+                        .read(true)
+                        .write(true)
+                        .create_new(true)
+                        .open(path)?,
+                    true,
+                )
             }
             Err(error) => return Err(error),
         };
+        validate_regular(&file)?;
         file.try_lock().map_err(io::Error::other)?;
         if created {
             file.write_all(MAGIC)?;
@@ -421,7 +454,7 @@ impl CacheWal {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut file = OpenOptions::new()
+        let mut file = private_options()
             .read(true)
             .write(true)
             .create_new(true)
@@ -920,5 +953,92 @@ mod tests {
         assert!(wal.is_poisoned());
         assert!(wal.append(b"unsafe", WalSync::Buffered).is_err());
         assert!(wal.synchronize().is_err());
+    }
+
+    #[test]
+    fn journal_and_checkpoint_are_created_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = Temp::new();
+        let path = tmp.file();
+        let mut wal = CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o077;
+        assert_eq!(mode(&path), 0);
+        assert_eq!(mode(&tmp.0.join("journal.lock")), 0);
+        wal.append(b"private", WalSync::Data).unwrap();
+        wal.rotate(1, |next| {
+            next.append(b"private", WalSync::Buffered)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(mode(&path), 0);
+    }
+
+    #[test]
+    fn journal_and_lock_reject_symlinks_and_hardlinks_without_mutating_target() {
+        use std::os::unix::fs::symlink;
+        let tmp = Temp::new();
+        let path = tmp.file();
+        let target = tmp.0.join("target");
+        let mut wal = CacheWal::open(&target, WalLimits::default(), |_, _| Ok(())).unwrap();
+        wal.append(b"original", WalSync::Data).unwrap();
+        drop(wal);
+        let original = std::fs::read(&target).unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::hard_link(&target, &path).unwrap();
+        assert!(CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).is_err());
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        let lock = tmp.0.join("journal.lock");
+        if lock.exists() {
+            std::fs::remove_file(&lock).unwrap();
+        }
+        symlink(tmp.0.join("target.lock"), &lock).unwrap();
+        assert!(CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).is_err());
+        assert!(!path.exists());
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::hard_link(tmp.0.join("target.lock"), &lock).unwrap();
+        assert!(CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn special_files_are_rejected_without_blocking_or_writing() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = Temp::new();
+        let path = tmp.file();
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: valid NUL-terminated path in a private test directory.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        assert!(CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).is_err());
+    }
+
+    #[test]
+    fn checkpoint_disk_full_before_publication_preserves_committed_journal() {
+        let tmp = Temp::new();
+        let path = tmp.file();
+        let mut wal = CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).unwrap();
+        wal.append(b"committed", WalSync::Data).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let result = wal.rotate(1, |next| {
+            next.append_with(b"snapshot", WalSync::Buffered, |file, header, _, _, _| {
+                file.write_all(&header[..4])?;
+                Err(io::Error::from_raw_os_error(libc::ENOSPC))
+            })?;
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOSPC));
+        assert!(!wal.is_poisoned());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(wal.append(b"continued", WalSync::Data).unwrap(), 2);
+        assert!(!std::fs::read_dir(&tmp.0).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".nulang-checkpoint-")));
     }
 }

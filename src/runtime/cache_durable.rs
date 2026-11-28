@@ -1263,4 +1263,63 @@ mod tests {
         assert!(cache.get(b"live", 252).is_err());
         assert!(cache.is_poisoned());
     }
+
+    #[test]
+    fn missing_initialized_journal_refuses_recreation_and_preserves_metadata() {
+        let tmp = Temp::new();
+        let mut cache = tmp.open(time(0, 1000));
+        cache
+            .set_bytes(b"key", b"value", None, time(0, 1000))
+            .unwrap();
+        drop(cache);
+        let path = tmp.path();
+        let clock = tmp.0.join("cache.wal.clock");
+        let marker = tmp.0.join("cache.wal.lock");
+        let original = std::fs::read(&path).unwrap();
+        let old_clock = std::fs::read(&clock).unwrap();
+        let old_marker = std::fs::read(&marker).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(try_open(&tmp, 1100).is_err());
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&clock).unwrap(), old_clock);
+        assert_eq!(std::fs::read(&marker).unwrap(), old_marker);
+        std::fs::write(&path, original).unwrap();
+        let mut restored = try_open(&tmp, 1100).unwrap();
+        assert_eq!(
+            restored.get(b"key", 0).unwrap(),
+            Some(CacheValueView::Bytes(b"value"))
+        );
+    }
+
+    #[test]
+    fn clock_sidecar_rejects_link_aliases() {
+        use std::os::unix::fs::symlink;
+        let tmp = Temp::new();
+        drop(tmp.open(time(0, 1000)));
+        let path = tmp.0.join("cache.wal.clock");
+        let target = tmp.0.join("clock-target");
+        std::fs::rename(&path, &target).unwrap();
+        let original = std::fs::read(&target).unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(try_open(&tmp, 1100).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::hard_link(&target, &path).unwrap();
+        assert!(try_open(&tmp, 1100).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+    }
+
+    #[test]
+    fn missing_journal_with_only_clock_metadata_still_refuses_recreation() {
+        let tmp = Temp::new();
+        drop(tmp.open(time(0, 1000)));
+        let clock = tmp.0.join("cache.wal.clock");
+        let marker = tmp.0.join("cache.wal.lock");
+        let old_clock = std::fs::read(&clock).unwrap();
+        std::fs::remove_file(tmp.path()).unwrap();
+        std::fs::remove_file(&marker).unwrap();
+        assert!(try_open(&tmp, 1100).is_err());
+        assert!(!tmp.path().exists());
+        assert_eq!(std::fs::read(&clock).unwrap(), old_clock);
+    }
 }
