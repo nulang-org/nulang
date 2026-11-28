@@ -582,8 +582,21 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
                         out.push_str(", ");
                     }
                     out.push_str(&p.name);
+                    if let Some(ty) = &p.ty {
+                        out.push_str(": ");
+                        out.push_str(&fmt_type(ty));
+                    }
                 }
-                out.push_str(&format!("): {}\n", ev.target));
+                out.push(')');
+                if let Some(source) = &ev.source {
+                    out.push_str(&format!(" from {}", source));
+                }
+                out.push_str(&format!(": {}", ev.target));
+                if let Some(guard) = &ev.guard {
+                    out.push_str(" if ");
+                    fmt_expr(out, guard, indent + 4, had_unhandled);
+                }
+                out.push('\n');
             }
             if !entry_hooks.is_empty() || !exit_hooks.is_empty() {
                 out.push('\n');
@@ -1328,6 +1341,21 @@ impl Eq Int {
             "got: {out}"
         );
         assert!(out.contains("on_entry Connecting {"), "got: {out}");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn test_fmt_state_machine_scoped_guard() {
+        let src = r#"state_machine Order {
+    state Pending
+    state Paid
+    event pay(amount) from Pending: Paid if amount > 0
+}"#;
+        let out = format_source(src).expect("state_machine formats");
+        assert!(
+            out.contains("event pay(amount) from Pending: Paid if amount > 0"),
+            "got: {out}"
+        );
         assert_idempotent(src);
     }
 

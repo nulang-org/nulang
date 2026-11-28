@@ -5693,6 +5693,51 @@ match { a: 2, b: 9 } with {
     }
 
     #[test]
+    fn test_state_machine_scoped_guarded_transitions_execute_correctly() {
+        use crate::runtime::PersistedValue;
+
+        fn run_case(events: &str, expected: &str) {
+            let source = format!(
+                r#"
+                state_machine Order {{
+                    state Pending
+                    state Paid
+                    event pay(amount: Int) from Pending: Paid if amount > 0
+                    event reset: Pending
+                }}
+                fn main() {{
+                    let order = spawn Order {{}} in {{
+                        {}
+                        order
+                    }}
+                }}
+                "#,
+                events
+            );
+            let runtime = Rc::new(RefCell::new(Runtime::new()));
+            let (actor_ref, _) = run_source_with_runtime(&source, runtime.clone()).unwrap();
+            let actor_id = actor_ref.as_actor_id().unwrap();
+            runtime.borrow_mut().run_scheduler();
+
+            let rt = runtime.borrow();
+            let actor = rt.actors.get(&actor_id).expect("order actor must survive");
+            let state = actor.get_state_field("_sm_state").expect("machine state");
+            let persisted = actor.persist_value(&state);
+            assert!(
+                matches!(persisted, PersistedValue::String(ref name) if name == expected),
+                "expected state {}, got {:?}",
+                expected,
+                persisted
+            );
+        }
+
+        run_case("send order pay(0)", "Pending");
+        run_case("send order pay(20)", "Paid");
+        run_case("send order pay(20)\n send order pay(20)", "Paid");
+        run_case("send order pay(20)\n send order reset()", "Pending");
+    }
+
+    #[test]
     fn test_state_machine_self_transition_runs_hooks() {
         // A self-transition (event targeting the current state) must run
         // both exit and entry hooks. Verify the actor survives self-ticks.

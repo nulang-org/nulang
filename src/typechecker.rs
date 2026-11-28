@@ -5863,6 +5863,34 @@ mod tests {
     }
 
     #[test]
+    fn test_state_machine_guard_must_have_boolean_type() {
+        let valid = check_src(
+            r#"
+            state_machine M {
+                state A
+                state B
+                event go(x: Int) from A: B if x > 0
+            }
+        "#,
+        );
+        assert!(
+            valid.is_ok(),
+            "expected valid guarded transition: {valid:?}"
+        );
+
+        let invalid = check_src(
+            r#"
+            state_machine M {
+                state A
+                state B
+                event go(x: Int) from A: B if x
+            }
+        "#,
+        );
+        assert!(invalid.is_err(), "Int guard should not typecheck");
+    }
+
+    #[test]
     fn test_state_machine_binds_actor_type_for_spawn_and_send() {
         // The machine name binds an actor type, so `spawn`/`send`/`ask`
         // against it check exactly like against a hand-written actor.

@@ -92,6 +92,7 @@ pub mod resolver;
 pub mod runtime;
 pub mod semantic_identity;
 pub mod semantic_schema;
+pub mod statechart;
 pub mod stdlib;
 #[cfg(test)]
 pub mod stress_tests;
