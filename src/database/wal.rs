@@ -217,6 +217,21 @@ impl WalRecord {
     }
 }
 
+// Explicit unlock on final logical ownership release. On Unix flock is
+// attached to the open file description, which a forked child may briefly
+// retain until exec even when the parent closes its descriptor. Arc keeps
+// this guard alive across replacement; intermediate handle drops never unlock.
+#[derive(Debug)]
+struct WriterLock(File);
+
+impl Drop for WriterLock {
+    fn drop(&mut self) {
+        // Drop cannot report I/O errors. Closing the descriptor is still
+        // the fallback; never unlink the persistent lock sidecar.
+        let _ = self.0.unlock();
+    }
+}
+
 /// File-backed, per-tablet append-only WAL.
 ///
 /// A nonblocking advisory lock on a persistent `.lock` sidecar admits at most
@@ -234,7 +249,7 @@ pub struct FileWal {
     path: PathBuf,
     file: File,
     // Never removed while writers may exist. This lock survives WAL rename/reclaim.
-    writer_lock: Arc<File>,
+    writer_lock: Arc<WriterLock>,
     records: Vec<WalRecord>,
     record_end_offsets: Vec<u64>,
     base_sequence: u64,
@@ -247,6 +262,8 @@ pub struct FileWal {
 }
 
 impl FileWal {
+    /// Open a canonical lowercase .wal path in a trusted local directory.
+    /// Noncanonical legacy paths require verified offline migration.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WalError> {
         Self::open_with_mode(path.as_ref(), false, None, false)
     }
@@ -267,6 +284,11 @@ impl FileWal {
         binding: Option<SealBinding>,
         require_bound: bool,
     ) -> Result<Self, WalError> {
+        // WAL, checkpoint and lock/temp sidecars occupy disjoint namespaces.
+        // Both WAL3 and WAL4 admission must reject aliases before mutation.
+        if requested_path.extension() != Some(std::ffi::OsStr::new("wal")) {
+            return Err(WalError::InvalidWalExtension);
+        }
         let parent = requested_path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -295,18 +317,19 @@ impl FileWal {
             std::fs::TryLockError::WouldBlock => WalError::WriterLocked,
             std::fs::TryLockError::Error(error) => WalError::from(error),
         })?;
+        let lock = Arc::new(WriterLock(lock));
         if require_existing {
             let metadata = fs::symlink_metadata(&path)?;
             if !metadata.is_file() || metadata.len() < WAL_HEADER_BYTES as u64 {
                 return Err(WalError::InvalidHeader);
             }
         }
-        Self::open_locked(path, Arc::new(lock), binding, require_bound)
+        Self::open_locked(path, lock, binding, require_bound)
     }
 
     fn open_locked(
         path: PathBuf,
-        writer_lock: Arc<File>,
+        writer_lock: Arc<WriterLock>,
         binding: Option<SealBinding>,
         require_bound: bool,
     ) -> Result<Self, WalError> {
@@ -1346,6 +1369,7 @@ pub enum WalError {
     SealBindingMismatch,
     WriterLocked,
     AliasedWalPath,
+    InvalidWalExtension,
     WalHeaderChecksumMismatch,
     InvalidFrameHeader {
         offset: u64,
@@ -1430,6 +1454,7 @@ impl fmt::Display for WalError {
             Self::Io { message, .. } => write!(f, "WAL I/O error: {message}"),
             Self::InvalidHeader => f.write_str("invalid NuDB WAL header"),
             Self::SealBindingMismatch => f.write_str("bound WAL requires matching sealed manifest; legacy reclamation is disabled"),
+            Self::InvalidWalExtension => f.write_str("NuDB WAL path must end in .wal; noncanonical legacy paths require offline migration"),
             Self::WriterLocked => f.write_str("NuDB WAL already has an exclusive writer"),
             Self::AliasedWalPath => {
                 f.write_str("NuDB WAL or lock path must not be a symlink or hardlink")
@@ -1562,6 +1587,34 @@ mod hardening_tests {
             }],
         )
         .unwrap()
+    }
+
+    // On Unix, dup (like a fork before exec) retains the same open file
+    // description. Closing the owner's descriptor alone does not release flock.
+    #[cfg(unix)]
+    #[test]
+    fn final_writer_drop_releases_lock_with_inherited_descriptor() {
+        let path = temp_wal("inherited_descriptor");
+        let mut wal = FileWal::open(&path).unwrap();
+        let inherited = wal.writer_lock.0.try_clone().unwrap();
+        wal.append_write(&write(0, b"k")).unwrap();
+        wal.reclaim_through(1).unwrap();
+        assert_eq!(FileWal::open(&path).unwrap_err(), WalError::WriterLocked);
+        drop(wal);
+
+        // No retry or sleep: the logical owner has gone even though the
+        // simulated child still has the old descriptor open.
+        let mut reopened = FileWal::open(&path).unwrap();
+        assert_eq!(reopened.last_sequence(), 1);
+        drop(inherited);
+        assert_eq!(FileWal::open(&path).unwrap_err(), WalError::WriterLocked);
+        reopened.append_write(&write(1, b"k2")).unwrap();
+        drop(reopened);
+        let reopened = FileWal::open(&path).unwrap();
+        assert_eq!(reopened.last_sequence(), 2);
+        drop(reopened);
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(writer_lock_path(&path)).unwrap();
     }
 
     #[test]
