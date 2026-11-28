@@ -127,6 +127,10 @@
 - **Remote libSQL uses a platform-native HTTPS connector rather than the affected legacy Rustls dependency chain.** HTTPS and libsql:// endpoints are supported; plaintext HTTP endpoints now fail closed. Native CA trust stores must be maintained by deployments.
 - **The security branch passed cargo audit, focused SQLite/transport regressions, full-feature checks, and four-platform release builds.** Live authenticated Turso connectivity remains an operational smoke-test requirement before promoting remote-libSQL workloads.
 
+### Five-node split-brain post-heal readiness regression — 2026-11-09
+- **The five-node TCP cluster chaos test now waits for healthy peer statuses as well as active-view convergence after a healed network partition.** The address resolver refuses one-shot sends when peers still have `Suspect` or `Failed` status; merely appearing in the active view is not sufficient to establish post-heal send readiness.
+- **Tighten diagnostics before cross-boundary delivery.** The test asserts A/E agree they are healthy, then preserves the original one-shot send and delivery assertion; no runtime transport/retry semantics are changed.
+- **Evidence:** the original test failed on one of two repeated local runs with the same remote-delivery assertion seen on PR #2540; the stricter test passed 12 consecutive local runs. Further high-contention CI confirmation remains necessary.
 ### Per-priority scheduler runnable backlog diagnostics — 2026-11-20
 - **Expose approximate queued High, Normal, and Low runnable task counts** in the existing scheduler metrics snapshot, including global injector and worker-local queues, without adding counters to scheduling hot paths.
 - **Regression tests cover mixed priority queues, dequeues, and metrics-counter reset.** Queue depths are sampled non-atomically for diagnostics only; they are not admission, fairness, or backpressure guarantees.
