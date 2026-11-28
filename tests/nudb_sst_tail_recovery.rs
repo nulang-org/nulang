@@ -2118,3 +2118,195 @@ fn committed_compaction_lineage_survives_later_rotation_and_reopen() {
             .unwrap();
     assert_eq!(restored.current_sequence(), 3);
 }
+
+#[test]
+fn multi_output_compaction_splits_at_sequence_boundaries_and_recovers() {
+    use nulang::database::{
+        generation_registry::{GenerationRegistry, GenerationStatus},
+        managed_storage::ManagedTablet,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    let first = db
+        .commit_idempotent(id(1), vec![put(&vec![b'x'; 4096])])
+        .unwrap();
+    for n in 2..=4 {
+        db.commit_idempotent(id(n), vec![put(&[n; 64])]).unwrap();
+    }
+    let mut old = f.manifest();
+    for _ in 0..4 {
+        db.flush_sst_shadow(&mut old, 1).unwrap();
+    }
+    db.seal_sst_recovery_at_floor(&mut old, 2).unwrap();
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let reg = f.0.join("registry");
+    fs::create_dir(&reg).unwrap();
+    let registry = GenerationRegistry::create(&reg, 7, 3).unwrap();
+    let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+    let tail = managed
+        .commit_idempotent(id(5), vec![put(b"tail")])
+        .unwrap();
+    let wal = f.0.join("tablet.wal");
+    let before = fs::read(&wal).unwrap();
+    let rejected = f.0.join("too-small");
+    fs::create_dir(&rejected).unwrap();
+    assert!(managed
+        .compact_with_target(ManifestStore::create(&rejected, 7, 3).unwrap(), 100)
+        .is_err());
+    assert_eq!(fs::read_dir(&rejected).unwrap().count(), 2);
+    assert_eq!(fs::read(&wal).unwrap(), before);
+    let target = f.0.join("compact");
+    fs::create_dir(&target).unwrap();
+    let stats = managed
+        .compact_with_target(ManifestStore::create(&target, 7, 3).unwrap(), 190)
+        .unwrap();
+    assert_eq!(stats.output_tables, 3);
+    assert_eq!(stats.output_versions, 3);
+    assert!(stats.output_bytes < stats.input_bytes);
+    let after = fs::read(&wal).unwrap();
+    assert_eq!(&before[128..], &after[128..]);
+    for n in 2..=4 {
+        assert_eq!(
+            managed.read_at(b"k", n).unwrap(),
+            Some([n as u8; 64].as_slice())
+        );
+    }
+    assert_eq!(managed.read_at(b"k", 5).unwrap(), Some(b"tail".as_slice()));
+    let backup = f.0.join("backup");
+    managed.backup([8; 16], &backup).unwrap();
+    let q = f.0.join("quarantine");
+    managed
+        .quarantine(
+            ManifestStore::open(f.0.join("sst"), 7, 3).unwrap(),
+            &backup,
+            &q,
+        )
+        .unwrap();
+    let old = ManifestStore::open(&q, 7, 3).unwrap();
+    managed.reserve_retirement(&old, &backup).unwrap();
+    drop(old);
+    managed.delete_reserved_generation(&q, &backup).unwrap();
+    assert_eq!(
+        managed.retirement_status(&q).unwrap(),
+        GenerationStatus::Deleted
+    );
+    drop(managed);
+    let m = ManifestStore::open(&target, 7, 3).unwrap();
+    assert_eq!(
+        m.current()
+            .entries()
+            .iter()
+            .map(|e| e.sequence_interval())
+            .collect::<Vec<_>>(),
+        vec![(1, 2), (3, 3), (4, 4)]
+    );
+    for i in 1..=3 {
+        assert!(
+            fs::metadata(target.join(format!("nudb-sst-{i:020}.sst")))
+                .unwrap()
+                .len()
+                <= 190
+        );
+    }
+    drop(m);
+    let registry = GenerationRegistry::open(&reg, 7, 3).unwrap();
+    let mut managed = ManagedTablet::open(f.descriptor(), &wal, &target, registry).unwrap();
+    assert_eq!(
+        managed
+            .commit_idempotent(id(1), vec![put(&vec![b'x'; 4096])])
+            .unwrap(),
+        first
+    );
+    assert_eq!(
+        managed
+            .commit_idempotent(id(5), vec![put(b"tail")])
+            .unwrap(),
+        tail
+    );
+    let restored =
+        WalBackedTablet::restore_sealed_backup(f.descriptor(), &backup, f.0.join("restored"))
+            .unwrap();
+    assert_eq!(restored.current_sequence(), 5);
+}
+
+#[test]
+fn multi_output_compaction_accounts_for_shared_keys_and_whole_sequences() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(&[1; 64])]).unwrap();
+    db.commit_idempotent(id(2), vec![]).unwrap();
+    db.commit_idempotent(id(3), vec![put(&[3; 64])]).unwrap();
+    db.commit_idempotent(
+        id(4),
+        vec![
+            put(&[4; 59]),
+            TabletMutation::Put {
+                key: b"e".to_vec(),
+                value: vec![4; 59],
+            },
+        ],
+    )
+    .unwrap();
+    let old = seal(&f, &db);
+    let rejected = f.0.join("rejected");
+    fs::create_dir(&rejected).unwrap();
+    let mut next = ManifestStore::create(&rejected, 7, 3).unwrap();
+    assert!(old
+        .prepare_compacted_shadow_with_target(&mut next, 243)
+        .is_err());
+    assert!(next.current().entries().is_empty());
+    assert_eq!(fs::read_dir(&rejected).unwrap().count(), 2);
+    let target = f.0.join("target");
+    fs::create_dir(&target).unwrap();
+    let mut next = ManifestStore::create(&target, 7, 3).unwrap();
+    let stats = old
+        .prepare_compacted_shadow_with_target(&mut next, 245)
+        .unwrap();
+    assert_eq!(stats.output_tables, 2);
+    assert_eq!(
+        next.current()
+            .entries()
+            .iter()
+            .map(|e| e.sequence_interval())
+            .collect::<Vec<_>>(),
+        vec![(1, 3), (4, 4)]
+    );
+    assert_eq!(
+        fs::metadata(target.join("nudb-sst-00000000000000000001.sst"))
+            .unwrap()
+            .len(),
+        245
+    );
+    assert_eq!(
+        fs::metadata(target.join("nudb-sst-00000000000000000002.sst"))
+            .unwrap()
+            .len(),
+        244
+    );
+    for snapshot in 0..=4 {
+        for key in [b"k".as_slice(), b"e"] {
+            assert_eq!(
+                next.recovered_read_at(key, snapshot).unwrap(),
+                db.read_at(key, snapshot).unwrap().map(|v| v.to_vec())
+            );
+        }
+    }
+}
+
+#[test]
+fn multi_output_compaction_rejects_excessive_output_count_before_writing() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    for n in 1..=17 {
+        db.commit_idempotent(id(n), vec![put(&[n; 64])]).unwrap();
+    }
+    let old = seal(&f, &db);
+    let target = f.0.join("target");
+    fs::create_dir(&target).unwrap();
+    let mut next = ManifestStore::create(&target, 7, 3).unwrap();
+    assert!(old
+        .prepare_compacted_shadow_with_target(&mut next, 190)
+        .is_err());
+    assert!(next.current().entries().is_empty());
+    assert_eq!(fs::read_dir(&target).unwrap().count(), 2);
+}

@@ -189,10 +189,22 @@ impl ManagedTablet {
     /// committed lineage for later explicitly backup-gated retirement.
     pub fn compact(
         &mut self,
+        next: ManifestStore,
+    ) -> io::Result<super::sst_manifest::CompactionStats> {
+        self.compact_with_target(next, 256 * 1024 * 1024)
+    }
+
+    /// Compaction with an explicit per-SST encoded-byte ceiling. No transaction
+    /// sequence is split between files; all outputs are verified before cutover.
+    pub fn compact_with_target(
+        &mut self,
         mut next: ManifestStore,
+        target_bytes: u64,
     ) -> io::Result<super::sst_manifest::CompactionStats> {
         self.ready()?;
-        let stats = self.active.prepare_compacted_shadow(&mut next)?;
+        let stats = self
+            .active
+            .prepare_compacted_shadow_with_target(&mut next, target_bytes)?;
         if self.active.wal_binding()? == next.wal_binding()? {
             return Err(io::Error::other(
                 "compaction produced identical seal; no cutover needed",
