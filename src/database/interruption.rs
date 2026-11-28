@@ -37,6 +37,7 @@ pub(crate) enum StorageInterruptionPoint {
     RetirementAfterTombstone,
     RetirementAfterUnlink,
     RetirementAfterFilesSync,
+    CompactionAfterOutput,
 }
 
 thread_local! {
@@ -2174,4 +2175,84 @@ mod process_crash_matrix {
             assert_eq!(&fs::read(&wal).unwrap()[..8], b"NUDBWAL5");
         }
     }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn interrupted_multi_output_preparation_leaves_active_generation_writable() {
+    use super::generation_registry::GenerationRegistry;
+    use super::managed_storage::ManagedTablet;
+    use super::sst_manifest::ManifestStore;
+    use super::tablet::TransactionId;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "nudb-multi-output-fault-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&dir).unwrap();
+    let old_dir = dir.join("old");
+    let target = dir.join("target");
+    let fresh = dir.join("fresh");
+    let reg = dir.join("registry");
+    for d in [&old_dir, &target, &fresh, &reg] {
+        fs::create_dir(d).unwrap();
+    }
+    let wal = dir.join("tablet.wal");
+    let desc = TabletDescriptor::new(
+        TabletId::new(97).unwrap(),
+        KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+        7,
+    )
+    .unwrap();
+    let mut db = WalBackedTablet::open(desc.clone(), &wal).unwrap();
+    for n in 1..=3 {
+        db.commit_idempotent(
+            TransactionId::new([n; 16]),
+            vec![TabletMutation::Put {
+                key: b"k".to_vec(),
+                value: vec![n; 64],
+            }],
+        )
+        .unwrap();
+    }
+    let mut old = ManifestStore::create(&old_dir, 97, 7).unwrap();
+    for _ in 0..3 {
+        db.flush_sst_shadow(&mut old, 1).unwrap();
+    }
+    db.seal_sst_recovery(&mut old).unwrap();
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let registry = GenerationRegistry::create(&reg, 97, 7).unwrap();
+    let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+    let before = fs::read(&wal).unwrap();
+    let next = ManifestStore::create(&target, 97, 7).unwrap();
+    let result = with_interruption(StorageInterruptionPoint::CompactionAfterOutput, || {
+        managed.compact_with_target(next, 245)
+    });
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("injected NulangDB storage interruption"));
+    assert_eq!(fs::read(&wal).unwrap(), before);
+    let abandoned = ManifestStore::open(&target, 97, 7).unwrap();
+    assert!(!abandoned.current().is_recovery_sealed());
+    assert!(abandoned.current().entries().is_empty());
+    drop(abandoned);
+    managed
+        .commit_idempotent(TransactionId::new([4; 16]), vec![])
+        .unwrap();
+    let stats = managed
+        .compact_with_target(ManifestStore::create(&fresh, 97, 7).unwrap(), 245)
+        .unwrap();
+    assert_eq!(stats.output_tables, 2);
+    assert_eq!(managed.current_sequence(), 4);
+    assert_eq!(managed.read_at(b"k", 3).unwrap(), Some([3; 64].as_slice()));
+    drop(managed);
+    let registry = GenerationRegistry::open(&reg, 97, 7).unwrap();
+    assert!(ManagedTablet::open(desc.clone(), &wal, &target, registry).is_err());
+    let registry = GenerationRegistry::open(&reg, 97, 7).unwrap();
+    let managed = ManagedTablet::open(desc, &wal, &fresh, registry).unwrap();
+    assert_eq!(managed.current_sequence(), 4);
+    drop(managed);
+    fs::remove_dir_all(dir).unwrap();
 }

@@ -37,7 +37,7 @@ fn reject_alias(path: &Path) -> io::Result<()> {
     }
 }
 
-fn table_path(dir: &Path, generation: u64) -> PathBuf {
+pub(super) fn table_path(dir: &Path, generation: u64) -> PathBuf {
     dir.join(format!("nudb-sst-{generation:020}.sst"))
 }
 
@@ -559,6 +559,18 @@ impl ManifestStore {
     /// keys and versions must fit one table's limits. Use a fresh destination
     /// after any failure, including a partially published shadow.
     pub fn prepare_compacted_shadow(&self, next: &mut Self) -> io::Result<CompactionStats> {
+        self.prepare_compacted_shadow_with_target(next, 256 * 1024 * 1024)
+    }
+
+    /// Like prepare_compacted_shadow, but splits into at most 16 contiguous
+    /// output intervals under a caller-supplied hard encoded-byte ceiling.
+    /// Exact encoded-byte accounting charges row headers once per output.
+    /// An indivisible sequence exceeding the ceiling is rejected before output.
+    pub fn prepare_compacted_shadow_with_target(
+        &self,
+        next: &mut Self,
+        target_bytes: u64,
+    ) -> io::Result<CompactionStats> {
         const MAX_INPUT_TABLES: usize = 16;
         const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
         let meta = self.recovery_meta()?.clone();
@@ -595,18 +607,25 @@ impl ManifestStore {
             }
             tables.push(table);
         }
-        let path = table_path(&next.dir, 1);
-        super::indexed_sst::compact_verified_tables(
-            &path,
+        let output_tables = super::indexed_sst::compact_verified_tables(
+            &next.dir,
             tables,
             meta.floor,
             self.manifest.durable_sequence(),
+            target_bytes,
         )?;
-        let output = IndexedSst::open(&path)?;
-        let output_versions = output.indexed_versions();
-        let output_bytes = output.file_bytes();
-        drop(output);
-        next.append(TableEntry::inspect(&next.dir, 1)?)?;
+        let mut output_versions = 0;
+        let mut output_bytes = 0;
+        for generation in 1..=output_tables as u64 {
+            let output = IndexedSst::open(table_path(&next.dir, generation))?;
+            if output.file_bytes() > target_bytes {
+                return Err(invalid("compaction output exceeded target"));
+            }
+            output_versions += output.indexed_versions();
+            output_bytes += output.file_bytes();
+            drop(output);
+            next.append(TableEntry::inspect(&next.dir, generation)?)?;
+        }
         // Verify logical equivalence before publishing a recovery seal.
         let mut candidate = next.manifest.clone();
         candidate.recovery = Some(meta.clone());
@@ -621,7 +640,7 @@ impl ManifestStore {
         next.sync_for_wal_binding()?;
         Ok(CompactionStats {
             input_tables,
-            output_tables: 1,
+            output_tables,
             input_bytes,
             output_bytes,
             input_versions,

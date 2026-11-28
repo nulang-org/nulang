@@ -371,12 +371,13 @@ pub fn write_immutable_table<'a>(
 /// across inputs; value bytes are streamed through a fixed scratch buffer.
 #[cfg(unix)]
 pub(super) fn compact_verified_tables(
-    path: &Path,
+    directory: &Path,
     tables: Vec<IndexedSst>,
     floor: u64,
     sequence: u64,
-) -> io::Result<()> {
-    streaming_writer::compact(path, tables, floor, sequence)
+    target_bytes: u64,
+) -> io::Result<usize> {
+    streaming_writer::compact(directory, tables, floor, sequence, target_bytes)
 }
 
 #[cfg(unix)]
@@ -560,11 +561,17 @@ mod streaming_writer {
     }
 
     pub(super) fn compact(
-        path: &Path,
+        directory: &Path,
         tables: Vec<IndexedSst>,
         floor: u64,
         sequence: u64,
-    ) -> io::Result<()> {
+        target_bytes: u64,
+    ) -> io::Result<usize> {
+        const OVERHEAD: u64 = 82;
+        const MAX_OUTPUTS: usize = 16;
+        if !(OVERHEAD..=MAX_TABLE_BYTES).contains(&target_bytes) {
+            return Err(invalid("invalid compaction output target"));
+        }
         if tables.is_empty() || sequence == 0 || floor > sequence {
             return Err(invalid("invalid compaction interval"));
         }
@@ -615,50 +622,127 @@ mod streaming_writer {
             }
         }
         merged.retain(|_, history| !history.is_empty());
-        let header = SstHeader {
-            generation: 1,
-            min_sequence: 1,
-            max_sequence: sequence,
-            key_count: merged.len() as u64,
-            version_count: merged.values().map(|h| h.len() as u64).sum(),
-        };
-        write_encoded(path, header, |encoder| {
-            let mut scratch = [0u8; 64 * 1024];
-            for (key, history) in merged {
-                encoder.emit(&(key.len() as u32).to_le_bytes())?;
-                encoder.emit(key)?;
-                encoder.emit(&(history.len() as u32).to_le_bytes())?;
-                let mut previous = 0;
-                for (index, version) in history {
-                    if version.sequence <= previous || version.sequence > sequence {
-                        return Err(invalid("invalid compacted MVCC order"));
+        // Plan every output before writing. Charge each key's row header
+        // once per output and each version exactly once. Group by sequence
+        // so no multi-key commit is split. Metadata is bounded by the
+        // existing aggregate input version/key limits.
+        let mut charges = BTreeMap::<u64, Vec<(&[u8], u64)>>::new();
+        for (key, history) in &merged {
+            for (_, version) in history {
+                let bytes = 9 + version.value.as_ref().map_or(0, |v| 4 + v.length as u64);
+                charges
+                    .entry(version.sequence)
+                    .or_default()
+                    .push((key, bytes));
+            }
+        }
+        let mut intervals = Vec::new();
+        let mut start = 1u64;
+        let mut used = OVERHEAD;
+        let mut keys = std::collections::BTreeSet::<&[u8]>::new();
+        for (seq, group) in charges {
+            let charge = group
+                .iter()
+                .map(|(key, bytes)| {
+                    bytes
+                        + if keys.contains(key) {
+                            0
+                        } else {
+                            8 + key.len() as u64
+                        }
+                })
+                .sum::<u64>();
+            if used + charge > target_bytes {
+                let standalone = group
+                    .iter()
+                    .map(|(key, bytes)| bytes + 8 + key.len() as u64)
+                    .sum::<u64>();
+                if standalone > target_bytes - OVERHEAD {
+                    return Err(invalid("one retained sequence exceeds output target"));
+                }
+                intervals.push((start, seq - 1));
+                if intervals.len() >= MAX_OUTPUTS {
+                    return Err(invalid("compaction output count limit"));
+                }
+                start = seq;
+                keys.clear();
+                used = OVERHEAD + standalone;
+            } else {
+                used += charge;
+            }
+            keys.extend(group.into_iter().map(|(key, _)| key));
+        }
+        intervals.push((start, sequence));
+        let count = intervals.len();
+        for (index, (min, max)) in intervals.into_iter().enumerate() {
+            let generation = index as u64 + 1;
+            let mut key_count = 0;
+            let mut version_count = 0;
+            for history in merged.values() {
+                let lo = history.partition_point(|(_, v)| v.sequence < min);
+                let hi = history.partition_point(|(_, v)| v.sequence <= max);
+                if hi > lo {
+                    key_count += 1;
+                    version_count += (hi - lo) as u64;
+                }
+            }
+            let header = SstHeader {
+                generation,
+                min_sequence: min,
+                max_sequence: max,
+                key_count,
+                version_count,
+            };
+            let path = super::super::sst_manifest::table_path(directory, generation);
+            write_encoded(&path, header, |encoder| {
+                let mut scratch = [0u8; 64 * 1024];
+                for (key, history) in &merged {
+                    let lo = history.partition_point(|(_, v)| v.sequence < min);
+                    let hi = history.partition_point(|(_, v)| v.sequence <= max);
+                    let history = &history[lo..hi];
+                    if history.is_empty() {
+                        continue;
                     }
-                    previous = version.sequence;
-                    encoder.emit(&version.sequence.to_le_bytes())?;
-                    match &version.value {
-                        None => encoder.emit(&[0])?,
-                        Some(loc) => {
-                            encoder.emit(&[1])?;
-                            encoder.emit(&(loc.length as u32).to_le_bytes())?;
-                            let file = &mut files[index];
-                            file.seek(SeekFrom::Start(loc.offset))?;
-                            let mut digest = blake3::Hasher::new();
-                            let mut left = loc.length;
-                            while left != 0 {
-                                let n = left.min(scratch.len());
-                                file.read_exact(&mut scratch[..n])?;
-                                digest.update(&scratch[..n]);
-                                encoder.emit(&scratch[..n])?;
-                                left -= n;
-                            }
-                            if digest.finalize() != loc.digest {
-                                return Err(invalid("SST value changed during compaction"));
+                    encoder.emit(&(key.len() as u32).to_le_bytes())?;
+                    encoder.emit(key)?;
+                    encoder.emit(&(history.len() as u32).to_le_bytes())?;
+                    let mut previous = 0;
+                    for &(index, version) in history {
+                        if version.sequence <= previous || version.sequence > sequence {
+                            return Err(invalid("invalid compacted MVCC order"));
+                        }
+                        previous = version.sequence;
+                        encoder.emit(&version.sequence.to_le_bytes())?;
+                        match &version.value {
+                            None => encoder.emit(&[0])?,
+                            Some(loc) => {
+                                encoder.emit(&[1])?;
+                                encoder.emit(&(loc.length as u32).to_le_bytes())?;
+                                let file = &mut files[index];
+                                file.seek(SeekFrom::Start(loc.offset))?;
+                                let mut digest = blake3::Hasher::new();
+                                let mut left = loc.length;
+                                while left != 0 {
+                                    let n = left.min(scratch.len());
+                                    file.read_exact(&mut scratch[..n])?;
+                                    digest.update(&scratch[..n]);
+                                    encoder.emit(&scratch[..n])?;
+                                    left -= n;
+                                }
+                                if digest.finalize() != loc.digest {
+                                    return Err(invalid("SST value changed during compaction"));
+                                }
                             }
                         }
                     }
                 }
-            }
-            Ok(())
-        })
+                Ok(())
+            })?;
+            #[cfg(test)]
+            super::super::interruption::hit(
+                super::super::interruption::StorageInterruptionPoint::CompactionAfterOutput,
+            )?;
+        }
+        Ok(count)
     }
 }

@@ -686,7 +686,8 @@ impl WalBackedTablet {
             || next.current().recovery_floor() != previous.current().recovery_floor()
             || previous.directory().starts_with(next.directory())
             || next.directory().starts_with(previous.directory())
-            || next.current().entries().len() != 1
+            || next.current().entries().is_empty()
+            || next.current().entries().len() > 16
         {
             return Err(io::Error::other("invalid compacted generation"));
         }
