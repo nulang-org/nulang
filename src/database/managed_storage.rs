@@ -3,7 +3,8 @@
 //! Enrolled WALs require their exact local registry. Unenrolled WALs and
 //! older binaries remain outside this scope; all
 //! cooperating consumers must use the same dedicated registry and namespace.
-//! This is not a permanent deletion authority.
+//! Destructive retirement is explicit and requires an offline/quiescent retired
+//! directory, a durable journal, and a current verified backup.
 use super::generation_registry::{GenerationRegistry, GenerationStatus, ReferenceKind};
 use super::sst_manifest::ManifestStore;
 use super::store::{SnapshotPin, WalBackedError, WalBackedTablet};
@@ -212,6 +213,59 @@ impl ManagedTablet {
             self.tablet
                 .verify_retirement_candidate(&self.active, obsolete, backup.as_ref())?;
         let result = self.registry.reserve_retirement(obsolete);
+        if result.is_err() {
+            self.fenced = true;
+        }
+        result
+    }
+
+    /// Report the persisted retirement state by its exact physical directory.
+    pub fn retirement_status(&self, directory: impl AsRef<Path>) -> io::Result<GenerationStatus> {
+        self.ready()?;
+        self.registry.retirement_status(directory.as_ref())
+    }
+
+    /// Permanently unlink only journaled SST/manifest files in an explicitly
+    /// reserved, quarantined generation. The operator MUST ensure no external
+    /// or legacy consumer depends on this directory, and prevent namespace
+    /// modification throughout. Keep the directory and stable lock tombstone.
+    /// On retry, revalidate the current backup and every remaining file.
+    pub fn delete_reserved_generation(
+        &mut self,
+        directory: impl AsRef<Path>,
+        backup: impl AsRef<Path>,
+    ) -> io::Result<()> {
+        self.ready()?;
+        let directory = directory.as_ref();
+        let status = self.registry.retirement_status(directory)?;
+        let _archive = if status == GenerationStatus::RetirementReserved {
+            let obsolete = ManifestStore::open(
+                directory,
+                self.tablet.descriptor().id().get(),
+                self.tablet.descriptor().ownership_epoch(),
+            )?;
+            let archive = self.tablet.verify_retirement_candidate(
+                &self.active,
+                &obsolete,
+                backup.as_ref(),
+            )?;
+            let result = self.registry.prepare_deletion(&obsolete);
+            if result.is_err() {
+                self.fenced = true;
+            }
+            result?;
+            // Release the manifest lock only after journal publication; the
+            // deletion executor reacquires the exact recorded lock inode.
+            drop(obsolete);
+            archive
+        } else {
+            self.tablet.verify_current_retirement_backup(
+                &self.active,
+                directory,
+                backup.as_ref(),
+            )?
+        };
+        let result = self.registry.execute_deletion(directory);
         if result.is_err() {
             self.fenced = true;
         }

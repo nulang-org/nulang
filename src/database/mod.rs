@@ -12,6 +12,8 @@ pub mod indexed_sst;
 pub mod managed_storage;
 pub mod optimistic;
 #[cfg(unix)]
+mod retired_files;
+#[cfg(unix)]
 mod sealed_backup;
 #[cfg(unix)]
 mod sidecar_lock;

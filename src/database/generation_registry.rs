@@ -3,6 +3,7 @@
 //! with the same digest are conservatively protected. Unregistered consumers,
 //! external processes and direct legacy APIs are outside this registry's scope.
 //! Unreferenced is advisory, never a deletion authorization.
+use super::retired_files::DeletionPlan;
 use super::sst_manifest::ManifestStore;
 use super::wal::SealBinding;
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAGIC: &[u8; 8] = b"NUDBREG1";
 const RETIREMENT_MAGIC: &[u8; 8] = b"NUDBREG2";
+const DELETION_MAGIC: &[u8; 8] = b"NUDBREG3";
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ITEMS: usize = 8192;
 const MAX_PATH: usize = 4096;
@@ -32,6 +34,8 @@ pub enum GenerationStatus {
     Referenced,
     Unreferenced,
     RetirementReserved,
+    DeletionPending,
+    Deleted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -62,6 +66,8 @@ struct Retirement {
     directory: Vec<u8>,
     device: u64,
     inode: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deletion: Option<DeletionPlan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +106,9 @@ impl State {
             {
                 return Err(invalid("invalid retirement reservation"));
             }
+            if let Some(plan) = &retirement.deletion {
+                plan.validate()?;
+            }
             previous_digest = Some(retirement.digest);
         }
         let mut previous = None;
@@ -128,7 +137,9 @@ impl State {
 
     fn encode(&self) -> io::Result<Vec<u8>> {
         self.validate()?;
-        let mut bytes = if self.retirements.is_empty() {
+        let mut bytes = if self.retirements.iter().any(|r| r.deletion.is_some()) {
+            DELETION_MAGIC
+        } else if self.retirements.is_empty() {
             MAGIC
         } else {
             RETIREMENT_MAGIC
@@ -157,7 +168,9 @@ impl State {
     fn decode(bytes: &[u8]) -> io::Result<Self> {
         if bytes.len() < 40
             || bytes.len() > MAX_BYTES
-            || (&bytes[..8] != MAGIC && &bytes[..8] != RETIREMENT_MAGIC)
+            || (&bytes[..8] != MAGIC
+                && &bytes[..8] != RETIREMENT_MAGIC
+                && &bytes[..8] != DELETION_MAGIC)
         {
             return Err(invalid("registry magic or length"));
         }
@@ -383,8 +396,12 @@ impl GenerationRegistry {
 
     pub fn status(&self, manifest: &ManifestStore) -> io::Result<GenerationStatus> {
         let digest = self.digest(manifest.wal_binding()?)?;
-        if self.state.is_retired(digest) {
-            return Ok(GenerationStatus::RetirementReserved);
+        if let Ok(i) = self
+            .state
+            .retirements
+            .binary_search_by_key(&digest, |r| r.digest)
+        {
+            return Ok(Self::retirement_state(&self.state.retirements[i]));
         }
         Ok(
             if self
@@ -421,6 +438,7 @@ impl GenerationRegistry {
             directory: dir.as_os_str().as_bytes().to_vec(),
             device: meta.dev(),
             inode: meta.ino(),
+            deletion: None,
         };
         let mut next = self.state.clone();
         match next.retirements.binary_search_by_key(&digest, |r| r.digest) {
@@ -437,6 +455,75 @@ impl GenerationRegistry {
                 next.retirements.insert(i, record);
             }
         }
+        self.update(next)
+    }
+
+    fn retirement_state(record: &Retirement) -> GenerationStatus {
+        match &record.deletion {
+            None => GenerationStatus::RetirementReserved,
+            Some(plan) if plan.complete => GenerationStatus::Deleted,
+            Some(_) => GenerationStatus::DeletionPending,
+        }
+    }
+
+    fn retirement_index(&self, directory: &Path) -> io::Result<usize> {
+        self.ready()?;
+        let meta = fs::symlink_metadata(directory)?;
+        if !meta.is_dir() || directory.canonicalize()? != directory {
+            return Err(invalid("retirement requires exact canonical directory"));
+        }
+        let index = self
+            .state
+            .retirements
+            .iter()
+            .position(|r| r.directory == directory.as_os_str().as_bytes())
+            .ok_or_else(|| invalid("retirement not reserved"))?;
+        let record = &self.state.retirements[index];
+        if (record.device, record.inode) != (meta.dev(), meta.ino()) {
+            return Err(invalid("reserved directory identity changed"));
+        }
+        Ok(index)
+    }
+
+    pub(super) fn retirement_status(&self, directory: &Path) -> io::Result<GenerationStatus> {
+        let i = self.retirement_index(directory)?;
+        Ok(Self::retirement_state(&self.state.retirements[i]))
+    }
+
+    /// The full manifest and backup have been verified while locks are held.
+    /// Persist the exact inventory before the first destructive operation.
+    pub(super) fn prepare_deletion(&mut self, manifest: &ManifestStore) -> io::Result<()> {
+        let i = self.retirement_index(manifest.directory())?;
+        if self.state.retirements[i].digest != self.digest(manifest.wal_binding()?)?
+            || self.state.retirements[i].deletion.is_some()
+        {
+            return Err(invalid("retirement journal identity mismatch"));
+        }
+        manifest.verify_dedicated_files()?;
+        let plan = DeletionPlan::capture(manifest.directory())?;
+        let mut next = self.state.clone();
+        next.retirements[i].deletion = Some(plan);
+        self.update(next)
+    }
+
+    /// Resume the persisted plan; caller revalidates current backup every time.
+    pub(super) fn execute_deletion(&mut self, directory: &Path) -> io::Result<()> {
+        let i = self.retirement_index(directory)?;
+        let record = &self.state.retirements[i];
+        let plan = record
+            .deletion
+            .as_ref()
+            .ok_or_else(|| invalid("deletion journal missing"))?;
+        let _retired_lock = plan.execute(directory, record.digest)?;
+        if plan.complete {
+            return Ok(());
+        }
+        let mut next = self.state.clone();
+        next.retirements[i]
+            .deletion
+            .as_mut()
+            .expect("journal")
+            .complete = true;
         self.update(next)
     }
 

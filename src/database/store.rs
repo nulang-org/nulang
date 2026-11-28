@@ -817,6 +817,18 @@ impl WalBackedTablet {
         obsolete: &super::sst_manifest::ManifestStore,
         backup: &Path,
     ) -> std::io::Result<super::sst_manifest::ManifestStore> {
+        obsolete.verify_obsolete_prefix(active)?;
+        obsolete.verify_dedicated_files()?;
+        self.verify_current_retirement_backup(active, obsolete.directory(), backup)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn verify_current_retirement_backup(
+        &self,
+        active: &super::sst_manifest::ManifestStore,
+        old: &Path,
+        backup: &Path,
+    ) -> std::io::Result<super::sst_manifest::ManifestStore> {
         use super::sealed_backup::{self, Completion};
         use std::io;
         let binding = active.wal_binding()?;
@@ -837,7 +849,6 @@ impl WalBackedTablet {
             Err(error) => return Err(error),
         }
         let backup = backup.canonicalize()?;
-        let old = obsolete.directory();
         let active_dir = active.directory();
         let overlaps = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
         if overlaps(old, active_dir)
@@ -848,7 +859,6 @@ impl WalBackedTablet {
         {
             return Err(io::Error::other("quarantine paths must be independent"));
         }
-        obsolete.verify_obsolete_prefix(active)?;
         if active.sync_for_wal_binding()? != binding {
             return Err(io::Error::other("active seal binding changed"));
         }
@@ -878,7 +888,6 @@ impl WalBackedTablet {
                 "backup contents do not match active generation and WAL",
             ));
         }
-        obsolete.verify_dedicated_files()?;
         Ok(archived)
     }
 

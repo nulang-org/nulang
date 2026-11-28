@@ -260,6 +260,9 @@ fn acquire(dir: &Path) -> io::Result<(PathBuf, super::sidecar_lock::SidecarLock)
         .truncate(false)
         .open(lock_path)?;
     let lock = super::sidecar_lock::SidecarLock::acquire(lock, "manifest writer already held")?;
+    if lock.metadata()?.len() != 0 {
+        return Err(invalid("manifest directory retired or lock marker damaged"));
+    }
     Ok((dir, lock))
 }
 

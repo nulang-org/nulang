@@ -33,6 +33,9 @@ pub(crate) enum StorageInterruptionPoint {
     RegistryBeforeWalSync,
     EnrollmentBeforeWrite,
     EnrollmentAfterWrite,
+    RetirementAfterTombstone,
+    RetirementAfterUnlink,
+    RetirementAfterFilesSync,
 }
 
 thread_local! {
@@ -1417,6 +1420,140 @@ fn retirement_publication_interruption_fences_handle_and_preserves_generation() 
         assert!(quarantine.join("MANIFEST").exists());
         drop(managed);
         drop(obsolete);
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn journaled_retirement_resumes_after_intent_marker_unlink_and_final_sync() {
+    use super::generation_registry::{GenerationRegistry, GenerationStatus};
+    use super::managed_storage::ManagedTablet;
+    use super::sst_manifest::ManifestStore;
+    use super::tablet::TransactionId;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    for point in [
+        StorageInterruptionPoint::RegistryBeforeRename,
+        StorageInterruptionPoint::RegistryAfterRename,
+        StorageInterruptionPoint::RetirementAfterTombstone,
+        StorageInterruptionPoint::RetirementAfterUnlink,
+        StorageInterruptionPoint::RetirementAfterFilesSync,
+    ] {
+        let dir = std::env::temp_dir().join(format!(
+            "nudb-retirement-delete-fault-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).unwrap();
+        let old_dir = dir.join("old");
+        let new_dir = dir.join("new");
+        let reg_dir = dir.join("registry");
+        fs::create_dir(&old_dir).unwrap();
+        fs::create_dir(&new_dir).unwrap();
+        fs::create_dir(&reg_dir).unwrap();
+        let path = dir.join("tablet.wal");
+        let desc = TabletDescriptor::new(
+            TabletId::new(97).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        let mut db = WalBackedTablet::open(desc.clone(), &path).unwrap();
+        let receipt = db
+            .commit_idempotent(TransactionId::new([1; 16]), vec![])
+            .unwrap();
+        let mut old = ManifestStore::create(&old_dir, 97, 7).unwrap();
+        db.flush_sst_shadow(&mut old, 1).unwrap();
+        db.seal_sst_recovery(&mut old).unwrap();
+        db.reclaim_to_sealed_sst(&old).unwrap();
+        let registry = GenerationRegistry::create(&reg_dir, 97, 7).unwrap();
+        let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+        managed
+            .commit_idempotent(TransactionId::new([2; 16]), vec![])
+            .unwrap();
+        managed
+            .rotate(ManifestStore::create(&new_dir, 97, 7).unwrap(), 1)
+            .unwrap();
+        let backup = dir.join("backup");
+        managed.backup([3; 16], &backup).unwrap();
+        let q = dir.join("quarantine");
+        managed
+            .quarantine(ManifestStore::open(&old_dir, 97, 7).unwrap(), &backup, &q)
+            .unwrap();
+        let obsolete = ManifestStore::open(&q, 97, 7).unwrap();
+        managed.reserve_retirement(&obsolete, &backup).unwrap();
+        drop(obsolete);
+        let before = fs::read(&path).unwrap();
+        let initial_count = fs::read_dir(&q).unwrap().count();
+        let result = with_interruption(point, || managed.delete_reserved_generation(&q, &backup));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("injected NulangDB storage interruption"));
+        assert!(managed.retirement_status(&q).is_err());
+        assert!(managed
+            .commit_idempotent(TransactionId::new([3; 16]), vec![])
+            .is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let count = fs::read_dir(&q).unwrap().count();
+        if matches!(
+            point,
+            StorageInterruptionPoint::RegistryBeforeRename
+                | StorageInterruptionPoint::RegistryAfterRename
+                | StorageInterruptionPoint::RetirementAfterTombstone
+        ) {
+            assert_eq!(count, initial_count);
+        } else if point == StorageInterruptionPoint::RetirementAfterUnlink {
+            assert_eq!(count, initial_count - 1);
+        } else {
+            assert_eq!(count, 1);
+        }
+        if matches!(
+            point,
+            StorageInterruptionPoint::RetirementAfterTombstone
+                | StorageInterruptionPoint::RetirementAfterUnlink
+                | StorageInterruptionPoint::RetirementAfterFilesSync
+        ) {
+            assert!(ManifestStore::open(&q, 97, 7).is_err());
+            assert!(ManifestStore::create(&q, 97, 7).is_err());
+        }
+        drop(managed);
+        let registry = GenerationRegistry::open(&reg_dir, 97, 7).unwrap();
+        let mut managed = ManagedTablet::open(desc.clone(), &path, &new_dir, registry).unwrap();
+        assert_eq!(
+            managed.retirement_status(&q).unwrap(),
+            if point == StorageInterruptionPoint::RegistryBeforeRename {
+                GenerationStatus::RetirementReserved
+            } else {
+                GenerationStatus::DeletionPending
+            }
+        );
+        // A stale backup must never authorize a resumed deletion.
+        managed
+            .commit_idempotent(TransactionId::new([3; 16]), vec![])
+            .unwrap();
+        assert!(managed.delete_reserved_generation(&q, &backup).is_err());
+        assert_eq!(fs::read_dir(&q).unwrap().count(), count);
+        let fresh = dir.join("fresh");
+        managed.backup([4; 16], &fresh).unwrap();
+        managed.delete_reserved_generation(&q, &fresh).unwrap();
+        assert_eq!(
+            managed.retirement_status(&q).unwrap(),
+            GenerationStatus::Deleted
+        );
+        assert_eq!(fs::read_dir(&q).unwrap().count(), 1);
+        assert!(ManifestStore::create(&q, 97, 7).is_err());
+        assert_eq!(
+            managed
+                .commit_idempotent(TransactionId::new([1; 16]), vec![])
+                .unwrap(),
+            receipt
+        );
+        let restored =
+            WalBackedTablet::restore_sealed_backup(desc, &fresh, dir.join("restored")).unwrap();
+        assert_eq!(restored.current_sequence(), 3);
+        drop(restored);
+        drop(managed);
         fs::remove_dir_all(dir).unwrap();
     }
 }
