@@ -199,3 +199,37 @@ Qualify against the same harness with paired exact-on/off runs on a
 less contended disk before considering default enablement. Retain the
 previous per-connection path as a fallback. Raw results:
 fabric-resp-concurrent-20261127.json.
+
+
+## Cross-client group commit: paired same-binary comparison
+
+    python3 scripts/fabric_group_commit_ab_bench.py \
+      --fabric target/release/nulang-fabric \
+      --journal-dir /path/to/local/disk \
+      --output /tmp/fabric-group-ab.json
+
+The same binary runs both per-connection and cross-client modes with
+synchronous WAL, 1000 ms clock reservation, fresh journals, alternating
+order, and independently seeded hot keys. Three pairs per workload;
+64 commands per client, 8 or 32 clients, pipeline depths 1 and 32.
+Every reply is validated. No checkpoints or TLS in the benchmark.
+Paired speedup is the median of the three round-wise ratios, not the
+ratio of independent medians. Raw data retains both metrics and the
+binary hash: fabric-cross-client-group-commit-20261127.json.
+
+| Clients | Pipeline | Per-connection ops/s | Cross-client ops/s | Median paired speedup |
+|---:|---:|---:|---:|---:|
+| 8 | 1 | 1,361 | 4,356 | 3.17x |
+| 8 | 32 | 1,462 | 42,845 | 2.83x |
+| 32 | 1 | 544 | 9,785 | 18.00x |
+| 32 | 32 | 4,802 | 50,807 | 2.69x |
+
+
+The unpipelined 32-client result supports further qualification of the
+cross-client barrier. Disk latency varied widely across short runs,
+including within pairs. This does not establish general throughput or
+tail-latency gains; the 32-deep workload has only two measured batches
+per client. Repeat with a full release executable, dedicated hardware,
+longer workload and storage fault qualification before default adoption.
+The candidate remains opt-in. No direct Valkey comparison is implied by
+this same-Fabric experiment.
