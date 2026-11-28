@@ -1168,3 +1168,103 @@ fn unregistered_managed_open_leaves_torn_wal_unchanged() {
     assert!(ManagedTablet::open(f.descriptor(), &wal, f.0.join("sst"), registry).is_err());
     assert_eq!(fs::read(&wal).unwrap(), torn);
 }
+
+#[test]
+fn sealed_recovery_rejects_noncanonical_wal_name_before_lock_creation() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"original")]).unwrap();
+    let manifest = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&manifest).unwrap();
+    drop(manifest);
+    drop(db);
+    let path = f.0.join("tablet.wal");
+    let alternate = f.0.join("tablet.other");
+    let original = fs::read(&path).unwrap();
+    fs::copy(&path, &alternate).unwrap();
+    assert!(
+        WalBackedTablet::open_from_sealed_sst(f.descriptor(), &alternate, f.0.join("sst")).is_err()
+    );
+    assert!(!f.0.join("tablet.other.lock").exists());
+    assert_eq!(fs::read(&alternate).unwrap(), original);
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(
+        recover(&f).unwrap().read_latest(b"k"),
+        Some(b"original".as_slice())
+    );
+}
+
+#[test]
+fn durable_enrollment_rejects_raw_recovery_and_alternate_registry() {
+    use nulang::database::{
+        generation_registry::GenerationRegistry, managed_storage::ManagedTablet,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let old = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let dir = f.0.join("registry");
+    let other = f.0.join("alternate");
+    fs::create_dir(&dir).unwrap();
+    fs::create_dir(&other).unwrap();
+    let mut alt = GenerationRegistry::create(&other, 7, 3).unwrap();
+    db.register_generation_wal(&mut alt, &old).unwrap();
+    let registry = GenerationRegistry::create(&dir, 7, 3).unwrap();
+    let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+    managed
+        .commit_idempotent(id(2), vec![put(b"tail")])
+        .unwrap();
+    drop(managed);
+    let wal = f.0.join("tablet.wal");
+    let mut torn = fs::read(&wal).unwrap();
+    torn.extend_from_slice(b"partial");
+    fs::write(&wal, &torn).unwrap();
+    assert!(recover(&f).is_err());
+    assert_eq!(fs::read(&wal).unwrap(), torn);
+    assert!(ManagedTablet::open(f.descriptor(), &wal, f.0.join("sst"), alt).is_err());
+    assert_eq!(fs::read(&wal).unwrap(), torn);
+    let registry = GenerationRegistry::open(&dir, 7, 3).unwrap();
+    let managed = ManagedTablet::open(f.descriptor(), &wal, f.0.join("sst"), registry).unwrap();
+    assert_eq!(managed.current_sequence(), 2);
+    assert_eq!(managed.read_at(b"k", 2).unwrap(), Some(b"tail".as_slice()));
+    drop(managed);
+    assert!(recover(&f).is_err());
+}
+
+#[test]
+fn malformed_enrollment_marker_blocks_raw_and_managed_recovery_before_wal_repair() {
+    use nulang::database::{
+        generation_registry::GenerationRegistry, managed_storage::ManagedTablet,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let m = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&m).unwrap();
+    let reg = f.0.join("registry");
+    fs::create_dir(&reg).unwrap();
+    let registry = GenerationRegistry::create(&reg, 7, 3).unwrap();
+    drop(ManagedTablet::adopt(db, registry, m).unwrap());
+    let wal = f.0.join("tablet.wal");
+    let lock = f.0.join("tablet.wal.lock");
+    let original = fs::read(&lock).unwrap();
+    assert_eq!(original.len(), 72);
+    let mut torn = fs::read(&wal).unwrap();
+    torn.extend_from_slice(b"partial");
+    fs::write(&wal, &torn).unwrap();
+    let mut corrupt = original.clone();
+    corrupt[20] ^= 1;
+    for marker in [original[..13].to_vec(), corrupt] {
+        fs::write(&lock, &marker).unwrap();
+        assert!(recover(&f).is_err());
+        let registry = GenerationRegistry::open(&reg, 7, 3).unwrap();
+        assert!(ManagedTablet::open(f.descriptor(), &wal, f.0.join("sst"), registry).is_err());
+        assert_eq!(fs::read(&wal).unwrap(), torn);
+        assert_eq!(fs::read(&lock).unwrap(), marker);
+    }
+    fs::write(&lock, original).unwrap();
+    let registry = GenerationRegistry::open(&reg, 7, 3).unwrap();
+    let managed = ManagedTablet::open(f.descriptor(), &wal, f.0.join("sst"), registry).unwrap();
+    assert_eq!(managed.current_sequence(), 1);
+}

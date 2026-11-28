@@ -31,6 +31,8 @@ pub(crate) enum StorageInterruptionPoint {
     RegistryBeforeRename,
     RegistryAfterRename,
     RegistryBeforeWalSync,
+    EnrollmentBeforeWrite,
+    EnrollmentAfterWrite,
 }
 
 thread_local! {
@@ -1058,6 +1060,92 @@ fn managed_rotation_recovers_both_sides_of_wal_rename_and_registry_reservation()
         );
         drop(managed);
         drop(other);
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn durable_enrollment_interruption_reopens_only_consistent_state() {
+    use super::generation_registry::{GenerationRegistry, GenerationStatus};
+    use super::managed_storage::ManagedTablet;
+    use super::sst_manifest::ManifestStore;
+    use super::tablet::TransactionId;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    for point in [
+        StorageInterruptionPoint::EnrollmentBeforeWrite,
+        StorageInterruptionPoint::EnrollmentAfterWrite,
+    ] {
+        let dir = std::env::temp_dir().join(format!(
+            "nudb-enrollment-fault-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).unwrap();
+        let sst = dir.join("sst");
+        let reg = dir.join("registry");
+        fs::create_dir(&sst).unwrap();
+        fs::create_dir(&reg).unwrap();
+        let path = dir.join("tablet.wal");
+        let desc = TabletDescriptor::new(
+            TabletId::new(97).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        let mut db = WalBackedTablet::open(desc.clone(), &path).unwrap();
+        let receipt = db
+            .commit_idempotent(TransactionId::new([1; 16]), vec![])
+            .unwrap();
+        let mut m = ManifestStore::create(&sst, 97, 7).unwrap();
+        db.flush_sst_shadow(&mut m, 1).unwrap();
+        db.seal_sst_recovery(&mut m).unwrap();
+        db.reclaim_to_sealed_sst(&m).unwrap();
+        let registry = GenerationRegistry::create(&reg, 97, 7).unwrap();
+        let before = fs::read(&path).unwrap();
+        let result = with_interruption(point, || ManagedTablet::adopt(db, registry, m));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("injected NulangDB storage interruption"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let registry = GenerationRegistry::open(&reg, 97, 7).unwrap();
+        let m = ManifestStore::open(&sst, 97, 7).unwrap();
+        assert_eq!(registry.status(&m).unwrap(), GenerationStatus::Referenced);
+        let mut managed = if point == StorageInterruptionPoint::EnrollmentBeforeWrite {
+            drop(m);
+            assert!(ManagedTablet::open(desc.clone(), &path, &sst, registry).is_err());
+            let db = WalBackedTablet::open_from_sealed_sst(desc.clone(), &path, &sst).unwrap();
+            let m = ManifestStore::open(&sst, 97, 7).unwrap();
+            let registry = GenerationRegistry::open(&reg, 97, 7).unwrap();
+            ManagedTablet::adopt(db, registry, m).unwrap()
+        } else {
+            drop(m);
+            assert!(WalBackedTablet::open_from_sealed_sst(desc.clone(), &path, &sst).is_err());
+            ManagedTablet::open(desc.clone(), &path, &sst, registry).unwrap()
+        };
+        assert_eq!(
+            managed
+                .commit_idempotent(TransactionId::new([1; 16]), vec![])
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(
+            managed
+                .commit_idempotent(TransactionId::new([2; 16]), vec![])
+                .unwrap()
+                .sequence(),
+            2
+        );
+        let backup = dir.join("backup");
+        managed.backup([3; 16], &backup).unwrap();
+        let restored =
+            WalBackedTablet::restore_sealed_backup(desc.clone(), &backup, dir.join("restored"))
+                .unwrap();
+        assert_eq!(restored.current_sequence(), 2);
+        drop(restored);
+        drop(managed);
+        assert!(WalBackedTablet::open_from_sealed_sst(desc, &path, &sst).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 }
