@@ -1740,3 +1740,141 @@ fn journaled_deletion_requires_reserved_exact_generation_and_current_backup() {
             .unwrap();
     assert_eq!(restored.current_sequence(), 3);
 }
+
+#[test]
+fn compacted_shadow_preserves_retained_history_and_receipts_without_cutover() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    let first = db
+        .commit_idempotent(
+            id(1),
+            vec![
+                put(&vec![b'x'; 4096]),
+                TabletMutation::Put {
+                    key: b"d".to_vec(),
+                    value: b"old".to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+    db.commit_idempotent(
+        id(2),
+        vec![
+            put(b"anchor"),
+            TabletMutation::Delete { key: b"d".to_vec() },
+        ],
+    )
+    .unwrap();
+    db.commit_idempotent(
+        id(3),
+        vec![TabletMutation::Put {
+            key: b"e".to_vec(),
+            value: vec![],
+        }],
+    )
+    .unwrap();
+    db.commit_idempotent(id(4), vec![TabletMutation::Delete { key: b"k".to_vec() }])
+        .unwrap();
+    db.commit_idempotent(id(5), vec![put(b"latest")]).unwrap();
+    db.commit_idempotent(id(6), vec![]).unwrap();
+    let mut old = f.manifest();
+    for _ in 0..3 {
+        db.flush_sst_shadow(&mut old, 2).unwrap();
+    }
+    db.seal_sst_recovery_at_floor(&mut old, 3).unwrap();
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let wal = f.0.join("tablet.wal");
+    let before = fs::read(&wal).unwrap();
+    let target = f.0.join("compacted");
+    fs::create_dir(&target).unwrap();
+    let mut next = ManifestStore::create(&target, 7, 3).unwrap();
+    let stats = old.prepare_compacted_shadow(&mut next).unwrap();
+    assert_eq!(stats.input_tables, 3);
+    assert_eq!(stats.output_tables, 1);
+    assert!(stats.output_bytes < stats.input_bytes);
+    assert_eq!(next.current().recovery_floor(), Some(3));
+    assert_eq!(next.current().durable_sequence(), 6);
+    for snapshot in 3..=6 {
+        for key in [b"k".as_slice(), b"d", b"e", b"missing"] {
+            assert_eq!(
+                next.recovered_read_at(key, snapshot).unwrap(),
+                db.read_at(key, snapshot).unwrap().map(|v| v.to_vec())
+            );
+        }
+    }
+    assert!(next.recovered_read_at(b"k", 2).is_err());
+    assert_eq!(next.recovered_receipt(id(1)).unwrap(), Some(first));
+    assert_eq!(fs::read(&wal).unwrap(), before);
+    assert!(old.prepare_compacted_shadow(&mut next).is_err());
+    drop(next);
+    drop(db);
+    drop(old);
+    assert!(WalBackedTablet::open_from_sealed_sst(f.descriptor(), &wal, &target).is_err());
+    assert_eq!(recover(&f).unwrap().current_sequence(), 6);
+}
+
+#[test]
+fn compacted_shadow_handles_empty_retained_state_and_zero_floor() {
+    for floor in [0, 2] {
+        let f = Fixture::new();
+        let mut db = f.open();
+        db.commit_idempotent(id(1), vec![put(b"value")]).unwrap();
+        let deleted = db
+            .commit_idempotent(id(2), vec![TabletMutation::Delete { key: b"k".to_vec() }])
+            .unwrap();
+        let mut old = f.manifest();
+        db.flush_sst_shadow(&mut old, 1).unwrap();
+        db.flush_sst_shadow(&mut old, 1).unwrap();
+        db.seal_sst_recovery_at_floor(&mut old, floor).unwrap();
+        db.reclaim_to_sealed_sst(&old).unwrap();
+        let target = f.0.join("compacted");
+        fs::create_dir(&target).unwrap();
+        let mut next = ManifestStore::create(&target, 7, 3).unwrap();
+        let stats = old.prepare_compacted_shadow(&mut next).unwrap();
+        assert_eq!(stats.input_versions, 2);
+        assert_eq!(stats.output_versions, if floor == 0 { 2 } else { 0 });
+        assert_eq!(next.current().durable_sequence(), 2);
+        for snapshot in floor..=2 {
+            assert_eq!(
+                next.recovered_read_at(b"k", snapshot).unwrap(),
+                db.read_at(b"k", snapshot).unwrap().map(|v| v.to_vec())
+            );
+        }
+        assert_eq!(next.recovered_receipt(id(2)).unwrap(), Some(deleted));
+        drop(next);
+        let reopened = ManifestStore::open(&target, 7, 3).unwrap();
+        assert_eq!(reopened.recovered_read_at(b"k", 2).unwrap(), None);
+    }
+}
+
+#[test]
+fn compacted_shadow_rejects_input_budget_and_nonempty_destination() {
+    let f = Fixture::new();
+    let mut db = f.open();
+    for n in 1..=17 {
+        db.commit_idempotent(id(n), vec![put(&[n])]).unwrap();
+    }
+    let mut old = f.manifest();
+    for _ in 0..17 {
+        db.flush_sst_shadow(&mut old, 1).unwrap();
+    }
+    db.seal_sst_recovery_at_floor(&mut old, 17).unwrap();
+    let target = f.0.join("compacted");
+    fs::create_dir(&target).unwrap();
+    let mut next = ManifestStore::create(&target, 7, 3).unwrap();
+    let before = fs::read(target.join("MANIFEST")).unwrap();
+    assert!(old.prepare_compacted_shadow(&mut next).is_err());
+    assert_eq!(fs::read(target.join("MANIFEST")).unwrap(), before);
+    assert_eq!(fs::read_dir(&target).unwrap().count(), 2);
+    assert!(next.current().entries().is_empty());
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"x")]).unwrap();
+    let old = seal(&f, &db);
+    let target = f.0.join("compacted");
+    fs::create_dir(&target).unwrap();
+    let mut next = ManifestStore::create(&target, 7, 3).unwrap();
+    fs::write(target.join("unrelated"), b"keep").unwrap();
+    assert!(old.prepare_compacted_shadow(&mut next).is_err());
+    assert_eq!(fs::read(target.join("unrelated")).unwrap(), b"keep");
+}
