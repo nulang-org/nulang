@@ -44,8 +44,7 @@ thread_local! {
     static ACTIVE: Cell<Option<StorageInterruptionPoint>> = const { Cell::new(None) };
     #[cfg(unix)]
     static CRASH_ACK: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
-    #[cfg(unix)]
-    static CRASH_SKIP: Cell<usize> = const { Cell::new(0) };
+    static INTERRUPTION_SKIP: Cell<usize> = const { Cell::new(0) };
     static ERROR_KIND: Cell<io::ErrorKind> = const { Cell::new(io::ErrorKind::Other) };
 }
 
@@ -57,8 +56,7 @@ impl Drop for ResetInterruption {
         ERROR_KIND.with(|kind| kind.set(io::ErrorKind::Other));
         #[cfg(unix)]
         CRASH_ACK.with(|ack| ack.borrow_mut().take());
-        #[cfg(unix)]
-        CRASH_SKIP.with(|skip| skip.set(0));
+        INTERRUPTION_SKIP.with(|skip| skip.set(0));
     }
 }
 
@@ -67,6 +65,19 @@ pub(crate) fn with_interruption<T>(
     operation: impl FnOnce() -> T,
 ) -> T {
     with_interruption_kind(point, io::ErrorKind::Other, operation)
+}
+
+/// Select a zero-based occurrence of a shared publication hook.
+#[cfg(unix)]
+pub(crate) fn with_interruption_occurrence<T>(
+    point: StorageInterruptionPoint,
+    occurrence: usize,
+    operation: impl FnOnce() -> T,
+) -> T {
+    with_interruption(point, || {
+        INTERRUPTION_SKIP.with(|skip| skip.set(occurrence));
+        operation()
+    })
 }
 
 fn with_interruption_kind<T>(
@@ -89,19 +100,19 @@ fn with_interruption_kind<T>(
 pub(crate) fn hit(point: StorageInterruptionPoint) -> io::Result<()> {
     let should_interrupt = ACTIVE.with(|active| active.get() == Some(point));
     if should_interrupt {
+        if INTERRUPTION_SKIP.with(|skip| {
+            let n = skip.get();
+            if n > 0 {
+                skip.set(n - 1);
+                true
+            } else {
+                false
+            }
+        }) {
+            return Ok(());
+        }
         #[cfg(unix)]
         if let Some(ack) = CRASH_ACK.with(|slot| slot.borrow().clone()) {
-            if CRASH_SKIP.with(|skip| {
-                let n = skip.get();
-                if n > 0 {
-                    skip.set(n - 1);
-                    true
-                } else {
-                    false
-                }
-            }) {
-                return Ok(());
-            }
             // Signal only after reaching the exact boundary; park with all
             // stack-owned locks and staged files intact until the parent kills us.
             let temp = ack.with_extension("tmp");
@@ -2064,7 +2075,7 @@ mod process_crash_matrix {
                 with_interruption(point, || {
                     CRASH_ACK.with(|slot| *slot.borrow_mut() = Some(root.join("boundary.ack")));
                     if action == "retire-complete" {
-                        CRASH_SKIP.with(|skip| skip.set(1));
+                        INTERRUPTION_SKIP.with(|skip| skip.set(1));
                     }
                     managed.delete_reserved_generation(&q, &backup).unwrap();
                 });

@@ -36,3 +36,6 @@ mod model_tests;
 
 #[cfg(test)]
 mod receipt_tests;
+
+#[cfg(test)]
+mod registry_protocol_model;
