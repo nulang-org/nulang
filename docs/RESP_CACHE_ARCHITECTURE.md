@@ -976,3 +976,53 @@ opt-in QEMU/ext4 harness, acknowledgement and recovery checks, guest-only
 device-mapper error target, safe execution constraints, and evidence limits.
 This is a separate local qualification gate, not a hosted CI or physical
 host power-loss claim.
+
+
+## Deterministic persisted-image fault matrix
+
+Four standard Rust tests construct actual WAL/checkpoint/clock bytes
+using the production writers, synthesize crash images, then run the
+production recovery path against isolated files. No mock decoder,
+device access, privileged operation or new runtime dependency is needed.
+Run with:
+
+    cargo test --locked --no-default-features --lib test_storage_model -- --nocapture
+
+The deterministic matrix exercises 510 enumerated image cases (some
+boundary cases produce equivalent bytes), plus explicit false-success
+flush comparisons:
+
+| Model | Cases | Expected behavior |
+| --- | ---: | --- |
+| 512-byte sector persistence choices, tears, EOF cuts and record reordering | 86 | Valid contiguous prefix or reject unchanged corrupt image |
+| Atomic mutation prefixes and old/new checkpoint versions | 293 | Complete MSET/DEL or prior state; expired key absent |
+| 4 KiB checkpoint sector faults | 34 | Required prefix cannot be silently discarded; complete snapshot recovers |
+| Clock-sidecar old/new splices and truncations | 97 | Validate checksum/length and floor; characterize valid stale sidecar |
+
+The matrix is deliberately a persisted-file-image model, not a block
+device simulator that reproduces filesystem metadata, write barriers,
+or every possible sector interleaving. The previously qualified
+disposable QEMU/ext4 and device-mapper error harness complements it.
+
+### Explicit limitation: false-success flush / valid rollback
+
+A device that loses a complete previously acknowledged WAL suffix
+and reports a successful flush can return a valid older journal.
+There is no way to infer the missing acknowledged sequence from that
+journal alone. Similarly, a completely valid stale clock sidecar
+combined with a regressed wall clock can resurrect a previously
+observed expired TTL. The tests characterize these unsupported
+failures explicitly; they are not counted as successful durability
+guarantees. Checksums and contiguous sequences detect corruption and
+gaps in retained bytes, not rollback to an internally consistent
+earlier version. A separate local watermark can help detect some
+partial rollback combinations but cannot solve coordinated rollback
+of all local durable metadata. Trustworthy storage flush guarantees,
+independent durable witnesses/replication or externally recorded
+commit frontiers are needed for stronger guarantees.
+
+Do not change the established sync acknowledgement policy to claim
+protection against a device that lies about persistence. Do not
+promote buffered mode to power-loss durable. Keep the release gate
+for physical power interruption and wider storage-stack fault tests
+separate from the deterministic image tests.
