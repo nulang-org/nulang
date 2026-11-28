@@ -924,3 +924,47 @@ tests and torn-tail, checksum, sequence and clock tests remain part of
 qualification. After an ambiguous publication the writer remains
 poisoned until recovery. These are deterministic error injections,
 not physical power-loss or filesystem-level ENOSPC qualification.
+
+
+## Filesystem process-crash qualification
+
+The standard Rust tests now re-execute isolated test children and send
+SIGKILL at 13 actual I/O boundaries: incomplete WAL header, payload,
+digest, immediately before and after data synchronization; incomplete
+checkpoint snapshot, after snapshot sync before rename, after rename
+before directory sync, after directory sync; and clock-sidecar write,
+file sync, rename and directory sync. The parent verifies recovery,
+sequence continuation, preservation of committed records, exclusive
+writer acquisition, and clock rollback refusal. Incomplete temporary
+snapshot/clock files are never replayed. Crash-orphaned files may
+remain; clean them only offline in the private storage directory.
+
+A Linux standalone process test additionally limits only its child
+to 256-byte files using RLIMIT_FSIZE and ignores SIGXFSZ so the
+kernel returns EFBIG after a short write. The process must fail-stop
+without returning the uncertain SET or its dependent GET response.
+Restart without that child limit must repair the torn tail and recover
+the previously acknowledged value in all three synchronous modes:
+per-record, per-connection group and cross-client group. No real disk
+filling or host-wide limit is required.
+
+Concurrent test-child spawning exposed that close-on-exec descriptors
+may transiently retain an advisory flock after the owning handle is
+dropped. The WAL now explicitly unlocks each owning file guard on drop,
+with shared ownership of the stable lock across checkpoint rotation.
+A duplicate-descriptor regression verifies exclusive ownership before,
+during and after replacement, and immediate reacquisition after the
+last owner is dropped. Forking a live writer and using its copied
+handles in the child is not supported.
+
+Local qualification used private temporary directories on the Fedora
+host's actual Btrfs disk rather than its default tmpfs. CI can select
+a disk-backed TMPDIR and run the standard cache and standalone suites.
+SIGKILL preserves the kernel and page cache: a complete unacknowledged
+record may survive, and a rename visible after process death does not
+prove the directory entry would survive loss of power. RLIMIT_FSIZE
+is a real kernel file-write failure, not ENOSPC or device failure.
+No physical power-loss, filesystem journal replay, controller-cache
+or destructive fault experiment is claimed. Use a disposable VM/disk
+with forced power interruption or a block-device fault harness for
+that separate qualification gate.

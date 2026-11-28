@@ -9,6 +9,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 const MAGIC: &[u8; 8] = b"NLCWAL02";
 const HEADER_BYTES: usize = MAGIC.len();
@@ -43,9 +44,9 @@ pub enum WalSync {
 
 #[derive(Debug)]
 pub struct CacheWal {
-    file: File,
+    file: LockedFile,
     path: PathBuf,
-    lock: File,
+    lock: Arc<LockedFile>,
     limits: WalLimits,
     last_sequence: u64,
     valid_len: u64,
@@ -54,6 +55,38 @@ pub struct CacheWal {
     pub(super) fail_next_append: bool,
     #[cfg(all(test, feature = "cache-server"))]
     pub(super) fail_next_sync: bool,
+}
+
+// Explicitly unlock on the final owning guard's drop. A concurrent
+// fork/exec or duplicated descriptor can otherwise keep the same open
+// file description (and flock) alive after this owner has closed it.
+#[derive(Debug)]
+struct LockedFile(File);
+
+impl LockedFile {
+    fn acquire(file: File) -> io::Result<Self> {
+        file.try_lock().map_err(io::Error::other)?;
+        Ok(Self(file))
+    }
+}
+
+impl std::ops::Deref for LockedFile {
+    type Target = File;
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for LockedFile {
+    fn deref_mut(&mut self) -> &mut File {
+        &mut self.0
+    }
+}
+
+impl Drop for LockedFile {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -132,6 +165,14 @@ pub(super) struct ClockFloor {
 pub const MAX_CLOCK_RESERVATION_MS: u64 = 1000;
 
 const CLOCK_MAGIC: &[u8; 8] = b"NLCLK001";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClockPublishBoundary {
+    Written,
+    FileSynced,
+    Renamed,
+    DirectorySynced,
+}
 
 impl ClockFloor {
     fn path_for(journal: &Path) -> PathBuf {
@@ -230,6 +271,14 @@ impl ClockFloor {
     }
 
     fn publish(&mut self, now: u64) -> io::Result<()> {
+        self.publish_with(now, |_| Ok(()))
+    }
+
+    fn publish_with(
+        &mut self,
+        now: u64,
+        boundary: impl Fn(ClockPublishBoundary) -> io::Result<()>,
+    ) -> io::Result<()> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let parent = parent_dir(&self.path);
         let directory = File::open(parent)?;
@@ -245,9 +294,13 @@ impl ClockFloor {
         let mut file = private_options().write(true).create_new(true).open(&path)?;
         let temp = TemporaryJournal(path);
         file.write_all(&Self::encode(now))?;
+        boundary(ClockPublishBoundary::Written)?;
         file.sync_all()?;
+        boundary(ClockPublishBoundary::FileSynced)?;
         std::fs::rename(&temp.0, &self.path)?;
+        boundary(ClockPublishBoundary::Renamed)?;
         directory.sync_all()?;
+        boundary(ClockPublishBoundary::DirectorySynced)?;
         self.unix_ms = now;
         Ok(())
     }
@@ -286,15 +339,15 @@ impl CacheWal {
         // unlink this sidecar while any cooperating writer may be active.
         let mut lock_path = path.as_os_str().to_os_string();
         lock_path.push(".lock");
-        let mut lock = private_options()
+        let lock = private_options()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(lock_path)?;
         validate_regular(&lock)?;
-        lock.try_lock().map_err(io::Error::other)?;
-        let (mut file, created) = match private_options().read(true).write(true).open(path) {
+        let mut lock = LockedFile::acquire(lock)?;
+        let (file, created) = match private_options().read(true).write(true).open(path) {
             Ok(file) => (file, false),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 // Existing durable metadata is evidence of a prior store.
@@ -321,7 +374,7 @@ impl CacheWal {
             Err(error) => return Err(error),
         };
         validate_regular(&file)?;
-        file.try_lock().map_err(io::Error::other)?;
+        let mut file = LockedFile::acquire(file)?;
         if created {
             file.write_all(MAGIC)?;
             file.sync_all()?;
@@ -400,7 +453,7 @@ impl CacheWal {
         Ok(Self {
             file,
             path: path.to_path_buf(),
-            lock,
+            lock: Arc::new(lock),
             limits,
             last_sequence,
             valid_len: position,
@@ -454,18 +507,18 @@ impl CacheWal {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut file = private_options()
+        let file = private_options()
             .read(true)
             .write(true)
             .create_new(true)
             .open(&temp_path)?;
         let temp = TemporaryJournal(temp_path);
-        file.try_lock().map_err(io::Error::other)?;
+        let mut file = LockedFile::acquire(file)?;
         file.write_all(&checkpoint_header(self.last_sequence, entries))?;
         let mut replacement = CacheWal {
             file,
             path: self.path.clone(),
-            lock: self.lock.try_clone()?,
+            lock: Arc::clone(&self.lock),
             limits: self.limits,
             last_sequence: self.last_sequence,
             valid_len: CHECKPOINT_HEADER_BYTES as u64,
@@ -1040,5 +1093,316 @@ mod tests {
             .file_name()
             .to_string_lossy()
             .starts_with(".nulang-checkpoint-")));
+    }
+
+    // Re-execute this exact standard test in a private child, then SIGKILL
+    // that child at a real I/O boundary. No production crash hook.
+    fn kill_at_boundary() -> ! {
+        // SAFETY: sends SIGKILL only to the current, isolated test child.
+        unsafe { libc::raise(libc::SIGKILL) };
+        panic!("SIGKILL unexpectedly returned");
+    }
+
+    fn run_crash_child(test: &str, path: &Path, phase: &str) {
+        use std::os::unix::process::ExitStatusExt;
+        let module = module_path!().split_once("::").unwrap().1;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("{module}::{test}"), "--nocapture"])
+            .env("NULANG_WAL_CRASH_TEST_PATH", path)
+            .env("NULANG_WAL_CRASH_TEST_PHASE", phase)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("crash child timed out at {phase}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "child did not reach {phase}: {status}"
+        );
+    }
+
+    #[test]
+    fn test_wal_process_crash_at_append_boundaries() {
+        const PHASES: [&str; 5] = ["header", "payload", "digest", "before-sync", "after-sync"];
+        if let Some(path) = std::env::var_os("NULANG_WAL_CRASH_TEST_PATH") {
+            let phase = std::env::var("NULANG_WAL_CRASH_TEST_PHASE").unwrap();
+            assert!(PHASES.contains(&phase.as_str()));
+            let mut wal = CacheWal::open(path, WalLimits::default(), |_, _| Ok(())).unwrap();
+            wal.append_with(
+                b"pending",
+                WalSync::Data,
+                |file, header, payload, digest, _| {
+                    if phase == "header" {
+                        file.write_all(&header[..7])?;
+                        kill_at_boundary();
+                    }
+                    file.write_all(header)?;
+                    if phase == "payload" {
+                        file.write_all(&payload[..3])?;
+                        kill_at_boundary();
+                    }
+                    file.write_all(payload)?;
+                    if phase == "digest" {
+                        file.write_all(&digest[..11])?;
+                        kill_at_boundary();
+                    }
+                    file.write_all(digest)?;
+                    if phase == "before-sync" {
+                        kill_at_boundary();
+                    }
+                    file.sync_data()?;
+                    kill_at_boundary();
+                },
+            )
+            .unwrap();
+            unreachable!("child did not stop");
+        }
+        for phase in PHASES {
+            let tmp = Temp::new();
+            let path = tmp.file();
+            let mut wal = CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).unwrap();
+            wal.append(b"acknowledged", WalSync::Data).unwrap();
+            let stable_len = wal.journal_bytes();
+            drop(wal);
+            run_crash_child("test_wal_process_crash_at_append_boundaries", &path, phase);
+            let mut records = Vec::new();
+            let mut recovered = CacheWal::open(&path, WalLimits::default(), |seq, payload| {
+                records.push((seq, payload.to_vec()));
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(records[0], (1, b"acknowledged".to_vec()), "{phase}");
+            match phase {
+                "header" | "payload" | "digest" => {
+                    assert_eq!(records.len(), 1, "{phase}");
+                    assert_eq!(std::fs::metadata(&path).unwrap().len(), stable_len);
+                }
+                // SIGKILL leaves the kernel/page cache alive; complete
+                // unsynced records can legitimately survive.
+                "before-sync" | "after-sync" => assert_eq!(
+                    records,
+                    vec![(1, b"acknowledged".to_vec()), (2, b"pending".to_vec())]
+                ),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                recovered.append(b"continued", WalSync::Data).unwrap(),
+                records.len() as u64 + 1
+            );
+        }
+    }
+
+    #[test]
+    fn test_checkpoint_process_crash_at_publication_boundaries() {
+        const PHASES: [&str; 4] = [
+            "partial-snapshot",
+            "before-rename",
+            "after-rename",
+            "after-directory-sync",
+        ];
+        if let Some(path) = std::env::var_os("NULANG_WAL_CRASH_TEST_PATH") {
+            let phase = std::env::var("NULANG_WAL_CRASH_TEST_PHASE").unwrap();
+            assert!(PHASES.contains(&phase.as_str()));
+            let mut wal = CacheWal::open(path, WalLimits::default(), |_, _| Ok(())).unwrap();
+            wal.rotate_with(
+                1,
+                |next| {
+                    if phase == "partial-snapshot" {
+                        next.append_with(
+                            b"snapshot",
+                            WalSync::Buffered,
+                            |file, header, _, _, _| {
+                                file.write_all(&header[..7])?;
+                                kill_at_boundary();
+                            },
+                        )?;
+                    } else {
+                        next.append(b"snapshot", WalSync::Buffered)?;
+                    }
+                    Ok(())
+                },
+                |published| {
+                    if (!published && phase == "before-rename")
+                        || (published && phase == "after-rename")
+                    {
+                        kill_at_boundary();
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(phase, "after-directory-sync");
+            kill_at_boundary();
+        }
+        for phase in PHASES {
+            let tmp = Temp::new();
+            let path = tmp.file();
+            let mut wal = CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).unwrap();
+            wal.append(b"old", WalSync::Data).unwrap();
+            wal.append(b"committed", WalSync::Data).unwrap();
+            let original = std::fs::read(&path).unwrap();
+            drop(wal);
+            run_crash_child(
+                "test_checkpoint_process_crash_at_publication_boundaries",
+                &path,
+                phase,
+            );
+            let mut records = Vec::new();
+            let mut recovered = CacheWal::open(&path, WalLimits::default(), |seq, payload| {
+                records.push((seq, payload.to_vec()));
+                Ok(())
+            })
+            .unwrap();
+            match phase {
+                "partial-snapshot" | "before-rename" => {
+                    assert_eq!(std::fs::read(&path).unwrap(), original);
+                    assert_eq!(
+                        records,
+                        vec![(1, b"old".to_vec()), (2, b"committed".to_vec())]
+                    );
+                    assert_eq!(recovered.append(b"continued", WalSync::Data).unwrap(), 3);
+                }
+                "after-rename" | "after-directory-sync" => {
+                    assert_eq!(records, vec![(3, b"snapshot".to_vec())]);
+                    assert_eq!(recovered.append(b"continued", WalSync::Data).unwrap(), 4);
+                }
+                _ => unreachable!(),
+            }
+            assert!(CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).is_err());
+        }
+    }
+
+    #[test]
+    fn test_clock_process_crash_at_publication_boundaries() {
+        const PHASES: [(&str, ClockPublishBoundary); 4] = [
+            ("written", ClockPublishBoundary::Written),
+            ("file-synced", ClockPublishBoundary::FileSynced),
+            ("renamed", ClockPublishBoundary::Renamed),
+            ("directory-synced", ClockPublishBoundary::DirectorySynced),
+        ];
+        if let Some(path) = std::env::var_os("NULANG_WAL_CRASH_TEST_PATH") {
+            let phase = std::env::var("NULANG_WAL_CRASH_TEST_PHASE").unwrap();
+            let selected = PHASES.iter().find(|(name, _)| *name == phase).unwrap().1;
+            let mut clock = None;
+            let _wal = CacheWal::open_prepared(
+                path,
+                WalLimits::default(),
+                |path, lock| {
+                    clock = Some(ClockFloor::open(path, lock, 1000)?);
+                    Ok(())
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap();
+            clock
+                .unwrap()
+                .publish_with(2000, |point| {
+                    if point == selected {
+                        kill_at_boundary();
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            unreachable!("child did not stop");
+        }
+        for (phase, point) in PHASES {
+            let tmp = Temp::new();
+            let path = tmp.file();
+            let mut wal = CacheWal::open_prepared(
+                &path,
+                WalLimits::default(),
+                |path, lock| {
+                    ClockFloor::open(path, lock, 1000)?;
+                    Ok(())
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap();
+            wal.append(b"committed", WalSync::Data).unwrap();
+            drop(wal);
+            run_crash_child(
+                "test_clock_process_crash_at_publication_boundaries",
+                &path,
+                phase,
+            );
+            let expected_floor = match point {
+                ClockPublishBoundary::Written | ClockPublishBoundary::FileSynced => 1000,
+                ClockPublishBoundary::Renamed | ClockPublishBoundary::DirectorySynced => 2000,
+            };
+            let persisted = std::fs::read(ClockFloor::path_for(&path)).unwrap();
+            assert_eq!(persisted, ClockFloor::encode(expected_floor), "{phase}");
+            assert!(CacheWal::open_prepared(
+                &path,
+                WalLimits::default(),
+                |path, lock| {
+                    ClockFloor::open(path, lock, expected_floor - 1)?;
+                    Ok(())
+                },
+                |_, _| panic!("rollback should not reach replay")
+            )
+            .is_err());
+            assert_eq!(
+                std::fs::read(ClockFloor::path_for(&path)).unwrap(),
+                persisted
+            );
+            let mut records = Vec::new();
+            let mut recovered = CacheWal::open_prepared(
+                &path,
+                WalLimits::default(),
+                |path, lock| {
+                    ClockFloor::open(path, lock, expected_floor)?;
+                    Ok(())
+                },
+                |seq, payload| {
+                    records.push((seq, payload.to_vec()));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(records, vec![(1, b"committed".to_vec())]);
+            assert_eq!(recovered.append(b"continued", WalSync::Data).unwrap(), 2);
+        }
+    }
+
+    #[test]
+    fn test_wal_releases_locks_even_if_an_unrelated_fork_retains_file_descriptors() {
+        let tmp = Temp::new();
+        let path = tmp.file();
+        let mut wal = CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).unwrap();
+        // Duplicates share the open file descriptions, just as inherited
+        // descriptors do in the interval between fork and exec.
+        let inherited_file = wal.file.try_clone().unwrap();
+        let inherited_lock = wal.lock.try_clone().unwrap();
+        assert!(CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).is_err());
+        wal.rotate_with(
+            1,
+            |next| {
+                next.append(b"snapshot", WalSync::Buffered)?;
+                Ok(())
+            },
+            |_| {
+                assert!(CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).is_err());
+                Ok(())
+            },
+        )
+        .unwrap();
+        let inherited_replacement = wal.file.try_clone().unwrap();
+        assert!(CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).is_err());
+        drop(wal);
+        let mut next = CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).unwrap();
+        assert_eq!(next.append(b"new writer", WalSync::Data).unwrap(), 2);
+        drop(inherited_file);
+        drop(inherited_replacement);
+        drop(inherited_lock);
     }
 }

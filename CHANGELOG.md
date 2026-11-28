@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Fabric filesystem crash qualification — 2026-11-27
+- **Qualify real process crashes at WAL, checkpoint and clock publication boundaries**, plus kernel file-size exhaustion in all synchronous modes. Release owning advisory locks explicitly to prevent inherited descriptors from retaining stale locks while preserving stable-lock ownership across rotation. No new dependencies.
+
 ### Fabric storage qualification and hardening — 2026-11-27
 - **Refuse to silently recreate an initialized missing WAL**, create owner-only journal/lock/checkpoint files, reject final-component link aliases and special files, and qualify checkpoint disk-full failure without losing the committed journal. No dependency changes.
 

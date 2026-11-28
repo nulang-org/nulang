@@ -712,3 +712,92 @@ fn cross_client_acknowledged_mutations_recover_after_process_kill() {
     let _recovered = Server::start(address, &args);
     request(address, GET, b"$2\r\n64\r\n");
 }
+
+// A real kernel file-size limit forces a short write followed by EFBIG.
+// Only the child is restricted; no filesystem filling or host limits.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_real_wal_file_size_failure_never_acknowledges_uncertain_mutation() {
+    use std::os::unix::process::CommandExt;
+    let temp = Temp(std::env::temp_dir().join(format!(
+        "nulang-fabric-fsize-{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    )));
+    std::fs::create_dir(&temp.0).unwrap();
+    for (index, extra) in [
+        &[][..],
+        &["--group-commit", "1"][..],
+        &["--cross-client-group-commit", "1"][..],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let journal = temp.0.join(format!("{index}.wal"));
+        let address = port();
+        let mut args = vec![
+            "--mode",
+            "sync",
+            "--journal",
+            journal.to_str().unwrap(),
+            "--checkpoint-percent",
+            "0",
+        ];
+        args.extend_from_slice(extra);
+        let mut server = Server::start_with(address, &args, |command| {
+            // SAFETY: only async-signal-safe calls in the post-fork child.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::signal(libc::SIGXFSZ, libc::SIG_IGN) == libc::SIG_ERR {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let limit = libc::rlimit {
+                        rlim_cur: 256,
+                        rlim_max: 256,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        });
+        request(address, SET, b"+OK\r\n");
+        let stable_len = std::fs::metadata(&journal).unwrap().len();
+        assert!(stable_len < 256);
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut wire = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$512\r\n".to_vec();
+        wire.extend(std::iter::repeat_n(b'x', 512));
+        wire.extend_from_slice(b"\r\n");
+        wire.extend_from_slice(GET);
+        client.write_all(&wire).unwrap();
+        match client.read(&mut [0; 1]) {
+            Ok(0) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("uncertain WAL write produced response: {other:?}"),
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(status) = server.0.try_wait().unwrap() {
+                assert!(!status.success());
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "poisoned process did not stop"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            std::fs::metadata(&journal).unwrap().len(),
+            256,
+            "kernel limit was not reached"
+        );
+        drop(server);
+        let _recovered = Server::start(address, &args);
+        assert_eq!(std::fs::metadata(&journal).unwrap().len(), stable_len);
+        request(address, GET, b"$5\r\nvalue\r\n");
+    }
+}
