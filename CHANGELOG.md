@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Fabric bounded cross-client coalescing — 2026-11-27
+- **Add opt-in 0–2000 us cross-client collection window** with bounded readiness collection, existing durability barrier and resource limits, metrics and same-binary comparison. Zero-wait default unchanged; no new dependencies.
+
 ### Fabric WAL storage comparison — 2026-11-27
 - **Add same-binary disk/tmpfs and synchronous group-commit comparison**, verified recovery per sample, and an asynchronous WAL writer design decision record. No runtime changes or durability downgrade.
 

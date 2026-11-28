@@ -117,3 +117,28 @@ Two rounds, 12 seconds each, 16 clients, 20 batches/s per client, 16 commands/ba
 | ram/cross | 5,097 | 14.2 | 2–2 | 0.005–0.005 |
 
 The disk-backed cross-client cases approached the workload ceiling; per-connection cases did not. The tmpfs negative control also approached the ceiling and exhibited much lower sync latencies. Prioritize configurable bounded coalescing experiments and dedicated-disk testing before changing the reactor/WAL ownership protocol. Existing caps and defaults are unchanged. A writer thread cannot itself eliminate storage synchronization latency. Raw data: benchmarks/fabric-wal-storage-ab-20261127.json. Host was shared Fedora/Btrfs with a nearly full disk; samples are short and do not prove causality, maximum throughput, or physical durability.
+
+
+## Bounded coalescing experiment
+
+The opt-in 0..2000 us collection window retains the existing
+durability barrier and limits; see RESP_CACHE_ARCHITECTURE.md.
+Use the same executable and a disk-backed work directory:
+
+    python3 scripts/fabric_coalescing_ab.py \
+      --fabric target/release/nulang-fabric \
+      --work-dir /path/to/local-disk \
+      --output /tmp/fabric-coalescing-new.json \
+      --rounds 2 --seconds 10 --clients 16 --batches-per-second 20
+
+Six cases passed, including exact replies, budget checks, TTL
+reclamation, checkpoints and post-SIGKILL recovery. The following
+are medians of two samples, with ranges of batch-p99 bucket bounds.
+
+| Window (us) | Median ops/s | Records/sync | Batch p99 upper bounds (ms) |
+|---|---:|---:|---:|
+| 0 | 5,094 | 61.9 | 10–10 |
+| 500 | 4,929 | 63.0 | 10–200 |
+| 2000 | 4,978 | 66.1 | 10–200 |
+
+Nonzero windows collected additional ready turns and modestly increased records per sync, but did not demonstrate a consistent throughput or tail-latency improvement. The zero-wait cases reached the 5,120 ops/s offered-load ceiling on both rounds. Nonzero windows encountered much slower storage in round two. Short shared-host runs on nearly full Btrfs do not establish that the added wait caused the observed slowdown. Keep zero as the default; repeat on dedicated storage under a saturating and lower-concurrency workload before adopting adaptive batching or an asynchronous writer. Raw results: benchmarks/fabric-coalescing-ab-20261127.json.

@@ -1081,3 +1081,39 @@ the cumulative histograms, retaining the final snapshot in its report.
 It measures client batch round-trip separately. Compare distributions
 and counts rather than treating internal percentiles as additive
 or attributing individual batch delays without correlated tracing.
+
+
+## Optional cross-client collection window
+
+The standalone sync-mode flag --cross-group-wait-us 0..2000 and
+embedded configure_cross_group_wait method opt into one additional
+readiness poll for the final mutating group of a reactor iteration.
+Configure before polling, after enabling cross-client commit.
+Default zero retains the original ready-only batching behavior.
+The window is measured from group start, not reset on new arrivals,
+and cannot exceed the existing cooperative two-millisecond group
+budget. It does not wait for read-only groups, shutdown, exhausted
+turn/command/byte budgets, pending deferred work, or expired
+maintenance deadlines. The extra poll is capped by the nearest
+existing poll deadline. OS timeout rounding, scheduling, and
+individual command or storage operations can exceed the nominal
+window: it is not a hard end-to-end latency guarantee.
+
+Previously driven tokens are not dispatched twice in the iteration.
+New readiness not consumed before the deadline/limit is retained
+for the next ordinary iteration. Listener/wake events end the
+collection and are deferred until after commit. Writable interest
+on participating connections is suppressed while the optional
+barrier is open and restored after synchronization. All responses
+remain withheld until the existing group barrier succeeds. A sync
+failure closes participating connections, with no uncertain
+acknowledgements. No background worker or speculative execution
+is introduced. The existing 128-command, 32-turn and cooperative
+1 MiB journal-growth limits remain in force.
+
+The optional collection polls and additional turns are exposed as
+fabric_coalescing_polls_total and fabric_coalescing_turns_total.
+The latter counts driven connection events, not necessarily
+commands or mutations. Both counters are zero with the default
+window. See the WAL writer decision record for the initial
+same-binary window comparison and limitations.
