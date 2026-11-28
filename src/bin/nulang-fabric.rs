@@ -20,6 +20,7 @@ mod unix {
     --max-connection-bytes N --max-input-bytes N --max-output-bytes N --max-pipeline-depth N
     --max-record-bytes N --max-journal-bytes N
     --group-commit 0|1 (default 0; sync mode only)\n    --cross-client-group-commit 0|1 (default 0; sync mode only)
+    --cross-group-wait-us 0..2000 (default 0; cross-client sync only)
     --clock-reservation-ms 0..1000 (default 0; may delay restart)
     --checkpoint-percent 0..99 (default 70; 0 disables)
     --checkpoint-min-savings-percent 1..99 (default 10)
@@ -51,6 +52,7 @@ Durable modes require a private journal path. Memory mode is the default.";
         shutdown_drain_ms: u64,
         group_commit: bool,
         cross_client_group_commit: bool,
+        cross_group_wait_us: u64,
         clock_reservation_ms: u64,
         metrics_bind: Option<SocketAddr>,
         latency_metrics: bool,
@@ -83,6 +85,7 @@ Durable modes require a private journal path. Memory mode is the default.";
                 shutdown_drain_ms: 5000,
                 group_commit: false,
                 cross_client_group_commit: false,
+                cross_group_wait_us: 0,
                 clock_reservation_ms: 0,
                 metrics_bind: None,
                 latency_metrics: false,
@@ -165,6 +168,13 @@ Durable modes require a private journal path. Memory mode is the default.";
                             _ => return Err("cross-client group commit must be 0 or 1".into()),
                         };
                     }
+                    "--cross-group-wait-us" => {
+                        config.cross_group_wait_us =
+                            value.parse().map_err(|_| "invalid cross-group wait")?;
+                        if config.cross_group_wait_us > 2000 {
+                            return Err("cross-group wait exceeds 2000 us".into());
+                        }
+                    }
                     "--group-commit" => {
                         config.group_commit = match value.as_str() {
                             "0" => false,
@@ -223,6 +233,11 @@ Durable modes require a private journal path. Memory mode is the default.";
                 && (seen.contains("--group-commit") || seen.contains("--cross-client-group-commit"))
             {
                 return Err("group commit requires sync mode".into());
+            }
+            if seen.contains("--cross-group-wait-us")
+                && (config.mode != Mode::Sync || !config.cross_client_group_commit)
+            {
+                return Err("cross-group wait requires cross-client sync mode".into());
             }
             if config.mode == Mode::Memory && seen.contains("--clock-reservation-ms") {
                 return Err("clock reservation requires durable mode".into());
@@ -325,6 +340,11 @@ Durable modes require a private journal path. Memory mode is the default.";
             if self.cross_client_group_commit {
                 server
                     .enable_cross_client_group_commit()
+                    .map_err(|e| format!("{e:?}"))?;
+                server
+                    .configure_cross_group_wait(std::time::Duration::from_micros(
+                        self.cross_group_wait_us,
+                    ))
                     .map_err(|e| format!("{e:?}"))?;
             } else if self.group_commit {
                 server.enable_group_commit().map_err(|e| format!("{e:?}"))?;
@@ -446,6 +466,8 @@ Durable modes require a private journal path. Memory mode is the default.";
             gauge!("tls_handshake_timeouts_total", c.handshake_timeouts);
             gauge!("commands_dispatched_total", c.commands_dispatched);
             gauge!("polls_completed_total", c.polls_completed);
+            gauge!("coalescing_polls_total", c.coalescing_polls);
+            gauge!("coalescing_turns_total", c.coalescing_turns);
             gauge!("wal_groups_synced_total", c.wal_groups_synced);
             gauge!("wal_group_records_synced_total", c.wal_group_records_synced);
             gauge!("tls_reserved_bytes", sample.tls_reserved_bytes);
@@ -1008,6 +1030,34 @@ Durable modes require a private journal path. Memory mode is the default.";
                 .unwrap()
                 .group_commit
             );
+        }
+
+        #[test]
+        fn cross_group_wait_cli_is_bounded_and_requires_cross_client_sync() {
+            assert_eq!(parse(&[]).unwrap().cross_group_wait_us, 0);
+            assert!(parse(&["--cross-group-wait-us", "0"]).is_err());
+            for (wait, valid) in [
+                ("0", true),
+                ("500", true),
+                ("2000", true),
+                ("2001", false),
+                ("-1", false),
+            ] {
+                assert_eq!(
+                    parse(&[
+                        "--mode",
+                        "sync",
+                        "--journal",
+                        "test.wal",
+                        "--cross-client-group-commit",
+                        "1",
+                        "--cross-group-wait-us",
+                        wait
+                    ])
+                    .is_ok(),
+                    valid
+                );
+            }
         }
 
         #[test]

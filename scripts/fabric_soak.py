@@ -141,6 +141,9 @@ def parse_metrics(body, latency=False):
     if not set(METRICS) <= result.keys():
         raise ValueError("missing required metrics")
     sample = {key: result[key] for key in METRICS}
+    for key in ("coalescing_polls_total", "coalescing_turns_total"):
+        if key in result:
+            sample[key] = result[key]
     if latency:
         sample["internal_latency"] = parse_latency(result)
     return sample
@@ -183,23 +186,25 @@ def rss_bytes(pid):
     raise RuntimeError("RSS missing")
 
 
-def commit_args(mode):
+def commit_args(mode, wait_us=0):
+    if not 0 <= wait_us <= 2000 or (wait_us and mode != "cross"):
+        raise ValueError("invalid cross-group wait")
     if mode == "connection":
         return ["--group-commit", "1"]
     if mode == "cross":
-        return ["--cross-client-group-commit", "1"]
+        return ["--cross-client-group-commit", "1"] + (["--cross-group-wait-us", str(wait_us)] if wait_us else [])
     raise ValueError("invalid synchronous commit mode")
 
 
 @contextmanager
-def instance(binary, journal, log_path, latency=False, commit_mode="cross"):
+def instance(binary, journal, log_path, latency=False, commit_mode="cross", wait_us=0):
     port, metrics = free_port(), free_port()
     while metrics == port:
         metrics = free_port()
     address = ("127.0.0.1", port)
     command = [str(binary), "--bind", f"127.0.0.1:{port}",
                "--metrics-bind", f"127.0.0.1:{metrics}",
-               "--mode", "sync", *commit_args(commit_mode),
+               "--mode", "sync", *commit_args(commit_mode, wait_us),
                "--clock-reservation-ms", "1000", "--journal", str(journal),
                "--max-entries", str(ENTRIES), "--max-arena-bytes", str(ARENA_BYTES),
                "--max-connection-bytes", str(CONNECTION_BYTES),
@@ -250,11 +255,11 @@ def worker(address, client, start, stop, seconds, rate):
         raise
 
 
-def run_soak(binary, root, clients, seconds, rate, report, latency=False, commit_mode="cross"):
+def run_soak(binary, root, clients, seconds, rate, report, latency=False, commit_mode="cross", wait_us=0):
     journal = root / "cache.wal"
     stop = threading.Event()
     start = threading.Barrier(clients + 1)
-    with instance(binary, journal, root / "write.log", latency, commit_mode) as (proc, address, metrics):
+    with instance(binary, journal, root / "write.log", latency, commit_mode, wait_us) as (proc, address, metrics):
         with ThreadPoolExecutor(max_workers=clients) as pool:
             futures = [pool.submit(worker, address, i, start, stop, seconds, rate)
                        for i in range(clients)]
@@ -317,7 +322,7 @@ def run_soak(binary, root, clients, seconds, rate, report, latency=False, commit
             raise RuntimeError("expected SIGKILL")
     # A reserved durable clock watermark can delay immediate restart.
     time.sleep(1.1)
-    with instance(binary, journal, root / "recover.log", False, commit_mode) as (_, address, metrics):
+    with instance(binary, journal, root / "recover.log", False, commit_mode, wait_us) as (_, address, metrics):
         with socket.create_connection(address, timeout=10) as sock:
             for client, seq in enumerate(sequences):
                 exchange(sock, resp(b"GET", counter_key(client)), bulk(str(seq).encode()))
@@ -339,7 +344,12 @@ def main():
     p.add_argument("--batches-per-second", type=int, default=20)
     p.add_argument("--latency-metrics", action="store_true")
     p.add_argument("--commit-mode", choices=("connection", "cross"), default="cross")
+    p.add_argument("--cross-group-wait-us", type=int, default=0)
     a = p.parse_args()
+    try:
+        commit_args(a.commit_mode, a.cross_group_wait_us)
+    except ValueError as error:
+        p.error(str(error))
     if not 1 <= a.clients <= 16 or not 10 <= a.seconds <= 3600 or not 1 <= a.batches_per_second <= 100:
         p.error("clients 1..16, duration 10..3600 seconds, rate 1..100 batches/s")
     binary, work = a.fabric.resolve(), a.work_dir.resolve()
@@ -352,13 +362,13 @@ def main():
               "limits": {"entries": ENTRIES, "arena_bytes": ARENA_BYTES,
                          "connection_bytes": CONNECTION_BYTES, "journal_bytes": JOURNAL_BYTES},
               "mode": "sync", "cross_client_group_commit": a.commit_mode == "cross",
-              "commit_mode": a.commit_mode,
+              "commit_mode": a.commit_mode, "cross_group_wait_us": a.cross_group_wait_us,
               "clock_reservation_ms": 1000, "checkpoint_percent": 60,
               "checkpoint_retry_ms": 100,
               "samples": [], "recovery_verified": False}
     with a.output.open("x") as f, tempfile.TemporaryDirectory(prefix="fabric-soak-", dir=work) as tmp:
         try:
-            run_soak(binary, Path(tmp), a.clients, a.seconds, a.batches_per_second, report, a.latency_metrics, a.commit_mode)
+            run_soak(binary, Path(tmp), a.clients, a.seconds, a.batches_per_second, report, a.latency_metrics, a.commit_mode, a.cross_group_wait_us)
         except BaseException as error:
             report["failure"] = str(error)
             raise
