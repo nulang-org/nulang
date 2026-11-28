@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Fabric cross-client group commit — 2026-11-27
+- **Add opt-in bounded cross-client WAL durability groups** across already-ready connection turns, withhold all plaintext and encrypted output until the group sync succeeds, fail-stop on ambiguous errors, and qualify bounds, TLS, process recovery, and paired performance. No new dependencies.
+
 ### Fabric bounded synchronous group commit — 2026-11-27
 - **Add opt-in synchronous WAL group commit within each bounded connection turn**, holding responses until the WAL is synced, preserving ordered mutation visibility and fail-stop on uncertain writes. Expose group counters and benchmark evidence; no new dependencies.
 

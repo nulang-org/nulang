@@ -203,6 +203,15 @@ fn termination_signals_exit_successfully_and_release_journal() {
 
 #[test]
 fn mutual_tls_requires_trusted_client_certificate() {
+    qualify_mutual_tls(false);
+}
+
+#[test]
+fn cross_client_commit_with_mutual_tls_preserves_admission_and_pipeline_order() {
+    qualify_mutual_tls(true);
+}
+
+fn qualify_mutual_tls(cross_client: bool) {
     use rcgen::{
         BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
         KeyUsagePurpose,
@@ -240,23 +249,32 @@ fn mutual_tls_requires_trusted_client_certificate() {
     std::fs::write(&cert_path, server_cert.pem()).unwrap();
     std::fs::write(&key_path, server_key.serialize_pem()).unwrap();
     let addr = port();
-    let _server = Server::start(
-        addr,
-        &[
-            "--tls-ca",
-            ca_path.to_str().unwrap(),
-            "--tls-cert",
-            cert_path.to_str().unwrap(),
-            "--tls-key",
-            key_path.to_str().unwrap(),
-            "--max-input-bytes",
-            "262144",
-            "--max-output-bytes",
-            "524288",
-            "--max-connections",
-            "8",
-        ],
-    );
+    let journal = temp.0.join("tls.wal");
+    let mut args = vec![
+        "--tls-ca",
+        ca_path.to_str().unwrap(),
+        "--tls-cert",
+        cert_path.to_str().unwrap(),
+        "--tls-key",
+        key_path.to_str().unwrap(),
+        "--max-input-bytes",
+        "262144",
+        "--max-output-bytes",
+        "524288",
+        "--max-connections",
+        "8",
+    ];
+    if cross_client {
+        args.extend([
+            "--mode",
+            "sync",
+            "--journal",
+            journal.to_str().unwrap(),
+            "--cross-client-group-commit",
+            "1",
+        ]);
+    }
+    let _server = Server::start(addr, &args);
     let mut roots = RootCertStore::empty();
     roots.add(ca.der().clone()).unwrap();
     let connect = |config: ClientConfig| {
@@ -634,6 +652,62 @@ fn grouped_sync_pipeline_recovers_after_process_kill() {
     let mut reply = vec![0; expected.len()];
     client.read_exact(&mut reply).unwrap();
     assert_eq!(reply, expected.as_bytes());
+    drop(server);
+    let _recovered = Server::start(address, &args);
+    request(address, GET, b"$2\r\n64\r\n");
+}
+
+#[test]
+fn cross_client_acknowledged_mutations_recover_after_process_kill() {
+    let temp = Temp(std::env::temp_dir().join(format!(
+            "nulang-fabric-cross-process-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )));
+    std::fs::create_dir(&temp.0).unwrap();
+    let journal = temp.0.join("cache.wal");
+    let address = port();
+    let args = [
+        "--mode",
+        "sync",
+        "--journal",
+        journal.to_str().unwrap(),
+        "--cross-client-group-commit",
+        "1",
+    ];
+    let server = Server::start(address, &args);
+    let mut clients: Vec<_> = (0..8)
+        .map(|_| {
+            let connection = TcpStream::connect(address).unwrap();
+            connection
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            BufReader::new(connection)
+        })
+        .collect();
+    let pipeline = b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n".repeat(8);
+    for client in &mut clients {
+        client.get_mut().write_all(&pipeline).unwrap();
+    }
+    let mut seen = Vec::new();
+    for client in &mut clients {
+        for _ in 0..8 {
+            let mut line = String::new();
+            client.read_line(&mut line).unwrap();
+            seen.push(
+                line.strip_prefix(':')
+                    .unwrap()
+                    .trim()
+                    .parse::<usize>()
+                    .unwrap(),
+            );
+        }
+    }
+    seen.sort_unstable();
+    assert_eq!(seen, (1..=64).collect::<Vec<_>>());
     drop(server);
     let _recovered = Server::start(address, &args);
     request(address, GET, b"$2\r\n64\r\n");

@@ -850,3 +850,45 @@ receipt. Tests cover two groups for 64 ordered mutations, read-only
 behavior, sync failure with dependent reads withheld, partial append
 failure, nonpoisoning journal-full prefix, and abrupt process recovery.
 See benchmarks/FABRIC_RESP.md for the small comparative baseline.
+
+
+## Opt-in cross-client WAL group commit
+
+In synchronous standalone mode, --cross-client-group-commit 1
+supersedes per-connection --group-commit 1; both are disabled by
+default. Embedded reactors may enable_cross_client_group_commit before
+polling. There is no intentional wait for additional clients. A group
+combines already-ready connection turns in one reactor iteration,
+with each client retaining the existing 32-command quantum.
+
+A group ends at 128 dispatched commands, 32 connection turns, one MiB
+of appended journal bytes, two milliseconds of elapsed collection time,
+listener/inbox readiness, shutdown, or exhaustion of the ready set.
+Byte and elapsed thresholds are cooperative, checked between commands
+and turns; one record can cross the byte threshold (bounded by the WAL
+record limit), and one expensive command, parsing, TLS operations,
+kernel scheduling or synchronization can exceed the time threshold.
+This is not a hard latency or RSS guarantee. Zero-command groups do
+not sync; collection allows a first command to ensure progress.
+
+All application output, including dependent reads on another connection,
+stays in existing charged connection buffers until WAL synchronization
+succeeds. No plaintext or TLS write is performed while a group is
+open. Successful synchronization releases each participating connection
+through the existing bounded write quantum, with explicit continuations
+for unfinished output and preserved per-connection order. An append,
+sync or reactor error leaving an open group fails closed before any
+group reply is released; all clients close. Read-only groups avoid a
+sync; previously completed groups may already have been acknowledged.
+A nonpoisoning connection error does not roll back the group's valid
+mutations. Groups are durability boundaries, not atomic transactions,
+and unacknowledged complete records may survive recovery.
+
+Checkpoint and expiry maintenance happen outside open groups, and the
+clock floor retains its independent persistence semantics. Existing
+connection/peer/TLS budgets remain in force. Tests cover multi-client
+coalescing, failed synchronization with dependent reads withheld,
+command/byte/time thresholds, real TCP process-kill recovery, and the
+mutual TLS admission/large-response pipeline suite in cross-client mode.
+No new storage format, dependency, worker thread, or timer is required.
+See benchmarks/FABRIC_RESP.md for paired performance evidence.

@@ -613,6 +613,22 @@ pub struct CacheOperationalSnapshot {
     pub checkpoint_reclaimed_bytes: u64,
 }
 
+#[cfg(unix)]
+const CROSS_GROUP_COMMANDS: usize = 128;
+#[cfg(unix)]
+const CROSS_GROUP_TURNS: usize = 32;
+#[cfg(unix)]
+const CROSS_GROUP_BYTES: u64 = 1024 * 1024;
+#[cfg(unix)]
+const CROSS_GROUP_TIME: Duration = Duration::from_millis(2);
+
+#[cfg(unix)]
+struct CrossGroupProgress {
+    started: Instant,
+    journal_start: u64,
+    commands: usize,
+}
+
 /// One physical cache shard and its network reactor.
 ///
 /// CacheShardServer requires redirect routing. A client that reaches the wrong
@@ -640,6 +656,12 @@ pub struct CacheShardServer {
     started: bool,
     #[cfg(unix)]
     group_commit: bool,
+    #[cfg(unix)]
+    cross_client_group_commit: bool,
+    #[cfg(unix)]
+    cross_group: Option<CrossGroupProgress>,
+    #[cfg(unix)]
+    cross_group_time_limit: Duration,
     counters: CacheOperationalCounters,
     #[cfg(unix)]
     automatic_checkpoint: Option<AutomaticCheckpoint>,
@@ -796,6 +818,12 @@ impl CacheShardServer {
             started: false,
             #[cfg(unix)]
             group_commit: false,
+            #[cfg(unix)]
+            cross_client_group_commit: false,
+            #[cfg(unix)]
+            cross_group: None,
+            #[cfg(unix)]
+            cross_group_time_limit: CROSS_GROUP_TIME,
             counters: CacheOperationalCounters::default(),
             #[cfg(unix)]
             automatic_checkpoint: None,
@@ -947,6 +975,14 @@ impl CacheShardServer {
         Ok(())
     }
 
+    /// Coalesce already-ready clients, with no intentional batching delay.
+    #[cfg(unix)]
+    pub fn enable_cross_client_group_commit(&mut self) -> Result<(), CacheServerError> {
+        self.enable_group_commit()?;
+        self.cross_client_group_commit = true;
+        Ok(())
+    }
+
     /// Explicit maintenance checkpoint on the owning reactor thread.
     /// The reactor does not serve commands while the replacement is written.
     #[cfg(unix)]
@@ -1055,6 +1091,7 @@ impl CacheShardServer {
                 let _ = self.poll.registry().deregister(&mut connection.stream);
             }
             self.deferred.clear();
+            self.cross_group = None;
             self.close_listener();
             self.shutdown.store(true, Ordering::Release);
             return Err(CacheServerError::DurableShardPoisoned);
@@ -1269,6 +1306,23 @@ impl CacheShardServer {
         self.ready
             .extend(self.deferred.drain().map(|(_, event)| event));
 
+        #[cfg(unix)]
+        if self.cross_client_group_commit {
+            self.drive_cross_client_ready()?;
+        } else {
+            self.drive_ready()?;
+        }
+        #[cfg(not(unix))]
+        self.drive_ready()?;
+
+        if !self.shutdown.load(Ordering::Acquire) {
+            self.sweep_expired_if_due()?;
+        }
+        self.counters.polls_completed = self.counters.polls_completed.saturating_add(1);
+        Ok(())
+    }
+
+    fn drive_ready(&mut self) -> Result<(), CacheServerError> {
         for index in 0..self.ready.len() {
             if self.shutdown.load(Ordering::Acquire) {
                 break;
@@ -1282,11 +1336,130 @@ impl CacheShardServer {
             self.ensure_healthy()?;
         }
 
-        if !self.shutdown.load(Ordering::Acquire) {
-            self.sweep_expired_if_due()?;
-        }
-        self.counters.polls_completed = self.counters.polls_completed.saturating_add(1);
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn cross_group_at_limit(&self) -> bool {
+        let Some(group) = &self.cross_group else {
+            return false;
+        };
+        let CacheBackend::Durable { cache, .. } = &self.backend else {
+            return true;
+        };
+        group.commands >= CROSS_GROUP_COMMANDS
+            || cache.journal_usage().0.saturating_sub(group.journal_start) >= CROSS_GROUP_BYTES
+            || (group.commands != 0 && group.started.elapsed() >= self.cross_group_time_limit)
+    }
+
+    #[cfg(unix)]
+    fn begin_cross_group(&mut self) -> Result<(), CacheServerError> {
+        let CacheBackend::Durable { cache, .. } = &mut self.backend else {
+            return Err(CacheServerError::InvalidConfig(
+                "cross-client group requires durable mode",
+            ));
+        };
+        cache.begin_group().map_err(CacheServerError::Durability)?;
+        self.cross_group = Some(CrossGroupProgress {
+            started: Instant::now(),
+            journal_start: cache.journal_usage().0,
+            commands: 0,
+        });
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn finish_cross_group(&mut self, tokens: &mut Vec<Token>) -> Result<(), CacheServerError> {
+        if self.cross_group.is_none() {
+            return Ok(());
+        }
+        let CacheBackend::Durable { cache, .. } = &mut self.backend else {
+            return Err(CacheServerError::InvalidConfig(
+                "cross-client group requires durable mode",
+            ));
+        };
+        let result = cache.finish_group();
+        // Open/poisoned group means no wire output can be released.
+        self.ensure_healthy()?;
+        let records = result.map_err(CacheServerError::Durability)?;
+        self.cross_group = None;
+        if records != 0 {
+            self.counters.wal_groups_synced = self.counters.wal_groups_synced.saturating_add(1);
+            self.counters.wal_group_records_synced = self
+                .counters
+                .wal_group_records_synced
+                .saturating_add(records);
+        }
+        // No network write (including TLS plaintext-to-ciphertext conversion)
+        // took place while the barrier was open.
+        for token in tokens.drain(..) {
+            let Some(mut connection) = self.connections.remove(&token) else {
+                continue;
+            };
+            match Self::flush_quantum(&mut connection) {
+                Ok(resume) => {
+                    connection.lease.release_empty(&mut connection.output);
+                    self.update_interest(token, &mut connection)?;
+                    self.connections.insert(token, connection);
+                    if resume {
+                        self.defer(ReadyEvent::continuation(token, false, true));
+                    }
+                }
+                Err(_) => {
+                    self.counters.connection_errors =
+                        self.counters.connection_errors.saturating_add(1);
+                    self.deferred.remove(&token);
+                    let _ = self.poll.registry().deregister(&mut connection.stream);
+                }
+            }
+        }
+        if !self.shutdown.load(Ordering::Acquire) {
+            self.maybe_checkpoint(self.clock.now_ms())?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn drive_cross_client_ready(&mut self) -> Result<(), CacheServerError> {
+        let mut tokens = Vec::with_capacity(CROSS_GROUP_TURNS);
+        let result = (|| {
+            for index in 0..self.ready.len() {
+                if self.shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                let event = self.ready[index];
+                match event.token {
+                    LISTENER_TOKEN | WAKE_TOKEN => {
+                        self.finish_cross_group(&mut tokens)?;
+                        if event.token == LISTENER_TOKEN {
+                            self.accept_ready()?;
+                        } else {
+                            self.handle_wake()?;
+                        }
+                        self.ensure_healthy()?;
+                    }
+                    token => {
+                        if self.cross_group.is_none() {
+                            self.begin_cross_group()?;
+                        }
+                        self.connection_ready(token, event)?;
+                        tokens.push(token);
+                        if matches!(&self.backend, CacheBackend::Durable { cache, .. } if cache.is_poisoned())
+                        {
+                            return self.ensure_healthy();
+                        }
+                        if tokens.len() >= CROSS_GROUP_TURNS || self.cross_group_at_limit() {
+                            self.finish_cross_group(&mut tokens)?;
+                        }
+                    }
+                }
+            }
+            self.finish_cross_group(&mut tokens)
+        })();
+        // Registration/dispatch failure while a group is open is fail-stop,
+        // even if no underlying journal error was reported.
+        self.ensure_healthy()?;
+        result
     }
 
     fn poll_timeout(&self, requested: Option<Duration>) -> Option<Duration> {
@@ -1514,23 +1687,30 @@ impl CacheShardServer {
         }
 
         let mut write_again = false;
-        if writable || connection.has_pending_wire() {
-            let mut remaining = WRITE_QUANTUM;
-            Self::flush_connection_while(connection, || {
-                if remaining == 0 {
-                    return false;
-                }
-                remaining -= 1;
-                true
-            })
-            .map_err(|_| ConnectionAction::Close)?;
-            write_again = remaining == 0 && connection.has_pending_wire();
+        #[cfg(unix)]
+        let withheld = self.cross_group.is_some();
+        #[cfg(not(unix))]
+        let withheld = false;
+        if !withheld && (writable || connection.has_pending_wire()) {
+            write_again = Self::flush_quantum(connection).map_err(|_| ConnectionAction::Close)?;
         }
 
         // Reclaim only empty allocations. A yielded batch retains its input.
         connection.lease.release_empty(&mut connection.input);
         connection.lease.release_empty(&mut connection.output);
         Ok((read_again, write_again))
+    }
+
+    fn flush_quantum(connection: &mut CacheConnection) -> io::Result<bool> {
+        let mut remaining = WRITE_QUANTUM;
+        Self::flush_connection_while(connection, || {
+            if remaining == 0 {
+                return false;
+            }
+            remaining -= 1;
+            true
+        })?;
+        Ok(remaining == 0 && connection.has_pending_wire())
     }
 
     // True means there may be unread kernel/TLS data; schedule another turn.
@@ -1586,6 +1766,10 @@ impl CacheShardServer {
     }
 
     fn process_input(&mut self, connection: &mut CacheConnection) -> Result<(), ConnectionAction> {
+        #[cfg(unix)]
+        if self.cross_group.is_some() {
+            return self.process_input_inner(connection);
+        }
         #[cfg(unix)]
         if self.group_commit {
             let CacheBackend::Durable { cache, .. } = &mut self.backend else {
@@ -1645,6 +1829,11 @@ impl CacheShardServer {
             connection.commands_remaining = depth;
         }
         for _ in 0..COMMAND_QUANTUM {
+            #[cfg(unix)]
+            if self.cross_group_at_limit() {
+                connection.compact_input();
+                return Ok(());
+            }
             if self.shutdown.load(Ordering::Acquire) || connection.commands_remaining == 0 {
                 connection.compact_input();
                 return Ok(());
@@ -1727,6 +1916,11 @@ impl CacheShardServer {
                 return Err(ConnectionAction::Close);
             }
             self.counters.commands_dispatched = self.counters.commands_dispatched.saturating_add(1);
+            #[cfg(unix)]
+            if let Some(group) = &mut self.cross_group {
+                group.commands += 1;
+            }
+
             connection.input_start += consumed;
             connection.commands_remaining -= 1;
             // Group commit defers maintenance until after synchronization.
@@ -3372,6 +3566,191 @@ mod tests {
             &mut client,
             b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
             b"$-1\r\n",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_client_group_commits_multiple_ready_peers_together() {
+        let tmp = DurableTestDir::new();
+        let journal = tmp.0.join("cross.wal");
+        let mut server = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        server.enable_cross_client_group_commit().unwrap();
+        server.cross_group_time_limit = Duration::from_secs(10);
+        let mut clients: Vec<_> = (0..8).map(|_| connect_client(&server)).collect();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+            if server.connection_count() == clients.len() {
+                break;
+            }
+        }
+        let wire = b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n";
+        for client in &mut clients {
+            client.write_all(wire).unwrap();
+        }
+        // Drive an explicit ready set so the test does not depend on the
+        // kernel combining every readable edge in one poll result.
+        server.ready = server
+            .connections
+            .keys()
+            .map(|&token| ReadyEvent::continuation(token, true, false))
+            .collect();
+        server.drive_cross_client_ready().unwrap();
+        let snapshot = server.operational_snapshot();
+        assert_eq!(snapshot.counters.wal_groups_synced, 1);
+        assert_eq!(snapshot.counters.wal_group_records_synced, 8);
+        let mut values = Vec::new();
+        for client in &mut clients {
+            let mut reply = [0; 4];
+            client.read_exact(&mut reply).unwrap();
+            values.push(reply[1]);
+        }
+        values.sort_unstable();
+        assert_eq!(values, b"12345678");
+        assert_eq!(server.buffer_budget.used_bytes(), 0);
+        drop(server);
+        let mut recovered = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        let mut client = connect_client(&recovered);
+        roundtrip(
+            &mut recovered,
+            &mut client,
+            b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
+            b"$1\r\n8\r\n",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_client_sync_failure_withholds_all_participating_responses() {
+        let tmp = DurableTestDir::new();
+        let journal = tmp.0.join("cross-failure.wal");
+        let mut server = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        server.enable_cross_client_group_commit().unwrap();
+        server.cross_group_time_limit = Duration::from_secs(10);
+        let mut clients: Vec<_> = (0..3).map(|_| connect_client(&server)).collect();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+            if server.connection_count() == clients.len() {
+                break;
+            }
+        }
+        for client in &mut clients {
+            client
+                .write_all(b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+                .unwrap();
+        }
+        if let CacheBackend::Durable { cache, .. } = &mut server.backend {
+            cache.fail_next_group_sync();
+        }
+        server.ready = server
+            .connections
+            .keys()
+            .map(|&token| ReadyEvent::continuation(token, true, false))
+            .collect();
+        assert!(matches!(
+            server.drive_cross_client_ready(),
+            Err(CacheServerError::DurableShardPoisoned)
+        ));
+        assert_eq!(server.connection_count(), 0);
+        assert_eq!(server.buffer_budget.used_bytes(), 0);
+        assert_eq!(server.operational_snapshot().counters.wal_groups_synced, 0);
+        assert_eq!(
+            server.operational_snapshot().counters.commands_dispatched,
+            6
+        );
+        for client in &mut clients {
+            match client.read(&mut [0; 1]) {
+                Ok(0) => {}
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+                other => panic!("uncommitted cross-client response: {other:?}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_client_group_enforces_command_bound_and_resumes_yielded_clients() {
+        let tmp = DurableTestDir::new();
+        let journal = tmp.0.join("cross-limit.wal");
+        let mut server = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        server.enable_cross_client_group_commit().unwrap();
+        server.cross_group_time_limit = Duration::from_secs(10);
+        let mut clients: Vec<_> = (0..5).map(|_| connect_client(&server)).collect();
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+            if server.connection_count() == clients.len() {
+                break;
+            }
+        }
+        let wire = b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n".repeat(32);
+        for client in &mut clients {
+            client.write_all(&wire).unwrap();
+        }
+        server.ready = server
+            .connections
+            .keys()
+            .map(|&token| ReadyEvent::continuation(token, true, false))
+            .collect();
+        server.drive_cross_client_ready().unwrap();
+        assert_eq!(server.operational_snapshot().counters.wal_groups_synced, 2);
+        assert_eq!(
+            server
+                .operational_snapshot()
+                .counters
+                .wal_group_records_synced,
+            160
+        );
+        for client in &mut clients {
+            let mut reader = std::io::BufReader::new(client);
+            use std::io::BufRead;
+            for _ in 0..32 {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.starts_with(':') && line.ends_with("\r\n"));
+            }
+        }
+        assert_eq!(server.buffer_budget.used_bytes(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_group_byte_and_time_thresholds_trigger_only_after_progress() {
+        let tmp = DurableTestDir::new();
+        let mut server = build_durable_server(
+            &tmp.0.join("threshold.wal"),
+            WalSync::Data,
+            WalLimits::default(),
+        );
+        server.enable_cross_client_group_commit().unwrap();
+        server.begin_cross_group().unwrap();
+        assert!(!server.cross_group_at_limit());
+        let group = server.cross_group.as_mut().unwrap();
+        group.started = Instant::now() - Duration::from_secs(1);
+        assert!(!server.cross_group_at_limit());
+        server.cross_group.as_mut().unwrap().commands = 1;
+        assert!(server.cross_group_at_limit());
+        server.finish_cross_group(&mut Vec::new()).unwrap();
+        server.begin_cross_group().unwrap();
+        server.cross_group_time_limit = Duration::from_secs(10);
+        if let CacheBackend::Durable { cache, anchor } = &mut server.backend {
+            let time = durable_clock(*anchor, server.clock.now_ms()).unwrap();
+            cache
+                .set_bytes(
+                    b"large",
+                    &vec![b'x'; CROSS_GROUP_BYTES as usize],
+                    None,
+                    time,
+                )
+                .unwrap();
+        }
+        assert!(server.cross_group_at_limit());
+        server.finish_cross_group(&mut Vec::new()).unwrap();
+        assert_eq!(
+            server
+                .operational_snapshot()
+                .counters
+                .wal_group_records_synced,
+            1
         );
     }
 }

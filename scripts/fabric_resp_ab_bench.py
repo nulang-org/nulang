@@ -91,7 +91,7 @@ def free_port() -> int:
 
 
 @contextmanager
-def server(binary: Path, engine: str, mode: str, root: Path, clock_reservation_ms: int = 0, group_commit: bool = False):
+def server(binary: Path, engine: str, mode: str, root: Path, clock_reservation_ms: int = 0, group_commit: bool = False, cross_client_group_commit: bool = False):
     with tempfile.TemporaryDirectory(prefix=f"{engine}-{mode}-", dir=root) as tmp:
         path = Path(tmp)
         port = free_port()
@@ -101,7 +101,9 @@ def server(binary: Path, engine: str, mode: str, root: Path, clock_reservation_m
                 command += ["--journal", str(path / "cache.wal"), "--checkpoint-percent", "0"]
                 if clock_reservation_ms:
                     command += ["--clock-reservation-ms", str(clock_reservation_ms)]
-                if mode == "sync" and group_commit:
+                if mode == "sync" and cross_client_group_commit:
+                    command += ["--cross-client-group-commit", "1"]
+                elif mode == "sync" and group_commit:
                     command += ["--group-commit", "1"]
         else:
             command = [str(binary), "--bind", "127.0.0.1", "--port", str(port),
