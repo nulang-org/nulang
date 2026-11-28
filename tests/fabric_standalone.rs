@@ -110,6 +110,37 @@ fn s3fifo_cli_evicts_only_under_entry_pressure() {
 }
 
 #[test]
+fn s3fifo_cli_reuses_matching_arena_blocks_and_preserves_unrelated_keys() {
+    let address = port();
+    let _server = Server::start(
+        address,
+        &[
+            "--eviction",
+            "s3fifo",
+            "--max-entries",
+            "10",
+            "--max-arena-bytes",
+            "64",
+        ],
+    );
+    request(address, SET, b"+OK\r\n");
+    let set = |key: u8, value: u8| {
+        let mut wire = format!("*3\r\n$3\r\nSET\r\n$1\r\n{}\r\n$64\r\n", key as char).into_bytes();
+        wire.extend([value; 64]);
+        wire.extend(b"\r\n");
+        wire
+    };
+    request(address, &set(b'a', b'x'), b"+OK\r\n");
+    request(address, &set(b'b', b'y'), b"+OK\r\n");
+    request(address, GET, b"$5\r\nvalue\r\n");
+    request(address, b"*2\r\n$3\r\nGET\r\n$1\r\na\r\n", b"$-1\r\n");
+    let mut reply = b"$64\r\n".to_vec();
+    reply.extend([b'y'; 64]);
+    reply.extend(b"\r\n");
+    request(address, b"*2\r\n$3\r\nGET\r\n$1\r\nb\r\n", &reply);
+}
+
+#[test]
 fn memory_mode_does_not_recover_after_process_kill() {
     let address = port();
     let server = Server::start(address, &[]);

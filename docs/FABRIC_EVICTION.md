@@ -1,4 +1,4 @@
-# Opt-in entry-pressure S3-FIFO eviction
+# Opt-in S3-FIFO eviction
 
 Enable only for disposable memory-mode cache data:
 
@@ -14,7 +14,7 @@ This is an entry-count S3-FIFO adaptation: a small probationary FIFO
 (target max(1, floor(capacity/10))), a main second-chance FIFO, and a
 bounded ghost FIFO containing only 64-bit key fingerprints. A successful
 GET (including MGET element reads) increments a saturating 2-bit frequency.
-Writes, TTL and existence queries do not count as GETs. On entry pressure,
+Writes, TTL and existence queries do not count as GETs. On entry or arena pressure,
 small entries with frequency greater than one move to main with frequency
 zero; other small victims enter ghost history. Main entries with nonzero
 frequency are rotated while decrementing the count. A ghost match places
@@ -33,16 +33,30 @@ on planning failure, although policy ordering/frequencies may change.
 The current planner uses bounded temporary victim/protection bookkeeping;
 hit-path frequency updates require no allocation.
 
-All writes first perform conservative arena admission, ignoring blocks
-that might be freed by eviction or later batch replacement. Automatic
-eviction addresses entry count only, not arena pressure. A value can be
-rejected even if evicting a matching arena size-class block would permit
-it. MSET preflights all new keys and allocations, protects existing batch
-targets, selects the entire victim set before deleting anything and
-applies the writes only after admission. Duplicate keys retain last-write
-semantics. Existing durable preflight remains unchanged. The local
-metrics endpoint exports cache_evictions_total separately from expiration
-and explicit deletion counters.
+Normal conservative admission is attempted first. When it fails and
+S3-FIFO is enabled, the planner calculates the allocation demand by
+arena size class (every value and every distinct new key), the free
+blocks in each class, and remaining initialized arena extent. It selects
+victims until both entry pressure and required additional extent fit.
+Once entry pressure is satisfied, entries that cannot reduce outstanding
+class demand are skipped. Protected batch targets and the key being
+overwritten cannot be selected. No live key is deleted until the complete
+plan succeeds. The 4096-node budget still includes skipped nodes,
+promotions and rotations. A rejected plan preserves values, TTLs and
+eviction counts, although policy order and frequencies can change.
+Victim bookkeeping is bounded by the scan budget; key/protection
+bookkeeping is proportional to the input batch.
+
+Eviction frees reusable blocks, not initialized arena extent. Different
+classes cannot be coalesced, and existing protected values or values
+replaced earlier in a batch are not counted as available blocks.
+Fragmentation, conservative replacement accounting and the scan limit
+can therefore still cause OOM. There is no compaction or hard RSS
+guarantee. Duplicate MSET keys retain last-write semantics and admission
+is atomic with respect to all visible values. Existing noeviction and
+durable preflight behavior remains unchanged. The local metrics endpoint
+exports cache_evictions_total separately from expiration and explicit
+deletion counters.
 
 ## Seeded hit-ratio qualification
 
@@ -74,3 +88,41 @@ not a default change. Gertrude local qualification used the repository's
 pinned Rust 1.95.0 and a focused manifest with lockfile package identities
 verified against the repository lock. Full workspace and independent
 reference-server qualification remain outstanding.
+
+
+## Arena-pressure qualification
+
+    cargo run --locked --no-default-features --release --example fabric_arena_eviction_trace
+
+Compare the actual entry-only store from b62aea6d8 with the arena-aware
+candidate using the same trace source, separate isolated cache-only
+build targets, pinned Rust 1.95 and rustc-hash 2.1.3. Twelve traces per
+revision, each 100,000 references, three seeds, 1024 entry cap, 8/32 KiB
+arena caps, constant 64-byte values or mixed 32–256-byte values and
+occasional 32-byte keys. Each admitted key is read back and compared
+when hit. These are synthetic reference streams, not throughput tests.
+
+| Arena | Values | Entry-only hit rate | Arena-aware hit rate | Entry-only rejected misses | Arena-aware rejected misses |
+|---:|---|---:|---:|---:|---:|
+| 8 KiB | 64 B | 31.84% | 18.47% | 204,099 | 0 |
+| 8 KiB | mixed | 18.20% | 4.25% | 245,195 | 0 |
+| 32 KiB | 64 B | 59.28% | 59.86% | 120,630 | 0 |
+| 32 KiB | mixed | 51.41% | 59.83% | 144,961 | 0 |
+
+
+Raw results: benchmarks/fabric-arena-entry-only-20261128.csv and
+benchmarks/fabric-arena-aware-20261128.csv. Across the 1.2 million
+references per revision, the entry-only policy rejected 714,885 misses,
+whereas the candidate admitted every miss in these specific traces.
+All 18 previous inline traces retain the same hit/eviction counts.
+
+The tight 8 KiB arena cases demonstrate a real tradeoff: a static
+probation target of 102 entries (10% of the configured 1024 entry cap)
+is disproportionate to effective resident capacity, especially with
+mixed-size values. The baseline freezes after filling the arena and
+can retain some hot keys by rejecting all later misses; the candidate
+keeps admitting and may churn hot keys. The 32 KiB traces improve
+hit rate. These results do not establish universal hit-rate improvement
+or equal total memory consumption. Dynamic/byte-aware queue sizing,
+compaction or alternative arena layout, and larger real-world traces
+remain separate design questions. No default change is warranted.
