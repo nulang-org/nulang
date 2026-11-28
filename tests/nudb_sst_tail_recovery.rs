@@ -2310,3 +2310,81 @@ fn multi_output_compaction_rejects_excessive_output_count_before_writing() {
     assert!(next.current().entries().is_empty());
     assert_eq!(fs::read_dir(&target).unwrap().count(), 2);
 }
+
+#[test]
+fn compaction_budget_rejects_before_output_and_preserves_live_writes() {
+    use nulang::database::{
+        generation_registry::GenerationRegistry, managed_storage::ManagedTablet,
+        storage_admission::CompactionBudget,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"old")]).unwrap();
+    db.commit_idempotent(id(2), vec![put(b"anchor")]).unwrap();
+    let mut old = f.manifest();
+    db.flush_sst_shadow(&mut old, 1).unwrap();
+    db.flush_sst_shadow(&mut old, 1).unwrap();
+    db.seal_sst_recovery_at_floor(&mut old, 2).unwrap();
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let reg = f.0.join("registry");
+    fs::create_dir(&reg).unwrap();
+    let registry = GenerationRegistry::create(&reg, 7, 3).unwrap();
+    let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+    managed
+        .commit_idempotent(id(3), vec![put(b"tail")])
+        .unwrap();
+    let wal = f.0.join("tablet.wal");
+    let before = fs::read(&wal).unwrap();
+    let registry_before = fs::read(reg.join("GENERATIONS")).unwrap();
+    for (n, budget) in [
+        (
+            1,
+            CompactionBudget {
+                max_additional_bytes: 1,
+                min_free_bytes: 0,
+            },
+        ),
+        (
+            2,
+            CompactionBudget {
+                max_additional_bytes: u64::MAX,
+                min_free_bytes: u64::MAX,
+            },
+        ),
+    ] {
+        let target = f.0.join(format!("rejected-{n}"));
+        fs::create_dir(&target).unwrap();
+        let err = managed
+            .compact_with_budget(ManifestStore::create(&target, 7, 3).unwrap(), 4096, budget)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("compaction storage admission"),
+            "{err}"
+        );
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 2);
+        assert_eq!(fs::read(&wal).unwrap(), before);
+        assert_eq!(fs::read(reg.join("GENERATIONS")).unwrap(), registry_before);
+    }
+    assert_eq!(
+        managed.commit_idempotent(id(4), vec![]).unwrap().sequence(),
+        4
+    );
+    let next = f.0.join("admitted");
+    fs::create_dir(&next).unwrap();
+    let stats = managed
+        .compact_with_budget(
+            ManifestStore::create(&next, 7, 3).unwrap(),
+            4096,
+            CompactionBudget {
+                max_additional_bytes: 32 * 1024 * 1024,
+                min_free_bytes: 0,
+            },
+        )
+        .unwrap();
+    assert_eq!(stats.output_versions, 1);
+    assert_eq!(managed.read_at(b"k", 4).unwrap(), Some(b"tail".as_slice()));
+    drop(managed);
+    let registry = GenerationRegistry::open(&reg, 7, 3).unwrap();
+    let managed = ManagedTablet::open(f.descriptor(), &wal, &next, registry).unwrap();
+    assert_eq!(managed.current_sequence(), 4);
+}
