@@ -78,6 +78,38 @@ const SET: &[u8] = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$5\r\nvalue\r\n";
 const GET: &[u8] = b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n";
 
 #[test]
+fn s3fifo_cli_evicts_only_under_entry_pressure() {
+    let address = port();
+    let _server = Server::start(
+        address,
+        &[
+            "--eviction",
+            "s3fifo",
+            "--max-entries",
+            "2",
+            "--max-arena-bytes",
+            "32",
+        ],
+    );
+    request(address, SET, b"+OK\r\n");
+    request(
+        address,
+        b"*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\nv\r\n",
+        b"+OK\r\n",
+    );
+    request(address, GET, b"$5\r\nvalue\r\n");
+    request(address, GET, b"$5\r\nvalue\r\n");
+    request(
+        address,
+        b"*3\r\n$3\r\nSET\r\n$1\r\nc\r\n$1\r\nv\r\n",
+        b"+OK\r\n",
+    );
+    request(address, GET, b"$5\r\nvalue\r\n");
+    request(address, b"*2\r\n$3\r\nGET\r\n$1\r\nb\r\n", b"$-1\r\n");
+    request(address, b"*2\r\n$3\r\nGET\r\n$1\r\nc\r\n", b"$1\r\nv\r\n");
+}
+
+#[test]
 fn memory_mode_does_not_recover_after_process_kill() {
     let address = port();
     let server = Server::start(address, &[]);
