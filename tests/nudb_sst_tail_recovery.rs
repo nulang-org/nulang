@@ -1644,3 +1644,99 @@ fn retirement_reservation_rejects_different_physical_copy_and_registry_downgrade
         GenerationStatus::RetirementReserved
     );
 }
+
+#[test]
+fn journaled_deletion_requires_reserved_exact_generation_and_current_backup() {
+    use nulang::database::{
+        generation_registry::{GenerationRegistry, GenerationStatus},
+        managed_storage::ManagedTablet,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    let receipt = db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let old = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let reg = f.0.join("registry");
+    fs::create_dir(&reg).unwrap();
+    let registry = GenerationRegistry::create(&reg, 7, 3).unwrap();
+    let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+    managed
+        .commit_idempotent(id(2), vec![put(b"tail")])
+        .unwrap();
+    let next = f.0.join("next");
+    fs::create_dir(&next).unwrap();
+    managed
+        .rotate(ManifestStore::create(&next, 7, 3).unwrap(), 1)
+        .unwrap();
+    let backup = f.0.join("backup");
+    managed.backup([1; 16], &backup).unwrap();
+    let quarantine = f.0.join("quarantine");
+    managed
+        .quarantine(
+            ManifestStore::open(f.0.join("sst"), 7, 3).unwrap(),
+            &backup,
+            &quarantine,
+        )
+        .unwrap();
+    assert!(managed
+        .delete_reserved_generation(&quarantine, &backup)
+        .is_err());
+    let obsolete = ManifestStore::open(&quarantine, 7, 3).unwrap();
+    managed.reserve_retirement(&obsolete, &backup).unwrap();
+    drop(obsolete);
+    managed
+        .commit_idempotent(id(3), vec![put(b"latest")])
+        .unwrap();
+    assert!(managed
+        .delete_reserved_generation(&quarantine, &backup)
+        .is_err());
+    assert!(quarantine.join("MANIFEST").exists());
+    let fresh = f.0.join("fresh");
+    managed.backup([2; 16], &fresh).unwrap();
+    let extra = quarantine.join("unrelated");
+    fs::write(&extra, b"keep").unwrap();
+    assert!(managed
+        .delete_reserved_generation(&quarantine, &fresh)
+        .is_err());
+    assert_eq!(fs::read(&extra).unwrap(), b"keep");
+    fs::remove_file(&extra).unwrap();
+    managed
+        .delete_reserved_generation(&quarantine, &fresh)
+        .unwrap();
+    assert_eq!(
+        fs::read_dir(&quarantine)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect::<Vec<_>>(),
+        vec![std::ffi::OsString::from("MANIFEST.lock")]
+    );
+    assert_eq!(
+        managed.retirement_status(&quarantine).unwrap(),
+        GenerationStatus::Deleted
+    );
+    assert_eq!(
+        managed
+            .commit_idempotent(id(1), vec![put(b"first")])
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(
+        managed.read_at(b"k", 3).unwrap(),
+        Some(b"latest".as_slice())
+    );
+    drop(managed);
+    let registry = GenerationRegistry::open(&reg, 7, 3).unwrap();
+    let mut managed =
+        ManagedTablet::open(f.descriptor(), f.0.join("tablet.wal"), &next, registry).unwrap();
+    managed
+        .delete_reserved_generation(&quarantine, &fresh)
+        .unwrap();
+    assert_eq!(
+        managed.retirement_status(&quarantine).unwrap(),
+        GenerationStatus::Deleted
+    );
+    let restored =
+        WalBackedTablet::restore_sealed_backup(f.descriptor(), &fresh, f.0.join("restore"))
+            .unwrap();
+    assert_eq!(restored.current_sequence(), 3);
+}
