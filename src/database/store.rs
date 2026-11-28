@@ -668,6 +668,18 @@ impl WalBackedTablet {
         Ok(())
     }
 
+    /// The same-base WAL replacement duplicates the exact live file.
+    #[cfg(unix)]
+    pub(super) fn compaction_wal_demand(&self) -> std::io::Result<(&Path, u64)> {
+        let (_, _, bytes) = self.wal.portable_headers().map_err(std::io::Error::other)?;
+        let parent = self
+            .wal
+            .path()
+            .parent()
+            .ok_or_else(|| std::io::Error::other("WAL parent missing"))?;
+        Ok((parent, bytes))
+    }
+
     /// Verify the exact sealed prefix and its retained MVCC history before
     /// same-sequence rebinding. Compare both base snapshots, then replay the
     /// unchanged tail independently and compare with the acknowledged state.
