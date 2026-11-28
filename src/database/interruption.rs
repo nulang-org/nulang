@@ -1853,6 +1853,27 @@ fn managed_compaction_recovers_exact_base_and_tail_at_every_cutover_boundary() {
             GenerationStatus::Unreferenced
         };
         assert_eq!(managed.generation_status(&other).unwrap(), expected);
+        let backup = dir.join("lineage-backup");
+        managed.backup([7; 16], &backup).unwrap();
+        let quarantine = dir.join("lineage-quarantine");
+        if replaced {
+            managed.quarantine(other, &backup, &quarantine).unwrap();
+            let obsolete = ManifestStore::open(&quarantine, 97, 7).unwrap();
+            managed.reserve_retirement(&obsolete, &backup).unwrap();
+            drop(obsolete);
+            managed
+                .delete_reserved_generation(&quarantine, &backup)
+                .unwrap();
+            assert_eq!(
+                managed.retirement_status(&quarantine).unwrap(),
+                GenerationStatus::Deleted
+            );
+        } else {
+            assert!(managed.reserve_retirement(&other, &backup).is_err());
+            assert!(managed.quarantine(other, &backup, &quarantine).is_err());
+            assert!(!quarantine.exists());
+        }
+
         assert_eq!(
             managed
                 .commit_idempotent(TransactionId::new([4; 16]), vec![])
@@ -1860,7 +1881,6 @@ fn managed_compaction_recovers_exact_base_and_tail_at_every_cutover_boundary() {
                 .sequence(),
             4
         );
-        drop(other);
         drop(managed);
         fs::remove_dir_all(dir).unwrap();
     }

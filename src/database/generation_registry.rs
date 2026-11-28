@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const MAGIC: &[u8; 8] = b"NUDBREG1";
 const RETIREMENT_MAGIC: &[u8; 8] = b"NUDBREG2";
 const DELETION_MAGIC: &[u8; 8] = b"NUDBREG3";
+const LINEAGE_MAGIC: &[u8; 8] = b"NUDBREG4";
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ITEMS: usize = 8192;
 const MAX_PATH: usize = 4096;
@@ -56,6 +57,22 @@ struct Reference {
     owner: Owner,
     active: Digest,
     pending: Option<Digest>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pending_lineage: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// A committed, verified transition of one exact canonical WAL owner.
+/// Entries are appended only on reconciliation with the durable new WAL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Lineage {
+    owner: Vec<u8>,
+    from: Digest,
+    to: Digest,
 }
 
 /// A permanent reference fence for a specific verified physical copy.
@@ -79,6 +96,8 @@ struct State {
     references: Vec<Reference>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     retirements: Vec<Retirement>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    lineage: Vec<Lineage>,
 }
 
 impl State {
@@ -88,6 +107,7 @@ impl State {
             || self.known.len() > MAX_ITEMS
             || self.references.len() > MAX_ITEMS
             || self.retirements.len() > MAX_ITEMS
+            || self.lineage.len() > MAX_ITEMS
         {
             return Err(invalid("registry identity or count limit"));
         }
@@ -115,6 +135,7 @@ impl State {
         for r in &self.references {
             if previous.is_some_and(|p| p >= &r.owner)
                 || !self.known.contains(&r.active)
+                || (r.pending_lineage && (r.pending.is_none() || !matches!(r.owner, Owner::Wal(_))))
                 || self.is_retired(r.active)
                 || r.pending.is_some_and(|p| self.is_retired(p))
                 || r.pending
@@ -132,19 +153,53 @@ impl State {
             }
             previous = Some(&r.owner);
         }
+        // Each owner has one linear, noncyclic committed history ending at
+        // its actual active reference. A pending edge is not ancestry.
+        let mut chains = std::collections::BTreeMap::<&[u8], (Digest, BTreeSet<Digest>)>::new();
+        for edge in &self.lineage {
+            if edge.from == edge.to
+                || !self.known.contains(&edge.from)
+                || !self.known.contains(&edge.to)
+            {
+                return Err(invalid("invalid lineage edge"));
+            }
+            let chain = chains
+                .entry(&edge.owner)
+                .or_insert_with(|| (edge.from, BTreeSet::from([edge.from])));
+            if chain.0 != edge.from || !chain.1.insert(edge.to) {
+                return Err(invalid("nonlinear or cyclic lineage"));
+            }
+            chain.0 = edge.to;
+        }
+        for (owner, (last, seen)) in chains {
+            let i = self
+                .index(&Owner::Wal(owner.to_vec()))
+                .map_err(|_| invalid("lineage owner missing"))?;
+            let reference = &self.references[i];
+            if reference.active != last
+                || reference
+                    .pending
+                    .is_some_and(|p| !reference.pending_lineage || seen.contains(&p))
+            {
+                return Err(invalid("lineage does not match WAL reference"));
+            }
+        }
         Ok(())
     }
 
     fn encode(&self) -> io::Result<Vec<u8>> {
         self.validate()?;
-        let mut bytes = if self.retirements.iter().any(|r| r.deletion.is_some()) {
-            DELETION_MAGIC
-        } else if self.retirements.is_empty() {
-            MAGIC
-        } else {
-            RETIREMENT_MAGIC
-        }
-        .to_vec();
+        let mut bytes =
+            if !self.lineage.is_empty() || self.references.iter().any(|r| r.pending_lineage) {
+                LINEAGE_MAGIC
+            } else if self.retirements.iter().any(|r| r.deletion.is_some()) {
+                DELETION_MAGIC
+            } else if self.retirements.is_empty() {
+                MAGIC
+            } else {
+                RETIREMENT_MAGIC
+            }
+            .to_vec();
         // Bound serialized growth rather than trusting record count alone.
         struct Bounded<'a>(&'a mut Vec<u8>);
         impl Write for Bounded<'_> {
@@ -170,7 +225,8 @@ impl State {
             || bytes.len() > MAX_BYTES
             || (&bytes[..8] != MAGIC
                 && &bytes[..8] != RETIREMENT_MAGIC
-                && &bytes[..8] != DELETION_MAGIC)
+                && &bytes[..8] != DELETION_MAGIC
+                && &bytes[..8] != LINEAGE_MAGIC)
         {
             return Err(invalid("registry magic or length"));
         }
@@ -293,6 +349,7 @@ impl GenerationRegistry {
             known: BTreeSet::new(),
             references: Vec::new(),
             retirements: Vec::new(),
+            lineage: Vec::new(),
         };
         let bytes = state.encode()?;
         if fs::read_dir(&dir)?.next().is_some() {
@@ -550,6 +607,7 @@ impl GenerationRegistry {
                     owner,
                     active: digest,
                     pending: None,
+                    pending_lineage: false,
                 },
             ),
         }
@@ -632,7 +690,12 @@ impl GenerationRegistry {
         if new.sequence <= old.sequence {
             return Err(invalid("rotation must advance generation"));
         }
-        self.reserve_binding_change(path, old, new)
+        let track = self
+            .state
+            .lineage
+            .iter()
+            .any(|edge| edge.owner == path.as_os_str().as_bytes());
+        self.reserve_binding_change(path, old, new, track)
     }
 
     /// Same-sequence replacement, only after coordinator verifies compaction
@@ -646,7 +709,7 @@ impl GenerationRegistry {
         if new.sequence != old.sequence {
             return Err(invalid("compaction must preserve base sequence"));
         }
-        self.reserve_binding_change(path, old, new)
+        self.reserve_binding_change(path, old, new, true)
     }
 
     fn reserve_binding_change(
@@ -654,6 +717,7 @@ impl GenerationRegistry {
         path: &Path,
         old: SealBinding,
         new: SealBinding,
+        track: bool,
     ) -> io::Result<()> {
         let old_digest = self.digest(old)?;
         let new_digest = self.digest(new)?;
@@ -665,12 +729,54 @@ impl GenerationRegistry {
             .index(&Self::wal_owner(path))
             .map_err(|_| invalid("WAL not registered"))?;
         let r = &mut next.references[i];
-        if r.active != old_digest || r.pending.is_some_and(|p| p != new_digest) {
+        if r.active != old_digest
+            || r.pending
+                .is_some_and(|p| p != new_digest || r.pending_lineage != track)
+        {
             return Err(invalid("rotation does not match registered WAL"));
         }
         r.pending = Some(new_digest);
+        r.pending_lineage = track;
         next.known.insert(new_digest);
+        if track {
+            let mut committed = next.clone();
+            let r = &mut committed.references[i];
+            r.active = new_digest;
+            r.pending = None;
+            r.pending_lineage = false;
+            committed.lineage.push(Lineage {
+                owner: path.as_os_str().as_bytes().to_vec(),
+                from: old_digest,
+                to: new_digest,
+            });
+            committed.encode()?;
+        }
         self.update(next)
+    }
+
+    /// A strict committed ancestor of this exact WAL's current binding.
+    /// Never infer ancestry from a known digest or an aborted reservation.
+    pub(super) fn proves_ancestry(
+        &self,
+        path: &Path,
+        old: SealBinding,
+        current: SealBinding,
+    ) -> io::Result<bool> {
+        let old = self.digest(old)?;
+        let current = self.digest(current)?;
+        let i = self
+            .state
+            .index(&Self::wal_owner(path))
+            .map_err(|_| invalid("WAL not registered"))?;
+        let reference = &self.state.references[i];
+        if reference.active != current || reference.pending.is_some() || old == current {
+            return Ok(false);
+        }
+        Ok(self
+            .state
+            .lineage
+            .iter()
+            .any(|edge| edge.owner == path.as_os_str().as_bytes() && edge.from == old))
     }
 
     /// Only the live/reopened WAL coordinator can supply the observed binding.
@@ -686,8 +792,16 @@ impl GenerationRegistry {
         if r.active != digest && r.pending != Some(digest) {
             return Err(invalid("observed WAL not in registered rotation"));
         }
+        if r.pending_lineage && r.pending == Some(digest) {
+            next.lineage.push(Lineage {
+                owner: path.as_os_str().as_bytes().to_vec(),
+                from: r.active,
+                to: digest,
+            });
+        }
         r.active = digest;
         r.pending = None;
+        r.pending_lineage = false;
         self.update(next)
     }
 }

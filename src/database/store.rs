@@ -892,6 +892,27 @@ impl WalBackedTablet {
         self.verify_current_retirement_backup(active, obsolete.directory(), backup)
     }
 
+    /// Managed retirement additionally accepts committed lineage for this
+    /// exact WAL. The raw API retains the stricter physical-prefix check.
+    #[cfg(unix)]
+    pub(super) fn verify_managed_retirement_candidate(
+        &self,
+        registry: &super::generation_registry::GenerationRegistry,
+        active: &super::sst_manifest::ManifestStore,
+        obsolete: &super::sst_manifest::ManifestStore,
+        backup: &Path,
+    ) -> std::io::Result<super::sst_manifest::ManifestStore> {
+        let current = self.verified_registry_binding(active)?;
+        let old = obsolete.wal_binding()?;
+        if registry.proves_ancestry(self.wal.path(), old, current)? {
+            obsolete.verify_retirement_scope(active)?;
+            obsolete.verify_dedicated_files()?;
+            self.verify_current_retirement_backup(active, obsolete.directory(), backup)
+        } else {
+            self.verify_retirement_candidate(active, obsolete, backup)
+        }
+    }
+
     #[cfg(unix)]
     pub(super) fn verify_current_retirement_backup(
         &self,

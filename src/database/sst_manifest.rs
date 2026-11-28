@@ -668,18 +668,27 @@ impl ManifestStore {
     /// Only a strict older, exact physical prefix with matching historical
     /// receipts is eligible for quarantine; unrelated seals are not garbage.
     pub(super) fn verify_obsolete_prefix(&self, active: &Self) -> io::Result<()> {
+        if self.manifest.durable_sequence() >= active.manifest.durable_sequence()
+            || !active.manifest.entries.starts_with(&self.manifest.entries)
+        {
+            return Err(invalid("obsolete seal is not an exact older prefix"));
+        }
+        self.verify_retirement_scope(active)
+    }
+
+    /// Common checks for exact prefix and committed compaction lineage.
+    pub(super) fn verify_retirement_scope(&self, active: &Self) -> io::Result<()> {
         let old = self.recovery_meta()?;
         let new = active.recovery_meta()?;
         if old.descriptor != new.descriptor
             || old.floor > new.floor
-            || self.manifest.durable_sequence() >= active.manifest.durable_sequence()
-            || !active.manifest.entries.starts_with(&self.manifest.entries)
+            || self.manifest.durable_sequence() > active.manifest.durable_sequence()
             || old
                 .receipts
                 .iter()
                 .any(|(id, receipt)| new.receipts.get(id) != Some(receipt))
         {
-            return Err(invalid("obsolete seal is not an exact older prefix"));
+            return Err(invalid("obsolete seal scope or receipts disagree"));
         }
         self.sync_for_wal_binding()?;
         Ok(())

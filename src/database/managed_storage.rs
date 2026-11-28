@@ -185,8 +185,8 @@ impl ManagedTablet {
 
     /// Build and atomically bind a compacted sealed prefix at the existing
     /// floor and base sequence, preserving every acknowledged WAL tail frame.
-    /// Both directories remain intact; physical-prefix retirement does not
-    /// authorize deletion of a replaced compacted generation.
+    /// Both directories remain intact. Successful reconciliation records
+    /// committed lineage for later explicitly backup-gated retirement.
     pub fn compact(
         &mut self,
         mut next: ManifestStore,
@@ -236,9 +236,12 @@ impl ManagedTablet {
                 ))
             }
         }
-        let _archive =
-            self.tablet
-                .verify_retirement_candidate(&self.active, obsolete, backup.as_ref())?;
+        let _archive = self.tablet.verify_managed_retirement_candidate(
+            &self.registry,
+            &self.active,
+            obsolete,
+            backup.as_ref(),
+        )?;
         let result = self.registry.reserve_retirement(obsolete);
         if result.is_err() {
             self.fenced = true;
@@ -271,7 +274,8 @@ impl ManagedTablet {
                 self.tablet.descriptor().id().get(),
                 self.tablet.descriptor().ownership_epoch(),
             )?;
-            let archive = self.tablet.verify_retirement_candidate(
+            let archive = self.tablet.verify_managed_retirement_candidate(
+                &self.registry,
                 &self.active,
                 &obsolete,
                 backup.as_ref(),
@@ -311,7 +315,12 @@ impl ManagedTablet {
         if self.registry.status(&obsolete)? != GenerationStatus::Unreferenced {
             return Err(io::Error::other("generation is unknown or referenced"));
         }
-        self.tablet
-            .quarantine_obsolete_sst(&self.active, obsolete, backup, target)
+        let _archive = self.tablet.verify_managed_retirement_candidate(
+            &self.registry,
+            &self.active,
+            &obsolete,
+            backup.as_ref(),
+        )?;
+        obsolete.quarantine(target.as_ref())
     }
 }
