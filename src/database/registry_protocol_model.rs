@@ -307,6 +307,7 @@ fn actual_managed_rotation_matches_model_through_repeated_recovery_interruptions
     }
     let visited = explore(Policy::Ordered).unwrap();
 
+    let mut replayed = 0;
     for (hook, occurrence, phase) in [
         (Hook::RegistryBeforeRename, 0, Phase::Ready),
         (Hook::RegistryAfterRename, 0, Phase::ReserveRenamed),
@@ -318,155 +319,223 @@ fn actual_managed_rotation_matches_model_through_repeated_recovery_interruptions
         (Hook::RegistryAfterRename, 1, Phase::ReconcileRenamed),
     ] {
         let expected = *path.iter().find(|s| s.phase == phase).unwrap();
-        let fixture = Fixture(std::env::temp_dir().join(format!(
-            "nudb-protocol-replay-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        )));
-        fs::create_dir(&fixture.0).unwrap();
-        let old_dir = fixture.0.join("old");
-        let new_dir = fixture.0.join("new");
-        let reg_dir = fixture.0.join("registry");
-        for dir in [&old_dir, &new_dir, &reg_dir] {
-            fs::create_dir(dir).unwrap();
-        }
-        let wal = fixture.0.join("tablet.wal");
-        let descriptor = TabletDescriptor::new(
-            TabletId::new(97).unwrap(),
-            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
-            7,
-        )
-        .unwrap();
-        let mutation = |value: &[u8]| {
-            vec![TabletMutation::Put {
-                key: b"k".to_vec(),
-                value: value.to_vec(),
-            }]
-        };
-        let first = TransactionId::new([1; 16]);
-        let second = TransactionId::new([2; 16]);
-        let mut raw = WalBackedTablet::open(descriptor.clone(), &wal).unwrap();
-        let first_receipt = raw.commit_idempotent(first, mutation(b"first")).unwrap();
-        let mut old = ManifestStore::create(&old_dir, 97, 7).unwrap();
-        raw.flush_sst_shadow(&mut old, 1).unwrap();
-        raw.seal_sst_recovery(&mut old).unwrap();
-        raw.reclaim_to_sealed_sst(&old).unwrap();
-        let registry = GenerationRegistry::create(&reg_dir, 97, 7).unwrap();
-        let mut managed = ManagedTablet::adopt(raw, registry, old).unwrap();
-        let second_receipt = managed
-            .commit_idempotent(second, mutation(b"second"))
-            .unwrap();
-        let next = ManifestStore::create(&new_dir, 97, 7).unwrap();
-        let err =
-            with_interruption_occurrence(hook, occurrence, || managed.rotate(next, 1)).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("injected NulangDB storage interruption"),
-            "{hook:?} occurrence {occurrence}: {err}"
-        );
-        assert!(managed.read_at(b"k", 2).is_err());
-        drop(managed);
-        let bytes = fs::read(&wal).unwrap();
-
-        // An injected process-visible I/O error retains successful renames.
-        // This is one legal outcome of the abstract power-loss model, not
-        // a simulation of lost unsynced directory writes.
-        let mut recovered = State {
-            registry: expected.registry,
-            durable_registry: expected.registry,
-            wal: expected.wal,
-            durable_wal: expected.wal,
-            phase: Phase::Recover,
-        };
-        assert!(visited.contains(&recovered), "{recovered:?}");
-        let (current, other) = match recovered.wal {
-            Binding::Old => (&old_dir, &new_dir),
-            Binding::New => (&new_dir, &old_dir),
-        };
-        let inspect = |state: State| {
-            let registry = GenerationRegistry::open(&reg_dir, 97, 7).unwrap();
-            let old = ManifestStore::open(&old_dir, 97, 7).unwrap();
-            let new = ManifestStore::open(&new_dir, 97, 7).unwrap();
-            check_registry(&registry, &old, &new, state.registry);
-        };
-        inspect(recovered);
-        let registry = GenerationRegistry::open(&reg_dir, 97, 7).unwrap();
-        assert!(ManagedTablet::open(descriptor.clone(), &wal, other, registry).is_err());
-        assert_eq!(fs::read(&wal).unwrap(), bytes);
-
-        // Interrupt reopening three more times, including before and after
-        // the registry reconciliation rename. Compute each next expected
-        // state by executing the model's recovery transitions.
-        for recovery_hook in [
-            Hook::RegistryBeforeWalSync,
-            Hook::RegistryBeforeRename,
-            Hook::RegistryAfterRename,
-        ] {
-            let registry = GenerationRegistry::open(&reg_dir, 97, 7).unwrap();
-            let result = with_interruption_occurrence(recovery_hook, 0, || {
-                ManagedTablet::open(descriptor.clone(), &wal, current, registry)
-            });
-            // An already reconciled registry is unchanged: the engine
-            // deliberately omits the redundant publication and its hooks.
-            if recovered.registry != Registry::Pending
-                && recovery_hook != Hook::RegistryBeforeWalSync
-            {
-                drop(result.expect("already reconciled registry must reopen without rename"));
-                inspect(recovered);
-                assert_eq!(fs::read(&wal).unwrap(), bytes);
-                continue;
+        let outcomes: HashSet<_> = expected
+            .successors(Policy::Ordered)
+            .into_iter()
+            .filter(|(label, _)| *label == "power interruption")
+            .map(|(_, state)| state)
+            .collect();
+        let mut outcomes: Vec<_> = outcomes.into_iter().collect();
+        outcomes.sort_by_key(|state| (state.registry as u8, state.wal as u8));
+        for outcome in outcomes {
+            let fixture = Fixture(std::env::temp_dir().join(format!(
+                "nudb-protocol-replay-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            )));
+            fs::create_dir(&fixture.0).unwrap();
+            let old_dir = fixture.0.join("old");
+            let new_dir = fixture.0.join("new");
+            let reg_dir = fixture.0.join("registry");
+            for dir in [&old_dir, &new_dir, &reg_dir] {
+                fs::create_dir(dir).unwrap();
             }
-            let err = result.expect_err("expected recovery interruption");
+            let wal = fixture.0.join("tablet.wal");
+            let descriptor = TabletDescriptor::new(
+                TabletId::new(97).unwrap(),
+                KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+                7,
+            )
+            .unwrap();
+            let mutation = |value: &[u8]| {
+                vec![TabletMutation::Put {
+                    key: b"k".to_vec(),
+                    value: value.to_vec(),
+                }]
+            };
+            let first = TransactionId::new([1; 16]);
+            let second = TransactionId::new([2; 16]);
+            let mut raw = WalBackedTablet::open(descriptor.clone(), &wal).unwrap();
+            let first_receipt = raw.commit_idempotent(first, mutation(b"first")).unwrap();
+            let mut old = ManifestStore::create(&old_dir, 97, 7).unwrap();
+            raw.flush_sst_shadow(&mut old, 1).unwrap();
+            raw.seal_sst_recovery(&mut old).unwrap();
+            raw.reclaim_to_sealed_sst(&old).unwrap();
+            let registry = GenerationRegistry::create(&reg_dir, 97, 7).unwrap();
+            let mut managed = ManagedTablet::adopt(raw, registry, old).unwrap();
+            let second_receipt = managed
+                .commit_idempotent(second, mutation(b"second"))
+                .unwrap();
+            let registry_path = reg_dir.join("GENERATIONS");
+            let old_registry_bytes = fs::read(&registry_path).unwrap();
+            let old_wal_bytes = fs::read(&wal).unwrap();
+            let next = ManifestStore::create(&new_dir, 97, 7).unwrap();
+            // For the lost reconciliation rename, capture the exact pending
+            // registry image from the same fixture before reopening. It includes
+            // this fixture's canonical WAL path and registry identity.
+            let lose_reconciliation =
+                phase == Phase::ReconcileRenamed && outcome.registry != expected.registry;
+            let (first_hook, first_occurrence) = if lose_reconciliation {
+                (Hook::WalReclaimAfterDirectorySync, 0)
+            } else {
+                (hook, occurrence)
+            };
+            let err = with_interruption_occurrence(first_hook, first_occurrence, || {
+                managed.rotate(next, 1)
+            })
+            .unwrap_err();
             assert!(
                 err.to_string()
                     .contains("injected NulangDB storage interruption"),
-                "{err}"
+                "{hook:?} occurrence {occurrence}: {err}"
             );
-            if recovery_hook == Hook::RegistryAfterRename {
-                let synced = recovered
-                    .successors(Policy::Ordered)
-                    .into_iter()
-                    .find(|(_, state)| state.phase == Phase::WalSynced)
-                    .unwrap()
-                    .1;
-                let renamed = synced
-                    .successors(Policy::Ordered)
-                    .into_iter()
-                    .find(|(_, state)| state.phase == Phase::ReconcileRenamed)
-                    .unwrap()
-                    .1;
-                recovered.registry = renamed.registry;
-                recovered.durable_registry = renamed.registry;
+            assert!(managed.read_at(b"k", 2).is_err());
+            drop(managed);
+            // Materialize the model's alternate rename outcomes using only
+            // exact bytes captured from this disposable, unlocked fixture.
+            // This tests recovery from possible durable images, not actual
+            // filesystem persistence or the correctness of fsync itself.
+            if lose_reconciliation {
+                let pending = fs::read(&registry_path).unwrap();
+                let registry = GenerationRegistry::open(&reg_dir, 97, 7).unwrap();
+                let err = with_interruption_occurrence(Hook::RegistryAfterRename, 0, || {
+                    ManagedTablet::open(descriptor.clone(), &wal, &new_dir, registry)
+                })
+                .unwrap_err();
+                assert!(err
+                    .to_string()
+                    .contains("injected NulangDB storage interruption"));
+                assert_ne!(fs::read(&registry_path).unwrap(), pending);
+                restore_fixture_image(&registry_path, &pending);
+            } else if outcome.registry != expected.registry {
+                assert_eq!(phase, Phase::ReserveRenamed);
+                assert_ne!(fs::read(&registry_path).unwrap(), old_registry_bytes);
+                restore_fixture_image(&registry_path, &old_registry_bytes);
             }
-            assert!(visited.contains(&recovered));
+            if outcome.wal != expected.wal {
+                assert_eq!(phase, Phase::WalRenamed);
+                assert_ne!(fs::read(&wal).unwrap(), old_wal_bytes);
+                restore_fixture_image(&wal, &old_wal_bytes);
+            }
+            let bytes = fs::read(&wal).unwrap();
+            let mut recovered = outcome;
+            assert!(visited.contains(&recovered), "{recovered:?}");
+            let (current, other) = match recovered.wal {
+                Binding::Old => (&old_dir, &new_dir),
+                Binding::New => (&new_dir, &old_dir),
+            };
+            let inspect = |state: State| {
+                let registry = GenerationRegistry::open(&reg_dir, 97, 7).unwrap();
+                let old = ManifestStore::open(&old_dir, 97, 7).unwrap();
+                let new = ManifestStore::open(&new_dir, 97, 7).unwrap();
+                check_registry(&registry, &old, &new, state.registry);
+            };
             inspect(recovered);
+            let registry = GenerationRegistry::open(&reg_dir, 97, 7).unwrap();
+            assert!(ManagedTablet::open(descriptor.clone(), &wal, other, registry).is_err());
             assert_eq!(fs::read(&wal).unwrap(), bytes);
+
+            // Interrupt reopening three more times, including before and after
+            // the registry reconciliation rename. Compute each next expected
+            // state by executing the model's recovery transitions.
+            for recovery_hook in [
+                Hook::RegistryBeforeWalSync,
+                Hook::RegistryBeforeRename,
+                Hook::RegistryAfterRename,
+            ] {
+                let registry = GenerationRegistry::open(&reg_dir, 97, 7).unwrap();
+                let result = with_interruption_occurrence(recovery_hook, 0, || {
+                    ManagedTablet::open(descriptor.clone(), &wal, current, registry)
+                });
+                // An already reconciled registry is unchanged: the engine
+                // deliberately omits the redundant publication and its hooks.
+                if recovered.registry != Registry::Pending
+                    && recovery_hook != Hook::RegistryBeforeWalSync
+                {
+                    drop(result.expect("already reconciled registry must reopen without rename"));
+                    inspect(recovered);
+                    assert_eq!(fs::read(&wal).unwrap(), bytes);
+                    continue;
+                }
+                let err = result.expect_err("expected recovery interruption");
+                assert!(
+                    err.to_string()
+                        .contains("injected NulangDB storage interruption"),
+                    "{err}"
+                );
+                if recovery_hook == Hook::RegistryAfterRename {
+                    let synced = recovered
+                        .successors(Policy::Ordered)
+                        .into_iter()
+                        .find(|(_, state)| state.phase == Phase::WalSynced)
+                        .unwrap()
+                        .1;
+                    let renamed = synced
+                        .successors(Policy::Ordered)
+                        .into_iter()
+                        .find(|(_, state)| state.phase == Phase::ReconcileRenamed)
+                        .unwrap()
+                        .1;
+                    recovered.registry = renamed.registry;
+                    recovered.durable_registry = renamed.registry;
+                }
+                assert!(visited.contains(&recovered));
+                inspect(recovered);
+                assert_eq!(fs::read(&wal).unwrap(), bytes);
+            }
+            let registry = GenerationRegistry::open(&reg_dir, 97, 7).unwrap();
+            let mut managed = ManagedTablet::open(descriptor, &wal, current, registry).unwrap();
+            assert_eq!(managed.current_sequence(), 2);
+            assert_eq!(managed.read_at(b"k", 1).unwrap(), Some(b"first".as_slice()));
+            assert_eq!(
+                managed.read_at(b"k", 2).unwrap(),
+                Some(b"second".as_slice())
+            );
+            assert_eq!(
+                managed
+                    .commit_idempotent(first, mutation(b"first"))
+                    .unwrap(),
+                first_receipt
+            );
+            assert_eq!(
+                managed
+                    .commit_idempotent(second, mutation(b"second"))
+                    .unwrap(),
+                second_receipt
+            );
+            let other = ManifestStore::open(other, 97, 7).unwrap();
+            assert_ne!(
+                managed.generation_status(&other).unwrap(),
+                GenerationStatus::Referenced
+            );
+            assert_eq!(fs::read(&wal).unwrap(), bytes);
+            replayed += 1;
         }
-        let registry = GenerationRegistry::open(&reg_dir, 97, 7).unwrap();
-        let mut managed = ManagedTablet::open(descriptor, &wal, current, registry).unwrap();
-        assert_eq!(managed.current_sequence(), 2);
-        assert_eq!(managed.read_at(b"k", 1).unwrap(), Some(b"first".as_slice()));
-        assert_eq!(
-            managed.read_at(b"k", 2).unwrap(),
-            Some(b"second".as_slice())
-        );
-        assert_eq!(
-            managed
-                .commit_idempotent(first, mutation(b"first"))
-                .unwrap(),
-            first_receipt
-        );
-        assert_eq!(
-            managed
-                .commit_idempotent(second, mutation(b"second"))
-                .unwrap(),
-            second_receipt
-        );
-        let other = ManifestStore::open(other, 97, 7).unwrap();
-        assert_ne!(
-            managed.generation_status(&other).unwrap(),
-            GenerationStatus::Referenced
-        );
-        assert_eq!(fs::read(&wal).unwrap(), bytes);
     }
+    assert_eq!(
+        replayed, 11,
+        "exercise every distinct modeled outcome at each of eight hooks"
+    );
+}
+
+/// Replace only a test fixture's named file with its captured pre-rename
+/// image. All engine handles must have been dropped before this call.
+#[cfg(unix)]
+fn restore_fixture_image(path: &std::path::Path, bytes: &[u8]) {
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    let temporary = path.with_extension("model-restore");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .unwrap();
+    file.write_all(bytes).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    fs::rename(&temporary, path).unwrap();
+    fs::File::open(path.parent().unwrap())
+        .unwrap()
+        .sync_all()
+        .unwrap();
 }
