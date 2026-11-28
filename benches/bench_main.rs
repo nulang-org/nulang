@@ -9,6 +9,7 @@ mod aot_bench;
 mod cache_bench;
 mod dist_bench;
 mod gc_bench;
+mod infrastructure_bench;
 mod interp_bench;
 #[cfg(feature = "native-codegen")]
 mod jit_bench;
@@ -24,6 +25,7 @@ criterion_main!(
     interp_bench::benches,
     actor_bench::benches,
     cache_bench::benches,
+    infrastructure_bench::benches,
     aot_bench::benches,
     jit_bench::benches,
     gc_bench::benches,
@@ -38,6 +40,7 @@ criterion_main!(
     interp_bench::benches,
     actor_bench::benches,
     cache_bench::benches,
+    infrastructure_bench::benches,
     gc_bench::benches,
     dist_bench::benches,
     persist_bench::benches,

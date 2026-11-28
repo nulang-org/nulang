@@ -115,6 +115,9 @@ jobs:
       - name: Test benchmark harness scripts
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
+      - name: Smoke infrastructure benchmarks (no performance claims)
+        run: python3 scripts/infrastructure_bench_smoke.py --storage-root "$RUNNER_TEMP"
+
       - name: Install cargo-llvm-cov
         if: env.CODECOV_TOKEN != ''
         run: cargo install cargo-llvm-cov --locked
