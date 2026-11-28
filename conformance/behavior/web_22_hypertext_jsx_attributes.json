@@ -1,0 +1,5 @@
+{
+  "exit_code": 0,
+  "stdout": "<button class=\"syn-button\" aria-pressed=\"true\" data-syn-state=\"active\" hx-get=\"/status\" data-on:click=\"$count = $count + 1\">Refresh</button>",
+  "stderr": ""
+}

@@ -1,0 +1,9 @@
+import stdlib::web::html
+import stdlib::web::types
+
+fn main() {
+    let enabled = text("true")
+    let endpoint = text("/status")
+    let h = <button class="syn-button" aria-pressed={enabled} data-syn-state="active" hx-get={endpoint} data-on:click="$count = $count + 1">Refresh</button>
+    perform IO.print(h)
+}

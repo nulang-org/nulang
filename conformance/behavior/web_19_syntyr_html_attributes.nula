@@ -1,0 +1,13 @@
+import stdlib::web::html
+import stdlib::web::types
+
+fn main() {
+    let h = el("button", [
+        ("type", text("button")),
+        ("class", text("syn-button syn-button--primary")),
+        ("aria-pressed", text("true")),
+        ("data-syn-state", text("active")),
+        ("title", text("Save & review \"draft\""))
+    ], [text("Save <draft>")])
+    perform IO.print(h)
+}

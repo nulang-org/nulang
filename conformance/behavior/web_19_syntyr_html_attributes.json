@@ -1,0 +1,5 @@
+{
+  "exit_code": 0,
+  "stdout": "<button type=\"button\" class=\"syn-button syn-button--primary\" aria-pressed=\"true\" data-syn-state=\"active\" title=\"Save &amp; review &quot;draft&quot;\">Save &lt;draft&gt;</button>",
+  "stderr": ""
+}

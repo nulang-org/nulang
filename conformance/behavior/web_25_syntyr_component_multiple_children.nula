@@ -1,0 +1,17 @@
+import stdlib::web::html
+import stdlib::web::types
+
+component Panel(title: String) {
+    <article class="syn-panel">
+        <h2 class="syn-heading">{title}</h2>
+        <slot />
+    </article>
+}
+
+fn main() {
+    let view = <Panel title="Operations">
+        <p class="syn-muted">All systems ready.</p>
+        <button class="syn-button">Refresh</button>
+    </Panel>
+    perform IO.print(view)
+}

@@ -104,7 +104,7 @@ An `app` block desugars into `perform Web.route(method, path, handler)` calls pl
 
 ### Building HTML
 
-The `stdlib::web::types` module defines `Html` as an **opaque type** — a compile-time distinction from `String` that erases at runtime. This is why you can't accidentally splice an unescaped string into a page:
+The `stdlib::web::types` module defines `Html` as an **opaque type** — a compile-time distinction from `String` that erases at runtime. Use the escaping `text` constructor for untrusted strings, and reserve `raw` for explicitly trusted markup:
 
 - `perform Web.html(tag: String, attrs: [(String, Html)], children: [Html]) -> Html` — build an element
 - `perform Web.text(s: String) -> Html` — escape and wrap as a text node
@@ -116,6 +116,49 @@ The `stdlib::web::html` module adds ergonomic helpers: `el`, `txt`, `attr`, `bod
 :::note
 `Web.redirect` produces an HTML page with a `<meta http-equiv="refresh">` and is sent with status 200 — not an HTTP 3xx. Browsers follow it; API clients will not.
 :::
+
+### JSX text, components, and safe interpolation (experimental)
+
+Nulang's JSX-like syntax lowers to ordinary `Html` expressions. Literal text preserves
+punctuation and inline spaces; indentation-only gaps are removed from multiline
+markup. All ordinary `{expression}` interpolations are **escaped** using `Web.text`,
+including string props and values derived from requests.
+
+Use `{html: expression}` only when `expression` is already a trusted/escaped
+`Html` fragment. This is an explicit trust boundary: applying it to an
+untrusted `String` can create an HTML-injection vulnerability.
+
+```nulang
+import stdlib::web::html
+import stdlib::web::types
+
+component Panel(title: String) {
+    <article class="syn-panel">
+        <h2 class="syn-heading">{title}</h2>
+        <slot />
+    </article>
+}
+
+fn home() -> Html {
+    <main class="syn-root">
+        <Panel title="Operations">
+            <p>Escaped by default: {"<unsafe>"}</p>
+            <p>Multiple child nodes work without a wrapper.</p>
+        </Panel>
+    </main>
+}
+```
+
+`component` is compile-time markup composition: it accepts named props and
+expands `<slot />` into the invocation's child nodes. It requires the component
+to be declared before use in the same source module. Unknown/duplicate/missing
+props are compile errors; component-specific JavaScript is not generated.
+Use native HTML and ARIA state attributes for interactivity. Ordinary
+`el`/`text` construction remains supported and does not require JSX.
+
+This is experimental syntax rather than a stable component ABI. It does not
+supply a general framework for hydration, client-side state, or form-action
+security; those remain Nulang Web host responsibilities.
 
 ### Reading the Request
 
@@ -133,7 +176,7 @@ Inside a handler, these operations access the current request:
 The `stdlib::web::host` module wraps these plus a few more implemented operations: `request_method()`, `form_fields()` / `form_value(name)` for URL-encoded bodies, and an ephemeral in-memory key/value store (`kv_get`, `kv_set`, `kv_delete`, `kv_all`) handy for demos. The kv store is per-process and not persisted.
 
 :::caution
-Route parameters are **statically checked**: if a route declares `/chat/:room`, the handler must literally contain `perform Web.param("room")` or compilation fails with a route-parameter error. The check is syntactic — it does not follow calls into helper functions.
+Route parameters are **statically checked**: if a route declares `/chat/:room`, the handler must contain `perform Web.param("room")` or the stdlib wrapper `param("room")`, or compilation fails with a route-parameter error. The check is syntactic — it does not follow arbitrary helper functions.
 :::
 
 ## A Complete Minimal Web Server

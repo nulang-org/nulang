@@ -173,36 +173,45 @@ fn merge_imported_decls(
     Ok(())
 }
 
+/// Locate a shipped stdlib module with one consistent search order.
+/// Source-built CLI binaries also work when launched from another project.
+pub(crate) fn resolve_stdlib_module(module: &str) -> PathBuf {
+    let file = format!(
+        "{}.nula",
+        module.replace("::", std::path::MAIN_SEPARATOR_STR)
+    );
+    if let Ok(dir) = std::env::var("NULANG_STDLIB") {
+        return PathBuf::from(dir).join(&file);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let candidate = exe_dir.join("stdlib").join(&file);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let candidate = cwd.join("src").join("stdlib").join(&file);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    // Development fallback for a source-built compiler invoked from a
+    // separate application directory. Installed binaries use adjacent stdlib.
+    let source_checkout = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("stdlib")
+        .join(&file);
+    if source_checkout.exists() {
+        return source_checkout;
+    }
+    PathBuf::from("src").join("stdlib").join(file)
+}
+
 fn resolve_path(base: &Path, import: &str) -> PathBuf {
-    // stdlib::set → resolve to STDLIB_DIR/set.nula or dev fallback.
-    // stdlib::web::types → STDLIB_DIR/web/types.nula.
     if let Some(module) = import.strip_prefix("stdlib::") {
-        let module_path = module.replace("::", std::path::MAIN_SEPARATOR_STR);
-        // Try NULANG_STDLIB env var first
-        if let Ok(dir) = std::env::var("NULANG_STDLIB") {
-            return PathBuf::from(dir).join(format!("{}.nula", module_path));
-        }
-        // Try relative to executable
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(exe_dir) = exe.parent() {
-                let candidate = exe_dir.join("stdlib").join(format!("{}.nula", module_path));
-                if candidate.exists() {
-                    return candidate;
-                }
-            }
-        }
-        // Development fallback: src/stdlib/ relative to CWD
-        if let Ok(cwd) = std::env::current_dir() {
-            let dev_path = cwd
-                .join("src")
-                .join("stdlib")
-                .join(format!("{}.nula", module_path));
-            if dev_path.exists() {
-                return dev_path;
-            }
-        }
-        // Last resort: relative to CWD
-        return PathBuf::from(format!("src/stdlib/{}.nula", module_path));
+        return resolve_stdlib_module(module);
     }
 
     // @nulang/auth or @nulang/auth/session → resolved via NULANG_MODULE_PATH.

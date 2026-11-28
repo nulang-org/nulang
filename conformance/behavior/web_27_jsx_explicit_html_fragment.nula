@@ -1,0 +1,12 @@
+import stdlib::web::html
+import stdlib::web::types
+
+fn badge(label: String) -> Html {
+    el("strong", [("class", text("syn-badge"))], [text(label)])
+}
+
+fn main() {
+    let content = badge("Safe")
+    let h = <section class="syn-panel">{html: content}</section>
+    perform IO.print(h)
+}
