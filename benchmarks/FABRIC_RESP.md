@@ -263,3 +263,22 @@ open-loop, write-contention, eviction or production-capacity test.
 Contract tests:
 
     python3 -m unittest discover -s scripts/tests -p 'test_fabric_resp*bench.py'
+
+### Optional process efficiency telemetry (Linux)
+
+Add `--process-metrics` to the keyspace command to capture each server's
+process CPU time and resident memory from /proc. Each raw round and scalar
+median includes idle RSS (after readiness and control connection), RSS after
+preloading all keys, signed preload RSS delta divided by key count, post-run
+RSS, lifetime peak RSS (VmHWM), CPU seconds during the measured worker
+interval, and CPU nanoseconds per validated GET. CPU snapshots bracket the
+synchronized start and completed workers, so teardown can contribute a small
+amount; warmup and preload are excluded from CPU time. The report records the
+kernel CPU accounting tick rate. Use long enough samples that many CPU ticks
+are observed: zero or one tick cannot establish a precise per-operation cost.
+RSS is page-granular and includes the process/runtime, shared mappings and
+allocator slack; the preload delta is an approximate resident cost, not
+allocated bytes per entry. Peak RSS includes setup and warmup. These are not
+hardware cycle counters or allocation counts. Telemetry reads occur outside
+the measured per-batch round trips. The option fails rather than silently
+reporting fabricated values if the requested Linux process data is unavailable.
