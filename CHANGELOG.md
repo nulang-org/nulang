@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Fabric resident-adaptive probation — 2026-11-28
+- **Scale the S3-FIFO probationary target to resident occupancy at victim-plan start**, recovering tight-arena hot-set retention without changing scan or admission bounds.
+
+### Fabric arena-aware eviction — 2026-11-28
+- **Plan memory-cache S3-FIFO victims against entry count and reusable arena size classes**, with atomic failure, protected targets, fragmentation regressions and seeded mixed-size comparison. No dependency or durable-mode changes.
+
 ### Fabric coalescing qualification — 2026-11-27
 - **Honor the embedded caller readiness-wait budget across both group collection polls**, including nonblocking callers; qualify wake/shutdown ordering, mutual TLS, acknowledged-state recovery and real file-write failure with coalescing enabled. No dependency or default-setting changes.
 
