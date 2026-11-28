@@ -282,3 +282,38 @@ allocated bytes per entry. Peak RSS includes setup and warmup. These are not
 hardware cycle counters or allocation counts. Telemetry reads occur outside
 the measured per-batch round trips. The option fails rather than silently
 reporting fabricated values if the requested Linux process data is unavailable.
+
+### Focused large-keyspace observation (2026-11-27)
+
+Raw report: fabric-resp-keyspace-20261127.json. A locked Cargo full-release
+build with two jobs timed out at 100 seconds; dependencies completed but the
+full binary did not. The fallback compiled an optimized rlib named nulang
+with a wrapper exposing the ten unmodified runtime cache/RESP modules listed
+in the report under runtime, then compiled the unmodified
+src/bin/nulang-fabric.rs against it. Both rustc invocations used edition
+2021, opt-level 3, eight codegen units and the exact locked Cargo release
+dependency rlibs; the library enabled cache-server. This is NOT the
+full-release LTO build. Source and lock hashes, executable hashes, and
+compiler version are recorded. All eighteen samples ran successfully.
+
+65,536 preloaded keys, 64-byte values, 8 clients, 16,384 measured GETs per
+client, pipeline 32, three alternating-order rounds per engine; process
+telemetry enabled. Median results:
+
+| Distribution | Fabric ops/s | Valkey ops/s | Fabric batch p99 ms | Valkey batch p99 ms | Fabric CPU ns/GET | Valkey CPU ns/GET |
+|---|---:|---:|---:|---:|---:|---:|
+| Shared | 466,822 | 470,717 | 1.440 | 1.400 | 687 | 839 |
+| Uniform | 471,211 | 474,491 | 1.447 | 1.409 | 1,144 | 916 |
+| Hot90 | 479,944 | 474,376 | 1.414 | 1.418 | 763 | 839 |
+
+All throughput differences are within about 1.2%; client-side Python
+batch construction and scheduling may dominate. Total post-preload RSS
+was about 14.3 MiB for Fabric and 20.6–20.8 MiB for Valkey, but the
+incremental preload RSS delta was about 178 B/key for Fabric versus
+141–143 B/key for Valkey. Lower absolute process RSS is therefore not
+evidence of better per-key memory efficiency. CPU accounting is coarse
+and the uniform case motivates profiling of hash/index/arena locality;
+it does not prove a specific bottleneck. The host was shared, no full
+release or competing engines beyond Valkey were tested, and closed-loop
+batch p99 is not per-command service latency. Do not use these results
+as a regression gate or production capacity estimate.
