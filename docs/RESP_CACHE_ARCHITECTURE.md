@@ -968,3 +968,11 @@ No physical power-loss, filesystem journal replay, controller-cache
 or destructive fault experiment is claimed. Use a disposable VM/disk
 with forced power interruption or a block-device fault harness for
 that separate qualification gate.
+
+## Disposable guest-kernel loss and block-device qualification
+
+See [Fabric VM durability qualification](FABRIC_VM_DURABILITY.md) for the
+opt-in QEMU/ext4 harness, acknowledgement and recovery checks, guest-only
+device-mapper error target, safe execution constraints, and evidence limits.
+This is a separate local qualification gate, not a hosted CI or physical
+host power-loss claim.

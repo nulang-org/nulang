@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Fabric guest-kernel durability qualification — 2026-11-27
+- **Add disposable QEMU/ext4 guest power-cut and block-device error qualification**, checking acknowledged data, expiration, checkpoint recovery, fail-stop on device I/O failure, and successful post-recovery mutation. No host device access, production runtime changes or new dependencies.
+
 ### Fabric filesystem crash qualification — 2026-11-27
 - **Qualify real process crashes at WAL, checkpoint and clock publication boundaries**, plus kernel file-size exhaustion in all synchronous modes. Release owning advisory locks explicitly to prevent inherited descriptors from retaining stale locks while preserving stable-lock ownership across rotation. No new dependencies.
 
