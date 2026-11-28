@@ -419,9 +419,13 @@ pub(crate) fn perform_web_builtin(
         Some("route") => Some(crate::vm::Value::unit()),
         Some("redirect") => {
             let url = resolve(constants, *regs.first()?);
+            // When serving HTTP, the request adapter turns this Respond effect
+            // into an actual 303/Location response. Standalone/static rendering
+            // retains the previous HTML fallback for compatibility.
+            crate::runtime::http_server::record_response_redirect(&url);
             let out = format!(
                 "<html><head><meta http-equiv=\"refresh\" content=\"0;url={}\"></head></html>",
-                url
+                html_escape(&url)
             );
             Some(callbacks.alloc_string(&out))
         }
