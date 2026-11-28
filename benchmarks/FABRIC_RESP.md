@@ -233,3 +233,33 @@ per client. Repeat with a full release executable, dedicated hardware,
 longer workload and storage fault qualification before default adoption.
 The candidate remains opt-in. No direct Valkey comparison is implied by
 this same-Fabric experiment.
+
+## Shared-key and larger-keyspace GET qualification
+
+The independent-client benchmark repeats one key per connection. Use the
+following memory-only supplement to measure shared hot-key pressure, uniform
+random access, and a 90% single-hot-key / 10% uniform-cold workload:
+
+    python3 scripts/fabric_resp_keyspace_bench.py \
+      --fabric target/release/nulang-fabric \
+      --valkey /usr/bin/valkey-server \
+      --journal-dir /path/to/local/disk \
+      --output /tmp/fabric-keyspace.json \
+      --keys 4096 --clients 8 --commands 8192 --pipeline 32 --rounds 3
+
+Repeat with --keys 65536 and --pipeline 1 to investigate working-set and
+pipelining effects. Each sample uses a fresh server and a preloaded shared
+dataset with distinct 64-byte values, deterministic per-client traces,
+synchronized starts, bounded client/key/command counts, and byte-exact
+ordered reply validation. A round uses the same seed for both engines.
+Reports contain per-round throughput, pooled batch RTT percentiles, observed
+key-zero request count, distinct requested key count, and executable hashes.
+No partial matrix is written on workload failure. The warmup and preload are
+excluded from timing; throughput includes Python batch construction and
+client scheduling, while batch RTT excludes batch construction. This is a
+single-node closed-loop GET experiment, not a multicore shard-scaling,
+open-loop, write-contention, eviction or production-capacity test.
+
+Contract tests:
+
+    python3 -m unittest discover -s scripts/tests -p 'test_fabric_resp*bench.py'
