@@ -324,3 +324,283 @@ fn failed_write_requires_reconciliation_before_retry() {
     drop(recovered);
     cleanup(&path);
 }
+
+#[cfg(unix)]
+mod managed_model {
+    use super::super::generation_registry::{GenerationRegistry, GenerationStatus};
+    use super::super::managed_storage::ManagedTablet;
+    use super::super::sst_manifest::ManifestStore;
+    use super::super::tablet::{TransactionId, TransactionReceipt};
+    use super::*;
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let path = temp_wal("managed").with_extension("dir");
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn dir(&self, name: &str) -> PathBuf {
+            let path = self.0.join(name);
+            fs::create_dir(&path).unwrap();
+            path
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    fn manifest(path: &Path) -> ManifestStore {
+        ManifestStore::create(path, 127, EPOCH).unwrap()
+    }
+    fn reopen(wal: &Path, active: &Path, reg: &Path) -> ManagedTablet {
+        ManagedTablet::open(
+            descriptor(),
+            wal,
+            active,
+            GenerationRegistry::open(reg, 127, EPOCH).unwrap(),
+        )
+        .unwrap()
+    }
+    fn tx(sequence: u64) -> TransactionId {
+        let mut bytes = [0; 16];
+        bytes[..8].copy_from_slice(&sequence.to_le_bytes());
+        TransactionId::new(bytes)
+    }
+    type Ledger = Vec<(Vec<TabletMutation>, TransactionReceipt)>;
+    fn check(
+        db: &mut ManagedTablet,
+        model: &Reference,
+        ledger: &Ledger,
+        floor: u64,
+        seed: u64,
+        step: usize,
+    ) {
+        assert_eq!(
+            db.current_sequence(),
+            model.sequence,
+            "seed={seed:x} step={step} sequence"
+        );
+        assert_eq!(
+            db.oldest_retained_snapshot(),
+            floor,
+            "seed={seed:x} step={step} floor"
+        );
+        for key in KEYS.chain(std::iter::once(b'x')) {
+            for seq in floor..=model.sequence {
+                assert_eq!(
+                    db.read_at(&[key], seq).unwrap().map(<[u8]>::to_vec),
+                    model.read_at(&[key], seq),
+                    "seed={seed:x} step={step} key={key} seq={seq}"
+                );
+            }
+            if floor > 0 {
+                assert!(db.read_at(&[key], floor - 1).is_err());
+            }
+            assert!(db.read_at(&[key], model.sequence + 1).is_err());
+        }
+        for (i, (mutations, receipt)) in ledger.iter().enumerate() {
+            assert_eq!(
+                db.commit_idempotent(tx(i as u64 + 1), mutations.clone())
+                    .unwrap(),
+                *receipt,
+                "seed={seed:x} step={step} receipt={i}"
+            );
+        }
+        assert_eq!(db.current_sequence(), model.sequence);
+    }
+    fn put_new(
+        db: &mut ManagedTablet,
+        model: &mut Reference,
+        ledger: &mut Ledger,
+        mutations: Vec<TabletMutation>,
+    ) {
+        let next = model.sequence + 1;
+        let receipt = db.commit_idempotent(tx(next), mutations.clone()).unwrap();
+        assert_eq!(receipt.sequence(), next);
+        model.apply(&mutations);
+        ledger.push((mutations, receipt));
+    }
+    #[test]
+    fn seeded_managed_lifecycle_matches_independent_snapshot_and_receipt_model() {
+        use StorageInterruptionPoint::*;
+        const SEEDS: [u64; 8] = [
+            1,
+            0x5eed,
+            0x12345678,
+            0xdec0de01,
+            0xcafe,
+            0xabad1dea,
+            0x987654321,
+            0xdeadbeef,
+        ];
+        const WRITE_FAULTS: [StorageInterruptionPoint; 4] = [
+            WalAfterHeader,
+            WalAfterPayload,
+            WalAfterChecksum,
+            WalAfterSync,
+        ];
+        const ROTATION_FAULTS: [StorageInterruptionPoint; 5] = [
+            RegistryBeforeRename,
+            RegistryAfterRename,
+            WalReclaimAfterReplacementSync,
+            WalReclaimAfterRename,
+            WalReclaimAfterDirectorySync,
+        ];
+        for seed in SEEDS {
+            let fixture = Fixture::new();
+            let wal = fixture.0.join("tablet.wal");
+            let reg = fixture.dir("registry");
+            let mut active = fixture.dir("initial");
+            let mut rng = Seeded(seed);
+            let mut model = Reference::default();
+            let mut ledger = Ledger::new();
+            let mut raw = WalBackedTablet::open(descriptor(), &wal).unwrap();
+            for step in 0..4 {
+                let mutations = rng.mutations(seed, step);
+                let receipt = raw
+                    .commit_idempotent(tx(model.sequence + 1), mutations.clone())
+                    .unwrap();
+                model.apply(&mutations);
+                assert_eq!(receipt.sequence(), model.sequence);
+                ledger.push((mutations, receipt));
+            }
+            let mut initial = manifest(&active);
+            for _ in 0..4 {
+                raw.flush_sst_shadow(&mut initial, 1).unwrap();
+            }
+            let mut floor = 2;
+            raw.seal_sst_recovery_at_floor(&mut initial, floor).unwrap();
+            raw.reclaim_to_sealed_sst(&initial).unwrap();
+            let registry = GenerationRegistry::create(&reg, 127, EPOCH).unwrap();
+            let mut db = ManagedTablet::adopt(raw, registry, initial).unwrap();
+            check(&mut db, &model, &ledger, floor, seed, 0);
+            for round in 0..6 {
+                for slot in 0..4 {
+                    let step = 4 + round * 4 + slot;
+                    let mutations = rng.mutations(seed, step);
+                    let next = model.sequence + 1;
+                    if slot == 1 || slot == 3 {
+                        let point = WRITE_FAULTS[((rng.next() as usize) + round + slot) % 4];
+                        let failure = with_interruption(point, || {
+                            db.commit_idempotent(tx(next), mutations.clone())
+                        });
+                        assert!(
+                            failure
+                                .unwrap_err()
+                                .to_string()
+                                .contains(&format!("{point:?}")),
+                            "seed={seed:x} step={step}"
+                        );
+                        assert_eq!(db.current_sequence(), model.sequence);
+                        assert!(db.commit_idempotent(tx(next), mutations.clone()).is_err());
+                        drop(db);
+                        db = reopen(&wal, &active, &reg);
+                        let survived = matches!(point, WalAfterChecksum | WalAfterSync);
+                        assert_eq!(
+                            db.current_sequence(),
+                            model.sequence + u64::from(survived),
+                            "seed={seed:x} step={step}"
+                        );
+                    }
+                    put_new(&mut db, &mut model, &mut ledger, mutations);
+                    if slot == 2 {
+                        drop(db);
+                        db = reopen(&wal, &active, &reg);
+                    }
+                    check(&mut db, &model, &ledger, floor, seed, step);
+                }
+                let requested = model.sequence - (rng.next() % 3);
+                let point = ROTATION_FAULTS[round % ROTATION_FAULTS.len()];
+                let next = fixture.dir(&format!("rotate-{round}"));
+                let failure = with_interruption(point, || db.rotate(manifest(&next), requested));
+                assert!(
+                    failure
+                        .unwrap_err()
+                        .to_string()
+                        .contains(&format!("{point:?}")),
+                    "seed={seed:x} round={round}"
+                );
+                drop(db);
+                if matches!(point, WalReclaimAfterRename | WalReclaimAfterDirectorySync) {
+                    active = next;
+                    floor = requested;
+                    db = reopen(&wal, &active, &reg);
+                } else {
+                    db = reopen(&wal, &active, &reg);
+                    check(&mut db, &model, &ledger, floor, seed, 100 + round);
+                    let retry = fixture.dir(&format!("rotate-retry-{round}"));
+                    db.rotate(manifest(&retry), requested).unwrap();
+                    active = retry;
+                    floor = requested;
+                }
+                check(&mut db, &model, &ledger, floor, seed, 200 + round);
+                // Preserve an acknowledged nonempty tail across compaction.
+                let mutations = rng.mutations(seed, 100 + round);
+                put_new(&mut db, &mut model, &mut ledger, mutations);
+                let predecessor = active.clone();
+                let compact = fixture.dir(&format!("compact-{round}"));
+                let bytes = fs::read(&wal).unwrap();
+                if round % 2 == 0 {
+                    let partial = fixture.dir(&format!("partial-{round}"));
+                    let failure =
+                        with_interruption(CompactionAfterOutput, || db.compact(manifest(&partial)));
+                    assert!(failure
+                        .unwrap_err()
+                        .to_string()
+                        .contains("CompactionAfterOutput"));
+                    assert_eq!(fs::read(&wal).unwrap(), bytes);
+                    drop(db);
+                    db = reopen(&wal, &active, &reg);
+                    check(&mut db, &model, &ledger, floor, seed, 300 + round);
+                }
+                db.compact(manifest(&compact)).unwrap();
+                active = compact;
+                assert_eq!(&fs::read(&wal).unwrap()[128..], &bytes[128..]);
+                drop(db);
+                db = reopen(&wal, &active, &reg);
+                check(&mut db, &model, &ledger, floor, seed, 400 + round);
+                let backup = fixture.0.join(format!("backup-{round}"));
+                let q = fixture.0.join(format!("quarantine-{round}"));
+                db.backup([round as u8 + 1; 16], &backup).unwrap();
+                db.quarantine(
+                    ManifestStore::open(&predecessor, 127, EPOCH).unwrap(),
+                    &backup,
+                    &q,
+                )
+                .unwrap();
+                let old = ManifestStore::open(&q, 127, EPOCH).unwrap();
+                db.reserve_retirement(&old, &backup).unwrap();
+                drop(old);
+                db.delete_reserved_generation(&q, &backup).unwrap();
+                assert_eq!(db.retirement_status(&q).unwrap(), GenerationStatus::Deleted);
+                let mut restored = WalBackedTablet::restore_sealed_backup(
+                    descriptor(),
+                    &backup,
+                    fixture.0.join(format!("restored-{round}")),
+                )
+                .unwrap();
+                assert_eq!(restored.current_sequence(), model.sequence);
+                assert_eq!(restored.oldest_retained_snapshot(), floor);
+                for key in KEYS {
+                    for seq in floor..=model.sequence {
+                        assert_eq!(
+                            restored.read_at(&[key], seq).unwrap().map(<[u8]>::to_vec),
+                            model.read_at(&[key], seq)
+                        );
+                    }
+                }
+                for (i, (mutations, receipt)) in ledger.iter().enumerate() {
+                    assert_eq!(
+                        restored
+                            .commit_idempotent(tx(i as u64 + 1), mutations.clone())
+                            .unwrap(),
+                        *receipt
+                    );
+                }
+                check(&mut db, &model, &ledger, floor, seed, 500 + round);
+            }
+        }
+    }
+}
