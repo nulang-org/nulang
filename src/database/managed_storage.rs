@@ -68,6 +68,32 @@ impl ManagedTablet {
         })
     }
 
+    /// Explicit offline repair of a missing, empty or recognized damaged
+    /// enrollment sidecar. Stop all WAL users first: an unlinked old lock
+    /// inode cannot be fenced by acquiring its replacement. Does not open
+    /// the tablet, repair the WAL tail, or change registry references.
+    /// WAL4, conflicting valid markers, and unrelated files are refused.
+    pub fn repair_enrollment(
+        descriptor: TabletDescriptor,
+        wal: impl AsRef<Path>,
+        seal: impl AsRef<Path>,
+        registry: &GenerationRegistry,
+    ) -> io::Result<()> {
+        let active =
+            ManifestStore::open(seal, descriptor.id().get(), descriptor.ownership_epoch())?;
+        if active.current().recovery_descriptor() != Some(&descriptor) {
+            return Err(io::Error::other("sealed recovery descriptor mismatch"));
+        }
+        let binding = active.sync_for_wal_binding()?;
+        registry.require_registered_wal(wal.as_ref(), binding)?;
+        super::wal::FileWal::repair_enrollment(
+            wal.as_ref(),
+            binding,
+            registry.enrollment_identity()?,
+        )
+        .map_err(io::Error::other)
+    }
+
     fn ready(&self) -> io::Result<()> {
         if self.fenced {
             Err(io::Error::other("managed storage requires reopen"))

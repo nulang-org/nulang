@@ -576,6 +576,106 @@ impl FileWal {
         }
     }
 
+    /// Repair only a recognized enrollment marker, under the stable writer
+    /// lock, using the exact WAL5 header as independent evidence. The caller
+    /// must have stopped all users of this WAL (including processes that
+    /// might hold an unlinked lock inode). Never repair or replay WAL frames.
+    #[cfg(unix)]
+    pub(super) fn repair_enrollment(
+        requested_path: &Path,
+        binding: SealBinding,
+        registry: [u8; 32],
+    ) -> Result<(), WalError> {
+        use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+        if requested_path.extension() != Some(std::ffi::OsStr::new("wal")) {
+            return Err(WalError::InvalidWalExtension);
+        }
+        let parent = requested_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let path = fs::canonicalize(parent)?
+            .join(requested_path.file_name().ok_or(WalError::AliasedWalPath)?);
+        let lock_path = writer_lock_path(&path);
+        let validate_header = || -> Result<File, WalError> {
+            reject_path_aliases(&path)?;
+            if !fs::symlink_metadata(&path)?.is_file() {
+                return Err(WalError::AliasedWalPath);
+            }
+            let mut file = File::open(&path)?;
+            let mut actual = [0; MANAGED_HEADER_BYTES];
+            file.read_exact(&mut actual)?;
+            if actual.as_slice() != bound_header(binding, Some(registry)) {
+                return Err(WalError::ManagedEnrollmentMismatch);
+            }
+            match fs::symlink_metadata(super::checkpoint::checkpoint_path_for_wal(&path)) {
+                Ok(_) => return Err(WalError::ManagedEnrollmentMismatch),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            Ok(file)
+        };
+        // Reject incorrect registry/seal even before creating a missing lock.
+        validate_header()?;
+        reject_path_aliases(&lock_path)?;
+        let lock = match fs::symlink_metadata(&lock_path) {
+            Ok(meta) if meta.is_file() => {
+                OpenOptions::new().read(true).write(true).open(&lock_path)?
+            }
+            Ok(_) => return Err(WalError::AliasedWalPath),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&lock_path)?,
+            Err(error) => return Err(error.into()),
+        };
+        lock.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => WalError::WriterLocked,
+            std::fs::TryLockError::Error(error) => WalError::from(error),
+        })?;
+        let lock = WriterLock(lock);
+        reject_path_aliases(&lock_path)?;
+        let named = fs::metadata(&lock_path)?;
+        let held = lock.0.metadata()?;
+        if named.dev() != held.dev() || named.ino() != held.ino() {
+            return Err(WalError::AliasedWalPath);
+        }
+        let wal = validate_header()?;
+        let expected = Self::enrollment_bytes(registry);
+        let len = held.len();
+        if len > expected.len() as u64 {
+            return Err(WalError::ManagedEnrollmentMismatch);
+        }
+        let mut actual = [0; 72];
+        lock.0.read_exact_at(&mut actual[..len as usize], 0)?;
+        let actual = &actual[..len as usize];
+        // Accept empty/partial expected writes or recognized full markers
+        // with a damaged checksum. Never overwrite arbitrary data or a
+        // valid conflicting enrollment, even with the correct WAL5 header.
+        let repairable = expected.starts_with(actual)
+            || (len == 72
+                && &actual[..8] == b"NUDBENR1"
+                && blake3::hash(&actual[..40]).as_bytes() != &actual[40..]);
+        if !repairable {
+            return Err(WalError::ManagedEnrollmentMismatch);
+        }
+        wal.sync_all()?;
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::EnrollmentBeforeWrite,
+        )?;
+        lock.0.write_all_at(&expected, 0)?;
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::EnrollmentAfterWrite,
+        )?;
+        lock.0.sync_all()?;
+        sync_parent_directory(&path)?;
+        Ok(())
+    }
+
     /// Persist enrollment on the stable writer-lock inode after registry
     /// registration, while still holding exclusive ownership. Partial
     /// nonempty markers fail closed; never truncate or remove this sidecar.
