@@ -15,6 +15,7 @@ const ERR_INTEGER: &[u8] = b"ERR value is not an integer or out of range";
 const ERR_SYNTAX: &[u8] = b"ERR syntax error";
 const ERR_SET_EXPIRE: &[u8] = b"ERR invalid expire time in 'set' command";
 const ERR_CROSS_SLOT: &[u8] = b"CROSSSLOT Keys in request don't hash to the same slot";
+const ERR_OOM: &[u8] = b"OOM cache admission limit exceeded";
 const ERR_UNKNOWN: &[u8] = b"ERR unknown command";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,7 +91,7 @@ pub fn command_slot(command: RespCommand<'_>) -> RespCommandSlot {
     }
 
     if name.eq_ignore_ascii_case(b"MSET") {
-        return if command.argc() == 0 || command.argc() % 2 != 0 {
+        return if command.argc() == 0 || !command.argc().is_multiple_of(2) {
             RespCommandSlot::Unkeyed
         } else {
             route_key_value_args(command.args())
@@ -129,12 +130,171 @@ fn route_key_value_args(mut args: RespArgs<'_>) -> RespCommandSlot {
     RespCommandSlot::Slot(slot)
 }
 
+// Static dispatch keeps the memory-only path free of journal work while sharing
+// all protocol validation and response encoding with the durable backend.
+trait RespBackend {
+    fn get(&mut self, key: &[u8], now: u64) -> Result<Option<CacheValueView<'_>>, &'static [u8]>;
+    fn exists(&mut self, key: &[u8], now: u64) -> Result<bool, &'static [u8]>;
+    fn ttl(&mut self, key: &[u8], now: u64) -> Result<CacheTtl, &'static [u8]>;
+    fn set_bytes(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        ttl: Option<u64>,
+        now: u64,
+    ) -> Result<(), &'static [u8]>;
+    fn set_batch(&mut self, pairs: &[(&[u8], &[u8])], now: u64) -> Result<(), &'static [u8]>;
+    fn delete_many(&mut self, keys: RespArgs<'_>, now: u64) -> Result<usize, &'static [u8]>;
+    fn increment(&mut self, key: &[u8], now: u64) -> Result<i64, &'static [u8]>;
+    fn expire(&mut self, key: &[u8], ttl: u64, now: u64) -> Result<bool, &'static [u8]>;
+}
+
+fn increment_error(error: CacheIncrementError) -> &'static [u8] {
+    match error {
+        CacheIncrementError::Admission(_) => ERR_OOM,
+        CacheIncrementError::NotInteger => ERR_INTEGER,
+        CacheIncrementError::Overflow => b"ERR increment or decrement would overflow",
+    }
+}
+
+impl RespBackend for CacheStore {
+    fn get(&mut self, key: &[u8], now: u64) -> Result<Option<CacheValueView<'_>>, &'static [u8]> {
+        Ok(CacheStore::get(self, key, now))
+    }
+    fn exists(&mut self, key: &[u8], now: u64) -> Result<bool, &'static [u8]> {
+        Ok(CacheStore::exists(self, key, now))
+    }
+    fn ttl(&mut self, key: &[u8], now: u64) -> Result<CacheTtl, &'static [u8]> {
+        Ok(CacheStore::ttl(self, key, now))
+    }
+    fn set_bytes(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        ttl: Option<u64>,
+        now: u64,
+    ) -> Result<(), &'static [u8]> {
+        CacheStore::set_bytes(self, key, value, ttl, now).map_err(|_| ERR_OOM)
+    }
+    fn set_batch(&mut self, pairs: &[(&[u8], &[u8])], now: u64) -> Result<(), &'static [u8]> {
+        CacheStore::set_batch(self, pairs, now).map_err(|_| ERR_OOM)
+    }
+    fn delete_many(&mut self, keys: RespArgs<'_>, now: u64) -> Result<usize, &'static [u8]> {
+        Ok(keys.filter(|key| self.delete_at(key, now)).count())
+    }
+    fn increment(&mut self, key: &[u8], now: u64) -> Result<i64, &'static [u8]> {
+        CacheStore::increment(self, key, 1, now).map_err(increment_error)
+    }
+    fn expire(&mut self, key: &[u8], ttl: u64, now: u64) -> Result<bool, &'static [u8]> {
+        Ok(if ttl == 0 {
+            self.delete_at(key, now)
+        } else {
+            self.expire_ms(key, ttl, now)
+        })
+    }
+}
+
+#[cfg(all(unix, feature = "cache-server"))]
+use super::cache_durable::{CacheTime, DurableCache, DurableError};
+
+#[cfg(all(unix, feature = "cache-server"))]
+fn durable_error(error: DurableError) -> &'static [u8] {
+    match error {
+        DurableError::Admission(_) => ERR_OOM,
+        DurableError::Increment(error) => increment_error(error),
+        DurableError::InvalidTime => ERR_INTEGER,
+        DurableError::Journal(_) | DurableError::Poisoned => b"ERR cache persistence unavailable",
+    }
+}
+
+#[cfg(all(unix, feature = "cache-server"))]
+struct DurableResp<'a> {
+    store: &'a mut DurableCache,
+    time: CacheTime,
+}
+#[cfg(all(unix, feature = "cache-server"))]
+impl RespBackend for DurableResp<'_> {
+    fn get(&mut self, key: &[u8], now: u64) -> Result<Option<CacheValueView<'_>>, &'static [u8]> {
+        self.store.get(key, now).map_err(durable_error)
+    }
+    fn exists(&mut self, key: &[u8], now: u64) -> Result<bool, &'static [u8]> {
+        self.store.exists(key, now).map_err(durable_error)
+    }
+    fn ttl(&mut self, key: &[u8], now: u64) -> Result<CacheTtl, &'static [u8]> {
+        self.store.ttl(key, now).map_err(durable_error)
+    }
+    fn set_bytes(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        ttl: Option<u64>,
+        _: u64,
+    ) -> Result<(), &'static [u8]> {
+        self.store
+            .set_bytes(key, value, ttl, self.time)
+            .map_err(durable_error)
+    }
+    fn set_batch(&mut self, pairs: &[(&[u8], &[u8])], _: u64) -> Result<(), &'static [u8]> {
+        self.store
+            .set_batch(pairs, self.time)
+            .map_err(durable_error)
+    }
+    fn delete_many(&mut self, keys: RespArgs<'_>, _: u64) -> Result<usize, &'static [u8]> {
+        self.store
+            .delete_many(&keys.collect::<Vec<_>>(), self.time)
+            .map_err(durable_error)
+    }
+    fn increment(&mut self, key: &[u8], _: u64) -> Result<i64, &'static [u8]> {
+        self.store
+            .increment(key, 1, self.time)
+            .map_err(durable_error)
+    }
+    fn expire(&mut self, key: &[u8], ttl: u64, _: u64) -> Result<bool, &'static [u8]> {
+        self.store
+            .expire(key, ttl, self.time)
+            .map_err(durable_error)
+    }
+}
+
+#[cfg(all(unix, feature = "cache-server"))]
+pub(super) fn execute_durable_command(
+    store: &mut DurableCache,
+    command: RespCommand<'_>,
+    time: CacheTime,
+    out: &mut Vec<u8>,
+) -> Result<(), DurableError> {
+    if store.is_poisoned() {
+        return Err(DurableError::Poisoned);
+    }
+    let start = out.len();
+    execute_command_inner(
+        &mut DurableResp { store, time },
+        command,
+        time.monotonic_ms,
+        out,
+    );
+    if store.is_poisoned() {
+        out.truncate(start);
+        return Err(DurableError::Poisoned);
+    }
+    Ok(())
+}
+
 /// Execute a validated RESP command against one shard-local cache store.
 ///
 /// Multi-key commands fail with Redis-compatible `CROSSSLOT` before any
 /// mutation when their keys do not share the same logical slot.
 pub fn execute_command(
     store: &mut CacheStore,
+    command: RespCommand<'_>,
+    now_ms: u64,
+    out: &mut Vec<u8>,
+) {
+    execute_command_inner(store, command, now_ms, out);
+}
+
+fn execute_command_inner(
+    store: &mut impl RespBackend,
     command: RespCommand<'_>,
     now_ms: u64,
     out: &mut Vec<u8>,
@@ -174,17 +334,30 @@ fn execute_ping(command: RespCommand<'_>, out: &mut Vec<u8>) {
     }
 }
 
-fn execute_get(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
+fn execute_get(
+    store: &mut impl RespBackend,
+    command: RespCommand<'_>,
+    now_ms: u64,
+    out: &mut Vec<u8>,
+) {
     if command.argc() != 1 {
         wrong_arity(out, b"get");
         return;
     }
 
     let key = command.args().next().expect("validated argument");
-    write_value(store.get(key, now_ms), out);
+    match store.get(key, now_ms) {
+        Ok(value) => write_value(value, out),
+        Err(error) => write_error(out, error),
+    }
 }
 
-fn execute_set(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
+fn execute_set(
+    store: &mut impl RespBackend,
+    command: RespCommand<'_>,
+    now_ms: u64,
+    out: &mut Vec<u8>,
+) {
     if command.argc() != 2 && command.argc() != 4 {
         wrong_arity(out, b"set");
         return;
@@ -221,11 +394,18 @@ fn execute_set(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, ou
         None
     };
 
-    store.set_bytes(key, value, ttl_ms, now_ms);
-    write_simple(out, b"OK");
+    match store.set_bytes(key, value, ttl_ms, now_ms) {
+        Ok(()) => write_simple(out, b"OK"),
+        Err(error) => write_error(out, error),
+    }
 }
 
-fn execute_del(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
+fn execute_del(
+    store: &mut impl RespBackend,
+    command: RespCommand<'_>,
+    now_ms: u64,
+    out: &mut Vec<u8>,
+) {
     if command.argc() == 0 {
         wrong_arity(out, b"del");
         return;
@@ -235,17 +415,14 @@ fn execute_del(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, ou
         return;
     }
 
-    let mut deleted = 0i64;
-    for key in command.args() {
-        if store.delete_at(key, now_ms) {
-            deleted += 1;
-        }
+    match store.delete_many(command.args(), now_ms) {
+        Ok(deleted) => write_integer(out, deleted as i64),
+        Err(error) => write_error(out, error),
     }
-    write_integer(out, deleted);
 }
 
 fn execute_exists(
-    store: &mut CacheStore,
+    store: &mut impl RespBackend,
     command: RespCommand<'_>,
     now_ms: u64,
     out: &mut Vec<u8>,
@@ -261,30 +438,37 @@ fn execute_exists(
 
     let mut count = 0i64;
     for key in command.args() {
-        if store.exists(key, now_ms) {
-            count += 1;
+        match store.exists(key, now_ms) {
+            Ok(exists) => count += i64::from(exists),
+            Err(error) => {
+                write_error(out, error);
+                return;
+            }
         }
     }
     write_integer(out, count);
 }
 
-fn execute_incr(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
+fn execute_incr(
+    store: &mut impl RespBackend,
+    command: RespCommand<'_>,
+    now_ms: u64,
+    out: &mut Vec<u8>,
+) {
     if command.argc() != 1 {
         wrong_arity(out, b"incr");
         return;
     }
 
     let key = command.args().next().expect("validated argument");
-    match store.increment(key, 1, now_ms) {
+    match store.increment(key, now_ms) {
         Ok(value) => write_integer(out, value),
-        Err(CacheIncrementError::NotInteger | CacheIncrementError::Overflow) => {
-            write_error(out, ERR_INTEGER)
-        }
+        Err(error) => write_error(out, error),
     }
 }
 
 fn execute_expire(
-    store: &mut CacheStore,
+    store: &mut impl RespBackend,
     command: RespCommand<'_>,
     now_ms: u64,
     out: &mut Vec<u8>,
@@ -301,19 +485,27 @@ fn execute_expire(
         return;
     };
 
-    let changed = if seconds <= 0 {
-        store.delete_at(key, now_ms)
+    let ttl = if seconds <= 0 {
+        0
     } else {
         let Some(ttl_ms) = (seconds as u64).checked_mul(1_000) else {
             write_error(out, ERR_INTEGER);
             return;
         };
-        store.expire_ms(key, ttl_ms, now_ms)
+        ttl_ms
     };
-    write_integer(out, if changed { 1 } else { 0 });
+    match store.expire(key, ttl, now_ms) {
+        Ok(changed) => write_integer(out, i64::from(changed)),
+        Err(error) => write_error(out, error),
+    }
 }
 
-fn execute_ttl(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
+fn execute_ttl(
+    store: &mut impl RespBackend,
+    command: RespCommand<'_>,
+    now_ms: u64,
+    out: &mut Vec<u8>,
+) {
     if command.argc() != 1 {
         wrong_arity(out, b"ttl");
         return;
@@ -321,14 +513,24 @@ fn execute_ttl(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, ou
 
     let key = command.args().next().expect("validated argument");
     let ttl = match store.ttl(key, now_ms) {
-        CacheTtl::Missing => -2,
-        CacheTtl::Persistent => -1,
-        CacheTtl::RemainingMs(ms) => (ms / 1_000) as i64,
+        Ok(CacheTtl::Missing) => -2,
+        Ok(CacheTtl::Persistent) => -1,
+        // Redis rounds to the nearest second. Divide first to avoid overflow.
+        Ok(CacheTtl::RemainingMs(ms)) => (ms / 1_000 + u64::from(ms % 1_000 >= 500)) as i64,
+        Err(error) => {
+            write_error(out, error);
+            return;
+        }
     };
     write_integer(out, ttl);
 }
 
-fn execute_mget(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
+fn execute_mget(
+    store: &mut impl RespBackend,
+    command: RespCommand<'_>,
+    now_ms: u64,
+    out: &mut Vec<u8>,
+) {
     if command.argc() == 0 {
         wrong_arity(out, b"mget");
         return;
@@ -338,14 +540,27 @@ fn execute_mget(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, o
         return;
     }
 
+    let start = out.len();
     write_array_len(out, command.argc());
     for key in command.args() {
-        write_value(store.get(key, now_ms), out);
+        match store.get(key, now_ms) {
+            Ok(value) => write_value(value, out),
+            Err(error) => {
+                out.truncate(start);
+                write_error(out, error);
+                return;
+            }
+        }
     }
 }
 
-fn execute_mset(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
-    if command.argc() == 0 || command.argc() % 2 != 0 {
+fn execute_mset(
+    store: &mut impl RespBackend,
+    command: RespCommand<'_>,
+    now_ms: u64,
+    out: &mut Vec<u8>,
+) {
+    if command.argc() == 0 || !command.argc().is_multiple_of(2) {
         wrong_arity(out, b"mset");
         return;
     }
@@ -358,11 +573,14 @@ fn execute_mset(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, o
     // all keys have passed the slot check, these writes are atomic with respect
     // to other commands on this shard.
     let mut args = command.args();
+    let mut pairs = Vec::new();
     while let Some(key) = args.next() {
-        let value = args.next().expect("validated value pair");
-        store.set_bytes(key, value, None, now_ms);
+        pairs.push((key, args.next().expect("validated value pair")));
     }
-    write_simple(out, b"OK");
+    match store.set_batch(&pairs, now_ms) {
+        Ok(()) => write_simple(out, b"OK"),
+        Err(error) => write_error(out, error),
+    }
 }
 
 fn write_value(value: Option<CacheValueView<'_>>, out: &mut Vec<u8>) {
@@ -561,5 +779,184 @@ mod tests {
             .unwrap();
         assert_eq!(consumed, first.len());
         assert_eq!(out, b"+PONG\r\n");
+    }
+
+    #[test]
+    fn admission_rejects_set_and_incr_without_mutating_existing_keys() {
+        let mut store = CacheStore::with_limits(super::super::cache::CacheLimits {
+            max_entries: 1,
+            max_arena_bytes: 32,
+        });
+        let large = vec![b'x'; 32];
+        let cmd = |args: &[&[u8]]| {
+            let mut wire = format!("*{}\r\n", args.len()).into_bytes();
+            for arg in args {
+                wire.extend_from_slice(format!("{}{}\r\n", '$', arg.len()).as_bytes());
+                wire.extend_from_slice(arg);
+                wire.extend_from_slice(b"\r\n");
+            }
+            wire
+        };
+        assert_eq!(
+            run(&mut store, &cmd(&[b"SET", b"a", b"old"]), 0),
+            b"+OK\r\n"
+        );
+        assert!(run(&mut store, &cmd(&[b"SET", b"b", b"v"]), 0).starts_with(b"-OOM "));
+        assert!(run(&mut store, &cmd(&[b"INCR", b"b"]), 0).starts_with(b"-OOM "));
+        assert_eq!(
+            run(&mut store, &cmd(&[b"SET", b"a", &large]), 0),
+            b"+OK\r\n"
+        );
+        assert!(run(&mut store, &cmd(&[b"SET", b"a", &[b'y'; 33]]), 0).starts_with(b"-OOM "));
+        assert_eq!(store.get(b"a", 0), Some(CacheValueView::Bytes(&large)));
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.memory_stats().arena_reserved_bytes, 32);
+        assert!(store.delete(b"a"));
+        assert_eq!(
+            run(&mut store, &cmd(&[b"SET", b"b", &large]), 0),
+            b"+OK\r\n"
+        );
+    }
+
+    #[test]
+    fn admission_rejects_whole_mset_before_mutation() {
+        let mut store = CacheStore::with_limits(super::super::cache::CacheLimits {
+            max_entries: 1,
+            max_arena_bytes: 32,
+        });
+        run(
+            &mut store,
+            b"*3\r\n$3\r\nSET\r\n$4\r\na{t}\r\n$3\r\nold\r\n",
+            0,
+        );
+        assert!(run(
+            &mut store,
+            b"*5\r\n$4\r\nMSET\r\n$4\r\na{t}\r\n$1\r\nx\r\n$4\r\nb{t}\r\n$1\r\ny\r\n",
+            0
+        )
+        .starts_with(b"-OOM "));
+        assert_eq!(store.get(b"a{t}", 0), Some(CacheValueView::Bytes(b"old")));
+        assert_eq!(store.len(), 1);
+        assert_eq!(
+            run(
+                &mut store,
+                b"*5\r\n$4\r\nMSET\r\n$4\r\na{t}\r\n$1\r\nx\r\n$4\r\na{t}\r\n$1\r\ny\r\n",
+                0
+            ),
+            b"+OK\r\n"
+        );
+        assert_eq!(store.get(b"a{t}", 0), Some(CacheValueView::Bytes(b"y")));
+    }
+
+    #[cfg(all(unix, feature = "cache-server"))]
+    #[test]
+    fn test_durable_and_memory_resp_parity_across_checkpoints_and_restarts() {
+        use super::super::cache::{CacheLimits, CacheStore};
+        use super::super::cache_wal::{WalLimits, WalSync};
+        use std::path::PathBuf;
+        struct Temp(PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let tmp = Temp(std::env::temp_dir().join(format!(
+                "nulang-parity-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )));
+        std::fs::create_dir(&tmp.0).unwrap();
+        let path = tmp.0.join("journal");
+        let keys = [b"a{t}".as_slice(), b"b{t}", b"c{t}", b"d{t}"];
+        let values = [
+            b"0".as_slice(),
+            b"41",
+            b"-1",
+            b"+1",
+            b"01",
+            b"9223372036854775807",
+            b"\0\xff",
+            b"",
+        ];
+        for (i, seed) in [1u64, 42, 0xdeadbeef].into_iter().enumerate() {
+            let path = path.with_extension(format!("{i}.wal"));
+            let mut memory = CacheStore::new();
+            let mut state = seed;
+            let mut anchor = 0u64;
+            let open = |absolute: u64| {
+                DurableCache::open(
+                    &path,
+                    CacheLimits::default(),
+                    WalLimits::default(),
+                    WalSync::Buffered,
+                    CacheTime {
+                        monotonic_ms: 0,
+                        unix_ms: 1_000_000 + absolute,
+                    },
+                )
+                .unwrap()
+            };
+            let mut durable = open(0);
+            for step in 0..256u64 {
+                let now = step * 53;
+                if step != 0 && step % 32 == 0 {
+                    durable
+                        .checkpoint(CacheTime {
+                            monotonic_ms: now - anchor,
+                            unix_ms: 1_000_000 + now,
+                        })
+                        .unwrap();
+                    drop(durable);
+                    durable = open(now);
+                    anchor = now;
+                }
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let key = keys[(state >> 8) as usize % keys.len()];
+                let other = keys[(state >> 16) as usize % keys.len()];
+                let value = values[(state >> 24) as usize % values.len()];
+                let parts: &[&[u8]] = match state % 14 {
+                    0 => &[b"SET", key, value],
+                    1 => &[b"SET", key, value, b"PX", b"200"],
+                    2 => &[b"GET", key],
+                    3 => &[b"INCR", key],
+                    4 => &[b"DEL", key, other],
+                    5 => &[b"EXPIRE", key, b"1"],
+                    6 => &[b"EXPIRE", key, b"0"],
+                    7 => &[b"TTL", key],
+                    8 => &[b"MSET", key, value, other, b"42"],
+                    9 => &[b"MGET", key, other],
+                    10 => &[b"EXISTS", key, other],
+                    11 => &[b"SET", key, value, b"PX", b"0"],
+                    12 => &[b"MSET", key, value, b"unrelated", b"no"],
+                    _ => &[b"PING", value],
+                };
+                let mut wire = format!("*{}\r\n", parts.len()).into_bytes();
+                for part in parts {
+                    wire.extend_from_slice(format!("${}\r\n", part.len()).as_bytes());
+                    wire.extend_from_slice(part);
+                    wire.extend_from_slice(b"\r\n");
+                }
+                let expected = run(&mut memory, &wire, now);
+                let (cmd, consumed) = parse_command(&wire).unwrap().unwrap();
+                assert_eq!(consumed, wire.len());
+                let mut actual = Vec::new();
+                execute_durable_command(
+                    &mut durable,
+                    cmd,
+                    CacheTime {
+                        monotonic_ms: now - anchor,
+                        unix_ms: 1_000_000 + now,
+                    },
+                    &mut actual,
+                )
+                .unwrap();
+                assert_eq!(actual, expected, "seed {seed}, step {step}, args {parts:?}");
+            }
+        }
     }
 }

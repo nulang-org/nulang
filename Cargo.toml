@@ -202,6 +202,11 @@ name = "nulang"
 path = "src/main.rs"
 
 [[bin]]
+name = "nulang-fabric"
+path = "src/bin/nulang-fabric.rs"
+required-features = ["cache-server"]
+
+[[bin]]
 name = "nula_difffuzz"
 path = "src/bin/nula_difffuzz.rs"
 required-features = ["difffuzz"]
