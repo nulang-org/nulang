@@ -1972,7 +1972,7 @@ fn managed_compaction_rebinds_same_base_and_preserves_nonempty_wal_tail() {
 }
 
 #[test]
-fn managed_compaction_empty_tail_preserves_pins_and_refuses_unproven_retirement() {
+fn managed_compaction_empty_tail_preserves_pins_and_retires_proven_predecessor() {
     use nulang::database::{
         generation_registry::{GenerationRegistry, GenerationStatus},
         managed_storage::ManagedTablet,
@@ -2010,11 +2010,19 @@ fn managed_compaction_empty_tail_preserves_pins_and_refuses_unproven_retirement(
         managed.generation_status(&old).unwrap(),
         GenerationStatus::Unreferenced
     );
-    assert!(managed.reserve_retirement(&old, &backup).is_err());
-    assert!(managed
-        .quarantine(old, &backup, f.0.join("quarantine"))
-        .is_err());
-    assert!(f.0.join("sst/MANIFEST").exists());
+    let quarantine = f.0.join("quarantine");
+    managed.quarantine(old, &backup, &quarantine).unwrap();
+    let obsolete = ManifestStore::open(&quarantine, 7, 3).unwrap();
+    managed.reserve_retirement(&obsolete, &backup).unwrap();
+    drop(obsolete);
+    managed
+        .delete_reserved_generation(&quarantine, &backup)
+        .unwrap();
+    assert_eq!(
+        managed.retirement_status(&quarantine).unwrap(),
+        GenerationStatus::Deleted
+    );
+    assert!(!f.0.join("sst/MANIFEST").exists());
     managed
         .commit_idempotent(id(3), vec![put(b"tail")])
         .unwrap();
@@ -2031,4 +2039,82 @@ fn managed_compaction_empty_tail_preserves_pins_and_refuses_unproven_retirement(
         .unwrap();
     assert_eq!(managed.oldest_retained_snapshot(), 3);
     assert_eq!(managed.read_at(b"k", 3).unwrap(), Some(b"tail".as_slice()));
+}
+
+#[test]
+fn committed_compaction_lineage_survives_later_rotation_and_reopen() {
+    use nulang::database::{
+        generation_registry::{GenerationRegistry, GenerationStatus, ReferenceKind},
+        managed_storage::ManagedTablet,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    let first = db.commit_idempotent(id(1), vec![put(b"old")]).unwrap();
+    db.commit_idempotent(id(2), vec![put(b"anchor")]).unwrap();
+    let mut old = f.manifest();
+    db.flush_sst_shadow(&mut old, 1).unwrap();
+    db.flush_sst_shadow(&mut old, 1).unwrap();
+    db.seal_sst_recovery_at_floor(&mut old, 2).unwrap();
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let reg = f.0.join("registry");
+    fs::create_dir(&reg).unwrap();
+    let registry = GenerationRegistry::create(&reg, 7, 3).unwrap();
+    let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+    managed
+        .register_reference(ReferenceKind::Reader, [9; 16])
+        .unwrap();
+    let compact = f.0.join("compact");
+    fs::create_dir(&compact).unwrap();
+    managed
+        .compact(ManifestStore::create(&compact, 7, 3).unwrap())
+        .unwrap();
+    managed
+        .commit_idempotent(id(3), vec![put(b"tail")])
+        .unwrap();
+    let successor = f.0.join("successor");
+    fs::create_dir(&successor).unwrap();
+    managed
+        .rotate(ManifestStore::create(&successor, 7, 3).unwrap(), 3)
+        .unwrap();
+    drop(managed);
+    let file = reg.join("GENERATIONS");
+    let original = fs::read(&file).unwrap();
+    assert_eq!(&original[..8], b"NUDBREG4");
+    let mut downgraded = original.clone();
+    downgraded[..8].copy_from_slice(b"NUDBREG3");
+    let split = downgraded.len() - 32;
+    let digest = blake3::hash(&downgraded[..split]);
+    downgraded[split..].copy_from_slice(digest.as_bytes());
+    fs::write(&file, &downgraded).unwrap();
+    assert!(GenerationRegistry::open(&reg, 7, 3).is_err());
+    fs::write(&file, &original).unwrap();
+    let registry = GenerationRegistry::open(&reg, 7, 3).unwrap();
+    let mut managed =
+        ManagedTablet::open(f.descriptor(), f.0.join("tablet.wal"), &successor, registry).unwrap();
+    let old = ManifestStore::open(f.0.join("sst"), 7, 3).unwrap();
+    let backup = f.0.join("backup");
+    managed.backup([8; 16], &backup).unwrap();
+    assert!(managed.reserve_retirement(&old, &backup).is_err());
+    managed
+        .release_reference(ReferenceKind::Reader, [9; 16], &old)
+        .unwrap();
+    let q = f.0.join("quarantine");
+    managed.quarantine(old, &backup, &q).unwrap();
+    let old = ManifestStore::open(&q, 7, 3).unwrap();
+    managed.reserve_retirement(&old, &backup).unwrap();
+    drop(old);
+    managed.delete_reserved_generation(&q, &backup).unwrap();
+    assert_eq!(
+        managed.retirement_status(&q).unwrap(),
+        GenerationStatus::Deleted
+    );
+    assert_eq!(
+        managed.commit_idempotent(id(1), vec![put(b"old")]).unwrap(),
+        first
+    );
+    assert_eq!(managed.read_at(b"k", 3).unwrap(), Some(b"tail".as_slice()));
+    let restored =
+        WalBackedTablet::restore_sealed_backup(f.descriptor(), &backup, f.0.join("restored"))
+            .unwrap();
+    assert_eq!(restored.current_sequence(), 3);
 }
