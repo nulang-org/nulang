@@ -41,6 +41,8 @@ pub(crate) enum StorageInterruptionPoint {
 
 thread_local! {
     static ACTIVE: Cell<Option<StorageInterruptionPoint>> = const { Cell::new(None) };
+    #[cfg(unix)]
+    static CRASH_ACK: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     static ERROR_KIND: Cell<io::ErrorKind> = const { Cell::new(io::ErrorKind::Other) };
 }
 
@@ -50,6 +52,8 @@ impl Drop for ResetInterruption {
     fn drop(&mut self) {
         ACTIVE.with(|active| active.set(None));
         ERROR_KIND.with(|kind| kind.set(io::ErrorKind::Other));
+        #[cfg(unix)]
+        CRASH_ACK.with(|ack| ack.borrow_mut().take());
     }
 }
 
@@ -80,6 +84,17 @@ fn with_interruption_kind<T>(
 pub(crate) fn hit(point: StorageInterruptionPoint) -> io::Result<()> {
     let should_interrupt = ACTIVE.with(|active| active.get() == Some(point));
     if should_interrupt {
+        #[cfg(unix)]
+        if let Some(ack) = CRASH_ACK.with(|slot| slot.borrow().clone()) {
+            // Signal only after reaching the exact boundary; park with all
+            // stack-owned locks and staged files intact until the parent kills us.
+            let temp = ack.with_extension("tmp");
+            fs::write(&temp, format!("{point:?}"))?;
+            fs::rename(temp, ack)?;
+            loop {
+                std::thread::park();
+            }
+        }
         return Err(io::Error::new(
             ERROR_KIND.with(Cell::get),
             format!("injected NulangDB storage interruption at {point:?}"),
@@ -1710,5 +1725,295 @@ fn managed_wal_storage_full_preserves_receipts_and_blocks_further_writes() {
         assert_eq!(managed.current_sequence(), 2);
         drop(managed);
         fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod process_crash_matrix {
+    use super::super::generation_registry::{GenerationRegistry, GenerationStatus};
+    use super::super::managed_storage::ManagedTablet;
+    use super::super::sst_manifest::ManifestStore;
+    use super::super::tablet::TransactionId;
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    const CASES: [(&str, StorageInterruptionPoint); 11] = [
+        ("enroll", StorageInterruptionPoint::EnrollmentBeforeWrite),
+        ("enroll", StorageInterruptionPoint::EnrollmentAfterWrite),
+        (
+            "enroll",
+            StorageInterruptionPoint::WalReclaimAfterReplacementWrite,
+        ),
+        (
+            "enroll",
+            StorageInterruptionPoint::WalReclaimAfterReplacementSync,
+        ),
+        ("enroll", StorageInterruptionPoint::WalReclaimAfterRename),
+        (
+            "enroll",
+            StorageInterruptionPoint::WalReclaimAfterDirectorySync,
+        ),
+        ("rotate", StorageInterruptionPoint::RegistryBeforeRename),
+        ("rotate", StorageInterruptionPoint::RegistryAfterRename),
+        (
+            "rotate",
+            StorageInterruptionPoint::WalReclaimAfterReplacementSync,
+        ),
+        ("rotate", StorageInterruptionPoint::WalReclaimAfterRename),
+        (
+            "rotate",
+            StorageInterruptionPoint::WalReclaimAfterDirectorySync,
+        ),
+    ];
+    fn descriptor() -> TabletDescriptor {
+        TabletDescriptor::new(
+            TabletId::new(97).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap()
+    }
+    fn tx(n: u8) -> TransactionId {
+        TransactionId::new([n; 16])
+    }
+    fn put(value: &[u8]) -> Vec<TabletMutation> {
+        vec![TabletMutation::Put {
+            key: b"k".to_vec(),
+            value: value.to_vec(),
+        }]
+    }
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "nudb-process-boundary-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    struct Running(Child);
+    impl Drop for Running {
+        fn drop(&mut self) {
+            if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "child fixture: parent kills process at selected storage boundary"]
+    fn boundary_child() {
+        let Some(root) = std::env::var_os("NUDB_BOUNDARY_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let index: usize = std::env::var("NUDB_BOUNDARY_CASE")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (action, point) = CASES[index];
+        let old = root.join("old");
+        let next = root.join("next");
+        let reg = root.join("registry");
+        let wal = root.join("tablet.wal");
+        for path in [&old, &next, &reg] {
+            fs::create_dir(path).unwrap();
+        }
+        let mut db = WalBackedTablet::open(descriptor(), &wal).unwrap();
+        assert_eq!(
+            db.commit_idempotent(tx(1), put(b"first"))
+                .unwrap()
+                .sequence(),
+            1
+        );
+        let mut manifest = ManifestStore::create(&old, 97, 7).unwrap();
+        db.flush_sst_shadow(&mut manifest, 1).unwrap();
+        db.seal_sst_recovery(&mut manifest).unwrap();
+        db.reclaim_to_sealed_sst(&manifest).unwrap();
+        assert_eq!(
+            db.commit_idempotent(tx(2), put(b"tail"))
+                .unwrap()
+                .sequence(),
+            2
+        );
+        let registry = GenerationRegistry::create(&reg, 97, 7).unwrap();
+        fs::write(root.join("before.wal.bytes"), fs::read(&wal).unwrap()).unwrap();
+        if action == "enroll" {
+            with_interruption(point, || {
+                CRASH_ACK.with(|slot| *slot.borrow_mut() = Some(root.join("boundary.ack")));
+                let _ = ManagedTablet::adopt(db, registry, manifest).unwrap();
+            });
+        } else {
+            let mut managed = ManagedTablet::adopt(db, registry, manifest).unwrap();
+            let candidate = ManifestStore::create(&next, 97, 7).unwrap();
+            with_interruption(point, || {
+                CRASH_ACK.with(|slot| *slot.borrow_mut() = Some(root.join("boundary.ack")));
+                managed.rotate(candidate, 1).unwrap();
+            });
+        }
+        panic!("selected boundary was not reached");
+    }
+
+    fn kill_at(root: &Path, index: usize) {
+        let mut child = Running(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "database::interruption::process_crash_matrix::boundary_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("NUDB_BOUNDARY_ROOT", root)
+                .env("NUDB_BOUNDARY_CASE", index.to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let ack = root.join("boundary.ack");
+        let start = Instant::now();
+        loop {
+            match fs::read_to_string(&ack) {
+                Ok(value) => {
+                    assert_eq!(value, format!("{:?}", CASES[index].1));
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => panic!("ack read: {e}"),
+            }
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "child exited before boundary {index}"
+            );
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "boundary {index} timeout"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(child.0.try_wait().unwrap().is_none());
+        assert_eq!(
+            GenerationRegistry::open(root.join("registry"), 97, 7)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock,
+            "child must retain registry ownership at the boundary"
+        );
+        child.0.kill().unwrap();
+        assert_eq!(child.0.wait().unwrap().signal(), Some(9));
+    }
+
+    #[test]
+    fn managed_midpublication_sigkill_matrix_recovers_acknowledged_prefix() {
+        for (index, (action, point)) in CASES.into_iter().enumerate() {
+            let fixture = Fixture::new();
+            let root = &fixture.0;
+            kill_at(root, index);
+            let old = root.join("old");
+            let next = root.join("next");
+            let reg = root.join("registry");
+            let wal = root.join("tablet.wal");
+            let bytes = fs::read(&wal).unwrap();
+            if action == "enroll" {
+                let before = fs::read(root.join("before.wal.bytes")).unwrap();
+                if matches!(
+                    point,
+                    StorageInterruptionPoint::WalReclaimAfterRename
+                        | StorageInterruptionPoint::WalReclaimAfterDirectorySync
+                ) {
+                    assert_eq!(&bytes[..8], b"NUDBWAL5");
+                    assert_eq!(
+                        &bytes[128..],
+                        &before[96..],
+                        "migration must preserve exact acknowledged tail"
+                    );
+                } else {
+                    assert_eq!(
+                        bytes, before,
+                        "canonical WAL must not change before replacement"
+                    );
+                }
+            }
+            let registry = GenerationRegistry::open(&reg, 97, 7).unwrap();
+            let mut managed = if action == "enroll"
+                && point == StorageInterruptionPoint::EnrollmentBeforeWrite
+            {
+                assert!(ManagedTablet::open(descriptor(), &wal, &old, registry).is_err());
+                assert_eq!(fs::read(&wal).unwrap(), bytes);
+                let db = WalBackedTablet::open_from_sealed_sst(descriptor(), &wal, &old).unwrap();
+                let m = ManifestStore::open(&old, 97, 7).unwrap();
+                let registry = GenerationRegistry::open(&reg, 97, 7).unwrap();
+                ManagedTablet::adopt(db, registry, m).unwrap()
+            } else {
+                assert!(WalBackedTablet::open_from_sealed_sst(descriptor(), &wal, &old).is_err());
+                assert_eq!(fs::read(&wal).unwrap(), bytes);
+                let advanced = action == "rotate"
+                    && matches!(
+                        point,
+                        StorageInterruptionPoint::WalReclaimAfterRename
+                            | StorageInterruptionPoint::WalReclaimAfterDirectorySync
+                    );
+                let (current, other) = if advanced {
+                    (&next, &old)
+                } else {
+                    (&old, &next)
+                };
+                if action == "rotate" && other.join("MANIFEST").exists() {
+                    assert!(ManagedTablet::open(descriptor(), &wal, other, registry).is_err());
+                    assert_eq!(fs::read(&wal).unwrap(), bytes);
+                    let registry = GenerationRegistry::open(&reg, 97, 7).unwrap();
+                    let managed =
+                        ManagedTablet::open(descriptor(), &wal, current, registry).unwrap();
+                    let other = ManifestStore::open(other, 97, 7).unwrap();
+                    assert_eq!(
+                        managed.generation_status(&other).unwrap(),
+                        if point == StorageInterruptionPoint::RegistryBeforeRename {
+                            GenerationStatus::Unknown
+                        } else {
+                            GenerationStatus::Unreferenced
+                        }
+                    );
+                    managed
+                } else {
+                    ManagedTablet::open(descriptor(), &wal, current, registry).unwrap()
+                }
+            };
+            assert_eq!(managed.current_sequence(), 2, "case {index}");
+            assert_eq!(managed.read_at(b"k", 2).unwrap(), Some(b"tail".as_slice()));
+            assert_eq!(
+                managed
+                    .commit_idempotent(tx(1), put(b"first"))
+                    .unwrap()
+                    .sequence(),
+                1
+            );
+            assert_eq!(
+                managed
+                    .commit_idempotent(tx(2), put(b"tail"))
+                    .unwrap()
+                    .sequence(),
+                2
+            );
+            assert!(managed.commit_idempotent(tx(2), put(b"wrong")).is_err());
+            assert_eq!(
+                managed
+                    .commit_idempotent(tx(3), put(b"after"))
+                    .unwrap()
+                    .sequence(),
+                3
+            );
+            assert_eq!(&fs::read(&wal).unwrap()[..8], b"NUDBWAL5");
+        }
     }
 }
