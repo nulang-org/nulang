@@ -157,3 +157,60 @@ All 18 inline reference traces retain identical hit and eviction
 counts. Raw results: benchmarks/fabric-arena-adaptive-20261128.csv.
 This is a count-based occupancy adjustment, not a byte-weighted
 policy, guarantee of scan resistance, or equal-memory comparison.
+
+
+## Million-entry bounded scan qualification
+
+    cargo run --locked --no-default-features --release --example fabric_eviction_scale -- s3fifo 1000000
+    cargo run --locked --no-default-features --release --example fabric_eviction_scale -- noeviction 1000000
+
+The harness fills one million entries with inline eight-byte keys and
+64-byte values, a fixed 64,000,000-byte initialized arena limit, and a
+62,500-key hot prefix. It performs four scans of 500,000 previously
+unseen keys each, warming the hot set twice before each scan and
+verifying every hot key afterward. Every admitted value is read back
+and compared; each rejection is checked for unchanged entry and eviction
+counts and absence of the rejected key. It checks resident count and
+arena extent after each scan. Separate processes report Linux peak RSS
+(VmHWM) and estimated retained cache capacity.
+
+Two alternating rounds on shared Gertrude, using an optimized isolated
+cache-kernel build with pinned Rust 1.95 and repository-locked
+rustc-hash 2.1.3, yielded identical admission counts and verified
+hot-key reads across repetitions. Source runtime: 97d35703c (#2883).
+Results: benchmarks/fabric-eviction-scale-20261128.csv.
+
+| Metric (per run) | No eviction | S3-FIFO |
+|---|---:|---:|
+| Resident entries | 1,000,000 | 1,000,000 |
+| Verified hot reads | 750,000 | 750,000 |
+| New writes attempted | 2,000,000 | 2,000,000 |
+| New writes admitted | 0 | 1,999,985 |
+| Entry-limit rejections | 2,000,000 | 15 |
+| Arena-limit rejections | 0 | 0 |
+| Arena extent (bytes) | 64,000,000 | 64,000,000 |
+| Retained capacity after fill (bytes) | 184,619,992 | 197,203,056 |
+| Retained capacity after scans (bytes) | 184,619,992 | 255,169,908–255,170,889 |
+| Peak RSS after scans (KiB) | 176,076–176,080 | 322,620–322,868 |
+
+The first exploratory scale run failed the harness's overly strict
+zero-rejections assertion, despite preserving all hot keys. The
+corrected harness distinguishes successful admissions from conservative
+rejections without changing the runtime or retrying failed writes.
+The 15 S3-FIFO rejections are a contiguous initial prefix, matching
+the floor of 62,500 hot probationary entries divided by the existing
+4096-node scan budget. The source planner promotes these entries and
+can exhaust one admission's work budget before reaching a victim.
+Subsequent admissions make progress. This is a bounded availability
+tradeoff; do not lift the scan cap or promise every write succeeds.
+
+The noeviction control retains its hot keys by refusing every new
+write; this is not an equal-workload throughput comparison. Equal
+entry and arena limits are not equal total memory. Ghost and resident
+metadata raise retained capacity by about 38% after churn; measured
+peak RSS rises about 83%, including allocator/transient allocations.
+Neither figure is a hard RSS guarantee or a general overhead bound.
+Shared-host timing is descriptive only, and this does not exercise
+RESP transport, TLS, durable writes, multi-shard concurrency or
+production distributions. Equal-memory-budget comparisons and
+allocation/ghost-history optimization remain separate tasks.
