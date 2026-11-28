@@ -1244,3 +1244,70 @@ fn wal5_enrollment_migration_recovers_exact_tail_at_every_replacement_boundary()
         fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[cfg(all(test, unix))]
+#[test]
+fn interrupted_offline_enrollment_repair_is_retryable_without_wal_changes() {
+    use super::generation_registry::GenerationRegistry;
+    use super::managed_storage::ManagedTablet;
+    use super::sst_manifest::ManifestStore;
+    use super::tablet::TransactionId;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "nudb-sidecar-repair-fault-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&dir).unwrap();
+    let sst = dir.join("sst");
+    let reg = dir.join("registry");
+    fs::create_dir(&sst).unwrap();
+    fs::create_dir(&reg).unwrap();
+    let path = dir.join("tablet.wal");
+    let desc = TabletDescriptor::new(
+        TabletId::new(97).unwrap(),
+        KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+        7,
+    )
+    .unwrap();
+    let mut db = WalBackedTablet::open(desc.clone(), &path).unwrap();
+    let receipt = db
+        .commit_idempotent(TransactionId::new([1; 16]), vec![])
+        .unwrap();
+    let mut m = ManifestStore::create(&sst, 97, 7).unwrap();
+    db.flush_sst_shadow(&mut m, 1).unwrap();
+    db.seal_sst_recovery(&mut m).unwrap();
+    db.reclaim_to_sealed_sst(&m).unwrap();
+    let registry = GenerationRegistry::create(&reg, 97, 7).unwrap();
+    drop(ManagedTablet::adopt(db, registry, m).unwrap());
+    let registry = GenerationRegistry::open(&reg, 97, 7).unwrap();
+    let marker = dir.join("tablet.wal.lock");
+    let expected = fs::read(&marker).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    for point in [
+        StorageInterruptionPoint::EnrollmentBeforeWrite,
+        StorageInterruptionPoint::EnrollmentAfterWrite,
+    ] {
+        fs::write(&marker, []).unwrap();
+        let result = with_interruption(point, || {
+            ManagedTablet::repair_enrollment(desc.clone(), &path, &sst, &registry)
+        });
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("injected NulangDB storage interruption"));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(WalBackedTablet::open_from_sealed_sst(desc.clone(), &path, &sst).is_err());
+        ManagedTablet::repair_enrollment(desc.clone(), &path, &sst, &registry).unwrap();
+        assert_eq!(fs::read(&marker).unwrap(), expected);
+    }
+    let mut managed = ManagedTablet::open(desc, &path, &sst, registry).unwrap();
+    assert_eq!(
+        managed
+            .commit_idempotent(TransactionId::new([1; 16]), vec![])
+            .unwrap(),
+        receipt
+    );
+    drop(managed);
+    fs::remove_dir_all(dir).unwrap();
+}
