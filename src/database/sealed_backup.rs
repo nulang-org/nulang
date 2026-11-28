@@ -89,6 +89,52 @@ pub(super) fn wal_digest(path: &Path, expected_len: u64) -> io::Result<[u8; 32]>
     Ok(*hash.finalize().as_bytes())
 }
 
+/// Export/hash the canonical portable WAL4 representation. A managed WAL5
+/// is validated against its exact live header, then only the header is
+/// normalized. Frame bytes are preserved; the source is never changed.
+pub(super) fn portable_wal(
+    wal: &super::wal::FileWal,
+    destination: Option<&Path>,
+) -> io::Result<(u64, [u8; 32])> {
+    let (source, portable, len) = wal.portable_headers().map_err(io::Error::other)?;
+    let mut input = unique_file(wal.path())?;
+    if input.metadata()?.len() != len {
+        return Err(invalid("live WAL length mismatch"));
+    }
+    let mut actual = vec![0; source.len()];
+    input.read_exact(&mut actual)?;
+    if actual != source {
+        return Err(invalid("live WAL header mismatch"));
+    }
+    let mut output = destination.map(exclusive_file).transpose()?;
+    let mut hash = blake3::Hasher::new();
+    hash.update(&portable);
+    if let Some(out) = output.as_mut() {
+        out.write_all(&portable)?;
+    }
+    let tail = len
+        .checked_sub(source.len() as u64)
+        .ok_or_else(|| invalid("live WAL length mismatch"))?;
+    let mut remaining = tail;
+    let mut buf = [0; 64 * 1024];
+    while remaining != 0 {
+        let n = remaining.min(buf.len() as u64) as usize;
+        input.read_exact(&mut buf[..n])?;
+        hash.update(&buf[..n]);
+        if let Some(out) = output.as_mut() {
+            out.write_all(&buf[..n])?;
+        }
+        remaining -= n as u64;
+    }
+    if input.read(&mut buf[..1])? != 0 {
+        return Err(invalid("live WAL grew"));
+    }
+    if let Some(out) = output {
+        out.sync_all()?;
+    }
+    Ok((portable.len() as u64 + tail, *hash.finalize().as_bytes()))
+}
+
 pub(super) struct Completion {
     pub sequence: u64,
     pub floor: u64,

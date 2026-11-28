@@ -6,7 +6,8 @@
 //! file := wal_header record*
 //! wal_header := "NUDBWAL3" base_sequence:u64 tablet_id:u64 ownership_epoch:u64 header_blake3:[u8; 32]
 //! bound_header := "NUDBWAL4" base_sequence:u64 tablet_id:u64 ownership_epoch:u64 sealed_manifest_blake3:[u8; 32] header_blake3:[u8; 32]
-//! WAL4 is emitted only by explicit sealed reclamation and accepted only by explicit sealed recovery.
+//! managed_header := "NUDBWAL5" base_sequence:u64 tablet_id:u64 ownership_epoch:u64 sealed_manifest_blake3:[u8; 32] registry_identity:[u8; 32] header_blake3:[u8; 32]
+//! WAL5 requires both a matching registry and an enrollment sidecar; WAL3/WAL4 remain readable by their existing paths.
 //! record := frame_header payload:[u8; payload_len] payload_blake3:[u8; 32]
 //! frame_header := "NREC" frame_version:u16 payload_len:u32 header_blake3:[u8; 32]
 //! ```
@@ -31,6 +32,24 @@ use super::tablet::{
 const WAL_MAGIC: &[u8; 8] = b"NUDBWAL3";
 const BOUND_WAL_MAGIC: &[u8; 8] = b"NUDBWAL4";
 const BOUND_HEADER_BYTES: usize = 96;
+const MANAGED_WAL_MAGIC: &[u8; 8] = b"NUDBWAL5";
+const MANAGED_HEADER_BYTES: usize = 128;
+
+fn bound_header(binding: SealBinding, registry: Option<[u8; 32]>) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(if registry.is_some() {
+        MANAGED_HEADER_BYTES
+    } else {
+        BOUND_HEADER_BYTES
+    });
+    bytes.extend_from_slice(&binding.prefix());
+    if let Some(id) = registry {
+        bytes[..8].copy_from_slice(MANAGED_WAL_MAGIC);
+        bytes.extend_from_slice(&id);
+    }
+    let digest = blake3::hash(&bytes);
+    bytes.extend_from_slice(digest.as_bytes());
+    bytes
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SealBinding {
@@ -254,6 +273,7 @@ pub struct FileWal {
     record_end_offsets: Vec<u64>,
     base_sequence: u64,
     seal_binding: Option<SealBinding>,
+    managed_registry: Option<[u8; 32]>,
     tablet_id: Option<TabletId>,
     latest_ownership_epoch: Option<u64>,
     poisoned: bool,
@@ -338,7 +358,7 @@ impl FileWal {
                 return Err(WalError::InvalidHeader);
             }
         }
-        Self::open_locked(path, lock, binding, require_bound)
+        Self::open_locked(path, lock, binding, require_bound, registry)
     }
 
     fn open_locked(
@@ -346,6 +366,7 @@ impl FileWal {
         writer_lock: Arc<WriterLock>,
         binding: Option<SealBinding>,
         require_bound: bool,
+        registry: Option<[u8; 32]>,
     ) -> Result<Self, WalError> {
         // The caller already holds the stable sidecar lock. This path is also
         // used after WAL reclamation, so it must not try to lock a second time.
@@ -371,27 +392,38 @@ impl FileWal {
         if read_up_to(&mut file, &mut wal_header)? != WAL_HEADER_BYTES {
             return Err(WalError::InvalidHeader);
         }
+        let mut managed_registry = None;
         let (base_sequence, mut tablet_id, mut latest_ownership_epoch, seal_binding, header_len) =
-            if &wal_header[..8] == BOUND_WAL_MAGIC {
-                // Require exact expected identity before inspecting or repairing any tail.
+            if &wal_header[..8] == MANAGED_WAL_MAGIC || &wal_header[..8] == BOUND_WAL_MAGIC {
                 let expected = binding.ok_or(WalError::SealBindingMismatch)?;
-                let mut checksum = [0; 32];
-                if read_up_to(&mut file, &mut checksum)? != checksum.len() {
+                let managed = &wal_header[..8] == MANAGED_WAL_MAGIC;
+                let identity = if managed {
+                    Some(registry.ok_or(WalError::ManagedEnrollmentMismatch)?)
+                } else {
+                    None
+                };
+                let expected_header = bound_header(expected, identity);
+                let mut actual = wal_header.to_vec();
+                actual.resize(expected_header.len(), 0);
+                if read_up_to(&mut file, &mut actual[WAL_HEADER_BYTES..])?
+                    != expected_header.len() - WAL_HEADER_BYTES
+                {
                     return Err(WalError::InvalidHeader);
                 }
-                if blake3::hash(&wal_header).as_bytes() != &checksum {
+                let split = actual.len() - 32;
+                if blake3::hash(&actual[..split]).as_bytes() != &actual[split..] {
                     return Err(WalError::WalHeaderChecksumMismatch);
                 }
-                if expected.sequence == 0 || expected.epoch == 0 || wal_header != expected.prefix()
-                {
+                if expected.sequence == 0 || expected.epoch == 0 || actual != expected_header {
                     return Err(WalError::SealBindingMismatch);
                 }
+                managed_registry = identity;
                 (
                     expected.sequence,
                     Some(expected.tablet_id),
                     Some(expected.epoch),
                     Some(expected),
-                    BOUND_HEADER_BYTES,
+                    actual.len(),
                 )
             } else {
                 if require_bound {
@@ -480,6 +512,7 @@ impl FileWal {
             record_end_offsets,
             base_sequence,
             seal_binding,
+            managed_registry,
             tablet_id,
             latest_ownership_epoch,
             poisoned: false,
@@ -547,7 +580,7 @@ impl FileWal {
     /// registration, while still holding exclusive ownership. Partial
     /// nonempty markers fail closed; never truncate or remove this sidecar.
     #[cfg(unix)]
-    pub(super) fn enroll_registry(&self, registry: [u8; 32]) -> Result<(), WalError> {
+    pub(super) fn enroll_registry(&mut self, registry: [u8; 32]) -> Result<(), WalError> {
         use std::os::unix::fs::FileExt;
         if self.poisoned || !self.is_seal_bound() {
             return Err(WalError::ManagedEnrollmentMismatch);
@@ -555,20 +588,41 @@ impl FileWal {
         self.sync_for_registry()?;
         let lock = &self.writer_lock.0;
         if lock.metadata()?.len() != 0 {
-            return Self::verify_enrollment(lock, &self.path, Some(registry));
+            Self::verify_enrollment(lock, &self.path, Some(registry))?;
+        } else {
+            #[cfg(test)]
+            super::interruption::hit(
+                super::interruption::StorageInterruptionPoint::EnrollmentBeforeWrite,
+            )?;
+            lock.write_all_at(&Self::enrollment_bytes(registry), 0)?;
+            #[cfg(test)]
+            super::interruption::hit(
+                super::interruption::StorageInterruptionPoint::EnrollmentAfterWrite,
+            )?;
+            lock.sync_all()?;
+            sync_parent_directory(&self.path)?;
         }
-        #[cfg(test)]
-        super::interruption::hit(
-            super::interruption::StorageInterruptionPoint::EnrollmentBeforeWrite,
-        )?;
-        lock.write_all_at(&Self::enrollment_bytes(registry), 0)?;
-        #[cfg(test)]
-        super::interruption::hit(
-            super::interruption::StorageInterruptionPoint::EnrollmentAfterWrite,
-        )?;
-        lock.sync_all()?;
-        sync_parent_directory(&self.path)?;
-        Ok(())
+        if self.managed_registry == Some(registry) {
+            return Ok(());
+        }
+        if self.managed_registry.is_some() {
+            return Err(WalError::ManagedEnrollmentMismatch);
+        }
+        let binding = self.seal_binding.ok_or(WalError::SealBindingMismatch)?;
+        self.replace_bound(binding, Some(registry), true)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn portable_headers(&self) -> Result<(Vec<u8>, Vec<u8>, u64), WalError> {
+        let binding = self.seal_binding.ok_or(WalError::SealBindingMismatch)?;
+        let source = bound_header(binding, self.managed_registry);
+        let portable = bound_header(binding, None);
+        let len = self
+            .record_end_offsets
+            .last()
+            .copied()
+            .unwrap_or(source.len() as u64);
+        Ok((source, portable, len))
     }
 
     /// Re-establish the durability of a recovered WAL's canonical name before
@@ -858,6 +912,7 @@ impl FileWal {
             Arc::clone(&self.writer_lock),
             None,
             false,
+            None,
         )?;
         Ok(())
     }
@@ -866,9 +921,6 @@ impl FileWal {
     /// the matching manifest lock and has verified and synced its contents.
     #[cfg(unix)]
     pub(super) fn reclaim_to_binding(&mut self, binding: SealBinding) -> Result<(), WalError> {
-        use std::os::unix::fs::OpenOptionsExt;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
         if self.poisoned {
             return Err(WalError::Poisoned);
         }
@@ -884,6 +936,31 @@ impl FileWal {
             return Err(WalError::SealBindingMismatch);
         }
 
+        self.replace_bound(binding, self.managed_registry, false)
+    }
+
+    /// Atomically replace the bound header, optionally copying the exact
+    /// acknowledged tail for enrollment migration. No reserialization.
+    #[cfg(unix)]
+    fn replace_bound(
+        &mut self,
+        binding: SealBinding,
+        registry: Option<[u8; 32]>,
+        keep_tail: bool,
+    ) -> Result<(), WalError> {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let old_header = self
+            .seal_binding
+            .map(|b| bound_header(b, self.managed_registry));
+        let old_len = self
+            .record_end_offsets
+            .last()
+            .copied()
+            .unwrap_or(old_header.as_ref().map_or(0, |h| h.len() as u64));
+        let old_sequence = self.last_sequence();
+        let old_records = self.records.len();
         self.poisoned = true;
         // Exclusive staging creation; abandoned stages are never adopted.
         // Do not truncate a preexisting path or follow a staging symlink.
@@ -923,9 +1000,24 @@ impl FileWal {
                 "bound WAL staging collision limit",
             )
         })?;
-        let prefix = binding.prefix();
-        replacement.write_all(&prefix)?;
-        replacement.write_all(blake3::hash(&prefix).as_bytes())?;
+        replacement.write_all(&bound_header(binding, registry))?;
+        if keep_tail {
+            let header = old_header.ok_or(WalError::SealBindingMismatch)?;
+            let mut input = File::open(&self.path)?;
+            let mut actual = vec![0; header.len()];
+            input.read_exact(&mut actual)?;
+            if actual != header || input.metadata()?.len() != old_len {
+                return Err(WalError::SealBindingMismatch);
+            }
+            let tail = old_len
+                .checked_sub(header.len() as u64)
+                .ok_or(WalError::InvalidHeader)?;
+            if io::copy(&mut (&mut input).take(tail), &mut replacement)? != tail
+                || input.read(&mut [0; 1])? != 0
+            {
+                return Err(WalError::InvalidHeader);
+            }
+        }
         #[cfg(test)]
         super::interruption::hit(
             super::interruption::StorageInterruptionPoint::WalReclaimAfterReplacementWrite,
@@ -935,6 +1027,23 @@ impl FileWal {
         super::interruption::hit(
             super::interruption::StorageInterruptionPoint::WalReclaimAfterReplacementSync,
         )?;
+        // Validate the staged migration against every acknowledged record
+        // before replacing the live name, not just sequence/count equality.
+        if keep_tail {
+            let staged = Self::open_locked(
+                stage.0.as_ref().expect("staged bound WAL").clone(),
+                Arc::clone(&self.writer_lock),
+                Some(binding),
+                true,
+                registry,
+            )?;
+            if staged.records != self.records
+                || staged.file.metadata()?.len()
+                    != old_len - BOUND_HEADER_BYTES as u64 + MANAGED_HEADER_BYTES as u64
+            {
+                return Err(WalError::SealBindingMismatch);
+            }
+        }
         drop(replacement);
         fs::rename(stage.0.as_ref().expect("staged bound WAL"), &self.path)?;
         stage.0 = None;
@@ -953,8 +1062,16 @@ impl FileWal {
             Arc::clone(&self.writer_lock),
             Some(binding),
             true,
+            registry,
         )?;
-        if reopened.seal_binding != Some(binding) || !reopened.records.is_empty() {
+        if reopened.seal_binding != Some(binding)
+            || reopened.managed_registry != registry
+            || (keep_tail
+                && (reopened.last_sequence() != old_sequence
+                    || reopened.records.len() != old_records
+                    || reopened.records != self.records))
+            || (!keep_tail && !reopened.records.is_empty())
+        {
             return Err(WalError::SealBindingMismatch);
         }
         *self = reopened;

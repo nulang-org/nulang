@@ -6,6 +6,10 @@ use std::io;
 pub(super) struct SidecarLock(File);
 
 impl SidecarLock {
+    pub(super) fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        self.0.metadata()
+    }
+
     pub(super) fn acquire(file: File, contention: &'static str) -> io::Result<Self> {
         file.try_lock().map_err(|error| match error {
             std::fs::TryLockError::WouldBlock => {

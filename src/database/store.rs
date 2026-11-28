@@ -704,15 +704,8 @@ impl WalBackedTablet {
         if copied != binding {
             return Err(io::Error::other("backup seal changed"));
         }
-        let wal_len = self
-            .wal
-            .records()
-            .len()
-            .checked_sub(1)
-            .and_then(|i| self.wal.record_end_offset(i))
-            .unwrap_or(96);
         let wal_path = destination.join("tablet.wal");
-        let wal_digest = sealed_backup::copy_wal(self.wal.path(), &wal_path, wal_len)?;
+        let (wal_len, wal_digest) = sealed_backup::portable_wal(&self.wal, Some(&wal_path))?;
         // Reopen the independent copy, not the source. Require exact live
         // logical state and ensure recovery did not truncate any bytes.
         let recovered =
@@ -847,13 +840,7 @@ impl WalBackedTablet {
             return Err(io::Error::other("active seal binding changed"));
         }
         let completion = Completion::read(&backup)?;
-        let wal_len = self
-            .wal
-            .records()
-            .len()
-            .checked_sub(1)
-            .and_then(|i| self.wal.record_end_offset(i))
-            .unwrap_or(96);
+        let (wal_len, live_digest) = sealed_backup::portable_wal(&self.wal, None)?;
         if completion.sequence != self.current_sequence()
             || completion.floor != self.oldest_retained_snapshot()
             || completion.seal_digest != binding.digest
@@ -872,7 +859,7 @@ impl WalBackedTablet {
             || archived.current().recovery_descriptor() != Some(self.descriptor())
             || sealed_backup::wal_digest(&backup.join("tablet.wal"), wal_len)?
                 != completion.wal_digest
-            || sealed_backup::wal_digest(self.wal.path(), wal_len)? != completion.wal_digest
+            || live_digest != completion.wal_digest
         {
             return Err(io::Error::other(
                 "backup contents do not match active generation and WAL",
@@ -896,7 +883,7 @@ impl WalBackedTablet {
 
     #[cfg(unix)]
     pub(super) fn enroll_generation_registry(
-        &self,
+        &mut self,
         registry: &super::generation_registry::GenerationRegistry,
     ) -> std::io::Result<()> {
         self.wal

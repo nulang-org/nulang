@@ -1268,3 +1268,95 @@ fn malformed_enrollment_marker_blocks_raw_and_managed_recovery_before_wal_repair
     let managed = ManagedTablet::open(f.descriptor(), &wal, f.0.join("sst"), registry).unwrap();
     assert_eq!(managed.current_sequence(), 1);
 }
+
+#[test]
+fn wal5_self_identifies_even_if_enrollment_sidecar_is_empty_and_backups_are_portable() {
+    use nulang::database::{
+        generation_registry::GenerationRegistry, managed_storage::ManagedTablet,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    let receipt = db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let old = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    db.commit_idempotent(id(2), vec![put(b"tail")]).unwrap();
+    let wal = f.0.join("tablet.wal");
+    let lock = f.0.join("tablet.wal.lock");
+    let before = fs::read(&wal).unwrap();
+    let reg = f.0.join("registry");
+    fs::create_dir(&reg).unwrap();
+    let registry = GenerationRegistry::create(&reg, 7, 3).unwrap();
+    let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+    let managed_bytes = fs::read(&wal).unwrap();
+    assert_eq!(&managed_bytes[..8], b"NUDBWAL5");
+    assert_eq!(&managed_bytes[128..], &before[96..]);
+    let backup = f.0.join("backup");
+    managed.backup([1; 16], &backup).unwrap();
+    assert_eq!(fs::read(backup.join("tablet.wal")).unwrap(), before);
+    let restored =
+        WalBackedTablet::restore_sealed_backup(f.descriptor(), &backup, f.0.join("restored"))
+            .unwrap();
+    assert_eq!(restored.current_sequence(), 2);
+    drop(restored);
+    drop(managed);
+    let marker = fs::read(&lock).unwrap();
+    fs::write(&lock, []).unwrap();
+    assert!(recover(&f).is_err());
+    assert_eq!(fs::read(&wal).unwrap(), managed_bytes);
+    let registry = GenerationRegistry::open(&reg, 7, 3).unwrap();
+    assert!(ManagedTablet::open(f.descriptor(), &wal, f.0.join("sst"), registry).is_err());
+    fs::write(&lock, marker).unwrap();
+    let registry = GenerationRegistry::open(&reg, 7, 3).unwrap();
+    let mut managed = ManagedTablet::open(f.descriptor(), &wal, f.0.join("sst"), registry).unwrap();
+    assert_eq!(
+        managed
+            .commit_idempotent(id(1), vec![put(b"first")])
+            .unwrap(),
+        receipt
+    );
+    let next = f.0.join("next");
+    fs::create_dir(&next).unwrap();
+    managed
+        .rotate(ManifestStore::create(&next, 7, 3).unwrap(), 1)
+        .unwrap();
+    let bytes = fs::read(&wal).unwrap();
+    assert_eq!(bytes.len(), 128);
+    assert_eq!(&bytes[..8], b"NUDBWAL5");
+    drop(managed);
+    fs::remove_file(&lock).unwrap();
+    assert!(WalBackedTablet::open_from_sealed_sst(f.descriptor(), &wal, &next).is_err());
+    assert_eq!(fs::read(&wal).unwrap(), bytes);
+}
+
+#[test]
+fn wal5_migration_refuses_valid_but_changed_tail_before_replacing_live_wal() {
+    use nulang::database::{
+        generation_registry::GenerationRegistry, managed_storage::ManagedTablet,
+    };
+    let f = Fixture::new();
+    let other = Fixture::new();
+    let mut db = f.open();
+    let mut other_db = other.open();
+    for db in [&mut db, &mut other_db] {
+        db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    }
+    let m = seal(&f, &db);
+    let om = seal(&other, &other_db);
+    db.reclaim_to_sealed_sst(&m).unwrap();
+    other_db.reclaim_to_sealed_sst(&om).unwrap();
+    let write = db.prepare_write(3, 1, vec![put(b"tail")]).unwrap();
+    db.commit(write).unwrap();
+    let write = other_db.prepare_write(3, 1, vec![put(b"tall")]).unwrap();
+    other_db.commit(write).unwrap();
+    let wal = f.0.join("tablet.wal");
+    let other_bytes = fs::read(other.0.join("tablet.wal")).unwrap();
+    // A valid alternate frame with the same sequence and length must not
+    // silently replace the acknowledged logical state during migration.
+    assert_eq!(fs::metadata(&wal).unwrap().len(), other_bytes.len() as u64);
+    fs::write(&wal, &other_bytes).unwrap();
+    let reg = f.0.join("registry");
+    fs::create_dir(&reg).unwrap();
+    let registry = GenerationRegistry::create(&reg, 7, 3).unwrap();
+    assert!(ManagedTablet::adopt(db, registry, m).is_err());
+    assert_eq!(fs::read(&wal).unwrap(), other_bytes);
+}
