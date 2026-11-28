@@ -1140,6 +1140,6 @@ performance measurement of this follow-up timeout repair.
 
 ## Optional memory-cache eviction
 
-See [Fabric eviction](FABRIC_EVICTION.md) for the entry-pressure S3-FIFO
-policy, conservative arena admission, atomic MSET behavior and trace
+See [Fabric eviction](FABRIC_EVICTION.md) for the entry- and arena-pressure S3-FIFO
+policy, size-class admission, atomic MSET behavior and trace
 comparison. Noeviction remains default; durable mode rejects S3-FIFO.
