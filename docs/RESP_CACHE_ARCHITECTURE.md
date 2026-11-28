@@ -1117,3 +1117,23 @@ The latter counts driven connection events, not necessarily
 commands or mutations. Both counters are zero with the default
 window. See the WAL writer decision record for the initial
 same-binary window comparison and limitations.
+
+
+### Embedded readiness-wait budget and transport qualification
+
+An explicit poll_once timeout is a shared readiness-wait budget for
+the initial poll and optional collection poll. A zero timeout disables
+the additional waiting, even when the configured collection window is
+nonzero. Elapsed time before the extra poll reduces its remaining
+budget. This is not a bound on command execution, synchronous storage
+operations, scheduler delay or the complete reactor iteration.
+
+A deterministic regression reproduced the extra wait with a zero-timeout
+caller before the repair. Additional tests exercise wake-event deferral
+and commit before shutdown, trusted/untrusted mutual TLS with nonzero
+collection enabled, pipeline ordering and admission, recovery of 64
+acknowledged increments after SIGKILL, and real child-only file-size
+exhaustion with the collection window enabled. No durability semantics
+or default collection settings are relaxed. The earlier A/B report
+describes the original collection-window implementation; it is not a
+performance measurement of this follow-up timeout repair.

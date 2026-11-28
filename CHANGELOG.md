@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Fabric coalescing qualification — 2026-11-27
+- **Honor the embedded caller readiness-wait budget across both group collection polls**, including nonblocking callers; qualify wake/shutdown ordering, mutual TLS, acknowledged-state recovery and real file-write failure with coalescing enabled. No dependency or default-setting changes.
+
 ### Fabric bounded cross-client coalescing — 2026-11-27
 - **Add opt-in 0–2000 us cross-client collection window** with bounded readiness collection, existing durability barrier and resource limits, metrics and same-binary comparison. Zero-wait default unchanged; no new dependencies.
 
