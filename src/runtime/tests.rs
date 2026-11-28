@@ -2517,6 +2517,132 @@ fn test_libsql_store_persists_to_disk() {
 
 #[cfg(feature = "sqlite")]
 #[test]
+fn test_libsql_store_disposable_legacy_backup_upgrade_reopen_restore() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "nulang-sqlite-upgrade-rollback-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create disposable SQLite fixture directory");
+    let legacy_path = dir.join("legacy.db");
+    let backup_path = dir.join("pre-upgrade.db");
+    let restored_path = dir.join("restored.db");
+
+    {
+        let legacy = rusqlite::Connection::open(&legacy_path).expect("open old-schema fixture");
+        legacy
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA synchronous=FULL;
+                 CREATE TABLE snapshots (
+                     actor_id INTEGER PRIMARY KEY,
+                     sequence INTEGER NOT NULL,
+                     state TEXT NOT NULL,
+                     waiting_signal TEXT
+                 );
+                 CREATE TABLE journal (
+                     actor_id INTEGER NOT NULL,
+                     sequence INTEGER NOT NULL,
+                     behavior_id INTEGER NOT NULL,
+                     payload TEXT NOT NULL,
+                     PRIMARY KEY (actor_id, sequence)
+                 );
+                 INSERT INTO snapshots (actor_id, sequence, state, waiting_signal)
+                     VALUES (7, 3, '{}', NULL);
+                 INSERT INTO journal (actor_id, sequence, behavior_id, payload)
+                     VALUES (7, 4, 2, '[]');",
+            )
+            .expect("commit durable old-schema state and journal");
+
+        // VACUUM INTO exports one consistent SQLite snapshot, including
+        // committed WAL state, rather than incorrectly copying a live .db file.
+        legacy
+            .execute(
+                "VACUUM INTO ?1",
+                [backup_path
+                    .to_str()
+                    .expect("temporary backup path is UTF-8")],
+            )
+            .expect("create immutable pre-upgrade backup from legacy fixture");
+    }
+
+    {
+        let backup = rusqlite::Connection::open(&backup_path).expect("verify backup");
+        let integrity: String = backup
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .expect("run backup integrity check");
+        assert_eq!(integrity, "ok");
+    }
+
+    {
+        let mut upgraded = LibsqlStore::new(&legacy_path).expect("upgrade old schema in place");
+        assert_eq!(
+            upgraded.load_snapshot(7).expect("legacy snapshot").sequence,
+            3
+        );
+        assert_eq!(upgraded.latest_sequence(7), 4);
+        assert_eq!(upgraded.read_journal(7).len(), 1);
+
+        let mut state = HashMap::new();
+        state.insert("count".to_string(), PersistedValue::Int(5));
+        upgraded
+            .save_snapshot(ActorSnapshot {
+                actor_id: 7,
+                sequence: 5,
+                activation_epoch: 1,
+                state,
+                waiting_signal: None,
+                crdt_snapshot: None,
+                crdt_field_map: None,
+                schema_name: None,
+                authority_tokens: Default::default(),
+            })
+            .expect("persist an upgraded actor snapshot");
+        upgraded
+            .append_journal(
+                7,
+                JournalEntry {
+                    sequence: 6,
+                    behavior_id: 3,
+                    payload: vec![PersistedValue::Int(5)],
+                },
+            )
+            .expect("persist a post-upgrade journal entry");
+    }
+    {
+        let reopened = LibsqlStore::new(&legacy_path).expect("reopen upgraded SQLite store");
+        let snapshot = reopened
+            .load_snapshot(7)
+            .expect("upgraded snapshot survives reopen");
+        assert_eq!(snapshot.sequence, 5);
+        assert_eq!(snapshot.state.get("count"), Some(&PersistedValue::Int(5)));
+        assert_eq!(reopened.latest_sequence(7), 6);
+        assert_eq!(reopened.read_journal(7).len(), 2);
+    }
+
+    // Rollback requires restoring the *pre-upgrade* backup to a clean
+    // directory. Merely reverting the binary against upgraded files is unsafe.
+    std::fs::copy(&backup_path, &restored_path).expect("restore immutable backup");
+    {
+        let restored = LibsqlStore::new(&restored_path).expect("read restored legacy snapshot");
+        let snapshot = restored.load_snapshot(7).expect("pre-upgrade actor state");
+        assert_eq!(snapshot.sequence, 3);
+        assert!(snapshot.state.get("count").is_none());
+        assert_eq!(restored.latest_sequence(7), 4);
+        assert_eq!(restored.read_journal(7).len(), 1);
+    }
+
+    // This verifies the new adapter's restored-copy path, not a separate old
+    // binary's ability to reopen the restored database or live Turso behavior.
+    std::fs::remove_dir_all(&dir).expect("clean up disposable SQLite fixtures");
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
 fn test_libsql_store_crdt_snapshot_roundtrip() {
     let mut store = LibsqlStore::in_memory().unwrap();
     store
@@ -2559,6 +2685,182 @@ fn test_libsql_store_crdt_snapshot_roundtrip() {
 
 #[cfg(feature = "sqlite")]
 #[test]
+fn test_libsql_store_rejects_snapshot_table_missing_required_state_column() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "nulang-snapshot-missing-state-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create disposable directory");
+    let path = dir.join("legacy.db");
+    {
+        let db = rusqlite::Connection::open(&path).expect("create legacy SQLite fixture");
+        db.execute(
+            "CREATE TABLE snapshots (actor_id INTEGER PRIMARY KEY, sequence INTEGER NOT NULL)",
+            [],
+        )
+        .expect("create malformed legacy schema missing state");
+    }
+
+    let error = LibsqlStore::new(&path)
+        .err()
+        .expect("startup must reject snapshots missing required state column");
+    assert!(
+        error.to_string().contains("state"),
+        "report the missing required snapshot column: {error}"
+    );
+    std::fs::remove_dir_all(&dir).expect("clean up disposable fixture");
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn test_libsql_store_migrates_casefolded_optional_snapshot_columns_without_duplication() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "nulang-snapshot-casefolded-columns-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create disposable directory");
+    let path = dir.join("legacy.db");
+    {
+        let db = rusqlite::Connection::open(&path).expect("create legacy SQLite fixture");
+        db.execute(
+            "CREATE TABLE snapshots (
+                actor_id INTEGER PRIMARY KEY,
+                sequence INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                ACTIVATION_EPOCH INTEGER NOT NULL DEFAULT 1,
+                CRDT_SNAPSHOT TEXT
+            )",
+            [],
+        )
+        .expect("create valid schema with uppercase optional column names");
+    }
+
+    let store = LibsqlStore::new(&path).expect(
+        "SQLite identifiers are case-insensitive; optional columns must not be added twice",
+    );
+    let columns = store
+        .query("PRAGMA table_info(snapshots)", &[])
+        .expect("inspect migrated schema");
+    assert_eq!(
+        columns
+            .iter()
+            .filter(|c| c.to_ascii_lowercase().contains("activation_epoch"))
+            .count(),
+        1,
+        "legacy activation_epoch must not be duplicated"
+    );
+    drop(store);
+    std::fs::remove_dir_all(&dir).expect("clean up disposable fixture");
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn test_libsql_store_rejects_incompatible_snapshot_view_before_accepting_writes() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "nulang-snapshot-schema-fail-closed-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create disposable directory");
+    let path = dir.join("legacy.db");
+    {
+        let db = rusqlite::Connection::open(&path).expect("create fixture");
+        db.execute("CREATE VIEW snapshots AS SELECT 1 AS actor_id", [])
+            .expect("create incompatible legacy object");
+    }
+    // The former migration swallowed every failed ALTER TABLE statement,
+    // returning a live actor store whose snapshots table was actually a view.
+    let error = LibsqlStore::new(&path)
+        .err()
+        .expect("startup must fail when a required snapshot column cannot be added");
+    assert!(
+        error.to_string().contains("snapshots"),
+        "identify the failing table without accepting a broken store: {error}"
+    );
+    std::fs::remove_dir_all(&dir).expect("clean up disposable fixture");
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn test_libsql_store_rejects_complete_snapshot_view_at_startup() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "nulang-snapshot-complete-view-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create disposable directory");
+    let path = dir.join("snapshot.db");
+    {
+        let db = rusqlite::Connection::open(&path).expect("create fixture");
+        db.execute(
+            "CREATE VIEW snapshots AS SELECT 1 AS actor_id, 1 AS sequence, \
+             1 AS activation_epoch, '{}' AS state, NULL AS waiting_signal, \
+             NULL AS crdt_snapshot, NULL AS crdt_field_map, \
+             NULL AS schema_name, NULL AS authority_tokens",
+            [],
+        )
+        .expect("create incompatible view with every expected column");
+    }
+    // PRAGMA table_info lists view columns too: checking only names can
+    // mistake an unwritable view for a valid durable snapshots table.
+    let result = LibsqlStore::new(&path);
+    assert!(
+        result.is_err(),
+        "startup must reject an unwritable snapshots view even with every column"
+    );
+    std::fs::remove_dir_all(&dir).expect("clean up disposable fixture");
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn test_libsql_store_accepts_casefolded_legacy_snapshots_table() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "nulang-snapshot-uppercase-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create disposable directory");
+    let path = dir.join("snapshot.db");
+    {
+        let db = rusqlite::Connection::open(&path).expect("create fixture");
+        db.execute(
+            "CREATE TABLE SNAPSHOTS (actor_id INTEGER PRIMARY KEY, sequence INTEGER NOT NULL, state TEXT NOT NULL)",
+            [],
+        )
+        .expect("create uppercase legacy snapshots table");
+    }
+    // SQL identifiers are case-insensitive. The metadata lookup must not
+    // reject an otherwise valid legacy table based on its stored name case.
+    let store = LibsqlStore::new(&path);
+    assert!(store.is_ok(), "uppercase legacy table should migrate");
+    drop(store);
+    std::fs::remove_dir_all(&dir).expect("clean up disposable fixture");
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
 fn test_libsql_store_migrates_old_schema_crdt_column() {
     let path =
         std::env::temp_dir().join(format!("nulang_libsql_migrate_{}.db", std::process::id()));
@@ -2566,7 +2868,10 @@ fn test_libsql_store_migrates_old_schema_crdt_column() {
         // Create a database with the pre-crdt_snapshot four-column schema.
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let db = libsql::Builder::new_local(&path).build().await.unwrap();
+            let db = super::sqlite_compat::Builder::new_local(&path)
+                .build()
+                .await
+                .unwrap();
             let conn = db.connect().unwrap();
             conn.execute(
                 "CREATE TABLE snapshots (
@@ -5552,6 +5857,20 @@ fn active_views_converged(nodes: &[&Runtime], ids: &[NodeId]) -> bool {
     })
 }
 
+/// Active peer membership is not sufficient to show a healed partition:
+/// the address resolver rejects one-shot messages to peers whose status
+/// remains Suspect or Failed. Require both active-view convergence and
+/// healthy peer statuses before post-heal delivery assertions.
+#[cfg(feature = "tcp")]
+fn healthy_active_views_converged(nodes: &[&Runtime], ids: &[NodeId]) -> bool {
+    active_views_converged(nodes, ids)
+        && nodes.iter().all(|rt| {
+            let local = rt.distributed.node_id.expect("node id");
+            ids.iter()
+                .all(|id| *id == local || cluster_status(rt, *id) == Some(NodeStatus::Healthy))
+        })
+}
+
 #[cfg(feature = "tcp")]
 /// PLAN.md Phase 1 bullet 4 (chaos suite): split-brain — two mutually
 /// invisible healthy sub-clusters, NOT one node dying. Three real
@@ -5964,12 +6283,15 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
     let mut healed = false;
     for _ in 0..400 {
         advance_all(&mut nodes.iter_mut().collect::<Vec<_>>(), step);
-        if active_views_converged(&nodes.iter().collect::<Vec<_>>(), &ids) {
+        if healthy_active_views_converged(&nodes.iter().collect::<Vec<_>>(), &ids) {
             healed = true;
             break;
         }
     }
-    assert!(healed, "5-node cluster did not heal after the split-brain");
+    assert!(
+        healed,
+        "5-node cluster did not regain healthy active peer views after the split-brain"
+    );
 
     // Membership convergence alone does not guarantee that every peer has
     // relearned the authoritative listen address after a partition. The
@@ -5988,6 +6310,20 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
         let (first_four, last) = nodes.split_at_mut(4);
         pump_until_peer_roundtrip(&mut last[0], &mut first_four[0], Duration::from_secs(15));
     }
+
+    // A healthy active view is a necessary precondition for sending a
+    // one-shot message. Address/ACK convergence alone does not prove that
+    // the address resolver considers the target peer healthy.
+    assert_eq!(
+        cluster_status(&nodes[4], ids[0]),
+        Some(NodeStatus::Healthy),
+        "E must see A healthy before cross-boundary delivery"
+    );
+    assert_eq!(
+        cluster_status(&nodes[0], ids[4]),
+        Some(NodeStatus::Healthy),
+        "A must see E healthy before cross-boundary delivery"
+    );
 
     // Cross-boundary delivery after healing: E (node 4) -> actor on A
     // (node 0).
