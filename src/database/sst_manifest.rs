@@ -19,7 +19,7 @@ const MAGIC: &[u8; 8] = b"NUDBMAN1";
 const MAX_ENTRIES: usize = 1024;
 const HEADER_BYTES: usize = 34;
 const ENTRY_BYTES: usize = 64;
-const MAX_BYTES: usize = HEADER_BYTES + ENTRY_BYTES * MAX_ENTRIES + MAX_META_BYTES + 32;
+pub(super) const MAX_BYTES: usize = HEADER_BYTES + ENTRY_BYTES * MAX_ENTRIES + MAX_META_BYTES + 32;
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 fn invalid(reason: &'static str) -> io::Error {
@@ -571,6 +571,15 @@ impl ManifestStore {
         next: &mut Self,
         target_bytes: u64,
     ) -> io::Result<CompactionStats> {
+        self.prepare_compacted_shadow_admitted(next, target_bytes, |_, _, _| Ok(()))
+    }
+
+    pub(super) fn prepare_compacted_shadow_admitted(
+        &self,
+        next: &mut Self,
+        target_bytes: u64,
+        admit: impl FnOnce(&Path, u64, usize) -> io::Result<()>,
+    ) -> io::Result<CompactionStats> {
         const MAX_INPUT_TABLES: usize = 16;
         const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
         let meta = self.recovery_meta()?.clone();
@@ -613,6 +622,7 @@ impl ManifestStore {
             meta.floor,
             self.manifest.durable_sequence(),
             target_bytes,
+            |bytes, count| admit(&next.dir, bytes, count),
         )?;
         let mut output_versions = 0;
         let mut output_bytes = 0;

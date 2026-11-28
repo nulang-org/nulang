@@ -19,7 +19,7 @@ const MAGIC: &[u8; 8] = b"NUDBREG1";
 const RETIREMENT_MAGIC: &[u8; 8] = b"NUDBREG2";
 const DELETION_MAGIC: &[u8; 8] = b"NUDBREG3";
 const LINEAGE_MAGIC: &[u8; 8] = b"NUDBREG4";
-const MAX_BYTES: usize = 4 * 1024 * 1024;
+pub(super) const MAX_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ITEMS: usize = 8192;
 const MAX_PATH: usize = 4096;
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -397,6 +397,10 @@ impl GenerationRegistry {
             state,
             requires_reopen: false,
         })
+    }
+
+    pub(super) fn directory(&self) -> &Path {
+        &self.dir
     }
 
     fn ready(&self) -> io::Result<()> {

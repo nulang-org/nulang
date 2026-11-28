@@ -376,8 +376,9 @@ pub(super) fn compact_verified_tables(
     floor: u64,
     sequence: u64,
     target_bytes: u64,
+    admit: impl FnOnce(u64, usize) -> io::Result<()>,
 ) -> io::Result<usize> {
-    streaming_writer::compact(directory, tables, floor, sequence, target_bytes)
+    streaming_writer::compact(directory, tables, floor, sequence, target_bytes, admit)
 }
 
 #[cfg(unix)]
@@ -566,6 +567,7 @@ mod streaming_writer {
         floor: u64,
         sequence: u64,
         target_bytes: u64,
+        admit: impl FnOnce(u64, usize) -> io::Result<()>,
     ) -> io::Result<usize> {
         const OVERHEAD: u64 = 82;
         const MAX_OUTPUTS: usize = 16;
@@ -660,7 +662,7 @@ mod streaming_writer {
                 if standalone > target_bytes - OVERHEAD {
                     return Err(invalid("one retained sequence exceeds output target"));
                 }
-                intervals.push((start, seq - 1));
+                intervals.push((start, seq - 1, used));
                 if intervals.len() >= MAX_OUTPUTS {
                     return Err(invalid("compaction output count limit"));
                 }
@@ -672,9 +674,14 @@ mod streaming_writer {
             }
             keys.extend(group.into_iter().map(|(key, _)| key));
         }
-        intervals.push((start, sequence));
+        intervals.push((start, sequence, used));
         let count = intervals.len();
-        for (index, (min, max)) in intervals.into_iter().enumerate() {
+        let bytes = intervals.iter().try_fold(0u64, |sum, (_, _, n)| {
+            sum.checked_add(*n)
+                .ok_or_else(|| invalid("compaction output byte overflow"))
+        })?;
+        admit(bytes, count)?;
+        for (index, (min, max, _)) in intervals.into_iter().enumerate() {
             let generation = index as u64 + 1;
             let mut key_count = 0;
             let mut version_count = 0;
