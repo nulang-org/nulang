@@ -265,17 +265,21 @@ impl FileWal {
     /// Open a canonical lowercase .wal path in a trusted local directory.
     /// Noncanonical legacy paths require verified offline migration.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WalError> {
-        Self::open_with_mode(path.as_ref(), false, None, false)
+        Self::open_with_mode(path.as_ref(), false, None, false, None)
     }
 
     #[cfg(unix)]
     pub(super) fn open_existing(path: &Path, binding: SealBinding) -> Result<Self, WalError> {
-        Self::open_with_mode(path, true, Some(binding), false)
+        Self::open_with_mode(path, true, Some(binding), false, None)
     }
 
     #[cfg(unix)]
-    pub(super) fn open_existing_bound(path: &Path, binding: SealBinding) -> Result<Self, WalError> {
-        Self::open_with_mode(path, true, Some(binding), true)
+    pub(super) fn open_existing_bound(
+        path: &Path,
+        binding: SealBinding,
+        registry: [u8; 32],
+    ) -> Result<Self, WalError> {
+        Self::open_with_mode(path, true, Some(binding), true, Some(registry))
     }
 
     fn open_with_mode(
@@ -283,6 +287,7 @@ impl FileWal {
         require_existing: bool,
         binding: Option<SealBinding>,
         require_bound: bool,
+        registry: Option<[u8; 32]>,
     ) -> Result<Self, WalError> {
         // WAL, checkpoint and lock/temp sidecars occupy disjoint namespaces.
         // Both WAL3 and WAL4 admission must reject aliases before mutation.
@@ -318,6 +323,15 @@ impl FileWal {
             std::fs::TryLockError::Error(error) => WalError::from(error),
         })?;
         let lock = Arc::new(WriterLock(lock));
+        // Enrollment is checked while holding the stable lock, before
+        // opening or repairing the WAL. The lock inode is never replaced.
+        #[cfg(unix)]
+        Self::verify_enrollment(&lock.0, &path, registry)?;
+        #[cfg(not(unix))]
+        if registry.is_some() || lock.0.metadata()?.len() != 0 {
+            return Err(WalError::ManagedEnrollmentMismatch);
+        }
+
         if require_existing {
             let metadata = fs::symlink_metadata(&path)?;
             if !metadata.is_file() || metadata.len() < WAL_HEADER_BYTES as u64 {
@@ -493,6 +507,68 @@ impl FileWal {
     #[cfg(unix)]
     pub(super) fn matches_seal(&self, binding: SealBinding) -> bool {
         self.seal_binding == Some(binding)
+    }
+
+    #[cfg(unix)]
+    fn enrollment_bytes(registry: [u8; 32]) -> [u8; 72] {
+        let mut bytes = [0; 72];
+        bytes[..8].copy_from_slice(b"NUDBENR1");
+        bytes[8..40].copy_from_slice(&registry);
+        let digest = blake3::hash(&bytes[..40]);
+        bytes[40..].copy_from_slice(digest.as_bytes());
+        bytes
+    }
+
+    #[cfg(unix)]
+    fn verify_enrollment(
+        lock: &File,
+        path: &Path,
+        registry: Option<[u8; 32]>,
+    ) -> Result<(), WalError> {
+        use std::os::unix::fs::FileExt;
+        match registry {
+            None if lock.metadata()?.len() == 0 => Ok(()),
+            Some(id) if lock.metadata()?.len() == 72 => {
+                let mut bytes = [0; 72];
+                lock.read_exact_at(&mut bytes, 0)?;
+                if bytes != Self::enrollment_bytes(id) {
+                    return Err(WalError::ManagedEnrollmentMismatch);
+                }
+                // Recover a fully written marker even after ambiguous sync.
+                lock.sync_all()?;
+                sync_parent_directory(path)?;
+                Ok(())
+            }
+            _ => Err(WalError::ManagedEnrollmentMismatch),
+        }
+    }
+
+    /// Persist enrollment on the stable writer-lock inode after registry
+    /// registration, while still holding exclusive ownership. Partial
+    /// nonempty markers fail closed; never truncate or remove this sidecar.
+    #[cfg(unix)]
+    pub(super) fn enroll_registry(&self, registry: [u8; 32]) -> Result<(), WalError> {
+        use std::os::unix::fs::FileExt;
+        if self.poisoned || !self.is_seal_bound() {
+            return Err(WalError::ManagedEnrollmentMismatch);
+        }
+        self.sync_for_registry()?;
+        let lock = &self.writer_lock.0;
+        if lock.metadata()?.len() != 0 {
+            return Self::verify_enrollment(lock, &self.path, Some(registry));
+        }
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::EnrollmentBeforeWrite,
+        )?;
+        lock.write_all_at(&Self::enrollment_bytes(registry), 0)?;
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::EnrollmentAfterWrite,
+        )?;
+        lock.sync_all()?;
+        sync_parent_directory(&self.path)?;
+        Ok(())
     }
 
     /// Re-establish the durability of a recovered WAL's canonical name before
@@ -1370,6 +1446,7 @@ pub enum WalError {
     WriterLocked,
     AliasedWalPath,
     InvalidWalExtension,
+    ManagedEnrollmentMismatch,
     WalHeaderChecksumMismatch,
     InvalidFrameHeader {
         offset: u64,
@@ -1454,6 +1531,7 @@ impl fmt::Display for WalError {
             Self::Io { message, .. } => write!(f, "WAL I/O error: {message}"),
             Self::InvalidHeader => f.write_str("invalid NuDB WAL header"),
             Self::SealBindingMismatch => f.write_str("bound WAL requires matching sealed manifest; legacy reclamation is disabled"),
+            Self::ManagedEnrollmentMismatch => f.write_str("WAL managed enrollment missing, corrupt or requires its registered registry"),
             Self::InvalidWalExtension => f.write_str("NuDB WAL path must end in .wal; noncanonical legacy paths require offline migration"),
             Self::WriterLocked => f.write_str("NuDB WAL already has an exclusive writer"),
             Self::AliasedWalPath => {

@@ -90,7 +90,7 @@ impl WalBackedTablet {
             descriptor.id().get(),
             descriptor.ownership_epoch(),
         )?;
-        Self::open_with_sealed_manifest(descriptor, wal_path.as_ref(), &manifest, false)
+        Self::open_with_sealed_manifest(descriptor, wal_path.as_ref(), &manifest, None)
     }
 
     #[cfg(unix)]
@@ -98,7 +98,7 @@ impl WalBackedTablet {
         descriptor: TabletDescriptor,
         wal_path: &Path,
         manifest: &super::sst_manifest::ManifestStore,
-        require_bound: bool,
+        registry: Option<[u8; 32]>,
     ) -> std::io::Result<Self> {
         use std::io;
         let invalid = |reason: &'static str| io::Error::new(io::ErrorKind::InvalidData, reason);
@@ -108,8 +108,8 @@ impl WalBackedTablet {
             return Err(invalid("sealed recovery descriptor mismatch"));
         }
         let binding = manifest.wal_binding()?;
-        let wal = if require_bound {
-            FileWal::open_existing_bound(wal_path, binding)
+        let wal = if let Some(registry) = registry {
+            FileWal::open_existing_bound(wal_path, binding, registry)
         } else {
             FileWal::open_existing(wal_path, binding)
         }
@@ -892,6 +892,16 @@ impl WalBackedTablet {
         manifest: &super::sst_manifest::ManifestStore,
     ) -> std::io::Result<()> {
         registry.register_wal(self.wal.path(), self.verified_registry_binding(manifest)?)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn enroll_generation_registry(
+        &self,
+        registry: &super::generation_registry::GenerationRegistry,
+    ) -> std::io::Result<()> {
+        self.wal
+            .enroll_registry(registry.enrollment_identity()?)
+            .map_err(std::io::Error::other)
     }
 
     #[cfg(unix)]

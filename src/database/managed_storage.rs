@@ -1,6 +1,7 @@
 //! Opt-in managed storage coordinator. Owns the tablet, registry and active
 //! manifest locks for its lifetime. No raw mutable access or extraction.
-//! Raw legacy APIs and alternate registries remain outside this scope; all
+//! Enrolled WALs require their exact local registry. Unenrolled WALs and
+//! older binaries remain outside this scope; all
 //! cooperating consumers must use the same dedicated registry and namespace.
 //! This is not a permanent deletion authority.
 use super::generation_registry::{GenerationRegistry, GenerationStatus, ReferenceKind};
@@ -30,6 +31,7 @@ impl ManagedTablet {
         active: ManifestStore,
     ) -> io::Result<Self> {
         tablet.register_generation_wal(&mut registry, &active)?;
+        tablet.enroll_generation_registry(&registry)?;
         Ok(Self {
             tablet,
             registry,
@@ -50,8 +52,12 @@ impl ManagedTablet {
         let active =
             ManifestStore::open(seal, descriptor.id().get(), descriptor.ownership_epoch())?;
         registry.require_registered_wal(wal.as_ref(), active.wal_binding()?)?;
-        let tablet =
-            WalBackedTablet::open_with_sealed_manifest(descriptor, wal.as_ref(), &active, true)?;
+        let tablet = WalBackedTablet::open_with_sealed_manifest(
+            descriptor,
+            wal.as_ref(),
+            &active,
+            Some(registry.enrollment_identity()?),
+        )?;
         tablet.reconcile_generation_wal(&mut registry, &active)?;
         Ok(Self {
             tablet,

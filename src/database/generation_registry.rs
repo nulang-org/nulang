@@ -294,6 +294,28 @@ impl GenerationRegistry {
         }
     }
 
+    /// Local registry identity: canonical directory, scope, stable lock inode.
+    /// This deliberately forbids moving/recreating the registry underneath an
+    /// enrolled WAL. Not a cryptographic identity or distributed ownership.
+    pub(super) fn enrollment_identity(&self) -> io::Result<[u8; 32]> {
+        self.ready()?;
+        let path = self.dir.join("GENERATIONS.lock");
+        unique_file(&path)?;
+        let named = fs::metadata(&path)?;
+        let held = self._lock.metadata()?;
+        if named.dev() != held.dev() || named.ino() != held.ino() {
+            return Err(invalid("registry lock identity changed"));
+        }
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"NUDBREG-ENROLL1");
+        hash.update(&self.state.tablet.to_le_bytes());
+        hash.update(&self.state.epoch.to_le_bytes());
+        hash.update(&held.dev().to_le_bytes());
+        hash.update(&held.ino().to_le_bytes());
+        hash.update(self.dir.as_os_str().as_bytes());
+        Ok(*hash.finalize().as_bytes())
+    }
+
     fn digest(&self, binding: SealBinding) -> io::Result<Digest> {
         self.ready()?;
         if binding.tablet_id.get() != self.state.tablet || binding.epoch != self.state.epoch {
