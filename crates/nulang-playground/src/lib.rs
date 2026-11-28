@@ -39,6 +39,8 @@ pub mod actor_protocol;
 pub mod effect_checker;
 #[path = "../../../src/prelude_source.rs"]
 pub mod prelude_source;
+#[path = "../../../src/import_paths.rs"]
+mod import_paths;
 #[path = "../../../src/parser.rs"]
 pub mod parser;
 #[path = "../../../src/parallel_analysis.rs"]

@@ -1,7 +1,7 @@
 use crate::ast::{AstModule, Decl};
 use crate::lexer::Lexer;
 use crate::package::module_invalidation::ModuleSnapshot;
-use crate::parser::Parser;
+use crate::parser::{Parser, ParserReadTrace};
 use crate::types::{NuError, NuResult, Span};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
@@ -19,13 +19,14 @@ pub fn resolve_imports(
     current_file: &Path,
     stack: &mut HashSet<PathBuf>,
 ) -> NuResult<()> {
-    resolve_imports_inner(module, current_file, stack, None, "")
+    resolve_imports_inner(module, current_file, stack, None, "", None)
 }
 
 /// Parse and resolve a source string while recording the files and direct edges
 /// observed by the recursive import resolver. This is diagnostic only:
-/// parser-side imported-type lookups, prelude, toolchain, environment and other
-/// compiler inputs are not proven complete. Never use this snapshot to skip
+/// successful parser-side imported-type reads are checked against the observed
+/// graph, but failed probes, prelude, toolchain, environment and other compiler
+/// inputs are not proven complete. Never use this snapshot to skip
 /// compilation or reuse artifacts. Canonical path identities are local to this
 /// machine, not portable cache keys. The root digest describes the supplied
 /// source bytes, not a second read of the entry file.
@@ -34,7 +35,10 @@ pub fn resolve_source_with_snapshot(
     current_file: &Path,
     context_bytes: &[u8],
 ) -> NuResult<(AstModule, ModuleSnapshot)> {
-    let mut module = Parser::new(Lexer::new(source).lex()?).parse_module()?;
+    let trace = ParserReadTrace::default();
+    let mut module = Parser::new(Lexer::new(source).lex()?)
+        .with_read_trace(trace.clone())
+        .parse_module()?;
     let mut snapshot = ModuleSnapshot::new(context_bytes);
     resolve_imports_inner(
         &mut module,
@@ -42,8 +46,28 @@ pub fn resolve_source_with_snapshot(
         &mut HashSet::new(),
         Some(&mut snapshot),
         source,
+        Some(&trace),
     )?;
+    verify_parser_reads(&snapshot, &trace.lock().expect("parser trace lock"))?;
     Ok((module, snapshot))
+}
+
+fn verify_parser_reads(snapshot: &ModuleSnapshot, reads: &[(PathBuf, String)]) -> NuResult<()> {
+    for (path, source) in reads {
+        let canonical = canonical_path(path, true)?;
+        let name = snapshot_name(&canonical)?;
+        if !snapshot
+            .modules
+            .get(&name)
+            .is_some_and(|input| input.source_digest == *blake3::hash(source.as_bytes()).as_bytes())
+        {
+            return Err(NuError::RuntimeError {
+                msg: format!("parser read is absent or differs from resolved snapshot: {name}"),
+                span: Span::default(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn canonical_path(path: &Path, tracing: bool) -> NuResult<PathBuf> {
@@ -75,6 +99,7 @@ fn resolve_imports_inner(
     stack: &mut HashSet<PathBuf>,
     mut snapshot: Option<&mut ModuleSnapshot>,
     source: &str,
+    read_trace: Option<&ParserReadTrace>,
 ) -> NuResult<()> {
     if stack.is_empty() {
         IMPORT_CACHE.with(|c| c.borrow_mut().clear());
@@ -137,13 +162,14 @@ fn resolve_imports_inner(
                 msg: format!("lex error in '{}': {}", import_path, e),
                 span: Span::default(),
             })?;
-        let mut imported =
-            Parser::new(tokens)
-                .parse_module()
-                .map_err(|e| NuError::RuntimeError {
-                    msg: format!("parse error in '{}': {}", import_path, e),
-                    span: Span::default(),
-                })?;
+        let mut parser = Parser::new(tokens);
+        if let Some(trace) = read_trace {
+            parser = parser.with_read_trace(trace.clone());
+        }
+        let mut imported = parser.parse_module().map_err(|e| NuError::RuntimeError {
+            msg: format!("parse error in '{}': {}", import_path, e),
+            span: Span::default(),
+        })?;
 
         resolve_imports_inner(
             &mut imported,
@@ -151,6 +177,7 @@ fn resolve_imports_inner(
             stack,
             snapshot.as_deref_mut(),
             &source,
+            read_trace,
         )?;
 
         let imported_decls = if items.is_empty() {
@@ -249,40 +276,15 @@ fn merge_imported_decls(
 }
 
 fn resolve_path(base: &Path, import: &str) -> PathBuf {
-    // stdlib::set → resolve to STDLIB_DIR/set.nula or dev fallback.
-    // stdlib::web::types → STDLIB_DIR/web/types.nula.
-    if let Some(module) = import.strip_prefix("stdlib::") {
-        let module_path = module.replace("::", std::path::MAIN_SEPARATOR_STR);
-        // Try NULANG_STDLIB env var first
-        if let Ok(dir) = std::env::var("NULANG_STDLIB") {
-            return PathBuf::from(dir).join(format!("{}.nula", module_path));
-        }
-        // Try relative to executable
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(exe_dir) = exe.parent() {
-                let candidate = exe_dir.join("stdlib").join(format!("{}.nula", module_path));
-                if candidate.exists() {
-                    return candidate;
-                }
-            }
-        }
-        // Development fallback: src/stdlib/ relative to CWD
-        if let Ok(cwd) = std::env::current_dir() {
-            let dev_path = cwd
-                .join("src")
-                .join("stdlib")
-                .join(format!("{}.nula", module_path));
-            if dev_path.exists() {
-                return dev_path;
-            }
-        }
-        // Last resort: relative to CWD
-        return PathBuf::from(format!("src/stdlib/{}.nula", module_path));
+    if let Some(path) = crate::import_paths::resolve_named(import) {
+        return path;
     }
-
-    // @nulang/auth or @nulang/auth/session → resolved via NULANG_MODULE_PATH.
+    // Preserve the historical resolver fallback for unconfigured packages.
     if let Some(module) = import.strip_prefix("@nulang/") {
-        return resolve_module_path(module);
+        return PathBuf::from(format!(
+            "src/{}.nula",
+            module.replace('/', std::path::MAIN_SEPARATOR_STR)
+        ));
     }
 
     let p = Path::new(import);
@@ -360,53 +362,6 @@ fn filter_decls(decls: Vec<Decl>, items: &[String]) -> Vec<Decl> {
         .into_iter()
         .filter(|d| decl_name(d).map_or(false, |n| set.contains(n)))
         .collect()
-}
-
-/// Resolve an `@nulang/<module>` import path using the `NULANG_MODULE_PATH`
-/// environment variable. Entries are semicolon-separated `name=src_dir` pairs.
-/// The package source directory is expected to contain the module's `.nula`
-/// files; the bare import maps to `<dir>/lib.nula`, and subpaths map to
-/// `<dir>/<subpath>.nula`.
-fn resolve_module_path(module: &str) -> PathBuf {
-    let entries = std::env::var("NULANG_MODULE_PATH").unwrap_or_default();
-    let mut chosen_dir: Option<PathBuf> = None;
-    let mut chosen_prefix = String::new();
-    for entry in entries.split(';') {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
-        }
-        if let Some((name, dir)) = entry.split_once('=') {
-            let name = name.trim();
-            let dir = dir.trim();
-            if name.is_empty() || dir.is_empty() {
-                continue;
-            }
-            // Accept both `auth=...` and `@nulang/auth=...` in the env var.
-            let name = name.strip_prefix("@nulang/").unwrap_or(name);
-            if module == name || module.starts_with(&format!("{}/", name)) {
-                chosen_dir = Some(PathBuf::from(dir));
-                chosen_prefix = name.to_string();
-                break;
-            }
-        }
-    }
-    if let Some(dir) = chosen_dir {
-        let rest = module.strip_prefix(&chosen_prefix).unwrap_or(module);
-        let rest = rest.trim_start_matches('/');
-        let subpath = if rest.is_empty() {
-            "lib.nula"
-        } else {
-            &format!("{}.nula", rest.replace('/', std::path::MAIN_SEPARATOR_STR))
-        };
-        return dir.join(subpath);
-    }
-    // Fallback that produces a deterministic error path when the env var is
-    // not set or does not contain the requested module.
-    PathBuf::from(format!(
-        "src/{}.nula",
-        module.replace('/', std::path::MAIN_SEPARATOR_STR)
-    ))
 }
 
 #[cfg(test)]
@@ -528,6 +483,43 @@ mod tests {
                 root.key("main.nula")
             ]
         );
+    }
+
+    #[test]
+    fn imported_type_lookup_is_traced_and_matches_resolver_snapshot() {
+        let root = SnapshotFixture::new();
+        let source = "import stdlib::web::types\nfn identity_html(x: Html) -> Html { x }";
+        let entry = root.write("main.nula", source);
+        let trace = ParserReadTrace::default();
+        Parser::new(Lexer::new(source).lex().unwrap())
+            .with_read_trace(trace.clone())
+            .parse_module()
+            .unwrap();
+        let reads = trace.lock().unwrap();
+        assert!(
+            !reads.is_empty(),
+            "fixture must actually read an imported type"
+        );
+        let (_, snapshot) = resolve_source_with_snapshot(source, &entry, b"context").unwrap();
+        assert!(verify_parser_reads(&snapshot, &reads).is_ok());
+        assert!(snapshot.modules.len() >= 2);
+    }
+
+    #[test]
+    fn parser_read_verification_rejects_untracked_or_changed_bytes() {
+        let root = SnapshotFixture::new();
+        let path = root.write("types.nula", "type Sample = First | Second");
+        let mut snapshot = ModuleSnapshot::new(b"context");
+        let reads = vec![(path.clone(), "type Sample = First | Second".to_owned())];
+        assert!(verify_parser_reads(&snapshot, &reads).is_err());
+        snapshot.insert(
+            root.key("types.nula"),
+            reads[0].1.as_bytes(),
+            [] as [&str; 0],
+        );
+        assert!(verify_parser_reads(&snapshot, &reads).is_ok());
+        let changed = vec![(path, "type Sample = First | Third".to_owned())];
+        assert!(verify_parser_reads(&snapshot, &changed).is_err());
     }
 
     #[test]

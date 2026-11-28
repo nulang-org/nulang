@@ -11,7 +11,10 @@ use crate::types::{
     TypeVar, ACTOR_REF_TYPE_NAME,
 };
 use rustc_hash::FxHashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// Successful parser-side reads for diagnostic comparison with the resolver.
+pub type ParserReadTrace = Arc<Mutex<Vec<(std::path::PathBuf, String)>>>;
 
 /// Resolved prelude variant types (`Option[T]`, `Result[Ok, Err]`), keyed
 /// by name: `(type-parameter vars, expanded body)`. The prelude's type
@@ -122,6 +125,7 @@ pub struct Parser {
     /// body (with the parameters still free), so use-site type arguments can
     /// be substituted in on cache hits.
     imported_type_cache: FxHashMap<String, (Vec<TypeVar>, Type)>,
+    read_trace: Option<ParserReadTrace>,
     /// Module-level named handler registry.
     handler_registry: FxHashMap<String, Vec<EffectHandler>>,
 }
@@ -141,6 +145,12 @@ impl Parser {
         parser
     }
 
+    /// Enable opt-in tracing of successful imported-type file reads.
+    pub fn with_read_trace(mut self, trace: ParserReadTrace) -> Self {
+        self.read_trace = Some(trace);
+        self
+    }
+
     /// Construct a parser without seeding prelude type names. Used by the
     /// prelude cache itself to avoid `OnceLock::get_or_init` reentrancy.
     fn new_raw(tokens: Vec<Token>) -> Self {
@@ -150,6 +160,7 @@ impl Parser {
             global_type_constructors: FxHashMap::default(),
             local_type_params: FxHashMap::default(),
             imported_type_cache: FxHashMap::default(),
+            read_trace: None,
             handler_registry: FxHashMap::default(),
             diagnostics: Vec::new(),
             warnings: Vec::new(),
@@ -5862,10 +5873,16 @@ impl Parser {
             };
 
             // Resolve the file path (stdlib or relative).
-            let file_path = self.resolve_import_path(&import_path);
+            let file_path = crate::import_paths::resolve_named(&import_path);
             if let Some(path) = file_path {
                 // Load and lex the file.
                 if let Ok(source) = std::fs::read_to_string(&path) {
+                    if let Some(trace) = &self.read_trace {
+                        trace
+                            .lock()
+                            .expect("parser trace lock")
+                            .push((path.clone(), source.clone()));
+                    }
                     if let Ok(imported_tokens) = crate::lexer::Lexer::new(&source).lex() {
                         // Scan the imported tokens for type declarations.
                         let mut k = 0;
@@ -5912,6 +5929,7 @@ impl Parser {
                                             // Found it! Parse the type from the imported file.
                                             let mut sub_parser =
                                                 Parser::new(imported_tokens.clone());
+                                            sub_parser.read_trace = self.read_trace.clone();
                                             sub_parser.global_type_constructors =
                                                 self.global_type_constructors.clone();
                                             let (param_vars, resolved) = sub_parser
@@ -6196,72 +6214,6 @@ impl Parser {
             Expr::GrainRef { key, .. } => Self::expr_uses_param(key, param),
             _ => false,
         }
-    }
-
-    /// Resolve an import path to a file path. Handles stdlib:: prefix.
-    fn resolve_import_path(&self, import_path: &str) -> Option<std::path::PathBuf> {
-        if let Some(module) = import_path.strip_prefix("stdlib::") {
-            let module_path = module.replace("::", std::path::MAIN_SEPARATOR_STR);
-            // Try NULANG_STDLIB env var first.
-            if let Ok(dir) = std::env::var("NULANG_STDLIB") {
-                return Some(std::path::PathBuf::from(dir).join(format!("{}.nula", module_path)));
-            }
-            // Try relative to executable.
-            if let Ok(exe) = std::env::current_exe() {
-                if let Some(exe_dir) = exe.parent() {
-                    let candidate = exe_dir.join("stdlib").join(format!("{}.nula", module_path));
-                    if candidate.exists() {
-                        return Some(candidate);
-                    }
-                }
-            }
-            // Development fallback: src/stdlib/ relative to CWD.
-            if let Ok(cwd) = std::env::current_dir() {
-                let dev_path = cwd
-                    .join("src")
-                    .join("stdlib")
-                    .join(format!("{}.nula", module_path));
-                if dev_path.exists() {
-                    return Some(dev_path);
-                }
-            }
-            // Last resort.
-            return Some(std::path::PathBuf::from(format!(
-                "src/stdlib/{}.nula",
-                module_path
-            )));
-        }
-
-        // @nulang/auth or @nulang/auth/session -> resolved via NULANG_MODULE_PATH.
-        if let Some(module) = import_path.strip_prefix("@nulang/") {
-            let entries = std::env::var("NULANG_MODULE_PATH").unwrap_or_default();
-            for entry in entries.split(';') {
-                let entry = entry.trim();
-                if entry.is_empty() {
-                    continue;
-                }
-                if let Some((name, dir)) = entry.split_once('=') {
-                    let name = name.trim();
-                    let dir = dir.trim();
-                    if name.is_empty() || dir.is_empty() {
-                        continue;
-                    }
-                    let bare_name = name.strip_prefix("@nulang/").unwrap_or(name);
-                    if module == bare_name || module.starts_with(&format!("{}/", bare_name)) {
-                        let rest = module.strip_prefix(bare_name).unwrap_or(module);
-                        let rest = rest.trim_start_matches('/');
-                        let subpath = if rest.is_empty() {
-                            "lib.nula"
-                        } else {
-                            &format!("{}.nula", rest.replace('/', std::path::MAIN_SEPARATOR_STR))
-                        };
-                        return Some(std::path::PathBuf::from(dir).join(subpath));
-                    }
-                }
-            }
-        }
-
-        None
     }
 
     /// Substitute a single type variable with a concrete type throughout
