@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Fabric deterministic storage fault matrix — 2026-11-27
+- **Add 510 deterministic persisted-image cases** covering torn sectors, reordered records, atomic mutation recovery, required checkpoint prefixes and clock publication; explicitly characterize valid rollback under false-success storage flushes. No production behavior or dependency changes.
+
 ### Fabric guest-kernel durability qualification — 2026-11-27
 - **Add disposable QEMU/ext4 guest power-cut and block-device error qualification**, checking acknowledged data, expiration, checkpoint recovery, fail-stop on device I/O failure, and successful post-recovery mutation. No host device access, production runtime changes or new dependencies.
 

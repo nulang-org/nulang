@@ -1322,4 +1322,170 @@ mod tests {
         assert!(!tmp.path().exists());
         assert_eq!(std::fs::read(&clock).unwrap(), old_clock);
     }
+
+    #[test]
+    fn test_storage_model_atomic_mutation_prefixes_and_checkpoint_versions() {
+        let tmp = Temp::new();
+        let path = tmp.path();
+        let mut cache = tmp.open(time(0, 1000));
+        cache
+            .set_bytes(b"a", b"old-a", None, time(0, 1000))
+            .unwrap();
+        cache
+            .set_bytes(b"b", b"old-b", None, time(0, 1000))
+            .unwrap();
+        cache
+            .set_bytes(b"ttl", b"expire", Some(10), time(0, 1000))
+            .unwrap();
+        let stable = std::fs::read(&path).unwrap();
+        cache
+            .set_batch(&[(b"a", b"new-a"), (b"b", b"new-b")], time(0, 1000))
+            .unwrap();
+        let batch = std::fs::read(&path).unwrap();
+        cache.delete_many(&[b"a", b"b"], time(0, 1000)).unwrap();
+        let deletion = std::fs::read(&path).unwrap();
+        assert_eq!(cache.get(b"ttl", 11).unwrap(), None);
+        cache.checkpoint(time(11, 1011)).unwrap();
+        let checkpoint = std::fs::read(&path).unwrap();
+        cache
+            .set_batch(&[(b"a", b"after-a"), (b"b", b"after-b")], time(11, 1011))
+            .unwrap();
+        let post_checkpoint = std::fs::read(&path).unwrap();
+        drop(cache);
+
+        let mut cases = 0;
+        for (prior, next, previous, complete) in [
+            (
+                &stable,
+                &batch,
+                [Some(b"old-a".as_slice()), Some(b"old-b".as_slice())],
+                [Some(b"new-a".as_slice()), Some(b"new-b".as_slice())],
+            ),
+            (
+                &batch,
+                &deletion,
+                [Some(b"new-a".as_slice()), Some(b"new-b".as_slice())],
+                [None, None],
+            ),
+            (
+                &checkpoint,
+                &post_checkpoint,
+                [None, None],
+                [Some(b"after-a".as_slice()), Some(b"after-b".as_slice())],
+            ),
+        ] {
+            for cut in prior.len()..=next.len() {
+                std::fs::write(&path, &next[..cut]).unwrap();
+                let mut recovered = try_open(&tmp, 1011).unwrap();
+                let expected = if cut == next.len() {
+                    complete
+                } else {
+                    previous
+                };
+                for (key, value) in [b"a", b"b"].into_iter().zip(expected) {
+                    assert_eq!(
+                        recovered.get(key, 0).unwrap(),
+                        value.map(CacheValueView::Bytes),
+                        "cut {cut}"
+                    );
+                }
+                assert_eq!(recovered.get(b"ttl", 0).unwrap(), None);
+                cases += 1;
+            }
+        }
+        // Atomic rename may leave either complete version before the
+        // directory sync; the two versions represent the same state.
+        for image in [&deletion, &checkpoint] {
+            std::fs::write(&path, image).unwrap();
+            let mut recovered = try_open(&tmp, 1011).unwrap();
+            for key in [b"a".as_slice(), b"b", b"ttl"] {
+                assert_eq!(recovered.get(key, 0).unwrap(), None);
+            }
+            cases += 1;
+        }
+        // A published checkpoint header must not accept a torn snapshot
+        // prefix. This checkpoint is empty, so its complete header alone
+        // is valid, but every shorter byte prefix must be rejected.
+        for cut in 0..checkpoint.len() {
+            std::fs::write(&path, &checkpoint[..cut]).unwrap();
+            assert!(try_open(&tmp, 1011).is_err(), "checkpoint cut {cut}");
+            assert_eq!(std::fs::read(&path).unwrap(), checkpoint[..cut]);
+            cases += 1;
+        }
+        println!("storage model mutation/checkpoint: {cases} deterministic images");
+    }
+
+    #[test]
+    fn test_storage_model_clock_torn_publications_and_lost_flush_limits() {
+        let tmp = Temp::new();
+        let path = tmp.path();
+        let clock = tmp.0.join("cache.wal.clock");
+        let mut cache = tmp.open(time(0, 1000));
+        cache
+            .set_bytes(b"ttl", b"v", Some(100), time(0, 1000))
+            .unwrap();
+        cache
+            .set_bytes(b"key", b"before", None, time(0, 1000))
+            .unwrap();
+        let old_clock = std::fs::read(&clock).unwrap();
+        let old_wal = std::fs::read(&path).unwrap();
+        cache
+            .set_bytes(b"key", b"acknowledged", None, time(1, 1001))
+            .unwrap();
+        assert_eq!(cache.get(b"ttl", 200).unwrap(), None);
+        drop(cache);
+        let new_clock = std::fs::read(&clock).unwrap();
+        let new_wal = std::fs::read(&path).unwrap();
+        let mut cases = 0;
+        // Every old/new sidecar splice: a valid old/new complete record is
+        // possible, but a genuinely mixed invalid checksum must fail closed.
+        for cut in 0..=new_clock.len() {
+            let mut image = new_clock[..cut].to_vec();
+            image.extend_from_slice(&old_clock[cut..]);
+            std::fs::write(&clock, &image).unwrap();
+            if image == new_clock {
+                assert!(try_open(&tmp, 1199).is_err());
+                let mut recovered = try_open(&tmp, 1200).unwrap();
+                assert_eq!(recovered.get(b"ttl", 0).unwrap(), None);
+            } else if image == old_clock {
+                // Characterize the limit of checksums: a lying device
+                // that loses the *entire* successful clock publication
+                // can present a valid stale floor and resurrect a TTL.
+                let mut recovered = try_open(&tmp, 1050).unwrap();
+                assert_eq!(
+                    recovered.get(b"ttl", 0).unwrap(),
+                    Some(CacheValueView::Bytes(b"v"))
+                );
+            } else {
+                assert!(try_open(&tmp, 1200).is_err(), "mixed floor cut {cut}");
+                assert_eq!(std::fs::read(&clock).unwrap(), image);
+            }
+            cases += 1;
+        }
+        for cut in 0..new_clock.len() {
+            std::fs::write(&clock, &new_clock[..cut]).unwrap();
+            assert!(try_open(&tmp, 1200).is_err());
+            assert_eq!(std::fs::read(&clock).unwrap(), new_clock[..cut]);
+            cases += 1;
+        }
+        // A complete valid old WAL prefix after a falsely successful
+        // flush is indistinguishable from a history without that write.
+        // This is a documented unsupported device failure, NOT a
+        // successful durability guarantee.
+        std::fs::write(&clock, &new_clock).unwrap();
+        std::fs::write(&path, &old_wal).unwrap();
+        let mut recovered = try_open(&tmp, 1200).unwrap();
+        assert_eq!(
+            recovered.get(b"key", 0).unwrap(),
+            Some(CacheValueView::Bytes(b"before"))
+        );
+        drop(recovered);
+        std::fs::write(&path, &new_wal).unwrap();
+        let mut recovered = try_open(&tmp, 1200).unwrap();
+        assert_eq!(
+            recovered.get(b"key", 0).unwrap(),
+            Some(CacheValueView::Bytes(b"acknowledged"))
+        );
+        println!("storage model clock: {cases} images, 2 explicit false-flush limitations");
+    }
 }

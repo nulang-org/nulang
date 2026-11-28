@@ -1405,4 +1405,179 @@ mod tests {
         drop(inherited_replacement);
         drop(inherited_lock);
     }
+
+    /// Enumerate independent 512-byte persistence choices for a two-record
+    /// unacknowledged suffix. File length is independently persisted at the
+    /// full length, so missing interior/tail sectors are holes, not EOF.
+    #[test]
+    fn test_storage_model_reordered_and_torn_sector_matrix() {
+        const SECTOR: usize = 512;
+        let tmp = Temp::new();
+        let path = tmp.file();
+        let mut wal = CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).unwrap();
+        // Align the stable prefix to a sector: 8-byte magic + 48-byte frame.
+        let anchor = vec![b'a'; SECTOR - HEADER_BYTES - RECORD_HEADER_BYTES - CHECKSUM_BYTES];
+        wal.append(&anchor, WalSync::Data).unwrap();
+        let stable = std::fs::read(&path).unwrap();
+        assert_eq!(stable.len(), SECTOR);
+        let a = vec![b'b'; SECTOR * 2 - RECORD_HEADER_BYTES - CHECKSUM_BYTES];
+        let b = vec![b'c'; SECTOR * 2 - RECORD_HEADER_BYTES - CHECKSUM_BYTES];
+        wal.append(&a, WalSync::Buffered).unwrap();
+        wal.append(&b, WalSync::Buffered).unwrap();
+        drop(wal);
+        let complete = std::fs::read(&path).unwrap();
+        assert_eq!(complete.len(), 5 * SECTOR);
+        // All 16 subsets of the four suffix sectors, crossed with four
+        // representative prefix lengths inside each missing sector.
+        let mut cases = 0;
+        for mask in 0..16u8 {
+            for torn in [0, 1, 255, 511] {
+                let mut image = stable.clone();
+                image.resize(complete.len(), 0);
+                for index in 0..4 {
+                    let start = (index + 1) * SECTOR;
+                    let n = if mask & (1 << index) != 0 {
+                        SECTOR
+                    } else {
+                        torn
+                    };
+                    image[start..start + n].copy_from_slice(&complete[start..start + n]);
+                }
+                std::fs::write(&path, &image).unwrap();
+                let mut seen = Vec::new();
+                let outcome = CacheWal::open(&path, WalLimits::default(), |seq, payload| {
+                    seen.push((seq, payload.to_vec()));
+                    Ok(())
+                });
+                if image == complete {
+                    assert!(outcome.is_ok(), "complete suffix rejected");
+                    assert_eq!(seen, [(1, anchor.clone()), (2, a.clone()), (3, b.clone())]);
+                } else {
+                    assert!(
+                        outcome.is_err(),
+                        "mask {mask:04b}, tear {torn} accepted corrupt bytes"
+                    );
+                    assert_eq!(
+                        std::fs::read(&path).unwrap(),
+                        image,
+                        "corruption was rewritten"
+                    );
+                }
+                cases += 1;
+            }
+        }
+        // Persist the logical EOF independently: real prefix truncations
+        // retain exactly the complete record prefix, never a partial record.
+        for cut in (SECTOR..=complete.len())
+            .step_by(127)
+            .chain([3 * SECTOR, 5 * SECTOR])
+        {
+            std::fs::write(&path, &complete[..cut]).unwrap();
+            let mut seen = Vec::new();
+            let recovered = CacheWal::open(&path, WalLimits::default(), |seq, payload| {
+                seen.push((seq, payload.to_vec()));
+                Ok(())
+            })
+            .unwrap();
+            let n = if cut == complete.len() {
+                3
+            } else if cut >= 3 * SECTOR {
+                2
+            } else {
+                1
+            };
+            assert_eq!(recovered.last_sequence(), n);
+            assert_eq!(
+                seen,
+                [(1, anchor.clone()), (2, a.clone()), (3, b.clone())][..n as usize]
+            );
+            let expected_len = SECTOR + (n as usize - 1) * 2 * SECTOR;
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), expected_len as u64);
+            cases += 1;
+        }
+        // Fully checksummed records reordered or duplicated must still
+        // fail the contiguous sequence check.
+        for order in [[1, 0], [0, 0], [1, 1]] {
+            let mut image = stable.clone();
+            for index in order {
+                let start = SECTOR + index * 2 * SECTOR;
+                image.extend_from_slice(&complete[start..start + 2 * SECTOR]);
+            }
+            std::fs::write(&path, &image).unwrap();
+            assert!(CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), image);
+            cases += 1;
+        }
+        println!("storage model WAL: {cases} deterministic images");
+    }
+
+    #[test]
+    fn test_storage_model_checkpoint_4k_sector_faults() {
+        const SECTOR: usize = 4096;
+        let tmp = Temp::new();
+        let path = tmp.file();
+        let mut wal = CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).unwrap();
+        // Checkpoint header plus first frame occupies exactly one sector.
+        let first =
+            vec![b'a'; SECTOR - CHECKPOINT_HEADER_BYTES - RECORD_HEADER_BYTES - CHECKSUM_BYTES];
+        let second = vec![b'b'; SECTOR - RECORD_HEADER_BYTES - CHECKSUM_BYTES];
+        let third = vec![b'c'; SECTOR - RECORD_HEADER_BYTES - CHECKSUM_BYTES];
+        wal.append(b"old journal", WalSync::Data).unwrap();
+        wal.rotate(3, |next| {
+            for payload in [&first, &second, &third] {
+                next.append(payload, WalSync::Buffered)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        drop(wal);
+        let snapshot = std::fs::read(&path).unwrap();
+        assert_eq!(snapshot.len(), SECTOR * 3);
+        let mut cases = 0;
+        // Sector omissions, stale-neighbor replacements, and deterministic
+        // torn-sector suffixes in the required snapshot prefix.
+        for sector in 0..3 {
+            let start = sector * SECTOR;
+            let end = start + SECTOR;
+            for cut in [0, 1, 512, 2048, 4095] {
+                for replacement in [None, Some((sector + 1) % 3)] {
+                    let mut image = snapshot.clone();
+                    let suffix = &mut image[start + cut..end];
+                    match replacement {
+                        None => suffix.fill(0),
+                        Some(source) => suffix.copy_from_slice(
+                            &snapshot[source * SECTOR + cut..(source + 1) * SECTOR],
+                        ),
+                    }
+                    assert_ne!(image, snapshot);
+                    std::fs::write(&path, &image).unwrap();
+                    assert!(
+                        CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).is_err(),
+                        "sector {sector} cut {cut} replacement {replacement:?}"
+                    );
+                    assert_eq!(std::fs::read(&path).unwrap(), image);
+                    cases += 1;
+                }
+            }
+        }
+        // Losing entire suffix sectors is not recoverable for a required
+        // checkpoint prefix, even with a valid checksummed header.
+        for cut in [0, SECTOR, 2 * SECTOR] {
+            std::fs::write(&path, &snapshot[..cut]).unwrap();
+            assert!(CacheWal::open(&path, WalLimits::default(), |_, _| Ok(())).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), snapshot[..cut]);
+            cases += 1;
+        }
+        std::fs::write(&path, &snapshot).unwrap();
+        let mut seen = Vec::new();
+        let mut recovered = CacheWal::open(&path, WalLimits::default(), |seq, payload| {
+            seen.push((seq, payload.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, [(2, first), (3, second), (4, third)]);
+        assert_eq!(recovered.append(b"continued", WalSync::Data).unwrap(), 5);
+        cases += 1;
+        println!("storage model 4K checkpoint: {cases} deterministic images");
+    }
 }
