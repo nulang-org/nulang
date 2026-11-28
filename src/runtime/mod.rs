@@ -5755,30 +5755,6 @@ impl Runtime {
         actor.waiting_signal = snapshot.waiting_signal.clone();
         actor.install_authority_manifest(&authority_manifest);
         Self::restore_state_models_from_snapshot(&mut actor, selected_meta.as_ref(), &snapshot);
-        // Restore CRDT state if present in the snapshot.
-        if let Some(crdt_snap) = &snapshot.crdt_snapshot {
-            if let Some(manager) = &mut self.crdt_manager {
-                let crdt_map: HashMap<CrdtId, (CrdtType, Vec<u8>)> = crdt_snap
-                    .iter()
-                    .filter_map(|(id, ty, bytes)| {
-                        CrdtType::from_u8(*ty).map(|t| (CrdtId(*id), (t, bytes.clone())))
-                    })
-                    .collect();
-                manager.restore(crdt_map);
-                // Rebuild the (actor_id, field_name) -> CrdtId mapping so
-                // `perform Crdt.*` can target recovered fields.
-                if let Some(field_map) = &snapshot.crdt_field_map {
-                    for (field_name, crdt_id) in field_map {
-                        manager
-                            .field_map
-                            .insert((actor_id, field_name.clone()), CrdtId(*crdt_id));
-                        manager
-                            .field_reverse
-                            .insert(CrdtId(*crdt_id), (actor_id, field_name.clone()));
-                    }
-                }
-            }
-        }
         for (name, value) in snapshot.state {
             // Rehydrate the semantic_memory and procedural_memory JSON strings
             // by allocating them on the actor heap so runtime helpers can read
@@ -5905,6 +5881,33 @@ impl Runtime {
                     actor_id
                 );
                 return None;
+            }
+        }
+        // Publish shared CRDT state only after all fallible recovery
+        // reads and pre-publication validation have succeeded. A rejected
+        // actor must not overwrite replicas or field mappings of live actors.
+        // Restore CRDT state if present in the snapshot.
+        if let Some(crdt_snap) = &snapshot.crdt_snapshot {
+            if let Some(manager) = &mut self.crdt_manager {
+                let crdt_map: HashMap<CrdtId, (CrdtType, Vec<u8>)> = crdt_snap
+                    .iter()
+                    .filter_map(|(id, ty, bytes)| {
+                        CrdtType::from_u8(*ty).map(|t| (CrdtId(*id), (t, bytes.clone())))
+                    })
+                    .collect();
+                manager.restore(crdt_map);
+                // Rebuild the (actor_id, field_name) -> CrdtId mapping so
+                // `perform Crdt.*` can target recovered fields.
+                if let Some(field_map) = &snapshot.crdt_field_map {
+                    for (field_name, crdt_id) in field_map {
+                        manager
+                            .field_map
+                            .insert((actor_id, field_name.clone()), CrdtId(*crdt_id));
+                        manager
+                            .field_reverse
+                            .insert(CrdtId(*crdt_id), (actor_id, field_name.clone()));
+                    }
+                }
             }
         }
         if let Some(schema_name) = recovery_schema_name {

@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Recovery publication safety and guarded remote smoke — 2026-11-28
+- Defer shared CRDT restoration until checked actor recovery and pre-publication validation succeed; corrupt histories no longer overwrite live replicas or field mappings.
+- Discover the disposable Turso smoke test normally while retaining explicit confirmation, endpoint and token guards. Normal unconfigured test execution is not live remote qualification.
+
 ### Fail-closed SQLite history recovery and trusted streaming — 2026-11-26
 - **Keep untrusted `DB.query` results bounded** while visiting fixed internal actor snapshot, journal, workflow/domain event and durable-effect rows incrementally. Recovery no longer mistakes histories beyond the general 100,000-row/64 MiB adapter buffer budget for absent data.
 - Introduce checked persistence-history reads for actor/virtual-actor activation. SQLite query, decode or corruption failures now refuse recovery before publishing a partially restored actor; legacy reader APIs retain compatibility, with warnings for their fallback paths.

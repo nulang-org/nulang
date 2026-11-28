@@ -210,7 +210,9 @@ candidate unless independently proven otherwise.
 
 Provision a **new** disposable database named `nulang-smoke-<unique>` with a
 database-scoped, expiring write token. Never supply a shared or production
-database/token. The test refuses missing confirmation, arbitrary hostnames,
+database/token. With no confirmation the normally discovered test returns
+without a network connection. When explicitly configured it refuses invalid
+confirmation, arbitrary hostnames,
 plaintext, embedded credentials, ports, paths and query strings before
 network access. A successful run leaves smoke rows and schema in the disposable
 database; destroy only that explicitly provisioned database after recording the
@@ -223,7 +225,7 @@ Set `NULANG_DISPOSABLE_TURSO_URL` to the new database's HTTPS/libsql URL,
 
 ```sh
 cargo test --locked --no-default-features --features sqlite --lib \
-  disposable_turso_smoke_live_https_roundtrip -- --ignored --test-threads=1
+  disposable_turso_smoke_live_https_roundtrip -- --test-threads=1
 ```
 
 The harness verifies valid authentication, rejection of an invalid token,
