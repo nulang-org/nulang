@@ -1039,6 +1039,29 @@ impl FileWal {
         self.replace_bound(binding, self.managed_registry, false)
     }
 
+    /// Replace only a managed WAL's seal identity at the same base sequence.
+    /// The caller has verified full retained-state equivalence and reserved
+    /// both bindings in the authoritative registry.
+    #[cfg(unix)]
+    pub(super) fn rebind_compacted(&mut self, binding: SealBinding) -> Result<(), WalError> {
+        if self.poisoned {
+            return Err(WalError::Poisoned);
+        }
+        let old = self.seal_binding.ok_or(WalError::SealBindingMismatch)?;
+        let registry = self
+            .managed_registry
+            .ok_or(WalError::ManagedEnrollmentMismatch)?;
+        if old.sequence != binding.sequence
+            || old.tablet_id != binding.tablet_id
+            || old.epoch != binding.epoch
+            || old.digest == binding.digest
+            || self.base_sequence != binding.sequence
+        {
+            return Err(WalError::SealBindingMismatch);
+        }
+        self.replace_bound(binding, Some(registry), true)
+    }
+
     /// Atomically replace the bound header, optionally copying the exact
     /// acknowledged tail for enrollment migration. No reserialization.
     #[cfg(unix)]
@@ -1054,6 +1077,8 @@ impl FileWal {
         let old_header = self
             .seal_binding
             .map(|b| bound_header(b, self.managed_registry));
+        let old_header_len = old_header.as_ref().map_or(0, |h| h.len() as u64);
+        let new_header_len = bound_header(binding, registry).len() as u64;
         let old_len = self
             .record_end_offsets
             .last()
@@ -1138,8 +1163,7 @@ impl FileWal {
                 registry,
             )?;
             if staged.records != self.records
-                || staged.file.metadata()?.len()
-                    != old_len - BOUND_HEADER_BYTES as u64 + MANAGED_HEADER_BYTES as u64
+                || staged.file.metadata()?.len() != old_len - old_header_len + new_header_len
             {
                 return Err(WalError::SealBindingMismatch);
             }
