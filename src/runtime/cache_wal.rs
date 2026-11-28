@@ -44,6 +44,7 @@ pub enum WalSync {
 
 #[derive(Debug)]
 pub struct CacheWal {
+    latency_sync: Option<Box<super::cache::CacheLatencyHistogram>>,
     file: LockedFile,
     path: PathBuf,
     lock: Arc<LockedFile>,
@@ -155,6 +156,7 @@ pub struct CheckpointReport {
 /// even when the mutation journal is full. Never restore the WAL alone.
 #[derive(Debug)]
 pub(super) struct ClockFloor {
+    latency_publish: Option<Box<super::cache::CacheLatencyHistogram>>,
     path: PathBuf,
     unix_ms: u64,
     observed_ms: u64,
@@ -228,6 +230,7 @@ impl ClockFloor {
             ));
         }
         let mut clock = Self {
+            latency_publish: None,
             path,
             unix_ms: previous.unwrap_or(0),
             observed_ms: now,
@@ -270,8 +273,26 @@ impl ClockFloor {
         Ok(())
     }
 
+    #[cfg(feature = "cache-server")]
+    pub(super) fn enable_latency_metrics(&mut self) {
+        self.latency_publish.get_or_insert_with(Default::default);
+    }
+
+    #[cfg(feature = "cache-server")]
+    pub(super) fn latency_metrics(&self) -> super::cache::CacheLatencyHistogram {
+        self.latency_publish.as_deref().copied().unwrap_or_default()
+    }
+
     fn publish(&mut self, now: u64) -> io::Result<()> {
-        self.publish_with(now, |_| Ok(()))
+        let started = self
+            .latency_publish
+            .as_ref()
+            .map(|_| std::time::Instant::now());
+        let result = self.publish_with(now, |_| Ok(()));
+        if let (Some(start), Some(hist)) = (started, &mut self.latency_publish) {
+            hist.observe(start.elapsed());
+        }
+        result
     }
 
     fn publish_with(
@@ -451,6 +472,7 @@ impl CacheWal {
         }
         file.seek(SeekFrom::Start(position))?;
         Ok(Self {
+            latency_sync: None,
             file,
             path: path.to_path_buf(),
             lock: Arc::new(lock),
@@ -516,6 +538,7 @@ impl CacheWal {
         let mut file = LockedFile::acquire(file)?;
         file.write_all(&checkpoint_header(self.last_sequence, entries))?;
         let mut replacement = CacheWal {
+            latency_sync: None,
             file,
             path: self.path.clone(),
             lock: Arc::clone(&self.lock),
@@ -545,6 +568,7 @@ impl CacheWal {
         std::fs::rename(&temp.0, &self.path)?;
         boundary(true)?;
         directory.sync_all()?;
+        replacement.latency_sync = self.latency_sync.take();
         *self = replacement;
         Ok(report)
     }
@@ -568,6 +592,16 @@ impl CacheWal {
         self.poisoned
     }
 
+    #[cfg(feature = "cache-server")]
+    pub(super) fn enable_latency_metrics(&mut self) {
+        self.latency_sync.get_or_insert_with(Default::default);
+    }
+
+    #[cfg(feature = "cache-server")]
+    pub(super) fn latency_metrics(&self) -> super::cache::CacheLatencyHistogram {
+        self.latency_sync.as_deref().copied().unwrap_or_default()
+    }
+
     /// Synchronize all acknowledged buffered appends. An uncertain sync
     /// poisons the journal just like a failed synchronized append.
     pub fn synchronize(&mut self) -> io::Result<()> {
@@ -583,7 +617,15 @@ impl CacheWal {
             return Err(io::Error::other("cache WAL poisoned"));
         }
         self.poisoned = true;
-        sync(&self.file)?;
+        let started = self
+            .latency_sync
+            .as_ref()
+            .map(|_| std::time::Instant::now());
+        let result = sync(&self.file);
+        if let (Some(start), Some(hist)) = (started, &mut self.latency_sync) {
+            hist.observe(start.elapsed());
+        }
+        result?;
         self.poisoned = false;
         Ok(())
     }
@@ -596,15 +638,24 @@ impl CacheWal {
                 Err(io::Error::other("injected partial journal write"))
             });
         }
-        self.append_with(payload, sync, |file, header, payload, digest, sync| {
+        let measure = self.latency_sync.is_some();
+        let mut duration = None;
+        let result = self.append_with(payload, sync, |file, header, payload, digest, sync| {
             file.write_all(header)?;
             file.write_all(payload)?;
             file.write_all(digest)?;
             if sync == WalSync::Data {
-                file.sync_data()?;
+                let started = measure.then(std::time::Instant::now);
+                let result = file.sync_data();
+                duration = started.map(|start| start.elapsed());
+                result?;
             }
             Ok(())
-        })
+        });
+        if let (Some(duration), Some(hist)) = (duration, &mut self.latency_sync) {
+            hist.observe(duration);
+        }
+        result
     }
 
     pub(super) fn append_with(

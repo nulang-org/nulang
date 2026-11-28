@@ -103,7 +103,30 @@ def batch(client, seq):
     return bytes(wire), bytes(expected), seq + 4
 
 
-def parse_metrics(body):
+INTERNAL_BOUNDS = (1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000,
+                   10000, 25000, 50000, 100000, 250000, 500000, 1000000)
+
+
+def parse_latency(result):
+    if result.get("latency_metrics_enabled") != 1:
+        raise ValueError("latency metrics not enabled")
+    latency = {}
+    for name in ("command", "wal_sync", "clock_publish", "checkpoint"):
+        prefix = name + "_microseconds_"
+        count = result[prefix + "count"]
+        cumulative = [result[prefix + 'bucket{le="' + str(b) + '"}'] for b in INTERNAL_BOUNDS]
+        if cumulative != sorted(cumulative) or cumulative[-1] > count or result[prefix + 'bucket{le="+Inf"}'] != count:
+            raise ValueError("invalid cumulative histogram")
+        def quantile(q):
+            return next((b for b, c in zip(INTERNAL_BOUNDS, cumulative) if count and c >= math.ceil(q * count)), None)
+        latency[name] = {"count": count, "sum_us": result[prefix + "sum"], "max_us": result[prefix + "max"],
+                         "upper_bounds_us": list(INTERNAL_BOUNDS), "cumulative_counts": cumulative,
+                         "p50_upper_us": quantile(.5), "p95_upper_us": quantile(.95),
+                         "p99_upper_us": quantile(.99)}
+    return latency
+
+
+def parse_metrics(body, latency=False):
     result = {}
     for line in body.splitlines():
         if not line or line.startswith("#"):
@@ -117,7 +140,10 @@ def parse_metrics(body):
         result[key] = int(v)
     if not set(METRICS) <= result.keys():
         raise ValueError("missing required metrics")
-    return {key: result[key] for key in METRICS}
+    sample = {key: result[key] for key in METRICS}
+    if latency:
+        sample["internal_latency"] = parse_latency(result)
+    return sample
 
 
 def validate_sample(sample):
@@ -137,7 +163,7 @@ def validate_sample(sample):
             raise RuntimeError(f"unexpected failure: {key}={sample[key]}")
 
 
-def scrape(port):
+def scrape(port, latency=False):
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
     try:
         conn.request("GET", "/metrics")
@@ -145,7 +171,7 @@ def scrape(port):
         body = response.read(16385)
         if response.status != 200 or len(body) > 16384:
             raise RuntimeError("invalid metrics response")
-        return parse_metrics(body.decode("ascii"))
+        return parse_metrics(body.decode("ascii"), latency)
     finally:
         conn.close()
 
@@ -158,7 +184,7 @@ def rss_bytes(pid):
 
 
 @contextmanager
-def instance(binary, journal, log_path):
+def instance(binary, journal, log_path, latency=False):
     port, metrics = free_port(), free_port()
     while metrics == port:
         metrics = free_port()
@@ -171,6 +197,8 @@ def instance(binary, journal, log_path):
                "--max-connection-bytes", str(CONNECTION_BYTES),
                "--max-journal-bytes", str(JOURNAL_BYTES),
                "--checkpoint-percent", "60", "--checkpoint-retry-ms", "100"]
+    if latency:
+        command.extend(["--latency-metrics", "1"])
     with log_path.open("xb") as log:
         proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
         try:
@@ -214,11 +242,11 @@ def worker(address, client, start, stop, seconds, rate):
         raise
 
 
-def run_soak(binary, root, clients, seconds, rate, report):
+def run_soak(binary, root, clients, seconds, rate, report, latency=False):
     journal = root / "cache.wal"
     stop = threading.Event()
     start = threading.Barrier(clients + 1)
-    with instance(binary, journal, root / "write.log") as (proc, address, metrics):
+    with instance(binary, journal, root / "write.log", latency) as (proc, address, metrics):
         with ThreadPoolExecutor(max_workers=clients) as pool:
             futures = [pool.submit(worker, address, i, start, stop, seconds, rate)
                        for i in range(clients)]
@@ -230,7 +258,8 @@ def run_soak(binary, root, clients, seconds, rate, report):
                         raise RuntimeError("Fabric exited during workload")
                     if any(f.done() and f.exception() for f in futures):
                         raise next(f.exception() for f in futures if f.done() and f.exception())
-                    sample = scrape(metrics)
+                    sample = scrape(metrics, latency)
+                    sample.pop("internal_latency", None)
                     validate_sample(sample)
                     sample.update(elapsed_seconds=round(time.monotonic() - begin, 3),
                                   rss_bytes=rss_bytes(proc.pid),
@@ -255,7 +284,9 @@ def run_soak(binary, root, clients, seconds, rate, report):
             hist.merge(h)
         # Stop mutating; allow TTLs and final metrics snapshot to settle.
         time.sleep(1.1)
-        final = scrape(metrics)
+        final = scrape(metrics, latency)
+        if latency:
+            report["internal_latency"] = final.pop("internal_latency")
         validate_sample(final)
         final.update(elapsed_seconds=round(time.monotonic() - begin, 3),
                      rss_bytes=rss_bytes(proc.pid), actual_journal_bytes=journal.stat().st_size)
@@ -298,6 +329,7 @@ def main():
     p.add_argument("--clients", type=int, default=8)
     p.add_argument("--seconds", type=int, default=120)
     p.add_argument("--batches-per-second", type=int, default=20)
+    p.add_argument("--latency-metrics", action="store_true")
     a = p.parse_args()
     if not 1 <= a.clients <= 16 or not 10 <= a.seconds <= 3600 or not 1 <= a.batches_per_second <= 100:
         p.error("clients 1..16, duration 10..3600 seconds, rate 1..100 batches/s")
@@ -316,7 +348,7 @@ def main():
               "samples": [], "recovery_verified": False}
     with a.output.open("x") as f, tempfile.TemporaryDirectory(prefix="fabric-soak-", dir=work) as tmp:
         try:
-            run_soak(binary, Path(tmp), a.clients, a.seconds, a.batches_per_second, report)
+            run_soak(binary, Path(tmp), a.clients, a.seconds, a.batches_per_second, report, a.latency_metrics)
         except BaseException as error:
             report["failure"] = str(error)
             raise

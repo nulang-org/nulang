@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token, Waker};
 
-use super::cache::CacheStore;
+use super::cache::{CacheLatencyHistogram, CacheStore};
 use super::cache_cluster::CacheRoutingMode;
 use super::cache_dispatch::{
     CacheDispatchConfigError, CacheDispatchOutcome, CacheDispatchWake, CacheDispatcher,
@@ -554,10 +554,10 @@ struct AutomaticCheckpoint {
 }
 
 enum CacheBackend {
-    Memory(CacheStore),
+    Memory(Box<CacheStore>),
     #[cfg(unix)]
     Durable {
-        cache: DurableCache,
+        cache: Box<DurableCache>,
         anchor: CacheTime,
     },
 }
@@ -593,6 +593,18 @@ pub struct CacheOperationalCounters {
     pub wal_group_records_synced: u64,
 }
 
+/// Optional shard-local measurements. Durations overlap: a command can
+/// include a WAL sync or clock publication; checkpoint can include a clock
+/// publication. They must not be summed as disjoint CPU time.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CacheLatencyMetrics {
+    pub enabled: bool,
+    pub command: CacheLatencyHistogram,
+    pub wal_sync: CacheLatencyHistogram,
+    pub clock_publish: CacheLatencyHistogram,
+    pub checkpoint: CacheLatencyHistogram,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CacheOperationalSnapshot {
     pub healthy: bool,
@@ -604,6 +616,7 @@ pub struct CacheOperationalSnapshot {
     pub cache: super::cache::CacheMemoryStats,
     pub cache_stats: super::cache::CacheStats,
     pub counters: CacheOperationalCounters,
+    pub latency: CacheLatencyMetrics,
     pub durable: bool,
     pub journal_bytes: u64,
     pub journal_limit_bytes: u64,
@@ -663,6 +676,7 @@ pub struct CacheShardServer {
     #[cfg(unix)]
     cross_group_time_limit: Duration,
     counters: CacheOperationalCounters,
+    latency_command: Option<CacheLatencyHistogram>,
     #[cfg(unix)]
     automatic_checkpoint: Option<AutomaticCheckpoint>,
 }
@@ -694,7 +708,7 @@ impl CacheShardServer {
             bind_addr,
             dispatcher,
             inbox,
-            CacheBackend::Memory(store),
+            CacheBackend::Memory(Box::new(store)),
             config,
             clock,
             buffer_budget,
@@ -751,7 +765,10 @@ impl CacheShardServer {
             bind_addr,
             dispatcher,
             inbox,
-            CacheBackend::Durable { cache, anchor },
+            CacheBackend::Durable {
+                cache: Box::new(cache),
+                anchor,
+            },
             config,
             clock,
             buffer_budget,
@@ -825,6 +842,7 @@ impl CacheShardServer {
             #[cfg(unix)]
             cross_group_time_limit: CROSS_GROUP_TIME,
             counters: CacheOperationalCounters::default(),
+            latency_command: None,
             #[cfg(unix)]
             automatic_checkpoint: None,
         })
@@ -875,11 +893,46 @@ impl CacheShardServer {
         self.connections.len()
     }
 
+    /// Enable bounded timing before the reactor starts. Disabled by default
+    /// so the steady-state command path does not read the clock for metrics.
+    pub fn enable_latency_metrics(&mut self) -> Result<(), CacheServerError> {
+        if self.started {
+            return Err(CacheServerError::InvalidConfig(
+                "latency metrics must be enabled before polling",
+            ));
+        }
+        self.latency_command.get_or_insert_with(Default::default);
+        #[cfg(unix)]
+        if let CacheBackend::Durable { cache, .. } = &mut self.backend {
+            cache.enable_latency_metrics();
+        }
+        Ok(())
+    }
+
+    fn latency_metrics(&self) -> CacheLatencyMetrics {
+        let metrics = CacheLatencyMetrics {
+            enabled: self.latency_command.is_some(),
+            command: self.latency_command.unwrap_or_default(),
+            ..Default::default()
+        };
+        #[cfg(unix)]
+        if let CacheBackend::Durable { cache, .. } = &self.backend {
+            let (wal_sync, clock_publish, checkpoint) = cache.latency_metrics();
+            return CacheLatencyMetrics {
+                wal_sync,
+                clock_publish,
+                checkpoint,
+                ..metrics
+            };
+        }
+        metrics
+    }
+
     /// Read only on the owning reactor. Shared connection budget gauges
     /// are process-wide when multiple shards share that budget.
     pub fn operational_snapshot(&self) -> CacheOperationalSnapshot {
         let (store, durable, poisoned, journal_bytes, journal_limit_bytes) = match &self.backend {
-            CacheBackend::Memory(store) => (store, false, false, 0, 0),
+            CacheBackend::Memory(store) => (store.as_ref(), false, false, 0, 0),
             #[cfg(unix)]
             CacheBackend::Durable { cache, .. } => {
                 let (used, limit) = cache.journal_usage();
@@ -916,6 +969,7 @@ impl CacheShardServer {
             cache: store.memory_stats(),
             cache_stats: store.stats(),
             counters: self.counters,
+            latency: self.latency_metrics(),
             durable,
             journal_bytes,
             journal_limit_bytes,
@@ -1846,7 +1900,7 @@ impl CacheShardServer {
             };
             let now = self.clock.now_ms();
             let sizing_store = match &self.backend {
-                CacheBackend::Memory(store) => store,
+                CacheBackend::Memory(store) => store.as_ref(),
                 #[cfg(unix)]
                 CacheBackend::Durable { cache, .. } => cache
                     .store_for_sizing()
@@ -1875,6 +1929,7 @@ impl CacheShardServer {
                 )
                 .map_err(|_| ConnectionAction::Close)?;
             let reserved_capacity = connection.output.capacity();
+            let started = self.latency_command.as_ref().map(|_| Instant::now());
             match &mut self.backend {
                 CacheBackend::Memory(store) => {
                     let outcome = self
@@ -1914,6 +1969,9 @@ impl CacheShardServer {
                 || connection.output.capacity() > reserved_capacity
             {
                 return Err(ConnectionAction::Close);
+            }
+            if let (Some(start), Some(hist)) = (started, &mut self.latency_command) {
+                hist.observe(start.elapsed());
             }
             self.counters.commands_dispatched = self.counters.commands_dispatched.saturating_add(1);
             #[cfg(unix)]
@@ -3752,5 +3810,87 @@ mod tests {
                 .wal_group_records_synced,
             1
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_latency_metrics_count_group_sync_and_checkpoint_without_reset() {
+        let tmp = DurableTestDir::new();
+        let journal = tmp.0.join("timing.wal");
+        let mut server = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        server.enable_cross_client_group_commit().unwrap();
+        server.enable_latency_metrics().unwrap();
+        let mut client = connect_client(&server);
+        let wire = b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n".repeat(32);
+        let expected: String = (1..=32).map(|n| format!(":{n}\r\n")).collect();
+        roundtrip(&mut server, &mut client, &wire, expected.as_bytes());
+        let snapshot = server.operational_snapshot();
+        assert_eq!(snapshot.latency.command.count, 32);
+        assert_eq!(
+            snapshot.latency.wal_sync.count,
+            snapshot.counters.wal_groups_synced
+        );
+        assert!(snapshot.latency.wal_sync.count > 0);
+        assert_eq!(snapshot.latency.checkpoint.count, 0);
+        server.checkpoint().unwrap();
+        let snapshot2 = server.operational_snapshot();
+        assert_eq!(
+            snapshot2.latency.wal_sync.count,
+            snapshot.latency.wal_sync.count
+        );
+        assert_eq!(snapshot2.latency.checkpoint.count, 1);
+        assert_eq!(snapshot2.latency.command.count, 32);
+        assert!(server.enable_latency_metrics().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_latency_metrics_disabled_by_default() {
+        let tmp = DurableTestDir::new();
+        let mut server = build_durable_server(
+            &tmp.0.join("timing.wal"),
+            WalSync::Data,
+            WalLimits::default(),
+        );
+        let mut client = connect_client(&server);
+        roundtrip(
+            &mut server,
+            &mut client,
+            b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n",
+            b":1\r\n",
+        );
+        assert_eq!(server.operational_snapshot().latency.command.count, 0);
+        assert_eq!(server.operational_snapshot().latency.wal_sync.count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_latency_metrics_per_record_and_clock_publication() {
+        let tmp = DurableTestDir::new();
+        let mut server = build_durable_server(
+            &tmp.0.join("timing.wal"),
+            WalSync::Data,
+            WalLimits::default(),
+        );
+        server.enable_latency_metrics().unwrap();
+        let mut client = connect_client(&server);
+        roundtrip(
+            &mut server,
+            &mut client,
+            b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n",
+            b":1\r\n",
+        );
+        std::thread::sleep(Duration::from_millis(2));
+        roundtrip(
+            &mut server,
+            &mut client,
+            b"*5\r\n$3\r\nSET\r\n$3\r\nttl\r\n$1\r\nv\r\n$2\r\nPX\r\n$4\r\n1000\r\n",
+            b"+OK\r\n",
+        );
+        let snapshot = server.operational_snapshot();
+        assert_eq!(snapshot.latency.command.count, 2);
+        assert_eq!(snapshot.latency.wal_sync.count, 2);
+        assert_eq!(snapshot.latency.clock_publish.count, 1);
+        assert_eq!(snapshot.latency.checkpoint.count, 0);
     }
 }

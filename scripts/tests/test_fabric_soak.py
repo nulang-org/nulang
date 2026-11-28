@@ -70,5 +70,21 @@ class SoakContract(unittest.TestCase):
         self.assertEqual(a.report()["batches"], 2)
 
 
+    def test_internal_histogram_cumulative_bounds(self):
+        raw = {"latency_metrics_enabled": 1}
+        for name in ("command", "wal_sync", "clock_publish", "checkpoint"):
+            prefix = name + "_microseconds_"
+            raw.update({prefix+"count": 2, prefix+"sum": 3000001, prefix+"max": 3000000})
+            for bound in soak.INTERNAL_BOUNDS:
+                raw[prefix+'bucket{le="'+str(bound)+'"}'] = 1
+            raw[prefix+'bucket{le="+Inf"}'] = 2
+        parsed = soak.parse_latency(raw)
+        self.assertEqual(parsed["wal_sync"]["p50_upper_us"], 1)
+        self.assertIsNone(parsed["wal_sync"]["p99_upper_us"])
+        raw['wal_sync_microseconds_bucket{le="1"}'] = 2
+        with self.assertRaises(ValueError):
+            soak.parse_latency(raw)
+
+
 if __name__ == "__main__":
     unittest.main()

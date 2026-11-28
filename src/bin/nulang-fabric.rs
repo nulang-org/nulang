@@ -26,6 +26,7 @@ mod unix {
     --checkpoint-retry-ms N (default 5000)
     --shutdown-drain-ms 0..60000 (default 5000)
     --metrics-bind 127.0.0.1:PORT (optional local HTTP metrics and health)
+    --latency-metrics 0|1 (default 0; optional internal histograms)
     --tls-ca PATH --tls-cert PATH --tls-key PATH (all required for mutual TLS)
 
 Single-shard RESP server. Plaintext is loopback-only; remote binds require mutual TLS.
@@ -52,6 +53,7 @@ Durable modes require a private journal path. Memory mode is the default.";
         cross_client_group_commit: bool,
         clock_reservation_ms: u64,
         metrics_bind: Option<SocketAddr>,
+        latency_metrics: bool,
         tls_ca: Option<PathBuf>,
         tls_cert: Option<PathBuf>,
         tls_key: Option<PathBuf>,
@@ -83,6 +85,7 @@ Durable modes require a private journal path. Memory mode is the default.";
                 cross_client_group_commit: false,
                 clock_reservation_ms: 0,
                 metrics_bind: None,
+                latency_metrics: false,
                 tls_ca: None,
                 tls_cert: None,
                 tls_key: None,
@@ -175,6 +178,13 @@ Durable modes require a private journal path. Memory mode is the default.";
                         if config.clock_reservation_ms > MAX_CLOCK_RESERVATION_MS {
                             return Err("clock reservation exceeds 1000 ms".into());
                         }
+                    }
+                    "--latency-metrics" => {
+                        config.latency_metrics = match value.as_str() {
+                            "0" => false,
+                            "1" => true,
+                            _ => return Err("latency metrics must be 0 or 1".into()),
+                        };
                     }
                     "--metrics-bind" => {
                         let address: SocketAddr = value
@@ -329,6 +339,11 @@ Durable modes require a private journal path. Memory mode is the default.";
                     .enable_automatic_checkpoint(self.checkpoint)
                     .map_err(|e| format!("{e:?}"))?;
             }
+            if self.latency_metrics {
+                server
+                    .enable_latency_metrics()
+                    .map_err(|e| format!("{e:?}"))?;
+            }
             Ok(server)
         }
     }
@@ -464,6 +479,34 @@ Durable modes require a private journal path. Memory mode is the default.";
                 "checkpoint_reclaimed_bytes_total",
                 sample.checkpoint_reclaimed_bytes
             );
+            gauge!("latency_metrics_enabled", u8::from(sample.latency.enabled));
+            if sample.latency.enabled {
+                use nulang::runtime::cache::CACHE_LATENCY_BOUNDS_US;
+                for (name, hist) in [
+                    ("command", sample.latency.command),
+                    ("wal_sync", sample.latency.wal_sync),
+                    ("clock_publish", sample.latency.clock_publish),
+                    ("checkpoint", sample.latency.checkpoint),
+                ] {
+                    let _ = writeln!(body, "# TYPE fabric_{name}_microseconds histogram");
+                    let mut cumulative = 0u64;
+                    for (bound, count) in CACHE_LATENCY_BOUNDS_US.iter().zip(hist.buckets) {
+                        cumulative = cumulative.saturating_add(count);
+                        let _ = writeln!(
+                            body,
+                            "fabric_{name}_microseconds_bucket{{le=\"{bound}\"}} {cumulative}"
+                        );
+                    }
+                    let _ = writeln!(
+                        body,
+                        "fabric_{name}_microseconds_bucket{{le=\"+Inf\"}} {}",
+                        hist.count
+                    );
+                    let _ = writeln!(body, "fabric_{name}_microseconds_count {}", hist.count);
+                    let _ = writeln!(body, "fabric_{name}_microseconds_sum {}", hist.sum_us);
+                    let _ = writeln!(body, "fabric_{name}_microseconds_max {}", hist.max_us);
+                }
+            }
             body
         }
 
@@ -572,6 +615,7 @@ Durable modes require a private journal path. Memory mode is the default.";
                     },
                     cache_stats: CacheStats::default(),
                     counters: CacheOperationalCounters::default(),
+                    latency: Default::default(),
                     durable: false,
                     journal_bytes: 0,
                     journal_limit_bytes: 0,
@@ -598,6 +642,32 @@ Durable modes require a private journal path. Memory mode is the default.";
                 client.read_to_string(&mut response).unwrap();
                 thread.join().unwrap();
                 response
+            }
+
+            #[test]
+            fn latency_histogram_exports_cumulative_buckets_and_count() {
+                let mut sample = sample();
+                sample.latency.enabled = true;
+                sample.latency.wal_sync.observe(Duration::from_nanos(1));
+                sample.latency.wal_sync.observe(Duration::from_micros(6));
+                sample.latency.wal_sync.observe(Duration::from_secs(2));
+                let response = request_at(Instant::now(), sample, "/metrics");
+                for line in [
+                    "# TYPE fabric_wal_sync_microseconds histogram",
+                    "fabric_wal_sync_microseconds_bucket{le=\"1\"} 1",
+                    "fabric_wal_sync_microseconds_bucket{le=\"5\"} 1",
+                    "fabric_wal_sync_microseconds_bucket{le=\"10\"} 2",
+                    "fabric_wal_sync_microseconds_bucket{le=\"1000000\"} 2",
+                    "fabric_wal_sync_microseconds_bucket{le=\"+Inf\"} 3",
+                    "fabric_wal_sync_microseconds_count 3",
+                    "fabric_wal_sync_microseconds_sum 2000007",
+                    "fabric_wal_sync_microseconds_max 2000000",
+                ] {
+                    assert!(
+                        response.lines().any(|actual| actual == line),
+                        "missing {line}"
+                    );
+                }
             }
 
             #[test]
@@ -705,6 +775,13 @@ Durable modes require a private journal path. Memory mode is the default.";
 
         fn parse(args: &[&str]) -> Result<Config, String> {
             Config::parse(args.iter().map(|s| s.to_string()))
+        }
+
+        #[test]
+        fn latency_metrics_cli_flag_is_opt_in() {
+            assert!(!parse(&[]).unwrap().latency_metrics);
+            assert!(parse(&["--latency-metrics", "1"]).unwrap().latency_metrics);
+            assert!(parse(&["--latency-metrics", "2"]).is_err());
         }
 
         #[test]
