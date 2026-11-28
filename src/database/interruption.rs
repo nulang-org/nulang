@@ -44,6 +44,8 @@ thread_local! {
     static ACTIVE: Cell<Option<StorageInterruptionPoint>> = const { Cell::new(None) };
     #[cfg(unix)]
     static CRASH_ACK: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    #[cfg(unix)]
+    static CRASH_SKIP: Cell<usize> = const { Cell::new(0) };
     static ERROR_KIND: Cell<io::ErrorKind> = const { Cell::new(io::ErrorKind::Other) };
 }
 
@@ -55,6 +57,8 @@ impl Drop for ResetInterruption {
         ERROR_KIND.with(|kind| kind.set(io::ErrorKind::Other));
         #[cfg(unix)]
         CRASH_ACK.with(|ack| ack.borrow_mut().take());
+        #[cfg(unix)]
+        CRASH_SKIP.with(|skip| skip.set(0));
     }
 }
 
@@ -87,6 +91,17 @@ pub(crate) fn hit(point: StorageInterruptionPoint) -> io::Result<()> {
     if should_interrupt {
         #[cfg(unix)]
         if let Some(ack) = CRASH_ACK.with(|slot| slot.borrow().clone()) {
+            if CRASH_SKIP.with(|skip| {
+                let n = skip.get();
+                if n > 0 {
+                    skip.set(n - 1);
+                    true
+                } else {
+                    false
+                }
+            }) {
+                return Ok(());
+            }
             // Signal only after reaching the exact boundary; park with all
             // stack-owned locks and staged files intact until the parent kills us.
             let temp = ack.with_extension("tmp");
@@ -1898,7 +1913,7 @@ mod process_crash_matrix {
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    const CASES: [(&str, StorageInterruptionPoint); 11] = [
+    const CASES: [(&str, StorageInterruptionPoint); 18] = [
         ("enroll", StorageInterruptionPoint::EnrollmentBeforeWrite),
         ("enroll", StorageInterruptionPoint::EnrollmentAfterWrite),
         (
@@ -1924,6 +1939,19 @@ mod process_crash_matrix {
         (
             "rotate",
             StorageInterruptionPoint::WalReclaimAfterDirectorySync,
+        ),
+        ("retire", StorageInterruptionPoint::RegistryBeforeRename),
+        ("retire", StorageInterruptionPoint::RegistryAfterRename),
+        ("retire", StorageInterruptionPoint::RetirementAfterTombstone),
+        ("retire", StorageInterruptionPoint::RetirementAfterUnlink),
+        ("retire", StorageInterruptionPoint::RetirementAfterFilesSync),
+        (
+            "retire-complete",
+            StorageInterruptionPoint::RegistryBeforeRename,
+        ),
+        (
+            "retire-complete",
+            StorageInterruptionPoint::RegistryAfterRename,
         ),
     ];
     fn descriptor() -> TabletDescriptor {
@@ -2016,10 +2044,36 @@ mod process_crash_matrix {
         } else {
             let mut managed = ManagedTablet::adopt(db, registry, manifest).unwrap();
             let candidate = ManifestStore::create(&next, 97, 7).unwrap();
-            with_interruption(point, || {
-                CRASH_ACK.with(|slot| *slot.borrow_mut() = Some(root.join("boundary.ack")));
+            if action.starts_with("retire") {
                 managed.rotate(candidate, 1).unwrap();
-            });
+                let backup = root.join("backup");
+                let q = root.join("quarantine");
+                managed.backup([9; 16], &backup).unwrap();
+                managed
+                    .quarantine(ManifestStore::open(&old, 97, 7).unwrap(), &backup, &q)
+                    .unwrap();
+                let obsolete = ManifestStore::open(&q, 97, 7).unwrap();
+                managed.reserve_retirement(&obsolete, &backup).unwrap();
+                drop(obsolete);
+                fs::write(root.join("before.wal.bytes"), fs::read(&wal).unwrap()).unwrap();
+                fs::write(
+                    root.join("initial-count"),
+                    fs::read_dir(&q).unwrap().count().to_string(),
+                )
+                .unwrap();
+                with_interruption(point, || {
+                    CRASH_ACK.with(|slot| *slot.borrow_mut() = Some(root.join("boundary.ack")));
+                    if action == "retire-complete" {
+                        CRASH_SKIP.with(|skip| skip.set(1));
+                    }
+                    managed.delete_reserved_generation(&q, &backup).unwrap();
+                });
+            } else {
+                with_interruption(point, || {
+                    CRASH_ACK.with(|slot| *slot.borrow_mut() = Some(root.join("boundary.ack")));
+                    managed.rotate(candidate, 1).unwrap();
+                });
+            }
         }
         panic!("selected boundary was not reached");
     }
@@ -2075,7 +2129,11 @@ mod process_crash_matrix {
 
     #[test]
     fn managed_midpublication_sigkill_matrix_recovers_acknowledged_prefix() {
-        for (index, (action, point)) in CASES.into_iter().enumerate() {
+        for (index, (action, point)) in CASES
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (action, _))| !action.starts_with("retire"))
+        {
             let fixture = Fixture::new();
             let root = &fixture.0;
             kill_at(root, index);
@@ -2173,6 +2231,136 @@ mod process_crash_matrix {
                 3
             );
             assert_eq!(&fs::read(&wal).unwrap()[..8], b"NUDBWAL5");
+        }
+    }
+    #[test]
+    fn journaled_retirement_sigkill_matrix_preserves_active_and_backup() {
+        for (index, (action, point)) in CASES
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (action, _))| action.starts_with("retire"))
+        {
+            let fixture = Fixture::new();
+            let root = &fixture.0;
+            kill_at(root, index);
+            let wal = root.join("tablet.wal");
+            let q = root.join("quarantine");
+            let backup = root.join("backup");
+            assert_eq!(
+                fs::read(&wal).unwrap(),
+                fs::read(root.join("before.wal.bytes")).unwrap()
+            );
+            let initial: usize = fs::read_to_string(root.join("initial-count"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            let count = fs::read_dir(&q).unwrap().count();
+            let expected = if action == "retire-complete"
+                || point == StorageInterruptionPoint::RetirementAfterFilesSync
+            {
+                1
+            } else if point == StorageInterruptionPoint::RetirementAfterUnlink {
+                initial - 1
+            } else {
+                initial
+            };
+            assert_eq!(count, expected, "case {index}");
+            let registry = GenerationRegistry::open(root.join("registry"), 97, 7).unwrap();
+            let mut managed =
+                ManagedTablet::open(descriptor(), &wal, root.join("next"), registry).unwrap();
+            let expected_status = match (action, point) {
+                ("retire", StorageInterruptionPoint::RegistryBeforeRename) => {
+                    GenerationStatus::RetirementReserved
+                }
+                ("retire-complete", StorageInterruptionPoint::RegistryAfterRename) => {
+                    GenerationStatus::Deleted
+                }
+                _ => GenerationStatus::DeletionPending,
+            };
+            assert_eq!(
+                managed.retirement_status(&q).unwrap(),
+                expected_status,
+                "case {index}"
+            );
+            assert_eq!(managed.current_sequence(), 2);
+            assert_eq!(managed.read_at(b"k", 2).unwrap(), Some(b"tail".as_slice()));
+            assert_eq!(
+                managed
+                    .commit_idempotent(tx(1), put(b"first"))
+                    .unwrap()
+                    .sequence(),
+                1
+            );
+            assert_eq!(
+                managed
+                    .commit_idempotent(tx(2), put(b"tail"))
+                    .unwrap()
+                    .sequence(),
+                2
+            );
+            if action == "retire-complete"
+                || matches!(
+                    point,
+                    StorageInterruptionPoint::RetirementAfterTombstone
+                        | StorageInterruptionPoint::RetirementAfterUnlink
+                        | StorageInterruptionPoint::RetirementAfterFilesSync
+                )
+            {
+                assert!(ManifestStore::open(&q, 97, 7).is_err());
+                assert!(ManifestStore::create(&q, 97, 7).is_err());
+            }
+            let mut restored = WalBackedTablet::restore_sealed_backup(
+                descriptor(),
+                &backup,
+                root.join("restored-before"),
+            )
+            .unwrap();
+            assert_eq!(restored.current_sequence(), 2);
+            assert_eq!(
+                restored
+                    .commit_idempotent(tx(2), put(b"tail"))
+                    .unwrap()
+                    .sequence(),
+                2
+            );
+            drop(restored);
+            assert_eq!(
+                managed
+                    .commit_idempotent(tx(3), put(b"after"))
+                    .unwrap()
+                    .sequence(),
+                3
+            );
+            assert!(
+                managed.delete_reserved_generation(&q, &backup).is_err(),
+                "stale backup must not authorize retry"
+            );
+            assert_eq!(fs::read_dir(&q).unwrap().count(), count);
+            let fresh = root.join("fresh");
+            managed.backup([8; 16], &fresh).unwrap();
+            managed.delete_reserved_generation(&q, &fresh).unwrap();
+            managed.delete_reserved_generation(&q, &fresh).unwrap();
+            assert_eq!(
+                managed.retirement_status(&q).unwrap(),
+                GenerationStatus::Deleted
+            );
+            assert_eq!(fs::read_dir(&q).unwrap().count(), 1);
+            assert!(ManifestStore::create(&q, 97, 7).is_err());
+            let mut restored = WalBackedTablet::restore_sealed_backup(
+                descriptor(),
+                &fresh,
+                root.join("restored-after"),
+            )
+            .unwrap();
+            assert_eq!(restored.current_sequence(), 3);
+            assert_eq!(
+                restored
+                    .commit_idempotent(tx(3), put(b"after"))
+                    .unwrap()
+                    .sequence(),
+                3
+            );
+            assert_eq!(restored.read_latest(b"k"), Some(b"after".as_slice()));
         }
     }
 }
