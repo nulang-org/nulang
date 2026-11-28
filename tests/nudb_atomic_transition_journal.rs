@@ -561,6 +561,52 @@ fn actor_history_audit_rejects_orphan_transition_beyond_rewritten_tail() {
 }
 
 #[test]
+fn actor_history_audit_rejects_sparse_orphan_beyond_tail() {
+    let path = temp_wal("history_audit_sparse_orphan");
+    cleanup(&path);
+    let first = transition(902, 1, 1);
+    let digest = first.digest().unwrap();
+    {
+        let mut journal = NuDbTransitionJournal::open(&path).unwrap();
+        journal.commit_transition(first).unwrap();
+        journal.commit_transition(transition(902, 2, 1)).unwrap();
+        journal.commit_transition(transition(902, 3, 1)).unwrap();
+    }
+    mutate_raw_tablet(
+        &path,
+        TabletMutation::Delete {
+            key: raw_transition_key(902, 2),
+        },
+    );
+    mutate_raw_tablet(
+        &path,
+        TabletMutation::Put {
+            key: raw_tail_key(902),
+            value: serde_json::to_vec(
+                &serde_json::json!({"activation_epoch": 1, "sequence": 1, "digest": digest}),
+            )
+            .unwrap(),
+        },
+    );
+    let mut journal = NuDbTransitionJournal::open(&path).unwrap();
+    let before = journal.tablet_sequence();
+    assert_eq!(
+        journal.verify_actor_history(902).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert_eq!(
+        journal
+            .commit_transition(transition(902, 2, 1))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert_eq!(journal.tablet_sequence(), before);
+    drop(journal);
+    cleanup(&path);
+}
+
+#[test]
 fn commit_refuses_to_extend_an_actor_with_missing_middle_history() {
     let path = temp_wal("refuse_extend_incomplete_history");
     cleanup(&path);
