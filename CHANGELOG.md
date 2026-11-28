@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Fabric latency metrics — 2026-11-27
+- **Add opt-in bounded internal latency histograms** for command dispatch, WAL synchronization, clock publication and checkpoints, with cumulative local Prometheus metrics and soak-profile support. No new dependencies.
+
 ### Fabric sustained workload qualification — 2026-11-27
 - **Add bounded concurrent TTL/checkpoint soak and recovery harness**, exact reply validation, sampled resource budgets and RSS, fixed-memory latency histogram, idle reclamation and acknowledged-state recovery. No production runtime or dependency changes.
 

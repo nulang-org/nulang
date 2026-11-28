@@ -85,3 +85,27 @@ Fedora/Btrfs host, using the same optimized focused executable as
 the VM qualification, not a full-workspace release build. This
 run does not certify production throughput, continuous peak
 memory, or multi-hour stability.
+
+
+## Internal latency profile
+
+Add --latency-metrics to the soak command when using a binary with
+the optional runtime histograms. The harness validates the cumulative
+bucket contract on each scrape, keeps regular resource samples, and
+records the final internal command, WAL sync, clock publication and
+checkpoint distributions. This does not turn the closed-loop batch
+latencies into individual operation latencies or establish causal
+correlation. See RESP_CACHE_ARCHITECTURE.md for exact timing boundaries.
+
+### Initial instrumented profile
+
+16 clients for 30 seconds, 149,648 validated commands, 4,968 ops/s, all recovery checks passed. Internal counts match dispatch, group sync and checkpoint counters. Raw report: benchmarks/fabric-latency-profile-20261127.json.
+
+| Operation | Count | Median upper us | p95 upper us | p99 upper us | Max us |
+|---|---:|---:|---:|---:|---:|
+| command | 149649 | 10 | 25 | 25 | 39995 |
+| wal_sync | 1979 | 2500 | 25000 | 25000 | 39973 |
+| clock_publish | 31 | 2500 | 50000 | 50000 | 39963 |
+| checkpoint | 23 | 5000 | 50000 | 50000 | 42607 |
+
+A shared host and nearly full disk were used. Distributions are not paired per request; do not infer exact causal attribution or overhead from the previous run. The observed profile motivates controlled storage-latency experiments before architectural changes.

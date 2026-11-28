@@ -1034,3 +1034,50 @@ reply-validated concurrent TTL/checkpoint soak, sampled resource
 limits, bounded batch latency histogram and post-SIGKILL recovery
 verification. This opt-in local test is not a maximum-throughput
 benchmark or a substitute for long-duration production qualification.
+
+
+## Opt-in internal latency histograms
+
+Enable before polling via the embedded server's enable_latency_metrics
+method or the standalone CLI:
+
+    --latency-metrics 1 --metrics-bind 127.0.0.1:9090
+
+Disabled by default. One fixed-size, shard-local histogram for each
+of command dispatch, WAL data synchronization, clock publication
+and checkpoint. Durable histograms are allocated only when enabled.
+There is no per-observation allocation, shared histogram lock or
+unbounded list of latency samples. Backend ownership uses one boxed
+store per shard, not one allocation per command. The disabled path
+does not read the measurement clock; remaining branch overhead has
+not been benchmarked independently.
+
+The command measurement covers dispatch after response reservation,
+including reply encoding and successful dispatched error replies; it
+excludes input/preflight parsing, output admission, group sync after
+dispatch, queueing and network flush. Failed dispatches that close
+the connection are not counted. WAL sync measures mutation-file
+sync_data attempts in per-record mode or group commit, plus explicit
+synchronization; it includes failures, but not checkpoint file/directory
+syncs or startup replay. Clock publication measures the complete
+clock-sidecar publication attempt, including file and directory sync,
+not cheap observations covered by an existing reservation. Checkpoint
+measures the full DurableCache checkpoint attempt, including failures,
+but excludes automatic checkpoint savings estimation and startup.
+Counts reset on process start, not on journal rotation. Measurements
+can overlap; sums are not disjoint wall time and must not be added
+to infer overall time spent.
+
+The local metrics endpoint exports cumulative Prometheus histogram
+buckets, count, sum and a separate maximum in microseconds. There are
+18 finite bounds from 1 us through 1 second plus an overflow bucket.
+Durations round up to microseconds and counters saturate. The snapshot
+is published periodically; stale snapshot and readiness semantics
+remain unchanged. Only expose the existing metrics listener to trusted
+local collectors. No per-key, client or command labels are emitted.
+
+The sustained workload harness accepts --latency-metrics and validates
+the cumulative histograms, retaining the final snapshot in its report.
+It measures client batch round-trip separately. Compare distributions
+and counts rather than treating internal percentiles as additive
+or attributing individual batch delays without correlated tracing.

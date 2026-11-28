@@ -19,6 +19,32 @@ use rustc_hash::FxHasher;
 use std::collections::{HashSet, VecDeque};
 use std::hash::Hasher;
 
+/// Fixed, noncumulative latency buckets in microseconds. The last bucket
+/// contains every observation beyond the largest finite boundary.
+pub const CACHE_LATENCY_BOUNDS_US: [u64; 18] = [
+    1, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000,
+    500_000, 1_000_000,
+];
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CacheLatencyHistogram {
+    pub buckets: [u64; 19],
+    pub count: u64,
+    pub sum_us: u64,
+    pub max_us: u64,
+}
+
+impl CacheLatencyHistogram {
+    pub fn observe(&mut self, elapsed: std::time::Duration) {
+        let us = elapsed.as_nanos().div_ceil(1_000).min(u128::from(u64::MAX)) as u64;
+        let index = CACHE_LATENCY_BOUNDS_US.partition_point(|&bound| bound < us);
+        self.buckets[index] = self.buckets[index].saturating_add(1);
+        self.count = self.count.saturating_add(1);
+        self.sum_us = self.sum_us.saturating_add(us);
+        self.max_us = self.max_us.max(us);
+    }
+}
+
 pub const REDIS_CLUSTER_SLOTS: u16 = 16_384;
 const INLINE_BYTES: usize = 22;
 const EMPTY_SLOT: u32 = u32::MAX;

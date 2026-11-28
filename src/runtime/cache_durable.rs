@@ -288,6 +288,7 @@ impl Mutation<'_> {
 /// Owns the store and journal together. No mutable store escape hatch.
 /// Callers supply paired monotonic and wall-clock readings for each command.
 pub struct DurableCache {
+    latency_checkpoint: Option<Box<super::cache::CacheLatencyHistogram>>,
     store: CacheStore,
     wal: CacheWal,
     clock: ClockFloor,
@@ -324,6 +325,7 @@ impl DurableCache {
         )?;
         let clock = clock.ok_or_else(|| io::Error::other("missing cache clock floor"))?;
         Ok(Self {
+            latency_checkpoint: None,
             store,
             wal,
             clock,
@@ -380,6 +382,43 @@ impl DurableCache {
     /// Publish a complete snapshot as the new journal prefix, then continue
     /// appending to it. One entry is encoded at a time; no whole-cache clone.
     pub fn checkpoint(&mut self, time: CacheTime) -> Result<CheckpointReport, DurableError> {
+        let started = self
+            .latency_checkpoint
+            .as_ref()
+            .map(|_| std::time::Instant::now());
+        let result = self.checkpoint_inner(time);
+        if let (Some(start), Some(hist)) = (started, &mut self.latency_checkpoint) {
+            hist.observe(start.elapsed());
+        }
+        result
+    }
+
+    #[cfg(feature = "cache-server")]
+    pub(super) fn enable_latency_metrics(&mut self) {
+        self.latency_checkpoint.get_or_insert_with(Default::default);
+        self.wal.enable_latency_metrics();
+        self.clock.enable_latency_metrics();
+    }
+
+    #[cfg(feature = "cache-server")]
+    pub(super) fn latency_metrics(
+        &self,
+    ) -> (
+        super::cache::CacheLatencyHistogram,
+        super::cache::CacheLatencyHistogram,
+        super::cache::CacheLatencyHistogram,
+    ) {
+        (
+            self.wal.latency_metrics(),
+            self.clock.latency_metrics(),
+            self.latency_checkpoint
+                .as_deref()
+                .copied()
+                .unwrap_or_default(),
+        )
+    }
+
+    fn checkpoint_inner(&mut self, time: CacheTime) -> Result<CheckpointReport, DurableError> {
         self.healthy()?;
         self.validate_time(time)?;
         if self
