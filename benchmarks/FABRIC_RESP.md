@@ -138,3 +138,64 @@ fabric-group-commit-20261127.json.
 | ttl-set | 32 | 263 | 35,052 | 38,845 |
 
 Separate runs on the same Fedora host, not a controlled paired before/after trial. Three repeats per case, optimized focused harness, real Btrfs disk, small hot-key workload. For non-TTL SET the prior baseline used exact clock mode; plain SET does not need clock publication. No full-workspace release binary, concurrency, power-loss or reliable p99 claim. Grouped mode is opt-in and only applies to synchronous WAL records within one connection turn; no cross-client batching.
+
+
+## Concurrent closed-loop qualification
+
+Run the reply-validated independent-client harness with:
+
+    python3 scripts/fabric_resp_concurrent_bench.py \
+      --fabric target/release/nulang-fabric \
+      --valkey /usr/bin/valkey-server \
+      --journal-dir /path/to/local/disk \
+      --output /tmp/fabric-concurrent.json
+
+Three alternating-order rounds for each engine, fresh processes per
+round, one independent hot key per client, 64-byte values. Each worker
+seeds its key and warms up before a synchronized start. All workers
+complete identical fixed command counts (8192 for memory and 128 for
+sync in this run); aggregate throughput uses the slowest completion.
+All responses are checked. Pooled latency measures whole closed-loop
+pipeline round trips, including queuing and client scheduling; it is
+not open-loop latency and suffers coordinated omission. Raw data
+retains every client's completion time and round-level summaries.
+The Python generator may cap memory throughput. A dedicated load
+generator, larger keyspace, longer runs, and repeated disk experiments
+are necessary for production estimates.
+
+The Fabric binary SHA-256 matches the previous group-commit benchmark;
+it was built with the optimized focused harness and audited dependency
+versions, not the full release build. Sync mode uses group commit and
+1000 ms clock reservation (plain SET does not exercise TTL). Valkey
+uses AOF always. Neither checkpoints nor AOF rewrites are enabled.
+The local Btrfs volume was nearly full; background work and disk
+latency varied substantially (even the one-client sync result differs
+from the earlier benchmark). A short local qualification suite also
+ran during the sync matrix. These figures are exploratory, not a
+regression gate. Small sample sizes make p99/p99.9 noisy, especially
+with 32-deep sync pipelines (four measured batches per client).
+Do not infer strict engine-level causality from the differences.
+
+| Mode | Pipeline | Clients | Fabric ops/s | Valkey ops/s | Fabric batch p99 ms | Valkey batch p99 ms |
+|---|---:|---:|---:|---:|---:|---:|
+| memory | 32 | 1 | 1,093,798 | 896,260 | 0.050 | 0.051 |
+| memory | 32 | 8 | 2,067,112 | 2,028,425 | 0.216 | 0.208 |
+| memory | 32 | 32 | 2,119,877 | 1,709,827 | 1.000 | 0.948 |
+| sync | 1 | 1 | 1,390 | 1,372 | 1.617 | 1.089 |
+| sync | 1 | 8 | 733 | 467 | 36.261 | 59.449 |
+| sync | 1 | 32 | 330 | 8,171 | 808.547 | 44.752 |
+| sync | 32 | 1 | 1,657 | 19,244 | 19.978 | 1.731 |
+| sync | 32 | 8 | 20,213 | 27,527 | 22.788 | 13.864 |
+| sync | 32 | 32 | 2,615 | 218,744 | 870.384 | 6.854 |
+
+
+Memory throughput is competitive in this narrow experiment. Synchronous
+concurrency, especially independent unpipelined writers, warrants
+cross-client group commit: the current one-connection-turn barrier
+cannot amortize sync across peers. Prototype a bounded reactor-round
+barrier only with global reply withholding, safe checkpoint boundaries,
+fail-stop on ambiguous append/sync, and explicit command/byte/time limits.
+Qualify against the same harness with paired exact-on/off runs on a
+less contended disk before considering default enablement. Retain the
+previous per-connection path as a fallback. Raw results:
+fabric-resp-concurrent-20261127.json.
