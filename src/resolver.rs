@@ -1,5 +1,6 @@
 use crate::ast::{AstModule, Decl};
 use crate::lexer::Lexer;
+use crate::package::module_invalidation::ModuleSnapshot;
 use crate::parser::Parser;
 use crate::types::{NuError, NuResult, Span};
 use std::cell::RefCell;
@@ -18,13 +19,69 @@ pub fn resolve_imports(
     current_file: &Path,
     stack: &mut HashSet<PathBuf>,
 ) -> NuResult<()> {
+    resolve_imports_inner(module, current_file, stack, None, "")
+}
+
+/// Parse and resolve a source string while recording the files and direct edges
+/// observed by the recursive import resolver. This is diagnostic only:
+/// parser-side imported-type lookups, prelude, toolchain, environment and other
+/// compiler inputs are not proven complete. Never use this snapshot to skip
+/// compilation or reuse artifacts. Canonical path identities are local to this
+/// machine, not portable cache keys. The root digest describes the supplied
+/// source bytes, not a second read of the entry file.
+pub fn resolve_source_with_snapshot(
+    source: &str,
+    current_file: &Path,
+    context_bytes: &[u8],
+) -> NuResult<(AstModule, ModuleSnapshot)> {
+    let mut module = Parser::new(Lexer::new(source).lex()?).parse_module()?;
+    let mut snapshot = ModuleSnapshot::new(context_bytes);
+    resolve_imports_inner(
+        &mut module,
+        current_file,
+        &mut HashSet::new(),
+        Some(&mut snapshot),
+        source,
+    )?;
+    Ok((module, snapshot))
+}
+
+fn canonical_path(path: &Path, tracing: bool) -> NuResult<PathBuf> {
+    match path.canonicalize() {
+        Ok(path) => Ok(path),
+        Err(error) if tracing => Err(NuError::RuntimeError {
+            msg: format!(
+                "cannot identify snapshot path '{}': {error}",
+                path.display()
+            ),
+            span: Span::default(),
+        }),
+        Err(_) => Ok(path.to_path_buf()),
+    }
+}
+
+fn snapshot_name(path: &Path) -> NuResult<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| NuError::RuntimeError {
+            msg: "module snapshot path is not valid UTF-8".into(),
+            span: Span::default(),
+        })
+}
+
+fn resolve_imports_inner(
+    module: &mut AstModule,
+    current_file: &Path,
+    stack: &mut HashSet<PathBuf>,
+    mut snapshot: Option<&mut ModuleSnapshot>,
+    source: &str,
+) -> NuResult<()> {
     if stack.is_empty() {
         IMPORT_CACHE.with(|c| c.borrow_mut().clear());
     }
 
-    let canonical_file = current_file
-        .canonicalize()
-        .unwrap_or_else(|_| current_file.to_path_buf());
+    let canonical_file = canonical_path(current_file, snapshot.is_some())?;
+    let mut observed_imports = Vec::new();
     if stack.contains(&canonical_file) {
         return Err(NuError::RuntimeError {
             msg: format!("import cycle detected at '{}'", current_file.display()),
@@ -48,7 +105,12 @@ pub fn resolve_imports(
 
     for (import_path, items) in &imports {
         let resolved = resolve_path(&canonical_base, import_path);
-        let resolved_canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
+        let resolved_canonical = canonical_path(&resolved, snapshot.is_some())?;
+        // Record each edge before the per-compilation cache lookup, so shared
+        // imports in diamonds are visible from every importing module.
+        if snapshot.is_some() {
+            observed_imports.push(snapshot_name(&resolved_canonical)?);
+        }
 
         // If the file has already been fully resolved in this compilation,
         // reuse its cached declarations.
@@ -83,7 +145,13 @@ pub fn resolve_imports(
                     span: Span::default(),
                 })?;
 
-        resolve_imports(&mut imported, &resolved_canonical, stack)?;
+        resolve_imports_inner(
+            &mut imported,
+            &resolved_canonical,
+            stack,
+            snapshot.as_deref_mut(),
+            &source,
+        )?;
 
         let imported_decls = if items.is_empty() {
             imported.decls
@@ -99,6 +167,13 @@ pub fn resolve_imports(
     }
     module.decls.retain(|d| !matches!(d, Decl::Import { .. }));
     stack.remove(&canonical_file);
+    if let Some(snapshot) = snapshot {
+        snapshot.insert(
+            snapshot_name(&canonical_file)?,
+            source.as_bytes(),
+            observed_imports,
+        );
+    }
     Ok(())
 }
 
@@ -361,6 +436,115 @@ mod tests {
             public: false,
             span: sp(),
         }
+    }
+
+    struct SnapshotFixture(PathBuf);
+
+    impl SnapshotFixture {
+        fn new() -> Self {
+            static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "nulang-snapshot-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+
+        fn write(&self, name: &str, source: &str) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, source).unwrap();
+            path
+        }
+
+        fn key(&self, name: &str) -> String {
+            self.0
+                .join(name)
+                .canonicalize()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned()
+        }
+    }
+
+    impl Drop for SnapshotFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn resolved_snapshot_captures_transitive_sources_and_cached_edges() {
+        let root = SnapshotFixture::new();
+        let source = "import left\nimport right\nfn main() { 0 }";
+        let entry = root.write("main.nula", source);
+        root.write("left.nula", "import shared\nfn left() { 1 }");
+        root.write("right.nula", "import shared\nfn right() { 2 }");
+        // Identical re-exported type declarations are permitted by the existing
+        // resolver; shared function names are currently rejected on this diamond.
+        let shared = "type Shared = First | Second";
+        root.write("shared.nula", shared);
+        let (ast, snapshot) = resolve_source_with_snapshot(source, &entry, b"context").unwrap();
+        let mut normal = Parser::new(Lexer::new(source).lex().unwrap())
+            .parse_module()
+            .unwrap();
+        resolve_imports(&mut normal, &entry, &mut HashSet::new()).unwrap();
+        assert_eq!(ast, normal);
+        assert_eq!(snapshot.modules.len(), 4);
+        assert_eq!(
+            snapshot.modules[&root.key("main.nula")].source_digest,
+            *blake3::hash(source.as_bytes()).as_bytes()
+        );
+        assert_eq!(
+            snapshot.modules[&root.key("shared.nula")].source_digest,
+            *blake3::hash(shared.as_bytes()).as_bytes()
+        );
+        for name in ["left.nula", "right.nula"] {
+            assert_eq!(
+                snapshot.modules[&root.key(name)].imports,
+                [root.key("shared.nula")].into_iter().collect()
+            );
+        }
+        assert_eq!(
+            snapshot.modules[&root.key("main.nula")].imports,
+            [root.key("left.nula"), root.key("right.nula")]
+                .into_iter()
+                .collect()
+        );
+
+        root.write("shared.nula", "type Shared = First | Third");
+        let (_, updated) = resolve_source_with_snapshot(source, &entry, b"context").unwrap();
+        use crate::package::module_invalidation::explain_invalidation;
+        let impact = explain_invalidation(&snapshot, &updated);
+        assert_eq!(impact.changed_modules, vec![root.key("shared.nula")]);
+        assert_eq!(
+            impact.affected_in_dependency_order,
+            vec![
+                root.key("shared.nula"),
+                root.key("left.nula"),
+                root.key("right.nula"),
+                root.key("main.nula")
+            ]
+        );
+    }
+
+    #[test]
+    fn resolved_snapshot_refuses_missing_import() {
+        let root = SnapshotFixture::new();
+        let source = "import missing\nfn main() { 0 }";
+        let entry = root.write("main.nula", source);
+        assert!(resolve_source_with_snapshot(source, &entry, b"context").is_err());
+    }
+
+    #[test]
+    fn resolved_snapshot_refuses_import_cycle() {
+        let root = SnapshotFixture::new();
+        let source = "import other\nfn main() { 0 }";
+        let entry = root.write("main.nula", source);
+        root.write("other.nula", "import main\nfn other() { 1 }");
+        assert!(resolve_source_with_snapshot(source, &entry, b"context").is_err());
     }
 
     #[test]
