@@ -198,13 +198,66 @@ impl ManagedTablet {
     /// sequence is split between files; all outputs are verified before cutover.
     pub fn compact_with_target(
         &mut self,
-        mut next: ManifestStore,
+        next: ManifestStore,
         target_bytes: u64,
     ) -> io::Result<super::sst_manifest::CompactionStats> {
+        self.compact_with_budget(
+            next,
+            target_bytes,
+            super::storage_admission::CompactionBudget::default(),
+        )
+    }
+
+    /// Check configured aggregate additional-byte budget and observed
+    /// filesystem headroom before output, then recheck remaining staging
+    /// space before registry reservation. Not an allocation reservation.
+    pub fn compact_with_budget(
+        &mut self,
+        mut next: ManifestStore,
+        target_bytes: u64,
+        budget: super::storage_admission::CompactionBudget,
+    ) -> io::Result<super::sst_manifest::CompactionStats> {
+        use super::storage_admission::{self, Demand};
         self.ready()?;
-        let stats = self
-            .active
-            .prepare_compacted_shadow_with_target(&mut next, target_bytes)?;
+        let (wal_dir, wal_bytes) = self.tablet.compaction_wal_demand()?;
+        let remaining = [
+            Demand {
+                directory: wal_dir,
+                bytes: wal_bytes,
+                files: 1,
+            },
+            Demand {
+                directory: self.registry.directory(),
+                bytes: 2 * super::generation_registry::MAX_BYTES as u64,
+                files: 2,
+            },
+        ];
+        let stats = self.active.prepare_compacted_shadow_admitted(
+            &mut next,
+            target_bytes,
+            |directory, bytes, count| {
+                let bytes = bytes
+                    .checked_add(2 * super::sst_manifest::MAX_BYTES as u64)
+                    .ok_or_else(|| {
+                        io::Error::other("compaction storage admission: manifest estimate overflow")
+                    })?;
+                storage_admission::admit(
+                    budget,
+                    &[
+                        Demand {
+                            directory,
+                            bytes,
+                            files: count as u64 + 2,
+                        },
+                        remaining[0],
+                        remaining[1],
+                    ],
+                )
+            },
+        )?;
+        // Output files now exist: recheck only remaining extra files, plus
+        // the same headroom. Failure here leaves an inactive sealed shadow.
+        storage_admission::admit(budget, &remaining)?;
         if self.active.wal_binding()? == next.wal_binding()? {
             return Err(io::Error::other(
                 "compaction produced identical seal; no cutover needed",

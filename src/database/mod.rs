@@ -21,6 +21,8 @@ mod sidecar_lock;
 pub mod sst_manifest;
 #[cfg(unix)]
 mod sst_recovery_meta;
+#[cfg(unix)]
+pub mod storage_admission;
 pub mod store;
 pub mod tablet;
 pub mod wal;
