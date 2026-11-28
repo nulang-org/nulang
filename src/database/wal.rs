@@ -1416,6 +1416,10 @@ impl FileWal {
                 )?;
             }
         }
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::WalGroupBeforeSync,
+        )?;
         self.file.sync_data()?;
         #[cfg(test)]
         super::interruption::hit(super::interruption::StorageInterruptionPoint::WalGroupAfterSync)?;
