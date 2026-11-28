@@ -19,6 +19,7 @@ mod unix {
     --max-entries N --max-arena-bytes N --max-connections N --max-connections-per-peer N
     --max-connection-bytes N --max-input-bytes N --max-output-bytes N --max-pipeline-depth N
     --max-record-bytes N --max-journal-bytes N
+    --eviction noeviction|s3fifo (default noeviction; s3fifo memory mode only)
     --group-commit 0|1 (default 0; sync mode only)\n    --cross-client-group-commit 0|1 (default 0; sync mode only)
     --cross-group-wait-us 0..2000 (default 0; cross-client sync only)
     --clock-reservation-ms 0..1000 (default 0; may delay restart)
@@ -46,6 +47,7 @@ Durable modes require a private journal path. Memory mode is the default.";
         mode: Mode,
         journal: Option<PathBuf>,
         cache: CacheLimits,
+        s3fifo: bool,
         server: CacheServerConfig,
         wal: WalLimits,
         checkpoint: AutomaticCheckpointConfig,
@@ -79,6 +81,7 @@ Durable modes require a private journal path. Memory mode is the default.";
                 mode: Mode::Memory,
                 journal: None,
                 cache: CacheLimits::default(),
+                s3fifo: false,
                 server: CacheServerConfig::default(),
                 wal: WalLimits::default(),
                 checkpoint: AutomaticCheckpointConfig::default(),
@@ -121,6 +124,13 @@ Durable modes require a private journal path. Memory mode is the default.";
                             return Err("empty journal path".into());
                         }
                         config.journal = Some(PathBuf::from(value));
+                    }
+                    "--eviction" => {
+                        config.s3fifo = match value.as_str() {
+                            "noeviction" => false,
+                            "s3fifo" => true,
+                            _ => return Err("eviction must be noeviction or s3fifo".into()),
+                        };
                     }
                     "--max-entries" => config.cache.max_entries = positive(&value, &flag)?,
                     "--max-arena-bytes" => config.cache.max_arena_bytes = positive(&value, &flag)?,
@@ -229,6 +239,9 @@ Durable modes require a private journal path. Memory mode is the default.";
             if (config.mode == Mode::Memory) != config.journal.is_none() {
                 return Err("a journal path is required exactly in buffered or sync mode".into());
             }
+            if config.s3fifo && config.mode != Mode::Memory {
+                return Err("s3fifo requires memory mode".into());
+            }
             if config.mode != Mode::Sync
                 && (seen.contains("--group-commit") || seen.contains("--cross-client-group-commit"))
             {
@@ -309,7 +322,11 @@ Durable modes require a private journal path. Memory mode is the default.";
                     self.bind,
                     dispatcher,
                     inboxes.remove(0),
-                    CacheStore::with_limits(self.cache),
+                    if self.s3fifo {
+                        CacheStore::with_s3fifo(self.cache)
+                    } else {
+                        CacheStore::with_limits(self.cache)
+                    },
                     self.server,
                     clock,
                 ),
@@ -491,6 +508,7 @@ Durable modes require a private journal path. Memory mode is the default.";
             gauge!("cache_hits_total", sample.cache_stats.hits);
             gauge!("cache_misses_total", sample.cache_stats.misses);
             gauge!("cache_expirations_total", sample.cache_stats.expirations);
+            gauge!("cache_evictions_total", sample.cache_stats.evictions);
             gauge!("durable", u8::from(sample.durable));
             gauge!("journal_bytes", sample.journal_bytes);
             gauge!("journal_limit_bytes", sample.journal_limit_bytes);
@@ -797,6 +815,24 @@ Durable modes require a private journal path. Memory mode is the default.";
 
         fn parse(args: &[&str]) -> Result<Config, String> {
             Config::parse(args.iter().map(|s| s.to_string()))
+        }
+
+        #[test]
+        fn s3fifo_cli_requires_memory_mode() {
+            assert!(!parse(&[]).unwrap().s3fifo);
+            assert!(parse(&["--eviction", "s3fifo"]).unwrap().s3fifo);
+            assert!(parse(&["--eviction", "lru"]).is_err());
+            for mode in ["sync", "buffered"] {
+                assert!(parse(&[
+                    "--mode",
+                    mode,
+                    "--journal",
+                    "test.wal",
+                    "--eviction",
+                    "s3fifo"
+                ])
+                .is_err());
+            }
         }
 
         #[test]
