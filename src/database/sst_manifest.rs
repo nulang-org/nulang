@@ -228,7 +228,7 @@ impl Manifest {
 #[derive(Debug)]
 pub struct ManifestStore {
     dir: PathBuf,
-    _lock: File,
+    _lock: super::sidecar_lock::SidecarLock,
     manifest: Manifest,
     requires_reopen: bool,
 }
@@ -248,7 +248,7 @@ impl Drop for Staged {
     }
 }
 
-fn acquire(dir: &Path) -> io::Result<(PathBuf, File)> {
+fn acquire(dir: &Path) -> io::Result<(PathBuf, super::sidecar_lock::SidecarLock)> {
     let dir = dir.canonicalize()?;
     let lock_path = dir.join("MANIFEST.lock");
     reject_alias(&lock_path)?;
@@ -259,12 +259,7 @@ fn acquire(dir: &Path) -> io::Result<(PathBuf, File)> {
         .create(true)
         .truncate(false)
         .open(lock_path)?;
-    lock.try_lock().map_err(|error| match error {
-        std::fs::TryLockError::WouldBlock => {
-            io::Error::new(io::ErrorKind::WouldBlock, "manifest writer already held")
-        }
-        std::fs::TryLockError::Error(error) => error,
-    })?;
+    let lock = super::sidecar_lock::SidecarLock::acquire(lock, "manifest writer already held")?;
     Ok((dir, lock))
 }
 
@@ -783,5 +778,36 @@ mod seal_tests {
             drop(reopened);
             fs::remove_dir_all(dir).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod lock_lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn manifest_logical_drop_releases_lock_with_duplicated_descriptor() {
+        let dir = std::env::temp_dir().join(format!(
+            "nudb-manifest-lock-lifetime-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).unwrap();
+        let first = ManifestStore::create(&dir, 7, 3).unwrap();
+        let inherited = first._lock.duplicate_descriptor().unwrap();
+        assert_eq!(
+            ManifestStore::open(&dir, 7, 3).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(first);
+        let second = ManifestStore::open(&dir, 7, 3).unwrap();
+        drop(inherited);
+        assert_eq!(
+            ManifestStore::open(&dir, 7, 3).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(second);
+        drop(ManifestStore::open(&dir, 7, 3).unwrap());
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

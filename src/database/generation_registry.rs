@@ -138,7 +138,7 @@ impl State {
 #[derive(Debug)]
 pub struct GenerationRegistry {
     dir: PathBuf,
-    _lock: File,
+    _lock: super::sidecar_lock::SidecarLock,
     state: State,
     requires_reopen: bool,
 }
@@ -151,7 +151,7 @@ fn unique_file(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn lock(dir: &Path, initial: bool) -> io::Result<File> {
+fn lock(dir: &Path, initial: bool) -> io::Result<super::sidecar_lock::SidecarLock> {
     let path = dir.join("GENERATIONS.lock");
     let file = if initial {
         OpenOptions::new()
@@ -164,13 +164,7 @@ fn lock(dir: &Path, initial: bool) -> io::Result<File> {
         unique_file(&path)?;
         OpenOptions::new().read(true).write(true).open(&path)?
     };
-    file.try_lock().map_err(|e| match e {
-        std::fs::TryLockError::WouldBlock => {
-            io::Error::new(io::ErrorKind::WouldBlock, "registry already locked")
-        }
-        std::fs::TryLockError::Error(e) => e,
-    })?;
-    Ok(file)
+    super::sidecar_lock::SidecarLock::acquire(file, "registry already locked")
 }
 
 fn publish(dir: &Path, bytes: &[u8], initial: bool) -> io::Result<()> {
@@ -488,5 +482,36 @@ impl GenerationRegistry {
         r.active = digest;
         r.pending = None;
         self.update(next)
+    }
+}
+
+#[cfg(test)]
+mod lock_lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn registry_logical_drop_releases_lock_with_duplicated_descriptor() {
+        let dir = std::env::temp_dir().join(format!(
+            "nudb-registry-lock-lifetime-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).unwrap();
+        let first = GenerationRegistry::create(&dir, 7, 3).unwrap();
+        let inherited = first._lock.duplicate_descriptor().unwrap();
+        assert_eq!(
+            GenerationRegistry::open(&dir, 7, 3).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(first);
+        let second = GenerationRegistry::open(&dir, 7, 3).unwrap();
+        drop(inherited);
+        assert_eq!(
+            GenerationRegistry::open(&dir, 7, 3).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(second);
+        drop(GenerationRegistry::open(&dir, 7, 3).unwrap());
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

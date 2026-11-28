@@ -14,6 +14,8 @@ pub mod optimistic;
 #[cfg(unix)]
 mod sealed_backup;
 #[cfg(unix)]
+mod sidecar_lock;
+#[cfg(unix)]
 pub mod sst_manifest;
 #[cfg(unix)]
 mod sst_recovery_meta;
