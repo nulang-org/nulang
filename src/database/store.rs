@@ -804,6 +804,19 @@ impl WalBackedTablet {
         backup: impl AsRef<Path>,
         destination: impl AsRef<Path>,
     ) -> std::io::Result<()> {
+        let _archive = self.verify_retirement_candidate(active, &obsolete, backup.as_ref())?;
+        obsolete.quarantine(destination.as_ref())
+    }
+
+    /// Verify current recoverability and exact prefix lineage, retaining
+    /// the archive lock through the caller's registry publication or move.
+    #[cfg(unix)]
+    pub(super) fn verify_retirement_candidate(
+        &self,
+        active: &super::sst_manifest::ManifestStore,
+        obsolete: &super::sst_manifest::ManifestStore,
+        backup: &Path,
+    ) -> std::io::Result<super::sst_manifest::ManifestStore> {
         use super::sealed_backup::{self, Completion};
         use std::io;
         let binding = active.wal_binding()?;
@@ -823,7 +836,7 @@ impl WalBackedTablet {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        let backup = backup.as_ref().canonicalize()?;
+        let backup = backup.canonicalize()?;
         let old = obsolete.directory();
         let active_dir = active.directory();
         let overlaps = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
@@ -865,9 +878,8 @@ impl WalBackedTablet {
                 "backup contents do not match active generation and WAL",
             ));
         }
-        // Keep archive and active locks held through the rename. A full
-        // logical reconstruction was required to publish the backup marker.
-        obsolete.quarantine(destination.as_ref())
+        obsolete.verify_dedicated_files()?;
+        Ok(archived)
     }
 
     /// Register the actual recovered bound WAL under its canonical path.

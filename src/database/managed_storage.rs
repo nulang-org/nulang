@@ -189,6 +189,35 @@ impl ManagedTablet {
         self.tablet.backup_sealed(&self.active, destination)
     }
 
+    /// Permanently fence new registry references to a verified obsolete
+    /// generation. Operator supplies the already quarantined dedicated
+    /// directory and a current complete backup. This does not prove global
+    /// ownership, move directories, authorize unlink, or delete any files.
+    /// All consumers must participate in this same registry.
+    pub fn reserve_retirement(
+        &mut self,
+        obsolete: &ManifestStore,
+        backup: impl AsRef<Path>,
+    ) -> io::Result<()> {
+        self.ready()?;
+        match self.registry.status(obsolete)? {
+            GenerationStatus::Unreferenced | GenerationStatus::RetirementReserved => {}
+            _ => {
+                return Err(io::Error::other(
+                    "retirement requires known unreferenced generation",
+                ))
+            }
+        }
+        let _archive =
+            self.tablet
+                .verify_retirement_candidate(&self.active, obsolete, backup.as_ref())?;
+        let result = self.registry.reserve_retirement(obsolete);
+        if result.is_err() {
+            self.fenced = true;
+        }
+        result
+    }
+
     /// Quarantine only a known unreferenced generation. Existing exact-backup,
     /// lineage, file and path checks still apply. No permanent deletion.
     pub fn quarantine(

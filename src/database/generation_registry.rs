@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAGIC: &[u8; 8] = b"NUDBREG1";
+const RETIREMENT_MAGIC: &[u8; 8] = b"NUDBREG2";
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ITEMS: usize = 8192;
 const MAX_PATH: usize = 4096;
@@ -30,6 +31,7 @@ pub enum GenerationStatus {
     Unknown,
     Referenced,
     Unreferenced,
+    RetirementReserved,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -52,6 +54,16 @@ struct Reference {
     pending: Option<Digest>,
 }
 
+/// A permanent reference fence for a specific verified physical copy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Retirement {
+    digest: Digest,
+    directory: Vec<u8>,
+    device: u64,
+    inode: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct State {
@@ -59,6 +71,8 @@ struct State {
     epoch: u64,
     known: BTreeSet<Digest>,
     references: Vec<Reference>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    retirements: Vec<Retirement>,
 }
 
 impl State {
@@ -67,13 +81,33 @@ impl State {
             || self.epoch == 0
             || self.known.len() > MAX_ITEMS
             || self.references.len() > MAX_ITEMS
+            || self.retirements.len() > MAX_ITEMS
         {
             return Err(invalid("registry identity or count limit"));
+        }
+        let mut previous_digest = None;
+        let mut directories = BTreeSet::new();
+        let mut inodes = BTreeSet::new();
+        for retirement in &self.retirements {
+            if previous_digest.is_some_and(|p| p >= retirement.digest)
+                || !self.known.contains(&retirement.digest)
+                || retirement.directory.len() > MAX_PATH
+                || retirement.directory.first() != Some(&b'/')
+                || retirement.directory.contains(&0)
+                || retirement.inode == 0
+                || !directories.insert(&retirement.directory)
+                || !inodes.insert((retirement.device, retirement.inode))
+            {
+                return Err(invalid("invalid retirement reservation"));
+            }
+            previous_digest = Some(retirement.digest);
         }
         let mut previous = None;
         for r in &self.references {
             if previous.is_some_and(|p| p >= &r.owner)
                 || !self.known.contains(&r.active)
+                || self.is_retired(r.active)
+                || r.pending.is_some_and(|p| self.is_retired(p))
                 || r.pending
                     .is_some_and(|p| p == r.active || !self.known.contains(&p))
             {
@@ -94,7 +128,12 @@ impl State {
 
     fn encode(&self) -> io::Result<Vec<u8>> {
         self.validate()?;
-        let mut bytes = MAGIC.to_vec();
+        let mut bytes = if self.retirements.is_empty() {
+            MAGIC
+        } else {
+            RETIREMENT_MAGIC
+        }
+        .to_vec();
         // Bound serialized growth rather than trusting record count alone.
         struct Bounded<'a>(&'a mut Vec<u8>);
         impl Write for Bounded<'_> {
@@ -116,7 +155,10 @@ impl State {
     }
 
     fn decode(bytes: &[u8]) -> io::Result<Self> {
-        if bytes.len() < 40 || bytes.len() > MAX_BYTES || &bytes[..8] != MAGIC {
+        if bytes.len() < 40
+            || bytes.len() > MAX_BYTES
+            || (&bytes[..8] != MAGIC && &bytes[..8] != RETIREMENT_MAGIC)
+        {
             return Err(invalid("registry magic or length"));
         }
         let (body, checksum) = bytes.split_at(bytes.len() - 32);
@@ -128,6 +170,12 @@ impl State {
             return Err(invalid("noncanonical registry"));
         }
         Ok(state)
+    }
+
+    fn is_retired(&self, digest: Digest) -> bool {
+        self.retirements
+            .binary_search_by_key(&digest, |r| r.digest)
+            .is_ok()
     }
 
     fn index(&self, owner: &Owner) -> Result<usize, usize> {
@@ -231,6 +279,7 @@ impl GenerationRegistry {
             epoch,
             known: BTreeSet::new(),
             references: Vec::new(),
+            retirements: Vec::new(),
         };
         let bytes = state.encode()?;
         if fs::read_dir(&dir)?.next().is_some() {
@@ -334,6 +383,9 @@ impl GenerationRegistry {
 
     pub fn status(&self, manifest: &ManifestStore) -> io::Result<GenerationStatus> {
         let digest = self.digest(manifest.wal_binding()?)?;
+        if self.state.is_retired(digest) {
+            return Ok(GenerationStatus::RetirementReserved);
+        }
         Ok(
             if self
                 .state
@@ -350,7 +402,49 @@ impl GenerationRegistry {
         )
     }
 
+    /// Reserve an exact directory identity after the managed coordinator
+    /// verifies current backup, prefix lineage and dedicated file inventory.
+    /// This is irreversible within this registry, but never deletes bytes.
+    pub(super) fn reserve_retirement(&mut self, manifest: &ManifestStore) -> io::Result<()> {
+        let digest = self.digest(manifest.wal_binding()?)?;
+        let dir = manifest.directory();
+        let meta = fs::symlink_metadata(dir)?;
+        if !meta.is_dir() || dir.canonicalize()? != dir {
+            return Err(invalid("retirement requires exact directory"));
+        }
+        // Do not reserve the registry namespace or an ancestor/descendant.
+        if dir.starts_with(&self.dir) || self.dir.starts_with(dir) {
+            return Err(invalid("retirement overlaps registry directory"));
+        }
+        let record = Retirement {
+            digest,
+            directory: dir.as_os_str().as_bytes().to_vec(),
+            device: meta.dev(),
+            inode: meta.ino(),
+        };
+        let mut next = self.state.clone();
+        match next.retirements.binary_search_by_key(&digest, |r| r.digest) {
+            Ok(i) if next.retirements[i] == record => return Ok(()),
+            Ok(_) => {
+                return Err(invalid(
+                    "retirement already reserved for different physical copy",
+                ))
+            }
+            Err(i) => {
+                if self.status(manifest)? != GenerationStatus::Unreferenced {
+                    return Err(invalid("retirement requires known unreferenced generation"));
+                }
+                next.retirements.insert(i, record);
+            }
+        }
+        self.update(next)
+    }
+
     fn add(&mut self, owner: Owner, digest: Digest) -> io::Result<()> {
+        self.ready()?;
+        if self.state.is_retired(digest) {
+            return Err(invalid("retirement reserved"));
+        }
         let mut next = self.state.clone();
         match next.index(&owner) {
             Ok(i)
@@ -450,7 +544,10 @@ impl GenerationRegistry {
     ) -> io::Result<()> {
         let old_digest = self.digest(old)?;
         let new_digest = self.digest(new)?;
-        if new.sequence <= old.sequence || old_digest == new_digest {
+        if self.state.is_retired(new_digest)
+            || new.sequence <= old.sequence
+            || old_digest == new_digest
+        {
             return Err(invalid("rotation must advance generation"));
         }
         let mut next = self.state.clone();

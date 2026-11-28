@@ -612,6 +612,23 @@ impl ManifestStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
+        self.verify_dedicated_files()?;
+        File::open(parent)?.sync_all()?;
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::QuarantineBeforeRename,
+        )?;
+        fs::rename(&self.dir, &target)?;
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::QuarantineAfterRename,
+        )?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Validate the exact allowlisted contents without moving or deleting data.
+    pub(super) fn verify_dedicated_files(&self) -> io::Result<()> {
         let mut expected = std::collections::BTreeSet::new();
         expected.insert(std::ffi::OsString::from("MANIFEST"));
         expected.insert(std::ffi::OsString::from("MANIFEST.lock"));
@@ -633,17 +650,6 @@ impl ManifestStore {
         if !expected.is_empty() {
             return Err(invalid("missing obsolete generation file"));
         }
-        File::open(parent)?.sync_all()?;
-        #[cfg(test)]
-        super::interruption::hit(
-            super::interruption::StorageInterruptionPoint::QuarantineBeforeRename,
-        )?;
-        fs::rename(&self.dir, &target)?;
-        #[cfg(test)]
-        super::interruption::hit(
-            super::interruption::StorageInterruptionPoint::QuarantineAfterRename,
-        )?;
-        File::open(parent)?.sync_all()?;
         Ok(())
     }
 

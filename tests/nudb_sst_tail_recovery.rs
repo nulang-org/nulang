@@ -1493,3 +1493,154 @@ fn sidecar_repair_rejects_wal4_conflicting_marker_alias_and_active_lock() {
     assert_eq!(fs::read(&wal).unwrap(), bytes);
     assert_eq!(fs::read(&lock).unwrap(), marker);
 }
+
+#[test]
+fn retirement_reservation_survives_reopen_and_blocks_new_references() {
+    use nulang::database::{
+        generation_registry::{GenerationRegistry, GenerationStatus, ReferenceKind},
+        managed_storage::ManagedTablet,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let old = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let reg_dir = f.0.join("registry");
+    fs::create_dir(&reg_dir).unwrap();
+    let registry = GenerationRegistry::create(&reg_dir, 7, 3).unwrap();
+    let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+    managed
+        .register_reference(ReferenceKind::Reader, [1; 16])
+        .unwrap();
+    managed
+        .commit_idempotent(id(2), vec![put(b"tail")])
+        .unwrap();
+    let next_dir = f.0.join("next");
+    fs::create_dir(&next_dir).unwrap();
+    managed
+        .rotate(ManifestStore::create(&next_dir, 7, 3).unwrap(), 1)
+        .unwrap();
+    let old_dir = f.0.join("sst");
+    let old = ManifestStore::open(&old_dir, 7, 3).unwrap();
+    let backup = f.0.join("backup");
+    managed.backup([2; 16], &backup).unwrap();
+    assert!(managed.reserve_retirement(&old, &backup).is_err());
+    managed
+        .release_reference(ReferenceKind::Reader, [1; 16], &old)
+        .unwrap();
+    let quarantine = f.0.join("quarantine");
+    managed.quarantine(old, &backup, &quarantine).unwrap();
+    let obsolete = ManifestStore::open(&quarantine, 7, 3).unwrap();
+    managed
+        .commit_idempotent(id(3), vec![put(b"latest")])
+        .unwrap();
+    assert!(managed.reserve_retirement(&obsolete, &backup).is_err());
+    assert_eq!(
+        managed.generation_status(&obsolete).unwrap(),
+        GenerationStatus::Unreferenced
+    );
+    let fresh = f.0.join("fresh");
+    managed.backup([3; 16], &fresh).unwrap();
+    managed.reserve_retirement(&obsolete, &fresh).unwrap();
+    assert_eq!(
+        managed.generation_status(&obsolete).unwrap(),
+        GenerationStatus::RetirementReserved
+    );
+    assert!(quarantine.join("MANIFEST").exists());
+    drop(managed);
+    let mut registry = GenerationRegistry::open(&reg_dir, 7, 3).unwrap();
+    assert_eq!(
+        registry.status(&obsolete).unwrap(),
+        GenerationStatus::RetirementReserved
+    );
+    assert!(registry
+        .register_reference(ReferenceKind::Reader, [4; 16], &obsolete)
+        .is_err());
+    assert!(registry
+        .register_reference(ReferenceKind::Backup, [5; 16], &obsolete)
+        .is_err());
+    assert_eq!(
+        registry.status(&obsolete).unwrap(),
+        GenerationStatus::RetirementReserved
+    );
+    let mut managed =
+        ManagedTablet::open(f.descriptor(), f.0.join("tablet.wal"), &next_dir, registry).unwrap();
+    managed.reserve_retirement(&obsolete, &fresh).unwrap();
+    assert_eq!(
+        managed.read_at(b"k", 3).unwrap(),
+        Some(b"latest".as_slice())
+    );
+    assert_eq!(
+        managed.generation_status(&obsolete).unwrap(),
+        GenerationStatus::RetirementReserved
+    );
+}
+
+#[test]
+fn retirement_reservation_rejects_different_physical_copy_and_registry_downgrade() {
+    use nulang::database::{
+        generation_registry::{GenerationRegistry, GenerationStatus},
+        managed_storage::ManagedTablet,
+    };
+    let f = Fixture::new();
+    let mut db = f.open();
+    db.commit_idempotent(id(1), vec![put(b"first")]).unwrap();
+    let old = seal(&f, &db);
+    db.reclaim_to_sealed_sst(&old).unwrap();
+    let reg_dir = f.0.join("registry");
+    fs::create_dir(&reg_dir).unwrap();
+    let registry = GenerationRegistry::create(&reg_dir, 7, 3).unwrap();
+    let mut managed = ManagedTablet::adopt(db, registry, old).unwrap();
+    managed
+        .commit_idempotent(id(2), vec![put(b"tail")])
+        .unwrap();
+    let next = f.0.join("next");
+    fs::create_dir(&next).unwrap();
+    managed
+        .rotate(ManifestStore::create(&next, 7, 3).unwrap(), 0)
+        .unwrap();
+    let backup = f.0.join("backup");
+    managed.backup([1; 16], &backup).unwrap();
+    let quarantine = f.0.join("quarantine");
+    managed
+        .quarantine(
+            ManifestStore::open(f.0.join("sst"), 7, 3).unwrap(),
+            &backup,
+            &quarantine,
+        )
+        .unwrap();
+    let copy = f.0.join("copy");
+    fs::create_dir(&copy).unwrap();
+    for entry in fs::read_dir(&quarantine).unwrap() {
+        let entry = entry.unwrap();
+        fs::copy(entry.path(), copy.join(entry.file_name())).unwrap();
+    }
+    let obsolete = ManifestStore::open(&quarantine, 7, 3).unwrap();
+    let duplicate = ManifestStore::open(&copy, 7, 3).unwrap();
+    let file = reg_dir.join("GENERATIONS");
+    assert_eq!(&fs::read(&file).unwrap()[..8], b"NUDBREG1");
+    managed.reserve_retirement(&obsolete, &backup).unwrap();
+    assert_eq!(
+        managed.generation_status(&duplicate).unwrap(),
+        GenerationStatus::RetirementReserved
+    );
+    let persisted = fs::read(&file).unwrap();
+    assert_eq!(&persisted[..8], b"NUDBREG2");
+    assert!(managed.reserve_retirement(&duplicate, &backup).is_err());
+    assert_eq!(fs::read(&file).unwrap(), persisted);
+    assert!(copy.join("MANIFEST").exists());
+    drop(managed);
+    let mut downgraded = persisted.clone();
+    downgraded[..8].copy_from_slice(b"NUDBREG1");
+    let split = downgraded.len() - 32;
+    let digest = blake3::hash(&downgraded[..split]);
+    downgraded[split..].copy_from_slice(digest.as_bytes());
+    fs::write(&file, &downgraded).unwrap();
+    assert!(GenerationRegistry::open(&reg_dir, 7, 3).is_err());
+    fs::write(&file, &persisted).unwrap();
+    let registry = GenerationRegistry::open(&reg_dir, 7, 3).unwrap();
+    assert_eq!(
+        registry.status(&obsolete).unwrap(),
+        GenerationStatus::RetirementReserved
+    );
+}
