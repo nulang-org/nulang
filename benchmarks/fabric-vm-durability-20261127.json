@@ -1,0 +1,138 @@
+{
+  "scope": "abrupt QEMU termination, host remains running; not physical power loss",
+  "binary_sha256": "c34cc1a155d370be2396f6a88574f4092fd04d75db5eadd7dd2476c89ec31740",
+  "kernel_sha256": "c9f420c763aaf195b464715ad80da772ecf1be7061c77a430e41c58d76ebf980",
+  "qemu_version": "QEMU emulator version 10.2.2 (qemu-10.2.2-1.fc44)",
+  "accelerator": "kvm",
+  "filesystem": "ext4 in fresh 128 MiB sparse raw file",
+  "cache": "none",
+  "rounds": 3,
+  "expected_cases": 15,
+  "cases": [
+    {
+      "round": 1,
+      "mode": "record",
+      "passed": true,
+      "write_seconds": 1.335,
+      "ext4_needs_recovery": true,
+      "recover_seconds": 1.114
+    },
+    {
+      "round": 1,
+      "mode": "connection",
+      "passed": true,
+      "write_seconds": 1.479,
+      "ext4_needs_recovery": true,
+      "recover_seconds": 1.205
+    },
+    {
+      "round": 1,
+      "mode": "cross",
+      "passed": true,
+      "write_seconds": 1.57,
+      "ext4_needs_recovery": true,
+      "recover_seconds": 1.583
+    },
+    {
+      "round": 1,
+      "mode": "checkpoint",
+      "passed": true,
+      "write_seconds": 1.509,
+      "ext4_needs_recovery": true,
+      "recover_seconds": 1.318
+    },
+    {
+      "round": 1,
+      "mode": "fault",
+      "passed": true,
+      "write_seconds": 1.469,
+      "ext4_needs_recovery": true,
+      "recover_seconds": 1.338
+    },
+    {
+      "round": 2,
+      "mode": "record",
+      "passed": true,
+      "write_seconds": 1.641,
+      "ext4_needs_recovery": true,
+      "recover_seconds": 1.237
+    },
+    {
+      "round": 2,
+      "mode": "connection",
+      "passed": true,
+      "write_seconds": 1.303,
+      "ext4_needs_recovery": true,
+      "recover_seconds": 1.294
+    },
+    {
+      "round": 2,
+      "mode": "cross",
+      "passed": true,
+      "write_seconds": 1.324,
+      "ext4_needs_recovery": true,
+      "recover_seconds": 1.04
+    },
+    {
+      "round": 2,
+      "mode": "checkpoint",
+      "passed": true,
+      "write_seconds": 1.375,
+      "ext4_needs_recovery": true,
+      "recover_seconds": 1.135
+    },
+    {
+      "round": 2,
+      "mode": "fault",
+      "passed": true,
+      "write_seconds": 1.439,
+      "ext4_needs_recovery": true,
+      "recover_seconds": 1.245
+    },
+    {
+      "round": 3,
+      "mode": "record",
+      "passed": true,
+      "write_seconds": 1.387,
+      "ext4_needs_recovery": true,
+      "recover_seconds": 1.155
+    },
+    {
+      "round": 3,
+      "mode": "connection",
+      "passed": true,
+      "write_seconds": 1.244,
+      "ext4_needs_recovery": true,
+      "recover_seconds": 1.042
+    },
+    {
+      "round": 3,
+      "mode": "cross",
+      "passed": true,
+      "write_seconds": 1.425,
+      "ext4_needs_recovery": true,
+      "recover_seconds": 1.215
+    },
+    {
+      "round": 3,
+      "mode": "checkpoint",
+      "passed": true,
+      "write_seconds": 1.283,
+      "ext4_needs_recovery": true,
+      "recover_seconds": 1.284
+    },
+    {
+      "round": 3,
+      "mode": "fault",
+      "passed": true,
+      "write_seconds": 1.364,
+      "ext4_needs_recovery": true,
+      "recover_seconds": 1.214
+    }
+  ],
+  "source_commit": "832f023046e2660da21b3ca625d213811f8c3445",
+  "build": "optimized exact-module locked focused executable, not full workspace release profile",
+  "host_filesystem": "Btrfs",
+  "kernel_release": "7.1.13-200.fc44.x86_64",
+  "fault": "guest device-mapper linear-to-error target; no response, server exits nonzero, previously acknowledged data recovered"
+}
