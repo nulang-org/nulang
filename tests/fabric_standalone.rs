@@ -203,15 +203,20 @@ fn termination_signals_exit_successfully_and_release_journal() {
 
 #[test]
 fn mutual_tls_requires_trusted_client_certificate() {
-    qualify_mutual_tls(false);
+    qualify_mutual_tls(false, "0");
 }
 
 #[test]
 fn cross_client_commit_with_mutual_tls_preserves_admission_and_pipeline_order() {
-    qualify_mutual_tls(true);
+    qualify_mutual_tls(true, "0");
 }
 
-fn qualify_mutual_tls(cross_client: bool) {
+#[test]
+fn coalescing_with_mutual_tls_preserves_admission_and_pipeline_order() {
+    qualify_mutual_tls(true, "2000");
+}
+
+fn qualify_mutual_tls(cross_client: bool, wait: &str) {
     use rcgen::{
         BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
         KeyUsagePurpose,
@@ -272,6 +277,8 @@ fn qualify_mutual_tls(cross_client: bool) {
             journal.to_str().unwrap(),
             "--cross-client-group-commit",
             "1",
+            "--cross-group-wait-us",
+            wait,
         ]);
     }
     let _server = Server::start(addr, &args);
@@ -659,6 +666,15 @@ fn grouped_sync_pipeline_recovers_after_process_kill() {
 
 #[test]
 fn cross_client_acknowledged_mutations_recover_after_process_kill() {
+    qualify_cross_client_recovery("0");
+}
+
+#[test]
+fn coalescing_acknowledged_mutations_recover_after_process_kill() {
+    qualify_cross_client_recovery("2000");
+}
+
+fn qualify_cross_client_recovery(wait: &str) {
     let temp = Temp(std::env::temp_dir().join(format!(
             "nulang-fabric-cross-process-{}-{}",
             std::process::id(),
@@ -677,6 +693,8 @@ fn cross_client_acknowledged_mutations_recover_after_process_kill() {
         journal.to_str().unwrap(),
         "--cross-client-group-commit",
         "1",
+        "--cross-group-wait-us",
+        wait,
     ];
     let server = Server::start(address, &args);
     let mut clients: Vec<_> = (0..8)
@@ -728,6 +746,12 @@ fn test_real_wal_file_size_failure_never_acknowledges_uncertain_mutation() {
         &[][..],
         &["--group-commit", "1"][..],
         &["--cross-client-group-commit", "1"][..],
+        &[
+            "--cross-client-group-commit",
+            "1",
+            "--cross-group-wait-us",
+            "2000",
+        ][..],
     ]
     .into_iter()
     .enumerate()

@@ -1331,7 +1331,12 @@ impl CacheShardServer {
         }
         #[cfg(unix)]
         self.maybe_checkpoint(self.clock.now_ms())?;
-        let timeout = self.poll_timeout(timeout);
+        // The caller's readiness-wait budget covers both polls, not
+        // just the initial one. It is not a deadline for execution or fsync.
+        #[cfg(unix)]
+        let poll_started = Instant::now();
+        let requested = timeout;
+        let timeout = self.poll_timeout(requested);
         self.poll.poll(&mut self.events, timeout)?;
 
         // A slow unauthenticated handshake cannot retain a slot forever.
@@ -1381,7 +1386,9 @@ impl CacheShardServer {
 
         #[cfg(unix)]
         if self.cross_client_group_commit {
-            self.drive_cross_client_ready()?;
+            self.drive_cross_client_ready(
+                requested.map(|budget| budget.saturating_sub(poll_started.elapsed())),
+            )?;
         } else {
             self.drive_ready()?;
         }
@@ -1451,10 +1458,20 @@ impl CacheShardServer {
     /// all unprocessed events, including control events, for the next turn.
     /// Never dispatch a token twice in one iteration or extend the deadline.
     #[cfg(unix)]
-    fn coalesce_cross_group(&mut self, tokens: &mut Vec<Token>) -> Result<(), CacheServerError> {
+    fn coalesce_cross_group(
+        &mut self,
+        tokens: &mut Vec<Token>,
+        caller_budget: Option<(Instant, Duration)>,
+    ) -> Result<(), CacheServerError> {
         let Some(wait) = self.cross_group_wait_remaining(tokens.len()) else {
             return Ok(());
         };
+        let wait = caller_budget.map_or(wait, |(started, budget)| {
+            wait.min(budget.saturating_sub(started.elapsed()))
+        });
+        if wait.is_zero() {
+            return Ok(());
+        }
         self.counters.coalescing_polls = self.counters.coalescing_polls.saturating_add(1);
         match self.poll.poll(&mut self.events, Some(wait)) {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
@@ -1571,7 +1588,11 @@ impl CacheShardServer {
     }
 
     #[cfg(unix)]
-    fn drive_cross_client_ready(&mut self) -> Result<(), CacheServerError> {
+    fn drive_cross_client_ready(
+        &mut self,
+        caller_budget: Option<Duration>,
+    ) -> Result<(), CacheServerError> {
+        let caller_budget = caller_budget.map(|budget| (Instant::now(), budget));
         let mut tokens = Vec::with_capacity(CROSS_GROUP_TURNS);
         let result = (|| {
             for index in 0..self.ready.len() {
@@ -1605,7 +1626,7 @@ impl CacheShardServer {
                     }
                 }
             }
-            self.coalesce_cross_group(&mut tokens)?;
+            self.coalesce_cross_group(&mut tokens, caller_budget)?;
             self.finish_cross_group(&mut tokens)
         })();
         // Registration/dispatch failure while a group is open is fail-stop,
@@ -3757,7 +3778,7 @@ mod tests {
             .keys()
             .map(|&token| ReadyEvent::continuation(token, true, false))
             .collect();
-        server.drive_cross_client_ready().unwrap();
+        server.drive_cross_client_ready(None).unwrap();
         let snapshot = server.operational_snapshot();
         assert_eq!(snapshot.counters.wal_groups_synced, 1);
         assert_eq!(snapshot.counters.wal_group_records_synced, 8);
@@ -3810,7 +3831,7 @@ mod tests {
             .map(|&token| ReadyEvent::continuation(token, true, false))
             .collect();
         assert!(matches!(
-            server.drive_cross_client_ready(),
+            server.drive_cross_client_ready(None),
             Err(CacheServerError::DurableShardPoisoned)
         ));
         assert_eq!(server.connection_count(), 0);
@@ -3853,7 +3874,7 @@ mod tests {
             .keys()
             .map(|&token| ReadyEvent::continuation(token, true, false))
             .collect();
-        server.drive_cross_client_ready().unwrap();
+        server.drive_cross_client_ready(None).unwrap();
         assert_eq!(server.operational_snapshot().counters.wal_groups_synced, 2);
         assert_eq!(
             server
@@ -4099,7 +4120,7 @@ mod tests {
                 }
             }
             server.ready = vec![ReadyEvent::continuation(first_token, true, false)];
-            let result = server.drive_cross_client_ready();
+            let result = server.drive_cross_client_ready(None);
             assert_eq!(server.counters.coalescing_polls, 1);
             assert_eq!(server.counters.coalescing_turns, 1);
             if fail_sync {
@@ -4125,5 +4146,90 @@ mod tests {
             }
             assert_eq!(server.buffer_budget.used_bytes(), 0);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn coalescing_respects_nonblocking_caller_poll() {
+        let tmp = DurableTestDir::new();
+        let mut server = build_durable_server(
+            &tmp.0.join("nonblocking.wal"),
+            WalSync::Data,
+            WalLimits::default(),
+        );
+        server.enable_cross_client_group_commit().unwrap();
+        server
+            .configure_cross_group_wait(Duration::from_millis(2))
+            .unwrap();
+        let mut client = connect_client(&server);
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+            if server.connection_count() == 1 {
+                break;
+            }
+        }
+        server.next_expiry_sweep = Instant::now() + Duration::from_secs(1);
+        // Test-only longer window to make the regression deterministic.
+        server.cross_group_wait = Duration::from_secs(1);
+        server.cross_group_time_limit = Duration::from_secs(1);
+        client
+            .write_all(b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n")
+            .unwrap();
+        for _ in 0..100 {
+            server.poll_once(Some(Duration::ZERO)).unwrap();
+            if server.counters.wal_groups_synced == 1 {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(server.counters.wal_groups_synced, 1);
+        assert_eq!(server.counters.coalescing_polls, 0);
+        let mut reply = [0; 4];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b":1\r\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn coalescing_defers_control_event_and_commits_before_shutdown() {
+        let tmp = DurableTestDir::new();
+        let journal = tmp.0.join("control.wal");
+        let mut server = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        server.enable_cross_client_group_commit().unwrap();
+        server.cross_group_wait = Duration::from_millis(100);
+        server.cross_group_time_limit = Duration::from_millis(100);
+        let mut client = connect_client(&server);
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(5))).unwrap();
+            if server.connection_count() == 1 {
+                break;
+            }
+        }
+        server.next_expiry_sweep = Instant::now() + Duration::from_secs(1);
+        let token = *server.connections.keys().next().unwrap();
+        client
+            .write_all(b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n")
+            .unwrap();
+        server.waker.wake().unwrap();
+        server.ready = vec![ReadyEvent::continuation(token, true, false)];
+        server.drive_cross_client_ready(None).unwrap();
+        assert_eq!(server.counters.coalescing_polls, 1);
+        assert_eq!(server.counters.coalescing_turns, 0);
+        assert!(server.deferred.contains_key(&WAKE_TOKEN));
+        assert_eq!(server.counters.wal_groups_synced, 1);
+        let mut reply = [0; 4];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b":1\r\n");
+        server.shutdown.store(true, Ordering::Release);
+        server.run_with_shutdown_timeout(Duration::ZERO).unwrap();
+        drop(server);
+        let mut recovered = build_durable_server(&journal, WalSync::Data, WalLimits::default());
+        let mut client = connect_client(&recovered);
+        roundtrip(
+            &mut recovered,
+            &mut client,
+            b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
+            b"$1\r\n1\r\n",
+        );
     }
 }
