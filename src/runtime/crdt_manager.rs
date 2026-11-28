@@ -70,10 +70,8 @@ impl CrdtOp {
             _ => return None,
         };
         let payload_len = u32::from_be_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]) as usize;
-        if bytes.len() < 13 + payload_len {
-            return None;
-        }
-        let payload = bytes[13..13 + payload_len].to_vec();
+        let end = 13usize.checked_add(payload_len)?;
+        let payload = bytes.get(13..end)?.to_vec();
         Some(CrdtOp {
             crdt_id,
             crdt_type,

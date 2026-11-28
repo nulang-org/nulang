@@ -839,18 +839,10 @@ impl Packet {
             return None;
         }
         let actor_id = u64::from_be_bytes(payload[0..8].try_into().ok()?);
-        let nbc_len = u32::from_be_bytes(payload[8..12].try_into().ok()?) as usize;
-        if payload.len() < 12 + nbc_len + 4 {
-            return None;
-        }
-        let nbc_bytes = payload[12..12 + nbc_len].to_vec();
-        let json_off = 12 + nbc_len;
-        let json_len =
-            u32::from_be_bytes(payload[json_off..json_off + 4].try_into().ok()?) as usize;
-        if payload.len() < json_off + 4 + json_len {
-            return None;
-        }
-        let snapshot_json = payload[json_off + 4..json_off + 4 + json_len].to_vec();
+        let (nbc, json_off) = read_blob(payload, 8)?;
+        let (snapshot, _) = read_blob(payload, json_off)?;
+        let nbc_bytes = nbc.to_vec();
+        let snapshot_json = snapshot.to_vec();
         Some(Packet::MigrateActor {
             actor_id,
             nbc_bytes,
@@ -1164,13 +1156,9 @@ impl Packet {
         for _ in 0..object_count {
             let id = read_u64(payload, offset)?;
             offset = offset.checked_add(8)?;
-            let bytes_len = read_u32(payload, offset)? as usize;
-            offset = offset.checked_add(4)?;
-            if offset + bytes_len > payload.len() {
-                return None;
-            }
-            let bytes = payload[offset..offset + bytes_len].to_vec();
-            offset = offset.checked_add(bytes_len)?;
+            let (blob, next) = read_blob(payload, offset)?;
+            let bytes = blob.to_vec();
+            offset = next;
             object_table.push((id, bytes));
         }
         // trace_id: 1-byte flag + optional string content.
@@ -1250,16 +1238,8 @@ impl Packet {
             initial_state.push((key, value));
         }
         // Deserialize optional bytecode: 0 length = None.
-        let bytecode_len = read_u32(payload, offset)? as usize;
-        offset += 4;
-        let bytecode = if bytecode_len > 0 {
-            if offset + bytecode_len > payload.len() {
-                return None;
-            }
-            Some(payload[offset..offset + bytecode_len].to_vec())
-        } else {
-            None
-        };
+        let (blob, _) = read_blob(payload, offset)?;
+        let bytecode = (!blob.is_empty()).then(|| blob.to_vec());
         Some(Packet::SpawnRequest {
             request_id,
             behavior_name,
@@ -1304,12 +1284,13 @@ impl Packet {
                 payload[offset + 11],
                 payload[offset + 12],
             ]) as usize;
-            let total_op_len = 13 + op_payload_len;
-            if offset + total_op_len > payload.len() {
+            let total_op_len = 13usize.checked_add(op_payload_len)?;
+            let end = offset.checked_add(total_op_len)?;
+            if end > payload.len() {
                 return None;
             }
-            let op = CrdtOp::from_bytes(&payload[offset..offset + total_op_len])?;
-            offset += total_op_len;
+            let op = CrdtOp::from_bytes(&payload[offset..end])?;
+            offset = end;
             ops.push(op);
         }
         Some(Packet::CrdtSync { ops: Arc::new(ops) })
@@ -1334,12 +1315,13 @@ impl Packet {
                 payload[offset + 12],
                 payload[offset + 13],
             ]) as usize;
-            let total_op_len = 14 + op_payload_len;
-            if offset + total_op_len > payload.len() {
+            let total_op_len = 14usize.checked_add(op_payload_len)?;
+            let end = offset.checked_add(total_op_len)?;
+            if end > payload.len() {
                 return None;
             }
-            let op = CrdtDeltaOp::from_bytes(&payload[offset..offset + total_op_len])?;
-            offset += total_op_len;
+            let op = CrdtDeltaOp::from_bytes(&payload[offset..end])?;
+            offset = end;
             ops.push(op);
         }
         Some(Packet::CrdtDeltaSync { ops: Arc::new(ops) })
@@ -1487,18 +1469,11 @@ impl Packet {
             return None;
         }
         let actor_id = read_u64(payload, 0)?;
-        let nbc_len = read_u32(payload, 8)? as usize;
-        if payload.len() < 12 + nbc_len + 4 {
-            return None;
-        }
-        let nbc_bytes = payload[12..12 + nbc_len].to_vec();
-        let json_off = 12 + nbc_len;
-        let json_len = read_u32(payload, json_off)? as usize;
-        if payload.len() < json_off + 4 + json_len + 8 {
-            return None;
-        }
-        let snapshot_json = payload[json_off + 4..json_off + 4 + json_len].to_vec();
-        let epoch = read_u64(payload, json_off + 4 + json_len)?;
+        let (nbc, json_off) = read_blob(payload, 8)?;
+        let (snapshot, epoch_off) = read_blob(payload, json_off)?;
+        let epoch = read_u64(payload, epoch_off)?;
+        let nbc_bytes = nbc.to_vec();
+        let snapshot_json = snapshot.to_vec();
         Some(Packet::ShadowReplicate {
             actor_id,
             nbc_bytes,
@@ -1523,25 +1498,9 @@ impl Packet {
         let mut content_hash = [0u8; 32];
         content_hash.copy_from_slice(&payload[..32]);
         let (behavior_name, name_len) = read_string(payload, 32)?;
-        let off = 32 + name_len;
-        if payload.len() < off + 4 {
-            return None;
-        }
-        let byte_len = u32::from_be_bytes([
-            payload[off],
-            payload[off + 1],
-            payload[off + 2],
-            payload[off + 3],
-        ]) as usize;
-        let nbc_bytes = if byte_len == 0 {
-            None
-        } else {
-            let start = off + 4;
-            if payload.len() < start + byte_len {
-                return None;
-            }
-            Some(payload[start..start + byte_len].to_vec())
-        };
+        let off = 32usize.checked_add(name_len)?;
+        let (blob, _) = read_blob(payload, off)?;
+        let nbc_bytes = (!blob.is_empty()).then(|| blob.to_vec());
         Some(Packet::FetchBehaviorResponse {
             content_hash,
             behavior_name,
@@ -1592,6 +1551,10 @@ fn read_varint(bytes: &[u8], offset: usize) -> Option<(u64, usize)> {
     loop {
         let byte = *bytes.get(offset + consumed)?;
         consumed += 1;
+        // Only one payload bit fits in the tenth byte of a u64 varint.
+        if consumed == 10 && byte > 1 {
+            return None;
+        }
         result |= ((byte & 0x7F) as u64) << ((consumed - 1) * 7);
         if byte & 0x80 == 0 {
             return Some((result, consumed));
@@ -1727,18 +1690,22 @@ fn write_string(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(bytes);
 }
 
+/// Read a u32-length-prefixed byte slice and return its absolute end offset.
+/// Never add an untrusted length to an offset before checking for overflow.
+fn read_blob(bytes: &[u8], offset: usize) -> Option<(&[u8], usize)> {
+    let len = read_u32(bytes, offset)? as usize;
+    let start = offset.checked_add(4)?;
+    let end = start.checked_add(len)?;
+    Some((bytes.get(start..end)?, end))
+}
+
 /// Read a length-prefixed UTF-8 string.
 ///
 /// Returns `(String, total_bytes_consumed)`.
 fn read_string(bytes: &[u8], offset: usize) -> Option<(String, usize)> {
-    let len = read_u32(bytes, offset)? as usize;
-    let start = offset + 4;
-    let end = start + len;
-    if end > bytes.len() {
-        return None;
-    }
-    let s = String::from_utf8(bytes[start..end].to_vec()).ok()?;
-    Some((s, 4 + len))
+    let (blob, end) = read_blob(bytes, offset)?;
+    let s = std::str::from_utf8(blob).ok()?.to_owned();
+    Some((s, end - offset))
 }
 
 /// Write an optional BLAKE3 content hash: 1-byte flag (0=None, 1=Some)
@@ -1859,19 +1826,19 @@ fn status_from_u8(b: u8) -> Option<NodeStatus> {
 // ---------------------------------------------------------------------------
 
 fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
-    let slice = bytes.get(offset..offset + 8)?;
+    let slice = bytes.get(offset..offset.checked_add(8)?)?;
     let arr: [u8; 8] = slice.try_into().ok()?;
     Some(u64::from_be_bytes(arr))
 }
 
 fn read_i64(bytes: &[u8], offset: usize) -> Option<i64> {
-    let slice = bytes.get(offset..offset + 8)?;
+    let slice = bytes.get(offset..offset.checked_add(8)?)?;
     let arr: [u8; 8] = slice.try_into().ok()?;
     Some(i64::from_be_bytes(arr))
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
-    let slice = bytes.get(offset..offset + 4)?;
+    let slice = bytes.get(offset..offset.checked_add(4)?)?;
     let arr: [u8; 4] = slice.try_into().ok()?;
     Some(u32::from_be_bytes(arr))
 }
@@ -4295,6 +4262,204 @@ mod tests {
     // ------------------------------------------------------------------
     // 12. Corrupt / garbage bytes are rejected
     // ------------------------------------------------------------------
+    #[test]
+    fn test_packet_required_fields_reject_every_truncated_prefix() {
+        let watcher = RemoteLink {
+            node_id: NodeId(7),
+            actor_id: 11,
+        };
+        let target = RemoteLink {
+            node_id: NodeId(9),
+            actor_id: 13,
+        };
+        let packets = [
+            Packet::Heartbeat {
+                node_id: NodeId(4),
+                timestamp: u64::MAX,
+            },
+            Packet::Ack {
+                packet_seq: u64::MAX,
+            },
+            Packet::SpawnRequest {
+                request_id: 1,
+                behavior_name: "counter".into(),
+                content_hash: Some([3; 32]),
+                initial_state: vec![("count".into(), Value::int(17))],
+                bytecode: Some(vec![1, 2, 3]),
+            },
+            Packet::SpawnResponse {
+                request_id: 1,
+                actor_id: 5,
+                success: true,
+            },
+            Packet::FetchBehaviorRequest {
+                content_hash: [4; 32],
+            },
+            Packet::FetchBehaviorResponse {
+                content_hash: [4; 32],
+                behavior_name: "counter".into(),
+                nbc_bytes: Some(vec![1, 2, 3]),
+            },
+            Packet::Link {
+                watcher: watcher.clone(),
+                target: target.clone(),
+            },
+            Packet::Monitor {
+                watcher,
+                target: target.clone(),
+            },
+            Packet::Down {
+                target,
+                reason: "stopped".into(),
+            },
+            Packet::MigrateActor {
+                actor_id: 8,
+                nbc_bytes: vec![1, 2],
+                snapshot_json: vec![3, 4],
+            },
+            Packet::NodeGoodbye {
+                node_id: NodeId(6),
+                durable: vec![(8, 1), (9, 2)],
+            },
+            Packet::ShadowReplicate {
+                actor_id: 8,
+                nbc_bytes: vec![1, 2],
+                snapshot_json: vec![3, 4],
+                epoch: 2,
+            },
+            Packet::CrdtSync {
+                ops: Arc::new(vec![CrdtOp {
+                    crdt_id: CrdtId(1),
+                    crdt_type: CrdtType::GCounter,
+                    payload: vec![1, 2, 3],
+                }]),
+            },
+            Packet::CrdtDeltaSync {
+                ops: Arc::new(vec![CrdtDeltaOp {
+                    op: CrdtOp {
+                        crdt_id: CrdtId(1),
+                        crdt_type: CrdtType::GCounter,
+                        payload: vec![1, 2, 3],
+                    },
+                    is_delta: true,
+                }]),
+            },
+        ];
+        for packet in packets {
+            let bytes = packet.to_bytes(u64::MAX);
+            for end in 0..bytes.len() {
+                assert!(
+                    Packet::from_bytes(&bytes[..end]).is_none(),
+                    "accepted truncated packet type {} at {end}/{}",
+                    bytes[4],
+                    bytes.len()
+                );
+            }
+            assert_eq!(Packet::from_bytes(&bytes), Some((u64::MAX, packet)));
+        }
+    }
+
+    #[test]
+    fn test_packet_rejects_oversized_declared_counts_and_lengths() {
+        let cases = [
+            (
+                Packet::Down {
+                    target: RemoteLink {
+                        node_id: NodeId(1),
+                        actor_id: 2,
+                    },
+                    reason: "stop".into(),
+                },
+                16,
+            ),
+            (
+                Packet::NodeGoodbye {
+                    node_id: NodeId(1),
+                    durable: vec![(2, 3)],
+                },
+                8,
+            ),
+            (
+                Packet::CrdtSync {
+                    ops: Arc::new(vec![]),
+                },
+                0,
+            ),
+            (
+                Packet::CrdtDeltaSync {
+                    ops: Arc::new(vec![]),
+                },
+                0,
+            ),
+            (
+                Packet::MigrateActor {
+                    actor_id: 1,
+                    nbc_bytes: vec![1, 2],
+                    snapshot_json: vec![3],
+                },
+                8,
+            ),
+            (
+                Packet::ShadowReplicate {
+                    actor_id: 1,
+                    nbc_bytes: vec![1, 2],
+                    snapshot_json: vec![3],
+                    epoch: 4,
+                },
+                8,
+            ),
+        ];
+        for (packet, offset) in cases {
+            let mut bytes = packet.to_bytes(1);
+            let start = PACKET_HEADER_LEN + offset;
+            bytes[start..start + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+            assert!(
+                Packet::from_bytes(&bytes).is_none(),
+                "accepted oversized field for packet type {}",
+                bytes[4]
+            );
+        }
+    }
+
+    #[test]
+    fn test_packet_rejects_invalid_utf8_and_unknown_value_tag() {
+        let mut bytes = Packet::Down {
+            target: RemoteLink {
+                node_id: NodeId(1),
+                actor_id: 2,
+            },
+            reason: "x".into(),
+        }
+        .to_bytes(1);
+        *bytes.last_mut().unwrap() = 0xff;
+        assert!(Packet::from_bytes(&bytes).is_none());
+        assert!(read_value(&[0xff], 0).is_none());
+    }
+
+    #[test]
+    fn test_packet_readers_reject_unrepresentable_offsets() {
+        assert!(read_u32(&[], usize::MAX).is_none());
+        assert!(read_u64(&[], usize::MAX).is_none());
+        assert!(read_i64(&[], usize::MAX).is_none());
+        assert!(read_string(&[], usize::MAX).is_none());
+    }
+
+    #[test]
+    fn test_varint_rejects_overflow_in_tenth_byte() {
+        for terminal in 2..=127u8 {
+            let mut bytes = [0xff; 10];
+            bytes[9] = terminal;
+            assert!(
+                read_varint(&bytes, 0).is_none(),
+                "accepted overflowing terminal byte {terminal:#x}"
+            );
+        }
+        let mut max = [0xff; 10];
+        max[9] = 1;
+        assert_eq!(read_varint(&max, 0), Some((u64::MAX, 10)));
+        assert!(read_varint(&[0x80; 10], 0).is_none());
+    }
+
     #[test]
     fn test_packet_from_bytes_rejects_garbage() {
         assert!(Packet::from_bytes(b"").is_none());
