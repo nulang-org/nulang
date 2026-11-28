@@ -225,6 +225,17 @@ impl Manifest {
     }
 }
 
+/// Physical SST bytes (excluding manifests and WAL) for a shadow compaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionStats {
+    pub input_tables: usize,
+    pub output_tables: usize,
+    pub input_bytes: u64,
+    pub output_bytes: u64,
+    pub input_versions: usize,
+    pub output_versions: usize,
+}
+
 #[derive(Debug)]
 pub struct ManifestStore {
     dir: PathBuf,
@@ -419,16 +430,27 @@ impl ManifestStore {
     /// Rebuild the existing in-memory MVCC state from sealed disk tables.
     /// The caller must verify WAL correspondence before using it for writes.
     pub(super) fn restore_memory_tablet(&self) -> io::Result<super::tablet::MemoryTablet> {
+        self.recovery_meta()?;
+        self.restore_manifest_state(&self.manifest)
+    }
+
+    fn restore_manifest_state(
+        &self,
+        manifest: &Manifest,
+    ) -> io::Result<super::tablet::MemoryTablet> {
         use super::tablet::{MemoryTablet, TabletSnapshotRow, TabletSnapshotState, VersionedValue};
-        let meta = self.recovery_meta()?;
+        let meta = manifest
+            .recovery
+            .as_ref()
+            .ok_or_else(|| invalid("manifest is not recovery sealed"))?;
         let mut rows = std::collections::BTreeMap::<Vec<u8>, Vec<VersionedValue>>::new();
-        for entry in &self.manifest.entries {
+        for entry in &manifest.entries {
             for row in self.open_verified_table(entry)?.into_snapshot_rows()? {
                 rows.entry(row.key).or_default().extend(row.versions);
             }
         }
         let state = TabletSnapshotState {
-            current_sequence: self.manifest.durable_sequence(),
+            current_sequence: manifest.durable_sequence(),
             oldest_retained_snapshot: None,
             rows: rows
                 .into_iter()
@@ -529,6 +551,84 @@ impl ManifestStore {
         self.manifest = next;
         Ok(())
     }
+    /// Build an independently verified compacted shadow of a complete sealed
+    /// prefix at its already durable retention floor. No WAL binding changes,
+    /// new retention floor, retirement authorization, or automatic cutover.
+    /// Initial qualification admits at most 16 tables / 64 MiB encoded input
+    /// (also bounds the temporary in-memory recovery oracle). Aggregate index
+    /// keys and versions must fit one table's limits. Use a fresh destination
+    /// after any failure, including a partially published shadow.
+    pub fn prepare_compacted_shadow(&self, next: &mut Self) -> io::Result<CompactionStats> {
+        const MAX_INPUT_TABLES: usize = 16;
+        const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+        let meta = self.recovery_meta()?.clone();
+        if next.requires_reopen
+            || next.manifest.is_recovery_sealed()
+            || !next.manifest.entries.is_empty()
+            || self.manifest.tablet_id != next.manifest.tablet_id
+            || self.manifest.epoch != next.manifest.epoch
+            || self.dir.starts_with(&next.dir)
+            || next.dir.starts_with(&self.dir)
+        {
+            return Err(invalid("compaction requires separate empty manifest"));
+        }
+        next.verify_dedicated_files()?;
+        let input_tables = self.manifest.entries.len();
+        let input_bytes = self.manifest.entries.iter().try_fold(0u64, |total, e| {
+            total
+                .checked_add(e.file_bytes)
+                .ok_or_else(|| invalid("compaction byte overflow"))
+        })?;
+        if input_tables == 0 || input_tables > MAX_INPUT_TABLES || input_bytes > MAX_INPUT_BYTES {
+            return Err(invalid("shadow compaction input budget exceeded"));
+        }
+        self.sync_for_wal_binding()?;
+        let mut tables = Vec::with_capacity(input_tables);
+        let mut input_versions = 0usize;
+        let mut key_bytes = 0usize;
+        for entry in &self.manifest.entries {
+            let table = self.open_verified_table(entry)?;
+            input_versions += table.indexed_versions();
+            key_bytes += table.indexed_key_bytes();
+            if input_versions > 262_144 || key_bytes > 16 * 1024 * 1024 {
+                return Err(invalid("shadow compaction aggregate index budget exceeded"));
+            }
+            tables.push(table);
+        }
+        let path = table_path(&next.dir, 1);
+        super::indexed_sst::compact_verified_tables(
+            &path,
+            tables,
+            meta.floor,
+            self.manifest.durable_sequence(),
+        )?;
+        let output = IndexedSst::open(&path)?;
+        let output_versions = output.indexed_versions();
+        let output_bytes = output.file_bytes();
+        drop(output);
+        next.append(TableEntry::inspect(&next.dir, 1)?)?;
+        // Verify logical equivalence before publishing a recovery seal.
+        let mut candidate = next.manifest.clone();
+        candidate.recovery = Some(meta.clone());
+        let expected = self.restore_memory_tablet()?.snapshot_state();
+        let actual = next.restore_manifest_state(&candidate)?.snapshot_state();
+        if actual != expected {
+            return Err(invalid(
+                "compacted shadow disagrees with independent recovery oracle",
+            ));
+        }
+        next.seal(meta)?;
+        next.sync_for_wal_binding()?;
+        Ok(CompactionStats {
+            input_tables,
+            output_tables: 1,
+            input_bytes,
+            output_bytes,
+            input_versions,
+            output_versions,
+        })
+    }
+
     /// Start an independent generation with exact copies of the bound
     /// prefix. Never modify the previous generation or overwrite a file.
     pub(super) fn copy_prefix_into(&self, next: &mut Self) -> io::Result<()> {

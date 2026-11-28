@@ -366,6 +366,19 @@ pub fn write_immutable_table<'a>(
     }
 }
 
+/// Merge a complete contiguous sealed prefix, retaining only the visible
+/// value at the floor and versions strictly above it. Metadata is bounded
+/// across inputs; value bytes are streamed through a fixed scratch buffer.
+#[cfg(unix)]
+pub(super) fn compact_verified_tables(
+    path: &Path,
+    tables: Vec<IndexedSst>,
+    floor: u64,
+    sequence: u64,
+) -> io::Result<()> {
+    streaming_writer::compact(path, tables, floor, sequence)
+}
+
 #[cfg(unix)]
 mod streaming_writer {
     use super::*;
@@ -431,6 +444,71 @@ mod streaming_writer {
         header: SstHeader,
         rows: impl IntoIterator<Item = SstRow<'a>>,
     ) -> io::Result<()> {
+        write_encoded(path, header, |encoder| {
+            let mut previous_key: Option<&[u8]> = None;
+            let mut keys = 0u64;
+            let mut versions = 0u64;
+            let mut key_bytes = 0usize;
+            for (key, history) in rows {
+                if previous_key.is_some_and(|prev| prev >= key) {
+                    return Err(invalid("SST keys must be strictly ordered"));
+                }
+                previous_key = Some(key);
+                key_bytes = key_bytes
+                    .checked_add(key.len())
+                    .ok_or_else(|| invalid("SST key bytes overflow"))?;
+                keys = keys
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("SST key count overflow"))?;
+                versions = versions
+                    .checked_add(history.len() as u64)
+                    .ok_or_else(|| invalid("SST version count overflow"))?;
+                if key.len() > MAX_KEY_BYTES
+                    || key_bytes > MAX_INDEX_KEY_BYTES
+                    || history.is_empty()
+                    || keys > header.key_count
+                    || versions > header.version_count
+                {
+                    return Err(invalid("SST row exceeds declared counts or index limits"));
+                }
+                encoder.emit(&(key.len() as u32).to_le_bytes())?;
+                encoder.emit(key)?;
+                encoder.emit(&(history.len() as u32).to_le_bytes())?;
+                let mut previous = 0;
+                for &(sequence, value) in history {
+                    if sequence <= previous
+                        || sequence < header.min_sequence
+                        || sequence > header.max_sequence
+                    {
+                        return Err(invalid("invalid SST MVCC sequence"));
+                    }
+                    previous = sequence;
+                    encoder.emit(&sequence.to_le_bytes())?;
+                    match value {
+                        None => encoder.emit(&[0])?,
+                        Some(value) => {
+                            if value.len() > MAX_VALUE_BYTES {
+                                return Err(invalid("SST value too large"));
+                            }
+                            encoder.emit(&[1])?;
+                            encoder.emit(&(value.len() as u32).to_le_bytes())?;
+                            encoder.emit(value)?;
+                        }
+                    }
+                }
+            }
+            if keys != header.key_count || versions != header.version_count {
+                return Err(invalid("SST count mismatch"));
+            }
+            Ok(())
+        })
+    }
+
+    fn write_encoded(
+        path: &Path,
+        header: SstHeader,
+        write_rows: impl FnOnce(&mut Encoder) -> io::Result<()>,
+    ) -> io::Result<()> {
         if header.generation == 0
             || header.min_sequence == 0
             || header.min_sequence > header.max_sequence
@@ -465,61 +543,7 @@ mod streaming_writer {
         ] {
             encoder.emit(&n.to_le_bytes())?;
         }
-        let mut previous_key: Option<&[u8]> = None;
-        let mut keys = 0u64;
-        let mut versions = 0u64;
-        let mut key_bytes = 0usize;
-        for (key, history) in rows {
-            if previous_key.is_some_and(|prev| prev >= key) {
-                return Err(invalid("SST keys must be strictly ordered"));
-            }
-            previous_key = Some(key);
-            key_bytes = key_bytes
-                .checked_add(key.len())
-                .ok_or_else(|| invalid("SST key bytes overflow"))?;
-            keys = keys
-                .checked_add(1)
-                .ok_or_else(|| invalid("SST key count overflow"))?;
-            versions = versions
-                .checked_add(history.len() as u64)
-                .ok_or_else(|| invalid("SST version count overflow"))?;
-            if key.len() > MAX_KEY_BYTES
-                || key_bytes > MAX_INDEX_KEY_BYTES
-                || history.is_empty()
-                || keys > header.key_count
-                || versions > header.version_count
-            {
-                return Err(invalid("SST row exceeds declared counts or index limits"));
-            }
-            encoder.emit(&(key.len() as u32).to_le_bytes())?;
-            encoder.emit(key)?;
-            encoder.emit(&(history.len() as u32).to_le_bytes())?;
-            let mut previous = 0;
-            for &(sequence, value) in history {
-                if sequence <= previous
-                    || sequence < header.min_sequence
-                    || sequence > header.max_sequence
-                {
-                    return Err(invalid("invalid SST MVCC sequence"));
-                }
-                previous = sequence;
-                encoder.emit(&sequence.to_le_bytes())?;
-                match value {
-                    None => encoder.emit(&[0])?,
-                    Some(value) => {
-                        if value.len() > MAX_VALUE_BYTES {
-                            return Err(invalid("SST value too large"));
-                        }
-                        encoder.emit(&[1])?;
-                        encoder.emit(&(value.len() as u32).to_le_bytes())?;
-                        encoder.emit(value)?;
-                    }
-                }
-            }
-        }
-        if keys != header.key_count || versions != header.version_count {
-            return Err(invalid("SST count mismatch"));
-        }
+        write_rows(&mut encoder)?;
         encoder
             .writer
             .write_all(encoder.digest.finalize().as_bytes())?;
@@ -533,5 +557,108 @@ mod streaming_writer {
         fs::remove_file(&staged.0)?;
         File::open(&parent)?.sync_all()?;
         Ok(())
+    }
+
+    pub(super) fn compact(
+        path: &Path,
+        tables: Vec<IndexedSst>,
+        floor: u64,
+        sequence: u64,
+    ) -> io::Result<()> {
+        if tables.is_empty() || sequence == 0 || floor > sequence {
+            return Err(invalid("invalid compaction interval"));
+        }
+        let mut next = 1;
+        let mut versions = 0usize;
+        let mut key_bytes = 0usize;
+        for table in &tables {
+            if table.min_sequence != next {
+                return Err(invalid("compaction inputs must cover contiguous prefix"));
+            }
+            next = table
+                .max_sequence
+                .checked_add(1)
+                .ok_or_else(|| invalid("compaction sequence overflow"))?;
+            versions = versions
+                .checked_add(table.version_count)
+                .ok_or_else(|| invalid("compaction version overflow"))?;
+            key_bytes = key_bytes
+                .checked_add(table.key_bytes)
+                .ok_or_else(|| invalid("compaction key bytes overflow"))?;
+            if versions > MAX_INDEX_VERSIONS || key_bytes > MAX_INDEX_KEY_BYTES {
+                return Err(invalid("aggregate compaction index limit"));
+            }
+        }
+        if next - 1 != sequence {
+            return Err(invalid("compaction prefix incomplete"));
+        }
+        let (mut files, maps): (Vec<_>, Vec<_>) = tables
+            .into_iter()
+            .map(|table| (table.file, table.rows))
+            .unzip();
+        // Borrow keys and metadata from the verified indexes; never materialize
+        // all values. Contiguous intervals ensure append order is sequence order.
+        let mut merged = BTreeMap::<&[u8], Vec<(usize, &Version)>>::new();
+        for (index, map) in maps.iter().enumerate() {
+            for (key, history) in map {
+                merged
+                    .entry(key.as_slice())
+                    .or_default()
+                    .extend(history.iter().map(|v| (index, v)));
+            }
+        }
+        for history in merged.values_mut() {
+            let boundary = history.partition_point(|(_, v)| v.sequence <= floor);
+            if boundary != 0 {
+                let keep_anchor = history[boundary - 1].1.value.is_some();
+                history.drain(..boundary - usize::from(keep_anchor));
+            }
+        }
+        merged.retain(|_, history| !history.is_empty());
+        let header = SstHeader {
+            generation: 1,
+            min_sequence: 1,
+            max_sequence: sequence,
+            key_count: merged.len() as u64,
+            version_count: merged.values().map(|h| h.len() as u64).sum(),
+        };
+        write_encoded(path, header, |encoder| {
+            let mut scratch = [0u8; 64 * 1024];
+            for (key, history) in merged {
+                encoder.emit(&(key.len() as u32).to_le_bytes())?;
+                encoder.emit(key)?;
+                encoder.emit(&(history.len() as u32).to_le_bytes())?;
+                let mut previous = 0;
+                for (index, version) in history {
+                    if version.sequence <= previous || version.sequence > sequence {
+                        return Err(invalid("invalid compacted MVCC order"));
+                    }
+                    previous = version.sequence;
+                    encoder.emit(&version.sequence.to_le_bytes())?;
+                    match &version.value {
+                        None => encoder.emit(&[0])?,
+                        Some(loc) => {
+                            encoder.emit(&[1])?;
+                            encoder.emit(&(loc.length as u32).to_le_bytes())?;
+                            let file = &mut files[index];
+                            file.seek(SeekFrom::Start(loc.offset))?;
+                            let mut digest = blake3::Hasher::new();
+                            let mut left = loc.length;
+                            while left != 0 {
+                                let n = left.min(scratch.len());
+                                file.read_exact(&mut scratch[..n])?;
+                                digest.update(&scratch[..n]);
+                                encoder.emit(&scratch[..n])?;
+                                left -= n;
+                            }
+                            if digest.finalize() != loc.digest {
+                                return Err(invalid("SST value changed during compaction"));
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 }

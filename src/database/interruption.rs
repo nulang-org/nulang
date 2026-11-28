@@ -16,6 +16,7 @@ pub(crate) enum StorageInterruptionPoint {
     WalAfterSync,
     WalGroupAfterFirstFrame,
     WalGroupAfterSecondHeader,
+    WalGroupBeforeSync,
     WalGroupAfterSync,
     CheckpointAfterTempWrite,
     CheckpointAfterTempSync,
@@ -40,6 +41,7 @@ pub(crate) enum StorageInterruptionPoint {
 
 thread_local! {
     static ACTIVE: Cell<Option<StorageInterruptionPoint>> = const { Cell::new(None) };
+    static ERROR_KIND: Cell<io::ErrorKind> = const { Cell::new(io::ErrorKind::Other) };
 }
 
 struct ResetInterruption;
@@ -47,11 +49,20 @@ struct ResetInterruption;
 impl Drop for ResetInterruption {
     fn drop(&mut self) {
         ACTIVE.with(|active| active.set(None));
+        ERROR_KIND.with(|kind| kind.set(io::ErrorKind::Other));
     }
 }
 
 pub(crate) fn with_interruption<T>(
     point: StorageInterruptionPoint,
+    operation: impl FnOnce() -> T,
+) -> T {
+    with_interruption_kind(point, io::ErrorKind::Other, operation)
+}
+
+fn with_interruption_kind<T>(
+    point: StorageInterruptionPoint,
+    kind: io::ErrorKind,
     operation: impl FnOnce() -> T,
 ) -> T {
     ACTIVE.with(|active| {
@@ -62,15 +73,17 @@ pub(crate) fn with_interruption<T>(
         active.set(Some(point));
     });
     let _reset = ResetInterruption;
+    ERROR_KIND.with(|slot| slot.set(kind));
     operation()
 }
 
 pub(crate) fn hit(point: StorageInterruptionPoint) -> io::Result<()> {
     let should_interrupt = ACTIVE.with(|active| active.get() == Some(point));
     if should_interrupt {
-        return Err(io::Error::other(format!(
-            "injected NulangDB storage interruption at {point:?}"
-        )));
+        return Err(io::Error::new(
+            ERROR_KIND.with(Cell::get),
+            format!("injected NulangDB storage interruption at {point:?}"),
+        ));
     }
     Ok(())
 }
@@ -207,6 +220,61 @@ mod tests {
             drop(reopened);
             cleanup(&path);
             let _ = fs::remove_file(appended(&path, ".lock"));
+        }
+    }
+
+    #[test]
+    fn storage_full_group_preserves_acknowledged_prefix_and_reconciles_retry() {
+        use super::super::tablet::TransactionId;
+        for (point, recovered) in [
+            (StorageInterruptionPoint::WalGroupAfterFirstFrame, 2),
+            (StorageInterruptionPoint::WalGroupAfterSecondHeader, 2),
+            (StorageInterruptionPoint::WalGroupBeforeSync, 3),
+        ] {
+            let path = temp_wal("group-storage-full");
+            let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
+            let acknowledged = tablet
+                .commit_idempotent(TransactionId::new([1; 16]), vec![])
+                .unwrap();
+            let entries = vec![
+                (TransactionId::new([2; 16]), vec![]),
+                (TransactionId::new([3; 16]), vec![]),
+            ];
+            let failure = with_interruption_kind(point, io::ErrorKind::StorageFull, || {
+                tablet.commit_batch_idempotent(entries.clone())
+            });
+            assert!(matches!(
+                failure,
+                Err(WalBackedError::Wal(WalError::Io {
+                    kind: io::ErrorKind::StorageFull,
+                    ..
+                }))
+            ));
+            assert_eq!(tablet.current_sequence(), 1);
+            let bytes = fs::read(&path).unwrap();
+            assert_eq!(
+                tablet.commit_batch_idempotent(entries.clone()).unwrap_err(),
+                WalBackedError::Wal(WalError::Poisoned)
+            );
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            drop(tablet);
+            let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
+            assert_eq!(tablet.current_sequence(), recovered);
+            assert_eq!(
+                tablet
+                    .commit_idempotent(TransactionId::new([1; 16]), vec![])
+                    .unwrap(),
+                acknowledged
+            );
+            let receipts = tablet.commit_batch_idempotent(entries).unwrap();
+            assert_eq!(
+                receipts.iter().map(|r| r.sequence()).collect::<Vec<_>>(),
+                vec![2, 3]
+            );
+            assert_eq!(tablet.current_sequence(), 3);
+            drop(tablet);
+            cleanup(&path);
+            fs::remove_file(appended(&path, ".lock")).unwrap();
         }
     }
 
@@ -1553,6 +1621,93 @@ fn journaled_retirement_resumes_after_intent_marker_unlink_and_final_sync() {
             WalBackedTablet::restore_sealed_backup(desc, &fresh, dir.join("restored")).unwrap();
         assert_eq!(restored.current_sequence(), 3);
         drop(restored);
+        drop(managed);
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn managed_wal_storage_full_preserves_receipts_and_blocks_further_writes() {
+    use super::generation_registry::GenerationRegistry;
+    use super::managed_storage::ManagedTablet;
+    use super::sst_manifest::ManifestStore;
+    use super::tablet::TransactionId;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    for (point, recovered) in [
+        (StorageInterruptionPoint::WalAfterHeader, 1),
+        (StorageInterruptionPoint::WalAfterPayload, 1),
+        (StorageInterruptionPoint::WalAfterChecksum, 2),
+    ] {
+        let dir = std::env::temp_dir().join(format!(
+            "nudb-managed-storage-full-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).unwrap();
+        let seal = dir.join("seal");
+        let reg = dir.join("registry");
+        fs::create_dir(&seal).unwrap();
+        fs::create_dir(&reg).unwrap();
+        let path = dir.join("tablet.wal");
+        let desc = TabletDescriptor::new(
+            TabletId::new(97).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        let mut db = WalBackedTablet::open(desc.clone(), &path).unwrap();
+        let acknowledged = db
+            .commit_idempotent(TransactionId::new([1; 16]), vec![])
+            .unwrap();
+        let mut manifest = ManifestStore::create(&seal, 97, 7).unwrap();
+        db.flush_sst_shadow(&mut manifest, 1).unwrap();
+        db.seal_sst_recovery(&mut manifest).unwrap();
+        db.reclaim_to_sealed_sst(&manifest).unwrap();
+        let registry = GenerationRegistry::create(&reg, 97, 7).unwrap();
+        let mut managed = ManagedTablet::adopt(db, registry, manifest).unwrap();
+        let mutations = vec![TabletMutation::Put {
+            key: b"k".to_vec(),
+            value: b"new".to_vec(),
+        }];
+        let failure = with_interruption_kind(point, io::ErrorKind::StorageFull, || {
+            managed.commit_idempotent(TransactionId::new([2; 16]), mutations.clone())
+        });
+        assert!(matches!(
+            failure,
+            Err(WalBackedError::Wal(WalError::Io {
+                kind: io::ErrorKind::StorageFull,
+                ..
+            }))
+        ));
+        assert_eq!(managed.current_sequence(), 1);
+        let bytes = fs::read(&path).unwrap();
+        assert!(managed
+            .commit_idempotent(TransactionId::new([3; 16]), vec![])
+            .is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        drop(managed);
+        let registry = GenerationRegistry::open(&reg, 97, 7).unwrap();
+        let mut managed = ManagedTablet::open(desc, &path, &seal, registry).unwrap();
+        assert_eq!(managed.current_sequence(), recovered);
+        assert_eq!(
+            managed
+                .commit_idempotent(TransactionId::new([1; 16]), vec![])
+                .unwrap(),
+            acknowledged
+        );
+        assert_eq!(
+            managed
+                .commit_idempotent(TransactionId::new([2; 16]), mutations)
+                .unwrap()
+                .sequence(),
+            2
+        );
+        assert_eq!(managed.read_at(b"k", 2).unwrap(), Some(b"new".as_slice()));
+        assert!(managed
+            .commit_idempotent(TransactionId::new([2; 16]), vec![])
+            .is_err());
+        assert_eq!(managed.current_sequence(), 2);
         drop(managed);
         fs::remove_dir_all(dir).unwrap();
     }
